@@ -124,10 +124,126 @@ research/07):
   и чужие id. Владелец видит прогон автотестов на сервере (опасные вызовы —
   403, чужой id — 404 без данных) и журнал отказов со снимком страницы.
 
-С двумя выкладками и двумя закрытиями выходит **14,5 + 12,25 ч**. Обе половины
-больше 11,5 ч, но меньше 15,1 ч Д4а. Как Д4а, каждая остаётся одним днём с
+С двумя выкладками и двумя закрытиями выходит **15,0 + 12,75 ч**. Обе половины
+больше 11,5 ч, но не больше 15,1 ч Д4а. Как Д4а, каждая остаётся одним днём с
 чертой отсечения и порогом темпа (шапки половин). По живому темпу, худшая доля
-0,30 плановой шкалы, это около 4,4 и 3,7 ч.
+0,30 плановой шкалы, это около 4,5 и 3,8 ч.
+
+## Изменения по критике, раунд 3
+
+Критика — три критика Opus 5.5: 1 блокер, 6 major (3 различных и дубль
+блокера), 18 minor; всё проверено опытами. Строка — «замечание → что
+изменилось».
+
+**Блокер**
+1. `lifespan` шлюза звал `students()` до ветки `config_error` и вне `try`.
+   Настоящий сбой `core.db` выпускал `StoreError` из `lifespan`, uvicorn
+   выходил с кодом 3, и `core` со службой данных и LLM-прокси уходил в цикл
+   перезапусков. Тест подменял `open()` при живой базе → исправлено:
+   - `lifespan` шлюза **не бросает никогда**: всё после `open()` идёт в `try`;
+   - `students()` и первый такт — только без `config_error`;
+   - `StoreError`, `OSError` и прочие исключения дописываются в
+     `config_error` или в строку журнала.
+
+   Тест `test_gateway_db_failure_keeps_core`: `DB_PATH` в каталоге `0500`,
+   рядом роль «данные», без подмен. Процесс поднят, `/healthz/live` и ручка
+   службы данных отвечают, `/healthz/gateway` — 503 с причиной. Ещё
+   `test_lifespan_never_raises` — `students()` бросает.
+
+**Major**
+2. Удаляющие `Set-Cookie` (27–39 заголовков) не проходили через `edge`:
+   больше `proxy_buffer_size` 4 КиБ, «upstream sent too big header», 503 без
+   `Set-Cookie`, строка сторожа в норме →
+   - удаления — короткие строки без лишних атрибутов
+     (`pcbk_session=; Max-Age=0; Path=…; Secure[; Domain=…][; Partitioned]`);
+   - бюджет — не больше 16 КиБ на самом длинном пути белого списка при хосте
+     из четырёх меток (`test_clear_cookies_size_budget`);
+   - в `edge` на уровне `server` (наследуют все `location` под `/pcbk/api/`)
+     — `proxy_buffer_size 32k; proxy_buffers 8 32k; proxy_busy_buffers_size 64k`
+     (правило в Д5-R30);
+   - на стенде `GW_ORIGIN` — имя из трёх меток (`stand.pcbk.test`); тесты
+     через `edge`: две cookie на `wake` (Д5а) и на длинном пути `/oc/` (Д5б)
+     → 401 JSON с `Set-Cookie` и `Domain=`, выход через `edge` — 200 с
+     `Set-Cookie`;
+   - счётчик `cookies_duplicate` и строка сторожа «внимание — подброшена cookie
+     сессии»;
+   - строка владельцу 2 исправлена.
+3. `error_page 400` на именованный `location` давал на `%00` ответ 500 HTML, а
+   `TRACE` — 405 HTML → ошибки nginx 400, 405, 413, 429, 502–504 ведут на
+   внутренние `location` по URI (`/pcbk-errors/NNN.json`) с `return` JSON;
+   все `error_page` — на уровне `server` (502–504 — с `=503`). Тесты `%00` → 400 JSON и `TRACE` → 405 JSON
+   (А6), `curl` в А7.
+4. Живой прогон Д5б берёт место 09, а умолчание владельца держало под пробы
+   только 10 → по решению контролёра места **09 и 10** служат пробам только
+   до начала пилота. После каждого прогона пробы убирают свои тестовые
+   данные и освобождают места (процедура README, шаги А8.9 и Б7.6); пилот —
+   на все 10 мест. Строка 5 владельца — для сведения. Фраза «на месте
+   студента с его согласия» убрана; Б0 проверяет, что у мест 09 и 10 нет
+   закреплений.
+5. Дубли блокера и major 2–3 — закрыты теми же правками.
+
+**Minor** (исправлены):
+- тест редактирования `/health/llm` сверяет весь набор полей;
+- владение потоком: флаг ставится перед `return`, освобождение —
+  идемпотентной функцией из `finally` генератора и из `BackgroundTask`; тест
+  обрыва клиента во время ожидания заголовков;
+- домены удалений — из хоста самого запроса (`X-Forwarded-Host` от `edge`,
+  без него — `Host`), а не из `GW_ORIGIN`: браузер слал cookie именно этому
+  хосту, и опечатка в `GW_ORIGIN` набор не ломает; пути-предки — не длиннее
+  самого длинного пути белого списка (64 знака), так бюджет держится на любом
+  пути;
+- очередь потока — `maxsize=4`, событие — до 512 КиБ, у `edge` для потока —
+  `send_timeout 60s`; память пересчитана;
+- первый такт — параллельно по местам и фоновой задачей после запуска
+  (решение контролёра, п. 3 ниже);
+- «упало при старте» — от `StartedAt`, снятого сразу после start; двойник
+  меняет `started_at` на start;
+- `/health/gateway` — через тот же реестр ошибок;
+- варианты `Partitioned` в удалениях;
+- рецепт `forms` — `|| [ -n "$pw" ]`;
+- живая проверка `/health/llm` — с положительным контролем через петлю;
+- `store.ping()` в каждом такте;
+- `/me` с 503 — форма и текст;
+- README «Новый студент» переписан;
+- срок учения «простой» — `t1` + 180 с;
+- А0 сверяет, что реестр Д4а поглотил прямые `add_exception_handler` и
+  `BodyLimit` службы данных Д3б;
+- `store.ping()` проверен тестами `test_store_errors_counted_and_ping_recovers`
+  и `test_reaper_tick_pings_store`.
+
+**Minor (отложен):** счётчик «`same-origin`, но `Origin` ≠ `GW_ORIGIN`» —
+в Д6 (Д5-R26): через туннель проверок он срабатывал бы на каждом входе, а
+вреда от опечатки больше нет — удаления cookie от `GW_ORIGIN` не зависят.
+
+**Решения контролёра после раунда 3**
+1. Места 09 и 10 служат пробам только до начала пилота. Пробные учётки
+   (`dN-probe-*`) после уборки своих тестовых данных освобождаются, пилот —
+   на все 10 мест. Изменено:
+   - строка 5 владельца — для сведения, без вопроса;
+   - в README — процедура «Освобождение места пробной учётки» (разговоры
+     пробы по списку id, сверка `[]`, `disable`, `remove`, `release-place`,
+     `list`);
+   - на неё ссылаются шаги А8.9 и Б7.6;
+   - Б0 при уже начавшемся пилоте берёт свободные места или откладывает
+     живой прогон;
+   - строка в «Отклонениях» для Д6–Д12.
+2. `proxy_buffer_size 32k` на уровне `server` — принято.
+3. Первый такт шлюза не задерживает запуск других ролей:
+   - `lifespan` создаёт фоновую задачу уборщика и сразу отдаёт `yield`;
+     строка «учётных записей студентов N» и первый такт идут в ней;
+   - `FIRST_TICK_S` убран;
+   - «готово» работающим местам возвращает первый такт; до его конца
+     `/oc/*` отвечает 503 «спит», пробуждение находит место готовым без
+     start (Д5-R27);
+   - `health()` до первого такта — норма;
+   - тест `test_first_tick_does_not_block_startup`: `/healthz/data` отвечает,
+     пока первый такт висит на `GET /agent`, затем флаг «готово» вернулся;
+   - в А3 тест `test_first_tick_restores_ready_in_parallel` вместо теста
+     срока.
+4. Ошибки `edge` уровня `server` и для прочих путей 8443 — принято; строка
+   для Д6 — в «Отклонениях».
+5. Строка «подброшена cookie сессии» на час после живых проверок (А8, Б7) —
+   принято, в журнале проверок это отмечается как ожидаемое.
 
 ## Изменения по критике, раунд 2
 
@@ -154,7 +270,8 @@ research/07):
      `health()` — `(False, причина)`, строка сторожа — «сбой: ошибка
      настройки: …»; процесс жив.
 
-   Тест `test_gateway_config_error_keeps_core`.
+   Тест `test_gateway_config_error_keeps_core` (в раунде 3 разделён на
+   `test_gateway_settings_error_keeps_core` и `test_gateway_db_failure_keeps_core`).
 
 **Major**
 3. Порождённые «близнецы» совпадали с разрешёнными GET/PATCH `/session/{SES}`
@@ -201,7 +318,8 @@ research/07):
 **Решения контролёра по вопросам ревизии раунда 2:**
 13. `pcbk-egress` — зона администратора для `/health/llm` → принято,
     `ADMIN_NETS` без изменений.
-14. Место 10 за пробами → остаётся умолчанием в строке 5 раздела владельца.
+14. Место 10 за пробами → остаётся умолчанием в строке 5 раздела владельца
+    (раунд 3: места 09 и 10 — живой прогон Д5б берёт оба).
 15. Имя вместо адреса в `scope["server"]` → по умолчанию **чужое** (закрыто
     при сомнении). Своим его считает только приложение с явной пометкой
     `app.state.zone_names_ok = True`, которую ставят лишь помощники тестов.
@@ -240,7 +358,7 @@ research/07):
   половине;
 - шаблон `scrypt` — полный формат хеша;
 - учения видны в `note`; «вход перегружен» — строка сторожа;
-- расход памяти шлюза посчитан, пределы ужаты (ответ 4 МиБ, событие 1 МиБ);
+- расход памяти шлюза посчитан, пределы ужаты (ответ 4 МиБ, событие 1 МиБ; в раунде 3 событие — 512 КиБ);
 - `pytestmark = pytest.mark.anyio` в асинхронных модулях.
 
 ## Изменения по критике, раунд 1
@@ -283,8 +401,8 @@ research/07):
 Строки для раздела «Отклонения» `docs/PLAN-platform-2026-09-29.md` — дорожную
 карту правит контролёр при утверждении плана, закрытия дней её не трогают:
 
-* **Шлюз и вход — два дня (Д5а и Д5б):** по плановой шкале около 23 ч одним
-  днём после двух раундов критики (Д5а — 14,5 ч, Д5б — 12,25 ч). Д5а — вход,
+* **Шлюз и вход — два дня (Д5а и Д5б):** по плановой шкале около 24 ч одним
+  днём после трёх раундов критики (Д5а — 15,0 ч, Д5б — 12,75 ч). Д5а — вход,
   учётные записи и закрепление мест, место по учётной записи, подъём и сон
   мест, зоны адресов, строка сторожа; Д5б — белый список вызовов OpenCode,
   поток SSE, автотесты шлюза. Всего 15 дней, нумерация Д6–Д12 прежняя.
@@ -305,6 +423,20 @@ research/07):
 * **Переподключение MCP места шлюз не дублирует** (Д4б-R18). **Имя агента в
   событии службы данных — Д7**, не Д5: MCP-вызов не несёт агента.
   `ReloadWorker` и карантин агента — Д7 (research/09 §6).
+* **Для Д6 — ошибки и заголовки `edge` уровня `server`** (Д5-R30, решение
+  контролёра р3). С Д5а ошибки самого nginx на 8443 — JSON через внутренние
+  `/pcbk-errors/NNN.json`, на уровне `server`, для всех путей без своих
+  `error_page` (400 и 405 — и для `/`). Там же `proxy_buffer_size 32k`,
+  `proxy_buffers 8 32k`, `proxy_busy_buffers_size 64k` и
+  `proxy_set_header X-Forwarded-Host $host` рядом с `Connection ""` Д1.
+  `location` веба чата Д6 ставит свои `error_page`, если ему нужен не JSON.
+  Свой `proxy_set_header` в `location` отменяет оба заголовка уровня
+  `server`: их надо повторить. Там же в Д6 — отложенный счётчик «`same-origin`,
+  но `Origin` ≠ `GW_ORIGIN`» (Д5-R26).
+* **Места 09 и 10 — пробам только до начала пилота** (решение контролёра
+  р3): после каждой живой проверки пробные учётки убирают свои тестовые
+  разговоры и освобождают места (`release-place`), пилот — на все 10 мест.
+  Дням Д6–Д12 после начала пилота нужен свой способ живых проверок чата.
 
 ## Что нужно от владельца
 
@@ -323,15 +455,22 @@ research/07):
    cookie не делятся ни по портам, ни по поддоменам с `Domain=`.
    **Умолчание:**
    - пути и cookie шлюза — под `/pcbk/api/`, которого у Dify нет;
-   - при двух и больше `pcbk_session` закрываются все предъявленные сессии и
-     стираются cookie на всех путях-предках и родительских доменах.
+   - при двух и больше `pcbk_session` закрываются все предъявленные сессии.
+     Ответ 401 несёт удаления на всех путях-предках, родительских доменах и в
+     разделе `Partitioned`; `edge` пропускает такой ответ (буфер 32 КиБ);
+   - каждый такой случай считается, и строка «Шлюз и вход» говорит
+     «внимание — подброшена cookie сессии».
 
    Остаточный риск: скрипт с любого `*.pcbk.ru`, в том числе XSS в Dify,
    может подбросить браузеру свою cookie.
    - Если сессии нет, студент окажется в чужой сессии. Имя на странице входа
      это покажет, но не при cookie с узким путём (`/pcbk/api/oc/`); Д6
      показывает логин в шапке чата.
-   - Если сессия уже открыта, студента выкинет из обеих.
+   - Если сессия уже открыта, обе сессии закрываются, cookie стираются, и
+     студент входит заново.
+   - Если подброшенная cookie переживёт удаление (иной набор атрибутов),
+     студент будет получать 401 после каждого входа, пока не очистит данные
+     сайта. Строка сторожа это покажет.
 
    Полное лечение — отдельное имя хоста для резерва (DNS и сертификат
    заказчика).
@@ -341,10 +480,14 @@ research/07):
 4. **Тестовые разговоры прошлых дней в местах 01–02** (разговор Д4б и учения
    с данными БДРВ). **Умолчание:** эти места выдаются студентам последними;
    чистка тестовых разговоров — с согласия владельца.
-5. **Место для проб живых проверок Д6–Д12.** Пробная учётка не получит место,
-   закреплённое за студентом. **Умолчание:** место 10 держится за пробами и
-   студентам не выдаётся. Пилот — до 9 студентов, пока владелец не скажет
-   иначе; тогда живые проверки чата идут на месте студента с его согласия.
+5. **Места для проб живых проверок Д5–Д12 — для сведения** (решение
+   контролёра р3, вопроса нет). До начала пилота пробные учётки
+   (`dN-probe-*`) берут места 09 и 10 и после каждой проверки освобождают
+   их: удаляют свои тестовые разговоры, учётка отключается и удаляется,
+   закрепление снимается (`release-place`; процедура README «Освобождение
+   места пробной учётки», шаги А8.9 и Б7.6). Пилот получает все 10 мест.
+   После начала пилота проба может взять только место без закрепления; как
+   проверять, если свободных нет, решит план дня, которому это понадобится.
 
 Прежние хвосты: новый сертификат `edge` (истёк 21.09 — страница открывается с
 `--ignore-certificate-errors`), 8443 из сети ПЦБК (§11 п. 3).
@@ -416,7 +559,7 @@ research/07):
   `0600`, на экран не выводится):
 
   ```bash
-  IFS= read -r pw < F
+  IFS= read -r pw < F || [ -n "$pw" ]      # файлы паролей мест — без перевода строки, read даёт код 1
   printf '%s\n%s\n' "$pw" "$(printf 'opencode:%s' "$pw" | base64 -w0)" > ~/pcbk-d5/forms-X
   ```
 
@@ -431,8 +574,16 @@ research/07):
   не `grep` оболочки: локальный `ugrep` пропускает пустые шаблоны.
 - **Ответы шлюза и ошибки `edge` под `/pcbk/api/`** — JSON вида OpenCode
   `{"name": …, "data": {"message": …}}`, без `WWW-Authenticate` (research/07
-  §8). Это касается и 400, 404, 405, 413, 429, и путей без косой черты на
-  конце.
+  §8). Это касается и 400 (в том числе неверной строки запроса `%00`), 404,
+  405 (в том числе `TRACE`), 413, 429, и путей без косой черты на конце.
+  Ошибки самого nginx ведут на внутренние `location` по URI, не на
+  именованные: для неверной строки запроса перехода в именованный `location`
+  у nginx нет (500 HTML). Все `error_page` — на уровне `server`; `location`
+  под `/pcbk/api/` своих `error_page` и `proxy_set_header` не ставят.
+- **Ответ `core` помещается в буфер `edge`:** заголовки ответа шлюза, включая
+  набор удалений `clear_cookies` на самом длинном пути белого списка при
+  хосте из четырёх меток, — не больше 16 КиБ при `proxy_buffer_size 32k` у
+  `edge` (на уровне `server`).
 - **`edge` пропускает в `core` только пути шлюза.** В Д5а это
   `/pcbk/api/auth/*`, `/pcbk/api/workplace`, `/pcbk/api/workplace/wake`; в Д5б
   к ним добавляется `/pcbk/api/oc/*`. Остальное под `/pcbk/api/` получает 404
@@ -484,18 +635,18 @@ research/07):
 | А1. Сторож: вид `gateway`, строка «Шлюз и вход» | 1,25 | локально |
 | А2. Учётные записи, закрепление мест, надгробия, сессии, замок, команда администратора | 2,0 | локально |
 | А3. Места: прокси сокета, замок места, пробуждение, готовность, уборщик | 2,0 | локально |
-| А4. Роль `gateway`: настройки, `config_error`, зоны адресов, вход, cookie, scrypt, охрана выхода | 2,25 | локально |
-| А5. Страница входа и `edge` | 1,0 | локально |
+| А4. Роль `gateway`: настройки, `config_error`, зоны адресов, вход, cookie, scrypt, охрана выхода | 2,5 | локально |
+| А5. Страница входа и `edge` | 1,25 | локально |
 | А6. Компоновка и интеграционные тесты | 2,25 | локально |
 | А7. Выкладка | 0,75 | сервер |
 | А8. Живые проверки и учения | 1,5 | сервер |
 | А9. Закрытие дня | 1,25 | — |
-| **Критический путь** | **14,5** при хвостах 0,25 | |
+| **Критический путь** | **15,0** при хвостах 0,25 | |
 
 **Принятое основание «один день»** — как в Д4а:
 - живой темп по git: Д1 — 0,24 плановой шкалы, Д2 — 0,14, Д3а — 0,24–0,30
   (худшая 0,30). Строки «план / факт» Д3б–Д4б — если будут к началу дня;
-- при 0,30 Д5а — около 4,4 ч;
+- при 0,30 Д5а — около 4,5 ч;
 - полный интеграционный прогон к Д5 растёт: А0 замеряет настенное время
   последнего прогона Д4б, а Д5а добавляет около 9 минут ожиданий (учения
   `test_entry`).
@@ -508,8 +659,8 @@ research/07):
 
 Владелец получает строку с числами.
 
-**Черта отсечения — конец одиннадцатого часа** плюс превышение хвостов Д4б
-над 0,25 ч. К черте зелёны задачи А0–А6 (по оценке 11,0 ч). После черты
+**Черта отсечения — конец двенадцатого часа** плюс превышение хвостов Д4б
+над 0,25 ч. К черте зелёны задачи А0–А6 (по оценке 11,5 ч). После черты
 порядок жёсткий: А7 → А8 → А9.
 - **А6 зелёна к черте.** Всё по порядку. Если закрытие не помещается, оно
   сжимается: один раунд критика, при нуле блокеров — слияние и тег. Иначе
@@ -582,11 +733,31 @@ research/07):
 - **Две и больше `pcbk_session` в заголовках `Cookie`:**
   1. каждая предъявленная сессия закрывается на сервере
      (`close_session` на каждое значение), в том числе подброшенная;
-  2. ответ — 401 `need_login` и удаляющие `Set-Cookie` (`Max-Age=0`, те же
-     флаги). Они уходят для host-only и для каждого родительского домена
-     хоста `GW_ORIGIN` не короче двух меток (`a.b.c` → `a.b.c`, `b.c`), на
-     каждом пути-предке запроса: от `/` до самого пути, с косой чертой на
-     конце и без.
+  2. счётчик `cookies_duplicate` и строка журнала `gw cookies duplicate`;
+  3. ответ — 401 `need_login` и удаляющие `Set-Cookie`. Каждая — короткая
+     строка без лишних атрибутов:
+     `pcbk_session=; Max-Age=0; Path=<путь>; Secure[; Domain=<домен>][; Partitioned]`.
+     Строки собираются сами, без `delete_cookie` Starlette: тот добавляет
+     `expires`, `HttpOnly`, `SameSite`, и заголовки не лезут в буфер `edge`.
+     Набор удалений — все сочетания:
+     - пути: каждый путь cookie, который совпадает с путём запроса по
+       RFC 6265 §5.1.4: `/`, каждый предок с косой чертой на конце и без,
+       сам путь. Пути длиннее `COOKIE_PATH_MAX_LEN = 64` знаков (самый
+       длинный путь белого списка —
+       `/pcbk/api/oc/session/{SES}/prompt_async`) не берутся: cookie с таким
+       путём браузер шлёт только на пути вне белого списка, и шлюзу она
+       безвредна;
+     - домены: host-only и каждый родительский домен не короче двух меток
+       (`a.b.c` → `a.b.c`, `b.c`) для хоста самого запроса:
+       `X-Forwarded-Host` (его ставит `edge`, `$host`), без него — `Host`,
+       без порта. Браузер слал cookie именно этому хосту, поэтому опечатка в
+       `GW_ORIGIN` набор не ломает; у адреса IP доменов нет;
+     - раздел: без `Partitioned` и с ним (CHIPS: подброшенную в раздел
+       cookie стирает только удаление с `Partitioned`).
+
+     Бюджет — не больше 16 КиБ заголовков на самом длинном пути белого
+     списка при хосте из четырёх меток (около 100 строк); `edge` держит
+     32 КиБ (Д5-R30).
 
   Подброшенная cookie раз пришла, значит совпала с хостом и путём запроса, и
   этот набор её покрывает. Starlette берёт последнее значение, поэтому одну
@@ -623,7 +794,12 @@ research/07):
 
 Счёт отказов:
 - на входе и пробуждении — `origin_refused`: строка сторожа видит неверный
-  `GW_ORIGIN`;
+  `GW_ORIGIN` у клиентов без `Sec-Fetch-Site`. Браузер на своей странице
+  шлёт `same-origin`, поэтому опечатку в `GW_ORIGIN` он не заметит, и строка
+  её не покажет. Вреда от этого нет: удаления cookie берут хост из запроса,
+  а не из `GW_ORIGIN` (Д5-R25). Счётчик расхождения «`same-origin`, но
+  `Origin` ≠ `GW_ORIGIN`» отложен в Д6: через туннель проверок он срабатывал
+  бы на каждом входе;
 - у прокси `/pcbk/api/oc/*` — `refused` с `reason=origin`: поддельная запись
   в чат видна в журнале и в числе отказов, но не красит строку подсказкой про
   `GW_ORIGIN`.
@@ -648,9 +824,12 @@ research/07):
      0,5 с, срок `GW_WAKE_TIMEOUT_S = 60` (первые ~3 с запросы висят —
      research/04 §3).
 - «Упало при старте» — это `Restarting == true` или `StartedAt`, сменившийся
-  после нашего start. У мест `restart: unless-stopped`, поэтому падающий
-  контейнер всё время виден как `Running`. Ручной start сбрасывает
-  `RestartCount`, поэтому по счётчику не судим.
+  после нашего start. Базовую метку `StartedAt` даёт inspect сразу после
+  удачного start (204); при 304 (место уже шло) остаётся метка до start. Так
+  холодный старт спящего места «упавшим» не считается. У мест
+  `restart: unless-stopped`, поэтому падающий контейнер всё время виден как
+  `Running`. Ручной start сбрасывает `RestartCount`, поэтому по счётчику не
+  судим.
 - Неудача после start (срок, 401, «упало») останавливает место: полуживое
   место не держит память. Состояние сразу становится `failed`, без ожидания
   такта. Отказ `sp-ctl` (403, 409, 500) — свой текст `refused`.
@@ -660,10 +839,25 @@ research/07):
   - в Д5б — отказ соединения.
 - Первый такт после старта `core` проверяет готовность работающих мест без
   флага одним `GET /agent` и возвращает им флаг: открытые вкладки после
-  перезапуска `core` не получают 503.
+  перезапуска `core` снова работают без пробуждения. inspect и `GET /agent`
+  в нём идут параллельно (`asyncio.gather`).
+- **Первый такт не задерживает запуск других ролей** (решение контролёра
+  р3). uvicorn открывает порт только после `lifespan` всех ролей, поэтому
+  `lifespan` шлюза не ждёт ни такта, ни `sp-ctl`, ни мест: фоновая задача
+  уборщика создаётся до `yield` и не ожидается. Первый такт идёт в ней сразу,
+  дальше — раз в `GW_REAPER_TICK_S`. Служба данных, MCP мест и LLM-прокси
+  отвечают, пока первый такт ещё висит.
+- До конца первого такта у работающего места нет флага «готово»:
+  `/pcbk/api/oc/*` отвечает 503 «Рабочее место спит — разбудите его на
+  странице входа», а пробуждение с той же страницы находит место готовым без
+  start (ход пробуждения, шаг 1). `health()` до первого такта — норма:
+  молчание уборщика отсчитывается от запуска роли.
 
-**Цена ошибки:** место, остановленное извне, до ближайшего такта (≤ 30 с)
-числится готовым; в Д5б первый вызов получает 503 и снимает флаг.
+**Цена ошибки:**
+- место, остановленное извне, до ближайшего такта (≤ 30 с) числится
+  готовым; в Д5б первый вызов получает 503 и снимает флаг;
+- после перезапуска `core` открытая вкладка до конца первого такта (секунды)
+  получает 503 «спит», а кнопка страницы входа её возвращает без start.
 
 **Д5-R28 — простой.**
 - Активность места — `POST /pcbk/api/workplace/wake` и в Д5б вызовы
@@ -694,6 +888,9 @@ research/07):
 
   Между шагами 2 и 3 нет `await`: прокси проверяет «готово» перед
   пересылкой, и запрос не проскочит в гаснущее место.
+- Каждый такт делает ещё `store.ping()` (`SELECT 1` в потоке): итог
+  обновляет счётчик сбоев базы, и строка «учётные записи не читаются»
+  появляется и сходит без трафика людей.
 - Пульс уборщика — `checked_at` в `/health/gateway`. Порог сторожа
   `GW_STALE_S` должен быть не меньше 4 × `GW_REAPER_TICK_S`.
 
@@ -728,18 +925,37 @@ research/07):
 - Сырой URI с `%2e`, `%2f`, `%5c`, `/.` или `//` под `/pcbk/api/` отвечает 400
   JSON — до `core`. `proxy_pass` с переменной отдаёт `core` сырой URI, а
   nginx сверяет `location` по нормализованному.
-- Ошибки самого nginx — JSON:
+- Ошибки самого nginx — JSON, через внутренние `location` по URI
+  (`/pcbk-errors/NNN.json`, `internal`, `return NNN '<JSON>'`), а не через
+  именованные: у запроса с неверной строкой (`%00`) ещё нет URI, и переход в
+  именованный `location` nginx заменяет на 500 HTML:
   - 502–504 → 503 «Серверный слой не отвечает»;
   - 413 → «Запрос слишком большой»;
   - 429 → «Слишком много попыток входа»;
-  - 400 (в том числе `%00`, на уровне `server`) и 405 → «Неверный запрос».
+  - 400 (в том числе `%00`) и 405 (в том числе `TRACE`, отвергнутый до
+    выбора `location`) → «Неверный запрос».
+
+  Все пять `error_page` — на уровне `server` (502–504 — с `=503`, иначе код
+  остался бы исходным). `location` под `/pcbk/api/` своих `error_page` не
+  ставят, иначе не унаследуют эти.
+- **Буфер заголовков ответа** — на уровне `server`, его наследуют все
+  `location`, в том числе поток Д5б:
+  `proxy_buffer_size 32k; proxy_buffers 8 32k; proxy_busy_buffers_size 64k`.
+  Иначе ответ с набором удалений cookie (Д5-R25) даёт «upstream sent too big
+  header» и 503 без `Set-Cookie`. Правило: набор удалений на самом длинном
+  пути белого списка при хосте из четырёх меток — не больше 16 КиБ
+  (`test_clear_cookies_size_budget`), вдвое меньше буфера.
+- `proxy_set_header X-Forwarded-Host $host` — тоже на уровне `server`, рядом с
+  `Connection ""` Д1: хост для доменов удалений cookie (Д5-R25). В `location`
+  под `/pcbk/api/` своих `proxy_set_header` нет — иначе оба потерялись бы.
 - **Сроки:** срок `edge` к `core` больше суммы сроков `core` к месту плюс
   запас:
   - у `/pcbk/api/oc/` `proxy_read_timeout 45s` при 25 с `core` на весь ход
     вызова;
   - у входа и места — 30 с (пробуждение асинхронно, сверка входа — доли
     секунды);
-  - у потока — 90 с при 60 с тишины у шлюза.
+  - у потока — 90 с при 60 с тишины у шлюза, и `send_timeout 60s`: браузер,
+    переставший читать, отключается, и шлюз не копит события (Д5-R35).
 
   Иначе при зависшем месте `edge` отвечал бы первым своим «Серверный слой не
   отвечает».
@@ -805,8 +1021,9 @@ research/07):
    `Domain=pcbk.ru` пережила стирание. Ожидание: вне `pcbk-front` — 404,
    `/health/llm` без полей счёта; две cookie — обе сессии закрыты, удаление с
    `Domain`. Тесты — задача А4, `test_front_only_routes`,
-   `test_health_llm_redacted_off_admin`, `test_two_session_cookies_refused`;
-   задача А6, `test_place_sees_no_gateway`, `test_edge_passes_only_gateway_paths`.
+   `test_health_llm_redacted_off_admin`, `test_two_session_cookies_refused`,
+   `test_clear_cookies_size_budget`; задача А6, `test_place_sees_no_gateway`,
+   `test_edge_passes_only_gateway_paths`, `test_duplicate_cookies_through_edge`.
 3. **Простой и уборщик:** вход во время остановки даёт ложный сбой или
    «готово» у погасшего места; опрос держит место; уборщик гасит место
    посреди хода или сразу после действия студента; уборщик молча умер.
@@ -818,10 +1035,16 @@ research/07):
    `test_freeze_reaper_drill_stops_ticks`; задача А6,
    `test_idle_place_sleeps_while_polled`, `test_reaper_freeze_drill`.
 4. **Роль ломает процесс или врёт о здоровье:** сбой `core.db` или опечатка в
-   `GW_*` роняет `core` вместе со службой данных и LLM-прокси; `health()`
-   ходит в базу. Ожидание: `config_error` шлюза, 503 JSON с причиной, строка
+   `GW_*` роняет `core` вместе со службой данных и LLM-прокси; первый такт
+   шлюза (медленный `sp-ctl`, зависшее место) задерживает их запуск;
+   `health()` ходит в базу. Ожидание: `config_error` шлюза, 503 JSON с причиной, строка
    «ошибка настройки», служба данных в норме. Тесты — задача А4,
-   `test_gateway_config_error_keeps_core`, `test_health_does_no_io`.
+   `test_gateway_settings_error_keeps_core`, `test_gateway_db_failure_keeps_core`
+   (каталог базы `0500`, без подмен), `test_lifespan_never_raises`,
+   `test_first_tick_does_not_block_startup` (служба данных отвечает, пока
+   первый такт шлюза висит),
+   `test_health_does_no_io`, `test_reaper_tick_pings_store`; задача А2,
+   `test_store_errors_counted_and_ping_recovers`.
 5. **Секреты в покое и в журнале:** cookie или пароль лежат открытым текстом
    в `core.db-wal`; пароль из поля логина или `Basic` места попали в журнал.
    Тесты — задача А2, `test_secrets_at_rest`; задача А4,
@@ -895,7 +1118,12 @@ docs/checks/D5a.md, docs/checks/D5a/*.png
   - `git grep -n -E 'def create_app|class RoleBase|def hooks_of|def body_limit|def install_egress_guard|test_egress_targets_include_openrouter|DB_PATH|class FakeMono|note:|def recreate|def http_host|def llm_health|def logs|def wait_for|def wait_until|def serve_app|def converse|def pause|KINDS|def check_llm|test_components_file_d4b|fake-openrouter|pcbk-core-data|config_error' -- core watchdog tests compose*.yaml`;
   - `git grep -n 'def egress_targets' core | grep -c LlmSettings` → `1`;
   - `git grep -n 'class LlmSettings' core` → есть;
-  - `git grep -n 'health/llm' core/pcbk_core/llm` → ручка есть.
+  - `git grep -n 'health/llm' core/pcbk_core/llm` → ручка есть;
+  - `git grep -n -E 'add_exception_handler|add_middleware' core/pcbk_core/data core/pcbk_core/llm` → `0`:
+    Д4а перенёс обработчик 422 и `BodyLimit` службы данных (в коде Д3б их
+    ставит `DataRole.install` напрямую, `data/http_api.py`) в реестр
+    `AppHooks`; `git grep -n 'class AppHooks' core` → есть. Если нет —
+    правка плана до А1: Д5 опирается на реестр.
 
   Expected: все имена и сигнатуры из разделов Interfaces на месте. Если
   что-то расходится — правка плана одним коммитом до задачи А1 («План Д5:
@@ -959,6 +1187,7 @@ docs/checks/D5a.md, docs/checks/D5a/*.png
 | `sp_ctl == "down"` | `fail` «нет связи с прокси сокета — места не будятся» | — |
 | `wake_failed_1h ≥ WAKE_FAILS_FAIL` и `wake_ok_1h == 0` | `fail` «рабочие места не поднимаются» | «k за час» |
 | `place_auth_failed_1h > 0` | `warn` «рабочее место не приняло пароль шлюза» | «k за час» |
+| `cookies_duplicate_1h > 0` | `warn` «подброшена cookie сессии» | «k за час» |
 | `origin_refused_1h > 0` | `warn` «вход отклоняется проверкой источника — проверьте GW_ORIGIN» | «k за час» |
 | `login_busy_1h > 0` | `warn` «вход перегружен» | «k за час» |
 | `wake_failed_1h > 0` | `warn` «рабочее место не поднялось по входу» | «k за час» |
@@ -977,6 +1206,7 @@ def gw(age=5, **kw):
     return {"checked_at": (T0 - timedelta(seconds=age)).isoformat(), "config_error": None, "store_ok": True,
             "sp_ctl": "ok", "running_n": 1, "ready_n": 1, "wake_ok_1h": 1, "wake_failed_1h": 0, "stop_failed_1h": 0,
             "place_auth_failed_1h": 0, "logins_failed_1h": 0, "origin_refused_1h": 0, "login_busy_1h": 0,
+            "cookies_duplicate_1h": 0,
             "drill": "", **kw}
 
 def gate_check(fake_core, obj):
@@ -994,6 +1224,7 @@ def test_gateway_verdicts(fake_core):
              (gw(wake_ok_1h=0, wake_failed_1h=3), ("fail", "рабочие места не поднимаются", "3 за час")),
              (gw(place_auth_failed_1h=1, wake_failed_1h=1), ("warn", "рабочее место не приняло пароль шлюза", "1 за час")),
              (gw(origin_refused_1h=4), ("warn", "вход отклоняется проверкой источника — проверьте GW_ORIGIN", "4 за час")),
+             (gw(cookies_duplicate_1h=1, origin_refused_1h=1), ("warn", "подброшена cookie сессии", "1 за час")),
              (gw(login_busy_1h=2), ("warn", "вход перегружен", "2 за час")),
              (gw(wake_failed_1h=2), ("warn", "рабочее место не поднялось по входу", "2 за час")),
              (gw(stop_failed_1h=1), ("warn", "уборщик не смог усыпить место", "1 за час")),
@@ -1039,7 +1270,7 @@ def test_gw_stale_setting():
 **Files:**
 - Create: `core/pcbk_core/gateway/__init__.py` (пока пустой),
   `core/pcbk_core/gateway/accounts.py`
-- Modify: `core/tests/helpers.py` (`PW`, `store`)
+- Modify: `core/tests/helpers.py` (`PW`, `store`, `fail_connect`)
 - Test: `core/tests/test_gw_accounts.py`
 
 **Interfaces:**
@@ -1097,6 +1328,8 @@ def test_gw_stale_setting():
     - `open_session(login) -> str`, `session(token: str | None) -> Account | None`
       (истёкшая сессия удаляется; отключённая учётка → `None`),
       `close_session(token)`;
+    - `ping() -> bool` — `SELECT 1`; итог обновляет `consecutive_failures`
+      (для такта уборщика, Д5-R28);
     - `locked(login) -> bool`, `failure(login)`, `unlock(login)`. Для
       существующих логинов — таблица, для прочих — `OrderedDict` в памяти на
       `UNKNOWN_KEYS` ключей (вытесняется самый старый).
@@ -1116,7 +1349,8 @@ def test_gw_stale_setting():
     `место NN\tlogin\tучётка есть|удалена` — без хешей. Ошибка — код 1 и одна
     строка в stderr без пароля.
 - `helpers.py`: `PW = "пароль-123"`; `store(tmp_path, **kw) -> AccountStore`
-  (база `tmp_path / "core.db"`, `open()` вызван).
+  (база `tmp_path / "core.db"`, `open()` вызван); `fail_connect(*a, **k)` —
+  подмена `sqlite3.connect`, бросает `OperationalError("database is locked")`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1224,6 +1458,17 @@ def test_login_lock_no_oracle_persisted_and_unlocked(tmp_path):
         s.failure("ivanov")
     clock.advance(LOCK_WINDOW_S)
     assert not s.locked("ivanov")
+
+def test_store_errors_counted_and_ping_recovers(tmp_path, monkeypatch):                # Д5-R28
+    s = store(tmp_path)
+    real = sqlite3.connect
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
+    with pytest.raises(StoreError) as e:
+        s.students()
+    assert str(tmp_path) not in str(e.value) and s.consecutive_failures == 1
+    assert s.ping() is False and s.consecutive_failures == 2                           # ping не бросает
+    monkeypatch.setattr(sqlite3, "connect", real)
+    assert s.ping() is True and s.consecutive_failures == 0                            # удача обнуляет
 
 def test_remove_only_disabled(tmp_path):
     s = store(tmp_path)
@@ -1342,8 +1587,10 @@ PLACE_TEXTS = {
     - `is_ready(n) -> bool`, `mark_unready(n)`;
     - `async tick() -> None` — один проход уборщика (Д5-R28). Первый проход
       возвращает «готово» работающим местам без флага (одна попытка
-      `GET /agent`). В конце прохода обновляются `checked_at` (часы стены,
-      для JSON), `last_tick_mono` (для `health()` роли) и `ticks`;
+      `GET /agent`, по местам параллельно — `asyncio.gather`). В конце
+      прохода обновляются `checked_at` (часы стены, для JSON),
+      `last_tick_mono` (для `health()` роли) и `ticks`. До первого прохода
+      `last_tick_mono` — время создания `Workplaces` по монотонным часам;
     - `sp_ctl: Literal["ok", "down", "unknown"]`, `checked_at: datetime | None`,
       `running: set[int]`.
 
@@ -1351,8 +1598,10 @@ PLACE_TEXTS = {
     1. Пароль места читается до start: нет файла → `no_password`, start не
        зовётся.
     2. inspect: место работает и «готово» при том же `StartedAt` → `ready`
-       без start. Иначе запомнить `StartedAt`.
-    3. `start(n)` (`SpCtlError` → текст по `kind`).
+       без start. Иначе запомнить `StartedAt` как базовую метку.
+    3. `start(n)` (`SpCtlError` → текст по `kind`). При 204 базовой меткой
+       становится `StartedAt` из inspect сразу после start; при 304 остаётся
+       прежняя.
     4. Повторять `GET /agent` с `timeout=READY_ATTEMPT_S` до 200:
        - 401 → `place_auth`;
        - inspect показал `Restarting` или `StartedAt` сменился после нашего
@@ -1382,7 +1631,8 @@ PLACE_TEXTS = {
     `sp-ctl`:
     - `containers: dict[int, dict]` (`exists`, `running`, `restarting`,
       `restart_count`, `started_at`);
-    - start сбрасывает `restart_count` в 0, как Docker. Место из
+    - start ставит новый `started_at` и сбрасывает `restart_count` в 0, как
+      Docker. Место из
       `exit_on_start` после start видно как Docker при `unless-stopped`:
       `Running: true`, `Restarting: true`;
     - `down` бросает `httpx.ConnectError`, `hang` — `httpx.ReadTimeout`;
@@ -1390,9 +1640,9 @@ PLACE_TEXTS = {
       `Running`;
     - журнал `calls: list[tuple[str, int]]` (`ping` записывается как
       `("ping", 0)`), свойство `stopped: list[int]`.
-  - `FakePlaces(*, ready_after: int = 1, never_ready: bool = False, wrong_pw: bool = False, busy: set[int] = frozenset(), status_delay: float = 0.0)`
+  - `FakePlaces(*, ready_after: int = 1, never_ready: bool = False, wrong_pw: bool = False, busy: set[int] = frozenset(), status_delay: float = 0.0, agent_delay: float = 0.0)`
     — обработчик по хосту `STU_NET.N.3`:
-    - `/agent` → 200 после `ready_after` вызовов места;
+    - `/agent` → 200 после `ready_after` вызовов места (после `agent_delay`);
     - 401, если `Authorization` не равен `Workplaces.basic(n)` или
       `wrong_pw`;
     - `/session/status` → `{}` (после `status_delay`), для мест из `busy` —
@@ -1422,10 +1672,18 @@ async def test_wake_single_flight(tmp_path):                                    
     w = make_places(tmp_path, oc=FakePlaces(ready_after=3))
     v1, v2 = await asyncio.gather(w.wake(3), w.wake(3))
     assert (v1.state, v2.state) == ("starting", "starting")
-    assert (await w.wait_ready(3)).state == "ready" and w.is_ready(3)
+    assert (await w.wait_ready(3)).state == "ready" and w.is_ready(3)          # холодный старт — не «упало»
     assert starts(w) == [("start", 3)] and w.oc.agent_calls[3] == 3
     assert all(r.headers["authorization"] == w.basic(3) for r in w.oc.requests)
     assert w.stats.count_1h("wake_ok") == 1
+
+async def test_first_tick_restores_ready_in_parallel(tmp_path):                         # Д5-R27
+    w = make_places(tmp_path, FakeDocker(running={3, 5}), FakePlaces(agent_delay=0.5))
+    t = time.monotonic()
+    await w.tick()                                                                     # первый такт
+    assert w.is_ready(3) and w.is_ready(5) and w.ticks == 1
+    assert time.monotonic() - t < 0.9                                                  # параллельно: подряд было бы 1,0 с
+    assert starts(w) == []                                                             # не будит и не гасит
 
 async def test_wake_failures_named_and_place_stopped(tmp_path):
     cases = [(FakeDocker(down=True), FakePlaces(), "down", False),
@@ -1504,6 +1762,9 @@ def test_place_name_checked():
     with pytest.raises(ValueError):
         SpCtl("http://pcbk-sp-ctl:2375").path(11, "start")    # имя вне диапазона — не в путь
 ```
+
+`places` — модуль `pcbk_core.gateway.places`. `agent_delay` двойника — настоящая
+пауза (`asyncio.sleep`), а не `fast_sleep`.
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_gw_places.py`. Expected: FAIL — нет `pcbk_core.gateway.places`.
 - [ ] **Step 3: Implement `places.py`, `stats.py`, `GatewaySettings` (поля и умолчания), двойники и помощники по интерфейсам.**
@@ -1606,10 +1867,22 @@ GW_MESSAGES = {
     `origin` по `Origin` не совпадает ни с чем.
   - `session_tokens(request: Request) -> list[str]` — все значения
     `pcbk_session` из сырых заголовков `Cookie`.
-  - `clear_cookies(request: Request, gw: GatewaySettings) -> list[str]` —
-    удаляющие `Set-Cookie` по Д5-R25: host-only и `Domain=` для каждого
-    родительского домена хоста `GW_ORIGIN` (≥ 2 меток; у адреса — нет), на
-    каждом пути-предке запроса с косой чертой на конце и без.
+  - `clear_cookies(request: Request) -> list[str]` —
+    удаляющие `Set-Cookie` по Д5-R25, строки собираются сами (без
+    `delete_cookie`): `pcbk_session=; Max-Age=0; Path=<путь>; Secure[; Domain=<домен>][; Partitioned]`.
+    Все сочетания:
+    - путей cookie, совпадающих с путём запроса (RFC 6265 §5.1.4: `/`,
+      предки с косой чертой на конце и без, сам путь), не длиннее
+      `COOKIE_PATH_MAX_LEN = 64`;
+    - доменов: host-only и родительских доменов (≥ 2 меток) хоста запроса —
+      `X-Forwarded-Host`, без него `Host`, без порта; у адреса IP доменов
+      нет;
+    - раздела: без `Partitioned` и с ним.
+
+    Число строк — пути × (1 + домены) × 2; у хоста из четырёх меток на
+    пути в 64 знака — 12 × 4 × 2 = 96.
+  - `COOKIE_HEADERS_BUDGET = 16 * 1024` — предел суммы байт этих строк
+    (Д5-R30).
   - `current_account(role) -> Callable[[Request], Awaitable[Account]]` —
     зависимость FastAPI:
     1. `session_tokens`: ни одного → 401;
@@ -1662,7 +1935,9 @@ GW_MESSAGES = {
     - `GET /health/gateway` → `health_json(now)`, с `front_only`;
     - `catch_all_router()` последним;
   - `install(app)` — только через реестр Д4а:
-    `hooks_of(app).http_exception("/pcbk/api/", handler)`, где `handler`
+    `hooks_of(app).http_exception("/pcbk/api/", handler)` и
+    `hooks_of(app).http_exception("/health/gateway", handler)` (отказ
+    `front_only` там тоже JSON вида OpenCode), где `handler`
     отдаёт `gw_error` с тем же кодом (404 → `NotFound`, 405 →
     `MethodNotAllowed`, прочее — по таблице имён `gw_error`). В Д5б сюда же
     добавляется `hooks_of(app).body_limit("/pcbk/api/oc/", …)`. Обработчика
@@ -1671,26 +1946,38 @@ GW_MESSAGES = {
     - `config_error` → `(False, "ошибка настройки: " + config_error[:60])`;
     - `store.consecutive_failures > 0` → `(False, "учётные записи не читаются")`;
     - `sp_ctl == "down"` → `(False, "нет связи с прокси сокета — места не будятся")`;
-    - по монотонным часам с `last_tick_mono` прошло больше
-      4 × `GW_REAPER_TICK_S` → `(False, "уборщик простоя молчит")`;
+    - по монотонным часам с `last_tick_mono` (до первого такта — с
+      создания `Workplaces`) прошло больше 4 × `GW_REAPER_TICK_S` →
+      `(False, "уборщик простоя молчит")`;
     - иначе `(True, "принимает вход")`;
   - `health_json(now) -> dict` — ровно ключи `checked_at`, `config_error`,
     `store_ok`, `sp_ctl`, `running_n`, `ready_n`, `wake_ok_1h`,
     `wake_failed_1h`, `stop_failed_1h`, `place_auth_failed_1h`,
-    `logins_failed_1h`, `origin_refused_1h`, `login_busy_1h`, `drill`. Только
-    числа и тексты: ни логинов, ни номеров мест;
-  - `lifespan()`:
-    - `await asyncio.to_thread(store.open)`; `False` → к `config_error`
-      дописывается «учётные записи не открываются: <класс ошибки>» (вся
-      причина — не длиннее 80 знаков);
-    - `open()` клиентов `SpCtl` и `Workplaces`;
-    - строка журнала «шлюз: учётных записей студентов N, простой до сна 1800 с»
-      (`students()` — в потоке); при учениях — «УЧЕНИЯ: DRILL_GATEWAY=…»;
-    - при `config_error` — строка «шлюз: ошибка настройки: …», уборщика нет;
-    - иначе первый `tick()` — до готовности приложения (`await` внутри
-      `lifespan`, до `yield`), дальше цикл в фоне раз в `GW_REAPER_TICK_S`;
-      при `freeze_reaper` цикла нет — только первый такт;
-    - на выходе — отмена задач и `aclose()`.
+    `logins_failed_1h`, `origin_refused_1h`, `login_busy_1h`,
+    `cookies_duplicate_1h`, `drill`. Только числа и тексты: ни логинов, ни
+    номеров мест;
+  - `lifespan()` — **не бросает никогда** (иначе uvicorn выходит с кодом 3, и
+    `core` со службой данных и LLM-прокси уходит в цикл перезапусков). Весь
+    запуск до `yield` — в `try … except Exception`: исключение дописывается
+    в `config_error` («запуск шлюза: <класс ошибки>») и строку журнала,
+    `yield` выполняется всегда. По порядку:
+    1. `ok = await asyncio.to_thread(store.open)`; `False` → к `config_error`
+       дописывается «учётные записи не открываются: <класс ошибки>» (вся
+       причина — не длиннее 80 знаков);
+    2. `open()` клиентов `SpCtl` и `Workplaces` (без ввода-вывода по сети);
+    3. при `config_error` — строка «шлюз: ошибка настройки: …» **без
+       обращений к базе** и без уборщика; дальше сразу `yield`;
+    4. иначе — фоновая задача уборщика (`asyncio.create_task`, **не
+       ожидается**) и сразу `yield`: первый такт не задерживает запуск
+       службы данных и LLM-прокси (решение контролёра р3, Д5-R27). Задача:
+       1. строка журнала «шлюз: учётных записей студентов N, простой до сна
+          1800 с» (`students()` в потоке; `StoreError` → та же строка с `?`
+          вместо N); при учениях — «УЧЕНИЯ: DRILL_GATEWAY=…»;
+       2. первый `tick()` сразу, дальше раз в `GW_REAPER_TICK_S`; каждый
+          такт — ещё `store.ping()` в потоке;
+       3. исключение такта (и первого) — строка «такт уборщика: <класс
+          ошибки>», цикл живёт. При `freeze_reaper` — только первый такт;
+    5. на выходе — отмена задачи и `aclose()`.
 - Produces (`main.py`):
   - `egress_targets(llm: LlmSettings, gw: GatewaySettings, cfg: BdrvConfig)` —
     к направлениям Д4а добавляются `(хост SP_CTL_URL, порт)` и
@@ -1705,8 +1992,9 @@ GW_MESSAGES = {
 - `helpers.py`:
   - `BDRV_CFG = BdrvConfig("h", 1433, "Runtime", "u", "p")`;
   - `ORIGIN = "https://stand.test:8443"`;
-  - `gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (), stream_recheck_s: float = 10.0, config_error: str | None = None, **gw_overrides) -> GatewayRole`:
-    - создаёт `tmp_path`, если его нет; `DB_PATH = tmp_path / "core.db"`;
+  - `gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (), stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None, accounts: bool = True, **gw_overrides) -> GatewayRole`:
+    - создаёт `tmp_path`, если его нет; `DB_PATH = db_path or tmp_path / "core.db"`;
+      при `accounts=False` учётки не заводятся и база заранее не открывается;
     - роль на двойниках задачи А3, `FakeMono(1000.0)`, `GW_ORIGIN = ORIGIN`;
       `gw_overrides` — поля `GatewaySettings`, `stream_recheck_s` — параметр
       роли (Д5б);
@@ -1750,10 +2038,31 @@ def test_two_session_cookies_refused(tmp_path):                                 
         r = c.get("/pcbk/api/auth/me", headers={"Cookie": f"pcbk_session={own}; pcbk_session={other}"})
         assert (r.status_code, r.json()["name"]) == (401, "Unauthorized")
         deletes = r.headers.get_list("set-cookie")
-        assert all("Max-Age=0" in d for d in deletes)
-        assert any("Domain=stand.test" in d for d in deletes) and any("Domain" not in d for d in deletes)
-        assert {p for d in deletes for p in re.findall(r"Path=([^;]+)", d)} >= {"/", "/pcbk/api/", "/pcbk/api/auth", "/pcbk/api/auth/me"}
+        assert all(d.startswith("pcbk_session=; Max-Age=0; Path=") and "Secure" in d for d in deletes)
+        assert not any(a in d.lower() for d in deletes for a in ("expires", "httponly", "samesite"))   # короткие строки
+        assert {p for d in deletes for p in re.findall(r"Path=([^;]+)", d)} == set(rfc_paths("/pcbk/api/auth/me"))
+        assert {re.search(r"Domain=([^;]+)", d)[1] if "Domain=" in d else None for d in deletes} == {None, "stand.test"}
+        assert sum("Partitioned" in d for d in deletes) * 2 == len(deletes) == 8 * 2 * 2
+        assert role.stats.count_1h("cookies_duplicate") == 1
     assert role.store.session(own) is None and role.store.session(other) is None        # обе закрыты на сервере
+
+def rfc_paths(path):                                                                    # RFC 6265 §5.1.4
+    parts = path.strip("/").split("/")
+    heads = ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    return ["/"] + [v for h in heads[:-1] for v in (h, h + "/")] + [heads[-1]]
+
+def test_clear_cookies_size_budget():                                                   # Д5-R25, Д5-R30
+    long_path = "/pcbk/api/oc/session/ses_" + "A" * 26 + "/prompt_async"             # самый длинный путь белого списка
+    assert len(long_path) == COOKIE_PATH_MAX_LEN == 64
+    host = "reserve-stand.ai-lab.customer-domain.test"                                 # четыре метки, длиннее боевого
+    for path, xfh in ((long_path, host), (long_path + "/x" * 400, host), ("/pcbk/api/auth/me", None)):
+        headers = {"host": "pcbk-core:8000", "x-forwarded-host": xfh} if xfh else {"host": f"{host}:8443"}   # Host от edge — имя службы
+        lines = clear_cookies(make_request(path, headers))
+        assert sum(len("set-cookie: ") + len(v) + 2 for v in lines) <= COOKIE_HEADERS_BUDGET, path[:40]
+        domains = {re.search(r"Domain=([^;]+)", v)[1] for v in lines if "Domain=" in v}
+        assert domains == {host, "ai-lab.customer-domain.test", "customer-domain.test"}
+    assert len(clear_cookies(make_request(long_path, {"host": host}))) == 12 * 4 * 2
+    assert not any("Domain=" in v for v in clear_cookies(make_request("/pcbk/api/auth/me", {"host": "127.0.0.1:18443"})))
 
 def test_writes_need_origin(tmp_path):
     app, role = make_gateway(tmp_path)
@@ -1882,19 +2191,66 @@ def test_settings_gateway_validation():
             GatewaySettings.from_env(bad)
     assert Settings.from_env({"GW_ORIGIN": "http://x"})                                # Settings поля шлюза не знает
 
-def test_gateway_config_error_keeps_core(tmp_path, monkeypatch):                       # блокер р2; Review Focus 4
+def test_gateway_settings_error_keeps_core(tmp_path, monkeypatch):                     # блокер р2; Review Focus 4
     monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
     monkeypatch.setenv("GW_ORIGIN", "https://x/path")                                  # опечатка администратора
     roles = {r.name: r for r in build_roles(Settings.from_env())}                      # не бросает
     assert roles["gateway"].config_error.startswith("настройки шлюза: GW_ORIGIN")
-    app, role = make_gateway(tmp_path / "db")                                          # учётки заведены заранее
-    monkeypatch.setattr(AccountStore, "open", lambda self: False)                     # база не открылась в lifespan
-    with TestClient(app, base_url=BASE) as c:                                         # процесс поднялся
-        assert role.config_error.startswith("учётные записи не открываются")
-        assert c.get("/healthz/gateway").status_code == 503
-        r = login(c, "stu-03")
-        assert (r.status_code, r.json()["name"]) == (503, "Unavailable")
-        assert c.get("/health/gateway").json()["config_error"] == role.config_error
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root пишет и в каталог 0500")
+def test_gateway_db_failure_keeps_core(tmp_path, caplog):                              # блокер р3; Review Focus 4
+    ro = tmp_path / "ro"
+    ro.mkdir(mode=0o500)                                                               # настоящий сбой, без подмен
+    gw = gateway_role(tmp_path / "gw", db_path=ro / "sub" / "core.db", accounts=False)
+    app, _ = make_app(tmp_path / "data", extra_roles=[gw])                             # рядом служба данных Д3б
+    try:
+        with TestClient(app, base_url=BASE) as c:                                      # lifespan не бросил
+            assert c.get("/healthz/live").status_code == 200
+            assert c.get("/healthz/data").status_code == 200
+            assert gw.config_error.startswith("учётные записи не открываются")
+            assert len(gw.config_error) <= 80 and str(ro) not in gw.config_error
+            j = c.get("/healthz/gateway")
+            assert j.status_code == 503 and j.json()["detail"].startswith("ошибка настройки: учётные записи")
+            r = login(c, "stu-03")
+            assert (r.status_code, r.json()["name"]) == (503, "Unavailable")
+            assert c.get("/health/gateway").json()["config_error"] == gw.config_error
+            assert gw.workplaces.ticks == 0                                             # при config_error уборщика нет
+        assert "учётных записей студентов" not in caplog.text                          # students() не звали
+    finally:
+        ro.chmod(0o700)
+
+def test_lifespan_never_raises(tmp_path, monkeypatch, caplog):                         # блокер р3
+    app, role = make_gateway(tmp_path)
+    monkeypatch.setattr(AccountStore, "students", lambda self: (_ for _ in ()).throw(StoreError("sqlite")))
+    monkeypatch.setattr(role.workplaces, "tick", AsyncMock(side_effect=RuntimeError("такт")))
+    with TestClient(app, base_url=BASE) as c:                                          # приложение поднялось
+        assert c.get("/healthz/live").status_code == 200
+        assert login(c, "stu-03").status_code == 200                                   # база исправна — вход работает
+        wait_until(lambda: "такт уборщика: RuntimeError" in caplog.text, timeout=2)   # задача уборщика — фоном
+    assert "шлюз: учётных записей студентов ?" in caplog.text
+
+def test_first_tick_does_not_block_startup(tmp_path):                                  # решение контролёра р3; Д5-R27
+    gw = gateway_role(tmp_path / "gw", docker=FakeDocker(running={3}), oc=FakePlaces(agent_delay=3.0))
+    app, _ = make_app(tmp_path / "data", extra_roles=[gw])                             # рядом служба данных Д3б
+    t = time.monotonic()
+    with TestClient(app, base_url=BASE) as c:
+        assert time.monotonic() - t < 1.5                                              # lifespan не ждал такта
+        assert c.get("/healthz/data").status_code == 200                               # первый такт висит на GET /agent
+        assert gw.workplaces.ticks == 0 and not gw.workplaces.is_ready(3)
+        assert c.get("/healthz/gateway").json() == {"ok": True, "detail": "принимает вход"}
+        wait_until(lambda: gw.workplaces.ticks == 1, timeout=6)
+        assert gw.workplaces.is_ready(3)                                               # «готово» вернул первый такт
+
+def test_reaper_tick_pings_store(tmp_path, monkeypatch):                                # Д5-R28
+    app, role = make_gateway(tmp_path, GW_REAPER_TICK_S=0.05)
+    real = sqlite3.connect
+    with TestClient(app) as c:
+        monkeypatch.setattr(sqlite3, "connect", fail_connect)
+        wait_until(lambda: role.store.consecutive_failures > 0, timeout=2)
+        assert c.get("/healthz/gateway").json() == {"ok": False, "detail": "учётные записи не читаются"}
+        monkeypatch.setattr(sqlite3, "connect", real)
+        wait_until(lambda: role.store.consecutive_failures == 0, timeout=2)            # без единого входа
+        assert c.get("/healthz/gateway").json()["ok"] is True
 
 def test_health_does_no_io(tmp_path, monkeypatch):                                     # договор Role
     app, role = make_gateway(tmp_path)
@@ -1913,7 +2269,7 @@ def test_health_json_only_numbers(tmp_path):
         j = c.get("/health/gateway").json()
         assert set(j) == {"checked_at", "config_error", "store_ok", "sp_ctl", "running_n", "ready_n", "wake_ok_1h",
                           "wake_failed_1h", "stop_failed_1h", "place_auth_failed_1h", "logins_failed_1h",
-                          "origin_refused_1h", "login_busy_1h", "drill"}
+                          "origin_refused_1h", "login_busy_1h", "cookies_duplicate_1h", "drill"}
         assert all(isinstance(j[k], int) for k in j if k.endswith(("_n", "_1h")))
         assert c.get("/healthz/gateway").json() == {"ok": True, "detail": "принимает вход"}
         assert "stu-03" not in json.dumps(j)
@@ -1921,7 +2277,7 @@ def test_health_json_only_numbers(tmp_path):
 def test_freeze_reaper_drill_stops_ticks(tmp_path):                                    # Review Focus 3
     app, role = make_gateway(tmp_path, DRILL_GATEWAY="freeze_reaper", GW_REAPER_TICK_S=0.05)
     with TestClient(app) as c:
-        assert role.workplaces.ticks == 1                                              # первый такт — до готовности
+        wait_until(lambda: role.workplaces.ticks == 1, timeout=2)                      # первый такт — фоном
         time.sleep(0.3)
         assert role.workplaces.ticks == 1
         role.mono.advance(10)                                      # срок молчания — 4 такта
@@ -1935,7 +2291,7 @@ def test_health_llm_redacted_off_admin(tmp_path):                               
                        ("http://172.31.250.34:8000", True)):
         with TestClient(app, base_url=base) as c:
             keys = set(c.get("/health/llm").json())
-            assert (money <= keys) is full and ("spent_usd" in keys), base
+            assert (money & keys) == (money if full else set()) and "spent_usd" in keys, base
 
 # core/tests/test_hooks.py (+) — реестр Д4а, решение контролёра р2
 def test_http_exception_dispatch_by_prefix():
@@ -1973,7 +2329,13 @@ def test_error_shapes_unchanged_with_gateway(tmp_path):                         
 телах могут отличаться).
 
 `accounts` — модуль `pcbk_core.gateway.accounts`; `LLM_SETTINGS`,
-`make_llm_app` — помощники Д4а. Второй `TestClient` в
+`make_llm_app` — помощники Д4а. `make_request(path, headers)` — в
+`test_gw_api.py`: `starlette.requests.Request` на словаре `scope` (`type`
+`http`, метод GET, `path`, `raw_path`, заголовки в нижнем регистре);
+`fail_connect` — из `helpers.py` (задача А2);
+`AsyncMock` — из `unittest.mock`. Тест с каталогом `0500` под root
+пропускается: root пишет и туда (`CORE_PYTEST` идёт через `uv` от
+пользователя разработчика, не от root). Второй `TestClient` в
 `test_two_session_cookies_refused` (без `with`) нужен только для второй
 сессии.
 
@@ -2007,10 +2369,13 @@ def test_error_shapes_unchanged_with_gateway(tmp_path):                         
   - `export function loginError(status: number, body: unknown) -> string` —
     `data.message` из JSON; при не-JSON и 502–504 — «Серверный слой не
     отвечает»;
+  - `export function meView(status: number, body: unknown) -> {form: boolean, text: string}`
+    — ответ `GET /pcbk/api/auth/me`: 200 → `form: false`, «Вы вошли как
+    <логин>»; 401 → форма без текста; любой другой код (503 при лежащем
+    `core`, 429, не JSON) → форма и `loginError(status, body)`;
   - DOM подключается, только если есть `document`. Ход страницы:
-    1. `GET /pcbk/api/auth/me`: 200 → строка «Вы вошли как <логин>»; у
-       студента — шаг 3, у преподавателя — текст «У преподавателя нет
-       рабочего места»; 401 → форма.
+    1. `GET /pcbk/api/auth/me` → `meView`; вошедший студент — шаг 3,
+       преподаватель — текст «У преподавателя нет рабочего места».
     2. Форма: `POST /pcbk/api/auth/login` (`fetch`, JSON,
        `credentials: "same-origin"`).
     3. `POST /pcbk/api/workplace/wake`, затем раз в 1 с
@@ -2029,7 +2394,26 @@ limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;
 
 # server 8443 — дополнение
     set $pcbk_core pcbk-core:8000;
-    error_page 400 = @bad_request;         # и неверная строка запроса (%00) — JSON
+    proxy_set_header X-Forwarded-Host $host;        # хост для доменов удалений cookie (Д5-R25); рядом с Connection "" Д1
+    proxy_buffer_size 32k;                          # набор удалений cookie — до 16 КиБ заголовков (Д5-R30)
+    proxy_buffers 8 32k;
+    proxy_busy_buffers_size 64k;
+
+    # ошибки самого nginx — JSON через внутренние location по URI, на уровне server: у строки с %00
+    # URI ещё нет (именованный location дал бы 500 HTML), TRACE отвергается до выбора location.
+    # location со своим error_page (страница состояния Д1) их не наследуют — и location под /pcbk/api/
+    # своих error_page не ставят, иначе потеряют эти.
+    error_page 400 /pcbk-errors/400.json;
+    error_page 405 /pcbk-errors/405.json;
+    error_page 413 /pcbk-errors/413.json;
+    error_page 429 /pcbk-errors/429.json;
+    error_page 502 503 504 =503 /pcbk-errors/503.json;    # «=503»: без него код остался бы 502 или 504
+
+    location = /pcbk-errors/400.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
+    location = /pcbk-errors/405.json { internal; default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
+    location = /pcbk-errors/413.json { internal; default_type application/json; return 413 '{"name":"PayloadTooLarge","data":{"message":"Запрос слишком большой"}}'; }
+    location = /pcbk-errors/429.json { internal; default_type application/json; return 429 '{"name":"TooManyAttempts","data":{"message":"Слишком много попыток входа — подождите"}}'; }
+    location = /pcbk-errors/503.json { internal; default_type application/json; return 503 '{"name":"Unavailable","data":{"message":"Серверный слой не отвечает"}}'; }
 
     location = /login {
         charset utf-8;
@@ -2048,11 +2432,7 @@ limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;
         limit_req_status 429;
         client_max_body_size 64k;
         proxy_read_timeout 30s;
-        error_page 405 = @bad_method;
-        error_page 413 = @too_large;
-        error_page 429 = @too_many;
-        error_page 502 503 504 = @core_down;
-        proxy_pass http://$pcbk_core;
+        proxy_pass http://$pcbk_core;               # error_page, буферы, X-Forwarded-Host — от server
     }
     # location = /pcbk/api/workplace и = /pcbk/api/workplace/wake — то же тело без limit_req
 
@@ -2066,17 +2446,15 @@ limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
         return 404 '{"name":"NotFound","data":{"message":"не найдено"}}';
     }
-
-    location @core_down   { default_type application/json; return 503 '{"name":"Unavailable","data":{"message":"Серверный слой не отвечает"}}'; }
-    location @too_large   { default_type application/json; return 413 '{"name":"PayloadTooLarge","data":{"message":"Запрос слишком большой"}}'; }
-    location @too_many    { default_type application/json; return 429 '{"name":"TooManyAttempts","data":{"message":"Слишком много попыток входа — подождите"}}'; }
-    location @bad_request { default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
-    location @bad_method  { default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
 ```
 
-  В `location` Д1 для страницы состояния свой `error_page`, поэтому серверный
-  `error_page 400` их не трогает (nginx не наследует `error_page` в
-  `location` со своим).
+  В `location` Д1 для страницы состояния свой `error_page`, поэтому серверные
+  `error_page` их не трогают (nginx не наследует `error_page` в `location` со
+  своим). Прочие `location` Д1 (`= /`, `/`) при `%00` и `TRACE` тоже отвечают
+  JSON 400 и 405 — это приемлемо. Будущие `location` Д6 с веб-чатом ставят
+  свои `error_page`, если им нужен не JSON. `proxy_set_header` в `location`
+  под `/pcbk/api/` не ставится: иначе `location` потеряет и `Connection ""`,
+  и `X-Forwarded-Host` уровня `server`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2084,7 +2462,7 @@ limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;
 // edge/tests/login.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { viewFor, loginError, GIVE_UP_S } from "../static/login.js";
+import { viewFor, loginError, meView, GIVE_UP_S } from "../static/login.js";
 
 test("состояния места", () => {
   assert.deepEqual(viewFor({ state: "starting" }), { text: "Готовлю рабочее место…", poll: true, ok: false });
@@ -2101,6 +2479,14 @@ test("ошибки входа", () => {
   assert.equal(loginError(401, { name: "Unauthorized", data: { message: "Неверный логин или пароль" } }), "Неверный логин или пароль");
   assert.equal(loginError(503, { name: "Unavailable", data: { message: "Серверный слой не отвечает" } }), "Серверный слой не отвечает");
   assert.equal(loginError(502, "<html>"), "Серверный слой не отвечает");
+});
+
+test("ответ /me", () => {
+  assert.deepEqual(meView(200, { login: "stu-03", role: "student", place: "03" }), { form: false, text: "Вы вошли как stu-03" });
+  assert.deepEqual(meView(401, { name: "Unauthorized", data: { message: "Нужно войти" } }), { form: true, text: "" });
+  assert.deepEqual(meView(503, { name: "Unavailable", data: { message: "Серверный слой не отвечает" } }),
+                   { form: true, text: "Серверный слой не отвечает" });                // core лежит — форма всё равно есть
+  assert.deepEqual(meView(504, "<html>"), { form: true, text: "Серверный слой не отвечает" });
 });
 ```
 
@@ -2155,12 +2541,14 @@ test("ошибки входа", () => {
   входа, `https://<имя сертификата>:8443`) и `GW_IDLE_STOP_S=` — без значений.
 - Produces (`gwclient.py`):
   - `class GwClient`:
-    - `__init__(self, base: str, *, origin: str | None = None, same_origin: bool = False, timeout: float = 30.0)`
-      — TLS без проверки (тестовый сертификат, туннель);
+    - `__init__(self, base: str, *, host: str | None = None, origin: str | None = None, same_origin: bool = False, timeout: float = 30.0)`
+      — TLS без проверки (тестовый сертификат, туннель); `host` — заголовок
+      `Host` вместо хоста из `base` (соединение — по адресу из `base`);
     - `call(method: str, path: str, body=None, *, headers: dict | None = None) -> tuple[int, Any, http.client.HTTPMessage]`
-      — путь от корня уходит как есть (`putrequest`); cookie — своя; на не-GET
-      ставит `Origin` и/или `Sec-Fetch-Site: same-origin` по настройке; тело
-      разбирается, если это JSON;
+      — путь от корня уходит как есть (`putrequest`); cookie — своя, а
+      `Cookie` из `headers` её заменяет; на не-GET ставит `Origin` и/или
+      `Sec-Fetch-Site: same-origin` по настройке; тело разбирается, если это
+      JSON;
     - `login(login: str, password: str) -> dict` (не 200 → `AssertionError` с
       кодом); запоминает `place` из ответа; `logout()`;
     - `wake_and_wait(timeout: float = 90.0) -> dict` —
@@ -2170,7 +2558,10 @@ test("ошибки входа", () => {
 - Produces (`conftest.py`):
   - `STACK_VARS` + `GW_ORIGIN`, `GW_IDLE_STOP_S`, `GW_REAPER_TICK_S`,
     `DRILL_GATEWAY`, `GW_STALE_S`; `test.env` получает
-    `GW_ORIGIN=https://127.0.0.1:18443`;
+    `GW_ORIGIN=https://stand.pcbk.test:18443` — имя из трёх меток, чтобы
+    удаления cookie с `Domain=` шли через настоящий `edge` (Д5-R25, Д5-R30);
+    имя нигде не разрешается: клиент ходит на `127.0.0.1:18443` с этим
+    `Host`;
   - `stack.http_from_core(method: str, url: str) -> int` — `http.client`
     внутри `pcbk-core` (как `http_from_watchdog`), путь как есть;
   - `stack.http_front(method: str, path: str, headers: dict | None = None) -> int`
@@ -2184,7 +2575,9 @@ test("ошибки входа", () => {
   - `stack.add_account(login: str, role: str, place: int | None, password: str) -> None` —
     `docker exec -i pcbk-core python -m pcbk_core.gateway.accounts add …`,
     пароль — в stdin;
-  - `stack.gw_client() -> GwClient` — `GwClient("https://127.0.0.1:18443", origin="https://127.0.0.1:18443")`;
+  - `STAND_ORIGIN = "https://stand.pcbk.test:18443"`;
+    `stack.gw_client() -> GwClient` —
+    `GwClient("https://127.0.0.1:18443", host="stand.pcbk.test:18443", origin=STAND_ORIGIN)`;
   - модульная `secret_forms(pw: str) -> list[str]` — `[pw, b64("opencode:"+pw), "Basic " + b64("opencode:"+pw)]`.
 - Правки тестов прежних дней:
   - `test_socket_proxy.py`, `test_students.py::test_sp_ctl_really_starts_and_stops_student`:
@@ -2256,8 +2649,12 @@ def test_edge_passes_only_gateway_paths(stack):                                 
     for path in ("/pcbk/api/auth/%2e%2e/data/tag_now", "/pcbk/api/auth/..%2Fdata%2Ftag_now", "/pcbk/api/auth//me",
                  "/pcbk/api/data/%2e%2e/auth/me", "/pcbk/api/auth/./me", "/pcbk/api/auth/me%00"):
         code, body, _ = c.call("GET", path)
-        assert (code, body["name"]) == (400, "BadRequest"), path
-    for path in ("/api/auth/me", "/api/data/tag_now", "/healthz/data", "/health/historian", "/health/gateway", "/mcp"):
+        assert (code, body["name"]) == (400, "BadRequest"), path                      # %00 — JSON, не 500 HTML
+    for path in ("/pcbk/api/oc/session", "/pcbk/api/auth/me"):
+        code, body, _ = c.call("TRACE", path)                                          # отвергается до выбора location
+        assert (code, body["name"]) == (405, "MethodNotAllowed"), path
+    for path in ("/api/auth/me", "/api/data/tag_now", "/healthz/data", "/health/historian", "/health/gateway", "/mcp",
+                 "/pcbk-errors/503.json"):                                             # внутренние location снаружи не видны
         assert stack.https(path)[0] == 404, path
     code, body, _ = c.call("POST", "/pcbk/api/auth/login", {"login": "x", "password": "я" * 70000})
     assert (code, body["name"]) == (413, "PayloadTooLarge")
@@ -2289,7 +2686,7 @@ def test_teacher_and_lockout(stack, accounts):
 def test_origin_required_and_counted(stack, accounts):
     raw = GwClient("https://127.0.0.1:18443")                                         # без Origin и Sec-Fetch-Site
     assert raw.call("POST", "/pcbk/api/auth/login", {"login": "stu-01", "password": PW["stu-01"]})[0] == 403
-    evil = GwClient("https://127.0.0.1:18443", origin="https://127.0.0.1")           # тот же хост без порта
+    evil = GwClient("https://127.0.0.1:18443", host="stand.pcbk.test:18443", origin="https://stand.pcbk.test")   # хост без порта — Dify
     assert evil.call("POST", "/pcbk/api/auth/login", {"login": "stu-01", "password": PW["stu-01"]})[0] == 403
     stack.wait_status(lambda d: row(d, "gateway")[:2] ==
                       ("warn", "вход отклоняется проверкой источника — проверьте GW_ORIGIN"), timeout=60)
@@ -2300,6 +2697,21 @@ def test_secrets_not_in_core_logs(stack, accounts):                             
     assert "gw login ok login=stu-01" in logs                                          # журнал прочитан
     forbidden = [*PW.values(), c.cookie, *secret_forms(stack.password(1))]
     assert [s for s in forbidden if s in logs] == []
+
+def test_duplicate_cookies_through_edge(stack, accounts):                              # Review Focus 2; Д5-R25, Д5-R30
+    own, other = as_user(stack, "stu-03"), as_user(stack, "stu-05")                   # после строки origin: она ниже
+    both = {"Cookie": f"pcbk_session={own.cookie}; pcbk_session={other.cookie}"}
+    code, body, headers = own.call("POST", "/pcbk/api/workplace/wake", headers=both)
+    deletes = headers.get_all("Set-Cookie") or []
+    assert (code, body["name"]) == (401, "Unauthorized")                               # не 503 «Серверный слой не отвечает»
+    assert {re.search(r"Domain=([^;]+)", d)[1] for d in deletes if "Domain=" in d} == {"stand.pcbk.test", "pcbk.test"}
+    assert sum("Partitioned" in d for d in deletes) * 2 == len(deletes) == 8 * 3 * 2    # 8 путей × 3 домена × 2
+    assert other.call("GET", "/pcbk/api/auth/me")[0] == 401                            # подброшенная закрыта на сервере
+    assert "too big header" not in stack.logs("pcbk-edge")
+    stack.wait_status(lambda d: row(d, "gateway")[:2] == ("warn", "подброшена cookie сессии"), timeout=60)
+    c = as_user(stack, "stu-03")
+    code, _, headers = c.call("POST", "/pcbk/api/auth/logout")                        # штатный выход через edge
+    assert code == 200 and len(headers.get_all("Set-Cookie") or []) == 8 * 3 * 2
 
 # учения — последними в модуле: пересоздание core сбрасывает счётчики сбоев
 def test_idle_place_sleeps_while_polled(stack, accounts):                             # Review Focus 3
@@ -2398,7 +2810,22 @@ def test_core_down_login_json_503(stack, accounts):
     не допускает. Логин прежнего студента новому человеку не выдаётся;
     `--same-person` — только тому же человеку. Процедура — решение
     владельца;
-  - место 10 — для пробных учёток живых проверок (строка 5 раздела владельца);
+  - места 09 и 10 до начала пилота берут пробные учётки живых проверок
+    (`dN-probe-*`) и после каждой проверки освобождают (строка 5 раздела
+    владельца); пилот получает все 10 мест;
+  - **освобождение места пробной учётки** — после каждого живого прогона:
+    1. разговоры пробы — `DELETE /session/<id>` через API места (помощник
+       `oc` Д2, пароль места — файлом) по списку id, который записал прогон;
+       затем `GET "/experimental/session?roots=true&archived=true"` → `[]`.
+       Не пусто — разговоры прежних дней: место, как 01–02, выдаётся
+       последним (строка 4 раздела владельца), чужие разговоры не
+       удаляются;
+    2. файлов в `/work` проба не оставляет: Д5а к модели не ходит, Д5б идёт
+       под `DRILL_LLM=402`, инструменты не вызываются;
+    3. `disable --login L`, `remove --login L --yes`,
+       `release-place --place NN --yes`;
+    4. `list` — строки «место NN» нет; место остановлено
+       (`docker stop pcbk-student-NN`);
   - ручки шлюза отвечают только через `edge` (`pcbk-front`); из сетей мест —
     404;
   - `GW_ORIGIN` в `.env`; `GW_STALE_S` ≥ 4 × `GW_REAPER_TICK_S`; ошибка в
@@ -2407,6 +2834,19 @@ def test_core_down_login_json_503(stack, accounts):
     того, как их увидел уборщик;
   - учения `DRILL_GATEWAY`;
   - откат Д5а (шаг 3).
+- Modify: `deploy/README.md` — раздел Д2 «Новый студент», пункт «Смена
+  студента в слоте 01–10» заменяется:
+  - первая выдача места — `accounts add --login L --role student --place N`
+    (раздел «Вход и рабочие места»); файлы `student-NN.pw` и
+    `student-NN.llm-token` при этом не меняются;
+  - смена студента в месте, закреплённом за другим логином, — только по
+    процедуре владельца (строка 1 раздела владельца): команда
+    администратора такое место не выдаёт, а частичная смена (новые файлы
+    паролей при прежних томах) оставила бы новому студенту разговоры и
+    агентов прежнего.
+
+  Пункт «Место 11 и дальше» остаётся, к нему добавляется «и правка шлюза:
+  `PLACES` в `accounts.py`, направления к местам в `egress_targets`».
 - Modify: `docs/checks/D5a.md`
 
 - [ ] **Step 1: Образы.** Локально `docker compose build core watchdog`, затем
@@ -2441,6 +2881,10 @@ def test_core_down_login_json_503(stack, accounts):
     - `…/pcbk/api/auth/me` → `401`;
     - `…/pcbk/api/auth` → `404` (не 301);
     - `…/api/auth/me` → `404`;
+    - `…/pcbk/api/auth/me%00` → `400`, тело — JSON `BadRequest` (не 500
+      HTML);
+    - `curl -sk -X TRACE …/pcbk/api/auth/me` → `405`, тело — JSON
+      `MethodNotAllowed`;
   - время работы контейнеров Dify продолжает `~/pcbk-d5a-before.txt`.
 
   Откат:
@@ -2499,7 +2943,11 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
     - `…/health/gateway` → `404`;
     - `…/health/llm` → `200`, и `python3` печатает, есть ли ключи
       `account_remaining_usd`, `key_usage_usd`, `key_spent_usd` → «нет»;
-    - положительный контроль: тот же `curl` к `…/healthz/live` → `200`.
+    - положительный контроль связи: тот же `curl` к `…/healthz/live` → `200`;
+    - положительный контроль ключей: `docker exec pcbk-core python -c` с
+      `urllib` к `http://127.0.0.1:8000/health/llm` (петля — зона
+      администратора) печатает, есть ли те же три ключа → «да». Без этого
+      «нет» выше могло бы значить, что ключей нет вовсе.
   - Через туннель, `curl -sk`: задания лежат в `$JOB`, пароли — из файлов
     через `--data @файл`.
     - преподаватель: вход 200, `GET /pcbk/api/workplace` → 403 «У
@@ -2511,7 +2959,25 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
       `unlock --login d5-probe-t` → верный пароль → 200;
     - `Set-Cookie` входа несёт `HttpOnly`, `Secure`, `SameSite=Strict`,
       `Path=/pcbk/api/` (вердикт по `curl -D`, значение cookie не
-      печатается).
+      печатается);
+    - `…/pcbk/api/auth/me%00` → 400 и `TRACE /pcbk/api/auth/me` → 405, оба —
+      JSON (`"name":"BadRequest"`, `"name":"MethodNotAllowed"`).
+  - Две cookie через настоящий `edge` (Д5-R25, Д5-R30). Имя хоста —
+    из `GW_ORIGIN` в `.env` сервера, в переменной `GWH` (на экран не
+    выводится); все `curl` — с `-H "Host: $GWH:8443"`:
+    1. два входа `d5-probe-t` в две банки cookie `$JOB/jar1`, `$JOB/jar2`
+       (`0600`);
+    2. `POST /pcbk/api/workplace/wake` с обеими `pcbk_session` в одном
+       `Cookie` (значения берутся из банок в переменные, не печатаются) →
+       `401`; `/usr/bin/grep -ci '^set-cookie:'` по заголовкам → число
+       строк (8 путей × домены × 2); `/usr/bin/grep -c 'Domain='` → больше 0,
+       если в имени хоста есть точка;
+    3. `docker logs pcbk-edge 2>&1 | /usr/bin/grep -c 'too big header'` → `0`;
+    4. выход третьей сессией → `200` и столько же строк `Set-Cookie`;
+    5. строка «Шлюз и вход» → «внимание — подброшена cookie сессии» (она
+       выше строки проверки источника), снимок `04b-cookies-duplicate.png`.
+
+    Затем `rm -f $JOB/jar1 $JOB/jar2`.
   - Секретов в журнале `core` нет — с четырьмя контролями Global Constraints
     по каждому из `forms-a`, `forms-t`, `forms-10`:
     - `[ -s ~/pcbk-d5/forms-a ]`; `/usr/bin/grep -c '^$' ~/pcbk-d5/forms-a` → `0`;
@@ -2527,8 +2993,10 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
      вывода помощника.
 
   Expected:
-  - не позже `t1` + 120 + 30 + 10 с место 10 «спит» на странице (снимок
-    `05-idle-asleep.png`);
+  - не позже `t1` + 180 с место 10 «спит» на странице (снимок
+    `05-idle-asleep.png`). Срок: простой 120 + такт уборщика 30 + проверка
+    занятости 2 + остановка места 10 + такт сторожа 10 + опрос страницы 5 с,
+    с запасом;
   - в журнале `core` — одна строка `gw stop place=10 idle_s=… busy=no result=ok`.
 
   Затем `docker compose up -d --no-build core` (значения из `.env`).
@@ -2566,7 +3034,11 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
   (снимок `11-core-down-login.png`); `docker start pcbk-core`. Expected: так;
   строки — как в `~/pcbk-d5a-rows.txt` плюс «Шлюз и вход — норма» не позже 2
   минут.
-- [ ] **Step 9: Уборка.**
+- [ ] **Step 9: Уборка — место 10 освобождается для пилота** (процедура
+  README «Освобождение места пробной учётки»):
+  - разговоров у `d5-probe-a` нет (в Д5а через `edge` к OpenCode пути нет);
+    сверка `oc 10 GET "/experimental/session?roots=true&archived=true"` →
+    `[]` (иначе — как в шаге 1 процедуры);
   - `docker exec pcbk-core python -m pcbk_core.gateway.accounts disable --login d5-probe-a`,
     `remove --login d5-probe-a --yes`, `release-place --place 10 --yes`; для
     `d5-probe-t` — `disable` и `remove`;
@@ -2617,7 +3089,7 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
   `(cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs)`
   и `node --test edge/tests/*.test.mjs` проходят, снимки `docs/checks/D5a/` на
   месте. На сервере удалить `~/pcbk-d5a-before.txt` и `~/pcbk-d5a-rows.txt`.
-- [ ] **Step 4: План и факт.** Строка «план 14,5 ч / факт Y ч по git;
+- [ ] **Step 4: План и факт.** Строка «план 15,0 ч / факт Y ч по git;
   полный интеграционный прогон — Z мин» в `docs/checks/D5a.md`
   (`git log --reverse --format=%cI platform-d4b..platform-d5a | sed -n '1p;$p'`).
 - [ ] **Step 5: Владельцу** — «Д5а готов», снимки 02–05 и строка «место
@@ -2648,18 +3120,18 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
 | Б1. Счётчики прокси и строки сторожа (наблюдение до функций) | 0,75 | локально |
 | Б2. Правила белого списка и сборка тел | 1,5 | локально |
 | Б3. Прокси вызовов `/pcbk/api/oc/*` | 2,0 | локально |
-| Б4. Поток `/event` | 1,25 | локально |
-| Б5. `edge`, общая таблица случаев, интеграционные и живые автотесты | 3,25 | локально |
+| Б4. Поток `/event` | 1,5 | локально |
+| Б5. `edge`, общая таблица случаев, интеграционные и живые автотесты | 3,5 | локально |
 | Б6. Выкладка | 0,5 | сервер |
 | Б7. Живой прогон автотестов, учение, журнал отказов | 1,25 | сервер |
 | Б8. Закрытие дня | 1,25 | — |
-| **Критический путь** | **12,25** | |
+| **Критический путь** | **12,75** | |
 
-Основание «один день» — как в Д5а (при 0,30 — около 3,7 ч). При темпе хуже
+Основание «один день» — как в Д5а (при 0,30 — около 3,8 ч). При темпе хуже
 0,5 Д5б делится: Б0–Б6 и шаги 1–3 Б7 — первый день, остальное — второй.
 
-**Черта отсечения — конец десятого часа** плюс превышение хвостов Д5а над
-0,5 ч. К черте зелёны задачи Б0–Б5 (по оценке 9,25 ч). После черты порядок
+**Черта отсечения — 10,5 ч от начала дня** плюс превышение хвостов Д5а над
+0,5 ч. К черте зелёны задачи Б0–Б5 (по оценке 9,75 ч). После черты порядок
 жёсткий: Б6 → Б7 → Б8.
 - **Б5 не зелёна к черте.** Выкладки нет. Видимый результат — прогон
   автотестов шлюза на локальном стенде и выдержка журнала отказов с пометкой
@@ -2727,9 +3199,12 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
 - Пропускаются 20 типов (17 из research/07 §3 и `server.connected`,
   `server.heartbeat`, `server.instance.disposed`). События идут браузеру
   сырыми байтами, без пересборки JSON.
-- **Чтение места — отдельной задачей** в `asyncio.Queue`. Генератор ответа
-  ждёт `queue.get()` через `asyncio.wait_for` со сроком перепроверки: отмена
-  `get()` безопасна, поток места не закрывается.
+- **Чтение места — отдельной задачей** в `asyncio.Queue(maxsize=4)`.
+  Генератор ответа ждёт `queue.get()` через `asyncio.wait_for` со сроком
+  перепроверки: отмена `get()` безопасна, поток места не закрывается. Очередь
+  ограничена: если браузер перестал читать, читатель ждёт `put`, и давление
+  уходит к месту, а не в память `core`. Браузер, не читающий 60 с, `edge`
+  отключает (`send_timeout 60s`, Д5-R30).
 - **Сессия перепроверяется** не реже чем раз в `stream_recheck_s = 10` (на
   каждом событии и каждом сроке). Выход, отключение, смена пароля и
   истечение срока рвут поток — строка журнала `closed_by=session`.
@@ -2737,14 +3212,23 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
   — 429 «Открыто слишком много вкладок чата — закройте лишние»):
   - занимается только после ответа места 200 на `/event`, прямо перед
     `StreamingResponse`;
-  - освобождается в `try/finally` всего обработчика, пока генератор не
-    принял владение, и в `finally` генератора — после.
+  - владение переходит к ответу в момент `return`: флаг «ответ принял
+    владение» обработчик ставит сам прямо перед `return StreamingResponse(…)`.
+    `finally` обработчика срабатывает и на `return`, поэтому при флаге он
+    ничего не делает, а без флага (исключение до `return`) закрывает поток
+    места и возвращает слот;
+  - после `return` освобождает одна идемпотентная функция `release()`
+    (отмена читателя, закрытие потока места, `stream_closed`), её зовут
+    `finally` генератора и `BackgroundTask` ответа. Starlette зовёт
+    `background` и тогда, когда клиент ушёл раньше первого шага генератора.
 
-  Отказы 503/502/429 и обрыв клиента до первого куска слот не держат.
+  Отказы 503/502/429 и обрыв клиента до первого куска слот не держат и не
+  возвращают дважды.
 - **Заголовки места** ждутся не дольше `STREAM_OPEN_S = 10`, дальше 503
   «Рабочее место не отвечает» и `upstream_failed`.
-- Событие больше 1 МиБ рвёт поток; тишина места дольше 60 с (шесть пульсов по
-  10 с, `O:…/handlers/event.ts:63`) тоже. Оба случая считаются
+- Событие больше 512 КиБ рвёт поток (вывод инструментов OpenCode обрезает
+  сам, до десятков КиБ); тишина места дольше 60 с (шесть пульсов по 10 с,
+  `O:…/handlers/event.ts:63`) тоже. Оба случая считаются
   `stream_broken`.
 - Конец потока места — конец потока браузеру; обрыв браузера закрывает поток к
   месту. У `edge` — `proxy_read_timeout 90s`, `proxy_buffering off`,
@@ -2767,8 +3251,10 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
   (проверка агента или разрешения плюс пересылка) — не больше
   `PROXY_DEADLINE_S = 25`. `edge` на `/pcbk/api/oc/` ждёт 45 с (Д5-R30).
 - **Память:** ответ места больше `UPSTREAM_MAX_BYTES = 4 МиБ` — 502; событие
-  потока — до 1 МиБ; потоков — до 30 (3 × 10). Худший случай шлюза сверх Д4а
-  — около 10 × 4 МиБ × 2 (копия разбора) + 30 × 1 МиБ + 32 МиБ scrypt ≈ 140 МиБ.
+  потока — до 512 КиБ; потоков — до 30 (3 × 10), у каждого не больше шести
+  событий в памяти (очередь 4, копящееся у читателя, отправляемое у
+  генератора). Худший случай шлюза сверх Д4а — около 10 × 4 МиБ × 2 (копия
+  разбора) + 30 × 6 × 512 КиБ + 32 МиБ scrypt ≈ 80 + 90 + 32 ≈ 200 МиБ.
   `mem_limit` `core` — 512m (Д4а) без изменений; замер — Б7. **Цена
   ошибки:** история очень длинного разговора (больше 4 МиБ JSON) не
   откроется — 502 «ответ рабочего места слишком большой».
@@ -2824,7 +3310,7 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
    - живёт после выхода или отключения;
    - рвётся на паузе дольше срока перепроверки;
    - теряет слот на 503/502, и через три отказа студент навсегда получает
-     429;
+     429; возвращает слот дважды, и у студента открыто больше трёх вкладок;
    - ждёт заголовков зависшего места без срока;
    - `edge` рвёт его через 5 с или буферизует;
    - не кончается, когда место уснуло или зависло;
@@ -2833,7 +3319,8 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
    Тесты — задача Б4, `test_filter_sse_*`, `test_stream_ends_on_logout`,
    `test_stream_survives_pauses`, `test_stream_slot_not_leaked`,
    `test_stream_limit_per_login`, `test_client_disconnect_closes_upstream`,
-   `test_silent_place_is_stream_broken`; задача Б5,
+   `test_client_gone_while_place_opens`, `test_silent_place_is_stream_broken`;
+   задача Б5,
    `test_event_stream_through_edge`, `test_event_ends_when_place_stops`,
    `test_event_is_not_activity`.
 5. **Пароль места утёк или диагноз ложный:**
@@ -2886,10 +3373,15 @@ docs/checks/D5b.md, docs/checks/D5b/*.png
   слияние и тег `platform-d5a`, чистый клон. Expected: вердикты в
   `docs/checks/D5a.md`; ветка `d5b/gateway-whitelist` — от `main` после тега.
 - [ ] **Step 2: Предпроверки сервера (только чтение).**
-  `docker inspect -f '{{.State.Health.Status}} {{len .NetworkSettings.Networks}}' pcbk-core; docker exec pcbk-core python -m pcbk_core.gateway.accounts list | /usr/bin/grep -c probe; docker ps -a --filter label=pcbk.role=student --format '{{.State}}' | sort | uniq -c; curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(sorted((c["component"], c["state"]) for c in json.load(sys.stdin)["checks"]))' > ~/pcbk-d5b-rows.txt; docker ps --format '{{.Names}} {{.Status}}' > ~/pcbk-d5b-before.txt`.
+  `docker inspect -f '{{.State.Health.Status}} {{len .NetworkSettings.Networks}}' pcbk-core; docker exec pcbk-core python -m pcbk_core.gateway.accounts list | /usr/bin/grep -c probe; docker exec pcbk-core python -m pcbk_core.gateway.accounts list | /usr/bin/grep -c -E '^место (09|10)[[:space:]]'; docker ps -a --filter label=pcbk.role=student --format '{{.State}}' | sort | uniq -c; curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(sorted((c["component"], c["state"]) for c in json.load(sys.stdin)["checks"]))' > ~/pcbk-d5b-rows.txt; docker ps --format '{{.Names}} {{.Status}}' > ~/pcbk-d5b-before.txt`.
   Expected:
   - `core :d5a` `healthy` в 13 сетях;
-  - пробных учёток и закреплений нет (0);
+  - пробных учёток нет (0);
+  - у мест 09 и 10 закреплений нет (0): до начала пилота они свободны, пробы
+    Д5а место 10 освободили (строка 5 раздела владельца). Если место уже
+    выдано студенту — пилот начался: пробы Б7 берут два места без
+    закрепления из `list`, а если таких нет — живой прогон Б7 откладывается,
+    вердикт и строка владельцу (до Б6, а не посреди Б7);
   - места не `running`;
   - «Шлюз и вход» в норме;
   - снимки строк и времени работы Dify сохранены.
@@ -3380,7 +3872,7 @@ def test_not_ready_logged_once_per_minute(gw, caplog):
     — GET с `Accept: text/event-stream`, `Timeout(connect=2, read=None, write=5, pool=5)`.
     Заголовки ответа ждутся под `asyncio.timeout(STREAM_OPEN_S)`: двойник
     `MockTransport` сроков `httpx` не знает, поэтому срок держит шлюз.
-  - `proxy.py`: `SSE_MAX_EVENT_BYTES = 1024 * 1024`;
+  - `proxy.py`: `SSE_MAX_EVENT_BYTES = 512 * 1024`, `STREAM_QUEUE_MAX = 4`;
     `async def filter_sse(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]`:
     - копит байты до пустой строки (`\n\n` или `\r\n\r\n`);
     - берёт строки `data:` события и разбирает их JSON;
@@ -3394,24 +3886,26 @@ def test_not_ready_logged_once_per_minute(gw, caplog):
        `no_answer`, `upstream_failed`; 401 → 502 `place_auth`; иначе не 200 →
        503 `no_answer`;
     4. `stream_opened(login)`; `False` (гонка) → закрыть поток места, 429;
-    5. `StreamingResponse(…, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})`.
+    5. `owned = True`, затем
+       `return StreamingResponse(gen, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}, background=BackgroundTask(release))`.
 
-    Шаги 3–5 — в `try/finally` с флагом «генератор принял владение»: пока
-    флага нет, `finally` обработчика закрывает поток места и, если слот взят,
-    зовёт `stream_closed`. Генератор при первом шаге ставит флаг и дальше
-    сам освобождает всё в своём `finally`.
+    Шаги 3–5 — в `try/finally`: `finally` срабатывает и на `return`; при
+    `owned` он ничего не делает, иначе закрывает поток места и, если слот
+    взят, зовёт `stream_closed`. `release()` — идемпотентна (флаг
+    «освобождено»): отмена читателя, закрытие потока места,
+    `stream_closed(login)`, строка журнала; её зовут `finally` генератора и
+    `BackgroundTask`.
 
     Устройство генератора:
-    - задача-читатель гонит `filter_sse(aiter_raw)` в `asyncio.Queue`
-      (конец — метка `None`, ошибка — метка с видом `oversize` или
-      `timeout`);
+    - задача-читатель гонит `filter_sse(aiter_raw)` в
+      `asyncio.Queue(maxsize=STREAM_QUEUE_MAX)` (конец — метка `None`, ошибка —
+      метка с видом `oversize` или `timeout`);
     - генератор ждёт `asyncio.wait_for(queue.get(), stream_recheck_s)`. На
       каждом событии и каждом сроке он зовёт `store.session(token)` (в
       потоке): `None` → конец (`closed_by=session`);
     - тишина места дольше `places.SSE_READ_TIMEOUT_S` (читается при каждом
       ожидании) → конец (`closed_by=timeout`, `stream_broken`);
-    - в `finally` генератора — отмена читателя, закрытие потока места,
-      `stream_closed(login)`, строка журнала
+    - в `finally` генератора — `release()`; строка журнала
       `gw event place=NN closed_by=place|client|session|timeout|oversize s=N`;
     - `touch` не вызывается (Д5-R35).
 
@@ -3476,6 +3970,24 @@ def test_client_disconnect_closes_upstream(tmp_path):                           
         c.close()
         wait_until(lambda: fp.event_closed[3], timeout=3)
     assert role.stats.streams == 0
+
+def test_client_gone_while_place_opens(tmp_path):                                       # р3; Review Focus 4
+    app, role = make_gateway(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = "endless"
+    with serve_app(app) as url:
+        cookie = login_cookie(url, "stu-03")
+        c, s = open_stream(url, cookie)
+        with s as r:                                                                     # первая вкладка держит слот
+            next(r.iter_bytes())
+            fp.hang_for[3] = 0.3                                                         # вторая: заголовки места через 0,3 с
+            with pytest.raises(httpx.ReadTimeout):                                       # клиент ушёл раньше
+                httpx.get(url + "/pcbk/api/oc/event", headers={"Cookie": f"pcbk_session={cookie}"},
+                          timeout=httpx.Timeout(2.0, read=0.1))
+            wait_until(lambda: fp.event_starts[3] == 2 and fp.event_open[3] == 1, timeout=3)
+            assert role.stats.streams_of("stu-03") == 1                                  # возвращён ровно один слот
+        c.close()
+        wait_until(lambda: role.stats.streams == 0, timeout=3)
 
 def test_stream_ends_on_logout(tmp_path, caplog):                                       # Review Focus 4
     app, role = make_gateway(tmp_path, ready=(3,), stream_recheck_s=0.1)
@@ -3555,13 +4067,14 @@ cookie идёт заголовком.
 - бесконечным пульсом (`"endless"`, раз в 0,05 с);
 - одним `server.connected` и затем ожиданием без конца (`"silent"`).
 
-`event_closed[n]` становится `True`, когда поток закрыт. `hang_for[n]` —
-пауза до заголовков.
+`event_closed[n]` становится `True`, когда поток закрыт; `event_starts[n]` —
+сколько потоков место открыло, `event_open[n]` — сколько открыто сейчас.
+`hang_for[n]` — пауза до заголовков.
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_gw_stream.py`. Expected: FAIL — нет `filter_sse`.
 - [ ] **Step 3: Implement поток по интерфейсам.**
 - [ ] **Step 4: Run the whole core suite** — `cd core && CORE_PYTEST`. Expected: PASS.
-- [ ] **Step 5: Commit** — `git add core/ && git commit -m "Шлюз: поток /event — читатель в очереди, перепроверка сессии, слот только после 200 места, срок заголовков, 20 типов сырыми байтами"`.
+- [ ] **Step 5: Commit** — `git add core/ && git commit -m "Шлюз: поток /event — читатель в ограниченной очереди, перепроверка сессии, слот только после 200 места и ровно одно освобождение, срок заголовков, 20 типов сырыми байтами"`.
 
 ---
 
@@ -3593,10 +4106,7 @@ cookie идёт заголовком.
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
         client_max_body_size 512k;
         proxy_read_timeout 45s;          # больше 25 с хода вызова у core (Д5-R30)
-        error_page 405 = @bad_method;
-        error_page 413 = @too_large;
-        error_page 502 503 504 = @core_down;
-        proxy_pass http://$pcbk_core;
+        proxy_pass http://$pcbk_core;    # error_page, буферы, X-Forwarded-Host — от server (Д5а)
     }
     location = /pcbk/api/oc/event {      # поток: без буфера; пульс места — 10 с, шлюз рвёт первым через 60 с
         default_type application/json;
@@ -3605,7 +4115,7 @@ cookie идёт заголовком.
         proxy_cache off;
         gzip off;
         proxy_read_timeout 90s;
-        error_page 502 503 504 = @core_down;
+        send_timeout 60s;                # браузер не читает 60 с — отключить; очередь шлюза не копит (Д5-R35)
         proxy_pass http://$pcbk_core;
     }
 ```
@@ -3791,6 +4301,19 @@ def test_origin_and_teacher(stack, users):
     assert (code, body["data"]["message"]) == (403, "Запрос не с нашей страницы — отклонён")
     t = stack.gw_client(); t.login("gw-t", PW["gw-t"])
     assert t.call("GET", "/pcbk/api/oc/session/status")[0] == 403
+
+def test_duplicate_cookies_on_long_path_through_edge(stack, users):                     # Review Focus Д5а 2; Д5-R25, Д5-R30
+    a, _ = users
+    sid = a.call("POST", "/pcbk/api/oc/session")[1]["id"]
+    extra = stack.gw_client(); extra.login("gw-a", PW["gw-a"])                        # вторая сессия того же логина
+    both = {"Cookie": f"pcbk_session={a.cookie}; pcbk_session={extra.cookie}"}
+    code, body, headers = a.call("POST", f"/pcbk/api/oc/session/{sid}/prompt_async",   # самый длинный путь: 64 знака
+                                 {"parts": [{"type": "text", "text": "x"}]}, headers=both)
+    deletes = headers.get_all("Set-Cookie") or []
+    assert (code, body["name"]) == (401, "Unauthorized")                               # не 503 от edge
+    assert len(deletes) == 12 * 3 * 2 and any("Domain=pcbk.test" in d for d in deletes)
+    assert "too big header" not in stack.logs("pcbk-edge")
+    a.login("gw-a", PW["gw-a"])                                                        # обе сессии закрыты — вход заново
 
 def test_sleeping_place_503_no_wake(stack, users):
     c = stack.gw_client(); c.login("gw-c", PW["gw-c"])
@@ -3985,9 +4508,12 @@ def test_live_expected_refusals():                                              
 `~/pcbk-d5/`.
 
 - [ ] **Step 1: Пробные учётки.** `d5-probe-a` (место 10) и `d5-probe-b`
-  (место 09) — способом А8, шаг 1; `.cred` — в `$JOB` (`0600`). Файлы видов
-  секретов (рецептом Global Constraints): `forms-a`, `forms-b`, `forms-09`,
-  `forms-10`; у каждого `/usr/bin/grep -c '^$'` → `0`. Места 09 и 10 спят.
+  (место 09; оба места свободны до начала пилота — строка 5 раздела
+  владельца, проверено в Б0) — способом А8, шаг 1; `.cred` — в `$JOB` (`0600`). Файлы
+  видов секретов — рецептом Global Constraints (`IFS= read -r pw < F || [ -n "$pw" ]`:
+  файл пароля без перевода строки в конце тоже читается): `forms-a`,
+  `forms-b`, `forms-09`, `forms-10`; у каждого `[ -s … ]` и
+  `/usr/bin/grep -c '^$'` → `0`. Места 09 и 10 спят.
 - [ ] **Step 2: Учения LLM без денег.**
   `DRILL_LLM=402 docker compose up -d --no-build core`, время `t0`.
   Expected:
@@ -4005,6 +4531,16 @@ def test_live_expected_refusals():                                              
   - снимок страницы `01-refusals.png`: «Шлюз и вход — норма» (отказ
     `test_live_origin` — `refused`, а не `origin_refused`, Д5-R26), note с
     числом отказов.
+
+  После снимка — две cookie на самом длинном пути через настоящий `edge`
+  (Д5-R25, Д5-R30), способом А8, шаг 3 (`Host` из `GW_ORIGIN` в `GWH`, банки
+  `$JOB/jar1`, `$JOB/jar2` с двумя входами `d5-probe-a`):
+  `POST /pcbk/api/oc/session/<id>/prompt_async` (`id` — первая строка места
+  10 из `$JOB/live-sessions.txt`) → `401` JSON, строк `Set-Cookie` —
+  12 путей × домены × 2, `Domain=` есть (если в имени хоста есть точка);
+  `docker logs pcbk-edge 2>&1 | /usr/bin/grep -c 'too big header'` → `0`.
+  Строка «Шлюз и вход» → «внимание — подброшена cookie сессии»: так и должно
+  быть до конца часа. Затем `rm -f $JOB/jar1 $JOB/jar2`.
 - [ ] **Step 4: Учение «место зависло при открытом потоке».**
   1. Локально в фоне:
      `uv run --python 3.12 python $JOB/hold-stream.py`. Скрипт в `$JOB`
@@ -4056,7 +4592,9 @@ def test_live_expected_refusals():                                              
      09 → `[]` (в местах 09 и 10 разговоров не осталось).
   4. `docker stop pcbk-student-09 pcbk-student-10`.
   5. Учётки `d5-probe-a`, `d5-probe-b` — `disable`, `remove --yes`, затем
-     `release-place --place 10 --yes` и `--place 09 --yes`.
+     `release-place --place 10 --yes` и `--place 09 --yes` (процедура README
+     «Освобождение места пробной учётки»): места 09 и 10 снова свободны для
+     пилота, `list` — строк «место 09» и «место 10» нет.
   6. `rm -rf ~/pcbk-d5`; в `$JOB` — `*.cred`, `live-sessions.txt`,
      `hold-stream.py`.
 
@@ -4110,7 +4648,7 @@ def test_live_expected_refusals():                                              
   `(cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs)`
   и `node --test edge/tests/*.test.mjs` проходят, снимки на месте. На сервере
   удалить `~/pcbk-d5b-before.txt` и `~/pcbk-d5b-rows.txt`.
-- [ ] **Step 4: План и факт.** Строка «план 12,25 ч / факт Y ч по git» в
+- [ ] **Step 4: План и факт.** Строка «план 12,75 ч / факт Y ч по git» в
   `docs/checks/D5b.md`
   (`git log --reverse --format=%cI platform-d5a..platform-d5b | sed -n '1p;$p'`).
 - [ ] **Step 5: Владельцу** — «Д5 готов»: итог прогона автотестов (N случаев,
