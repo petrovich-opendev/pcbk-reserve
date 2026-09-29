@@ -20,6 +20,19 @@ def write(tmp_path, text: str) -> str:
     return str(path)
 
 
+class FakeMono:
+    """Подменные монотонные часы: вызываемые, идут только по advance(s)."""
+
+    def __init__(self, start: float = 0.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, s: float) -> None:
+        self.now += s
+
+
 async def dummy(scope, receive, send):
     """Точный маршрут роли — обычная ASGI-функция: 200 на любой метод."""
     await send({"type": "http.response.start", "status": 200,
