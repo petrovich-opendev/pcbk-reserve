@@ -143,6 +143,38 @@ def serve_http(handler):
 
 
 @pytest.fixture
+def fake_core():
+    """Двойник ручек pcbk-core: /health/historian — set(obj) или set_raw(text),
+    /healthz/data — set_health(code, obj); прочие пути — 404."""
+    replies = {"/health/historian": (200, "application/json", b"{}"),
+               "/healthz/data": (200, "application/json", b'{"ok": true, "detail": "ok"}')}
+
+    def as_json(obj) -> bytes:
+        return json.dumps(obj, ensure_ascii=False).encode()   # как у FastAPI: UTF-8, не \u
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            code, ctype, body = replies.get(self.path, (404, "text/plain", b"not found"))
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    with serve_http(Handler) as base:
+        yield SimpleNamespace(
+            base=base, url=base + "/health/historian",
+            set=lambda obj: replies.update({"/health/historian": (200, "application/json", as_json(obj))}),
+            set_raw=lambda text: replies.update(
+                {"/health/historian": (200, "text/plain; charset=utf-8", text.encode())}),
+            set_health=lambda code, obj: replies.update(
+                {"/healthz/data": (code, "application/json", as_json(obj))}))
+
+
+@pytest.fixture
 def silent_proxy_url():
     """Сокет принимает соединения и молчит — повисший прокси."""
     listener = socket.create_server(("127.0.0.1", 0))

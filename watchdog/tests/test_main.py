@@ -49,7 +49,7 @@ def test_run_checks_docker_down_marks_containers_unknown():
     assert "прокси сокета" in checks[1].detail
 
 
-def test_run_checks_all_kinds(fake_proxy, tls_server):
+def test_run_checks_all_kinds(fake_proxy, tls_server, fake_core):
     comps = [{"id": "edge", "title": "Входной прокси", "kind": "tls", "host": "127.0.0.1",
               "port": tls_server.port},
              {"id": "sp-ro", "title": "Прокси сокета сторожа", "kind": "docker_ping"},
@@ -57,13 +57,28 @@ def test_run_checks_all_kinds(fake_proxy, tls_server):
               "container": "pcbk-sp-ctl", "sleeping_ok": False},
              {"id": "memory", "title": "Память сервера", "kind": "memory"},
              {"id": "web", "title": "Веб", "kind": "http", "url": fake_proxy.url + "/v1.44/_ping"},
-             {"id": "core", "title": "Серверный слой", "kind": "absent"}]
-    settings = replace(SETTINGS, TLS_CAFILE=tls_server.cafile)
-    checks = run_checks(comps, DockerReader(fake_proxy.url, 0.5), settings, now_utc())
+             {"id": "core", "title": "Служба данных", "kind": "http",
+              "url": fake_core.base + "/healthz/data", "ok_detail": "жива"},
+             {"id": "historian", "title": "Историан БДРВ", "kind": "historian", "url": fake_core.url},
+             {"id": "llm", "title": "OpenRouter и бюджет", "kind": "absent"}]
+    now = now_utc()
+    # пороги — из настроек: 100 с при HIST_WARN_S=60 — предупреждение
+    fake_core.set({"checked_at": now.isoformat(), "age_s": 100.0, "skew_s": 0.0, "error": None,
+                   "error_text": None, "tags": 8, "catalog_age_s": 60.0})
+    settings = replace(SETTINGS, TLS_CAFILE=tls_server.cafile, HIST_WARN_S=60, HIST_FAIL_S=120)
+    checks = run_checks(comps, DockerReader(fake_proxy.url, 0.5), settings, now)
     assert [(c.component, c.state) for c in checks] == [
         ("edge", "ok"), ("sp-ro", "ok"), ("sp-ctl", "ok"), ("memory", "ok"), ("web", "ok"),
-        ("core", "absent")]
-    assert checks[5].detail == "ещё не установлен" and "11718 МиБ" in checks[3].detail
+        ("core", "ok"), ("historian", "warn"), ("llm", "absent")]
+    assert checks[7].detail == "ещё не установлен" and "11718 МиБ" in checks[3].detail
+    assert (checks[4].detail, checks[5].detail) == ("отвечает", "жива")
+    assert checks[6].detail == "последняя метка старше 60 с"
+    # давний опрос — по HIST_STALE_S
+    fake_core.set({"checked_at": (now - timedelta(seconds=31)).isoformat(), "age_s": 1.0,
+                   "skew_s": 0.0, "error": None, "error_text": None, "tags": 8, "catalog_age_s": 60.0})
+    checks = run_checks(comps[6:7], DockerReader(fake_proxy.url, 0.5),
+                        replace(settings, HIST_STALE_S=30), now)
+    assert (checks[0].state, checks[0].detail) == ("unknown", "служба давно не опрашивала историан")
 
 
 def test_tick_bounded_when_proxy_hangs(silent_proxy_url):   # принимает соединение и молчит
@@ -222,14 +237,35 @@ def test_journal_unopenable_at_start_shows_on_page(tmp_path):
     assert state.snapshot.checks == ()
 
 
-def test_components_file_d2():
-    comps = load_components("components.json")
-    assert [c["id"] for c in comps][:4] == ["edge", "sp-ro", "sp-ctl", "memory"]
-    students = [c for c in comps if c["id"].startswith("student-")]
+def test_components_file_d3a():
+    comps = {c["id"]: c for c in load_components("components.json")}
+    assert (comps["core"]["url"], comps["core"]["ok_detail"], comps["core"]["title"]) == \
+           ("http://pcbk-core:8000/healthz/data", "жива", "Служба данных")
+    assert comps["historian"]["kind"] == "historian"
+    assert {i for i, c in comps.items() if c["kind"] == "absent"} == {"llm"}
+    # остальное — как оставил Д2
+    assert list(comps)[:4] == ["edge", "sp-ro", "sp-ctl", "memory"]
+    assert list(comps)[-3:] == ["core", "historian", "llm"]
+    assert (comps["historian"]["url"], comps["historian"]["title"]) == \
+           ("http://pcbk-core:8000/health/historian", "Историан БДРВ")
+    students = [c for i, c in comps.items() if i.startswith("student-")]
     assert [(c["id"], c["title"], c["kind"], c["container"], c["sleeping_ok"]) for c in students] == \
            [(f"student-{n:02d}", f"Рабочее место {n:02d}", "container", f"pcbk-student-{n:02d}", True)
             for n in range(1, 11)]
-    assert {c["id"] for c in comps if c["kind"] == "absent"} == {"core", "historian", "llm"}
+
+
+def test_hist_settings_validation():
+    assert Settings.from_env({"HIST_WARN_S": "60", "HIST_FAIL_S": "120"}).HIST_FAIL_S == 120   # ручка учения
+    for warn, fail in ((0, 900), (900, 300), (300, 300)):
+        with pytest.raises(ValueError):
+            replace(SETTINGS, HIST_WARN_S=warn, HIST_FAIL_S=fail)
+    assert (Settings().HIST_WARN_S, Settings().HIST_FAIL_S, Settings().HIST_STALE_S) == (300, 900, 130)
+    for bad in ({"HIST_STALE_S": "0"}, {"HIST_STALE_S": "-5"}, {"HIST_WARN_S": "-1"},
+                {"HIST_FAIL_S": "abc"}):
+        with pytest.raises(ValueError):
+            Settings.from_env(bad)
+    # HIST_* правило срока такта не затрагивают
+    assert Settings(HIST_WARN_S=1, HIST_FAIL_S=2, HIST_STALE_S=1).tick_budget_s == Settings().tick_budget_s
 
 
 def test_components_file_d1_details():
@@ -245,7 +281,11 @@ def test_load_components_rejects_bad_config(tmp_path):
     for bad in ([{"id": "a", "title": "A", "kind": "shell"}],
                 [{"id": "a", "title": "A", "kind": "container", "container": "dify-api",
                   "sleeping_ok": False}],
-                [{"id": "a", "title": "A", "kind": "absent"}, {"id": "a", "title": "B", "kind": "absent"}]):
+                [{"id": "a", "title": "A", "kind": "absent"}, {"id": "a", "title": "B", "kind": "absent"}],
+                [{"id": "a", "title": "A", "kind": "historian"}],                      # нет url
+                [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": ""}],
+                [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": 1}],
+                [{"id": "a", "title": "A", "kind": "historian", "url": "http://x/", "ok_detail": "жив"}]):
         path = tmp_path / "c.json"
         path.write_text(json.dumps(bad))
         with pytest.raises(ValueError):

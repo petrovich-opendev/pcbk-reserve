@@ -1,8 +1,8 @@
 from datetime import timedelta, timezone
 
 from helpers import T0, insp, now_utc
-from pcbk_watchdog.checks import (check_container, check_http, check_memory, check_tls,
-                                  not_installed, tls_verdict)
+from pcbk_watchdog.checks import (check_container, check_historian, check_http, check_memory,
+                                  check_tls, not_installed, tls_verdict)
 from pcbk_watchdog.journal import Journal
 
 MEMINFO = "MemTotal: 16384000 kB\nMemAvailable: {} kB\n"
@@ -148,6 +148,96 @@ def test_not_installed_is_absent_not_fail():
 
 def test_check_http_down_is_fail():
     assert check_http("edge", "Входной прокси", "http://127.0.0.1:9/healthz", timeout=0.5).state == "fail"
+
+
+def test_check_http_ok_detail_and_reason(fake_core):
+    url = fake_core.base + "/healthz/data"
+    fake_core.set_health(200, {"ok": True, "detail": "каталог: 6"})
+    assert check_http("core", "Служба данных", url, ok_detail="жива").detail == "жива"
+    fake_core.set_health(503, {"ok": False, "detail": "белый список пуст или не найден"})
+    r = check_http("core", "Служба данных", url, ok_detail="жива")
+    assert (r.state, r.detail) == ("fail", "белый список пуст или не найден")
+
+
+def test_check_http_reason_fallbacks(fake_core):
+    url = fake_core.base + "/healthz/data"
+    fake_core.set_health(200, {"ok": True, "detail": "каталог: 6"})
+    assert check_http("web", "Веб", url).detail == "отвечает"                  # по умолчанию, как в Д1
+    fake_core.set_health(503, {"ok": False, "detail": "ф" * 100})
+    assert check_http("core", "Служба данных", url).detail == "ф" * 80          # первые 80 знаков
+    for body in ({"ok": False}, {"detail": ["не строка"]}, ["detail"], {"detail": ""}):
+        fake_core.set_health(500, body)
+        r = check_http("core", "Служба данных", url)
+        assert (r.state, r.detail) == ("fail", "отвечает ошибкой HTTP 500")
+    r = check_http("core", "Служба данных", fake_core.base + "/nope")             # не JSON
+    assert (r.state, r.detail) == ("fail", "отвечает ошибкой HTTP 404")
+
+
+def fresh(age, **kw):
+    return {"checked_at": (T0 - timedelta(seconds=10)).isoformat(), "age_s": age, "skew_s": 0.0,
+            "error": None, "error_text": None, "tags": 8, "catalog_age_s": 3600.0, **kw}
+
+
+def hist(fake_core, obj):
+    fake_core.set(obj)
+    return check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, timeout=0.5)
+
+
+def test_historian_verdicts(fake_core):
+    cases = [(fresh(42.4), ("ok", "последняя метка 42 с назад")),
+             (fresh(300), ("warn", "последняя метка старше 300 с")),
+             (fresh(901), ("fail", "последняя метка старше 900 с")),
+             (fresh(None, error="auth", error_text="историан отклонил учётные данные — обновите bdrv.env и перезапустите службу"),
+              ("fail", "историан отклонил учётные данные — обновите bdrv.env и перезапустите службу")),
+             (fresh(10, catalog_age_s=200000.0), ("warn", "каталог тегов старше двух суток")),
+             (fresh(1, checked_at=(T0 - timedelta(seconds=121)).isoformat()),
+              ("unknown", "служба давно не опрашивала историан")),
+             (fresh(None, checked_at=None), ("unknown", "служба ещё не опрашивала историан"))]
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail) == want
+
+
+def test_historian_boundaries_and_order(fake_core):
+    cases = [(fresh(899.9), ("warn", "последняя метка старше 300 с")),
+             (fresh(900), ("fail", "последняя метка старше 900 с")),             # порог — «не меньше»
+             (fresh(250, catalog_age_s=172800.0), ("ok", "последняя метка 250 с назад")),  # ровно двое суток
+             (fresh(5, catalog_age_s=None), ("ok", "последняя метка 5 с назад")),
+             (fresh(400, catalog_age_s=200000.0), ("warn", "последняя метка старше 300 с")),
+             (fresh(5, checked_at=(T0 - timedelta(seconds=120)).isoformat()),    # ровно stale_s — ещё свежо
+              ("ok", "последняя метка 5 с назад")),
+             (fresh(5, checked_at="2026-09-29T11:59:50Z"), ("ok", "последняя метка 5 с назад")),
+             # давний опрос важнее ошибки в нём: сперва — свежесть самого опроса
+             (fresh(5, error="timeout", error_text="историан не ответил вовремя",
+                    checked_at=(T0 - timedelta(seconds=200)).isoformat()),
+              ("unknown", "служба давно не опрашивала историан")),
+             (fresh(5, error="connect", error_text="нет связи с историаном"), ("fail", "нет связи с историаном")),
+             (fresh(5, error="auth", error_text="т" * 100), ("fail", "т" * 80)),
+             (fresh(5, error="new_code", error_text=None), ("fail", "new_code"))]
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.component, r.title, r.state, r.detail) == ("historian", "Историан БДРВ", *want), obj
+
+
+def test_historian_core_down_or_garbage_is_unknown(fake_core):
+    r = check_historian("historian", "Историан БДРВ", "http://127.0.0.1:9/x", T0, 300, 900, 120, 0.5)
+    assert (r.state, r.detail) == ("unknown", "служба данных не отвечает — свежесть неизвестна")
+    fake_core.set_raw("не json")
+    assert check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5).state == "unknown"
+
+
+def test_historian_bad_reply_is_unknown(fake_core):
+    down = ("unknown", "служба данных не отвечает — свежесть неизвестна")
+    r = check_historian("historian", "Историан БДРВ", fake_core.base + "/nope", T0, 300, 900, 120, 0.5)
+    assert (r.state, r.detail) == down                                            # HTTP ≠ 200
+    for obj in ("не json", [fresh(5)], {"checked_at": T0.isoformat()}, fresh("5"), fresh(True),
+                fresh(5, checked_at="вчера"), fresh(5, checked_at=12)):
+        if isinstance(obj, str):
+            fake_core.set_raw(obj)
+        else:
+            fake_core.set(obj)
+        r = check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5)
+        assert (r.state, r.detail) == down, obj
 
 
 def test_tls_verdict_ok_warn_fail():

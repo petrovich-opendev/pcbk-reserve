@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .checks import Check, check_container, check_http, check_memory, check_tls, not_installed
+from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, Check, check_container, check_historian,
+                     check_http, check_memory, check_tls, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
 from .page import Snapshot, is_stale, render_html, status_json
@@ -24,14 +25,12 @@ log = logging.getLogger("pcbk_watchdog")
 # вид проверки → обязательные поля в components.json сверх id и title
 KINDS: dict[str, tuple[str, ...]] = {
     "memory": (), "http": ("url",), "tls": ("host", "port"), "docker_ping": (),
-    "container": ("container", "sleeping_ok"), "absent": (),
+    "container": ("container", "sleeping_ok"), "absent": (), "historian": ("url",),
 }
 # виды без сети — их срок такта не отменяет
 LOCAL_KINDS = frozenset({"memory", "absent"})
 # имена, которые сторож пишет сам
 RESERVED_IDS = frozenset({"journal", "watchdog"})
-# срок ответа для проверок tls и http, с (на операцию сокета)
-NET_CHECK_TIMEOUT_S = 3.0
 
 STATUS_JS = (Path(__file__).parent / "static" / "status.js").read_bytes()
 EVENTS_ON_PAGE = 20
@@ -56,6 +55,12 @@ class Settings:
     COMPONENTS_PATH: str = "/app/components.json"
     # учения «цикл молчит при живом HTTP»: 1 — после первого такта цикл замирает
     DRILL_FREEZE_LOOP: bool = False
+    # свежесть историана: возраст последней метки — предупреждение и сбой, с (Д3а-R3)
+    HIST_WARN_S: int = 300
+    HIST_FAIL_S: int = 900
+    # опрос службы данных старше этого — «неизвестно»:
+    # max(120, CATALOG_DEADLINE_S + 2 × FRESH_POLL_S + 10) — задача 1 Д3а, шаг 5
+    HIST_STALE_S: int = 130
 
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:
@@ -67,6 +72,11 @@ class Settings:
             ZoneInfo(self.DISPLAY_TZ)
         except (ZoneInfoNotFoundError, ValueError) as e:
             raise ValueError(f"DISPLAY_TZ: неизвестный пояс {self.DISPLAY_TZ!r}") from e
+        # HIST_* правило срока такта не затрагивают: проверка историана — один HTTP-запрос
+        if not 0 < self.HIST_WARN_S < self.HIST_FAIL_S:
+            raise ValueError("нужно 0 < HIST_WARN_S < HIST_FAIL_S")
+        if self.HIST_STALE_S <= 0:
+            raise ValueError("HIST_STALE_S должен быть больше нуля")
 
     @property
     def tz(self) -> ZoneInfo:
@@ -122,6 +132,9 @@ def load_components(path: str) -> list[dict]:
         seen.add(c["id"])
         if kind == "container" and not CONTAINER_NAME.fullmatch(c["container"]):
             raise ValueError(f"components: чужое имя контейнера {c['container']!r}")
+        if "ok_detail" in c and (kind != "http" or not isinstance(c["ok_detail"], str)
+                                 or not c["ok_detail"].strip()):
+            raise ValueError(f"components: ok_detail у {c['id']!r} — только непустая строка вида http")
     return comps
 
 
@@ -143,7 +156,12 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
             c = check_memory(f.read(), settings.MEM_WARN_MIB, settings.MEM_FAIL_MIB)
         return Check(cid, title, c.state, c.detail)
     if kind == "http":
-        return check_http(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S)
+        return check_http(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S,
+                          ok_detail=comp.get("ok_detail", HTTP_OK_DETAIL))
+    if kind == "historian":
+        return check_historian(cid, title, comp["url"], now, settings.HIST_WARN_S,
+                               settings.HIST_FAIL_S, settings.HIST_STALE_S,
+                               timeout=NET_CHECK_TIMEOUT_S)
     if kind == "tls":
         return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
                          timeout=NET_CHECK_TIMEOUT_S)

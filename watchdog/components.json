@@ -13,7 +13,7 @@
   {"id": "student-08", "title": "Рабочее место 08", "kind": "container", "container": "pcbk-student-08", "sleeping_ok": true},
   {"id": "student-09", "title": "Рабочее место 09", "kind": "container", "container": "pcbk-student-09", "sleeping_ok": true},
   {"id": "student-10", "title": "Рабочее место 10", "kind": "container", "container": "pcbk-student-10", "sleeping_ok": true},
-  {"id": "core", "title": "Серверный слой", "kind": "absent"},
-  {"id": "historian", "title": "Историан БДРВ", "kind": "absent"},
+  {"id": "core", "title": "Служба данных", "kind": "http", "url": "http://pcbk-core:8000/healthz/data", "ok_detail": "жива"},
+  {"id": "historian", "title": "Историан БДРВ", "kind": "historian", "url": "http://pcbk-core:8000/health/historian"},
   {"id": "llm", "title": "OpenRouter и бюджет", "kind": "absent"}
 ]
