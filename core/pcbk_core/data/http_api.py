@@ -7,7 +7,7 @@
 
 Тело разбирает FastAPI по моделям ниже; его ошибки (битый JSON, лишние теги, неизвестный период)
 ловит validation_handler в том же порядке: 401, 503, иначе 422 с событием refused. BodyLimit
-стоит на всём приложении до маршрутизации: тело больше 64 КиБ — 413 и строка журнала, в том числе
+стоит на всём приложении до маршрутизации: тело больше MAX_BODY_BYTES — 413 и строка журнала, в том числе
 тело без длины. Оба крючка ставит DataRole.install — app.py не меняется.
 """
 import logging
@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 
 MAX_BODY_BYTES = 65536
 UNAUTHORIZED = {"detail": "нужен токен"}
-TOO_LARGE = {"detail": "тело запроса больше 64 КиБ"}
 PATH_LOG_CHARS = 100
 REASON_ERRORS = 3                       # ошибок разбора в тексте 422 — не больше
 # путь → инструмент
@@ -58,6 +57,11 @@ class TagPeriodArgs(BaseModel):
     period: Literal[PRESETS] | None = None
     start: str | None = None
     end: str | None = None
+
+
+def size_text(n: int) -> str:
+    """Предел тела словами: 65536 — «64 КиБ», не кратное КиБ — в байтах."""
+    return f"{n // 1024} КиБ" if n % 1024 == 0 else f"{n} байт"
 
 
 def safe_path(path: str) -> str:
@@ -96,7 +100,7 @@ def data_router(role: "DataRole") -> APIRouter:
         if refusal is not None:
             return refusal
         if role.config_error:
-            return JSONResponse(role.service.config_unavailable(caller, "http", "catalog_search", args.query),
+            return JSONResponse(await role.service.config_unavailable(caller, "http", "catalog_search", args.query),
                                 status_code=503)
         return JSONResponse(await role.service.catalog_search(caller, "http", args.query, args.limit))
 
@@ -106,7 +110,7 @@ def data_router(role: "DataRole") -> APIRouter:
         if refusal is not None:
             return refusal
         if role.config_error:
-            return JSONResponse(role.service.config_unavailable(caller, "http", "tag_now", args.tags),
+            return JSONResponse(await role.service.config_unavailable(caller, "http", "tag_now", args.tags),
                                 status_code=503)
         return JSONResponse(await role.service.tag_now(caller, "http", args.tags))
 
@@ -116,7 +120,7 @@ def data_router(role: "DataRole") -> APIRouter:
         if refusal is not None:
             return refusal
         if role.config_error:
-            return JSONResponse(role.service.config_unavailable(caller, "http", "tag_period", args.tags),
+            return JSONResponse(await role.service.config_unavailable(caller, "http", "tag_period", args.tags),
                                 status_code=503)
         return JSONResponse(await role.service.tag_period(caller, "http", args.tags, args.period, args.start,
                                                           args.end))
@@ -192,8 +196,10 @@ def validation_handler(role: "DataRole"):
             return unauthorized(path, "http")
         requested = requested_from_body(exc.body)
         if role.config_error:           # F5: и раньше 422
-            return JSONResponse(role.service.config_unavailable(caller, "http", tool, requested), status_code=503)
-        answer = role.service.refuse_args(caller, "http", tool, requested, validation_reason(list(exc.errors())))
+            return JSONResponse(await role.service.config_unavailable(caller, "http", tool, requested),
+                                status_code=503)
+        answer = await role.service.refuse_args(caller, "http", tool, requested,
+                                                validation_reason(list(exc.errors())))
         return JSONResponse(answer, status_code=422)
 
     return handle
@@ -210,6 +216,7 @@ class BodyLimit:
     def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES):
         self.app = app
         self.max_bytes = max_bytes
+        self.too_large = {"detail": f"тело запроса больше {size_text(max_bytes)}"}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -256,4 +263,4 @@ class BodyLimit:
 
     async def _too_large(self, scope: Scope, receive: Receive, send: Send) -> None:
         log.warning("outcome=too_large path=%s limit=%d", safe_path(scope.get("path", "")), self.max_bytes)
-        await JSONResponse(TOO_LARGE, status_code=413)(scope, receive, send)
+        await JSONResponse(self.too_large, status_code=413)(scope, receive, send)

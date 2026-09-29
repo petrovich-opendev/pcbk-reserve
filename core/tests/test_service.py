@@ -2,6 +2,7 @@
 import asyncio
 import json
 import sqlite3
+import threading
 from datetime import datetime
 
 import pytest
@@ -10,12 +11,12 @@ from fakes import LIVE_ROWS
 from helpers import make_role, make_service, sent_of
 from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data import service as service_module
-from pcbk_core.data.gate import GateRefused, GateResult
+from pcbk_core.data.gate import GateRefused, GateResult, SlidingWindow
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.periods import Period
 from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, ERROR_MESSAGE, ITEM_TEXTS, MESSAGES, NO_LAST_NOTE,
                                     OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE, SOURCE_LIVE, SOURCE_SUMMARY, STD_KIND)
-from pcbk_core.data.sql import HAS_LAST, clock_sql, live_sql
+from pcbk_core.data.sql import HAS_LAST, SUMMARY_COLUMNS, clock_sql, live_sql
 from pcbk_core.logs import setup_logging
 
 pytestmark = pytest.mark.anyio
@@ -97,7 +98,7 @@ async def test_config_error_never_enters_historian(tmp_path):                  #
     outs = [await s.catalog_search("student-01", "http", "расход"),
             await s.tag_now("student-01", "http", ["20FAKE_001_PV"]),
             await s.tag_period("student-01", "mcp", ["20FAKE_001_PV"], period="prev_shift"),
-            s.refuse_args("student-01", "mcp", "tag_now", ["x"], "tags: нужен список")]
+            await s.refuse_args("student-01", "mcp", "tag_now", ["x"], "tags: нужен список")]
     assert {(o["status"], o["message"]) for o in outs} == {("unavailable", "белый список не читается")}
     assert fake.calls == [] and role.gate.stats()["sent_names_total"] == 0      # ноль вызовов QueryFn
     events = role.events.recent()
@@ -372,7 +373,7 @@ async def test_argument_refusals_are_events(svc):
                                end="2026-10-02T06:00"),
             await s.catalog_search("student-01", "mcp", "", 10),
             await s.catalog_search("student-01", "mcp", "расход", 51),
-            s.refuse_args("student-01", "mcp", "tag_now", ["x"], "tags: нужен список")]
+            await s.refuse_args("student-01", "mcp", "tag_now", ["x"], "tags: нужен список")]
     assert all(o["status"] == "refused" and o["message"].startswith(MESSAGES["args"]) for o in outs)
     assert "позже текущего времени историана" in outs[4]["message"] and fake.calls == []
     events = s.role.events.recent()
@@ -403,3 +404,94 @@ async def test_flight_itself_refuses_summary_over_budget(svc):                # 
     with pytest.raises(RuntimeError):
         await s._read_summary(("20FAKE_001_PV", "20FAKE_002_SP"), over, "k", 3600)
     assert fake.calls == [] and len(s.cache) == 0
+
+
+# --- доводка по ревью задачи 5 ---
+
+async def test_cache_hit_age_is_per_call_asof_is_read_moment(svc):             # I1
+    s, fake = svc
+    fake.live["20FAKE_004_PV"] = (datetime(2026, 10, 1, 12, 1, 30), 3.2, 0)      # впереди часов на 90 с
+    miss = await s.tag_now("student-01", "http", ["20FAKE_001_PV", "20FAKE_004_PV", "25FAKE_007_CLS"])
+    s.role.monotonic.advance(10)
+    hit = await s.tag_now("student-02", "http", ["20FAKE_001_PV", "20FAKE_004_PV", "25FAKE_007_CLS"])
+    assert (miss["cache"], hit["cache"], hit["asof"]) == ("miss", "hit", miss["asof"])
+    assert [i["age_s"] for i in miss["items"]] == [42, 0, 1200]
+    assert [i["age_s"] for i in hit["items"]] == [52, 0, 1210]
+    assert hit["items"][1]["item_notes"] == ["метка тега впереди часов историана на 90 с"]   # от момента чтения
+    assert "не менялось 20 мин" in hit["items"][2]["item_notes"][0] and len(fake.calls) == 1
+
+
+def _duplicate_live(statements):
+    return GateResult(rows=[[LIVE_ROWS[0], LIVE_ROWS[0]]], sent=GATE_SENT)
+
+
+def _duplicate_summary(statements):
+    row = ("20FAKE_001_PV", *(1.0 for _ in SUMMARY_COLUMNS))
+    return GateResult(rows=[[row, ("20fake_001_pv", *row[1:])]], sent=GATE_SENT)    # повтор и без регистра
+
+
+@pytest.mark.parametrize("tool, answer", [("tag_now", _duplicate_live), ("tag_period", _duplicate_summary)])
+async def test_duplicate_tag_in_answer_is_error_after_send(svc, tool, answer):   # M1
+    s, _ = svc
+    stub_gate(s, answer)
+    kwargs = {"period": "prev_shift"} if tool == "tag_period" else {}
+    r = await getattr(s, tool)("student-01", "http", ["20FAKE_001_PV"], **kwargs)
+    e = s.role.events.recent()[0]
+    assert (r["status"], r["message"], e.outcome, e.sent) == ("error", ERROR_MESSAGE, "error", GATE_SENT)
+    assert "duplicate_tag" in e.summary and len(s.cache) == 0
+
+
+async def test_argument_refusals_count_as_calls(svc):                          # M2
+    s, _ = svc
+    s.per_caller = SlidingWindow(2, 300)
+    assert (await s.tag_now("student-01", "http", ["20FAKE_001_PV"]))["status"] == "ok"
+    assert (await s.refuse_args("student-01", "http", "tag_now", ["x"], "tags: нужен список"))["status"] == "refused"
+    over = await s.refuse_args("student-01", "http", "tag_now", ["x"], "tags: нужен список")
+    assert (over["status"], over["message"]) == ("rate", MESSAGES["rate"])
+    assert (await s.tag_now("student-01", "http", ["20FAKE_001_PV"]))["status"] == "rate"
+    assert [e.outcome for e in s.role.events.recent()] == ["rate", "rate", "refused", "ok"]
+
+
+async def test_period_syntax_errors_send_no_sql_even_with_stale_clock(svc):    # M3
+    s, fake = svc
+    s.role.monotonic.advance(301)                       # часы устарели: любой путь к периоду спросил бы их
+    cases = [dict(period="prev_shift", start="2026-10-01T10:00", end="2026-10-01T11:00"),
+             dict(start="вчера", end="2026-10-01T11:00"),
+             dict(start="2026-10-01T10:00"),
+             dict(start="2026-10-01T11:00", end="2026-10-01T10:00"),
+             dict(start="2026-10-01T10:00:00+05:00", end="2026-10-01T09:00"),      # с поясом и без — одна шкала
+             dict(start="2026-10-01T10:00", end="2026-10-01T10:00:30")]
+    for kwargs in cases:
+        r = await s.tag_period("student-01", "http", ["20FAKE_001_PV"], **kwargs)
+        assert r["status"] == "refused" and r["message"].startswith(MESSAGES["args"]), kwargs
+    assert fake.calls == []
+    future = await s.tag_period("student-01", "http", ["20FAKE_001_PV"], start="2026-10-02T00:00",
+                                end="2026-10-02T06:00")                          # нужно «сейчас» — часы спрошены
+    assert "позже текущего времени историана" in future["message"] and fake.calls == [[clock_sql()]]
+
+
+@pytest.mark.parametrize("tool", ["tag_now", "tag_period"])
+async def test_failure_after_gate_keeps_sent(svc, monkeypatch, tool):            # M4
+    s, fake = svc
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("кэш сломан")
+
+    monkeypatch.setattr(s.cache, "put", broken)
+    kwargs = {"period": "prev_shift"} if tool == "tag_period" else {}
+    r = await getattr(s, tool)("student-01", "http", ["20FAKE_001_PV"], **kwargs)
+    e = s.role.events.recent()[0]
+    assert (r["status"], e.outcome, e.sent, e.cache) == ("error", "error", ("20FAKE_001_PV",), "miss")
+    assert "RuntimeError" in e.summary and sent_of(fake) == ["20FAKE_001_PV"]
+
+
+async def test_refusal_events_are_written_off_loop(svc, tmp_path, monkeypatch):  # I2
+    s, _ = svc
+    broken, _ = make_role(db_dir=tmp_path / "cfg", config_error=CONFIG_ERRORS["bdrv_invalid"])
+    threads: list[int] = []
+    for events in (s.role.events, broken.events):
+        real = events.write
+        monkeypatch.setattr(events, "write", lambda e, real=real: threads.append(threading.get_ident()) or real(e))
+    await s.refuse_args("student-01", "http", "tag_now", ["x"], "tags: нужен список")
+    await broken.service.config_unavailable("student-01", "http", "tag_now", ["x"])
+    assert len(threads) == 2 and threading.get_ident() not in threads           # SQLite — не в потоке цикла

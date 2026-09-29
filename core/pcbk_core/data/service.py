@@ -160,8 +160,8 @@ class _Refusal(Exception):
 
 
 class _AfterSend(Exception):
-    """Ответ ворот не того вида: SQL уже ушёл — событие ведущего несёт sent ворот. Текст исходной
-    ошибки сюда не идёт, только её класс."""
+    """Сбой после ответа ворот (ответ не того вида, часы, кэш): SQL уже ушёл — событие ведущего несёт
+    sent ворот. Текст исходной ошибки сюда не идёт, только её код или класс."""
 
     def __init__(self, kind: str, sent: tuple[str, ...]):
         super().__init__(kind)
@@ -283,17 +283,58 @@ def _percent(value: float) -> str:
     return f"{math.floor(value * 10) / 10:g}".replace(".", ",")
 
 
+class _BadAnswer(ValueError):
+    """Ответ историана не того вида; code — для события и журнала (без строк ответа)."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
 def _rows_by_name(rows: object, width: int) -> Mapping[str, Row]:
-    """Строки ответа по имени тега в верхнем регистре; строка не той ширины — ValueError."""
+    """Строки ответа по имени тега в верхнем регистре. Не список, строка не той ширины или повтор имени
+    — _BadAnswer: какую из двух строк считать ответом, служба не выбирает."""
     if not isinstance(rows, list):
-        raise ValueError("ответ не список строк")
+        raise _BadAnswer("not_list")
     out: dict[str, Row] = {}
     for row in rows:
         row = tuple(row)
         if len(row) != width or not isinstance(row[0], str):
-            raise ValueError("строка ответа не того вида")
-        out.setdefault(row[0].upper(), row)
+            raise _BadAnswer("row_shape")
+        key = row[0].upper()
+        if key in out:
+            raise _BadAnswer("duplicate_tag")
+        out[key] = row
     return MappingProxyType(out)
+
+
+def _after_send(result: Any, keep: Callable[[], Snapshot]) -> Snapshot:
+    """Всё, что после ответа ворот (разбор, часы, кэш): сбой — _AfterSend с sent ворот, SQL уже ушёл.
+
+    Ошибка бросается после блока: без исходного исключения в __context__; дальше идёт только код или класс.
+    """
+    try:
+        return keep()
+    except Exception as exc:
+        failure = _AfterSend(exc.code if isinstance(exc, _BadAnswer) else type(exc).__name__,
+                             tuple(getattr(result, "sent", ()) or ()))
+    raise failure
+
+
+# ошибки периода без «сейчас»: resolve_period с «сейчас» так далеко, что проверки против него не срабатывают
+_FAR_NOW = datetime(9000, 1, 1)
+
+
+def _period_syntax(preset: str | None, start: str | None, end: str | None, offset: timedelta) -> str | None:
+    """Период задан двумя способами, дата не разобрана, конец раньше начала, короче минуты, раньше 2000
+    года — текст отказа; иначе None. Проверки против «сейчас» (начало в будущем, отсечка) — позже."""
+    if preset is not None and start is None and end is None:
+        return None                         # готовый период: всё, что не зависит от «сейчас», уже проверено
+    try:
+        resolve_period(_FAR_NOW, offset, preset, start, end)
+    except PeriodError as err:
+        return str(err)
+    return None
 
 
 def _other_item(entry: _Entry) -> dict[str, Any]:
@@ -333,51 +374,48 @@ class DataService:
 
     async def catalog_search(self, caller: str, channel: Channel, query: str, limit: int = 10) -> dict[str, Any]:
         if self.role.config_error:          # F5: первая строка — ни частоты, ни каталога, ни ворот
-            return self.config_unavailable(caller, channel, "catalog_search", query)
+            return await self.config_unavailable(caller, channel, "catalog_search", query)
         call = self._call(caller, channel, "catalog_search", query)
         return await self._run(call, self._catalog_search(call, query, limit))
 
     async def tag_now(self, caller: str, channel: Channel, tags: list[str]) -> dict[str, Any]:
         if self.role.config_error:          # F5
-            return self.config_unavailable(caller, channel, "tag_now", tags)
+            return await self.config_unavailable(caller, channel, "tag_now", tags)
         call = self._call(caller, channel, "tag_now", tags)
         return await self._run(call, self._tag_now(call, tags))
 
     async def tag_period(self, caller: str, channel: Channel, tags: list[str], period: str | None = None,
                          start: str | None = None, end: str | None = None) -> dict[str, Any]:
         if self.role.config_error:          # F5
-            return self.config_unavailable(caller, channel, "tag_period", tags)
+            return await self.config_unavailable(caller, channel, "tag_period", tags)
         call = self._call(caller, channel, "tag_period", tags)
         return await self._run(call, self._tag_period(call, tags, period, start, end))
 
-    def refuse_args(self, caller: str, channel: Channel, tool: str, requested: Sequence[str],
-                    reason: str) -> dict[str, Any]:
+    async def refuse_args(self, caller: str, channel: Channel, tool: str, requested: Sequence[str],
+                          reason: str) -> dict[str, Any]:
         """Отказ по аргументам, найденный до инструмента (HTTP 422, MCP): событие refused.
 
-        Синхронный (его зовут обработчики ошибок разбора): событие пишется сразу, блокировку SQLite
-        запись ждёт не дольше WRITE_TIMEOUT_S; сбой записи ответ не ломает.
+        Сразу после ошибки настройки — частота вызывающего: отказ по аргументам — тоже вызов.
         """
         if self.role.config_error:          # F5
-            return self.config_unavailable(caller, channel, tool, requested)
+            return await self.config_unavailable(caller, channel, tool, requested)
         call = self._call(caller, channel, tool, requested)
-        call.summary = "args: " + reason
-        answer = {"tool": tool, "status": "refused", "message": MESSAGES["args"] + reason, "notes": [],
-                  "cache": "none"}
-        return self._finish_sync(call, answer)
+        return await self._run(call, self._refuse_args(call, reason))
 
-    def config_unavailable(self, caller: str, channel: Channel, tool: str,
-                           requested: Sequence[str]) -> dict[str, Any]:
-        """Ошибка настройки (F5): unavailable с причиной Д3а; историан не трогается, sent пуст.
-
-        Синхронный, как refuse_args: событие пишется сразу, не дольше WRITE_TIMEOUT_S ожидания блокировки.
-        """
+    async def config_unavailable(self, caller: str, channel: Channel, tool: str,
+                                 requested: Sequence[str]) -> dict[str, Any]:
+        """Ошибка настройки (F5): unavailable с причиной Д3а; историан не трогается, sent пуст."""
         call = self._call(caller, channel, tool, requested)
         call.summary = CONFIG_SUMMARY
         answer = {"tool": tool, "status": "unavailable", "message": self.role.config_error or "", "notes": [],
                   "cache": "none"}
-        return self._finish_sync(call, answer)
+        return await self._finish(call, answer)
 
     # --- тела инструментов: отказ — _Refusal, ответ собирает _run ---
+
+    async def _refuse_args(self, call: _Call, reason: str) -> dict[str, Any]:
+        self._check_rate(call)
+        raise _args_refusal(reason)
 
     async def _catalog_search(self, call: _Call, query: str, limit: int) -> dict[str, Any]:
         self._check_rate(call)
@@ -410,7 +448,9 @@ class DataService:
             raise _Refusal("refused", MESSAGES["none"], "none: " + _counts(items), extra={"items": items})
         key = cache_key("tag_now", names, None, None)
         snap = await self._fetch(call, key, lambda: self._read_live(names, key))
-        items = [self._now_item(e, snap) for e in entries]
+        # «сейчас» — один раз на вызов: у попадания в кэш возраст растёт, asof — момент чтения Live
+        now = self.role.clock.aware(self._hist_now())
+        items = [self._now_item(e, snap, now) for e in entries]
         call.tags = tuple(i["tag"] for i in items if i["status"] in _DATA_STATUSES)
         call.summary = _counts(items)
         return {"tool": "tag_now", "status": "ok" if all(i["status"] == "ok" for i in items) else "partial",
@@ -423,7 +463,13 @@ class DataService:
         reason = _tags_problem(tags) or _period_problem(preset, start, end)
         if reason:
             raise _args_refusal(reason)
-        entries = _resolve(self._loaded_catalog(), tags)
+        catalog = self._loaded_catalog()
+        # ошибки периода, которым не нужно «сейчас», — до запроса часов: такой отказ не шлёт SQL
+        known = self.role.clock
+        reason = _period_syntax(preset, start, end, known.offset if known is not None else timedelta(0))
+        if reason:
+            raise _args_refusal(reason)
+        entries = _resolve(catalog, tags)
         names = tuple(e.lookup.info.name for e in entries
                       if e.lookup.status == "ok" and e.lookup.info.kind == "analog")
         if not names:
@@ -530,7 +576,7 @@ class DataService:
             raise _refusal(err) from None
         except _AfterSend as err:
             call.sent = err.sent if led else ()
-            raise _Refusal("error", ERROR_MESSAGE, f"ответ историана не того вида ({err.kind})",
+            raise _Refusal("error", ERROR_MESSAGE, f"сбой после ответа историана ({err.kind})",
                            error=err.kind) from None
         finally:
             call.cache = "miss" if led else "shared"
@@ -542,37 +588,36 @@ class DataService:
         """Работа полёта tag_now: Live по именам; удачный снимок — в кэш на TTL_NOW_S."""
         await self._fresh_clock()
         result = await self.role.gate.run([live_sql(names)])
-        clock = self.role.clock                 # опрос свежести мог обновить часы, пока шёл запрос
-        asof = clock.aware(self._hist_now())    # возраст — от момента ответа, а не от начала ожидания
-        snap = self._snapshot(result, 4, asof=asof, tz=clock.tz_label)
-        self.cache.put(key, snap, ttl_for("tag_now", None, asof), self.role.monotonic())
-        return snap
+
+        def keep() -> Snapshot:
+            clock = self.role.clock                 # опрос свежести мог обновить часы, пока шёл запрос
+            asof = clock.aware(self._hist_now())    # момент чтения Live
+            snap = Snapshot(rows=_rows_by_name(result.rows[0], 4), sent=tuple(result.sent),
+                            count=len(result.rows[0]), asof=asof, tz=clock.tz_label)
+            self.cache.put(key, snap, ttl_for("tag_now", None, asof), self.role.monotonic())
+            return snap
+
+        return _after_send(result, keep)
 
     async def _read_summary(self, names: tuple[str, ...], period: Period, key: str, ttl: float) -> Snapshot:
         """Работа полёта tag_period: сводка одной корзиной; удачный снимок — в кэш на ttl."""
         if check_budget(len(names), period.start, period.end) is not None:   # защита: только после бюджета
             raise RuntimeError("сводка без проверки бюджета")
         result = await self.role.gate.run([summary_sql(names, period.start, period.end)])
-        snap = self._snapshot(result, 1 + len(SUMMARY_COLUMNS), open=period.open)
-        self.cache.put(key, snap, ttl, self.role.monotonic())
-        return snap
 
-    @staticmethod
-    def _snapshot(result: Any, width: int, **fields: Any) -> Snapshot:
-        failure: _AfterSend | None = None
-        try:
-            rows = result.rows[0]
-            snap = Snapshot(rows=_rows_by_name(rows, width), sent=tuple(result.sent), count=len(rows), **fields)
-        except Exception as exc:            # SQL ушёл: ведущий получит sent ворот; текст — не дальше класса
-            failure = _AfterSend(type(exc).__name__, tuple(result.sent))
-        if failure is not None:
-            raise failure
-        return snap
+        def keep() -> Snapshot:
+            snap = Snapshot(rows=_rows_by_name(result.rows[0], 1 + len(SUMMARY_COLUMNS)), sent=tuple(result.sent),
+                            count=len(result.rows[0]), open=period.open)
+            self.cache.put(key, snap, ttl, self.role.monotonic())
+            return snap
+
+        return _after_send(result, keep)
 
     # --- сборка ответа ---
 
     @staticmethod
-    def _now_item(entry: _Entry, snap: Snapshot) -> dict[str, Any]:
+    def _now_item(entry: _Entry, snap: Snapshot, now: datetime) -> dict[str, Any]:
+        """age_s и «не менялось» — от now этого вызова; «метка впереди» — от snap.asof, момента чтения."""
         if entry.lookup.status != "ok":
             return _other_item(entry)
         info = entry.lookup.info
@@ -587,10 +632,10 @@ class DataService:
         age = None
         notes: list[str] = []
         if when is not None:
-            delta = (snap.asof - when).total_seconds()
-            age = max(0, int(delta))
-            if -delta > AHEAD_NOTE_S:
-                notes.append(f"метка тега впереди часов историана на {round(-delta)} с")
+            age = max(0, int((now - when).total_seconds()))
+            ahead = (when - snap.asof).total_seconds()
+            if ahead > AHEAD_NOTE_S:
+                notes.append(f"метка тега впереди часов историана на {round(ahead)} с")
             if status == "ok" and age > STILL_NOTE_S:
                 notes.append(f"значение не менялось {age // 60} мин: это и ровный процесс, и возможное "
                              "залипание — смотрите качество")
@@ -650,21 +695,14 @@ class DataService:
             call.summary = f"непредвиденный сбой ({error})"
             answer = {"tool": call.tool, "status": "error", "message": ERROR_MESSAGE, "notes": [],
                       "cache": call.cache}
-        event = self._event(call, answer["status"])
-        if event is not None:
-            await self.role._write_event(event)     # в потоке; сбой записи ответ не ломает (health покажет)
-        self._log(call, answer["status"], error)
-        return answer
+        return await self._finish(call, answer, error)
 
-    def _finish_sync(self, call: _Call, answer: dict[str, Any]) -> dict[str, Any]:
+    async def _finish(self, call: _Call, answer: dict[str, Any], error: str | None = None) -> dict[str, Any]:
+        """Событие — в потоке (asyncio.to_thread роли), SQLite не в цикле; сбой записи ответ не ломает."""
         event = self._event(call, answer["status"])
         if event is not None:
-            try:
-                self.role.events.write(event)
-            except Exception:
-                if self.role.events.consecutive_failures == 1:
-                    log.error("журнал событий: запись не удалась (%s)", self.role.events.last_error)
-        self._log(call, answer["status"])
+            await self.role._write_event(event)
+        self._log(call, answer["status"], error)
         return answer
 
     def _event(self, call: _Call, outcome: Outcome) -> CallEvent | None:

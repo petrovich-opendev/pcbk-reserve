@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from helpers import SETTINGS, TOKEN, make_app, make_role, wait_until
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS
-from pcbk_core.data.http_api import MAX_BODY_BYTES
+from pcbk_core.data.http_api import MAX_BODY_BYTES, BodyLimit
 from pcbk_core.logs import setup_logging
 
 
@@ -109,7 +109,8 @@ def test_body_exactly_at_limit_passes(tmp_path):
     with TestClient(app) as c:
         wait_until(lambda: role.catalog.loaded)
         assert c.post("/api/data/tag_now", content=body, headers=auth).status_code == 200
-        assert c.post("/api/data/tag_now", content=body + b" ", headers=auth).status_code == 413
+        over = c.post("/api/data/tag_now", content=body + b" ", headers=auth)
+        assert (over.status_code, over.json()) == (413, {"detail": "тело запроса больше 64 КиБ"})
         assert c.get("/healthz/data").status_code == 200                    # GET без тела проходит звено
 
 
@@ -121,3 +122,16 @@ def test_unknown_data_path_and_get_are_not_tools(tmp_path):
         assert c.get("/api/data/tag_now", headers=auth).status_code == 405
         assert c.post("/api/data/tag_now/", json={"tags": ["x"]}, headers=auth).status_code == 404
     assert role.events.count(channel="http") == 0
+
+
+async def _echo(scope, receive, send):
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b"ok"})
+
+
+def test_413_text_follows_limit():                                               # M5
+    for limit, text in ((2048, "2 КиБ"), (100, "100 байт")):
+        c = TestClient(BodyLimit(_echo, max_bytes=limit))                 # без lifespan: звено без приложения
+        assert c.post("/x", content=b"x" * limit).status_code == 200
+        r = c.post("/x", content=b"x" * (limit + 1))
+        assert (r.status_code, r.json()) == (413, {"detail": f"тело запроса больше {text}"})
