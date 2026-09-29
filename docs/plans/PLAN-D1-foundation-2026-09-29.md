@@ -267,7 +267,7 @@ git commit -m "Д1: утренняя проба — gVisor через reload, Op
 - Produces:
   - `State = Literal["ok", "warn", "fail", "absent", "unknown"]`
   - `@dataclass(frozen=True) class Check: component: str; title: str; state: State; detail: str`
-  - `check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Check` — компонент `memory`, по полю `MemAvailable`
+  - `check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Check` — компонент `memory`, по полю `MemAvailable`; `ok` — «свободно N МиБ», `warn`/`fail` — постоянный текст «свободно меньше <порог> МиБ» (иначе журнал пишет событие каждый такт)
   - `check_container(component: str, title: str, inspect: dict | None, *, sleeping_ok: bool, now: datetime) -> Check`
   - `check_http(component: str, title: str, url: str, timeout: float = 3.0) -> Check`
   - `tls_verdict(not_after: datetime, now: datetime, warn_days: int = 14) -> tuple[State, str]` — `ok` «сертификат до ДД.ММ.ГГГГ (N дн.)», `warn` при N < 14, `fail` «сертификат истёк ДД.ММ.ГГГГ»
@@ -275,7 +275,8 @@ git commit -m "Д1: утренняя проба — gVisor через reload, Op
     рукопожатие с `CERT_REQUIRED`, доверие — только `cafile` (тот же
     `cert.pem`, что у `edge`), `VERIFY_X509_PARTIAL_CHAIN`, без проверки
     имени; удалось → `tls_verdict` по `notAfter`; ошибка проверки с кодом
-    «истёк» → `fail` «сертификат истёк»; иная ошибка проверки → `fail`
+    10 → `fail` «сертификат истёк»; код 9 → `fail` «сертификат ещё не
+    действителен»; иная ошибка проверки → `fail`
     «отдаёт не тот сертификат»; нет соединения → `fail` «не отвечает»
   - `not_installed(component: str, title: str) -> Check` — `state="absent"`, `detail="ещё не установлен"`
   - `RECENT_RESTART = timedelta(minutes=15)`, `CRASH_LOOP_RESTARTS = 3`
@@ -295,7 +296,7 @@ git commit -m "Д1: утренняя проба — gVisor через reload, Op
 | `Paused` | `fail` «приостановлен» |
 | `Running` или `Restarting`, `RestartCount` ≥ 3 и `StartedAt` моложе `RECENT_RESTART` | `fail` «падает в цикле: N перезапусков» |
 | `Restarting` (Docker ставит и `Running`) | `warn` «перезапускается» |
-| `Running`, `RestartCount` > 0 и `StartedAt` моложе `RECENT_RESTART` | `warn` «перезапущен после сбоя в ЧЧ:ММ (N с последнего запуска)» |
+| `Running`, `RestartCount` > 0 и `StartedAt` моложе `RECENT_RESTART` | `warn` «перезапущен после сбоя в ЧЧ:ММ UTC±ЧЧ:ММ (N с последнего запуска)» — время в поясе `now` |
 | `Running` | `ok` «работает» (при `RestartCount` > 0 — «работает, сбоев с последнего запуска: N») |
 | остановлен, `OOMKilled` | `fail` «убит по памяти» |
 | остановлен, `State.Error` не пуст | `fail` «не запускается: <первые 80 знаков ошибки>» |
