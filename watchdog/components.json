@@ -1,0 +1,19 @@
+[
+  {"id": "edge", "title": "Входной прокси", "kind": "tls", "host": "pcbk-edge", "port": 8443},
+  {"id": "sp-ro", "title": "Прокси сокета сторожа", "kind": "docker_ping"},
+  {"id": "sp-ctl", "title": "Прокси сокета серверного слоя", "kind": "container", "container": "pcbk-sp-ctl", "sleeping_ok": false},
+  {"id": "memory", "title": "Память сервера", "kind": "memory"},
+  {"id": "student-01", "title": "Рабочее место 01", "kind": "absent"},
+  {"id": "student-02", "title": "Рабочее место 02", "kind": "absent"},
+  {"id": "student-03", "title": "Рабочее место 03", "kind": "absent"},
+  {"id": "student-04", "title": "Рабочее место 04", "kind": "absent"},
+  {"id": "student-05", "title": "Рабочее место 05", "kind": "absent"},
+  {"id": "student-06", "title": "Рабочее место 06", "kind": "absent"},
+  {"id": "student-07", "title": "Рабочее место 07", "kind": "absent"},
+  {"id": "student-08", "title": "Рабочее место 08", "kind": "absent"},
+  {"id": "student-09", "title": "Рабочее место 09", "kind": "absent"},
+  {"id": "student-10", "title": "Рабочее место 10", "kind": "absent"},
+  {"id": "core", "title": "Серверный слой", "kind": "absent"},
+  {"id": "historian", "title": "Историан БДРВ", "kind": "absent"},
+  {"id": "llm", "title": "OpenRouter и бюджет", "kind": "absent"}
+]

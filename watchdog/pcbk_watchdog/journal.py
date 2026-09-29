@@ -51,6 +51,18 @@ class Journal:
             return True
         return check.state in ("warn", "fail") and last[1] != check.detail
 
+    def probe(self) -> None:
+        """Пробная запись с откатом; бросает, если журнал нельзя писать."""
+        # одного BEGIN IMMEDIATE мало: на файле только для чтения он проходит
+        db = sqlite3.connect(self._path, timeout=5, isolation_level=None)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT INTO events (ts, component, state, detail)"
+                       " VALUES ('', 'probe', 'ok', '')")
+            db.execute("ROLLBACK")
+        finally:
+            db.close()   # при ошибке незавершённая проба откатывается при закрытии
+
     def started(self, now: datetime) -> Event:
         event = Event(now, "watchdog", "ok", "сторож запущен")
         self._append([event])

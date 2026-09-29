@@ -1,16 +1,21 @@
-"""Фикстуры сторожа: двойник прокси сокета sp-ro и локальный TLS-сервер."""
+"""Фикстуры сторожа: двойники прокси сокета sp-ro, локальный TLS-сервер, страница для браузера."""
 import json
 import socket
 import ssl
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from helpers import insp
+from helpers import insp, now_utc
+from pcbk_watchdog.checks import Check
+from pcbk_watchdog.page import Snapshot, render_html
 
 # ответы двойника sp-ro: путь → (код, тело)
 PROXY_ROUTES = {
@@ -121,3 +126,102 @@ def future_tls_server(tmp_path):   # сертификат ещё не вступ
 def other_cert(tmp_path):
     cert, _ = self_signed(tmp_path, "other")
     return cert
+
+
+@contextmanager
+def serve_http(handler):
+    """HTTP-двойник на 127.0.0.1 и свободном порту."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.fixture
+def silent_proxy_url():
+    """Сокет принимает соединения и молчит — повисший прокси."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.05)
+    stop, conns = threading.Event(), []
+
+    def accept():
+        while not stop.is_set():
+            try:
+                conns.append(listener.accept()[0])
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+
+    thread = threading.Thread(target=accept, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+    stop.set()
+    thread.join()
+    for conn in conns:
+        conn.close()
+    listener.close()
+
+
+# задержка ответа медленного прокси, с
+SLOW_REPLY_S = 0.3
+
+
+@pytest.fixture
+def slow_proxy_url():
+    """Прокси отвечает верно, но каждый ответ — через SLOW_REPLY_S."""
+    body = json.dumps(insp(running=True)).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(SLOW_REPLY_S)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    with serve_http(Handler) as url:
+        yield url
+
+
+STATUS_JS = Path(__file__).parent.parent / "pcbk_watchdog" / "static" / "status.js"
+
+
+@pytest.fixture
+def fake_page_server():
+    """Свежая страница (полоса скрыта), а /status.json уже говорит stale: true."""
+    now = now_utc()
+    html = render_html(Snapshot(now, (Check("edge", "Входной прокси", "ok", "отвечает"),)),
+                       [], now, 30, ZoneInfo("UTC")).encode()
+    stale = json.dumps({"checked_at": None, "stale": True, "stale_after_s": 30,
+                        "overall": "unknown", "checks": []}).encode()
+    routes = {"/status": ("text/html; charset=utf-8", html),
+              "/status.js": ("text/javascript; charset=utf-8", STATUS_JS.read_bytes()),
+              "/status.json": ("application/json", stale)}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in routes:
+                self.send_error(404)
+                return
+            ctype, body = routes[self.path]
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    with serve_http(Handler) as url:
+        yield SimpleNamespace(url=url)

@@ -1,4 +1,7 @@
+import sqlite3
 from datetime import timedelta
+
+import pytest
 
 from helpers import T0
 from pcbk_watchdog.checks import Check, check_memory
@@ -39,3 +42,12 @@ def test_memory_pressure_writes_one_event(tmp_path):
     events = (j.record([check_memory(meminfo.format(1_500 * 1024))], T0)
               + j.record([check_memory(meminfo.format(1_400 * 1024))], T0 + timedelta(seconds=10)))
     assert [(e.component, e.state) for e in events] == [("memory", "warn")]
+
+
+def test_probe_leaves_no_rows_and_fails_on_readonly(tmp_path):
+    j = Journal(str(tmp_path / "j.db"))
+    j.probe()
+    assert j.recent() == []                 # проба откатывается
+    (tmp_path / "j.db").chmod(0o400)
+    with pytest.raises(sqlite3.OperationalError):
+        j.probe()

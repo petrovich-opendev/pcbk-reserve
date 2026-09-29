@@ -1,0 +1,5 @@
+# в образ — только пакет и components.json, без кэшей хоста
+*
+!components.json
+!pcbk_watchdog/
+**/__pycache__
