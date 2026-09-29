@@ -294,7 +294,7 @@ git commit -m "Д1: утренняя проба — gVisor через reload, Op
 |---|---|
 | нет контейнера (`None`) | `fail` «нет контейнера» |
 | `Paused` | `fail` «приостановлен» |
-| `Running` или `Restarting`, `RestartCount` ≥ 3 и `StartedAt` моложе `RECENT_RESTART` | `fail` «падает в цикле: N перезапусков» |
+| `Running` или `Restarting`, `RestartCount` ≥ 3 и `StartedAt` моложе `RECENT_RESTART` | `fail` «падает в цикле (перезапуски подряд)» |
 | `Restarting` (Docker ставит и `Running`) | `warn` «перезапускается» |
 | `Running`, `RestartCount` > 0 и `StartedAt` моложе `RECENT_RESTART` | `warn` «перезапущен после сбоя в ЧЧ:ММ UTC±ЧЧ:ММ (N с последнего запуска)» — время в поясе `now` |
 | `Running` | `ok` «работает» (при `RestartCount` > 0 — «работает, сбоев с последнего запуска: N») |

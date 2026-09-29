@@ -686,7 +686,7 @@ git commit -m "Образ рабочего места: OpenCode 1.18.33 по sha
 |---|---|
 | нет контейнера (`None`) | `fail` «нет контейнера» |
 | `Paused` | `fail` «приостановлен» |
-| `Running` или `Restarting`, `RestartCount` ≥ 3 и `StartedAt` моложе `RECENT_RESTART` | `fail` «падает в цикле: N перезапусков» |
+| `Running` или `Restarting`, `RestartCount` ≥ 3 и `StartedAt` моложе `RECENT_RESTART` | `fail` «падает в цикле (перезапуски подряд)» |
 | `Restarting` (Docker ставит и `Running`) | `warn` «перезапускается» |
 | **`Running`, есть `State.Health`, позднейшее из `End` записей `Health.Log` и `StartedAt` старше `HEALTH_SILENCE` (Д2)** | **`fail` «проверка здоровья молчит»** |
 | **`Running` и `State.Health.Status == "unhealthy"` (Д2)** | **`fail` «OpenCode не отвечает»** |
