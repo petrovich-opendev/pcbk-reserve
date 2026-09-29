@@ -4,12 +4,14 @@ import time
 from datetime import datetime
 
 import anyio
+import pytds
 import pytest
 
-from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian
+from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian, RecordingConnect
 from helpers import FakeMono
 from pcbk_core.data.gate import AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
-from pcbk_core.data.historian import HistorianError
+from pcbk_core.data.historian import HistorianError, tds_query
+from pcbk_core.secrets import BdrvConfig
 from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, lit_dt, live_all_sql, live_sql, summary_sql
 from pcbk_core.logs import setup_logging
 
@@ -150,6 +152,22 @@ async def test_auth_error_latches_until_restart():                              
         assert e.value.code == "auth"
         mono.advance(10 ** 6)                                               # время защёлку не снимает
     assert len(fake.calls) == 1 and g.stats()["auth_latched"] is True
+
+
+async def test_sql_browser_login_error_pauses_not_latches():                  # ревью: LoginError — не пароль
+    mono = FakeMono(1000.0)
+    rec = RecordingConnect(fail_on_connect=pytds.LoginError("Instance INST not found on server h"))
+    g = gate(tds_query(BdrvConfig("h\\INST", None, "Runtime", "u", "p"), connect=rec), monotonic=mono)
+    with pytest.raises(HistorianError) as e:
+        await g.run([clock_sql()], lane="background")
+    assert e.value.code == "connect" and g.stats()["auth_latched"] is False
+    with pytest.raises(HistorianError) as e:
+        await g.run([clock_sql()], lane="background")
+    assert e.value.detail == "пауза после обрыва" and rec.connect_count == 1
+    mono.advance(CONNECT_COOLDOWN_S)
+    rec.fail_on_connect, rec.results = None, [CLOCK_ROWS]
+    assert (await g.run([clock_sql()], lane="background")).rows == [CLOCK_ROWS]
+    assert rec.connect_count == 2 and g.stats()["auth_latched"] is False
 
 
 async def test_connect_failure_pauses_attempts():

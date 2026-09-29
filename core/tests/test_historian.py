@@ -1,12 +1,15 @@
 """Соединение python-tds: аргументы входа, прелюдия, срок, разбор ошибок; часы историана."""
 import importlib.metadata
 import inspect
+import pathlib
+import re
 import socket
 from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytds
 import pytds.connection
+import pytds.instance_browser_client
 import pytds.tds_socket
 import pytest
 
@@ -31,7 +34,8 @@ def test_connect_args_prelude_one_argument_and_deadline_timeout():
 
 
 @pytest.mark.parametrize("where,exc,code", [
-    ("connect", pytds.LoginError("Login failed"), "auth"),
+    # LoginError у pytds 1.17.1 — только от SQL Browser: вход не начинался, это связь
+    ("connect", pytds.LoginError("Instance INST not found on server h"), "connect"),
     ("connect", auth_operational_error(18456), "auth"),          # OperationalError с msg_no
     ("connect", auth_operational_error(18452), "auth"),
     ("connect", ConnectionRefusedError(), "connect"),
@@ -128,3 +132,30 @@ def test_read_timeout_path_matches_pinned_pytds():
     assert importlib.metadata.version("python-tds") == "1.17.1"
     assert "self._tds_socket" in inspect.getsource(pytds.connection.BaseConnection.__init__)
     assert "self.sock = sock" in inspect.getsource(pytds.tds_socket._TdsSocket.__init__)
+
+
+# ревью: LoginError — это SQL Browser («экземпляр не найден», «нет TCP»), а не отказ учётных данных
+
+
+@pytest.mark.parametrize("text", ["Instance INST not found on server h",
+                                  "Instance INST doen't have tcp connections enabled"])
+def test_sql_browser_login_error_is_connect_not_auth(text):
+    rec = RecordingConnect(fail_on_connect=pytds.LoginError(text))
+    with pytest.raises(HistorianError) as e:
+        tds_query(replace(CFG, host="h\\INST", port=None), connect=rec)(["SELECT 1"], 15.0)
+    err = e.value
+    assert err.code == "connect" and err.public() == "connect LoginError" and err.msg_no is None
+    assert text in err.detail and text not in str(err)
+    assert err.__cause__ is None and err.__context__ is None and rec.connect_count == 1
+
+
+def test_login_error_comes_only_from_sql_browser_in_pinned_pytds():
+    # неверный пароль приходит от сервера как OperationalError с msg_no (tds_base._create_exception_by_message);
+    # LoginError бросает только resolve_instance_port клиента SQL Browser — до входа
+    assert importlib.metadata.version("python-tds") == "1.17.1"
+    root = pathlib.Path(pytds.__file__).parent
+    raisers = {p.name for p in root.glob("*.py")
+               if re.search(r"(?<!class )\bLoginError\(", p.read_text(encoding="utf-8"))}
+    assert raisers == {"instance_browser_client.py"}
+    assert "LoginError" in inspect.getsource(pytds.instance_browser_client.resolve_instance_port)
+    assert pytds.LoginError("x").msg_no == 0                        # без номера сообщения SQL Server
