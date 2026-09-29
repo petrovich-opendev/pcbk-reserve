@@ -47,12 +47,15 @@ gVisor, каждое в своей изолированной сети; стра
   В `Config.Env` пароля нет — `sp-ro` его не покажет.
 * `HEALTHCHECK` каждые 30 с: `GET /global/health` на `127.0.0.1:4096` с
   Basic из файла пароля (bash `/dev/tcp`, `base64`), таймаут 5 с,
-  `start_period` 20 с. Сторож: `State.Health.Status == "unhealthy"` →
-  `fail` «OpenCode не отвечает» (строка в таблицу `check_container`, тест).
+  `start_period` 20 с; скрипт печатает только код ответа (вывод попадает в
+  `State.Health.Log`, а его видит сторож через `sp-ro`). Сторож:
+  `State.Health.Status == "unhealthy"` → `fail` «OpenCode не отвечает»
+  (строка в таблицу `check_container`, тест).
 * `opencode.json`: `autoupdate: false`, `share: "disabled"`,
   `snapshot: false`, `enabled_providers: ["pcbk"]`, провайдер `pcbk`
-  (`@ai-sdk/openai-compatible`, `baseURL` и `apiKey` через `{env:…}`, модель
-  `stub`); ключей `mcp`, `lsp`, `formatter`, `plugin` нет — MCP и модели в Д4.
+  (`@ai-sdk/openai-compatible`, `baseURL` — адрес `core`, `apiKey` —
+  `{file:/run/secrets/llm-token}`, модель `stub`); ключей `mcp`, `lsp`,
+  `formatter`, `plugin` нет — MCP и модели в Д4, токен MCP тоже файлом.
 * Заглушки `bash`, `edit`, `write`, `apply_patch` — `export default` без
   импортов, `args: {}`, описание начинается «Отключено на учебном стенде».
 
@@ -64,8 +67,10 @@ gVisor, каждое в своей изолированной сети; стра
   (под gVisor DNS Docker не работает). Подсеть проверяется на пересечение
   утром (как в Д1, задача 0).
 * Место: `runtime: runsc`, `read_only`, `cap_drop: [ALL]`, `no-new-privileges`,
-  `mem_limit: 1g`, `cpus: 1.0`, `pids_limit` — по замеру пробы Д1 (не меньше
-  нескольких сотен), `restart: unless-stopped`, `stop_grace_period: 10s`,
+  `mem_limit: 1g`, `cpus: 1.0`, `pids_limit` — начальное значение по замеру
+  пробы Д1, уточняется собственным замером Д2 (не меньше нескольких сотен),
+  `restart: unless-stopped`, `stop_grace_period: 10s`, `profiles: [students]`
+  (команда выкладки Д1 без имён служб их не поднимет),
   тома `pcbk-student-NN-state`, `pcbk-student-NN-work`, агенты
   `${AGENTS_DIR}/student-NN` → `:ro` на `/etc/pcbk-opencode/opencode/agents`,
   `labels: {pcbk.role: student}`, `pull_policy: never`.
@@ -88,10 +93,12 @@ gVisor, каждое в своей изолированной сети; стра
   ним; `finally` — файл удалить; тестовый `AGENTS_DIR` — свежий на сессию.
 * `test_readonly_where_it_matters`: `touch` в `HOME`, конфигурации, агентах,
   `/usr/local/bin` — отказ; в `/var/lib/opencode` и `/work` — можно.
-* `test_no_route_anywhere`: из места 01 — отказ или таймаут на `.1` и `.8`
-  своей сети (22, 80, 443, 2375, 3389), адрес хоста в ЛВС, `HISTORIAN_ADDR:1433`
-  (из тестового `.env`, адрес заказчика в коде не пишется), `1.1.1.1:443`,
-  место 02 `.3:4096`; у моста сети нет адреса хоста.
+* `test_no_route_anywhere`: у моста сети нет адреса хоста (главное);
+  из места 01 способом Д1 (`grep -cE 'Established connection|Connected to'`
+  по выводу `curl -sv telnet://…`) — положительный контроль на OpenCode
+  своего места → 1, и 0 на: `.1` своей сети (22, 80, 443, 2375, 3389), адрес
+  хоста в ЛВС, `HISTORIAN_ADDR:1433` (из тестового `.env`, адрес заказчика в
+  коде не пишется), `1.1.1.1:443`, место 02 `.3:4096`.
 * `test_password_not_visible_to_watchdog`: `GET RO/containers/pcbk-student-01/json`
   изнутри сторожа — в теле нет пароля и нет `OPENCODE_SERVER_PASSWORD`.
 * `test_env_holds_only_own_secret`: в `/proc/1/environ` — только свой пароль,
@@ -115,4 +122,11 @@ gVisor, каждое в своей изолированной сети; стра
   OpenCode иначе) → через ≤ 2 мин `HEALTHCHECK` даёт `unhealthy`, снимок:
   «OpenCode не отвечает»; вернуть `kill -CONT 1`.
 
-### 5. Закрытие дня — как в Д1 (критик, `main`, тег `platform-d2`, чистый клон)
+### 5. Хвосты Д1
+
+* §11 п. 3, если в Д1 человека в сети ПЦБК не было: открыть
+  `https://ai-lab.pcbk.ru:8443/status` из сети ПЦБК и записать, как именно
+  открылось или нет.
+* Всё, что черта отсечения Д1 перенесла в утро Д2.
+
+### 6. Закрытие дня — как в Д1 (критик, `main`, тег `platform-d2`, чистый клон)
