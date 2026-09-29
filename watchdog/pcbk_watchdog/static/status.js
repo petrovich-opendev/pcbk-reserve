@@ -20,9 +20,13 @@ function span(doc, cls, text) {
   return el;
 }
 
-export function startPolling({ fetchImpl, doc, nowMs, setIntervalImpl, staleAfterS,
+export function startPolling({ fetchImpl, doc, setIntervalImpl, staleAfterS,
+                               nowMs = () => performance.now(),   // монотонные часы
+                               setTimeoutImpl = (fn, ms) => setTimeout(fn, ms),
+                               clearTimeoutImpl = (id) => clearTimeout(id),
                                pollMs = 5000, timeoutMs = 4000 }) {
   const silence = doc.getElementById('silence');
+  const content = doc.getElementById('content');
   const age = doc.getElementById('age');
   // страница пришла свежей — отсчёт от её загрузки; иначе ждём удачного ответа
   let lastOkMs = silence.hidden ? nowMs() : null;
@@ -38,6 +42,11 @@ export function startPolling({ fetchImpl, doc, nowMs, setIntervalImpl, staleAfte
     const now = nowMs();
     const silent = failing || lastOkMs === null || now - lastOkMs > staleAfterS * 1000;
     silence.hidden = !silent;
+    // старое под полосой — серым, чтобы зелёные строки не выглядели живыми
+    if (content) {
+      if (silent) content.setAttribute('data-stale', '');
+      else content.removeAttribute('data-stale');
+    }
     if (age && serverAgeS !== null) {
       age.textContent = `обновлено ${Math.round(serverAgeS + (now - ageBaseMs) / 1000)} с назад`;
     }
@@ -67,7 +76,7 @@ export function startPolling({ fetchImpl, doc, nowMs, setIntervalImpl, staleAfte
     update();   // часы браузера — до нового запроса
     const seq = ++sent;
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    const timer = setTimeoutImpl(() => ctl.abort(), timeoutMs);
     let data = null;
     try {
       const resp = await fetchImpl('/status.json', { signal: ctl.signal, cache: 'no-store' });
@@ -75,7 +84,7 @@ export function startPolling({ fetchImpl, doc, nowMs, setIntervalImpl, staleAfte
     } catch {
       data = null;   // сеть, отмена по таймауту, не JSON
     } finally {
-      clearTimeout(timer);
+      clearTimeoutImpl(timer);
     }
     if (seq < applied) return;   // запоздавший ответ старого запроса
     applied = seq;
@@ -102,8 +111,10 @@ if (typeof document !== 'undefined') {
   const poller = startPolling({
     fetchImpl: (url, opts) => fetch(url, opts),
     doc: document,
-    nowMs: () => Date.now(),
+    nowMs: () => performance.now(),
     setIntervalImpl: (fn, ms) => setInterval(fn, ms),
+    setTimeoutImpl: (fn, ms) => setTimeout(fn, ms),
+    clearTimeoutImpl: (id) => clearTimeout(id),
     staleAfterS: Number(document.body.dataset.staleAfterS) || 30,
   });
   // вкладка вернулась из фона — таймеры были придушены, спросить сразу

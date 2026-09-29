@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 import time
 from dataclasses import replace
 from datetime import timedelta
@@ -13,17 +14,26 @@ from pcbk_watchdog.checks import Check
 from pcbk_watchdog.docker_api import DockerReader
 from pcbk_watchdog.journal import Journal
 from pcbk_watchdog.main import (LazyJournal, Settings, WatchState, load_components, run_checks,
-                                tick)
-from pcbk_watchdog.page import Snapshot
+                                run_loop, tick)
+from pcbk_watchdog.page import Snapshot, is_stale
 
 
 def test_settings_defaults_and_env():
     assert Settings.from_env({}) == Settings()
     s = Settings.from_env({"TICK_S": "1", "DISPLAY_TZ": "Asia/Yekaterinburg", "LISTEN_PORT": "9000"})
     assert (s.TICK_S, s.LISTEN_PORT, s.STALE_AFTER_S, s.tz.key) == (1.0, 9000, 30, "Asia/Yekaterinburg")
-    for bad in ({"STALE_AFTER_S": "abc"}, {"TICK_S": "40"}, {"DISPLAY_TZ": "Нет/Такого"}):
+    for bad in ({"STALE_AFTER_S": "abc"}, {"TICK_S": "40"}, {"DISPLAY_TZ": "Нет/Такого"},
+                {"STALE_AFTER_S": "12"}):   # срок такта min(11, 6) − 2·3 = 0 — отказ
         with pytest.raises(ValueError):
             Settings.from_env(bad)
+
+
+def test_tick_budget_keeps_age_under_stale():
+    # срок такта d ≤ min(STALE − TICK, STALE/2) с запасом на одну проверку (2 срока сокета):
+    # возраст снимка до следующего ≤ max(TICK, d) + d ≤ STALE
+    assert Settings().tick_budget_s == 9          # min(30 − 10, 15) − 2·max(3, 3)
+    assert Settings(TICK_S=1).tick_budget_s == 9
+    assert Settings(STALE_AFTER_S=60, DOCKER_TIMEOUT_S=5).tick_budget_s == 30 - 10
 
 
 def test_run_checks_docker_down_marks_containers_unknown():
@@ -60,17 +70,73 @@ def test_tick_bounded_when_proxy_hangs(silent_proxy_url):   # принимает
     assert time.monotonic() - started < 1.5
 
 
-def test_tick_stops_at_budget_when_proxy_slow(slow_proxy_url):
-    # такт уложен в срок устаревания: бюджет = STALE_AFTER_S − TICK_S − DOCKER_TIMEOUT_S
-    settings = replace(SETTINGS, STALE_AFTER_S=3, TICK_S=1, DOCKER_TIMEOUT_S=1)
-    comps = [{"id": f"s{n}", "title": "x", "kind": "container", "container": f"pcbk-student-{n:02d}",
-              "sleeping_ok": True} for n in range(1, 11)] + [
-             {"id": "memory", "title": "Память сервера", "kind": "memory"}]
+def scaled_settings(monkeypatch):
+    """Настройки 1:10 (STALE 3 с, такт 1 с, сроки сокета 0,5 с): срок такта 0,5 с."""
+    monkeypatch.setattr(pcbk_watchdog.main, "NET_CHECK_TIMEOUT_S", 0.5)
+    return replace(SETTINGS, STALE_AFTER_S=3, TICK_S=1, DOCKER_TIMEOUT_S=0.5)
+
+
+def students(count):
+    return [{"id": f"s{n}", "title": "x", "kind": "container", "container": f"pcbk-student-{n:02d}",
+             "sleeping_ok": True} for n in range(1, count + 1)]
+
+
+def test_tick_stops_at_budget_when_proxy_slow(slow_proxy_url, monkeypatch):
+    # после срока такта сетевые проверки не начинаются; срок — tick_budget_s
+    settings = scaled_settings(monkeypatch)
+    comps = students(10) + [{"id": "memory", "title": "Память сервера", "kind": "memory"}]
     started = time.monotonic()
-    checks = run_checks(comps, DockerReader(slow_proxy_url, timeout=1), settings, now_utc())
-    assert time.monotonic() - started < 2
+    checks = run_checks(comps, DockerReader(slow_proxy_url, timeout=0.5), settings, now_utc())
+    assert time.monotonic() - started < 1.2   # срок 0,5 с + одна начатая проверка 0,3 с
     assert checks[0].state == "ok" and checks[9].state == "unknown" and "такт" in checks[9].detail
     assert checks[10].state == "ok"   # дешёвые проверки без сети не пропускаются
+
+
+def test_loop_keeps_snapshot_fresh_with_slow_proxy(slow_proxy_url, tmp_path, monkeypatch):
+    # прокси отвечает, но медленно: снимок после первого такта не устаревает ни разу
+    settings = replace(scaled_settings(monkeypatch), TICK_S=0.5)
+    state, stop = WatchState(), threading.Event()
+    loop = threading.Thread(target=run_loop, daemon=True, args=(
+        state, Journal(str(tmp_path / "j.db")), students(20), DockerReader(slow_proxy_url, 0.5),
+        settings, stop))
+    loop.start()
+    try:
+        first_by = time.monotonic() + 3
+        while state.snapshot is None and time.monotonic() < first_by:
+            time.sleep(0.02)
+        assert state.snapshot is not None
+        stale, ticks, watch_until = [], set(), time.monotonic() + 4
+        while time.monotonic() < watch_until:
+            snap = state.snapshot
+            ticks.add(snap.checked_at)
+            if is_stale(snap, now_utc(), settings.STALE_AFTER_S):
+                stale.append(round((now_utc() - snap.checked_at).total_seconds(), 2))
+            time.sleep(0.02)
+    finally:
+        stop.set()
+        loop.join(5)
+    assert stale == [] and len(ticks) >= 4
+
+
+def test_loop_survives_tick_exception(monkeypatch):
+    calls, again = [], threading.Event()
+
+    def flaky_tick(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("такт упал")
+        again.set()
+    monkeypatch.setattr(pcbk_watchdog.main, "tick", flaky_tick)
+    stop = threading.Event()
+    loop = threading.Thread(target=run_loop, daemon=True, args=(
+        WatchState(), None, [], None, replace(SETTINGS, TICK_S=0.05), stop))
+    loop.start()
+    try:
+        assert again.wait(2), "цикл остановился после исключения в такте"
+    finally:
+        stop.set()
+        loop.join(2)
+    assert not loop.is_alive()
 
 
 def test_run_checks_survives_check_exception(monkeypatch):
@@ -181,6 +247,7 @@ def test_browser_runs_status_js_on_stale_json(fake_page_server):
     # свежий HTML (полоса hidden), а /status.json отвечает stale: true
     dom = chrome_dom(fake_page_server.url + "/status", virtual_time_ms=8000)
     assert re.search(r'id="silence"(?![^>]*hidden)', dom)
+    assert re.search(r'<main[^>]*data-stale', dom)   # старое под полосой — серым
 
 
 @pytest.mark.skipif(CHROME is None, reason="нет google-chrome")

@@ -51,6 +51,17 @@ def test_html_stale_snapshot_shows_banner():
     assert "hidden" not in banner(render_html(None, [], T0, 30, ZoneInfo("UTC")))
 
 
+def test_html_stale_snapshot_greys_content():
+    s = Snapshot(T0, (Check("a", "A", "ok", ""),))
+
+    def main_tag(html):
+        return re.search(r"<main[^>]*>", html).group(0)
+    assert "data-stale" not in main_tag(render_html(s, [], T0 + timedelta(seconds=29), 30, ZoneInfo("UTC")))
+    assert "data-stale" in main_tag(render_html(s, [], T0 + timedelta(seconds=31), 30, ZoneInfo("UTC")))
+    assert "data-stale" in main_tag(render_html(None, [], T0, 30, ZoneInfo("UTC")))
+    assert re.search(r"main\[data-stale\]\s*\{[^}]*opacity", render_html(s, [], T0, 30, ZoneInfo("UTC")))
+
+
 def test_html_banner_text_and_age():
     html = render_html(Snapshot(T0, ()), [], T0 + timedelta(seconds=7), 30, ZoneInfo("UTC"))
     assert "Сторож не отвечает — состояние неизвестно" in html

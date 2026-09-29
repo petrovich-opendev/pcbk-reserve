@@ -17,6 +17,8 @@ class FakeEl {
   }
   getAttribute(name) { return name in this.attrs ? this.attrs[name] : null; }
   setAttribute(name, value) { this.attrs[name] = String(value); }
+  removeAttribute(name) { delete this.attrs[name]; }
+  hasAttribute(name) { return name in this.attrs; }
   append(...els) { this.children.push(...els); }
   replaceChildren(...els) { this.children = els; }
 }
@@ -29,6 +31,7 @@ function fakeDoc({ hidden = true, ageS = '2' } = {}) {
     overall: new FakeEl('span'),
     'checked-at': new FakeEl('time'),
     checks: new FakeEl('ul'),
+    content: new FakeEl('main', hidden ? {} : { 'data-stale': '' }),
   };
   return { els, getElementById: (id) => els[id] ?? null, createElement: (tag) => new FakeEl(tag) };
 }
@@ -57,12 +60,13 @@ async function advance(ms) {
   }
 }
 
-async function start(doc, fetchImpl) {
+async function start(doc, fetchImpl, extra = {}) {
   const calls = [];
   const poller = startPolling({
     fetchImpl: (url, opts) => { calls.push({ url, opts }); return fetchImpl(url, opts); },
     doc, nowMs: () => Date.now(), setIntervalImpl: (fn, ms) => setInterval(fn, ms),
-    staleAfterS: STALE_AFTER_S,
+    setTimeoutImpl: (fn, ms) => setTimeout(fn, ms), clearTimeoutImpl: (id) => clearTimeout(id),
+    staleAfterS: STALE_AFTER_S, ...extra,
   });
   await flush();
   return { poller, calls };
@@ -91,6 +95,7 @@ test('banner on stale json', async () => {
   await start(doc, staleJson);
   await advance(5000);
   assert.equal(doc.els.silence.hidden, false);
+  assert.equal(doc.els.content.hasAttribute('data-stale'), true);   // старое под полосой — серым
 });
 
 test('banner on http error', async () => {
@@ -121,9 +126,37 @@ test('banner hides after recovery', async () => {
   let answer = http502;
   await start(doc, (...a) => answer(...a));
   assert.equal(doc.els.silence.hidden, false);
+  assert.equal(doc.els.content.hasAttribute('data-stale'), true);
   answer = fresh;
   await advance(5000);
   assert.equal(doc.els.silence.hidden, true);
+  assert.equal(doc.els.content.hasAttribute('data-stale'), false);
+});
+
+test('late answer of an old request is discarded', async () => {
+  const doc = fakeDoc();
+  let releaseFirst;
+  const first = new Promise((resolve) => { releaseFirst = resolve; });
+  let n = 0;
+  await start(doc, () => (++n === 1 ? first : http502()));
+  await advance(5000);                                  // второй запрос — 502
+  assert.equal(doc.els.silence.hidden, false);
+  releaseFirst(reply(200, body(false)));                // первый ответил поздно и «свежо»
+  await flush();
+  assert.equal(doc.els.silence.hidden, false);          // не отменяет более новый сбой
+  assert.equal(doc.els.checks.children.length, 0);      // и не перерисовывает список
+});
+
+test('abort timer uses injected timer functions', async () => {
+  const doc = fakeDoc();
+  const timers = [];
+  const cleared = [];
+  await start(doc, fresh, {
+    setTimeoutImpl: (fn, ms) => { timers.push(ms); return `t${timers.length}`; },
+    clearTimeoutImpl: (id) => cleared.push(id),
+  });
+  assert.deepEqual(timers, [4000]);
+  assert.deepEqual(cleared, ['t1']);
 });
 
 test('banner stays on a page rendered stale until a fresh answer', async () => {

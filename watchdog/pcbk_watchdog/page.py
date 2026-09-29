@@ -65,6 +65,7 @@ STYLE = """
     --ok: #3fb950; --warn: #f0883e; --fail: #ff6b6b; --unknown: #e3b341; --unknown-bg: #3a2f00; } }
 body { margin: 0; font: 16px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
 main { max-width: 56rem; margin: 0 auto; padding: 1rem; }
+main[data-stale] { opacity: .5; filter: grayscale(1); }
 .silence { position: sticky; top: 0; z-index: 1; padding: .9rem 1rem; text-align: center;
   font-weight: 700; font-size: 1.15rem; color: #fff; background: var(--fail); }
 h1 { font-size: 1.4rem; margin: .5rem 0; }
@@ -126,6 +127,7 @@ def render_html(snapshot: Snapshot | None, events: list[Event], now: datetime, s
     event_rows = ("\n".join(_event_row(e, titles, tz) for e in events)
                   or "<li>Событий пока нет</li>")
     hidden = "" if stale else " hidden"
+    stale_mark = " data-stale" if stale else ""   # старое под полосой — серым
     return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -137,7 +139,7 @@ def render_html(snapshot: Snapshot | None, events: list[Event], now: datetime, s
 </head>
 <body data-stale-after-s="{int(stale_after_s)}">
 <div id="silence" class="silence" role="alert"{hidden}>{SILENCE_TEXT}</div>
-<main>
+<main id="content"{stale_mark}>
 <h1>Состояние резервного стенда</h1>
 <p class="summary">Общее состояние: {summary}</p>
 <p class="meta">Проверено: {at} · {age_text}. Страница обновляется сама каждые 5 с.</p>

@@ -30,6 +30,8 @@ KINDS: dict[str, tuple[str, ...]] = {
 LOCAL_KINDS = frozenset({"memory", "absent"})
 # имена, которые сторож пишет сам
 RESERVED_IDS = frozenset({"journal", "watchdog"})
+# срок ответа для проверок tls и http, с (на операцию сокета)
+NET_CHECK_TIMEOUT_S = 3.0
 
 STATUS_JS = (Path(__file__).parent / "static" / "status.js").read_bytes()
 EVENTS_ON_PAGE = 20
@@ -56,8 +58,9 @@ class Settings:
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:
             raise ValueError("TICK_S и DOCKER_TIMEOUT_S должны быть больше нуля")
-        if self.STALE_AFTER_S <= self.TICK_S:
-            raise ValueError("STALE_AFTER_S должен быть больше TICK_S — иначе снимок устаревает между тактами")
+        if self.tick_budget_s <= 0:
+            raise ValueError("срок такта не больше нуля — снимок устареет между тактами: "
+                             "увеличьте STALE_AFTER_S или уменьшите TICK_S и DOCKER_TIMEOUT_S")
         try:
             ZoneInfo(self.DISPLAY_TZ)
         except (ZoneInfoNotFoundError, ValueError) as e:
@@ -69,8 +72,16 @@ class Settings:
 
     @property
     def tick_budget_s(self) -> float:
-        """Срок сетевых проверок такта: новый снимок успевает до устаревания прежнего."""
-        return max(1.0, self.STALE_AFTER_S - self.TICK_S - self.DOCKER_TIMEOUT_S)
+        """Срок, после которого сетевые проверки такта не начинаются.
+
+        checked_at — начало такта, период цикла — max(TICK_S, d), поэтому перед
+        следующим снимком возраст прежнего доходит до max(TICK_S, d) + d. Он не
+        больше STALE_AFTER_S, если длина такта d ≤ min(STALE − TICK, STALE / 2).
+        Начатая до срока проверка идёт ещё до двух сроков сокета (соединение и
+        чтение) — их запас вычитается.
+        """
+        socket_s = max(self.DOCKER_TIMEOUT_S, NET_CHECK_TIMEOUT_S)
+        return min(self.STALE_AFTER_S - self.TICK_S, self.STALE_AFTER_S / 2) - 2 * socket_s
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -125,9 +136,10 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
             c = check_memory(f.read(), settings.MEM_WARN_MIB, settings.MEM_FAIL_MIB)
         return Check(cid, title, c.state, c.detail)
     if kind == "http":
-        return check_http(cid, title, comp["url"])
+        return check_http(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S)
     if kind == "tls":
-        return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now)
+        return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
+                         timeout=NET_CHECK_TIMEOUT_S)
     if kind == "docker_ping":
         docker.ping()
         return Check(cid, title, "ok", "отвечает")
