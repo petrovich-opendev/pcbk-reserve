@@ -5,6 +5,11 @@ requires-python = ">=3.12"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# TestClient starlette 1.7 просит httpx2, но mcp 1.30.0 требует httpx 0.28.1 —
+# до перехода на mcp 2.x глушим только это предупреждение
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
 
 # uv run не создаёт здесь .venv и uv.lock
 [tool.uv]

@@ -1,12 +1,14 @@
 """Протокол роли и сборка приложения: роутеры ролей, здоровье по ролям, точные маршруты."""
 import logging
+import re
 from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import Protocol
 
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
-from starlette.routing import Route
+from fastapi.routing import iter_route_contexts
+from starlette.routing import Route, WebSocketRoute, compile_path
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .settings import Settings
@@ -28,11 +30,14 @@ class Role(Protocol):
     def lifespan(self) -> AbstractAsyncContextManager[None]: ...
 
     def install(self, app: FastAPI) -> None:
-        """Обработчики исключений и промежуточные звенья уровня приложения — только здесь."""
+        """Обработчики исключений и промежуточные звенья уровня приложения — только здесь.
+
+        Mount, Host и frontend() не ставятся ни здесь, ни в router(): create_app откажет.
+        """
         ...
 
     def mounts(self) -> list[tuple[str, ASGIApp]]:
-        """Точные маршруты: путь → ASGI-приложение на любой метод."""
+        """Точные маршруты: путь → ASGI-приложение на любой метод; занятый путь — отказ сборки."""
         ...
 
 
@@ -66,6 +71,28 @@ def _health(role: Role) -> tuple[bool, str]:
     except Exception:
         log.exception("роль %s: проверка здоровья упала", role.name)
         return False, "сбой проверки здоровья"
+
+
+def _route_patterns(app: FastAPI) -> list[tuple[str, re.Pattern]]:
+    """Шаблоны путей всех маршрутов, включая роутеры ролей; ловящие поддеревья — отказ.
+
+    Mount и Host ловят целые поддеревья: Mount("/") одной роли молча забрал бы
+    чужие пути. frontend() FastAPI отвечает на всё, что не нашлось, — /mcp/
+    перестал бы давать 404. Поэтому в приложении — только маршруты по шаблону
+    пути. FastAPI 0.142 держит роутеры ролей живыми ссылками (_IncludedRouter),
+    их маршруты видны только через iter_route_contexts.
+    """
+    # закрытый метод FastAPI; версия закреплена хешем, смену ловит тест frontend
+    if next(app.router._iter_low_priority_routes(), None) is not None:
+        raise ValueError("frontend(): роли ставят только точные маршруты через mounts()")
+    patterns = []
+    for ctx in iter_route_contexts(app.router.routes):
+        route = ctx.original_route
+        if not isinstance(route, (Route, WebSocketRoute)):
+            raise ValueError(f"{type(route).__name__} {getattr(route, 'path', '')!r}: "
+                             "роли ставят только точные маршруты через mounts()")
+        patterns.append((ctx.path, compile_path(ctx.path)[0]))
+    return patterns
 
 
 def create_app(settings: Settings, roles: Sequence[Role]) -> FastAPI:
@@ -107,8 +134,16 @@ def create_app(settings: Settings, roles: Sequence[Role]) -> FastAPI:
     for role in roles:
         role.install(app)
 
-    # точные маршруты — последними: чужие пути они не перехватывают
+    # точные маршруты — последними: чужие пути они не перехватывают;
+    # путь, который уже ловит другой маршрут, — ошибка сборки, а не тихая тень
+    patterns = _route_patterns(app)
     for role in roles:
         for path, asgi in role.mounts():
+            if "{" in path:
+                raise ValueError(f"роль {role.name}: точный маршрут {path!r} — без параметров пути")
+            taken = next((p for p, regex in patterns if regex.fullmatch(path)), None)
+            if taken is not None:
+                raise ValueError(f"роль {role.name}: путь {path!r} уже занят маршрутом {taken!r}")
             app.router.routes.append(Route(path, _Asgi(asgi)))
+            patterns.append((path, compile_path(path)[0]))
     return app
