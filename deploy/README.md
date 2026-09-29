@@ -36,6 +36,38 @@
    стартуют сами.
 5. Проверка: `curl -sk https://127.0.0.1:8443/status.json` — `stale: false`.
 
+## Рабочие места (с Д2)
+
+1. Секреты — на сервере, в чат и git не попадают:
+   ```bash
+   cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && AD=$(grep '^AGENTS_DIR=' .env | cut -d= -f2)
+   umask 077 && install -d -m 0700 "$SD" "$AD"
+   for n in $(seq -w 1 10); do
+     for s in pw llm-token; do f=$SD/student-$n.$s
+       [ -e "$f" ] || { openssl rand -hex 24 | tr -d '\n' > "$f"; chmod 0444 "$f"; }   # не перезаписывать
+     done
+     install -d -m 0755 "$AD/student-$n"
+     for k in state work; do docker volume create --label pcbk.role=student "pcbk-student-$n-$k" >/dev/null; done
+   done
+   ```
+2. Места создаются, но не стартуют:
+   `docker compose --profile students create --no-build $(printf 'student-%02d ' $(seq 1 10))`,
+   затем `docker compose up -d --no-build watchdog` — в этом порядке, иначе
+   на странице будут десять «нет контейнера».
+3. Вручную: `docker start pcbk-student-NN` / `docker stop pcbk-student-NN`
+   (с Д5 это делает шлюз при входе и после 30 минут простоя).
+4. Образ места собирается из чистого дерева (`git archive`): `COPY config/`
+   заберёт в образ любой лишний файл из рабочей копии.
+
+### Новый студент
+- **Смена студента в слоте 01–10:** новые файлы `student-NN.pw` и
+  `student-NN.llm-token` (старые удалить), пустой каталог агентов места;
+  старые тома места — только по решению владельца; `docker compose
+  --profile students create --force-recreate --no-build student-NN`.
+- **Место 11 и дальше:** правка регулярок `sp-ro`/`sp-ctl`, подсеть N, блок
+  в `compose.yaml`, строка в `watchdog/components.json`, тесты границ
+  диапазона, пересборка сторожа.
+
 ## Что открывается наружу
 
 - Порт **8443** контейнера `edge` — Docker публикует его **в обход ufw**.
@@ -52,9 +84,22 @@
 
 ## Откат
 
-- Стенд: `cd /opt/pcbk-reserve && docker compose down` (том журнала
-  сторожа остаётся; `down -v` — удалить и его). Dify не затрагивается.
+- **`docker compose down` на сервере не выполнять** — он снимает все десять
+  мест и их сети. **`down -v` запрещён** — он удаляет том журнала сторожа;
+  журнал удаляется только явно: `docker volume rm pcbk-reserve_pcbk-watchdog-journal`.
+- Службы снимаются только по именам: `docker compose rm -sf <службы>`;
+  Д1 — `docker compose stop edge watchdog sp-ro sp-ctl` /
+  `docker compose rm -sf edge watchdog sp-ro sp-ctl`.
+- Места Д2 (только до первого входа студента):
+  `docker compose rm -sf $(printf 'student-%02d ' $(seq 1 10))`;
+  `docker network rm $(printf 'pcbk-stu-%02d ' $(seq 1 10))`; тома — только
+  по именам `pcbk-student-NN-*`; вернуть `compose.yaml.d1` и
+  `docker compose up -d --no-build watchdog` (образ `:d1`).
+- Тома мест, `secrets/` и `agents/` удаляются только до первого входа
+  студента и только по именам: после — там разговоры и агенты студентов.
+- `rm -rf /opt/pcbk-reserve` (с `sudo`) — только до первого входа. После —
+  удалять лишь `tls/`, `compose.yaml` и `edge/`; **`secrets/` и `agents/`
+  остаются**.
 - gVisor: остановить контейнеры с `runsc`; вернуть
   `/etc/docker/daemon.json.pre-runsc` на место; `systemctl reload docker`;
   `rm -rf /usr/local/bin/runsc /usr/local/bin/containerd-shim-runsc-v1 /usr/local/bin/gvisor-bin`.
-- Каталог: `rm -rf /opt/pcbk-reserve` (с `sudo`).
