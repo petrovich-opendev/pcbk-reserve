@@ -28,10 +28,15 @@
   строки запроса. Клиенты — `-allowfrom` (CIDR или имена, имена разрешаются по
   DNS на каждый запрос). Слушать не на 127.0.0.1 — только `-listenip=0.0.0.0`.
   Метод без списка → 405, путь вне списка → 403, чужой клиент → 403.
-  Опыт с нужной политикой: list, inspect и start/stop только контейнеров
-  студентов по имени — 200/204; inspect контейнера Dify, logs, archive,
-  events, info, images, restart, kill, update, create, exec, volumes, prune —
-  403; DELETE — 405; обход `start/../../create` и `%2F` — 403.
+  Опыт с нужной политикой: inspect и start/stop только контейнеров студентов
+  по имени — 200/204; inspect контейнера Dify, logs, archive, events, info,
+  images, restart, kill, update, create, exec, volumes, prune — 403; DELETE —
+  405; обход `start/../../create` и `%2F` (curl с `--path-as-is`) — 403.
+  **Список `GET /containers/json`, если его разрешить, отдаёт все контейнеры
+  сервера** вместе с `Command` (у Redis в Dify там пароль): строку запроса с
+  фильтром прокси не проверяет — в опыте фильтр ставил сам клиент. Поэтому
+  список не разрешается никому. Inspect отдаёт `Config.Env` — секреты
+  контейнерам только файлами.
   Образ `FROM scratch`, пользователь 65534, ~5 МиБ памяти; работает с
   `--user 65534:<gid docker> --read-only --cap-drop ALL no-new-privileges`
   без `--privileged`.
@@ -75,6 +80,13 @@
   песочницу целиком (sentry, gofer, приложение) — нужен запас; `pids.max`
   считает потоки песочницы на хосте, при упоре падает вся песочница — лимит не
   ставить крошечным, мерить [Д: #2490, #2535].
+* **Внутренняя сеть (`internal: true`) не отрезает контейнер от хоста**: на
+  мосту остаётся адрес хоста, и из контейнера открыты его службы на
+  `0.0.0.0` (SSH, опубликованные порты). С
+  `-o com.docker.network.bridge.gateway_mode_ipv4=isolated` адреса на мосту
+  нет, службы хоста закрыты, соседи по сети видны [Л: опыт критика плана;
+  Д: moby v29.7.2 `bridge_linux.go:699`]. При заданном `ip_range` без
+  `gateway` шлюз Docker ставит на первый адрес диапазона, а не на `.1` [Л].
 * **Встроенный DNS Docker (127.0.0.11) в пользовательских сетях под runsc не
   работает** ([gvisor#7469](https://github.com/google/gvisor/issues/7469),
   открыт): рабочее место находит соседей только по адресу — статические
@@ -203,6 +215,9 @@
 | OpenCode `opencode-linux-x64-baseline.tar.gz` | v1.18.33 | sha256 `440ca65423e99505cf285f8660684503cc54f6f9e6b64cfcd11bf412369be6d5` |
 | ripgrep `x86_64-unknown-linux-musl` | 15.1.0 | sha256 `1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599` |
 | ubuntu | 22.04 | `sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02` |
+| python (образ сторожа) | 3.12-slim (3.12.14) | `sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f` |
+| nginx | 1.30.5-alpine (= stable-alpine на 29.09) | `sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94` |
+| официальный образ OpenCode — только для пробы Д1 | 1.18.33 | `sha256:ee31dff80f8347b4705317de808b01fce1cfbf35cff560ddc573cda9718be0f7` |
 | curlimages/curl | 8.16.0 | `sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6` |
 | Docker Engine на сервере | 29.7.2 | API 1.40–1.55 |
 
