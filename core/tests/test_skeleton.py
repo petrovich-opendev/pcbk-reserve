@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from helpers import SETTINGS, DummyRole, dummy, write
 from pcbk_core.app import create_app
 from pcbk_core.logs import setup_logging
-from pcbk_core.main import build_roles, healthcheck, main
+from pcbk_core.main import healthcheck, main
 from pcbk_core.secrets import BdrvConfig, read_env_file
 from pcbk_core.settings import Settings
 
@@ -165,10 +165,6 @@ def test_lifespan_enters_roles_in_order_and_exits_in_reverse():
     with TestClient(create_app(SETTINGS, [Tracked("data", (True, "")), Tracked("llm", (True, ""))])):
         assert events == ["+data", "+llm"]
     assert events == ["+data", "+llm", "-llm", "-data"]
-
-
-def test_build_roles_empty_until_data_role():
-    assert build_roles(SETTINGS) == []
 
 
 @pytest.fixture

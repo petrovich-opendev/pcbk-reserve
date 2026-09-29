@@ -6,6 +6,7 @@ FastAPI и uvicorn грузятся только в ветке сервера: �
 from __future__ import annotations
 
 import http.client
+import logging
 import sys
 from typing import TYPE_CHECKING
 
@@ -18,8 +19,23 @@ USAGE = "использование: python -m pcbk_core.main [--healthcheck]"
 
 
 def build_roles(settings: Settings) -> list[Role]:
-    """Роли процесса; задача 5 добавит DataRole."""
-    return []
+    """Роли процесса: в Д3а — «данные»; Д4 добавит LLM-прокси.
+
+    Нет файла белого списка — роль с пустым списком: /healthz/data отвечает 503
+    с причиной, ворота не пускают ни одного имени. Учётные данные — только файлом.
+    """
+    from .data import DataRole
+    from .data.historian import tds_query
+    from .data.names import load_names
+    from .secrets import BdrvConfig
+
+    try:
+        whitelist = load_names(settings.WHITELIST_PATH)
+    except FileNotFoundError:
+        logging.getLogger("pcbk_core.main").error(
+            "белый список не найден: %s — роль «данные» без тегов", settings.WHITELIST_PATH)
+        whitelist = frozenset()
+    return [DataRole(settings, tds_query(BdrvConfig.from_env_file(settings.BDRV_ENV_FILE)), whitelist)]
 
 
 def healthcheck(settings: Settings) -> int:

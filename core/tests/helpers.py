@@ -1,10 +1,14 @@
 """Общие константы и помощники тестов серверного слоя (импорт явный: from helpers import …)."""
 import itertools
+import time
+from collections.abc import Callable
 from contextlib import nullcontext
 
 from fastapi import APIRouter, FastAPI
 
+from fakes import WHITELIST, FakeHistorian
 from pcbk_core.app import RoleBase
+from pcbk_core.data import DataRole
 from pcbk_core.settings import Settings
 
 # настройки тестов строятся напрямую: проверки from_env на них не действуют
@@ -31,6 +35,24 @@ class FakeMono:
 
     def advance(self, s: float) -> None:
         self.now += s
+
+
+def make_role(settings: Settings = SETTINGS, fake: FakeHistorian | None = None,
+              whitelist: frozenset[str] = WHITELIST, mono: Callable[[], float] | None = None,
+              ) -> tuple[DataRole, FakeHistorian]:
+    """Роль «данные» на двойнике историана; часы по умолчанию — FakeMono(1000.0)."""
+    fake = FakeHistorian() if fake is None else fake
+    mono = FakeMono(1000.0) if mono is None else mono
+    return DataRole(settings, fake, whitelist, monotonic=mono), fake
+
+
+def wait_until(pred: Callable[[], bool], timeout: float = 5) -> None:
+    """Ждёт условия в потоке теста (цикл TestClient — в своём потоке); не дождался — AssertionError."""
+    end = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > end:
+            raise AssertionError(f"условие не выполнилось за {timeout} с")
+        time.sleep(0.01)
 
 
 async def dummy(scope, receive, send):
