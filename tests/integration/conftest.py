@@ -129,6 +129,11 @@ class Stack:
     def containers(self) -> list[str]:
         return self.compose("ps", "-a", "--format", "{{.Name}}").split()
 
+    def test_env(self) -> dict[str, str]:
+        """Значения test.env — те, с которыми поднят стенд."""
+        lines = self.env_file.read_text(encoding="utf-8").splitlines()
+        return dict(line.split("=", 1) for line in lines if "=" in line)
+
     def exec(self, name: str, *cmd: str) -> str:
         return self._docker("exec", name, *cmd).stdout.strip()
 

@@ -1,6 +1,8 @@
 """Две копии узкого прокси сокета: кто, каким методом и к чему проходит; сети стенда."""
 import pytest
 
+SOCKET = "/var/run/docker.sock"
+PROXIES = ("pcbk-sp-ro", "pcbk-sp-ctl")
 RO = "http://pcbk-sp-ro:2375/v1.44"
 CTL = "http://pcbk-sp-ctl:2375/v1.44"
 PASSED = (200, 204, 304, 404)      # прокси пропустил; ответ уже от Docker
@@ -20,6 +22,42 @@ def test_sp_ro_serves_watchdog_reads_only(stack):
 
 def test_sp_ro_refuses_other_clients(stack):
     assert stack.http_as("pcbk-intruder", "pcbk-ro", "GET", RO + "/containers/pcbk-sp-ctl/json") == 403
+    # клиент sp-ctl в чужой сети — тоже чужой для sp-ro
+    assert stack.http_as("pcbk-core", "pcbk-ro", "GET", RO + "/containers/pcbk-sp-ctl/json") == 403
+
+
+@pytest.mark.parametrize("name", ["pcbk-student-00", "pcbk-student-11", "pcbk-student-1"])
+def test_student_range_boundaries(stack, name):
+    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + f"/containers/{name}/start") == 403
+    assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + f"/containers/{name}/json") == 403
+    assert stack.http_from_watchdog("GET", RO + f"/containers/{name}/json") == 403
+
+
+def test_student_range_upper_bound_passes(stack):
+    # положительный контроль границы: 10 — последнее место, прокси пропускает, Docker — 404
+    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + "/containers/pcbk-student-10/start") in PASSED
+    assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/pcbk-student-10/json") in PASSED
+    assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-student-10/json") in PASSED
+
+
+def test_socket_only_in_hardened_proxies(stack):
+    gid = stack.test_env()["DOCKER_GID"]
+    for name in PROXIES:
+        info = stack.inspect(name)
+        host = info["HostConfig"]
+        assert info["Config"]["User"] == f"65534:{gid}", name
+        assert host["ReadonlyRootfs"] is True and host["Privileged"] is False, name
+        assert host["CapDrop"] == ["ALL"] and not host["CapAdd"], name
+        assert host["SecurityOpt"] == ["no-new-privileges:true"], name
+        assert host["Memory"] == 32 * 1024 * 1024, name
+        assert host["RestartPolicy"]["Name"] == "unless-stopped", name
+        sock = [m for m in info["Mounts"] if m["Destination"] == SOCKET]
+        assert [(m["Type"], m["Source"], m["RW"]) for m in sock] == [("bind", SOCKET, False)], name
+    others = [n for n in stack.containers() if n not in PROXIES]
+    assert {"pcbk-edge", "pcbk-watchdog"} <= set(others)
+    for name in others:
+        assert not [m for m in stack.inspect(name)["Mounts"]
+                    if "docker.sock" in (m.get("Source") or "") + m["Destination"]], name
 
 
 def test_sp_ctl_passes_only_student_start_stop(stack):
