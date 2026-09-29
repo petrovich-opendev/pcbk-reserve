@@ -58,53 +58,68 @@
 
 | Задача | Часы | Где |
 |---|---|---|
-| 0. Хвосты Д2 (утренний слот по плану Д2) | 0,5–1,5 | сервер |
-| 1. Утренняя проба историана: запросы 1–6 | 0,75 | `$JOB` и сервер, **нужен владелец** |
+| 0. Хвосты Д2 (утренний слот по плану Д2; шаги 7–8 Д2 уже сделаны) | 0,25–1 | сервер |
+| 1. Проба историана: запросы 1–6 | 0,75 | `$JOB` и сервер, **окно владельца** |
 | 2. Каркас серверного слоя | 0,75 | локально |
 | 3. Шаблоны, соединение и ворота к историану | 1,5 | локально |
 | 4. Каталог и белый список | 0,75 | локально |
 | 5. Свежесть и роль «данные» | 1 | локально |
 | 6. Сторож: вид `historian` | 0,75 | локально |
 | 7. Серверный слой в компоновке | 1,5 | локально |
-| 8. Выкладка и белый список | 0,75 | сервер, **нужен владелец** |
+| 8. Выкладка и белый список (шаги 1–4 — в окне владельца) | 0,75 | сервер |
 | 9. Живые проверки и учения | 0,75 | сервер |
 | 10. Закрытие дня | 1,25 | — |
-| **Критический путь по плановой шкале** | **10,25** при хвостах 0,5 ч (задачи 1–10 — 9,75) | |
+| **Критический путь по плановой шкале** | **10,0** при хвостах 0,25 ч (задачи 1–10 — 9,75) | |
+
+**Порядок исполнения и одно окно владельца.** Задача 0 → 2 → 3 → 4, затем
+**одно окно владельца около 1,5 ч** (примерно с 3,5-го часа): задача 1 (проба)
+и задача 8, шаги 1–4 (засев, построитель, числа N/M/K и «да»). Построителю
+хватает образа `pcbk-reserve/core:d3a` после задачи 4 — он едет на сервер в
+начале окна. Дальше без владельца: 5 → 6 → 7 → задача 8, шаги 5–6
+(итоговый образ и подъём `core`) → 9 → 10. Числа пробы задают только
+значения `.env` (`HIST_*`, `CATALOG_DEADLINE_S`), код от них не зависит.
 
 **Принятое основание «один день».** Живой темп Д1: план в 9,5 ч по той же
 шкале выполнен примерно за 2 ч 20 мин по часам, с субагентами. Это основание
 записано, а не взято оправданием: плановая шкала остаётся честной и больше
-9,5 ч, а день укладывается в рабочий день по живому темпу. Если темп Д3а
-окажется вдвое медленнее Д1 или хуже, в тот же час владельцу уходит строка с
-пересчётом, до черты.
+9,5 ч, а день укладывается в рабочий день по живому темпу. Задача 10 пишет
+строку «план X ч / факт Y ч по git» — по ней Д3б проверяет свой порог. Если
+темп Д3а окажется вдвое медленнее Д1 или хуже, в тот же час владельцу уходит
+строка с пересчётом, до черты.
 
 **Черта отсечения — конец восьмого часа** плюс превышение хвостов Д2 над
-0,5 ч: черта сдвигается ровно на это превышение. По оценке задачи 0–7
-кончаются на 7,5 ч.
-- **Задача 7 зелёна к черте.** Выкладка (задача 8) и задача 9, шаги 1–4
+0,25 ч: черта сдвигается ровно на это превышение. К ней сделаны задачи 1–7 и
+шаги 1–4 задачи 8 (по оценке — около 7,75 ч).
+- **Задача 7 зелёна к черте.** Шаги 5–6 задачи 8 и задача 9, шаги 1–4
   (исправное состояние и три учения), идут без переноса. Закрытие сжимается:
-  один раунд критика, слияние и тег. Второй раунд, если он нужен, и проверка
-  чистым клоном уходят в утренний слот Д3б — это около 0,5 ч, строка в его
-  шапке. Шаг 5 задачи 9 (факты о сети выхода) — туда же, в задачу 8 Д3б.
-- **Хвосты Д2 больше 1,5 ч** (например, выкладка Д2 не сделана): в тот же час
+  один раунд критика; при нуле блокеров — слияние и тег; иначе второй раунд,
+  слияние и тег — в утреннем слоте Д3б (около 0,5 ч, строка в его шапке).
+  Шаг 5 задачи 9 (факты о сети выхода) — туда же, в задачу 8 Д3б.
+- **Хвосты Д2 больше 1 ч** (например, выкладка Д2 не сделана): в тот же час
   владельцу уходит одна строка — Д3а не влезает, разрез растягивается ещё на
   день, планы Д3б и Д4 пересчитываются до их начала.
 - **Задача 7 не зелёна к черте.** Выкладки нет. Видимый результат — снимки
   локального стенда (`docker compose -p pcbk-local …`, пометка «не на
   сервере»): «Служба данных — жива», учение «служба остановлена» и строка
-  историана «нет связи с историаном». Владельцу в тот же час — строка
-  «разрез растягивается», как выше. В Д4 ничего не переносится.
-- **Утром нет владельца.** Задачи 2–7 от него не зависят и идут первыми, задача
-  1 — когда он появится. Без владельца не делаются задача 1 и шаг 4 задачи 8
-  (белый список); выкладка останавливается перед этим шагом. Если владельца
-  нет весь день — видимый результат как в ветке «задача 7 не зелёна», плюс
-  строка владельцу.
+  историана «нет связи с историаном». Числа белого списка из окна владельца
+  уже есть. Владельцу в тот же час — строка «разрез растягивается», как
+  выше. В Д4 ничего не переносится.
+- **Окна владельца нет весь день.** Задачи 2–7 идут; задача 1 и шаги 1–4
+  задачи 8 не делаются, выкладка останавливается перед шагом 4. Видимый
+  результат — как в ветке «задача 7 не зелёна», плюс строка владельцу.
+- **Проба получила отказ учётных данных** (задача 1, запрос 1 — `auth`:
+  `LoginError`, 18452, 18456, 18486–18488) — **стоп**: ни построителя, ни
+  `core`, ни учений, потому что каждый вход бьёт общую с Dify учётку. В тот же
+  час владельцу — строка «обновить `/opt/dify/scripts/.bdrv.env` или копию и
+  повторить `install`». День идёт локально.
 - **Историан из контейнера недоступен** (задача 1, шаг 4):
   - не работает ни `bridge`, ни `host` — день идёт локально, владельцу тем же
     часом уходит вопрос о пути к 1433 из контейнеров;
   - работает только `host` — серверный слой в `pcbk-egress` тоже не дойдёт;
     выкладка идёт, строка историана будет красной «нет связи с историаном»,
-    вопрос владельцу тем же часом.
+    вопрос владельцу тем же часом. **Д3б не начинается до его ответа о пути
+    к 1433**: без этого пути в Д3б нет ни ответа за смену, ни сверки. Планы
+    Д3б и Д4 пересчитываются.
 
 ## Global Constraints
 
@@ -115,13 +130,19 @@
   `pull_policy: never`. Базовый образ серверного слоя — тот же, что у сторожа:
   `python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f`.
 - Секреты и данные заказчика — **никогда в git и в выводе проверок**. Перед
-  каждым коммитом задач 1, 8–10:
+  каждым коммитом задач 1, 2, 7–10:
   `git diff --cached -U0 -- . ':!docs/plans' | grep -E -i -f <шаблоны>` —
-  пусто. В файл шаблонов задания Д3а добавляет: шаблон имён тегов по схеме
-  именования историана (номер участка и узла в начале имени) и
-  `BDRV_PW=[^$<{ "]`; и префиксы имён прежнего списка без цифры в начале
-  (группы качества полотна и общих по машине) — сам файл шаблонов в git не
-  идёт.
+  пусто. В файл шаблонов задания Д3а добавляет:
+  - шаблон имён тегов по схеме именования историана (номер участка и узла в
+    начале имени);
+  - `BDRV_PW=\\?["']?[^$<{ "'\\]` — ловит и пароль в кавычках;
+  - префиксы имён прежнего списка без цифры в начале (группы качества полотна
+    и общих по машине).
+
+  Сам файл шаблонов в git не идёт. Тестовые пароли в плане — только
+  заглушки в угловых скобках (`<test-pw>`, `"<p w>"`), шаблон их заведомо не
+  ловит. Положительный контроль, как в Д2:
+  `printf 'BDRV_PW="x1"\n' | grep -c -E -f <шаблоны>` → 1; фикстуры тестов → 0.
 - **Секреты контейнерам — только файлами** (секреты Compose или bind `:ro`),
   никогда через `environment`, `env_file` или `--env-file` — в том числе у
   пробы. Файлы секретов — `0444` в каталоге `0700` (Д2, решение 5).
@@ -264,25 +285,28 @@ LLM-прокси своя строка (`/healthz/llm`), так что учен�
    её блокировка положит курс. Ожидание: после первого отказа — ни одного
    входа до перезапуска службы, на странице «историан отклонил учётные данные
    — обновите bdrv.env и перезапустите службу». Тест — задача 3,
-   `test_auth_error_latches_no_more_logins`.
-2. **Историан завис или очередь длинная.** Вызов заканчивается к сроку, место
-   держится до возврата драйвера. Место, взятое на исходе срока, не отправляет
-   SQL. Тесты — задача 3, `test_gate_deadline_returns_timeout_and_keeps_slot`,
-   `test_gate_late_acquire_is_busy_not_run`.
-3. **Нагрузка студентов выбирает общий предел, места и пул потоков.** Строка
-   историана не должна стать «неизвестно» при исправном историане. Ожидание:
-   фоновый вызов не ждёт мест людей (ответ быстрее 0,3 с при двух занятых
-   местах и двадцати ждущих вызовах), всего одновременно — не больше 3
-   запросов. Тесты — задача 3, `test_background_lane_not_starved`,
+   `test_auth_error_latches_until_restart`.
+2. **Историан медленный, очередь длинная, студенты выбрали места и предел.**
+   Вызов заканчивается к сроку, место держится до возврата драйвера, место на
+   исходе срока SQL не отправляет. Фоновый опрос не ждёт мест людей, и всего
+   одновременно не больше 3 запросов. Тесты — задача 3,
+   `test_gate_deadline_returns_timeout_sent_and_keeps_slot`,
+   `test_gate_late_acquire_is_busy_not_run`, `test_background_lane_not_starved`,
    `test_gate_total_concurrency_is_three`; задача 5,
    `test_poll_updates_under_user_saturation`.
-4. **Метки впереди часов историана и учение «метка устарела».** Возраст не
+3. **SQL без имён с полосы людей.** Полный снимок `Live` или запрос по дате
+   без `TagName IN (…)` забрал бы значения всех тегов при `sent=()`, и журнал
+   этого не увидел бы. Ожидание: на полосе людей — только `clock_sql()` или
+   инструкция с непустым `names_in()`, иначе отказ без SQL. Тест — задача 3,
+   `test_gate_refuses_nameless_user_sql`.
+4. **Точный маршрут роли — обычная ASGI-функция.** Starlette пускает функцию
+   в `Route` только на GET, а FastAPI по умолчанию отвечает 307 на путь со
+   слэшем — MCP Д3б молча не заработал бы. Ожидание: `POST /dummy` → 200,
+   `/dummy/` → 404. Тест — задача 2, `test_install_hook_exact_mounts_and_no_docs`.
+5. **Метки впереди часов историана и учение «метка устарела».** Возраст не
    залипает на «0 с». Учение с замороженными метками даёт предупреждение и
    сбой по настоящему возрасту, а не по порогу 0. Тесты — задача 5,
    `test_future_stamps_use_time_since_advance`, `test_drill_freeze_stamps_ages`.
-5. **Каталог грузится дольше срока или падает раз за разом.** Служба не должна
-   каждую минуту гонять самый тяжёлый запрос с выброшенным результатом, а
-   причина должна быть на странице. Тест — задача 5, `test_catalog_backoff_and_reason`.
 
 ---
 
@@ -343,23 +367,38 @@ uid 10003, порт 8000; секрет Compose `bdrv-env` → `/run/secrets/bdrv
 ### Task 0: Хвосты Д2
 
 Утренний слот, который держит план Д2: всё, что его черта перенесла в Д3.
+Шаги 7–8 задачи 5 Д2 уже сделаны: в простое место под `runsc` занимает около
+250 МиБ и держит 54 потока, холодный старт — 4,4 с, `dispose` под gVisor
+работает, убийство по памяти видно в `docker events`, swap = 0.
 
 **Files:**
-- Modify: `docs/checks/D2.md`
+- Modify: `docs/checks/D2.md`, `docs/DESIGN-platform-2026-09-29.md` (§11 п. 2 и 5:
+  пометка [П] и ссылка на `docs/checks/D2.md`), `README.md` (раздел
+  «Состояние»: хвосты Д2 закрыты), при нужде — `compose.yaml` (лимиты мест)
 
-- [ ] **Step 1:** По README, раздел «Состояние», и `docs/checks/D2.md` составить
-  список хвостов Д2: задача 5, шаги 7–8 (`dispose`, холодный старт и память);
-  проверка чистым клоном; второй раунд критика и слияние с тегом
-  `platform-d2`, если они перенесены. Отдельная строка: если выкладка Д2 не
-  сделана (ветка «задача 3 не зелёна» плана Д2), — сразу ветка «хвосты больше
-  1,5 ч» шапки: строка владельцу и пересчёт Д3а. Expected: у каждого хвоста
-  вердикт [П] или «ждёт владельца»; ветка Д3а начинается от `main` после тега
-  `platform-d2`.
-- [ ] **Step 2: Commit** (после проверки на секреты) — `git commit -m "Д2: хвосты закрыты в утреннем слоте Д3а"`.
+- [ ] **Step 1:** По README и `docs/checks/D2.md` составить список того, что
+  осталось от Д2:
+  - пометки [П] в §11 проекта и строка README;
+  - проверка чистым клоном;
+  - второй раунд критика и слияние с тегом `platform-d2`, если они
+    перенесены.
+
+  Отдельные строки:
+  - **правка лимитов по замеру** → `compose.yaml` и перевыкладка мест
+    (`create --force-recreate --no-build`, тома сохраняются). По замеру Д2
+    (250 МиБ и 54 потока против порогов 700 МиБ и 358) она не нужна; если
+    всё же понадобится и займёт больше 0,5 ч — ветка «хвосты больше 1 ч»
+    шапки;
+  - **выкладка Д2 не сделана** (ветка «задача 3 не зелёна» плана Д2) — сразу
+    ветка «хвосты больше 1 ч»: строка владельцу и пересчёт Д3а.
+
+  Expected: у каждого хвоста вердикт [П] или «ждёт владельца»; ветка Д3а
+  начинается от `main` после тега `platform-d2`.
+- [ ] **Step 2: Commit** (после проверки на секреты) — `git add docs/checks/D2.md docs/DESIGN-platform-2026-09-29.md README.md && git commit -m "Д2: хвосты закрыты в утреннем слоте Д3а"`.
 
 ---
 
-### Task 1: Утренняя проба историана — запросы 1–6
+### Task 1: Проба историана — запросы 1–6 (окно владельца)
 
 **Нужен владелец:** шаг 4 читает производственные данные. Проба отвечает на
 О1, О3, О11 и половину О4 (язык и формат даты сессии). Замеры времени
@@ -402,7 +441,7 @@ uid 10003, порт 8000; секрет Compose `bdrv-env` → `/run/secrets/bdrv
 | 3 | `SELECT GETDATE(), GETUTCDATE(), SYSDATETIMEOFFSET()` | смещение `GETDATE() − GETUTCDATE()` до 15 мин; совпадает ли с поясом `SYSDATETIMEOFFSET` (О3) |
 | 4 | `SELECT @@LANGUAGE, (SELECT date_format FROM sys.dm_exec_sessions WHERE session_id = @@SPID)` | язык и формат даты сессии (О4, половина) |
 | 5 | текст `catalog_sql()` из задачи 3 | строк, аналоговых, дискретных, секунд |
-| 6 | текст `live_all_sql()` из задачи 3 | строк, секунд; по тегам участка (`20`…`25`, без `$`) возраст против п. 3: p50, p95, max, число и минимум отрицательных; возраст самого свежего и 8-го по свежести аналогового; доля `Quality = 0` (О11) |
+| 6 | текст `live_all_sql()` из задачи 3 | строк, секунд; по тому же набору, из которого служба берёт теги свежести, — аналоговые теги участка по правилам 1, 2 и 4 Д3а-R1 (без служебных хвостов): возраст против п. 3 — p50, p95, max, число и минимум отрицательных; возраст самого свежего и 8-го по свежести; доля `Quality = 0` (О11) |
 
 - [ ] **Step 3: Копия учётных данных (на сервере, без вывода содержимого)**
 
@@ -421,7 +460,8 @@ Expected: ответ на каждый из 6 запросов (вердикт �
 
 | Итог | Решение | По умолчанию |
 |---|---|---|
-| О11: 8-й по свежести аналоговый тег участка моложе 100 с | `HIST_WARN_S=300`, `HIST_FAIL_S=900` | те же |
+| запрос 1 — `auth` (`LoginError`, 18452, 18456, 18486–18488) | **стоп** (ветка шапки): ни построителя, ни `core`, ни учений; строка владельцу | — |
+| О11: 8-й по свежести тег набора моложе 100 с | `HIST_WARN_S=300`, `HIST_FAIL_S=900` | те же |
 | О11: он старше 100 с | `HIST_WARN_S` = 3 × его возраст (вверх до минуты), `HIST_FAIL_S` = 3 × `HIST_WARN_S` | — |
 | запросы 5 + 6 дольше 10 с | `CATALOG_DEADLINE_S` = 3 × их сумма (вверх до 10 с) | `60` |
 | всегда | `HIST_STALE_S` = max(120, `CATALOG_DEADLINE_S` + 2 × `FRESH_POLL_S` + 10): загрузка каталога занимает место фона, и опрос свежести на это время замолкает; драйвер держит место не дольше срока, 10 с — запас на вход | `130` |
@@ -430,7 +470,7 @@ Expected: ответ на каждый из 6 запросов (вердикт �
 
 Expected: вердикты и таблица решений — в `docs/checks/D3a.md`.
 
-- [ ] **Step 6: Commit** (после проверки на секреты) — `git add docs/checks/D3a.md && git commit -m "Д3а: утренняя проба — версия, пояс, язык сессии, время каталога, задержка Live"`.
+- [ ] **Step 6: Commit** (после проверки на секреты) — `git add docs/checks/D3a.md && git commit -m "Д3а: проба историана — версия, пояс, язык сессии, время каталога, задержка Live"`.
 
 ---
 
@@ -475,12 +515,17 @@ Expected: вердикты и таблица решений — в `docs/checks/
     звенья уровня приложения; других путей к ним у ролей нет, Д4 и Д5 ставят
     свои так же;
     `mounts() -> list[tuple[str, ASGIApp]]` — точные маршруты: `create_app`
-    ставит их как `Route(path, app)`, не `Mount`, и чужие пути они не
+    оборачивает каждое приложение в класс-переходник
+    (`class _Asgi: async def __call__(self, scope, receive, send)`) и ставит
+    `Route(path, _Asgi(app))`, не `Mount`. Starlette пускает в `Route`
+    ASGI-приложение только как экземпляр класса, а обычную функцию считает
+    обработчиком и пускает только на GET. Чужие пути точные маршруты не
     перехватывают.
   - `class RoleBase` — пустые `install` и `mounts`, от него наследуются роли.
   - `create_app(settings: Settings, roles: Sequence[Role]) -> FastAPI`:
-    - `FastAPI(docs_url=None, redoc_url=None, openapi_url=None, …)`: с Д4 порт
-      8000 виден из сетей мест, описание API им не нужно;
+    - `FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False, …)`:
+      с Д4 порт 8000 виден из сетей мест, описание API им не нужно; без
+      перенаправлений `/mcp/` даёт 404, а не 307;
     - порядок: роутеры ролей → `GET /healthz` → `GET /healthz/{role}` →
       `install(app)` каждой роли → точные маршруты `mounts()` (последними);
     - `/healthz` — `200 {"ok": true, "roles": {имя: пояснение}}`, если все роли
@@ -504,7 +549,9 @@ Expected: вердикты и таблица решений — в `docs/checks/
     `fastapi==`, `uvicorn==` — версии на день выполнения.
   - `helpers.py`: `SETTINGS`, `DummyRole(name, health, installs=False)` (при
     `installs=True` ставит в `install` промежуточное звено с заголовком
-    `X-Role-Installed: 1` и точный маршрут `/dummy`), `write(tmp_path, text) -> str`.
+    `X-Role-Installed: 1`, а в `mounts()` отдаёт `/dummy` — обычную функцию
+    `async def dummy(scope, receive, send)`, отвечающую 200 на любой метод),
+    `write(tmp_path, text) -> str`.
     `conftest.py`: `anyio_backend`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -512,8 +559,8 @@ Expected: вердикты и таблица решений — в `docs/checks/
 ```python
 # core/tests/test_skeleton.py
 def test_read_env_file_strips_quotes_and_export(tmp_path):
-    p = write(tmp_path, "BDRV_HOST=h\nBDRV_PW=\"p w\"\n# к\n\nexport BDRV_USER='u'\n")
-    assert read_env_file(p) == {"BDRV_HOST": "h", "BDRV_PW": "p w", "BDRV_USER": "u"}
+    p = write(tmp_path, "BDRV_HOST=h\nBDRV_PW=\"<p w>\"\n# к\n\nexport BDRV_USER='u'\n")
+    assert read_env_file(p) == {"BDRV_HOST": "h", "BDRV_PW": "<p w>", "BDRV_USER": "u"}
 
 def test_read_env_file_error_hides_line(tmp_path):
     with pytest.raises(ValueError) as e:
@@ -521,9 +568,9 @@ def test_read_env_file_error_hides_line(tmp_path):
     assert "строка 2" in str(e.value) and "секрет" not in str(e.value)
 
 def test_bdrv_config_defaults_and_hidden_password(tmp_path):
-    cfg = BdrvConfig.from_env_file(write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=s3cr3t\n"))
+    cfg = BdrvConfig.from_env_file(write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<s3cr3t>\n"))
     assert (cfg.port, cfg.database) == (1433, "Runtime") and "s3cr3t" not in repr(cfg)
-    inst = BdrvConfig.from_env_file(write(tmp_path, "BDRV_HOST=h\\INST\nBDRV_USER=u\nBDRV_PW=p\n"))
+    inst = BdrvConfig.from_env_file(write(tmp_path, "BDRV_HOST=h\\INST\nBDRV_USER=u\nBDRV_PW=<p>\n"))
     assert inst.port is None                       # экземпляр: порт находит pytds
     with pytest.raises(ValueError, match="BDRV_PW"):
         BdrvConfig.from_env_file(write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\n"))
@@ -534,10 +581,11 @@ def test_settings_from_env():
         with pytest.raises(ValueError):
             Settings.from_env(bad)
 
-def test_install_hook_exact_mounts_and_no_docs():
+def test_install_hook_exact_mounts_and_no_docs():                     # Review Focus 4
     with TestClient(create_app(SETTINGS, [DummyRole("data", (True, "ок"), installs=True)])) as c:
         assert c.get("/healthz").headers["X-Role-Installed"] == "1"
-        assert c.get("/dummy").status_code == 200 and c.get("/dummy/x").status_code == 404
+        assert c.post("/dummy").status_code == 200 and c.get("/dummy").status_code == 200   # функция, не только GET
+        assert c.post("/dummy/").status_code == 404 and c.get("/dummy/x").status_code == 404
         assert c.get("/openapi.json").status_code == 404 and c.get("/docs").status_code == 404
 
 def test_healthz_and_role_health():
@@ -630,11 +678,17 @@ git commit -m "Серверный слой: каркас ролей, здоро�
       где `t` — остаток срока; `port=cfg.port` — только если он не `None`;
     - затем `execute(PRELUDE)` и на каждую строку `execute(sql)` одним
       аргументом и `fetchall()`; закрытие — в `finally`;
-    - разбор ошибок: `pytds.LoginError` или `pytds.OperationalError` с `msg_no`
-      из `AUTH_MSG_NOS` → `auth`; прочее из `connect` → `connect`;
-      `socket.timeout`/`TimeoutError` при чтении → `timeout`; `OSError` при
-      чтении → `connect`; `pytds.Error` → `query` (`detail` — класс и первые
-      200 знаков).
+    - `disable_connect_retry=True`: иначе pytds внутри одного `connect`
+      делает до 4 попыток входа;
+    - разбор ошибок — по фазе. Из `connect`: `pytds.LoginError` или
+      `pytds.OperationalError` с `msg_no` из `AUTH_MSG_NOS` → `auth`, всё
+      прочее (в том числе встроенный `TimeoutError`) → `connect`. При чтении:
+      `socket.timeout`/`TimeoutError` → `timeout`, `OSError` → `connect`,
+      `pytds.Error` → `query`;
+    - `detail` — класс исключения, `msg_no` и первые 200 знаков текста. Он
+      **не выходит из процесса**: в тексте SQL Server бывают учётка
+      («Login failed for user …») и начало SQL с именами тегов. В события и
+      строки журнала идут только `code`, класс и `msg_no`.
   - `@dataclass(frozen=True) class HistClock: local: datetime; utc: datetime`:
     свойства `offset` (до 15 мин), `tz`, `tz_label` («UTC+05:00»); метод
     `aware(dt) -> datetime`.
@@ -658,10 +712,13 @@ git commit -m "Серверный слой: каркас ролей, здоро�
       по порядку:
       1. каждый литерал из `literals()` должен быть именем из `names_in()` той
          же строки и входить в `allowed` — либо проходить `literal_ok`
-         (в Д3а таких нет; Д3б пускает даты и `'STAIRSTEP'`). Иначе — строка
-         журнала «ворота: литерал вне белого списка — отказ без SQL»,
-         счётчик, `GateRefused("unlisted")`. Шаблон с `TagName = '…'`
-         поэтому не обходит ни проверку, ни `sent`;
+         (в Д3а таких нет; Д3б пускает даты и `'STAIRSTEP'`). Шаблон с
+         `TagName = '…'` поэтому не обходит ни проверку, ни `sent`. Кроме
+         того, на полосе `user` каждая инструкция — либо ровно `clock_sql()`,
+         либо с непустым `names_in()`: `catalog_sql()` и `live_all_sql()`
+         пускаются только на полосе `background`. Иначе — строка журнала
+         «ворота: SQL вне белого списка — отказ без SQL», счётчик,
+         `GateRefused("unlisted")`;
       2. после ошибки `auth` ворота защёлкнуты до перезапуска службы:
          `HistorianError("auth", "защёлка: …")` без входа. После ошибки
          `connect` в течение `CONNECT_COOLDOWN_S` —
@@ -764,6 +821,7 @@ def test_connect_args_prelude_one_argument_and_deadline_timeout():
     assert tds_query(CFG, connect=rec)(["SELECT 1", "SELECT 2"], 12.0) == [[(1,)], [(2,)]]
     kw = rec.kwargs
     assert (kw["dsn"], kw["port"], kw["autocommit"], kw["login_timeout"], kw["timeout"]) == ("h", 1433, True, 10, 12.0)
+    assert kw["disable_connect_retry"] is True
     assert "server" not in kw and "cafile" not in kw and rec.connect_count == 1
     assert rec.executed == [(PRELUDE,), ("SELECT 1",), ("SELECT 2",)] and rec.closed
     rec2 = RecordingConnect(results=[[(1,)]])
@@ -775,6 +833,7 @@ def test_connect_args_prelude_one_argument_and_deadline_timeout():
     ("connect", auth_operational_error(18456), "auth"),          # OperationalError с msg_no
     ("connect", auth_operational_error(18452), "auth"),
     ("connect", ConnectionRefusedError(), "connect"),
+    ("connect", TimeoutError(), "connect"),                      # фаза входа — это связь, не срок чтения
     ("execute", socket.timeout(), "timeout"),
     ("execute", pytds.ProgrammingError("bad"), "query"),
 ])
@@ -815,6 +874,17 @@ async def test_gate_refuses_foreign_literals_without_sql():
         assert e.value.code == "unlisted"
     assert fake.calls == [] and g.stats()["refused_unlisted"] == 3
 
+async def test_gate_refuses_nameless_user_sql():                                # Review Focus 3
+    fake = FakeHistorian()
+    g = gate(fake)
+    for sql in (live_all_sql(), catalog_sql()):
+        with pytest.raises(GateRefused) as e:
+            await g.run([sql])                                              # полоса людей
+        assert e.value.code == "unlisted"
+    assert fake.calls == []
+    await g.run([live_all_sql()], lane="background")                          # фону — можно
+    await g.run([clock_sql()])                                                # часы — любой полосе
+
 async def test_gate_deadline_returns_timeout_sent_and_keeps_slot():             # Review Focus 2
     fake = FakeHistorian(delay_s=1.0)
     g = gate(fake, deadline_s=0.3)
@@ -841,7 +911,7 @@ async def test_gate_late_acquire_is_busy_not_run():                             
     assert e.value.code == "busy" and len(fake.calls) == 1
     await first
 
-async def test_background_lane_not_starved():                                   # Review Focus 3
+async def test_background_lane_not_starved():                                   # Review Focus 2
     fake = FakeHistorian(delay_s=1.0, slow=SLOW_Q)
     g = gate(fake, global_window=SlidingWindow(2, 300))
     users = [asyncio.ensure_future(g.run([Q])) for _ in range(2)]
@@ -855,7 +925,7 @@ async def test_background_lane_not_starved():                                   
         await g.run([Q])                                                     # окно людей выбрано
     assert e.value.code == "rate"
 
-async def test_background_survives_twenty_waiting_users():                     # Review Focus 3
+async def test_background_survives_twenty_waiting_users():                     # Review Focus 2
     fake = FakeHistorian(delay_s=1.0, slow=SLOW_Q)
     g = gate(fake, deadline_s=2.5)
     users = [asyncio.ensure_future(g.run([Q])) for _ in range(20)]         # 18 ждут места, не потоки
@@ -865,7 +935,7 @@ async def test_background_survives_twenty_waiting_users():                     #
     assert time.monotonic() - t < 0.3
     await asyncio.gather(*users, return_exceptions=True)
 
-async def test_gate_total_concurrency_is_three():                              # Review Focus 3
+async def test_gate_total_concurrency_is_three():                              # Review Focus 2
     fake = FakeHistorian(delay_s=0.3)
     g = gate(fake)
     async def timed(lane):
@@ -1072,9 +1142,11 @@ git commit -m "Служба данных: каталог в памяти, пра
     `clock_mono: float | None` — часы историана и момент их получения; их
     обновляют и `refresh_catalog`, и `poll_freshness` (раз в 30 с), Д3б
     берёт отсюда «сейчас историана» без лишнего запроса
-  - `async def refresh_catalog(self) -> bool` — ворота
-    `[clock_sql(), catalog_sql(), live_all_sql()]`, полоса `background`, срок
-    `CATALOG_DEADLINE_S`. Удача → каталог, часы и
+  - `async def refresh_catalog(self) -> bool` — два вызова ворот по полосе
+    `background`: `[clock_sql(), catalog_sql()]`, затем `[live_all_sql()]`;
+    срок у каждого — остаток общего `CATALOG_DEADLINE_S`. У pytds срок —
+    предел на каждое чтение, он ставится при входе, и разнесённые вызовы
+    держат фоновое место не дольше `CATALOG_DEADLINE_S`. Удача → каталог, часы и
     `freshness_tags = catalog.freshest(8)`, строка журнала «каталог: N тегов,
     в белом списке M, нет в историане K, живых L», `True`. `HistorianError` или
     `GateRefused` → код в `catalog_error`, `catalog_failures += 1`, `False`;
@@ -1126,7 +1198,7 @@ def test_age_from_historian_clock():
     f.observe(CLOCK, rows(datetime(2026, 10, 1, 11, 59, 18)), 1, mono=100.0, wall=W)
     assert (f.to_json(100.0)["age_s"], f.to_json(110.0)["age_s"]) == (42.0, 52.0)
 
-def test_future_stamps_use_time_since_advance():                               # Review Focus 4
+def test_future_stamps_use_time_since_advance():                               # Review Focus 5
     f, ahead = FreshnessTracker(), datetime(2026, 10, 1, 12, 0, 31)
     f.observe(CLOCK, rows(ahead), 1, mono=100.0, wall=W)
     assert (f.to_json(100.0)["age_s"], f.to_json(100.0)["skew_s"]) == (0.0, -31.0)
@@ -1135,7 +1207,7 @@ def test_future_stamps_use_time_since_advance():                               #
     f.observe(CLOCK, rows(ahead + timedelta(seconds=30)), 1, mono=190.0, wall=W)
     assert f.to_json(191.0)["age_s"] == 1.0
 
-def test_drill_freeze_stamps_ages():                                           # Review Focus 4
+def test_drill_freeze_stamps_ages():                                           # Review Focus 5
     f, t = FreshnessTracker(freeze_stamps=True), datetime(2026, 10, 1, 12, 0, 31)
     for i, mono in enumerate((100.0, 130.0, 160.0)):
         f.observe(CLOCK, rows(t + timedelta(seconds=30 * i)), 1, mono=mono, wall=W)
@@ -1167,7 +1239,7 @@ async def test_refresh_catalog_loads_and_picks_freshest():
     assert set(names_in(fake.calls[-1][1])) <= WHITELIST
     assert role.clock.tz_label == "UTC+05:00" and role.clock_mono == role.monotonic()
 
-async def test_catalog_backoff_and_reason():                                   # Review Focus 5
+async def test_catalog_backoff_and_reason():
     role, fake = make_role()
     fake.fail = HistorianError("timeout", "долго")
     delays = []
@@ -1183,7 +1255,7 @@ async def test_catalog_uses_own_deadline():
     fake.delay_s = 0.6
     assert await role.refresh_catalog() is False and role.catalog_error == "timeout"
 
-async def test_poll_updates_under_user_saturation():                           # Review Focus 3
+async def test_poll_updates_under_user_saturation():                           # Review Focus 2
     role, fake = make_role()
     await role.refresh_catalog()
     role.gate.global_window = SlidingWindow(2, 300)
@@ -1200,7 +1272,7 @@ async def test_drill_freeze_poll_stops_loop():
     role, fake = make_role(settings=replace(SETTINGS, FRESH_POLL_S=0.05, DRILL_FRESHNESS="freeze_poll"))
     async with role.lifespan():
         await anyio.sleep(0.4)
-    polls = sum(1 for call in fake.calls if call[0] == clock_sql() and len(call) == 2)
+    polls = sum(1 for call in fake.calls if len(call) == 2 and "FROM Live WHERE TagName IN" in call[1])
     assert polls == 1
 
 def test_health_and_routes(tmp_path):
@@ -1424,7 +1496,7 @@ git commit -m "Сторож: вид historian, строка службы дан�
       `HIST_STALE_S`;
     - фикстура пишет в тестовый `SECRETS_DIR` файл `bdrv.env`
       (`BDRV_HOST=192.0.2.10`, `BDRV_PORT=1433`, `BDRV_USER=test`,
-      `BDRV_PW=test-not-a-secret` — TEST-NET, недостижим), в тестовый
+      `BDRV_PW=<test-pw>` — TEST-NET, недостижим; заглушка не ловится шаблоном), в тестовый
       `DATA_DIR` — `whitelist.txt` из `20FAKE_001_PV`; файлы `0444`, каталоги
       `0700`; `DATA_DIR` — в `test.env`;
     - `ready["pcbk-core"]` — `docker exec pcbk-core python -m pcbk_core.main --healthcheck`
@@ -1526,7 +1598,8 @@ git commit -m "Серверный слой в компоновке: сеть в�
 ### Task 8: Выкладка и белый список
 
 Шаги — команды и вывод, который значит «прошло». Итоги — в `docs/checks/D3a.md`,
-только вердикты и числа. `sudo` не нужен. **Шаг 4 — при владельце.**
+только вердикты и числа. `sudo` не нужен. **Шаги 1–4 идут в окне владельца**
+сразу после задачи 1 (порядок — в шапке), шаги 5–6 — после задачи 7.
 
 **Files:**
 - Modify: `deploy/README.md` — раздел «Служба данных»:
@@ -1540,9 +1613,12 @@ git commit -m "Серверный слой в компоновке: сеть в�
 - [ ] **Step 1: Предпроверки** — `cd /opt/pcbk-reserve; docker compose ps --format '{{.Name}} {{.State}}'; stat -c '%a' secrets secrets/bdrv.env; [ -d data ] || install -d -m 0700 data; stat -c '%a' data; docker ps --format '{{.Names}} {{.Status}}' > ~/pcbk-d3a-before.txt`.
   Expected: службы Д1 и Д2 на месте; `700`, `444`, `700`.
 
-- [ ] **Step 2: Образы** — локально `docker compose build core watchdog`;
-  `docker save pcbk-reserve/core:d3a pcbk-reserve/watchdog:d3a | gzip | $SSH 'gunzip | docker load'`;
-  сверка `RootFS`. Expected: совпало; `:d2` сторожа на сервере остался.
+- [ ] **Step 2: Образы** — в окне владельца: `docker build -t pcbk-reserve/core:d3a core/`
+  (после задачи 4 в нём уже есть построитель) и
+  `docker save pcbk-reserve/core:d3a | gzip | $SSH 'gunzip | docker load'`.
+  Перед шагом 5 — ещё раз, итоговые: `docker compose build core watchdog` и
+  `docker save pcbk-reserve/core:d3a pcbk-reserve/watchdog:d3a | …`. Каждый
+  раз сверка `RootFS`. Expected: совпало; `:d2` сторожа на сервере остался.
 
 - [ ] **Step 3: Засев `whitelist.extra`** (локально, по прежнему списку)
 
@@ -1660,11 +1736,13 @@ Expected:
       дорожной карте и в Д2»;
     - таблица владельца, строка Д3 — «правило `d3-1` подтверждено» или его
       выбор, с числами N, M, K.
-  - `README.md`, раздел «Состояние» — «Д3а готов», дальше Д3б.
+  - `README.md`: раздел «Состояние» — «Д3а готов», дальше Д3б; в таблице
+    «Где что» — «13 дневных слайсов» вместо 12.
 - [ ] **Step 2: Критик** (Opus 5.5). Блокер — пункт «Блокер дня» дорожной карты.
   Петля — до нуля блокеров, не больше двух раундов; третий — только после
-  разговора с владельцем. Второй раунд, если черта сработала (шапка), — в
-  утренний слот Д3б, и слияние с тегом — после него.
+  разговора с владельцем. Если черта сработала (шапка): один раунд критика;
+  при нуле блокеров — слияние и тег; иначе второй раунд, слияние и тег — в
+  утреннем слоте Д3б.
 - [ ] **Step 3: Слияние.** Ветку — в `main`, тег `platform-d3a`. Перед
   пушем — `git log -p main..HEAD -- . ':!docs/plans' | grep -E -i -f <шаблоны>`
   пусто, `git ls-files | grep -cE 'whitelist\.(txt|extra)$|\.env$'` → `0`.
@@ -1672,6 +1750,10 @@ Expected:
   `(cd core && CORE_PYTEST)` проходит. На сервере удалить
   `~/pcbk-d3a-before.txt` и `rm -f /opt/pcbk-reserve/data/prior.txt` (если
   владелец выбирал `--base`); в `$JOB` удалить `whitelist.*`, `prior.txt`.
-- [ ] **Step 4: Владельцу** — «Д3а готов», снимки, числа белого списка.
-  Вопросы: 82 имени других участков из прежнего списка — в пилоте или нет;
-  `_LMN` (О9); TLS до историана (О5).
+- [ ] **Step 4: План и факт.** Строка в `docs/checks/D3a.md`: «план 10,0 ч /
+  факт Y ч по git». Y — от первого коммита ветки дня до тега:
+  `git log --reverse --format=%cI platform-d2..platform-d3a | sed -n '1p;$p'`.
+  По ней Д3б проверяет свой порог «темп вдвое медленнее Д1».
+- [ ] **Step 5: Владельцу** — «Д3а готов», снимки, числа белого списка, строка
+  «план / факт». Вопросы: 82 имени других участков из прежнего списка — в
+  пилоте или нет; `_LMN` (О9); TLS до историана (О5).

@@ -43,46 +43,61 @@ SQLite; pydantic.
 
 | Задача | Часы | Где |
 |---|---|---|
-| 0. Хвосты Д3а (второй раунд критика, чистый клон — по черте Д3а) | 0–0,5 | — |
-| 1. Эталон сверки и проба: запросы 7–15, режим `verify` | 1,75 | локально, сервер — **нужен владелец** |
+| 0. Хвосты Д3а (второй раунд критика и слияние, чистый клон — по черте Д3а) | 0–0,5 | — |
+| 1. Эталон сверки и скрипт пробы: запросы 7–15, режим `verify` (шаги 1–5) | 1,5 | локально |
 | 2. Шаблоны с датами и периоды | 0,75 | локально |
 | 3. Охрана выхода, токены, бюджет, кэш, single-flight | 1 | локально |
 | 4. Разбор имён, поиск и журнал событий | 1 | локально |
 | 5. Инструменты и HTTP | 2 | локально |
 | 6. MCP | 0,75 | локально |
 | 7. Компоновка и выкладка | 1,5 | локально, сервер |
-| 8. Живые проверки | 1 | сервер, **нужен владелец** |
-| 8а. Перевыкладка по `AVG_KIND`, если сверка подтвердила другой вид (условно) | (0,5) | локально, сервер |
+| 1б. Проба `morning-b`, константы по ней, пересборка и перевыкладка (задача 1, шаги 7–9) | 0,5 | сервер, **окно владельца** |
+| 8. Живые проверки | 1 | сервер, **окно владельца** |
+| 8а. Перевыкладка по `AVG_KIND` — только при закреплённой интерполяции или одном типе на всех (условно) | (0,5) | локально, сервер |
 | 9. Закрытие дня | 1,25 | — |
-| **Критический путь по плановой шкале** | **11,0** (с хвостами Д3а и 8а — до 12) | |
+| **Критический путь по плановой шкале** | **11,25** (с хвостами Д3а и 8а — до 12,25) | |
+
+**Одно окно владельца около 1,5 ч — вечером:** проба (задача 1, шаги 7–9),
+затем задача 8, шаги 3–6. До пробы константы стоят по умолчанию, тесты от них
+параметризованы. После пробы — один коммит констант, пересборка и
+перевыкладка `core` (около 15 минут) — и сразу ответ по туннелю и сверка.
 
 **Принятое основание «один день»** — то же, что в Д3а: живой темп Д1 (план в
 9,5 ч по этой шкале выполнен примерно за 2 ч 20 мин по часам, с субагентами).
 Плановая шкала остаётся честной, а день укладывается в рабочий день по живому
-темпу. Если темп Д3а оказался вдвое медленнее Д1 или хуже, план Д3б
-пересчитывается до его начала, и владелец получает строку с числами — или его
-явное «да» на день длиннее.
+темпу. Порог проверяется по строке «план / факт по git» из закрытия Д3а: если
+темп Д3а вдвое медленнее Д1 или хуже, план Д3б пересчитывается до его начала,
+и владелец получает строку с числами — или его явное «да» на день длиннее.
 
 **Черта отсечения — конец восьмого часа** плюс время хвостов Д3а. К ней зелёны
-задачи 1–6 (по оценке — 7,25 ч). После черты порядок жёсткий: задача 7,
-задача 8, при нужде 8а, задача 9. **В Д4 ничего не переносится:** Д4
-начинается после тега `platform-d3b`.
-- **Задача 5 или 6 не зелёна к черте.** Незелёная задача доделывается в тот же
-  день сверх оценки. Если к десятому часу её всё ещё нет — выкладки нет, а
-  владельцу в тот же час уходит строка: Д3б кончится завтрашним утром, Д4
-  сдвигается на полдня. Решение о сдвиге — его.
-- **Утром нет владельца.** Задачи 2–6 идут первыми; проба (задача 1, шаги 5–6)
-  — когда он появится. Вечерние шаги 3–6 задачи 8 без него не делаются;
-  тогда владельцу — строка о сдвиге, как выше.
-- **Сверка подтвердила другой вид среднего** (задача 8, шаг 4) — строка 8а:
-  правка одной константы, перевыкладка, повтор шагов 3–4 задачи 8.
+задачи 1 (шаги 1–6) и 2–6 (по оценке — 7,0 ч). После черты порядок жёсткий:
+задача 7, окно владельца (1б и 8), при нужде 8а, задача 9. **В Д4 ничего не
+переносится:** Д4 начинается после тега `platform-d3b`.
+- **Задача 5 или 6 не зелёна к черте.** Владельцу в тот же час уходит строка:
+  Д3б кончится завтрашним утром, окно владельца переносится туда же, Д4
+  сдвигается на полдня. Решение о сдвиге — его. Незелёная задача
+  доделывается сверх оценки.
+- **Окна владельца нет.** Задачи 1–7 идут; проба и шаги 3–6 задачи 8 ждут
+  окна, выкладка идёт с константами по умолчанию. Владельцу — строка о сдвиге,
+  как выше.
+- **Сверка подтвердила другой вид среднего или не сошлась** (задача 8, шаг 4)
+  — строка 8а, но только при `PIN_INTERPOLATION = "STAIRSTEP"` или при одном
+  типе интерполяции на всех по запросу 14. Иначе вердикт записывается,
+  `AVG_KIND` остаётся `"unverified"`: один тег не даёт права объявлять вид
+  для всех тегов.
 
 ## Global Constraints
 
 Действуют Global Constraints Д3а целиком. Д3б добавляет:
 
 - **Проверка на секреты** перед каждым коммитом задач 1, 7, 8, 9 — тем же
-  `git diff --cached … | grep -E -i -f <шаблоны>`.
+  `git diff --cached … | grep -E -i -f <шаблоны>`. Если Д3б ведёт новая
+  сессия и `$JOB` новый, файл шаблонов собирается заново по Д1, Д2 и Д3а:
+  адреса, шаблон имён тегов, префиксы прежнего списка без цифры, `BDRV_PW` с
+  кавычками. Затем положительный контроль, как в Д2 (задача 6, шаг 3), и
+  `printf 'BDRV_PW="x1"\n' | grep -c -E -f <шаблоны>` → 1. Тестовый токен
+  `TOKEN` — не 48 шестнадцатеричных знаков (`"test-token-student-01"`),
+  иначе его поймает шаблон Д2.
 - **Охрана выхода в процессе** (Д3б-R6) ставится при старте службы и
   построителя. Список разрешённого: историан (`BDRV_HOST` на `BDRV_PORT`, а
   если порт не задан из-за экземпляра — на любом TCP-порту) и петля.
@@ -120,24 +135,31 @@ SQLite; pydantic.
 
 ## Решения по умолчанию (Ruling)
 
-**Д3б-R6 — охрана выхода.** Аудит-хук Python на события:
+**Д3б-R6 — охрана выхода: растяжка, а не песочница.** Аудит-хук Python
+(PEP 578) ловит случайный выход нашим кодом и библиотеками. От атакующего
+внутри процесса он не защищает — PEP 578 так и говорит. Что хук делает:
 - `socket.connect`: адрес вне списка → `EgressDenied` до системного вызова.
   Имя хоста в кортеже разрешается через кэш, и проверяется каждый адрес; не
   разрешилось — отказ;
+- `socket.sendto` и `socket.sendmsg` на потоковом сокете — отказ: так TCP не
+  уйдёт через TCP Fast Open мимо `connect`. Сверх того у `core` в
+  `compose.yaml` — `sysctls: {net.ipv4.tcp_fastopen: "0"}`;
 - `subprocess.Popen`, `os.system`, `os.exec`, `os.posix_spawn`,
-  `ctypes.dlopen` → `PermissionError`.
+  `ctypes.dlopen` → `PermissionError("запуск процессов через subprocess/os запрещён")`.
 
 Правила `DOCKER-USER` не ставим: нужен `sudo`, они не переживают перезагрузку,
 адреса OpenRouter меняются, рядом работает Dify.
 
-**Остаточный риск:**
-- на уровне сети из `pcbk-egress` открыт любой адрес (факт Д3а);
-- DNS через 127.0.0.11 и UDP (`sendto`) не охраняются;
-- нативный код с тома `/var/lib/pcbk-core` может обойти хук.
+**Остаточный риск — обходы хука** (названы, а не закрыты):
+- уже загруженный `ctypes` и прямые системные вызовы через него;
+- `_posixsubprocess.fork_exec` в обход `subprocess`;
+- DNS через 127.0.0.11 и UDP (`sendto` на датаграммах);
+- нативный модуль с тома `/var/lib/pcbk-core`;
+- на уровне сети из `pcbk-egress` открыт любой адрес (факт Д3а).
 
 **Цена ошибки:** при взломе процесса атакующий получит сеть сервера.
-Закрывается правилами `DOCKER-USER` — предложение владельцу на Д12, с его
-`sudo`.
+Настоящая граница — правила `DOCKER-USER` для моста `pcbk-egress`:
+предложение владельцу на Д12, с его `sudo`.
 
 **Д3б-R7 — журнал доказывает белый список.**
 - Ворота Д3а пускают в SQL только литералы-имена из `TagName IN (…)` белого
@@ -159,8 +181,11 @@ SQLite; pydantic.
    времени (ступенькой) при различимости `d ≥ 0,01`, параметр закрепляется в
    шаблоне: `PIN_INTERPOLATION = "STAIRSTEP"`, `AVG_KIND = "step"` для всех
    тегов.
-2. Иначе смотрится распределение `InterpolationType` по `AnalogTag`. Вид
-   объявляется, только если он один на всех и сводка с ним сошлась.
+2. Иначе смотрится распределение `InterpolationType` по `AnalogTag` в
+   разбивке по `RawType`; значение 254 («по умолчанию системы»)
+   разворачивается через `InterpolationTypeReal` и `…Integer` из
+   `SystemParameter`. Вид объявляется, только если после разворота он один
+   на всех и сводка с ним сошлась.
 3. Иначе — `"unverified"`: вид среднего по тегам — вопрос в журнал долга.
 
 **Цена ошибки:** неверное «взвешено по времени» в ответе. Ловит его вечерняя
@@ -265,7 +290,8 @@ docs/checks/D3b.md, docs/checks/D3b/*.png  журнал и снимок стра
 
 ### Task 1: Эталон сверки и проба — запросы 7–15, режим `verify`
 
-**Нужен владелец:** шаг 6 читает производственные данные. Проба закрывает О4
+**Нужен владелец:** шаг 7 читает производственные данные — он идёт вечером, в
+одном окне с задачей 8. Шаги 1–6 — утром, локально. Проба закрывает О4
 (формат даты) и О2 (столбцы сводки, вид среднего и σ, интерполяция). Кроме
 того, она выбирает тег для вечерней сверки и имя для отрицательного контроля.
 Эталон `delta_stats` — в репозитории с тестами. Скрипт пробы `probe_b.py` —
@@ -294,7 +320,8 @@ docs/checks/D3b.md, docs/checks/D3b/*.png  журнал и снимок стра
     `verify --date-fmt A|B`.
   - Файлы `/opt/pcbk-reserve/probe-out/check-tag` и `unlisted-tag` (`0400`,
     имена только там).
-  - Решения для задач 2 и 5 — таблица шага 7.
+  - Решения для задач 2 и 5 — таблица шага 8; до неё — значения по
+    умолчанию.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -338,7 +365,9 @@ Expected: FAIL — `ModuleNotFoundError: delta_stats`
 
 - [ ] **Step 4: Run tests to verify they pass** — та же команда. Expected: PASS (4 теста).
 
-- [ ] **Step 5: Пробный образ `pcbk-probe/tds:d3b` (в `$JOB/probe-b/`)**
+- [ ] **Step 5: Commit** — `git add core/verify/ && git commit -m "Эталон сверки: среднее по времени и арифметическое по сырому Delta"`.
+
+- [ ] **Step 6: Пробный образ `pcbk-probe/tds:d3b` (в `$JOB/probe-b/`)**
 
 `FROM pcbk-probe/tds:1.17.1` — образ Д3а с python-tds; он есть локально и на
 сервере. Сверху — копия `core/verify/delta_stats.py` и самостоятельный
@@ -349,16 +378,22 @@ Expected: FAIL — `ModuleNotFoundError: delta_stats`
 - печатаются только агрегаты, имён и значений нет;
 - литерал даты — собственная функция пробы, не `sql.py`;
 - окно — последний полный час по `GETDATE()`; если сегодня день равен месяцу
-  (10.10), — тот же час вчера: такой день форматы не различает.
+  (10.10), — тот же час вчера: такой день форматы не различает;
+- **кандидаты — только из белого списка**: `whitelist.txt` (смонтирован
+  `:ro`) ∩ аналоговые по каталогу ∩ живые по снимку `Live`, по свежести —
+  как `freshest` Д3а. Выходы регуляторов `_LMN` и прочие служебные хвосты
+  меняются каждый скан, но вечером дали бы «не в белом списке».
 
 | № | Запрос | Что печатается |
 |---|---|---|
-| 7–8 | `SELECT DateTime, Value, Quality FROM AnalogHistory WHERE TagName = '<t>' AND DateTime >= '<a>' AND DateTime <= '<b>' AND wwRetrievalMode = 'Delta'` для самого свежего аналогового тега участка — формат **A** `YYYY-MM-DD HH:MM:SS.000` и **B** `YYYYMMDD HH:MM:SS.000` | на формат: «внутри окна» / «вне окна» / «пусто» / «ошибка: <класс>» (О4) |
-| 9–12 | тот же `Delta` для ещё четырёх самых свежих аналоговых тегов участка, прошедший формат | `discrimination` каждого; доля `Quality = 0` |
-| 13 | `SELECT * FROM AnalogSummaryHistory WHERE TagName = '<лучший по d>' AND StartDateTime >= '<a>' AND EndDateTime <= '<b>' AND wwCycleCount = 1 AND wwInterpolationType = 'STAIRSTEP'` | принят ли параметр; имена столбцов; `gap` у `Average` к трём средним, у `StdDev` — к двум σ; `Minimum`/`Maximum` = min/max; `Last` = последнему, если столбец есть |
+| 6а | `live_all_sql()` Д3а | строк, секунд |
+| 6б | `catalog_sql()` Д3а | строк, секунд; кандидаты — пять самых свежих тегов множества «белый список ∩ аналоговые ∩ живые» |
+| 7–8 | `SELECT DateTime, Value, Quality FROM AnalogHistory WHERE TagName = '<t>' AND DateTime >= '<a>' AND DateTime <= '<b>' AND wwRetrievalMode = 'Delta'` для первого кандидата — формат **A** `YYYY-MM-DD HH:MM:SS.000` и **B** `YYYYMMDD HH:MM:SS.000` | на формат: «внутри окна» / «вне окна» / «пусто» / «ошибка: <класс>» (О4) |
+| 9–12 | тот же `Delta` для остальных четырёх кандидатов, прошедший формат | `discrimination` каждого; доля `Quality = 0` |
+| 13 | `SELECT * FROM AnalogSummaryHistory WHERE TagName = '<лучший по d>' AND StartDateTime >= '<a>' AND EndDateTime <= '<b>' AND wwCycleCount = 1 AND wwInterpolationType = 'STAIRSTEP'` | принят ли параметр; имена столбцов; `gap` у `Average` к трём средним, у `StdDev` — к двум σ; `Minimum`/`Maximum` = min/max по всем точкам и только по хорошим; `PercentGood`; `Last` = последнему, если столбец есть |
 | 13б | то же без `wwInterpolationType`, если 13 дал ошибку | то же |
-| 14 | `SELECT InterpolationType, COUNT(*) FROM AnalogTag GROUP BY InterpolationType` | распределение (только числа) или класс ошибки |
-| 15 | `catalog_sql()` Д3а | первое имя участка вне `whitelist.txt` (смонтирован `:ro`) — в `/out/unlisted-tag`; лучший по `d` тег — в `/out/check-tag`; на экран — ничего |
+| 14 | `SELECT RawType, InterpolationType, COUNT(*) FROM AnalogTag GROUP BY RawType, InterpolationType` и `SELECT Name, Value FROM SystemParameter WHERE Name = 'InterpolationTypeReal'` (отдельно — `…Integer`) | распределение (только числа); значение 254 («по умолчанию системы») разворачивается по типу тега через параметр системы |
+| 15 | без нового запроса, по каталогу 6б | первое имя участка вне `whitelist.txt` — в `/out/unlisted-tag`; **два** лучших по `d` тега — в `/out/check-tag` (второй — запас на вечер); проба сама проверяет, что оба входят в белый список, и печатает только «check-tag в белом списке: да/нет» |
 
 Режим `verify --date-fmt A|B` читает из stdin ответ `tag_period`. Он
 запрашивает свои часы и сырой `Delta` по тегу ответа за его период, с
@@ -368,20 +403,22 @@ Expected: FAIL — `ModuleNotFoundError: delta_stats`
 - вид: «подтверждён <вид>», только если `d ≥ 0,01`, расхождение с ним не
   больше `1e-3` и хотя бы в 10 раз меньше, чем со вторым; иначе «вид не
   различим на этом теге» или «не сошёлся»;
-- `min`, `max` (`gap ≤ 1e-9`);
+- `min`, `max` (`gap ≤ 1e-9`) — по всем точкам и только по хорошим, плюс
+  `PercentGood` ответа: расхождение из-за правила качества видно сразу;
 - `last`, если поле есть;
 - `rows`: порядок числа строк и «обрезано», если их 200000;
 - `outside`: число строк `Delta` вне `[start, end]` — ожидание 0.
 
-- [ ] **Step 6: Проба `morning-b` (при владельце)**
+- [ ] **Step 7: Проба `morning-b` (окно владельца, вечером)**
 
 `install -d -m 0700 /opt/pcbk-reserve/probe-out`; перенос образа (`docker save … | $SSH …`,
 сверка `RootFS`); затем
 `$SSH 'docker run --rm --network bridge --user "$(id -u):$(id -g)" --read-only --cap-drop ALL --security-opt no-new-privileges:true -v /opt/pcbk-reserve/secrets/bdrv.env:/run/secrets/bdrv.env:ro -v /opt/pcbk-reserve/data/whitelist.txt:/data/whitelist.txt:ro -v /opt/pcbk-reserve/probe-out:/out pcbk-probe/tds:d3b morning-b' > "$JOB/probe-b.json"`
 (сеть — как в Д3а). `grep -E -i -f <шаблоны> "$JOB/probe-b.json"` — пусто.
-Expected: ответ на каждый запрос; оба файла в `probe-out` есть (`0400`).
+Expected: ответ на каждый запрос; оба файла в `probe-out` есть (`0400`);
+«check-tag в белом списке: да».
 
-- [ ] **Step 7: Решения по пробе**
+- [ ] **Step 8: Решения по пробе — константы, пересборка, перевыкладка**
 
 | Итог | Решение | По умолчанию |
 |---|---|---|
@@ -389,14 +426,18 @@ Expected: ответ на каждый запрос; оба файла в `probe
 | О4: только A «внутри окна» | `DATE_FMT = "%Y-%m-%d %H:%M:%S.000"` | — |
 | О4: ни один | стоп: периоды не строятся; вопрос владельцу, строка о сдвиге | — |
 | 13 принят, `d ≥ 0,01`, `Average` ближе к ступеньке хотя бы в 10 раз и `gap ≤ 1e-3` | `PIN_INTERPOLATION = "STAIRSTEP"`, `AVG_KIND = "step"` | `PIN_INTERPOLATION = None`, `AVG_KIND = "unverified"` |
-| 13 не принят; 14 — один тип на всех; 13б сошёлся с ним так же | `AVG_KIND` = этот вид | — |
+| 13 не принят; 14 — один тип на всех после разворота 254; 13б сошёлся с ним так же | `AVG_KIND` = этот вид | — |
 | иначе | `AVG_KIND = "unverified"`, вопрос в журнал долга | — |
 | `StdDev` — так же, порог `1e-2` | `STD_KIND` = `"step"` или `"arith"` | `"unverified"` |
 | есть `Last` и `LastDateTime`, `Last` = последнему `Delta` | `HAS_LAST = True`, столбцы — в `SUMMARY_COLUMNS` | `False` |
 
-Expected: вердикты и таблица с принятыми значениями — в `docs/checks/D3b.md`.
+Константы правятся в `core/pcbk_core/data/sql.py` и `service.py`, затем
+`cd core && CORE_PYTEST` — тесты параметризованы константами. Дальше
+`docker compose build core` и перевыкладка способом задачи 7, шаг 6 (около 15
+минут). Expected: вердикты и таблица с принятыми значениями — в
+`docs/checks/D3b.md`; `core` снова `healthy`.
 
-- [ ] **Step 8: Commit** (после проверки на секреты) — `git add core/verify/ docs/checks/D3b.md && git commit -m "Д3б: эталон сверки и проба — формат даты, вид среднего, интерполяция"`.
+- [ ] **Step 9: Commit** (после проверки на секреты) — `git add core/ docs/checks/D3b.md && git commit -m "Д3б: проба — формат даты, вид среднего, интерполяция; константы службы по ней"`.
 
 ---
 
@@ -547,8 +588,12 @@ def test_bad_periods(kw):
       через кэш (повтор при промахе — не чаще раза в 60 с), проверяется
       каждый адрес; вне `allowed` и `allowed_nets` или не разрешилось →
       `EgressDenied("выход запрещён: <адрес>:<порт>")`;
+    - `socket.sendto`/`socket.sendmsg` на потоковом сокете → `EgressDenied`
+      (TCP Fast Open мимо `connect`);
     - `subprocess.Popen`, `os.system`, `os.exec`, `os.posix_spawn`,
-      `ctypes.dlopen` → `PermissionError("запуск процессов и нативный код запрещены")`;
+      `ctypes.dlopen` → `PermissionError("запуск процессов через subprocess/os запрещён")`;
+    - в докстринге модуля — «растяжка по PEP 578, не песочница» и список
+      обходов из Д3б-R6;
     - `egress_guard_installed() -> bool`.
   - `main`: после `setup_logging` — `install_egress_guard([(cfg.host.split("\\")[0], cfg.port)])` и строка
     журнала «охрана выхода: разрешено 1 направление»; то же в `build_whitelist.main`.
@@ -610,12 +655,16 @@ for dest in (('localhost', {b}), ('nonexistent.invalid', 443)):   # не раз�
 """, a)
     assert out.split() == ["OK", "DENIED", "DENIED"]
 
-def test_guard_blocks_processes(listeners):
-    out = guard_py("""
+def test_guard_blocks_processes_and_fastopen(listeners):
+    a, b = listeners
+    out = guard_py(f"""
 try: subprocess.run(['true']); print('RAN')
 except PermissionError: print('BLOCKED')
-""", listeners[0])
-    assert out.strip() == "BLOCKED"
+s = socket.socket()
+try: s.sendto(b'x', 0x20000000, ('127.0.0.1', {b})); print('SENT')   # MSG_FASTOPEN
+except EgressDenied: print('DENIED')
+""", a)
+    assert out.split() == ["BLOCKED", "DENIED"]
 
 def test_token_table(tmp_path):
     t = TokenTable.from_file(write(tmp_path, f"ops {sha('tok-b')}\nstudent-01 {sha('tok-a')}\n"))
@@ -723,7 +772,11 @@ async def test_single_flight_shares_and_clears_on_error():
       счётчик;
     - `writable(self) -> bool` — на новом соединении, как у журнала сторожа
       Д1: `BEGIN IMMEDIATE`, `INSERT`, `ROLLBACK`;
-    - `recent(self, limit: int = 50) -> list[CallEvent]` — новые сверху.
+    - `recent(self, limit: int = 50, channel: Channel | None = None) -> list[CallEvent]` —
+      новые сверху; `channel` отсеивает, например, события `system`;
+    - `count(self, channel: Channel | None = None) -> int` — `SELECT COUNT(*)`:
+      тесты на работающем приложении считают им, а не длиной `recent()`
+      (опрос свежести пишет свои события между замерами).
 - `DataRole` (правки):
   - конструктор получает `tokens: TokenTable | None = None`; поле
     `events: EventLog(settings.DB_PATH)`;
@@ -932,9 +985,14 @@ def test_events_disk_full_turns_health_red(monkeypatch):                       #
       журнал). С токеном → `422` с телом `service.refuse_args(...)` (русская
       причина: поля и короткий текст) и событием. Прочие пути — обработчик
       FastAPI по умолчанию;
-    - `app.add_middleware(BodyLimit, max_bytes=65536)` — чистое ASGI-звено.
-      Оно считает прочитанные из `receive` байты, поэтому ловит и тело без
-      `Content-Length`. Больше предела → `413` и строка журнала
+    - `app.add_middleware(BodyLimit, max_bytes=65536)` — чистое ASGI-звено,
+      **до маршрутизации**. Сначала оно сверяет `Content-Length`; затем
+      читает тело целиком, но не больше `max_bytes + 1` байт, и только потом
+      зовёт приложение, отдавая ему буфер заново. Так 413 выходит и на теле
+      без длины, и на любом пути: исключение из `receive` FastAPI превратил
+      бы в 400, а транспорт MCP — в 500. Образец —
+      `RequestBodyLimitMiddleware` из `mcp`; его можно взять самого, обернув
+      строкой журнала. Больше предела → `413` и строка журнала
       `outcome=too_large path=…`; стоит на всём приложении, в том числе на
       `/mcp`.
   - `DataRole.router()` — роутер Д3а плюс `data_router`;
@@ -1092,7 +1150,7 @@ def test_http_422_is_refused_event(tmp_path):                                   
         wait_until(lambda: role.catalog.loaded)
         r = c.post("/api/data/tag_now", json={"tags": ["x"] * 17}, headers=auth)
         assert r.status_code == 422 and r.json()["status"] == "refused" and "неверные аргументы" in r.json()["message"]
-        e = role.events.recent()[0]
+        e = role.events.recent(channel="http")[0]
         assert (e.outcome, e.channel, e.tool) == ("refused", "http", "tag_now")
         assert c.post("/api/data/tag_now", json={"tags": ["20FAKE_001_PV"]}, headers=auth).json()["status"] == "ok"
 
@@ -1100,9 +1158,9 @@ def test_bad_json_without_token_is_401(tmp_path):                               
     app, role = make_app(tmp_path)
     with TestClient(app) as c:
         wait_until(lambda: role.catalog.loaded)
-        before = len(role.events.recent())
+        before = role.events.count(channel="http")
         r = c.post("/api/data/tag_now", content=b"{bad", headers={"Content-Type": "application/json"})
-        assert r.status_code == 401 and len(role.events.recent()) == before   # мусора в журнале нет
+        assert r.status_code == 401 and role.events.count(channel="http") == before   # мусора в журнале нет
 
 def test_chunked_body_over_limit_is_413(tmp_path, capfd):                       # Review Focus 3
     app, _ = make_app(tmp_path)
@@ -1110,8 +1168,17 @@ def test_chunked_body_over_limit_is_413(tmp_path, capfd):                       
     with TestClient(app) as c:
         chunks = (b"x" * 10_000 for _ in range(7))          # без Content-Length
         assert c.post("/api/data/tag_now", content=chunks, headers=auth).status_code == 413
-        assert c.post("/mcp", content=b"x" * 70_000, headers=auth).status_code == 413
+        assert c.post("/api/data/tag_now", content=b"x" * 70_000, headers=auth).status_code == 413   # по длине
+        assert c.post("/mcp", content=b"x" * 70_000, headers=auth).status_code == 413   # до маршрутизации
     assert "outcome=too_large" in capfd.readouterr().err
+
+# core/tests/test_service.py (+) — текст ошибки SQL Server не выходит из процесса
+async def test_error_detail_never_leaves_process(svc, capfd):
+    s, fake = svc
+    fake.fail = HistorianError("auth", "Login failed for user 'FAKEUSER'")
+    await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    e = s.role.events.recent(channel="http")[0]
+    assert "FAKEUSER" not in e.summary and "FAKEUSER" not in capfd.readouterr().err
 ```
 
 `make_service(tmp_path)` строит `DataRole` с `FakeHistorian` и `FakeMono`,
@@ -1120,6 +1187,10 @@ def test_chunked_body_over_limit_is_413(tmp_path, capfd):                       
 отправленных SQL. `gate.clear_pause()` — метод ворот, дописывается здесь:
 снимает защёлку и паузу; им пользуются только тесты, у людей защёлку снимает
 перезапуск службы. У `FakeHistorian` поле `fail` принимает любое исключение.
+В `core/tests/conftest.py` — фикстура `autouse` с `setup_logging()`, а
+обработчик журнала берёт `sys.stderr` в момент записи. Иначе при полном
+прогоне (`test_http.py` идёт раньше `test_skeleton.py`) строки журнала не
+попадут в `capfd`.
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_service.py tests/test_http.py`. Expected: FAIL.
 
@@ -1226,7 +1297,7 @@ async def test_mcp_bad_arg_types_are_refused_events(core_server):              #
         for tool, args in bad:
             sc = (await s.call_tool(tool, args)).structuredContent
             assert sc["status"] == "refused" and "неверные аргументы" in sc["message"], args
-            e = core_server.role.events.recent()[0]
+            e = core_server.role.events.recent(channel="mcp")[0]
             assert (e.outcome, e.channel, e.caller, e.sent) == ("refused", "mcp", "student-01", ())
 
 def test_mcp_auth_host_and_get(core_server):                                    # Review Focus 5
@@ -1243,7 +1314,7 @@ async def test_lifespan_without_app_runs(tmp_path):                             
     async with role.lifespan():                       # MCP построен в конструкторе, run() — один раз
         pass
     assert not logging.getLogger("pytds").isEnabledFor(logging.INFO)
-    assert not logging.getLogger().isEnabledFor(logging.INFO)          # FastMCP не поднял корневой журнал
+    assert role.mcp.settings.log_level == "WARNING"   # под pytest корень уже настроен — проверяем настройку
 ```
 
 `make_role(db_dir=…)` — вариант помощника Д3а с `DB_PATH` во временном
@@ -1267,7 +1338,8 @@ async def test_lifespan_without_app_runs(tmp_path):                             
   сторожа Д1. Новый именованный том наследует владельца каталога образа; без
   каталога том получит `root:root 0755`, `EventLog` не откроет `core.db`, и
   служба уйдёт в цикл перезапусков.
-- Modify: `compose.yaml` (у `core` — `image: pcbk-reserve/core:d3b`, секрет
+- Modify: `compose.yaml` (у `core` — `image: pcbk-reserve/core:d3b`,
+  `sysctls: {net.ipv4.tcp_fastopen: "0"}` (Д3б-R6), секрет
   `core-tokens`, том `pcbk-core-data:/var/lib/pcbk-core`), `.gitignore`
   (`core-tokens`, `*.data-token`), `tests/integration/conftest.py` (тестовый
   `core-tokens` с токеном `student-01`; `stack.core_token`;
@@ -1349,12 +1421,16 @@ Expected:
   `gate.refused_unlisted: 0`.
 
 - [ ] **Step 2: MCP.** `initialize`, затем `tools/list` — оба запроса `curl`
-  с `-H @"$JOB/ops.hdr"`, `-H 'Accept: application/json, text/event-stream'`,
-  телом JSON-RPC, на `http://127.0.0.1:18000/mcp` → `200`, три имени
-  инструментов. `GET /mcp` → `405`; без токена → `401`.
+  с `-H @"$JOB/ops.hdr"`, `-H 'Content-Type: application/json'`,
+  `-H 'Accept: application/json, text/event-stream'`, телом JSON-RPC, на
+  `http://127.0.0.1:18000/mcp` → `200`, три имени инструментов. Без
+  `Content-Type` curl шлёт форму, и транспорт отвечает ошибкой — ложный сбой.
+  `GET /mcp` → `405`; без токена → `401`.
 
-- [ ] **Step 3: Ответ за смену.** Тег — `check-tag` пробы (лучший по
-  различимости) или тот, что назовёт владелец. Запрос `$JOB/req.json` —
+- [ ] **Step 3: Ответ за смену.** Тег — первая строка `check-tag` пробы
+  (лучший по различимости, в белом списке); вторая строка — запас, если
+  первый ответит «нет данных». Либо тег, который назовёт владелец. Запрос
+  `$JOB/req.json` —
   `{"tags": ["<тег>"], "period": "prev_shift"}`.
   `curl -s -H @"$JOB/ops.hdr" -H 'Content-Type: application/json' --data @"$JOB/req.json" http://127.0.0.1:18000/api/data/tag_period | tee "$JOB/answer.json"`.
   Expected:
@@ -1370,10 +1446,14 @@ Expected:
   `grep -E -i -f <шаблоны> "$JOB/verify.json"` — пусто.
   Expected: `bounds`, `min`, `max`, `last` (если есть) — «сошлось»; печатается
   `d` и вердикт вида. Дальше по вердикту:
-  - вид «подтверждён», но не тот, что в `avg_kind`: строка 8а таблицы —
-    `AVG_KIND` правится одним коммитом, перевыкладка, шаги 3–4 повторяются;
+  - вид «подтверждён», но не тот, что в `avg_kind`, или «не сошёлся» —
+    строка 8а таблицы, но только при `PIN_INTERPOLATION = "STAIRSTEP"` или
+    одном типе на всех по запросу 14: `AVG_KIND` правится одним коммитом
+    (на подтверждённый вид или на `"unverified"`), перевыкладка, шаги 3–4
+    повторяются. Иначе вердикт записывается, `AVG_KIND` остаётся
+    `"unverified"`: один тег не даёт права объявлять вид для всех;
   - «не различим на этом теге»: так и записать; вид остаётся по пробе;
-  - «не сошёлся»: `AVG_KIND = "unverified"`, вопрос владельцу.
+  - вопрос владельцу — если вид так и не подтверждён.
 
   Успехом дня расхождение не прикрывается.
 
@@ -1408,14 +1488,32 @@ Expected:
     - токены `student-NN.data-token` (`openssl rand -hex 24`) и перезапуск
       `core`;
     - `pcbk-core` в сетях мест на `.2`;
+    - охрана выхода: `install_egress_guard` получает ещё `openrouter.ai:443`
+      — по имени, через кэш разрешения (адреса Cloudflare меняются); иначе
+      LLM-прокси упрётся в `EgressDenied`;
     - `core` поднимается раньше мест. OpenCode v1.18.33 не переподключает
       remote MCP сам: если при старте места `core` недоступен или токен
       неверен, сервер MCP остаётся в `failed` до перезапуска OpenCode.
-      Шлюз или сторож проверяет состояние MCP каждого места и при `failed`
-      вызывает переподключение. Учение «`core` перезапущен при работающих
-      местах» — вызов после перезапуска проходит без ручных действий;
+      В Д4 это проверяет **сторож** (в Д5 — ещё и шлюз): состояние MCP каждого
+      места, при `failed` — переподключение. Учение «`core` перезапущен при
+      работающих местах» — вызов после перезапуска проходит без ручных
+      действий. Это новая работа — **в оценку плана Д4**;
     - крючки уровня приложения ролей `llm` и `gateway` — только через
-      `Role.install(app)`, свои маршруты — точные, как `/mcp`.
+      `Role.install(app)`, свои маршруты — точные, как `/mcp`. Обработчик
+      `RequestValidationError` на приложение один, и последний `install`
+      побеждает. Поэтому Д4 заводит один общий обработчик, который по
+      префиксу пути отдаёт разбор роли. Тест Д4: при двух ролях 422 на
+      `/api/data` по-прежнему даёт событие;
+    - `HEALTHCHECK` образа — живость процесса (`/healthz/live`), а здоровье
+      ролей — только строки сторожа. Иначе 402 от OpenRouter сделает
+      `core` unhealthy, и тестовый стенд Д4 без ключа не поднимется;
+    - нагрузка на историан на странице: в `stats()` ворот — p95 за 5 минут,
+      число сроков и `busy`; предупреждение при p95 больше 5 с; после 3
+      сроков подряд — пауза полосы людей на 60 с. Сюда же — число ошибок
+      инструментов за последние N вызовов (строка «инструменты отвечают
+      ошибкой: k из N»). Всё это — до подключения мест;
+    - строка контейнера `core` видом `container` («убит по памяти», «падает в
+      цикле») требует правила `sp-ro` на `pcbk-core` — правка Д4.
   - Предпосылки Д5 — там же:
     - конфликт псевдонима `pcbk-core` в `http_as` для `sp-ctl`, когда сам
       `core` войдёт в `pcbk-ctl`;
@@ -1429,7 +1527,7 @@ Expected:
   проверка на секреты по ветке и
   `git ls-files | grep -cE '(core-tokens|\.data-token|whitelist\.(txt|extra))$'` → `0`.
   Затем `git push origin main platform-d3b`, чистый клон. Удалить
-  `$JOB/answer.json`, `verify.json`, `ops.*`, `check-tag`, `unlisted-tag`; на
+  `rm -f "$JOB"/{req,answer,verify,probe-b}.json "$JOB"/ops.* "$JOB"/{check,unlisted}-tag`; на
   сервере — `probe-out/`.
 - [ ] **Step 4: Владельцу** — «Д3 готов», ответ за смену и вердикт сверки
   одной строкой. Вопросы: вид среднего, если не подтверждён; правила
