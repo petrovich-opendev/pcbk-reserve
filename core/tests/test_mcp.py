@@ -201,21 +201,44 @@ def test_setup_logging_owns_root_one_line_records(tmp_path):
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} WARNING x: a\\nb", lines[0]), lines
 
 
+def _boom():
+    raise ValueError("1 validation error for X\n  input_value='20FAKE_001_PV'")
+
+
+BOOM_AT = f"{__file__}:{_boom.__code__.co_firstlineno + 1}"     # строка raise в _boom
+
+
 def test_one_line_filter_escapes_truncates_and_keeps_original():
     try:
-        raise ValueError("1 validation error for X\n  input_value='20FAKE_001_PV'")
+        _boom()
     except ValueError:
         exc_info = sys.exc_info()
     forged = logging.LogRecord("x", logging.WARNING, __file__, 1, "tool=%s", ("t\r\noutcome=ok",), None)
-    long = logging.LogRecord("x", logging.ERROR, __file__, 1, "%s", ("y" * 600,), exc_info)
+    long = logging.LogRecord("x", logging.WARNING, __file__, 1, "%s", ("y" * 600,), None)
+    long_failed = logging.LogRecord("x", logging.ERROR, __file__, 1, "%s", ("y" * 600,), exc_info)
     failed = logging.LogRecord("x", logging.ERROR, __file__, 1, "сбой", (), exc_info)
     line = OneLine().filter(forged)
     assert line.getMessage() == "tool=t\\r\\noutcome=ok" and forged.getMessage() == "tool=t\r\noutcome=ok"
     cut = OneLine().filter(long).getMessage()
     assert len(cut) == RECORD_CHARS and cut.endswith("…")
+    cut = OneLine().filter(long_failed).getMessage()                   # хвост исключения — целый
+    assert len(cut) == RECORD_CHARS and cut.endswith("… | ValueError: 1 validation error for X @ " + BOOM_AT)
     summary = OneLine().filter(failed)
-    assert summary.getMessage() == "сбой | ValueError: 1 validation error for X" and summary.exc_info is None
-    assert failed.exc_info is exc_info                                  # запись других обработчиков — как была
+    assert summary.getMessage() == "сбой | ValueError: 1 validation error for X @ " + BOOM_AT
+    assert summary.exc_info is None and failed.exc_info is exc_info    # запись других обработчиков — как была
+
+
+def test_malformed_log_call_never_raises(tmp_path):
+    """warning("%d", "x") и в корень (uvicorn.error), и в pcbk_core — запись-заглушка, вызывающий жив."""
+    r = python_in(tmp_path, "import logging\nfrom pcbk_core.logs import setup_logging\nsetup_logging()\n"
+                            "logging.getLogger('uvicorn.error').warning('bad %d', 'x')\n"
+                            "logging.getLogger('pcbk_core.data').warning('bad %d', 'x')\n"
+                            "print('alive')")
+    assert (r.returncode, r.stdout.strip()) == (0, "alive"), r.stderr[-300:]
+    lines = r.stderr.splitlines()
+    assert [line.split(" ", 1)[1] for line in lines] == [
+        "WARNING uvicorn.error: запись не собрана (TypeError)",
+        "WARNING pcbk_core.data: запись не собрана (TypeError)"], lines
 
 
 @pytest.mark.parametrize("kind", ["fifo", pytest.param("unreadable", marks=non_root)])

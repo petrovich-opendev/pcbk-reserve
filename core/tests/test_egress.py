@@ -210,6 +210,10 @@ def test_pytest_process_has_no_guard():
     assert egress_guard_installed() is False     # main(), build_roles, build_whitelist.main её не ставят
 
 
+# сбой в stderr: трасса без журнала или исключение, записанное журналом одной строкой (logs.OneLine)
+CRASH = re.compile(r"EgressDenied|PermissionError|Traceback| \| [A-Z]\w*(?:Error|Exception|Denied)\b")
+
+
 @pytest.mark.parametrize("bdrv_text, code, line", [
     ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 1 направление"),
     (None, 503, "разрешено 0 направлений"),              # нет bdrv.env → config_error, процесс жив (I2)
@@ -228,4 +232,10 @@ def test_serve_installs_guard_and_stays_up(tmp_path, bdrv_text, code, line):
         p.kill()             # не terminate: поток ворот досыпает login_timeout pytds, выход ждал бы его
         err = p.communicate(timeout=10)[1]
     assert got == code and f"охрана выхода: {line}" in err
-    assert not re.search(r"EgressDenied|PermissionError|Traceback", err)      # стек под хуком поднялся (F14)
+    assert not CRASH.search(err)                                         # стек под хуком поднялся (F14)
+
+
+def test_crash_signal_matches_one_line_exception():
+    assert CRASH.search("… ERROR pcbk_core.app: сбой | ImportError: no module @ /app/pcbk_core/x.py:3")
+    assert CRASH.search("… ERROR x: сбой | EgressDenied @ /app/pcbk_core/egress.py:9")
+    assert not CRASH.search("… WARNING pcbk_core.data: свежесть: нет связи с историаном (connect)")
