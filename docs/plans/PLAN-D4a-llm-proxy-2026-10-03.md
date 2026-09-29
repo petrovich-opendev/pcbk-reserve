@@ -35,6 +35,15 @@
 
 Часы: критический путь по плановой шкале 15,1 → 18,4 ч (хвосты Д3б ушли из задачи 0, добавлены задача 2а, поток-писатель, `LlmStream`, перебазирования). Код до черты — 14,55 ч.
 
+**Изменения по утренней проверке Д4а** (задача 0, шаг 3, `c0190cd`: публичные
+`/models` и `/endpoints/zdr` — 7 из 7 точек ZDR, цены точек совпали с
+таблицей; три риска по деньгам, решения контроллера 29.09):
+1. [деньги] У1 — базовое имя в `provider.only` (`fireworks`, `azure`) пускает и региональные варианты (`fireworks/us` у DeepSeek V4.1 Flash 0.45/1.80 — +105/+173 %, у GLM-5.3-Flash 0.225/0.75 — +50 %; `azure/us`, `azure/eu` у gpt-6-sol/luna — +10 %), `provider_matches` их не различает → в таблице задачи 3 — максимум цен по всем вариантам базового имени (оценка остаётся верхней), и каждый запрос несёт `provider.max_price` = этот максимум: подорожание выше таблицы — видимый отказ, а не перерасход; сверка цен в задачах 0 и 9 — по максимуму вариантов (Д4а-R13, задачи 3, 5, 6, 9; тесты: оценка по максимуму, `max_price` в теле, цена выше предела — отказ, записанный в журнал).
+2. [деньги] У2 — у Azure с 272 000 токенов входа другие цены (gpt-6-sol 4.00/15.00/5.00, gpt-6-luna 0.20/0.75/0.25) → оценка учитывает этот уровень: оценённый вход (байты / 3) ≥ 272 000 — цены длинного входа, у этих моделей `max_price` — цена длинного входа; к ней — та же надбавка вариантов +10 % (4.40/16.50/5.50 и 0.22/0.825/0.275). Тест на границе. Самая большая оценка вызова — ≈$2,19 (gpt-6-sol на пределе тела) (Д4а-R13, задача 3).
+3. [деньги] У3 — у Gemini на `google-vertex/global` `discount` 0,5, цена списка уже со скидкой → оценка и `max_price` — по цене без скидки (×2: 1.50/7.50), оценка переживает конец скидки. Допущение [?] сверяет задача 10, шаг 1: первый настоящий вызов Gemini против оценки (Д4а-R13, задачи 3, 9, 10).
+
+Часы: 18,4 → 19,05 (задачи 3 +0,25, 5 +0,1, 6 +0,1, 9 +0,1, 10 +0,1). Код до черты — 15,0 ч.
+
 **Изменения по критике, раунд 2** (три критика Opus 5.5; блокеров ноль, здесь —
 major и дешёвые minor). Находка → что поменялось:
 1. [major] сжатие на первом шаге нового вопроса относило вопрос к прошлому
@@ -197,7 +206,7 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
 
 **Разрез Д4 на два дня.** Строка Д4 дорожной карты по плановой шкале стоит
 около 21 ч, после правок по критике раундов 1 и 2 — около 26,7 ч, после
-предпроверки — около 30 ч (Д4а 18,4 + Д4б 11,6). В неё входят:
+предпроверки и утренней проверки — около 30,7 ч (Д4а 19,05 + Д4б 11,6). В неё входят:
 - сам прокси;
 - предпосылки Д4 из закрытия Д3б: общий обработчик 422, живость
   `/healthz/live`, охрана выхода к OpenRouter, нагрузка историана на
@@ -237,16 +246,16 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
 | 1. Живая проверка §11 п. 4 — остаток до траты, сырой поток с ключом владельца | 0,6 | сервер, **окно владельца** (после задачи 8 и `platform-d3b`) |
 | 2. Общие крючки приложения и живость (`BodyLimit` с реэкспортом, `serve_app`) | 1,0 | локально |
 | 2а. Охрана выхода: кэш адресов разрешённых имён, фоновое обновление, `install_guard` (Д4а-R18) | 0,75 | локально |
-| 3. Политика запроса: модели с ценами, оценка цены, тело, шаги (с продолжением после сжатия) | 1,5 | локально |
+| 3. Политика запроса: модели с верхними ценами (варианты, длинный вход, без скидки), оценка цены, `max_price`, тело, шаги (с продолжением после сжатия) | 1,75 | локально |
 | 4. Журнал вызовов: ленивое открытие, поток-писатель, оценки, доли, точка отсчёта под отпечатком ключа | 1,9 | локально |
-| 5. Проход к OpenRouter: двойник, клиент, поток, признаки «кончились деньги», тихий `httpx` | 1,8 | локально |
-| 6. Роль `llm`: ошибка настройки без падения, ручка, отказы, резерв, одновременность, `LlmStream`, опрос и сверка с `/key`, ключи файлами, учения, `serve()` и охрана | 3,75 | локально |
+| 5. Проход к OpenRouter: двойник (и цена точки выше `max_price`), клиент, поток, признаки «кончились деньги», тихий `httpx` | 1,9 | локально |
+| 6. Роль `llm`: ошибка настройки без падения, ручка, отказы, резерв, одновременность, `LlmStream`, опрос и сверка с `/key`, ключи файлами, учения, `serve()` и охрана | 3,85 | локально |
 | 7. Сторож: вид `llm`, порядок предупреждений, число в строке | 1,25 | локально |
 | 8. Компоновка и интеграционные тесты (с перебазированием на задачу 7 Д3б) | 2,15 | локально |
-| 9. Выкладка (шаг 1 — окно владельца) | 0,75 | сервер |
-| 10. Живые проверки и учения | 1,0 | сервер |
+| 9. Выкладка (шаг 1 — окно владельца; шаг 4a — цены с сервера) | 0,85 | сервер |
+| 10. Живые проверки и учения (и сверка цены Gemini с оценкой) | 1,1 | сервер |
 | 11. Закрытие дня (с перебазированием на `main` после `platform-d3b`) | 1,5 | — |
-| **Критический путь по плановой шкале** | **18,4** (до предпроверки — 15,1 при хвостах Д3б 0,45 ч; раунд 1 — 13,7; до критики — 11,5) | |
+| **Критический путь по плановой шкале** | **19,05** (после предпроверки — 18,4; до предпроверки — 15,1 при хвостах Д3б 0,45 ч; раунд 1 — 13,7; до критики — 11,5) | |
 
 Если к черте задачи 7 Д3б ещё нет и задача 8 переносит её локальную часть
 (Dockerfile, том, секрет `core-tokens`, `http_host(token=)`, `core_token`), —
@@ -302,9 +311,9 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
 - Д3б: задачи 2–6 (план 6,75 ч) — от `3f3e769` (21:02:50Z) до `ec7a5f0`
   (22:45:54Z), 1,72 ч, доля ≈0,25 (предпроверка Д4а, Г12).
 
-Худшая доля — 0,30, её и берём. Плановая шкала остаётся честной: Д4а — 18,4 ч,
+Худшая доля — 0,30, её и берём. Плановая шкала остаётся честной: Д4а — 19,05 ч,
 Д4б — 11,6 ч, в сумме больше одного дня, поэтому разрез. Д4а — самый крупный
-день по плановой шкале. По доле 0,30 это ≈4,4 ч до черты и ≈5,5 ч всего плюс
+день по плановой шкале. По доле 0,30 это ≈4,5 ч до черты и ≈5,7 ч всего плюс
 окно и петля критика — рабочий день с запасом. Их делят окна владельца и
 правило «день = видимый результат». Задача 11 пишет строку «план / факт по
 git» тем же способом, что шаг 1a.
@@ -313,7 +322,7 @@ git» тем же способом, что шаг 1a.
 коммита задачи 1 до коммита задачи 6 (последней до черты Д3б), делённое на
 плановые часы задач 2–6 (6,75 ч). Предпроверка уже посчитала её: 0,25 —
 деления нет; шаг 1a только повторяет замер. Если доля хуже 0,5 (задачи 0 и
-2–8 Д4а заняли бы больше 7,3 ч), Д4а делится до начала дня:
+2–8 Д4а заняли бы больше 7,5 ч), Д4а делится до начала дня:
 - **Д4а** — задачи 0, 2–8 и выкладка с пустым файлом ключа. Это ветка «ключа
   сегодня нет» ниже: строка честно красная, учение «LLM-прокси остановлен» —
   живьём, учения «402» и «OpenRouter недоступен» — снимками локального стенда;
@@ -323,8 +332,8 @@ git» тем же способом, что шаг 1a.
 владелец получает строку с числами.
 
 **Черта отсечения — конец восьмого часа.** К черте зелёны задачи 0, 2, 2а и
-3–8: по плановой шкале 14,55 ч, по доле 0,30 — ≈4,4 ч. Черта ловит темп хуже
-≈0,55 — тогда работает ветка «задача 8 не зелёна». Задача 8, которая ждёт
+3–8: по плановой шкале 15,0 ч, по доле 0,30 — ≈4,5 ч. Черта ловит темп хуже
+≈0,53 — тогда работает ветка «задача 8 не зелёна». Задача 8, которая ждёт
 коммит задачи 7 Д3б, к черте тоже считается «не зелёной». После черты, когда
 тег `platform-d3b` стоит, порядок жёсткий: окно владельца (задача 9, шаг 1 →
 задача 1 → задача 9, шаги 2–5 → задача 10, шаги 1–3), затем учения и
@@ -422,8 +431,8 @@ git и в вывод проверок; секреты контейнерам —
   `/api/data` и `/mcp` — тоже. Тестовые токены — не 48 hex
   (`"test-llm-token-student-01"`).
 - **Деньги.** У каждой живой проверки с моделью записан потолок: весь Д4а
-  тратит не больше $0,05 (сырой поток и 3–4 вызова через прокси; модель
-  `openai/gpt-6-luna`, `max_tokens` ≤ 400). До первой траты проверяется
+  тратит не больше $0,05 (сырой поток и 4–5 вызовов через прокси; модели
+  `openai/gpt-6-luna` и один вызов `google/gemini-3.8-flash`, `max_tokens` ≤ 400). До первой траты проверяется
   остаток: `/key` и, если есть ключ управления, `/credits`. Учения до OpenRouter
   не доходят: `DRILL_LLM=402` подменяет ответ внутри процесса. Все вызовы идут
   на счёт `ops`, доли студентов не трогаются.
@@ -569,9 +578,24 @@ git и в вывод проверок; секреты контейнерам —
 9 минут. Генерация у точки Vertex после обрыва идёт до конца, и цена
 появляется только после неё. Если цена так и не нашлась — `unknown`.
 
-Каждый вызов при открытии получает **верхнюю оценку** по ценам закреплённой
-точки (`ModelPolicy`, research/08 §3):
+Каждый вызов при открытии получает **верхнюю оценку** по верхним ценам
+таблицы `ModelPolicy` (research/08 §3, утренняя проверка Д4а):
 `ceil(байты собранного тела / 3) × max(цена входа, цена записи кэша) + max_tokens × цена выхода`.
+Верхние цены — не цены одной точки:
+- максимум по всем вариантам, которые пускает базовое имя в
+  `provider.only` (`fireworks` пускает и `fireworks/us`, `azure` — и
+  `azure/us`, `azure/eu`; по полю `provider` ответа их не отличить);
+- у Azure с 272 000 оценённых токенов входа — цены длинного входа;
+- у точки со скидкой (Gemini на `google-vertex/global`, `discount` 0,5) —
+  цена без скидки: оценка переживает конец скидки. Это допущение [?]:
+  цена в списке уже со скидкой. Задача 10, шаг 1 сверяет первый настоящий
+  вызов Gemini с оценкой.
+
+Те же верхние цены уходят в каждый запрос как `provider.max_price`
+(`prompt`, `completion`, $ за 1 млн токенов; у Azure — цена длинного входа).
+Если цена точки вырастет выше таблицы, OpenRouter не найдёт точку и
+откажет — отказ `pcbk_upstream_rejected` виден в чате и в журнале вызовов, а
+списания больше оценки нет.
 В доле вызывающего и в общем бюджете вызов стоит так:
 - идёт (`open`), ждёт дозапроса (`pending`), цена не нашлась (`unknown`),
   потерян при перезапуске (`lost`) — по оценке;
@@ -589,7 +613,9 @@ OpenRouter не останавливает генерацию после обр�
 - настоящая цена вызова премиума при окне образа 131 072 — до ≈$0,49
   (131 072 × $2,50/млн за запись кэша + 16 000 × $10/млн), оценка того же
   вызова по байтам — около $0,6;
-- оценка на пределе тела 1 МиБ — ≤ $1,03.
+- оценка на пределе тела 1 МиБ — ≤ $1,03 у премиума; самая большая — у
+  `openai/gpt-6-sol` по ценам длинного входа: 349 526 × $5,50/млн + 16 000 ×
+  $16,50/млн ≈ $2,19.
 
 Окно 131 072 само вход не ограничивает. OpenCode сверяет переполнение по
 токенам прошлого шага (`session/prompt.ts:1161–1167`), и следующий запрос
@@ -760,7 +786,12 @@ OpenRouter: отказ 402 бесплатный. Первый удачный в�
    - тело `/llm/` больше 1 МиБ — 413;
    - расхождение с `/key` больше $1 — предупреждение.
 
-   Тесты — задача 3, `test_estimate_upper_bound`; задача 6,
+   Цена точки выше таблицы (региональный вариант, длинный вход, конец
+   скидки) не даёт перерасхода: таблица — максимум, запрос несёт
+   `max_price`. Тесты — задача 3, `test_estimate_upper_bound`,
+   `test_estimate_uses_max_variant_undiscounted_and_tier`; задача 5,
+   `test_price_above_max_price_is_rejected`; задача 6,
+   `test_price_above_max_is_refused_and_recorded`,
    `test_inflight_reserve_refuses_share`, `test_caller_concurrency_is_busy`,
    `test_llm_body_limit_is_one_mib`, `test_key_drift_and_budget_from_key`;
    задача 4, `test_budget_total_before_share_and_key`; задача 7,
@@ -920,11 +951,15 @@ docs/checks/D4a.md, docs/checks/D4a/*.png
 
   Разбор — `python3` на сервере, в журнал идут только числа.
   Expected: `200`; «7 из 7 моделей есть в каталоге»; «7 из 7 закреплённых точек —
-  ZDR»; цены каждой точки — в пределах 10 % от констант таблицы задачи 3.
-  Если точка пропала из ZDR — в задаче 3 меняется её константа (запасная
-  точка из research/08 §8), и это записывается. Если цена ушла дальше 10 % —
-  в задаче 3 правится цена в таблице: от неё зависит верхняя оценка
-  (Д4а-R13).
+  ZDR»; по каждой модели **максимум** цен по всем вариантам, которые пускает
+  базовое имя закреплённой точки (регионы вида `fireworks/us`, `azure/eu`;
+  уровни `/flex`, `/priority` — нет), с учётом скидки (`discount` — цена
+  делится на `1 − discount`) и цен длинного входа — не выше констант таблицы
+  задачи 3 (У1–У3). Если точка пропала из ZDR — в задаче 3 меняется её
+  константа (запасная точка из research/08 §8), и это записывается. Если
+  максимум выше таблицы — в задаче 3 поднимается цена в таблице: от неё
+  зависят верхняя оценка и `max_price` (Д4а-R13). Выполнено 29.09 (`c0190cd`),
+  находки — в «Изменениях по утренней проверке».
 - [ ] **Step 4: Commit** (после проверки на секреты) — `git add docs/checks/D4a.md && git commit -m "Д4а: утро — темп Д3б, имена Д3 сверены, OpenRouter с сервера доступен, закреплённые точки ZDR и их цены" -- docs/checks/D4a.md`.
 
 ---
@@ -1315,26 +1350,48 @@ def test_install_guard_counts_and_logs():                                       
 **Interfaces:**
 - Consumes: `FakeMono` — Д3а.
 - Produces (`models.py`):
-  - `@dataclass(frozen=True) class ModelPolicy: model: str; provider_only: str; effort: Literal["low", "medium", "high"]; in_usd_m: float; out_usd_m: float; write_usd_m: float; auto_cache: bool = False` —
-    цены в долларах за 1 млн токенов на закреплённой точке (research/08 §3,
-    на 28.09; задача 0 сверяет их с `/endpoints/zdr`);
+  - `@dataclass(frozen=True) class ModelPolicy: model: str; provider_only: str; effort: Literal["low", "medium", "high"]; in_usd_m: float; out_usd_m: float; write_usd_m: float; auto_cache: bool = False; tier_tokens: int | None = None; tier_in_usd_m: float = 0.0; tier_out_usd_m: float = 0.0; tier_write_usd_m: float = 0.0` —
+    цены в долларах за 1 млн токенов — **верхние**, не цены одной точки
+    (утренняя проверка Д4а, У1–У3):
+    - базовое имя в `provider.only` (`fireworks`, `azure`) пускает и
+      региональные варианты (`fireworks/us`, `azure/us`, `azure/eu`), а
+      `provider_matches` их не различает. Поэтому в таблице — максимум цен по
+      всем вариантам, которые пускает базовое имя (уровни `/flex` и
+      `/priority` базовым именем не выбираются);
+    - `tier_*` — цены длинного входа: с `tier_tokens` токенов входа (Azure —
+      272 000) действуют они;
+    - у точки со скидкой (`discount` в `/endpoints`, у Gemini на
+      `google-vertex/global` — 0,5) — цена **без** скидки: цена в списке уже
+      со скидкой, и оценка должна пережить её конец;
   - `BYTES_PER_TOKEN = 3` — делитель верхней оценки входа;
   - `ModelPolicy.estimate_usd(self, body_bytes: int, max_tokens: int) -> float` —
-    `ceil(body_bytes / BYTES_PER_TOKEN) * max(in_usd_m, write_usd_m) / 1e6 + max_tokens * out_usd_m / 1e6`
-    (Д4а-R13);
+    `n = ceil(body_bytes / BYTES_PER_TOKEN)`; при `tier_tokens` и
+    `n ≥ tier_tokens` — цены `tier_*`, иначе базовые:
+    `n * max(вход, запись) / 1e6 + max_tokens * выход / 1e6` (Д4а-R13);
+  - `ModelPolicy.max_price(self) -> dict` —
+    `{"prompt": tier_in_usd_m or in_usd_m, "completion": tier_out_usd_m or out_usd_m}` —
+    самая высокая цена, которую модель может стоить; уходит в тело каждого
+    запроса как `provider.max_price` ($ за 1 млн токенов). Если цена точки
+    когда-нибудь вырастет выше таблицы, OpenRouter не найдёт точку и откажет
+    (виден отказ `pcbk_upstream_rejected`), а не спишет больше оценки;
   - `CANDIDATES: tuple[ModelPolicy, ...]` — ровно семь, по порядку research/08:
 
-    | `model` | `provider_only` | `effort` | вход | выход | запись кэша | `auto_cache` |
-    |---|---|---|---|---|---|---|
-    | `z-ai/glm-5.3` | `fireworks` | `high` | 1.40 | 4.40 | 0 | — |
-    | `deepseek/deepseek-v4.1-flash` | `fireworks` | `high` | 0.22 | 0.66 | 0.22 | — |
-    | `google/gemini-3.8-flash` | `google-vertex/global` | `medium` | 0.75 | 3.75 | 0 | — |
-    | `openai/gpt-6-sol` | `azure` | `medium` | 2.00 | 10.00 | 2.50 | — |
-    | `z-ai/glm-5.3-flash` | `fireworks` | `low` | 0.15 | 0.50 | 0 | — |
-    | `openai/gpt-6-luna` | `azure` | `medium` | 0.10 | 0.50 | 0.125 | — |
-    | `anthropic/claude-sonnet-5.5` | `google-vertex/global` | `low` | 2.00 | 10.00 | 2.50 | да |
+    | `model` | `provider_only` | `effort` | вход | выход | запись кэша | `auto_cache` | длинный вход: с токенов — вход / выход / запись | основание цены |
+    |---|---|---|---|---|---|---|---|---|
+    | `z-ai/glm-5.3` | `fireworks` | `high` | 1.40 | 4.40 | 0 | — | — | точка, вариантов нет |
+    | `deepseek/deepseek-v4.1-flash` | `fireworks` | `high` | 0.45 | 1.80 | 0.45 | — | — | максимум — `fireworks/us` |
+    | `google/gemini-3.8-flash` | `google-vertex/global` | `medium` | 1.50 | 7.50 | 0 | — | — | без скидки 0,5: 0.75 / 3.75 × 2 |
+    | `openai/gpt-6-sol` | `azure` | `medium` | 2.20 | 11.00 | 2.75 | — | 272 000 — 4.40 / 16.50 / 5.50 | максимум — `azure/us`, `azure/eu` (+10 %); длинный вход 4.00 / 15.00 / 5.00 + те же 10 % |
+    | `z-ai/glm-5.3-flash` | `fireworks` | `low` | 0.225 | 0.75 | 0 | — | — | максимум — `fireworks/us` |
+    | `openai/gpt-6-luna` | `azure` | `medium` | 0.11 | 0.55 | 0.1375 | — | 272 000 — 0.22 / 0.825 / 0.275 | максимум — `azure/us`, `azure/eu` (+10 %); длинный вход 0.20 / 0.75 / 0.25 + те же 10 % |
+    | `anthropic/claude-sonnet-5.5` | `google-vertex/global` | `low` | 2.00 | 10.00 | 2.50 | да | — | точка, вариантов нет |
 
-  - `PROVIDER_FIXED = {"allow_fallbacks": False, "zdr": True, "data_collection": "deny", "require_parameters": True}`
+    Цены длинного входа региональных вариантов Azure в `/endpoints` не
+    видны; берётся та же надбавка 10 %, что у базовых цен, — в сторону
+    завышения. Сверка — задача 9, шаг 4a.
+
+  - `PROVIDER_FIXED = {"allow_fallbacks": False, "zdr": True, "data_collection": "deny", "require_parameters": True}`;
+    `provider` тела — ещё и `"max_price": policy.max_price()` (У1)
   - `select_models(names: str) -> dict[str, ModelPolicy]`:
     - `""` → все семь по порядку;
     - иначе список через запятую, порядок — как в строке;
@@ -1376,7 +1433,7 @@ def test_install_guard_counts_and_logs():                                       
       (`type` ∈ `text | json_object | json_schema`), `temperature` (0…2),
       `top_p` (0…1) — только если значение годно, иначе ключа нет;
     - `reasoning` = `{"effort": policy.effort}`;
-    - `provider` = `{"only": [policy.provider_only], **PROVIDER_FIXED}`;
+    - `provider` = `{"only": [policy.provider_only], **PROVIDER_FIXED, "max_price": policy.max_price()}`;
     - `user` = `f"pcbk-{caller}"`; `session_id` = `f"{caller}:{session or 'none'}"`;
     - `cache_control` = `{"type": "ephemeral"}` — только при `policy.auto_cache`.
 
@@ -1454,7 +1511,8 @@ def test_rebuild_keeps_only_whitelist_and_sets_our_fields():                    
     assert set(b) == {"model", "messages", "tools", "stream", "stream_options", "max_tokens", "reasoning",
                       "provider", "user", "session_id"}
     assert b["provider"] == {"only": ["fireworks"], "allow_fallbacks": False, "zdr": True,
-                             "data_collection": "deny", "require_parameters": True}
+                             "data_collection": "deny", "require_parameters": True,
+                             "max_price": {"prompt": 1.40, "completion": 4.40}}           # У1
     assert (b["max_tokens"], b["reasoning"], b["user"], b["session_id"]) == \
            (16000, {"effort": "high"}, "pcbk-student-01", f"student-01:{SES}")
 
@@ -1524,6 +1582,23 @@ def test_estimate_upper_bound():                                                
     assert glm.estimate_usd(body_bytes(b), b["max_tokens"]) == \
            pytest.approx(math.ceil(body_bytes(b) / 3) * 1.4e-6 + 16000 * 4.4e-6)
     assert body_bytes({"a": "я"}) == len('{"a":"я"}'.encode())
+
+def test_estimate_uses_max_variant_undiscounted_and_tier():                       # утренняя проверка У1–У3
+    m = select_models("")
+    ds, gem, luna, sol = (m["deepseek/deepseek-v4.1-flash"], m["google/gemini-3.8-flash"],
+                          m["openai/gpt-6-luna"], m["openai/gpt-6-sol"])
+    assert ds.estimate_usd(3000, 100) == pytest.approx(1000 * 0.45e-6 + 100 * 1.80e-6)    # fireworks/us, не 0.22/0.66
+    assert gem.estimate_usd(3000, 100) == pytest.approx(1000 * 1.50e-6 + 100 * 7.50e-6)   # без скидки 0,5
+    below, at = 271_999 * 3, 272_000 * 3                                                    # граница длинного входа
+    assert luna.estimate_usd(below, 16000) == pytest.approx(271_999 * 0.1375e-6 + 16000 * 0.55e-6)
+    assert luna.estimate_usd(at, 16000) == pytest.approx(272_000 * 0.275e-6 + 16000 * 0.825e-6)
+    assert sol.estimate_usd(1_048_576, 16000) == pytest.approx(349_526 * 5.50e-6 + 16000 * 16.50e-6)   # ≈ $2,19
+    assert [p.max_price() for p in (ds, gem, luna, sol, m["z-ai/glm-5.3-flash"])] == [
+        {"prompt": 0.45, "completion": 1.80}, {"prompt": 1.50, "completion": 7.50},
+        {"prompt": 0.22, "completion": 0.825}, {"prompt": 4.40, "completion": 16.50},
+        {"prompt": 0.225, "completion": 0.75}]
+    b = rebuild_body({**OC_BODY, "model": luna.model}, luna, caller="ops", session=None)
+    assert b["provider"]["max_price"] == {"prompt": 0.22, "completion": 0.825}             # и в теле — цена длинного входа
 
 def h(text):
     return hashlib.sha256(text.encode()).hexdigest()[:16]
@@ -2015,11 +2090,20 @@ def test_no_content_columns(tmp_path):                                          
     так тест делает «OpenRouter насчитал больше».
   - `GET /api/v1/credits` — с ключом управления
     `{"data": {"total_credits": 50.0, "total_usage": 20.0}}`, иначе 403.
+  - Цена точки (утренняя проверка, У1): `POST /_price` с
+    `{"model": m, "prompt": p, "completion": c}` задаёт «нынешнюю цену точки»
+    модели ($ за 1 млн). Если для модели запроса цена задана и она выше
+    `body.provider.max_price` (любая из двух), чат отвечает 404
+    `{"error": {"code": 404, "message": "No endpoints found matching your max_price"}}`
+    и ничего не считает. Если `max_price` в теле нет — обычный ответ: так
+    тест ловит прокси, который не шлёт `max_price`. Цена не задана — проверки
+    нет.
   - `GET /_requests` — записанные запросы чата, `DELETE /_requests` — сброс;
-    `GET /_stats` — `{"aborted": n}`; `POST /_usage`. Это ручки только для
-    тестов.
+    `GET /_stats` — `{"aborted": n}`; `POST /_usage`; `POST /_price`. Это
+    ручки только для тестов.
   - Фикстура `fake_or` (на функцию): сервер на `127.0.0.1:0`, атрибуты `url`
-    (`…/api/v1`), `requests` (список), `aborted`, метод `add_usage(x, key="a")`.
+    (`…/api/v1`), `requests` (список), `aborted`, методы `add_usage(x, key="a")`
+    и `set_price(model, prompt, completion)`.
 - Produces (`sse.py`):
   - `class SseObserver` — `feed(self, chunk: bytes) -> None`:
     - события делятся пустой строкой (`\n\n` и `\r\n\r\n`), неполное событие
@@ -2173,6 +2257,16 @@ async def test_env_proxy_is_ignored(fake_or, monkeypatch):                      
     up = Upstream(fake_or.url, "test-openrouter-key", None)
     assert "usage" in await up.key_info()
     await up.aclose()
+
+async def test_price_above_max_price_is_rejected(fake_or):                       # У1
+    fake_or.set_price("openai/gpt-6-luna", 0.30, 1.00)                           # цена точки выросла
+    capped = {**BODY, "provider": {"only": ["azure"], "max_price": {"prompt": 0.22, "completion": 0.825}}}
+    with pytest.raises(UpstreamError) as e:
+        await Upstream(fake_or.url, "test-openrouter-key", None).open_chat(capped)
+    assert (e.value.kind, e.value.status) == ("rejected", 404) and "max_price" in e.value.message
+    wide = {**capped, "provider": {"only": ["azure"], "max_price": {"prompt": 0.30, "completion": 1.00}}}
+    up = Upstream(fake_or.url, "test-openrouter-key", None)
+    r = await up.open_chat(wide); await r.aclose(); await up.aclose()             # цена в пределе — ответ
 
 async def test_drill_402_never_touches_network(fake_or):
     with pytest.raises(UpstreamError) as e:
@@ -2616,6 +2710,7 @@ def test_stream_passes_through_and_is_charged(tmp_path, fake_or):               
         assert r.text.rstrip().endswith("data: [DONE]")
         sent = fake_or.requests[-1]["body"]
         assert (sent["provider"]["only"], sent["user"], sent["max_tokens"]) == (["fireworks"], "pcbk-student-01", 16000)
+        assert sent["provider"]["max_price"] == {"prompt": 1.40, "completion": 4.40}   # У1
         assert sent["session_id"] == f"student-01:{SES}"
         row = role.ledger.recent(1)[0]
         assert (row.status, row.cost, row.cost_source, row.provider_ok, row.step) == ("ok", 0.0012, "stream", True, 1)
@@ -2729,6 +2824,18 @@ def test_money_signs_turn_row_red_until_success(tmp_path, fake_or, word, status,
         assert role.health()[0] is False
         assert post(c, chat_body()).status_code == 200
     assert role.health()[0] is True and role.health_json(now_utc())["upstream"]["state"] == "ok"
+
+def test_price_above_max_is_refused_and_recorded(tmp_path, fake_or):             # утренняя проверка У1
+    app, role = make_llm_app(tmp_path, fake_or)
+    fake_or.set_price("z-ai/glm-5.3", 1.41, 4.40)                                # точка подорожала выше таблицы
+    with TestClient(app) as c:
+        r = post(c, chat_body())
+        assert (r.status_code, r.json()["error"]["code"]) == (404, "pcbk_upstream_rejected")
+        assert "max_price" in r.json()["error"]["message"]                      # текст OpenRouter виден в чате
+    row = role.ledger.recent(1)[0]
+    assert (row.status, row.code, row.cost_source, row.step) == ("upstream_error", "pcbk_upstream_rejected", "none", 1)
+    assert role.ledger.spent("student-01") == 0.0 and role.inflight.get("student-01", 0) == 0
+    assert fake_or.requests[-1]["body"]["provider"]["max_price"] == {"prompt": 1.40, "completion": 4.40}
 
 def test_in_flight_is_wait_not_money(tmp_path, fake_or):                         # Review Focus 3
     app, role = make_llm_app(tmp_path, fake_or)
@@ -3619,6 +3726,16 @@ Expected: `11`; `444`, `400`. Токен `ops` — в `$JOB` без вывода
     туннель токеном `ops` → 402, строка «сбой — на счёте OpenRouter кончились
     деньги», снимок `00-money-out.png`. Так же — после каждого пересоздания
     `core` в задаче 10.
+- [ ] **Step 4a: Цены с сервера (У1–У3).** Тем же одноразовым `curl` в
+  `pcbk-egress`, что задача 0, шаг 3, без ключа: `GET /api/v1/endpoints/zdr`,
+  разбор `python3`, в журнал — только числа. Для каждой из семи моделей —
+  максимум цен (вход, выход, запись кэша) по всем вариантам, которые пускает
+  базовое имя закреплённой точки, цена без скидки (`discount`), у Azure —
+  и цены длинного входа, если `/endpoints` их показывает.
+  Expected: каждый максимум не выше таблицы задачи 3; вывод — «7 из 7 не
+  выше таблицы». Выше — строка владельцу тем же часом и правка таблицы
+  отдельным коммитом до задачи 10: пока её нет, такие вызовы получают отказ
+  по `max_price`, лишних денег нет.
 
   Откат:
   - вернуть `compose.yaml.d3b`;
@@ -3660,7 +3777,16 @@ chmod 0700 ~/pcbk-d4/llmrows
   - `spent_usd` − `before` = `cost` этой строки (до 1e-9), `estimated_usd` = 0;
   - на странице первая часть `note` — ровно «расход {fmt_usd(spent_usd)} из
     $1000», дальше « · по ключу OpenRouter …» (после опроса — то же число) и
-    « · отбор и проверки …»; снимок `01-spend.png`.
+    « · отбор и проверки …»; снимок `01-spend.png`;
+  - `cost` ≤ `cost_est` этой строки (оценка верхняя).
+
+  Затем тот же запрос с моделью `google/gemini-3.8-flash` (`gemini.json`,
+  `max_tokens: 64`) — проверка допущения У3 о скидке. Expected: `status ok`,
+  `cost` ≤ `cost_est`; в `docs/checks/D4a.md` — отношение
+  `cost / (prompt_tokens × 0.75e-6 + completion_tokens × 3.75e-6)`: около 1 —
+  списывается цена списка (со скидкой), и оценка по цене без скидки вдвое
+  выше; около 2 — скидки нет, оценка равна цене; больше 2 — строка
+  владельцу и правка таблицы. Меньше $0,001.
 - [ ] **Step 2: Без потока и обрыв.** Тот же запрос с `"stream": false` →
   `cost_source body`. Затем запрос на 300 слов (`max_tokens: 400`),
   `curl --max-time 2` → `status cancelled`. Пока его цена `pending`,
@@ -3750,11 +3876,11 @@ chmod 0700 ~/pcbk-d4/llmrows
 - [ ] **Step 4: План и факт.** Две строки в `docs/checks/D4a.md`, помощники
   `at`/`msg`/`pace` задачи 0, шаг 1a:
   - темп кода до черты —
-    `pace "$(msg 'Серверный слой: один обработчик 422')" "$(msg 'LLM-прокси в компоновке')" 13.1`
-    (коммиты задач 2 и 8, между ними задачи 2а и 3–8 — 13,1 ч по шкале). Если
+    `pace "$(msg 'Серверный слой: один обработчик 422')" "$(msg 'LLM-прокси в компоновке')" 13.55`
+    (коммиты задач 2 и 8, между ними задачи 2а и 3–8 — 13,55 ч по шкале). Если
     задача 8 ждала коммит задачи 7 Д3б, замер — до коммита задачи 7
     (`msg 'Сторож: строка «LLM-прокси и бюджет»'`), часы задач 2а и 3–7 —
-    10,95. Эту долю берёт Д4б для правила «пересчитать до начала дня»;
+    11,4. Эту долю берёт Д4б для правила «пересчитать до начала дня»;
   - полное время дня — от `%aI` первого коммита задачи 0 до тега
     `platform-d4a`, справочно: в него входят окно владельца и петля критика.
 - [ ] **Step 5: Владельцу** — «Д4а готов», снимки, сколько потрачено (по
