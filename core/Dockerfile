@@ -20,7 +20,7 @@ COPY pcbk_core /app/pcbk_core
 USER 10003:10003
 EXPOSE 8000
 
-# 200 только когда все роли здоровы; строка сторожа смотрит /healthz/data
+# живость процесса: /healthz/live отвечает 200, пока жив uvicorn; здоровье ролей видит сторож (/healthz/data, /health/llm)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD ["python", "-m", "pcbk_core.main", "--healthcheck"]
 

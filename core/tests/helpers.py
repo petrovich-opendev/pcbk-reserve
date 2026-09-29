@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -24,17 +24,20 @@ import httpx
 import pytest
 import uvicorn
 from fastapi import APIRouter, FastAPI
+from fastapi.responses import JSONResponse
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from pydantic import BaseModel
 
 from fakes import WHITELIST, FakeHistorian
-from pcbk_core.app import RoleBase, create_app
+from pcbk_core.app import Role, RoleBase, create_app
 from pcbk_core.data import DataRole
 from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.events import CallEvent
 from pcbk_core.data.historian import parse_clock
 from pcbk_core.data.service import DataService
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
+from pcbk_core.hooks import hooks_of
 from pcbk_core.secrets import TokenTable
 from pcbk_core.settings import Settings
 
@@ -155,10 +158,13 @@ def make_service(tmp_path, **kwargs) -> tuple[DataService, FakeHistorian]:
     return role.service, fake
 
 
-def make_app(tmp_path, **kwargs) -> tuple[FastAPI, DataRole]:
-    """Приложение с одной ролью «данные» на двойнике; каталог грузит lifespan (TestClient)."""
+def make_app(tmp_path, *, extra_roles: Sequence[Role] = (), **kwargs) -> tuple[FastAPI, DataRole]:
+    """Приложение с ролью «данные» на двойнике и extra_roles за ней; каталог грузит lifespan (TestClient).
+
+    kwargs — в make_role.
+    """
     role, _ = make_role(db_dir=tmp_path, **kwargs)
-    return create_app(SETTINGS, [role]), role
+    return create_app(SETTINGS, [role, *extra_roles]), role
 
 
 def sent_of(fake: FakeHistorian) -> list[str]:
@@ -185,29 +191,38 @@ async def wait_until_async(pred: Callable[[], bool], timeout: float = 5) -> None
 
 
 @contextmanager
-def serve_role(role: DataRole, *, wait_catalog: bool = True) -> Iterator[str]:
-    """create_app с одной ролью под uvicorn в потоке на 127.0.0.1 (порт выбирает ядро); отдаёт url.
+def serve_app(app: FastAPI) -> Iterator[str]:
+    """Приложение под uvicorn в потоке на 127.0.0.1 (порт выбирает ядро); отдаёт базовый url.
 
-    wait_catalog — ждать загрузки каталога (роль с ошибкой настройки его не грузит). Журнал uvicorn не
-    настраивается, доступ не пишется — как в serve().
+    lifespan включён. Журнал uvicorn не настраивается, доступ не пишется — как в serve(). Не поднялся или не
+    остановился за 10 с — AssertionError.
     """
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(create_app(SETTINGS, [role]), lifespan="on", log_config=None,
-                                           access_log=False))
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, name="serve-role", daemon=True)
+    server = uvicorn.Server(uvicorn.Config(app, lifespan="on", log_config=None, access_log=False))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, name="serve-app", daemon=True)
     thread.start()
     try:
         wait_until(lambda: server.started or not thread.is_alive(), timeout=10)
         assert server.started, "uvicorn не поднялся"
-        if wait_catalog:
-            wait_until(lambda: role.catalog.loaded)
         yield f"http://127.0.0.1:{sock.getsockname()[1]}"
     finally:
         server.should_exit = True
         thread.join(timeout=10)
         sock.close()
         assert not thread.is_alive(), "uvicorn не остановился за 10 с"
+
+
+@contextmanager
+def serve_role(role: DataRole, *, wait_catalog: bool = True) -> Iterator[str]:
+    """create_app с одной ролью под uvicorn (serve_app); отдаёт url.
+
+    wait_catalog — ждать загрузки каталога (роль с ошибкой настройки его не грузит).
+    """
+    with serve_app(create_app(SETTINGS, [role])) as url:
+        if wait_catalog:
+            wait_until(lambda: role.catalog.loaded)
+        yield url
 
 
 @asynccontextmanager
@@ -253,16 +268,32 @@ async def _mark_installed(request, call_next):
     return response
 
 
-class DummyRole(RoleBase):
-    """Роль-двойник: здоровье задано; installs=True — промежуточное звено и точный маршрут /dummy."""
+class _Typed(BaseModel):
+    n: int
 
-    def __init__(self, name: str, health: tuple[bool, str], installs: bool = False):
+
+class DummyRole(RoleBase):
+    """Роль-двойник: здоровье задано; installs=True — промежуточное звено и точный маршрут /dummy.
+
+    validates — префикс: обработчик 422 на него в реестре крючков, ответ 422 {"handled_by": имя роли}, и
+    маршрут POST {префикс}typed с телом {"n": int}. body_limit — (префикс, предел) в реестр крючков.
+    """
+
+    def __init__(self, name: str, health: tuple[bool, str], installs: bool = False,
+                 validates: str | None = None, body_limit: tuple[str, int] | None = None):
         self.name = name
         self._health = health
         self.installs = installs
+        self.validates = validates
+        self.body_limit = body_limit
 
     def router(self) -> APIRouter:
-        return APIRouter()
+        router = APIRouter()
+        if self.validates is not None:
+            @router.post(f"{self.validates}typed")
+            async def typed(body: _Typed) -> dict:
+                return {"n": body.n}
+        return router
 
     def health(self) -> tuple[bool, str]:
         return self._health
@@ -273,6 +304,12 @@ class DummyRole(RoleBase):
     def install(self, app: FastAPI) -> None:
         if self.installs:
             app.middleware("http")(_mark_installed)
+        if self.validates is not None:
+            async def handled(request, exc) -> JSONResponse:
+                return JSONResponse({"handled_by": self.name}, status_code=422)
+            hooks_of(app).validation(self.validates, handled)
+        if self.body_limit is not None:
+            hooks_of(app).body_limit(*self.body_limit)
 
     def mounts(self):
         return [("/dummy", dummy)] if self.installs else []

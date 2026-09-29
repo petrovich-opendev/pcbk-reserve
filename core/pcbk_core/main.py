@@ -91,10 +91,14 @@ def build_roles(settings: Settings) -> list[Role]:
 
 
 def healthcheck(settings: Settings) -> int:
-    """Для HEALTHCHECK образа: 0 — /healthz ответил 200, иначе 1."""
+    """Для HEALTHCHECK образа — живость процесса: 0 — /healthz/live ответил 200 (uvicorn жив), иначе 1.
+
+    Здоровье ролей сюда не входит: его видит сторож (/healthz/data, /health/llm). Так 402 от OpenRouter
+    или ошибка настройки роли не делают контейнер core unhealthy.
+    """
     conn = http.client.HTTPConnection("127.0.0.1", settings.CORE_PORT, timeout=4)
     try:
-        conn.request("GET", "/healthz")
+        conn.request("GET", "/healthz/live")
         return 0 if conn.getresponse().status == 200 else 1
     except (OSError, http.client.HTTPException):
         return 1

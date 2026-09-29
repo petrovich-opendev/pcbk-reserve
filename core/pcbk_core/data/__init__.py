@@ -17,11 +17,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, FastAPI
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp
 
 from ..app import RoleBase
+from ..hooks import hooks_of
 from ..secrets import TokenTable
 from ..settings import Settings
 from .catalog import Catalog
@@ -29,7 +29,7 @@ from .events import EVENTS_CHECK_S, CallEvent, EventLog, Outcome, outcome_for
 from .freshness import ERROR_TEXTS, FreshnessTracker
 from .gate import GateRefused, GateResult, HistorianGate
 from .historian import HistClock, HistorianError, QueryFn, parse_clock
-from .http_api import MAX_BODY_BYTES, BodyLimit, data_router, validation_handler
+from .http_api import data_router, validation_handler
 from .mcp_server import MCP_PATH, build_mcp, mcp_auth
 from .service import DataService
 from .sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql
@@ -298,10 +298,11 @@ class DataRole(RoleBase):
         return router
 
     def install(self, app: FastAPI) -> None:
-        """Крючки уровня приложения: 422/401/503 для ошибок разбора /api/data/* и предел тела до
-        маршрутизации — на всём приложении, в том числе на /mcp."""
-        app.add_exception_handler(RequestValidationError, validation_handler(self))
-        app.add_middleware(BodyLimit, max_bytes=MAX_BODY_BYTES)
+        """Крючки уровня приложения — через реестр hooks_of(app): 422/401/503 для ошибок разбора /api/data/*.
+
+        Предел тела /api/data/ и /mcp — по умолчанию (64 КиБ): общее звено BodyLimit ставит create_app.
+        """
+        hooks_of(app).validation("/api/data/", validation_handler(self))
 
     def mounts(self) -> list[tuple[str, ASGIApp]]:
         """Точный маршрут /mcp без Mount("/"): чужие пути ролей Д4/Д5 он не перехватит, /mcp/ — 404."""
