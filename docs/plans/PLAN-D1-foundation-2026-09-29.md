@@ -1013,8 +1013,9 @@ Expected: имя процесса и пакет записаны; закрыти
 Сначала — снимок исправного состояния. Затем, со снимком после каждого:
 (а) сторож убит: `docker stop pcbk-watchdog` → «Сторож не отвечает»; `start`;
 (б) сторож завис: `docker pause pcbk-watchdog` → через ≤ 10 с та же страница; `unpause`;
-(в) цикл молчит при живом HTTP: `TICK_S=3600 docker compose up -d --no-build watchdog`,
-через 40 с — красная полоса «состояние неизвестно»; `docker compose up -d --no-build watchdog`;
+(в) цикл молчит при живом HTTP: `DRILL_FREEZE_LOOP=1 docker compose up -d --no-build watchdog`
+(цикл останавливается после первого такта), через 40 с — красная полоса «состояние
+неизвестно»; `docker compose up -d --no-build watchdog`;
 (г) `docker stop pcbk-sp-ro` → «Прокси сокета сторожа — не отвечает»,
 «Прокси сокета серверного слоя — неизвестно», итог — сбой; `start`;
 (д) `docker stop pcbk-sp-ctl` → «Прокси сокета серверного слоя — остановлен»; `start`;
