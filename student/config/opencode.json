@@ -1,0 +1,27 @@
+{
+  "autoupdate": false,
+  "share": "disabled",
+  "snapshot": false,
+  "enabled_providers": ["pcbk"],
+  "model": "pcbk/stub",
+  "permission": {
+    "external_directory": "deny",
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny"
+    }
+  },
+  "provider": {
+    "pcbk": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://core:8000/llm/v1",
+        "apiKey": "{file:/run/secrets/llm-token}"
+      },
+      "models": {
+        "stub": {}
+      }
+    }
+  }
+}

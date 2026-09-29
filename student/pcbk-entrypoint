@@ -1,0 +1,11 @@
+#!/bin/bash
+# student/pcbk-entrypoint — пароль сервера только из файла и только процессу OpenCode
+set -eu
+pw=""
+{ IFS= read -r pw < /run/secrets/opencode-pw; } 2>/dev/null || true   # нет файла, нет доступа, EOF без \n
+if [ -z "$pw" ]; then
+  echo "pcbk: нет пароля сервера OpenCode в /run/secrets/opencode-pw — не запускаюсь" >&2
+  exit 78
+fi
+export OPENCODE_SERVER_PASSWORD="$pw"
+exec opencode serve --hostname 0.0.0.0 --port 4096

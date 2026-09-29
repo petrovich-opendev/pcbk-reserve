@@ -17,6 +17,9 @@ from pathlib import Path
 
 import pytest
 
+from workplace import IMAGE as STUDENT_IMAGE
+from workplace import ONESHOT_LABEL
+
 REPO = Path(__file__).resolve().parents[2]
 PROJECT = "pcbk-test"
 HOST, PORT = "127.0.0.1", 18443
@@ -29,8 +32,6 @@ COMPOSE_FILES = ("compose.yaml", "compose.test.yaml")
 STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRETS_DIR", "AGENTS_DIR",
                         "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S",
                         "DRILL_FREEZE_LOOP"})
-# метка одноразовых клиентов http_as: уборка снимает только их
-ONESHOT_LABEL = "pcbk-test.oneshot"
 # запрос изнутри сторожа: argv — метод и адрес; печатает код ответа
 WATCHDOG_REQUEST = """\
 import http.client, sys
@@ -312,6 +313,13 @@ class Stack:
         if leftovers:
             self._docker("rm", "-f", *leftovers)
         self.compose("down", "-v", "--remove-orphans", "--timeout", "10")
+
+
+@pytest.fixture(scope="session")
+def student_image() -> str:
+    """Образ места собирается в каждом прогоне; контекст — student/."""
+    _run(["docker", "build", "-t", STUDENT_IMAGE, "student/"], timeout=COMPOSE_TIMEOUT_S, cwd=REPO)
+    return STUDENT_IMAGE
 
 
 @pytest.fixture(scope="session")
