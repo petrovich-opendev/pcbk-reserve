@@ -1,6 +1,7 @@
 """Ворота к историану: белый список литералов, полосы и места, срок, общий предел, защёлка входа."""
 import asyncio
 import time
+from datetime import datetime
 
 import anyio
 import pytest
@@ -9,7 +10,7 @@ from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian
 from helpers import FakeMono
 from pcbk_core.data.gate import AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
 from pcbk_core.data.historian import HistorianError
-from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, live_sql
+from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql, summary_sql
 from pcbk_core.logs import setup_logging
 
 pytestmark = pytest.mark.anyio
@@ -305,3 +306,19 @@ async def test_latch_text_names_both_causes():
         await g.run([clock_sql()])
     assert AUTH_LATCH_TEXT in e.value.detail
     assert "обновите bdrv.env или проверьте, не была ли база историана недоступна" in AUTH_LATCH_TEXT
+
+
+# Д3б, задача 2: сводка — даты и ww-значения через literal_ok, форма summary в реестре (F1)
+
+T6, T14 = datetime(2026, 10, 1, 6), datetime(2026, 10, 1, 14)          # те же, что в test_sql.py
+
+
+@pytest.mark.anyio
+async def test_gate_passes_summary_literals_only():
+    g = HistorianGate(FakeHistorian(), allowed=WHITELIST, literal_ok=allowed_literal)
+    assert (await g.run([summary_sql(["20FAKE_001_PV"], T6, T14)])).sent == ("20FAKE_001_PV",)
+    assert g.stats()["refused_unlisted"] == 0                    # форма summary зарегистрирована (F1)
+    with pytest.raises(GateRefused):
+        await g.run(["SELECT TagName FROM AnalogHistory WHERE TagName = '20FAKE_001_PV' AND wwRetrievalMode = 'Delta'"])
+    with pytest.raises(GateRefused):                              # имя вне списка и в верной форме
+        await g.run([summary_sql(["16FAKE_009_PV"], T6, T14)])

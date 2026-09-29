@@ -37,6 +37,13 @@ LIVE_ROWS = [   # TagName, DateTime, Value, Quality
 ]
 # GETDATE(), GETUTCDATE(): историан в UTC+05:00
 CLOCK_ROWS = [(datetime(2026, 10, 1, 12, 0, 0), datetime(2026, 10, 1, 7, 0, 0))]
+# сводка AnalogSummaryHistory за любой период: у второго тега данных нет
+SUMMARY = {
+    "20FAKE_001_PV": {"Minimum": 10.0, "Maximum": 15.0, "Average": 12.4, "StdDev": 1.1, "PercentGood": 100.0,
+                      "Last": 12.5, "LastDateTime": datetime(2026, 10, 1, 5, 59, 40)},
+    "20FAKE_002_SP": {"Minimum": None, "Maximum": None, "Average": None, "StdDev": None, "PercentGood": 0.0,
+                      "Last": None, "LastDateTime": None},
+}
 
 
 def auth_operational_error(msg_no: int, text: str = "Login failed") -> pytds.OperationalError:
@@ -125,6 +132,10 @@ _CATALOG = re.compile(r"SELECT t\.TagName, t\.Description, t\.TagType, a\.MinEU,
                       r"LEFT JOIN EngineeringUnit e ON e\.EUKey = a\.EUKey WHERE t\.TagType IN \(1, 2\)")
 _LIVE_ALL = re.compile(r"SELECT TagName, DateTime, Value, Quality FROM Live WHERE Value IS NOT NULL")
 _LIVE_IN = re.compile(r"SELECT TagName, DateTime, Value, Quality FROM Live WHERE TagName IN \('[^()]*'\)")
+# столбцы сводки — из текста SQL, в его порядке; даты и интерполяция — любые литералы
+_SUMMARY_IN = re.compile(r"SELECT TagName, (?P<columns>\w+(?:, \w+)*) FROM AnalogSummaryHistory "
+                         r"WHERE TagName IN \((?P<names>'[^()]*')\) AND StartDateTime >= '[^']*' "
+                         r"AND EndDateTime <= '[^']*' AND wwCycleCount = 1(?: AND wwInterpolationType = '[^']*')?")
 
 
 class FakeHistorian:
@@ -143,6 +154,7 @@ class FakeHistorian:
         self.max_concurrency = 0            # по полосам не делится
         self.live: dict[str, tuple[datetime, float | None, int]] = {r[0]: r[1:] for r in LIVE_ROWS}
         self.clock: list[Row] = list(CLOCK_ROWS)
+        self.summary: dict[str, dict] = {name: dict(row) for name, row in SUMMARY.items()}
         self._active = 0
         self._lock = threading.Lock()
 
@@ -174,4 +186,10 @@ class FakeHistorian:
         if _LIVE_IN.fullmatch(sql):
             names = [lit.replace("''", "'") for lit in _LIT.findall(sql)]
             return [(name, *self.live[name]) for name in names if name in self.live]
+        if m := _SUMMARY_IN.fullmatch(sql):
+            columns = m.group("columns").split(", ")
+            names = [lit.replace("''", "'") for lit in _LIT.findall(m.group("names"))]
+            if not all(c in row for row in self.summary.values() for c in columns):
+                raise AssertionError("двойник историана: столбец сводки вне SUMMARY")
+            return [(name, *(self.summary[name][c] for c in columns)) for name in names if name in self.summary]
         raise AssertionError("двойник историана: SQL вне шаблонов службы")

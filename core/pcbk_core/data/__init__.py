@@ -21,7 +21,7 @@ from .catalog import Catalog
 from .freshness import ERROR_TEXTS, FreshnessTracker
 from .gate import GateRefused, HistorianGate
 from .historian import HistClock, HistorianError, QueryFn, parse_clock
-from .sql import catalog_sql, clock_sql, live_all_sql, live_sql
+from .sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql
 
 FRESH_TAGS = 8
 BACKOFF_BASE_S = 60.0
@@ -51,7 +51,8 @@ class DataRole(RoleBase):
         self.whitelist = whitelist
         self.monotonic = monotonic
         self.wallclock = wallclock
-        self.gate = HistorianGate(query, allowed=whitelist, monotonic=monotonic)
+        # вне TagName IN (…) ворота пускают только даты сводки и закрытый набор ww-значений
+        self.gate = HistorianGate(query, allowed=whitelist, literal_ok=allowed_literal, monotonic=monotonic)
         self.catalog = Catalog.empty()
         self.freshness = FreshnessTracker(freeze_stamps=settings.DRILL_FRESHNESS == "freeze_stamps")
         self.catalog_error: str | None = None

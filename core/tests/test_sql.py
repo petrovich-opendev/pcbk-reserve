@@ -1,10 +1,14 @@
 """Шаблоны SQL к историану: только литералы, без LIKE и без параметров драйвера."""
 import re
+from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
-from pcbk_core.data.sql import (MAX_NAMES, catalog_sql, clock_sql, lit_name, literals, live_all_sql, live_sql,
-                                names_in, plain, scan_literals, template_of)
+from pcbk_core.data.sql import (DATE_FMT, HAS_LAST, MAX_NAMES, PIN_INTERPOLATION, SHAPE, SUMMARY_COLUMNS,
+                                TEMPLATE_FORMS, SummaryShape, allowed_literal, catalog_sql, clock_sql, lit_dt,
+                                lit_name, literals, live_all_sql, live_sql, names_in, plain, scan_literals,
+                                summary_form, summary_sql, template_of)
 
 SAMPLES = [clock_sql(), catalog_sql(), live_all_sql(), live_sql(["20FAKE_001_PV", "20FAKE_002_SP"])]
 
@@ -77,3 +81,56 @@ def test_every_template_has_its_form():
 @pytest.mark.parametrize("sql", BYPASSES)
 def test_bypasses_match_no_template(sql):
     assert template_of(sql) is None
+
+
+# Д3б, задача 2: сводка с датами; форма и SQL — из одних констант (F1)
+
+T6, T14 = datetime(2026, 10, 1, 6), datetime(2026, 10, 1, 14)
+
+
+def test_summary_template_rules():
+    s = summary_sql(["20FAKE_001_PV"], T6, T14)
+    assert not re.search(r"\?|%s|@|;|\bLIKE\b|\bOR\b", s) and not re.search(r"\bww\w+\s+IN\b", s)
+    assert "WHERE TagName IN ('20FAKE_001_PV') AND StartDateTime >= " in s and "wwCycleCount = 1" in s
+    assert ("wwInterpolationType = 'STAIRSTEP'" in s) is (PIN_INTERPOLATION == "STAIRSTEP")
+    assert "wwResolution" not in s and names_in(s) == ("20FAKE_001_PV",)
+
+
+def test_allowed_literals():
+    assert allowed_literal(lit_dt(T6).strip("'")) and allowed_literal("STAIRSTEP")
+    assert not allowed_literal("16FAKE_009_PV") and not allowed_literal("Delta")
+
+
+# F1: форма и SQL — из одних констант; каждое сочетание, которое может выбрать окно владельца
+FMTS = ("%Y-%m-%d %H:%M:%S.000", "%Y%m%d %H:%M:%S.000")
+SHAPES = [SummaryShape(f, pin, last) for f in FMTS for pin in (None, "STAIRSTEP") for last in (False, True)]
+
+
+@pytest.mark.parametrize("shape", SHAPES, ids=repr)
+def test_summary_form_built_from_same_constants(shape):
+    s = summary_sql(["20FAKE_001_PV", "20FAKE_004_PV"], T6, T14, shape)
+    form = summary_form(shape)
+    assert form.fullmatch(s)
+    one = lambda sh: summary_sql(["20FAKE_001_PV"], T6, T14, sh)
+    tampered = [one(replace(shape, date_fmt=FMTS[1 - FMTS.index(shape.date_fmt)])),    # дата не по формату
+                one(replace(shape, pin=None if shape.pin else "STAIRSTEP")),              # хвост интерполяции
+                one(replace(shape, has_last=not shape.has_last)),                         # другие столбцы
+                s.replace("TagName IN (", "TagName NOT IN ("), s + " OR 1=1",
+                s.replace("wwCycleCount = 1", "wwCycleCount = 100"),
+                s.replace(" AND wwCycleCount = 1", " AND wwRetrievalMode = 'Delta' AND wwCycleCount = 1")]
+    assert not any(form.fullmatch(t) for t in tampered)
+
+
+def test_summary_form_registered_from_module_constants():
+    assert TEMPLATE_FORMS["summary"].pattern == summary_form().pattern
+    assert template_of(summary_sql(["20FAKE_001_PV"], T6, T14)) == "summary"
+    assert SUMMARY_COLUMNS == SHAPE.columns and ("Last" in SUMMARY_COLUMNS) is HAS_LAST
+    assert (SHAPE.date_fmt, SHAPE.pin) == (DATE_FMT, PIN_INTERPOLATION)
+
+
+def test_date_literal():
+    want = {"%Y%m%d %H:%M:%S.000": "'20261001 06:00:00.000'",
+            "%Y-%m-%d %H:%M:%S.000": "'2026-10-01 06:00:00.000'"}[DATE_FMT]
+    assert lit_dt(datetime(2026, 10, 1, 6, 0, 0, 999_999)) == want
+    with pytest.raises(ValueError):
+        lit_dt(datetime(2026, 10, 1, 6, tzinfo=timezone.utc))

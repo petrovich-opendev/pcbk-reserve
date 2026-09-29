@@ -2,19 +2,20 @@
 import asyncio
 import time
 from dataclasses import replace
+from datetime import datetime, timedelta
 
 import anyio
 import pytest
 from fastapi.testclient import TestClient
 
-from fakes import WHITELIST, FakeHistorian
+from fakes import SUMMARY, WHITELIST, FakeHistorian
 from helpers import SETTINGS, make_role, wait_until, write
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS, DataRole
 from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.gate import SlidingWindow
 from pcbk_core.data.historian import HistorianError
-from pcbk_core.data.sql import live_all_sql, live_sql, names_in
+from pcbk_core.data.sql import SUMMARY_COLUMNS, live_all_sql, live_sql, names_in, summary_sql
 from pcbk_core.logs import setup_logging
 from pcbk_core.main import build_roles
 
@@ -341,3 +342,14 @@ def test_build_roles_bad_config_is_503_without_loops(tmp_path, capfd, restore_lo
     assert role.catalog_failures == 0 and role.gate.stats()["in_flight"] == {"user": 0, "background": 0}
     err = capfd.readouterr().err
     assert "ERROR" in err and "секрет" not in err and "FAKE" not in err and "0xff" not in err
+
+
+# Д3б, задача 2 (сверх брифа): ворота роли пускают сводку — literal_ok=allowed_literal
+
+
+async def test_role_gate_passes_summary():
+    role, _ = make_role()
+    t6 = datetime(2026, 10, 1, 6)
+    r = await role.gate.run([summary_sql(["20FAKE_001_PV", "20FAKE_003_PV"], t6, t6 + timedelta(hours=8))])
+    assert r.sent == ("20FAKE_001_PV", "20FAKE_003_PV") and role.gate.stats()["refused_unlisted"] == 0
+    assert r.rows == [[("20FAKE_001_PV", *(SUMMARY["20FAKE_001_PV"][c] for c in SUMMARY_COLUMNS))]]
