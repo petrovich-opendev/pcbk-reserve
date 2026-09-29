@@ -1326,10 +1326,11 @@ git commit -m "Служба данных: свежесть по росту ме�
   (с правилом срока такта), `run_checks`, `load_components` — код Д1 и Д2.
 - Produces:
   - `check_http(component, title, url, timeout=3.0, ok_detail: str = "отвечает") -> Check`:
-    при 2xx деталь — `ok_detail`; при другом коде, если тело — объект JSON с
-    строкой `detail`, → `fail` с ней (первые 80 знаков), иначе «отвечает
-    ошибкой HTTP N»; вид `http` берёт необязательное `ok_detail` из
-    `components.json`.
+    при 2xx деталь — `ok_detail`; при 503, если тело — объект JSON со
+    строкой `detail`, → `fail` с ней (первые 80 знаков), при любом другом
+    не-2xx — «отвечает ошибкой HTTP N»; вся проверка — под одним сроком
+    2 × `timeout` (по ревью задачи 6); вид `http` берёт необязательное
+    `ok_detail` из `components.json`.
   - `check_historian(component: str, title: str, url: str, now: datetime, warn_s: int, fail_s: int, stale_s: int, timeout: float = NET_CHECK_TIMEOUT_S) -> Check` —
     таблица ниже, первая подходящая сверху.
   - `KINDS["historian"] = ("url",)`; `_check_one` для этого вида вызывает
@@ -1350,6 +1351,7 @@ git commit -m "Служба данных: свежесть по росту ме�
 | Ответ службы | Итог |
 |---|---|
 | нет соединения, таймаут, HTTP ≠ 200, не JSON | `unknown` «служба данных не отвечает — свежесть неизвестна» |
+| 200 и JSON не по договору (не объект, нет поля, не тот тип, кривой ISO) | `unknown` «служба данных ответила не по договору — свежесть неизвестна» |
 | `checked_at` — `null` | `unknown` «служба ещё не опрашивала историан» |
 | `checked_at` старше `stale_s` | `unknown` «служба давно не опрашивала историан» |
 | `error` задан | `fail` — `error_text` (первые 80 знаков) |
