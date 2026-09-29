@@ -58,6 +58,14 @@ def test_token_table(tmp_path):                      # F15: рядом с BdrvCo
         TokenTable.from_file(write(tmp_path, "Student_01 abc\n"))
 
 
+def test_token_table_comments_and_duplicate_id(tmp_path):
+    t = TokenTable.from_file(write(tmp_path, f"# ops — дежурный\n\n  ops {sha('tok')}  \n"))
+    assert t.ids == frozenset({"ops"}) and t.caller("tok") == "ops"
+    with pytest.raises(ValueError, match="строка 2 — id повторяется") as e:
+        TokenTable.from_file(write(tmp_path, f"ops {sha('a')}\nops {sha('b')}\n"))
+    assert sha("a") not in str(e.value) and sha("b") not in str(e.value)       # строк файла в ошибке нет
+
+
 def test_settings_from_env():
     assert Settings.from_env({"FRESH_POLL_S": "5", "DRILL_FRESHNESS": ""}).FRESH_POLL_S == 5.0
     for bad in ({"FRESH_POLL_S": "0"}, {"DRILL_FRESHNESS": "freeze"}, {"CATALOG_DEADLINE_S": "5"}):

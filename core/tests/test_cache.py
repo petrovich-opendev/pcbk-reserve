@@ -40,3 +40,30 @@ async def test_single_flight_shares_and_clears_on_error():
     rs = await asyncio.gather(*(sf.run("e", boom) for _ in range(3)), return_exceptions=True)
     assert all(isinstance(r, HistorianError) for r in rs) and len(calls) == 2
     assert (await sf.run("e", ok))[1] is False and len(calls) == 3
+
+
+def test_ttl_cache_drops_expired_before_live():
+    c = TTLCache(max_entries=8)
+    c.put("gone", 0, ttl=1, now=0.0)
+    for i in range(1, 8):
+        c.put(f"k{i}", i, ttl=10 + i, now=0.0)
+    c.put("new", 8, ttl=100, now=5.0)        # протухла одна — уходит только она, четверть живых цела
+    assert len(c) == 8 and c.get("gone", 5.0) is None and c.get("k1", 5.0) == 1 and c.get("new", 5.0) == 8
+
+
+@pytest.mark.anyio
+async def test_single_flight_leader_cancel_keeps_work_for_others():
+    sf, calls = SingleFlight(), []
+
+    async def slow():
+        calls.append(1)
+        await anyio.sleep(0.05)
+        return "r"
+    leader = asyncio.create_task(sf.run("k", slow))
+    await asyncio.sleep(0)                   # ведущий завёл полёт
+    followers = [asyncio.create_task(sf.run("k", slow)) for _ in range(3)]
+    await asyncio.sleep(0.01)
+    leader.cancel()                          # обрыв клиента ведущего
+    assert await asyncio.gather(*followers) == [("r", True)] * 3 and len(calls) == 1
+    with pytest.raises(asyncio.CancelledError):
+        await leader
