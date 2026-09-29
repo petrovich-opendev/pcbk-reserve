@@ -2,6 +2,49 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Изменения по критике, раунд 2** (три критика Opus 5.5; блокеров ноль, здесь —
+major и дешёвые minor). Находка → что поменялось:
+1. [major] сжатие на первом шаге нового вопроса относило вопрос к прошлому
+   ходу → у продолжения после сжатия ищется последнее настоящее `user`; другой
+   текст — новый ход; продолжение узнаётся по любой части (задача 3).
+2. [major] `task` открыт в образе → в `:d4` `"task": "deny"` (Д4б, задача 2);
+   счёт по `x-parent-session-id` остаётся защитой (Д4а-R13).
+3. [major] точка отсчёта `/key` не привязана к ключу и к `off→on` → база
+   хранится под отпечатком ключа, ставится только при `on` и без идущих и
+   ожидающих вызовов (Д4а-R13, задачи 4, 6, README).
+4. [major] основание темпа записано неверно → по git Д3а — 0,24–0,30, худшая
+   доля 0,30; часы «по темпу» пересчитаны (шапка, дорожная карта).
+5. [major] замер темпа для деления дня мерил не темп → `%aI` между коммитами
+   задач до черты, найденными по тексту, делённое на часы тех же задач;
+   команда выписана (задача 0, шаг 1a; задача 11, шаг 4).
+6. [major] ветка «денег нет» без ключа управления показывала «норму» → после
+   выкладки и каждого пересоздания `core` — один вызов токеном `ops` (402
+   бесплатен), снимок красной строки (шапка, задачи 9, 10).
+7. [major] `health()` с записью в SQLite и сборка роли с вводом-выводом
+   нарушали договор `Role` Д3а → конструкторы без ввода-вывода, журнал
+   открывается в `lifespan`, проверка записи — в фоне, ошибки настройки LLM —
+   `config_error` роли, процесс жив (Global Constraints, задачи 4, 6).
+8. [major Д4б] ветка «ключа нет» не сшита с Д4б → ссылка на ветку Д4б «ключа
+   всё ещё нет» (шапка).
+9. [minor] общий итог при расходе ключа выше журнала терял резервы → итог =
+   `max(журнал, по ключу + резервы идущих)` (Д4а-R13, задача 4).
+10. [minor] полосы мигали от резервов идущих вызовов → число строки и полосы
+    — без резервов, резервы — отдельным числом в `note` (Д4а-R11, задача 7).
+11. [minor] отказ OpenRouter до ответа съедал шаг → шаг возвращается при
+    `cost_source = none` (задачи 3, 6).
+12. [minor] атомарность «проверки → резерв» и учёт в `finally` не записаны →
+    записаны, тесты проверяют `inflight == 0` после обрыва и ошибки (задача 6).
+13. [minor] сверки `/key` при `LLM_KEY_DEDICATED=off` давали ложное
+    «насчитал больше» → при `off` вердикт «не сверяется» (задача 10).
+14. [minor] текст `busy` обещал повтор, которого уже не будет → «дождитесь и
+    отправьте снова» (Д4а-R12).
+15. [minor] возраст `pending` считался от открытия вызова → от начала
+    ожидания или последнего запуска дозапроса (задача 4).
+16. [minor] у опроса не было своего срока, `LLM_STALE_S` без вывода → срок
+    опроса 15 с, правило `LLM_STALE_S` комментарием и тестом (задачи 5, 7).
+17. [minor] живая проверка «в сети выхода только `core`» пропала бы → живое
+    условие — `core` и двойник (задача 8).
+
 **Изменения по критике, раунд 1** (три критика Opus 5.5: деньги и прокси; места
 и OpenCode; наблюдаемость и тесты). Находка → что поменялось:
 1. [блокер] вызов с ценой `pending`/`unknown`/`lost` шёл в долю и в $1000 как
@@ -120,7 +163,7 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
 [`PLAN-D4b-workplaces-llm-2026-10-04.md`](PLAN-D4b-workplaces-llm-2026-10-04.md).
 
 **Разрез Д4 на два дня.** Строка Д4 дорожной карты по плановой шкале стоит
-около 21 ч, после правок по критике раунда 1 — около 24,5 ч. В неё входят:
+около 21 ч, после правок по критике раундов 1 и 2 — около 26,7 ч. В неё входят:
 - сам прокси;
 - предпосылки Д4 из закрытия Д3б: общий обработчик 422, живость
   `/healthz/live`, охрана выхода к OpenRouter, нагрузка историана на
@@ -145,19 +188,19 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
 
 | Задача | Часы | Где |
 |---|---|---|
-| 0. Хвосты Д3б; утро: темп Д3б по git, сверка имён с кодом Д3, связь сервера с OpenRouter без ключа, цены закреплённых точек | 0,35–0,85 | локально, сервер |
+| 0. Хвосты Д3б; утро: темп Д1–Д3б по git, сверка имён с кодом Д3, связь сервера с OpenRouter без ключа, цены закреплённых точек | 0,45–0,95 | локально, сервер |
 | 1. Живая проверка §11 п. 4 — остаток до траты, сырой поток с ключом владельца | 0,6 | сервер, **окно владельца** (после задачи 8) |
 | 2. Общие крючки приложения и живость | 0,75 | локально |
-| 3. Политика запроса: модели с ценами, оценка цены, тело, шаги | 1,25 | локально |
-| 4. Журнал вызовов, оценки и доли | 1,25 | локально |
-| 5. Проход к OpenRouter: двойник, клиент, поток, признаки «кончились деньги» | 1,5 | локально |
-| 6. Роль `llm`: ручка, отказы, резерв, одновременность, опрос и сверка с `/key`, ключи файлами, учения | 2,25 | локально |
-| 7. Сторож: вид `llm`, порядок предупреждений, число в строке | 1,0 | локально |
-| 8. Компоновка и интеграционные тесты | 1,75 | локально |
+| 3. Политика запроса: модели с ценами, оценка цены, тело, шаги (с продолжением после сжатия) | 1,5 | локально |
+| 4. Журнал вызовов: ленивое открытие, оценки, доли, точка отсчёта под отпечатком ключа | 1,5 | локально |
+| 5. Проход к OpenRouter: двойник, клиент, поток, признаки «кончились деньги» | 1,6 | локально |
+| 6. Роль `llm`: ошибка настройки без падения, ручка, отказы, резерв, одновременность, опрос и сверка с `/key`, ключи файлами, учения | 2,75 | локально |
+| 7. Сторож: вид `llm`, порядок предупреждений, число в строке | 1,1 | локально |
+| 8. Компоновка и интеграционные тесты | 1,85 | локально |
 | 9. Выкладка (шаг 1 — окно владельца) | 0,75 | сервер |
 | 10. Живые проверки и учения | 1,0 | сервер |
 | 11. Закрытие дня | 1,25 | — |
-| **Критический путь по плановой шкале** | **13,7** при хвостах 0,35 ч (до критики — 11,5) | |
+| **Критический путь по плановой шкале** | **15,1** при хвостах 0,45 ч (раунд 1 — 13,7; до критики — 11,5) | |
 
 **Порядок исполнения и окно владельца.** Сначала задача 0, затем код и
 компоновка: 2 → 3 → 4 → 5 → 6 → 7 → 8. **Одно окно владельца вечером**, сразу
@@ -191,23 +234,28 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
    шаг 1). Ещё около 30 минут он на связи: при плохом итоге сырого потока
    (402, регион, 401) ответ нужен тем же часом.
 
-**Принятое основание «один день».** Живой темп по git:
+**Принятое основание «один день».** Живой темп по git — доля факта от плановых
+часов тех же задач; время — дата автора (`%aI`) коммитов:
 - Д1: план в 9,5 ч выполнен примерно за 2 ч 20 мин — от одобрения плана
   `f4fb938` (14:23) до «Д1 закрыт» `ae0ad6c` (16:42), доля ≈0,25;
 - Д2: план в 10,25 ч — примерно за 1 ч 25 мин, от утренней проверки `968ad64`
   (17:15) до «Д2 закрыт» `0bb5fc1` (18:39), доля ≈0,14;
-- Д3а — доля ≈0,17 (по git, как посчитал критик раунда 1 планов Д4).
+- Д3а: задачи 2–7 (план 6,25 ч) — от `0bb5fc1` (18:38:41) до коммита задачи 7
+  `aa4d004` (20:09:06), 1,52 ч, доля ≈0,24; с ревью задачи 7 (`2c3a44a`,
+  20:31:58) — 1,89 ч, доля ≈0,30. Цифры — из проверки критика раунда 2 по
+  git; задача 0, шаг 1a пересчитывает их теми же командами.
 
-Плановая шкала остаётся честной: Д4а — 13,7 ч, Д4б — 10,75 ч, в сумме больше
-одного дня, поэтому разрез. После критики Д4а — самый крупный день по
-плановой шкале. По худшему живому темпу (0,25) это ≈3,4 ч работы плюс окно,
-то есть рабочий день с запасом. По живому темпу обе половины прошли бы и за
-один календарный день, но их делят окна владельца и правило «день = видимый
-результат». Задача 11 пишет строку «план / факт по git».
+Худшая доля — 0,30, её и берём. Плановая шкала остаётся честной: Д4а — 15,1 ч,
+Д4б — 11,6 ч, в сумме больше одного дня, поэтому разрез. Д4а — самый крупный
+день по плановой шкале. По доле 0,30 это ≈3,5 ч до черты и ≈4,5 ч всего плюс
+окно и петля критика — рабочий день с запасом. Их делят окна владельца и
+правило «день = видимый результат». Задача 11 пишет строку «план / факт по
+git» тем же способом, что шаг 1a.
 
-**Когда день делится до начала.** Задача 0 считает темп Д3б по git. Если он
-хуже 0,5 плановой шкалы (задачи 0 и 2–8 тогда заняли бы больше 5 ч), Д4а
-делится до начала дня:
+**Когда день делится до начала.** Задача 0, шаг 1a считает долю Д3б: от
+коммита задачи 1 до коммита задачи 6 (последней до черты Д3б), делённое на
+плановые часы задач 2–6 (6,75 ч). Если доля хуже 0,5 (задачи 0 и 2–8 Д4а
+заняли бы больше 5,75 ч), Д4а делится до начала дня:
 - **Д4а** — задачи 0, 2–8 и выкладка с пустым файлом ключа. Это ветка «ключа
   сегодня нет» ниже: строка честно красная, учение «LLM-прокси остановлен» —
   живьём, учения «402» и «OpenRouter недоступен» — снимками локального стенда;
@@ -217,8 +265,8 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
 владелец получает строку с числами.
 
 **Черта отсечения — конец восьмого часа** плюс превышение хвостов Д3б над
-0,35 ч. К черте зелёны задачи 0 и 2–8: по плановой шкале 10,1 ч, по живому
-темпу 1,7–2,5 ч. Черта ловит темп хуже ≈0,8 — тогда работает ветка «задача 8 не
+0,45 ч. К черте зелёны задачи 0 и 2–8: по плановой шкале 11,5 ч, по доле 0,30 —
+≈3,5 ч. Черта ловит темп хуже ≈0,7 — тогда работает ветка «задача 8 не
 зелёна». После черты порядок жёсткий: окно владельца (задача 9, шаг 1 →
 задача 1 → задача 9, шаги 2–5 → задача 10, шаги 1–3), затем учения и
 задача 11.
@@ -241,14 +289,22 @@ OpenAI-совместимая точка `/llm/v1/chat/completions`: токен 
   живьём. Учения «402» и «OpenRouter недоступен» — только локально: без ключа
   прокси отказывает раньше, чем доходит до заглушки. Когда ключ появится —
   задача 9, шаг 1 (`rm -f` и запись), затем
-  `docker compose up -d --no-build --force-recreate core`. §11 п. 4
-  переходит в окно Д4б.
+  `docker compose up -d --no-build --force-recreate core`. Задачи 1 и 10,
+  шаги 1–3, и §11 п. 4 переходят в Д4б: там это ветка «ключа всё ещё нет» и
+  часы хвостов Д4а в задаче 0 (строка Д4б таблицы владельца тоже называет
+  ключ).
 - **Ключ есть, денег нет.** Задача 1 до траты показала `limit_remaining` ≤ 0
   по `/key` или остаток ≤ 0 по `/credits`, либо сырой поток ответил 402.
-  Денег больше не тратить. Выкладка идёт, строка красная: «на счёте OpenRouter
-  кончились деньги» или «исчерпан лимит ключа OpenRouter». Владельцу тем же
-  часом — «пополнить счёт / поднять лимит ключа». Без пополнения Д4б идёт по
-  своей ветке «окна владельца нет»: разговоры и совместимость ждут.
+  Денег больше не тратить. Выкладка идёт. Без ключа управления роль о пустом
+  счёте сама не узнает: опрос `/key` удачен, и строка была бы «нормой»
+  (Д4а-R14). Поэтому после выкладки и после каждого пересоздания `core` в этой
+  ветке идёт один вызов через туннель токеном `ops` (`luna.json` задачи 10):
+  отказ 402 бесплатен, признак `money_out` загорается. Строка красная: «на
+  счёте OpenRouter кончились деньги» (или «исчерпан лимит ключа OpenRouter»
+  по `/key`), снимок `00-money-out.png` — видимый результат ветки. Владельцу
+  тем же часом — «пополнить счёт / поднять лимит ключа»; ключ управления
+  сделал бы этот признак автоматическим. Без пополнения Д4б идёт по своей
+  ветке «окна владельца нет»: разговоры и совместимость ждут.
 - **Сырой поток дал 403 «not available in your region» или 401.** Денег больше
   не тратить. Выкладка идёт, строка красная с этой причиной. Владельцу тем же
   часом уходит вопрос: путь к OpenRouter с сервера закрыт, а резерва провайдера
@@ -335,25 +391,58 @@ git и в вывод проверок; секреты контейнерам —
 - **Охрана выхода** (Д3б-R6) пускает историан и хост OpenRouter из
   `OPENROUTER_BASE_URL` — по имени, через кэш разрешения.
 - **Ход и предел шагов** (research/09 §2.4, §9 п. 6; OpenCode 1.18.33). Ключ
-  хода — `(вызывающий, x-parent-session-id или X-Session-Id)`, то есть
-  подагент `task` считается в ход родителя
-  (`session/llm/request.ts:196–200`). Новый ход начинает только запрос, у
-  которого последнее сообщение — `user`, его текст не оканчивается строкой
-  продолжения после сжатия OpenCode и метка хода новая. Строка продолжения —
-  «Continue if you have next steps, or stop and ask for clarification if you
-  are unsure how to proceed.» (`session/compaction.ts:531`, сообщение
-  `synthetic`, в модель уходит как обычный текст). Метка хода — «хеш текста
-  последнего `user` + число сообщений». Повтор того же запроса (OpenCode
-  повторяет до 5 раз, `session/retry.ts:31`) метку не меняет и ход не
-  сбрасывает. Подагент нового хода не начинает. Запрос без инструментов
-  (заголовок разговора, сам запрос сжатия с `tools: {}`,
+  хода — `(вызывающий, x-parent-session-id или X-Session-Id)`. Инструмент
+  `task` в образе места закрыт (Д4б, `"task": "deny"`), а счёт подагента в ход
+  родителя остаётся защитой (`session/llm/request.ts:196–200`). Что начинает
+  новый ход:
+  - последнее сообщение — «настоящее» `user` с новой меткой. Метка —
+    «хеш текста + число сообщений». Повтор того же запроса (OpenCode повторяет
+    до 5 раз, `session/retry.ts:31`) метку не меняет и ход не сбрасывает;
+  - последнее сообщение — продолжение после сжатия, а последнее «настоящее»
+    `user` в теле — с другим текстом, чем у текущего хода. Так бывает, когда
+    OpenCode сжимает разговор на первом шаге нового вопроса
+    (`session/prompt.ts:1164–1166`). После сжатия модели уходит
+    `[user «What did we do so far?», сводка, …сохранённый хвост…, user
+    продолжения]` (`session/message-v2.ts:235`, комментарий `:582–583`), и новый вопрос
+    лежит в хвосте (`session/message-v2.ts:569–572`).
+
+  Продолжение — сообщение `user`, у которого любая часть `text` равна строке
+  OpenCode «Continue if you have next steps, or stop and ask for
+  clarification if you are unsure how to proceed.» или оканчивается ею
+  (`session/compaction.ts:531`, вариант с префиксом о вложениях — `:529`).
+  Рядом бывает часть `PROMPT_PLAN` или `BUILD_SWITCH`
+  (`session/reminders.ts:25–46`). «Настоящее» `user` — не продолжение и не
+  «What did we do so far?». Продолжение без «настоящего» `user` в теле или с
+  тем же текстом — тот же ход. Подагент нового хода не начинает. Запрос без
+  инструментов (заголовок разговора, сам запрос сжатия с `tools: {}`,
   `session/compaction.ts:429`) шагом не считается, в журнале у него
-  `step = 0`.
+  `step = 0`. Отказ OpenRouter до начала ответа (`cost_source = none`) шаг
+  возвращает: модель не отвечала.
+- **Роль по договору `Role` Д3а** (`core/pcbk_core/app.py`: `health()` —
+  «быстрая проверка без ввода-вывода: вызывается в цикле событий»;
+  `main.build_roles`: ошибка настройки — роль с причиной, процесс жив;
+  предпроверка Д3б F4, F9, F23):
+  - конструкторы `LlmRole`, `Ledger`, `Upstream` без ввода-вывода.
+    `core.db` и таблицы открываются в начале `lifespan` через
+    `asyncio.to_thread`;
+  - проверка записи журнала — в фоне раз в 30 с (`asyncio.to_thread`),
+    `health()` и `health_json()` читают только запомненный итог;
+  - запись строк журнала вызовов — синхронно в цикле событий, как
+    `EventLog.write` Д3б, с `timeout=0.5` у соединения SQLite: долгая
+    блокировка — сбой записи со счётчиком, а не остановка цикла;
+  - ошибки настройки LLM (переменные `LLM_*`, `llm-tokens`, нечитаемый файл
+    ключа, журнал не открылся) — `config_error` роли `llm`. `/healthz/llm` и
+    строка сторожа — сбой с причиной, `/llm/` — 403 `pcbk_config`. Процесс
+    жив, служба данных работает.
 
 ## Решения по умолчанию (Ruling)
 
 **Д4а-R11 — пороги и число на странице.** Служба отдаёт числа
-(`/health/llm`). Пороги 50/80/95 % и стоп на 100 % считает сторож. «Внимание»
+(`/health/llm`). Число строки `spent_usd` — без резервов идущих вызовов:
+резерв ставится на каждый вызов и снимается через секунды, и полоса у порога
+мигала бы на каждом такте. Резервы — отдельным числом `reserved_usd` в
+`note`. Отказывает прокси по итогу с резервами (Д4а-R13). Пороги 50/80/95 % и
+стоп на 100 % считает сторож. «Внимание»
 на 50, 80 и 95 %, «сбой» на 100 %. Текст полосы постоянный («израсходовано
 больше 80 % бюджета»), а «расход $X из $1000» — в `note`. Журнал сторожа
 записывает смену полосы, но не каждый цент. Строка называется «LLM-прокси и
@@ -376,6 +465,7 @@ git и в вывод проверок; секреты контейнерам —
 | общий бюджет израсходован | 402 | `pcbk_budget_spent` |
 | больше 16 обращений за ход | 403 | `pcbk_turn_limit` |
 | у вызывающего уже `LLM_CALLER_CONCURRENCY` (3) идущих вызовов | 429 + `Retry-After: 2` | `pcbk_busy` |
+| ошибка настройки роли (`config_error`) | 403 | `pcbk_config` |
 | OpenRouter: кончились деньги / лимит ключа | 402 | `pcbk_money_out` / `pcbk_key_limit` |
 | OpenRouter: ключ отклонён / отказ по региону | 403 | `pcbk_key_rejected` / `pcbk_region` |
 | OpenRouter: 429 или 402 `in_flight_budget` | 429 (+ `Retry-After`, если был) | `pcbk_upstream_wait` |
@@ -423,16 +513,30 @@ OpenRouter не останавливает генерацию после обр�
 больше `LLM_CALLER_CONCURRENCY` = 3 (шаг, заголовок разговора и подагент).
 Сверх этого — 429 `pcbk_busy`, и OpenCode повторяет его сам, не больше 5 раз.
 
-Общий расход сверяется с OpenRouter. При первом удачном опросе `/key` в
-журнал ложится точка отсчёта:
+Общий расход сверяется с OpenRouter. Точка отсчёта хранится под отпечатком
+ключа: `llm_meta` ключ `key_base_usd:<первые 12 знаков sha256 ключа>`, сам ключ
+не хранится. Она ставится при первом удачном опросе `/key` этим ключом, только
+при `LLM_KEY_DEDICATED=on` и только когда в журнале нет идущих (`open`) и
+ожидающих (`pending`) вызовов. Иначе их оценка потом сменится ценой, и
+расхождение навсегда сдвинется. Ставится так:
 `key_base_usd = usage ключа − учтённое журналом`.
-Дальше `key_spent_usd = usage − key_base_usd`. Общий бюджет считается по
-`max(учтённое журналом, key_spent_usd)`, сторож предупреждает при
-`key_spent_usd` больше учтённого на $1. Условие — отдельный ключ под
-резервный контур (требование к владельцу). Если ключ общий,
-`LLM_KEY_DEDICATED=off`: сверки нет, `key_spent_usd` = `null`. Второй,
-независимый от журнала стоп — лимит ключа $1000 без сброса на стороне
-OpenRouter (просьба к владельцу, прокси понимает его отказ как `key_limit`).
+Дальше `key_spent_usd = usage − key_base_usd`, пока точки отсчёта нет —
+`null`. Новый ключ (другой отпечаток) или переход `off → on` — новая точка
+отсчёта: у нового ключа прежний расход в бюджет не попадает, а сверка не
+глохнет. Итог для отказов прокси — `max(учтённое журналом, key_spent_usd +
+резервы идущих вызовов)`: при расходе по ключу выше журнала резервы тоже в
+итоге. Сторож предупреждает при `key_spent_usd` больше учтённого на $1.
+Условие — отдельный ключ под резервный контур (требование к владельцу). Если
+ключ общий, `LLM_KEY_DEDICATED=off`: сверки нет, `key_spent_usd` = `null`.
+Второй, независимый от журнала стоп — лимит ключа $1000 без сброса на
+стороне OpenRouter (просьба к владельцу, прокси понимает его отказ как
+`key_limit`).
+
+Предел `LLM_CALLER_CONCURRENCY` = 3 рассчитан на шаг хода, заголовок
+разговора и один запас (вторая вкладка студента). Подагентов в образе нет:
+`task` закрыт (Д4б). Если `task` понадобится (Д7), подагентам нужны свои 16
+шагов и предел одновременности «подагенты + 2» — это решение Д7, не
+Д4.
 
 **Цена ошибки:** оценка по байтам завышает цену обычного текста примерно
 вдвое, поэтому неизвестная цена съедает долю быстрее настоящей. На
@@ -537,14 +641,26 @@ OpenRouter: отказ 402 бесплатный. Первый удачный в�
    `test_llm_body_limit_is_one_mib`, `test_key_drift_and_budget_from_key`;
    задача 4, `test_budget_total_before_share_and_key`; задача 7,
    `test_llm_verdicts`.
-7. **Предел 16 шагов обходится.** Автосжатие разговора добавляет синтетическое
-   `user` «Continue if you have next steps…», OpenCode повторяет первый шаг,
-   подагент `task` приходит со своим `X-Session-Id`. Ожидание: ни одно из трёх
-   новых 16 шагов не даёт. Тесты — задача 3,
+7. **Предел 16 шагов обходится или срабатывает ложно.** Автосжатие разговора
+   добавляет синтетическое `user` «Continue if you have next steps…»,
+   OpenCode повторяет первый шаг, подагент `task` приходит со своим
+   `X-Session-Id`. Ожидание: ни одно из трёх новых 16 шагов не даёт. И
+   обратное: сжатие на первом шаге нового вопроса начинает новый ход, а сбой
+   провайдера до ответа шага не съедает. Тесты — задача 3,
    `test_compaction_continue_is_not_a_new_turn`,
+   `test_compaction_on_first_step_of_new_question_is_new_turn`,
    `test_retry_of_first_step_does_not_reset`,
-   `test_subagent_counts_into_parent`; задача 6,
-   `test_turn_limit_17th_call_refused`.
+   `test_subagent_counts_into_parent`, `test_refund_returns_step`,
+   `test_turn_mark`; задача 6, `test_turn_limit_17th_call_refused`,
+   `test_upstream_error_before_answer_refunds_step`.
+8. **Вторая роль ломает первую.** Испорченный `llm-tokens`, неверный
+   `LLM_MODELS`, недоступный диск под `core.db`, медленная блокировка SQLite.
+   Ожидание: процесс жив, «Служба данных» в норме, строка «LLM-прокси и
+   бюджет» — сбой с причиной; `health()` не делает ввода-вывода; счётчик
+   идущих вызовов не утекает при обрыве. Тесты — задача 4,
+   `test_constructor_does_no_io_and_failed_open_keeps_memory`; задача 6,
+   `test_build_roles_llm_config_error_keeps_process`, `test_health_does_no_io`,
+   `test_inflight_back_to_zero`.
 
 ---
 
@@ -556,13 +672,13 @@ core/requirements.lock                пересобран с хешами
 core/pcbk_core/hooks.py               AppHooks, hooks_of, BodyLimit: предел тела и разбор 422 по префиксу
 core/pcbk_core/app.py                 + реестр крючков, /healthz/live, один обработчик 422, один BodyLimit
 core/pcbk_core/main.py                + --healthcheck по /healthz/live, LlmRole, egress_targets
-core/pcbk_core/settings.py            + OPENROUTER_*, LLM_*, DRILL_LLM
+core/pcbk_core/settings.py            + LlmSettings (OPENROUTER_*, LLM_*, DRILL_LLM) — отдельно от Settings
 core/pcbk_core/secrets.py             + read_key_file
 core/pcbk_core/data/__init__.py       install — через реестр крючков
 core/pcbk_core/data/http_api.py       − BodyLimit (переехал в hooks.py)
 core/pcbk_core/llm/__init__.py        LlmRole
 core/pcbk_core/llm/models.py          ModelPolicy (+ цены точки, estimate_usd), CANDIDATES, select_models, provider_matches
-core/pcbk_core/llm/request.py         rebuild_body, body_bytes, BodyRefused, session_of, turn_mark
+core/pcbk_core/llm/request.py         rebuild_body, body_bytes, BodyRefused, session_of, TurnMark, turn_mark
 core/pcbk_core/llm/turns.py           TurnLimiter, TurnLimitReached, COMPACTION_CONTINUE
 core/pcbk_core/llm/ledger.py          Usage, CallRow, Ledger (оценки, llm_meta, признак записи), Budget
 core/pcbk_core/llm/sse.py             SseObserver
@@ -614,13 +730,33 @@ docs/checks/D4a.md, docs/checks/D4a/*.png
   критика, слияние и тег `platform-d3b`, чистый клон.
   Expected: у каждого хвоста есть вердикт; ветка `d4a/llm-proxy` начинается от
   `main` после тега.
-- [ ] **Step 1a: Темп Д3б.** Закрытие Д3б строки «план / факт» не пишет, её
-  пишет этот шаг:
-  `git log --reverse --format=%cI platform-d3a..platform-d3b | sed -n '1p;$p'`
-  — первый и последний коммит дня. Факт в часах делится на плановые часы Д3б
-  из его шапки. Expected: в `docs/checks/D4a.md` строка «Д3б: план N ч / факт
-  Y ч, доля Y/N»; при доле больше 0,5 — разрез Д4а/Д4а′ по шапке этого плана
-  (правка дорожной карты тем же коммитом, строка владельцу).
+- [ ] **Step 1a: Темп Д1–Д3б по git.** Меряется только код до черты: время
+  между коммитом, которым кончилась первая задача с кодом, и коммитом последней
+  задачи до черты, делённое на плановые часы задач между ними. Время — дата
+  автора `%aI`: перебазирование ветки Д3б на `main` перед задачей 7 меняет
+  дату коммитера (`%cI`), а дату автора — нет. Окна владельца и петля критика
+  в замер не входят. Коммиты ищутся по хешам (Д1–Д3а) или по тексту
+  сообщения из плана (Д3б):
+
+  ```bash
+  at() { git log -1 --format=%aI "$1"; }                                   # дата автора коммита
+  msg() { git log --all --format='%aI %s' | grep -m1 -F -- "$1" | cut -d' ' -f1; }
+  pace() { python3 -c 'import sys; from datetime import datetime as D
+  a, b, h = D.fromisoformat(sys.argv[1]), D.fromisoformat(sys.argv[2]), float(sys.argv[3])
+  f = (b - a).total_seconds() / 3600; print(f"факт {f:.2f} ч / план {h} ч, доля {f / h:.2f}")' "$1" "$2" "$3"; }
+  pace "$(at f4fb938)" "$(at ae0ad6c)" 9.5        # Д1: одобрение плана → «Д1 закрыт»
+  pace "$(at 968ad64)" "$(at 0bb5fc1)" 10.25      # Д2: утренняя проверка → «Д2 закрыт»
+  pace "$(at 0bb5fc1)" "$(at aa4d004)" 6.25       # Д3а: задачи 2–7
+  pace "$(at 0bb5fc1)" "$(at 2c3a44a)" 6.25       # Д3а: задачи 2–7 с ревью задачи 7
+  pace "$(msg 'Эталон сверки: среднее по времени')" "$(msg 'Служба данных по MCP 1.30.0')" 6.75   # Д3б: задачи 2–6
+  ```
+
+  Expected: в `docs/checks/D4a.md` пять строк «факт / план, доля». Основание
+  шапки — худшая доля Д1–Д3а (0,30). Если пересчёт разошёлся с шапкой больше
+  чем на 0,05, часы «по темпу» в шапках Д4а и Д4б и в «Отклонениях» дорожной
+  карты правятся тем же коммитом. Доля Д3б больше 0,5 — разрез Д4а/Д4а′ по
+  шапке этого плана: правка дорожной карты тем же коммитом, строка
+  владельцу.
 - [ ] **Step 2: Сверка имён с кодом Д3.** План написан до кода Д3а/Д3б.
   `git grep -n -E 'def create_app|class RoleBase|def install|def mounts|class TokenTable|class EventLog|def install_egress_guard|class BodyLimit|DB_PATH|TOKENS_FILE|def make_app|def make_role|def http_host|core_token' -- core tests`
   Expected: все имена из разделов Interfaces этого плана на месте. Если что-то
@@ -915,14 +1051,22 @@ def test_healthcheck_passes_with_unhealthy_role(monkeypatch):
   - `body_bytes(body: dict) -> int` — длина
     `json.dumps(body, ensure_ascii=False, separators=(",", ":"))` в UTF-8: вход
     верхней оценки.
-  - `turn_mark(body: dict) -> tuple[str, int] | None` — метка начала хода
-    (Global Constraints, «Ход и предел шагов»):
-    - последнее сообщение не `user` → `None`;
-    - текст последнего `user` (строка или склейка частей `text`) после
-      `rstrip()` оканчивается на `COMPACTION_CONTINUE` → `None`. Сюда же
-      попадает вариант с префиксом о больших вложениях
-      (`session/compaction.ts:529–531`);
-    - иначе `(sha256(текст)[:16], len(body["messages"]))`.
+  - `@dataclass(frozen=True) class TurnMark: kind: Literal["user", "continue", "other"]; text_hash: str | None; n: int`
+  - `turn_mark(body: dict) -> TurnMark` — метка хода (Global Constraints, «Ход
+    и предел шагов»). Части сообщения — строка `content` или список частей
+    `text`; хеш — `sha256` склейки частей `text` через `\n`, первые 16 знаков:
+    - последнее сообщение не `user` → `("other", None, n)`;
+    - последнее `user` — продолжение: любая его часть `text` после `rstrip()`
+      равна `COMPACTION_CONTINUE` или оканчивается им (сюда же вариант с
+      префиксом о вложениях, `session/compaction.ts:529–531`, и соседние части
+      `PROMPT_PLAN`/`BUILD_SWITCH`) → `("continue", хеш последнего
+      «настоящего» user до него или None, n)`. «Настоящее» — не продолжение и
+      не ровно `SUMMARY_PROMPT`;
+    - иначе `("user", хеш его текста, n)`;
+
+    `n = len(body["messages"])`.
+  - `SUMMARY_PROMPT = "What did we do so far?"` — текст сообщения сжатия
+    (`session/message-v2.ts:235`).
 - Produces (`turns.py`):
   - `TURN_CALLS = 16`, `TURN_IDLE_S = 3600.0`
   - `COMPACTION_CONTINUE = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."`
@@ -930,21 +1074,30 @@ def test_healthcheck_passes_with_unhealthy_role(monkeypatch):
   - `class TurnLimitReached(Exception): step: int`
   - `class TurnLimiter`:
     - `__init__(self, limit: int = TURN_CALLS, idle_s: float = TURN_IDLE_S, monotonic=time.monotonic)`;
-    - `step(self, caller: str, session: str | None, mark: tuple[str, int] | None, *, parent: str | None = None) -> int` —
-      ключ `(caller, parent or session or "none")`;
-    - новый ход (шаг 1) — только при `parent is None`, `mark is not None` и
-      `mark` не равной метке текущего хода. Метка запоминается;
+    - `step(self, caller: str, session: str | None, mark: TurnMark, *, parent: str | None = None) -> int` —
+      ключ `(caller, parent or session or "none")`. У хода запомнены
+      `(text_hash, n)` его начала;
+    - новый ход (шаг 1), только при `parent is None`:
+      - `kind == "user"` и `(text_hash, n)` не равны запомненным;
+      - `kind == "continue"`, `text_hash` не `None` и не равен запомненному
+        (сжатие на первом шаге нового вопроса);
     - иначе шаг + 1. Первый увиденный запрос по ключу — шаг 1;
     - шаг больше `limit` → `TurnLimitReached`, счётчик не растёт;
+    - `refund(self, caller: str, session: str | None, *, parent: str | None = None) -> None` —
+      шаг − 1, не ниже 0: отказ OpenRouter до начала ответа шага не стоит;
     - ключи, не тронутые `idle_s`, забываются.
 
     Так research/09 §2.4 (ход начинается запросом, у которого последнее
-    сообщение — `user`) с тремя поправками по коду OpenCode 1.18.33:
-    - продолжение после сжатия хода не начинает;
+    сообщение — `user`) с поправками по коду OpenCode 1.18.33:
+    - продолжение после сжатия посреди хода хода не начинает, а на первом
+      шаге нового вопроса — начинает;
     - повтор с той же меткой не сбрасывает счётчик;
     - подагент (`x-parent-session-id`) считается в ход родителя.
 
     Тот же вопрос, заданный снова, начинает новый ход: сообщений в теле больше.
+    Остаток: если сжатие убрало новый вопрос из хвоста, он считается в прошлый
+    ход — OpenCode оставляет в хвосте последние сообщения, поэтому такое
+    маловероятно.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1039,31 +1192,58 @@ def test_estimate_upper_bound():                                                
            pytest.approx(math.ceil(body_bytes(b) / 3) * 1.4e-6 + 16000 * 4.4e-6)
     assert body_bytes({"a": "я"}) == len('{"a":"я"}'.encode())
 
+def h(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
 def test_turn_mark():
     user = lambda text: {"role": "user", "content": text}
     two = [{"role": "system", "content": "s"}, user("вопрос")]
-    assert turn_mark({"messages": two}) == (hashlib.sha256("вопрос".encode()).hexdigest()[:16], 2)
-    assert turn_mark({"messages": [*two, {"role": "tool", "tool_call_id": "c", "content": "x"}]}) is None
+    assert turn_mark({"messages": two}) == TurnMark("user", h("вопрос"), 2)
+    assert turn_mark({"messages": [*two, {"role": "tool", "tool_call_id": "c", "content": "x"}]}).kind == "other"
     for text in (COMPACTION_CONTINUE, "The previous request exceeded … files.\n\n" + COMPACTION_CONTINUE):
-        assert turn_mark({"messages": [*two, {"role": "assistant", "content": "итог"}, user(text)]}) is None
+        assert turn_mark({"messages": [*two, {"role": "assistant", "content": "итог"}, user(text)]}) == \
+               TurnMark("continue", h("вопрос"), 4)
+    # после сжатия: [сжатие, сводка, хвост с новым вопросом, продолжение]
+    after = [user(SUMMARY_PROMPT), {"role": "assistant", "content": "сводка"}, user("вопрос 2"), user(COMPACTION_CONTINUE)]
+    assert turn_mark({"messages": after}) == TurnMark("continue", h("вопрос 2"), 4)
+    only = [user(SUMMARY_PROMPT), {"role": "assistant", "content": "сводка"}, user(COMPACTION_CONTINUE)]
+    assert turn_mark({"messages": only}) == TurnMark("continue", None, 3)
+    plan = {"role": "user", "content": [{"type": "text", "text": COMPACTION_CONTINUE}, {"type": "text", "text": "<plan>"}]}
+    assert turn_mark({"messages": [*two, plan]}).kind == "continue"          # часть PROMPT_PLAN рядом
     parts = {"role": "user", "content": [{"type": "text", "text": "воп"}, {"type": "text", "text": "рос"}]}
-    assert turn_mark({"messages": [two[0], parts]})[0] == turn_mark({"messages": two})[0]
+    assert turn_mark({"messages": [two[0], parts]}).text_hash == h("воп\nрос")
 
 # core/tests/test_llm_turns.py
-M1, M1_AGAIN_LATER = ("h1", 2), ("h1", 6)
+M1, M1_AGAIN_LATER = TurnMark("user", "h1", 2), TurnMark("user", "h1", 6)
+OTHER = TurnMark("other", None, 3)
 
 def test_turn_counts_steps_and_new_turn_on_new_mark():
     t = TurnLimiter(limit=3, monotonic=FakeMono(0.0))
-    assert [t.step("student-01", "ses_a", m) for m in (M1, None, None)] == [1, 2, 3]
+    assert [t.step("student-01", "ses_a", m) for m in (M1, OTHER, OTHER)] == [1, 2, 3]
     with pytest.raises(TurnLimitReached):
-        t.step("student-01", "ses_a", None)                 # подсказка OpenCode о шагах — тоже шаг
+        t.step("student-01", "ses_a", OTHER)                # подсказка OpenCode о шагах — тоже шаг
     assert t.step("student-01", "ses_a", M1_AGAIN_LATER) == 1   # тот же текст позже — новый ход
 
 def test_compaction_continue_is_not_a_new_turn():                                # Review Focus 7
     t = TurnLimiter(limit=3, monotonic=FakeMono(0.0))
-    t.step("student-01", "ses_a", M1); t.step("student-01", "ses_a", None); t.step("student-01", "ses_a", None)
+    t.step("student-01", "ses_a", M1); t.step("student-01", "ses_a", OTHER); t.step("student-01", "ses_a", OTHER)
     with pytest.raises(TurnLimitReached):
-        t.step("student-01", "ses_a", None)                 # turn_mark(продолжение после сжатия) is None
+        t.step("student-01", "ses_a", TurnMark("continue", "h1", 5))        # сжатие посреди хода, в хвосте тот же вопрос
+    with pytest.raises(TurnLimitReached):
+        t.step("student-01", "ses_a", TurnMark("continue", None, 3))        # в хвосте вопроса нет
+
+def test_compaction_on_first_step_of_new_question_is_new_turn():                 # раунд 2
+    t = TurnLimiter(limit=16, monotonic=FakeMono(0.0))
+    t.step("student-01", "ses_a", M1)
+    for _ in range(13):
+        t.step("student-01", "ses_a", OTHER)                                   # прошлый ход — на шаге 14
+    assert t.step("student-01", "ses_a", TurnMark("continue", "h2", 4)) == 1  # новый вопрос в хвосте после сжатия
+    assert t.step("student-01", "ses_a", OTHER) == 2
+
+def test_refund_returns_step():
+    t = TurnLimiter(limit=3, monotonic=FakeMono(0.0))
+    t.step("student-01", "ses_a", M1); t.refund("student-01", "ses_a")
+    assert t.step("student-01", "ses_a", M1) == 1                              # повтор после 502 — снова шаг 1
 
 def test_retry_of_first_step_does_not_reset():                                   # Review Focus 7
     t = TurnLimiter(limit=3, monotonic=FakeMono(0.0))
@@ -1074,21 +1254,21 @@ def test_retry_of_first_step_does_not_reset():                                  
 def test_subagent_counts_into_parent():                                          # Review Focus 7
     t = TurnLimiter(limit=3, monotonic=FakeMono(0.0))
     t.step("student-01", "ses_a", M1)
-    assert t.step("student-01", "ses_child", ("h2", 2), parent="ses_a") == 2  # задача подагента хода не начинает
-    assert t.step("student-01", "ses_child", None, parent="ses_a") == 3
+    assert t.step("student-01", "ses_child", TurnMark("user", "h2", 2), parent="ses_a") == 2   # подагент хода не начинает
+    assert t.step("student-01", "ses_child", OTHER, parent="ses_a") == 3
     with pytest.raises(TurnLimitReached):
-        t.step("student-01", "ses_a", None)
+        t.step("student-01", "ses_a", OTHER)
 
 def test_turns_are_per_caller_and_session():
     t = TurnLimiter(limit=2, monotonic=FakeMono(0.0))
-    t.step("student-01", "ses_a", M1); t.step("student-01", "ses_a", None)
-    assert t.step("student-02", "ses_a", None) == 1 and t.step("student-01", "ses_b", None) == 1
+    t.step("student-01", "ses_a", M1); t.step("student-01", "ses_a", OTHER)
+    assert t.step("student-02", "ses_a", OTHER) == 1 and t.step("student-01", "ses_b", OTHER) == 1
 
 def test_idle_turn_forgotten():
     mono = FakeMono(0.0)
     t = TurnLimiter(limit=2, idle_s=60, monotonic=mono)
-    t.step("ops", None, M1); t.step("ops", None, None); mono.advance(61)
-    assert t.step("ops", None, None) == 1
+    t.step("ops", None, M1); t.step("ops", None, OTHER); mono.advance(61)
+    assert t.step("ops", None, OTHER) == 1
 ```
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_llm_request.py tests/test_llm_turns.py`. Expected: FAIL — нет `pcbk_core.llm`.
@@ -1098,14 +1278,15 @@ def test_idle_turn_forgotten():
 
 ---
 
-### Task 4: Журнал вызовов и доли
+### Task 4: Журнал вызовов, оценки и доли
 
 **Files:**
 - Create: `core/pcbk_core/llm/ledger.py`
 - Test: `core/tests/test_llm_ledger.py`
 
 **Interfaces:**
-- Consumes: `DB_PATH` — Д3б (та же `core.db`, соединение на операцию, как `EventLog`).
+- Consumes: `DB_PATH` — Д3б (та же `core.db`, соединение на операцию, как
+  `EventLog`); образец ленивого журнала — `EventLog` Д3б (F4, F9, F23).
 - Produces:
   - `@dataclass(frozen=True) class Usage: cost: float | None; prompt_tokens: int; completion_tokens: int; cached_tokens: int; cache_write_tokens: int; reasoning_tokens: int`;
     `Usage.from_openrouter(usage: dict) -> Usage` — `cost`;
@@ -1124,25 +1305,39 @@ def test_idle_turn_forgotten():
     - `cost_source`: `stream`, `body`, `generation`, `pending`, `unknown`,
       `none`. `none` — денег нет наверняка: отказ прокси или ошибка
       OpenRouter до начала ответа.
-  - Таблица `llm_meta (key TEXT PRIMARY KEY, value REAL)` — сейчас одна строка
-    `key_base_usd` (Д4а-R13).
+  - Таблица `llm_meta (key TEXT PRIMARY KEY, value REAL)` — точки отсчёта
+    сверки: строка `key_base_usd:<отпечаток ключа>` на каждый ключ
+    (Д4а-R13).
   - **Что стоит в сумме** (`charge(row)`):
     - `cost`, если `cost_source` ∈ `stream`, `body`, `generation`, `none`;
     - иначе (`open`, `pending`, `unknown`, `lost`) — `cost_est`.
   - `@dataclass(frozen=True) class CallRow` — те же поля.
-  - `PENDING_STUCK_S = 900` — дозапрос идёт около 9 минут, `pending` старше 15
-    минут значит, что дозапрос не идёт.
-  - `class Ledger`:
-    - `__init__(self, path: str)` — таблицы; строки `open` от прошлого запуска
-      → `status = lost`, `cost_source = unknown` (в сумме — по `cost_est`);
-      `pending` без `generation_id` → `unknown`; суммы `charge` по вызывающим —
-      в память; счётчик `id` — от `MAX(id)`;
+  - `PENDING_STUCK_S = 900` — дозапрос идёт около 9 минут. Возраст `pending`
+    считается от начала ожидания: закрытия вызова или последнего запуска
+    дозапроса (после перезапуска `core` дозапрос начинается заново). Старше 15
+    минут — дозапрос не идёт.
+  - `LEDGER_CHECK_S = 30.0` — период фоновой проверки записи;
+    `SQLITE_TIMEOUT_S = 0.5` — срок ожидания блокировки у соединений записи.
+  - `class Ledger` — конструктор без ввода-вывода (как `EventLog` Д3б, F4):
+    - `__init__(self, path: str)` — только запоминает путь;
+    - `open(self) -> bool` — файл, WAL, таблицы; строки `open` от прошлого
+      запуска → `status = lost`, `cost_source = unknown` (в сумме — по
+      `cost_est`); `pending` без `generation_id` → `unknown`; суммы `charge`
+      по вызывающим — в память; счётчик `id` — от `MAX(id)`. Сбой не бросает:
+      `opened = False`, `last_error`, `False`. Роль зовёт её в начале
+      `lifespan` через `asyncio.to_thread`;
+    - `opened: bool`; `writable_ok: bool | None` (итог последней проверки,
+      `None` до первой); `check(self) -> None` — `writable_ok = writable()`,
+      роль зовёт её в фоне раз в `LEDGER_CHECK_S` через `asyncio.to_thread`;
     - `open_call(self, *, ts: datetime, caller: str, session: str | None, model: str, step: int, estimate: float) -> int` —
       сначала память (`+estimate` вызывающему и итогу), затем `INSERT` с явным
       `id`;
-    - `close_call(self, call_id: int, *, status: str, code: str, http_status: int, provider: str | None, provider_ok: bool | None, generation_id: str | None, usage: Usage | None, cost_source: str, duration_ms: int) -> None` —
+    - `close_call(self, call_id: int, *, status: str, code: str, http_status: int, provider: str | None, provider_ok: bool | None, generation_id: str | None, usage: Usage | None, cost_source: str, duration_ms: int, now: datetime | None = None) -> None` —
       память: оценка заменяется `charge` закрытой строки, затем
-      `INSERT OR REPLACE` всей строки;
+      `INSERT OR REPLACE` всей строки. При `cost_source = "pending"` —
+      `pending_since[id] = now or ts + duration`;
+    - `resolve_started(self, call_id: int, now: datetime) -> None` —
+      `pending_since[id] = now` (запуск дозапроса, и после перезапуска);
     - `refused(self, *, ts: datetime, caller: str, session: str | None, model: str, code: str, http_status: int) -> None` —
       строка с ценой 0, `cost_est = 0` и `cost_source="none"`;
     - `set_cost(self, call_id: int, cost: float | None, source: str) -> None` —
@@ -1154,24 +1349,35 @@ def test_idle_turn_forgotten():
       памяти, с оценками идущих и безценовых вызовов;
     - `estimated(self, caller: str | None = None) -> float` — часть `spent`,
       которая стоит оценкой;
+    - `reserved_open(self) -> float` — оценки идущих (`open`) вызовов;
+    - `has_open_or_pending(self) -> bool` — для точки отсчёта сверки;
     - `meta_get(self, key: str) -> float | None`, `meta_set(self, key: str, value: float) -> None`;
-    - `totals(self, now: datetime) -> dict` — ключи `spent_usd`,
-      `estimated_usd`, `by_caller`, `pending`, `pending_stuck` (`pending`
-      старше `PENDING_STUCK_S`), `cost_unknown_24h` (`unknown` за 24 ч, `lost`
-      входит), `provider_mismatch_24h` (`provider_ok = 0` за 24 ч);
-    - `recent(self, limit: int = 10) -> list[CallRow]` — новые сверху;
-    - запись — как `EventLog` Д3б: ошибка SQLite не ломает вызов,
-      `consecutive_failures += 1`, `last_error = <класс и текст>`; удача
-      сбрасывает счётчик. `writable()` — `BEGIN IMMEDIATE`, `INSERT`,
-      `ROLLBACK` на новом соединении. Соединение на операцию даёт
-      `_connect(self) -> sqlite3.Connection` (точка подмены в тестах). Память
-      обновляется до SQLite, поэтому бюджет держится и при сбое диска, пока жив
-      процесс.
+    - `totals(self, now: datetime) -> dict` — только из памяти, без SQLite:
+      его зовёт `health_json` в цикле событий. `open()` загружает строки за
+      24 ч, дальше память ведут `open_call`/`close_call`/`set_cost`/`refused`.
+      Ключи `spent_usd`, `estimated_usd`, `reserved_usd`, `by_caller`,
+      `pending`, `pending_stuck` (`pending_since` старше `PENDING_STUCK_S`),
+      `cost_unknown_24h` (`unknown` за 24 ч, `lost` входит),
+      `provider_mismatch_24h` (`provider_ok = 0` за 24 ч);
+    - `recent(self, limit: int = 10) -> list[CallRow]` — новые сверху, из
+      SQLite (для тестов и `llmrows`, не для ручек);
+    - запись — как `EventLog.write` Д3б, синхронно: ошибка SQLite не ломает
+      вызов, `consecutive_failures += 1`, `last_error = <класс и текст>`;
+      удача сбрасывает счётчик. `writable()` — `BEGIN IMMEDIATE`, `INSERT`,
+      `ROLLBACK` на новом соединении; в цикле событий её не зовут (F9).
+      Соединение на операцию даёт `_connect(self) -> sqlite3.Connection` с
+      `timeout=SQLITE_TIMEOUT_S` (точка подмены в тестах). Память обновляется
+      до SQLite, поэтому бюджет держится и при сбое диска, пока жив процесс.
+      Все методы, кроме `open`, `check` и `writable`, при `opened = False`
+      работают только с памятью.
   - `class Budget`:
     - `__init__(self, ledger: Ledger, *, total_usd: float, share_usd: float, ops_share_usd: float, key_spent: Callable[[], float | None] = lambda: None)`;
     - `share_of(self, caller: str) -> float` — `ops_share_usd` для `ops`,
       иначе `share_usd`. Перераспределение долей — Д10;
-    - `total_spent(self) -> float` — `max(ledger.spent(), key_spent() or 0.0)`;
+    - `total_spent(self) -> float` — `max(ledger.spent(), (key_spent() or 0.0) + ledger.reserved_open())`:
+      при расходе по ключу выше журнала резервы идущих вызовов тоже в итоге;
+    - `page_spent(self) -> float` — `max(ledger.spent() − ledger.reserved_open(), key_spent() or 0.0)`:
+      число строки без резервов (Д4а-R11);
     - `refusal(self, caller: str) -> Literal["budget_spent", "share_spent"] | None` —
       сначала `total_spent() ≥ total_usd`, потом
       `ledger.spent(caller) ≥ share_of(caller)`. Оценку нового вызова проверка
@@ -1181,6 +1387,11 @@ def test_idle_turn_forgotten():
 
 ```python
 # core/tests/test_llm_ledger.py
+def lg(path):                                        # журнал, открытый как в lifespan
+    led = Ledger(path)
+    assert led.open() is True
+    return led
+
 T = datetime(2026, 10, 3, 9, tzinfo=timezone.utc)
 U = Usage(0.0123, 100, 20, 60, 10, 5)
 
@@ -1199,31 +1410,41 @@ def opened(led, caller="student-01", est=0.5):
 
 def test_ledger_sums_survive_reopen(tmp_path):
     p = str(tmp_path / "core.db")
-    led = Ledger(p)
+    led = lg(p)
     close_ok(led, opened(led))
     led.refused(ts=T, caller="student-02", session=None, model="x", code="pcbk_turn_limit", http_status=403)
-    again = Ledger(p)
+    again = lg(p)
     assert (again.spent(), again.spent("student-01"), again.spent("student-02")) == (pytest.approx(0.0123),
                                                                                      pytest.approx(0.0123), 0.0)
     assert [r.status for r in again.recent()] == ["refused", "ok"]
 
 def test_open_call_counts_estimate_until_closed(tmp_path):                        # Review Focus 6
-    led = Ledger(str(tmp_path / "core.db"))
+    led = lg(str(tmp_path / "core.db"))
     cid = opened(led, est=0.5)
     assert led.spent("student-01") == pytest.approx(0.5) and led.estimated() == pytest.approx(0.5)
+    assert (led.reserved_open(), led.has_open_or_pending()) == (pytest.approx(0.5), True)
     close_ok(led, cid)
     assert led.spent("student-01") == pytest.approx(0.0123) and led.estimated() == 0.0
+    assert (led.reserved_open(), led.has_open_or_pending()) == (0.0, False)
+
+def test_constructor_does_no_io_and_failed_open_keeps_memory(tmp_path):         # раунд 2: договор Role Д3а
+    path = tmp_path / "nope" / "core.db"                                      # каталога нет
+    led = Ledger(str(path))
+    assert not path.parent.exists()                                           # конструктор файлов не трогает
+    assert led.open() is False and led.opened is False and led.last_error
+    opened(led, est=0.5)
+    assert led.spent() == pytest.approx(0.5)                                  # память работает и без файла
 
 def test_open_call_after_crash_is_lost_at_estimate(tmp_path):                    # Review Focus 2
     p = str(tmp_path / "core.db")
-    opened(Ledger(p), est=0.5)
-    again = Ledger(p)
+    opened(lg(p), est=0.5)
+    again = lg(p)
     t = again.totals(T + timedelta(minutes=1))
     assert (t["cost_unknown_24h"], t["pending"], again.recent(1)[0].status) == (1, 0, "lost")
     assert again.spent("student-01") == pytest.approx(0.5)                     # не ноль
 
 def test_pending_then_generation_cost(tmp_path):                                 # Review Focus 2
-    led = Ledger(str(tmp_path / "core.db"))
+    led = lg(str(tmp_path / "core.db"))
     cid = opened(led, caller="ops", est=0.5)
     close_ok(led, cid, usage=None, source="pending")
     assert led.totals(T)["pending"] == 1 and led.spent("ops") == pytest.approx(0.5)
@@ -1233,19 +1454,21 @@ def test_pending_then_generation_cost(tmp_path):                                
     close_ok(led, cid2, usage=None, source="pending"); led.set_cost(cid2, None, "unknown")
     assert led.spent("ops") == pytest.approx(0.504) and led.totals(T)["cost_unknown_24h"] == 1
 
-def test_pending_survives_restart_for_resolve_and_stuck(tmp_path):
+def test_pending_survives_restart_for_resolve_and_stuck(tmp_path):              # раунд 2: возраст — от дозапроса
     p = str(tmp_path / "core.db")
-    led = Ledger(p)
+    led = lg(p)
     cid = opened(led, est=0.5)
     led.close_call(cid, status="cancelled", code="", http_status=200, provider=None, provider_ok=None,
-                   generation_id="gen-9", usage=None, cost_source="pending", duration_ms=10)
-    again = Ledger(p)
+                   generation_id="gen-9", usage=None, cost_source="pending", duration_ms=10, now=T)
+    assert led.totals(T + timedelta(minutes=16))["pending_stuck"] == 1
+    again = lg(p)                                                               # перезапуск через 10 мин
     assert again.pending_to_resolve() == [(cid, "gen-9")] and again.spent() == pytest.approx(0.5)
-    assert again.totals(T + timedelta(minutes=16))["pending_stuck"] == 1
-    assert again.totals(T + timedelta(minutes=10))["pending_stuck"] == 0
+    again.resolve_started(cid, T + timedelta(minutes=10))
+    assert again.totals(T + timedelta(minutes=20))["pending_stuck"] == 0      # дозапрос идёт
+    assert again.totals(T + timedelta(minutes=26))["pending_stuck"] == 1
 
 def test_write_failure_keeps_memory_and_flags(tmp_path, monkeypatch):
-    led = Ledger(str(tmp_path / "core.db"))
+    led = lg(str(tmp_path / "core.db"))
     monkeypatch.setattr(led, "_connect", lambda: (_ for _ in ()).throw(sqlite3.OperationalError("database or disk is full")))
     opened(led, est=0.5)
     assert led.spent() == pytest.approx(0.5) and led.consecutive_failures == 1
@@ -1253,11 +1476,11 @@ def test_write_failure_keeps_memory_and_flags(tmp_path, monkeypatch):
 
 def test_meta_roundtrip(tmp_path):
     p = str(tmp_path / "core.db")
-    Ledger(p).meta_set("key_base_usd", 12.5)
-    assert (Ledger(p).meta_get("key_base_usd"), Ledger(p).meta_get("nope")) == (12.5, None)
+    lg(p).meta_set("key_base_usd", 12.5)
+    assert (lg(p).meta_get("key_base_usd"), lg(p).meta_get("nope")) == (12.5, None)
 
 def test_budget_total_before_share_and_key(tmp_path):
-    led = Ledger(str(tmp_path / "core.db"))
+    led = lg(str(tmp_path / "core.db"))
     for caller, cost in (("student-01", 100.0), ("student-02", 5.0)):
         close_ok(led, opened(led, caller=caller), usage=replace(U, cost=cost))
     b = Budget(led, total_usd=1000.0, share_usd=100.0, ops_share_usd=80.0)
@@ -1265,6 +1488,10 @@ def test_budget_total_before_share_and_key(tmp_path):
     assert Budget(led, total_usd=100.0, share_usd=100.0, ops_share_usd=80.0).refusal("student-02") == "budget_spent"
     by_key = Budget(led, total_usd=1000.0, share_usd=100.0, ops_share_usd=80.0, key_spent=lambda: 1000.0)
     assert (by_key.total_spent(), by_key.refusal("student-02")) == (1000.0, "budget_spent")   # OpenRouter насчитал больше
+    opened(led, caller="student-03", est=0.5)                                  # идущий вызов
+    drift = Budget(led, total_usd=1000.0, share_usd=100.0, ops_share_usd=80.0, key_spent=lambda: 107.0)
+    assert drift.total_spent() == pytest.approx(107.5)                        # по ключу + резерв, не только max
+    assert drift.page_spent() == pytest.approx(107.0)                         # число строки — без резерва
 
 def test_no_content_columns(tmp_path):
     Ledger(str(tmp_path / "core.db"))
@@ -1309,6 +1536,8 @@ def test_no_content_columns(tmp_path):
     | `FAKEMID402` | то же с кодом 402 |
     | `FAKENOUSAGE` | 200, поток до `[DONE]` без чанка с `usage` |
     | `FAKEGENNEVER` | то же, но `/generation` по этому id всегда 404 — цена не найдётся никогда |
+    | `FAKEFLAKY` | первые два запроса с этим словом — 502 `"Provider returned error"`, дальше обычный ответ |
+    | `FAKEASK` | если в `tools` есть `question` и сообщений `tool` в ходе нет — вызов `question` с `{"questions": [{"question": "Какой из тегов?", "header": "Тег", "options": [{"label": "20FAKE_001_PV", "description": "первый"}]}]}`; иначе обычный ответ (для Д4б) |
     | `FAKEBREAK` | один чанк и обрыв соединения |
     | `FAKESLOW` | чанк каждые 0,5 с 10 с подряд; обрыв клиента — в счётчик `aborted` |
     | `FAKEPROVIDER` | обычный ответ, но `provider: "Together"` |
@@ -1333,7 +1562,9 @@ def test_no_content_columns(tmp_path):
     `{"data": {"id": …, "total_cost": 0.002}}`; id ответа `FAKEGENNEVER` —
     всегда 404.
   - `GET /api/v1/key` — `{"data": {"label": "test", "usage": <сумма отданных цен, включая 0.002 найденных дозапросом>, "limit": null, "limit_remaining": null, "limit_reset": null}}`;
-    чужой ключ — 401. `POST /_usage` с `{"add": x}` прибавляет x к `usage` —
+    чужой ключ — 401. Второй верный ключ `test-openrouter-key-b` — ключ с
+    прошлым расходом: его `usage` начинается с 50.0 (для теста смены ключа).
+    `POST /_usage` с `{"add": x, "key": "b"?}` прибавляет x к `usage` ключа —
     так тест делает «OpenRouter насчитал больше».
   - `GET /api/v1/credits` — с ключом управления
     `{"data": {"total_credits": 50.0, "total_usage": 20.0}}`, иначе 403.
@@ -1341,7 +1572,7 @@ def test_no_content_columns(tmp_path):
     `GET /_stats` — `{"aborted": n}`; `POST /_usage`. Это ручки только для
     тестов.
   - Фикстура `fake_or` (на функцию): сервер на `127.0.0.1:0`, атрибуты `url`
-    (`…/api/v1`), `requests` (список), `aborted`, метод `add_usage(x)`.
+    (`…/api/v1`), `requests` (список), `aborted`, метод `add_usage(x, key="a")`.
 - Produces (`sse.py`):
   - `class SseObserver` — `feed(self, chunk: bytes) -> None`:
     - события делятся пустой строкой (`\n\n` и `\r\n\r\n`), неполное событие
@@ -1388,7 +1619,9 @@ def test_no_content_columns(tmp_path):
     - `async def generation_cost(self, gen_id: str) -> float | None` — один
       запрос; 404 и любая ошибка → `None`;
     - `async def key_info(self) -> dict` — `data` из `/key`; ошибки →
-      `UpstreamError` по `classify`;
+      `UpstreamError` по `classify`. У запросов опроса (`key_info`,
+      `credits`) свой срок — `POLL_TIMEOUT_S = 15.0` на запрос, не
+      `read=120` чата: медленный OpenRouter не растягивает опрос на минуты;
     - `async def credits(self) -> float | None` — `total_credits − total_usage`
       ключом управления; без ключа — `None`; ошибки → `UpstreamError` с
       настоящим `status` (по нему `poll` отличает «ключ управления отклонён»,
@@ -1485,19 +1718,24 @@ async def test_key_info_and_credits(fake_or):
 
 ---
 
-### Task 6: Роль `llm` — ручка, отказы, опрос, ключи, учения
+### Task 6: Роль `llm` — настройка без падения, ручка, отказы, опрос, ключи, учения
 
 **Files:**
 - Create: `core/pcbk_core/llm/state.py`, `core/pcbk_core/llm/api.py`
-- Modify: `core/pcbk_core/llm/__init__.py` (`LlmRole`), `core/pcbk_core/settings.py`,
-  `core/pcbk_core/secrets.py` (`read_key_file`), `core/pcbk_core/main.py`
-  (`build_roles`, `egress_targets`), `core/tests/helpers.py`
-- Test: `core/tests/test_llm_role.py`, `core/tests/test_skeleton.py` (+2)
+- Modify: `core/pcbk_core/llm/__init__.py` (`LlmRole`), `core/pcbk_core/settings.py`
+  (`LlmSettings`), `core/pcbk_core/secrets.py` (`read_key_file`),
+  `core/pcbk_core/main.py` (`build_roles`, `egress_targets`), `core/tests/helpers.py`
+- Test: `core/tests/test_llm_role.py`, `core/tests/test_skeleton.py` (+3)
 
 **Interfaces:**
-- Consumes: задачи 2–5; `TokenTable`, `install_egress_guard`, `Settings.from_env`
-  (пустое — умолчание, числа > 0), `DB_PATH` — Д3а/Д3б.
-- Produces (`settings.py`) — новые поля `Settings`:
+- Consumes: задачи 2–5; `TokenTable` (`from_file`, `empty()`),
+  `install_egress_guard`, `Settings.from_env` (пустое — умолчание, числа > 0),
+  `DB_PATH`, `build_roles` с `config_error` — Д3а/Д3б.
+- Produces (`settings.py`) — отдельный `@dataclass(frozen=True) class LlmSettings`
+  со своим `from_env(env=None)`. Поля LLM не входят в `Settings`: ошибка в них
+  роняла бы `main()` с кодом 1 (`Settings.from_env` Д3а), а с ним и службу
+  данных. Ошибку `LlmSettings.from_env` ловит `build_roles` и отдаёт роли
+  `llm` как `config_error`:
 
 | Поле | По умолчанию | Проверка |
 |---|---|---|
@@ -1518,10 +1756,12 @@ async def test_key_info_and_credits(fake_or):
 | `LLM_STATE` | `"on"` | `on` или `stopped` |
 | `DRILL_LLM` | `""` | `""` или `402` |
 
-  Ошибка проверки — `ValueError` с именем поля.
+  Ошибка проверки — `ValueError` с именем поля. `DB_PATH` роль берёт из
+  `Settings` Д3б.
 - Produces (`secrets.py`): `read_key_file(path: str) -> str | None` — пробелы и
-  перевод строки срезаются; нет файла или пусто → `None`; текст ключа не
-  попадает ни в исключения, ни в журнал.
+  перевод строки срезаются; нет файла или пусто → `None`; прочая ошибка
+  чтения (права, каталог вместо файла) → `KeyFileError` с именем файла, без
+  текста ключа. Текст ключа не попадает ни в исключения, ни в журнал.
 - Produces (`state.py`):
   - `UPSTREAM_TEXTS = {"unknown": "OpenRouter ещё не опрашивался", "ok": "OpenRouter отвечает", "errors": "OpenRouter отвечает ошибками подряд", "unreachable": "OpenRouter недоступен", "key_rejected": "OpenRouter отклонил ключ стенда", "money_out": "на счёте OpenRouter кончились деньги", "key_limit": "исчерпан лимит ключа OpenRouter", "region": "OpenRouter отказывает по региону"}`
   - `FAIL_STATES = frozenset({"unreachable", "key_rejected", "money_out", "key_limit", "region"})`;
@@ -1564,7 +1804,8 @@ LLM_MESSAGES = {
                     "Сообщите преподавателю.",
     "turn_limit": "Предел шагов на ответ: {limit} обращений к модели за один ход. Ход остановлен — "
                   "задайте вопрос заново, короче или по частям.",
-    "busy": "С этого места уже идут несколько обращений к модели — повтор через несколько секунд.",
+    "busy": "Идёт другой запрос к модели с этого места — дождитесь его и отправьте сообщение снова.",
+    "config": "LLM-прокси не настроен: ошибка настройки на сервере. Сообщите преподавателю.",
     "money_out": "На счёте OpenRouter кончились деньги — модель не отвечает. Сообщите преподавателю.",
     "key_limit": "Исчерпан лимит ключа OpenRouter — модель не отвечает. Сообщите преподавателю.",
     "key_rejected": "OpenRouter отклонил ключ стенда — модель не отвечает. Сообщите преподавателю.",
@@ -1581,7 +1822,11 @@ LLM_MESSAGES = {
     - `POST /llm/v1/chat/completions`, проверки по порядку, первая сработавшая
       отвечает:
       1. токен `Authorization: Bearer` по таблице LLM (`role.tokens`) → 401 и
-         строка журнала `outcome=unauthorized channel=llm` без токена;
+         строка журнала `outcome=unauthorized channel=llm` без токена. Таблица
+         не прочиталась — она пустая (`TokenTable.empty()`), причина — в
+         `config_error`;
+      1а. `role.config_error` → `config` (403 `pcbk_config`), первым шагом
+         после токена, как F5 Д3б;
       2. `LLM_STATE=stopped` → `stopped`;
       3. нет ключа → `key_missing`;
       4. тело — объект JSON;
@@ -1598,10 +1843,21 @@ LLM_MESSAGES = {
          считается, в журнале у него `step = 0`. Иначе заголовок, пришедший
          посреди первого хода, обнулял бы счётчик.
 
-      Отказы из шагов 2–9 пишутся `ledger.refused` (401 — нет: вызывающий
+      Отказы из шагов 1а–9 пишутся `ledger.refused` (401 — нет: вызывающий
       неизвестен). Дальше `ledger.open_call(…, estimate=policy.estimate_usd(body_bytes(body), body["max_tokens"]))`,
-      счётчик идущих вызовов + 1 и `upstream.open_chat`. Счётчик − 1 — в
-      `finally` вызова, при любом исходе.
+      счётчик идущих вызовов + 1 и `upstream.open_chat`.
+
+      **Атомарность.** Шаги 7–9, `open_call` и `inflight + 1` — один
+      синхронный участок без `await`: иначе два одновременных запроса пройдут
+      проверки раньше, чем любой поставил резерв. `ledger` пишет синхронно
+      (задача 4), не через `to_thread`.
+
+      **Учёт в `finally`.** При обрыве клиента Starlette снимает задачу потока,
+      и код после первого `await` в `finally` не выполняется. Поэтому в
+      `finally` сначала синхронный учёт: `inflight − 1`, `close_call`,
+      `turns.refund(…)` при `cost_source = none`, запуск `resolve_cost` через
+      `asyncio.create_task`. Потом `await response.aclose()` под
+      `anyio.CancelScope(shield=True)`.
     - Поток: `StreamingResponse` отдаёт байты `aiter_raw()` как есть и кормит
       `SseObserver`. В `finally` ответ OpenRouter закрывается, вызов
       закрывается в журнале, обновляются `role.state` и строка журнала. Обрыв
@@ -1621,7 +1877,9 @@ LLM_MESSAGES = {
     - Ошибка OpenRouter до потока (статус не 200) → ответ по `REFUSALS`
       (`rejected` — со статусом и текстом OpenRouter), `ledger.close_call` со
       статусом `money` или `upstream_error` и `cost_source = "none"`: ответа не
-      было, денег нет. Соединение не открылось (`httpx.ConnectError`,
+      было, денег нет. Шаг хода возвращается (`turns.refund`): OpenCode
+      повторяет 5xx и 429 до 5 раз, и без возврата один сбой провайдера съел
+      бы до 6 шагов из 16. Соединение не открылось (`httpx.ConnectError`,
       `ConnectTimeout`) — тоже `none`. Тело ушло, а ответа нет (`ReadTimeout`,
       обрыв до заголовков) — `cost_source = "unknown"`, по оценке: запрос мог
       дойти до модели. `role.state.record(kind, …)`.
@@ -1630,36 +1888,46 @@ LLM_MESSAGES = {
       без текста и токенов.
     - `GET /health/llm` → `role.health_json(now)`, без токена.
 - Produces (`LlmRole(RoleBase)`, `name = "llm"`):
-  - `__init__(self, settings: Settings, *, tokens: TokenTable, upstream: Upstream | None, ledger: Ledger, monotonic=time.monotonic, wallclock=lambda: datetime.now(timezone.utc), cost_retry_delays: Sequence[float] = COST_RETRY_DELAYS_S)`;
-    `upstream is None` — ключа нет;
+  - `__init__(self, settings: Settings, llm: LlmSettings, *, tokens: TokenTable, upstream: Upstream | None, ledger: Ledger, key_fingerprint: str | None = None, config_error: str | None = None, monotonic=time.monotonic, wallclock=lambda: datetime.now(timezone.utc), cost_retry_delays: Sequence[float] = COST_RETRY_DELAYS_S)` —
+    без ввода-вывода: файлов не читает, `core.db` не открывает, сети не
+    трогает. `upstream is None` — ключа нет; `key_fingerprint` — первые 12
+    знаков sha256 ключа (сам ключ роли не нужен, он внутри `Upstream`);
     `COST_RETRY_DELAYS_S = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 120.0, 300.0)` —
     около 9 минут (Д4а-R13). Если задача 1 покажет цену позже — ветка шапки.
   - поля: `models`, `budget` (с `key_spent=self.key_spent_usd`), `turns`,
-    `state`, `tokens`, `ledger`, `upstream`, `inflight: dict[str, int]`,
+    `state`, `tokens`, `ledger`, `upstream`, `key_fingerprint`,
+    `inflight: dict[str, int]`,
     `checked_at: datetime | None` (конец последней попытки опроса, удачной
     или нет; `None` — опроса ещё не было), `key_usage_usd: float | None`,
     `account_remaining_usd: float | None`,
     `mgmt_key: Literal["ok", "missing", "rejected", "error"]` (до первого
     опроса — `"missing"` при пустом файле ключа управления, иначе `"ok"`).
-  - `key_spent_usd(self) -> float | None` — `key_usage_usd − ledger.meta_get("key_base_usd")`,
+  - `config_error: str | None` — причина ошибки настройки; `lifespan`
+    дописывает туда «журнал вызовов не открылся: …», если `ledger.open()`
+    вернул `False`.
+  - `key_spent_usd(self) -> float | None` — `key_usage_usd − ledger.meta_get(f"key_base_usd:{key_fingerprint}")`,
     если известны оба и `LLM_KEY_DEDICATED=on`; иначе `None`.
   - `router()` → `llm_router(self)`; `install(app)` →
     `hooks_of(app).body_limit("/llm/", settings.LLM_MAX_BODY_BYTES)`.
-  - `health() -> tuple[bool, str]`, первое подходящее:
+  - `ledger_ok(self) -> bool` — `ledger.opened and ledger.writable_ok is not False and ledger.consecutive_failures == 0`;
+    только запомненные итоги, без ввода-вывода.
+  - `health() -> tuple[bool, str]` — без ввода-вывода (договор `Role` Д3а),
+    первое подходящее:
+    - `config_error` → `(False, "ошибка настройки: " + config_error[:60])`;
     - выключатель → `(False, "LLM-прокси остановлен администратором")`;
     - нет ключа → `(False, "нет ключа OpenRouter")`;
-    - `not ledger.writable()` или `ledger.consecutive_failures > 0` →
-      `(False, "журнал вызовов не пишется: " + last_error[:60])`;
+    - `not ledger_ok()` → `(False, "журнал вызовов не пишется: " + (last_error or "")[:53])`;
     - `budget.total_spent() ≥ total` → `(False, "общий бюджет исчерпан")`;
     - состояние из `FAIL_STATES` → `(False, текст состояния)`;
     - иначе `(True, текст состояния)`.
   - `health_json(now: datetime) -> dict` — ровно ключи:
     - `checked_at` — `self.checked_at` в ISO или `null`. Это не `now`: `now`
       нужен только для окон «за 24 ч» и `pending_stuck`;
-    - `stopped`; `key` (`"ok"`/`"missing"`); `mgmt_key`; `drill`;
-      `ledger_ok` (`health()` не упал на журнале);
+    - `config_error` (строка или `null`); `stopped`; `key`
+      (`"ok"`/`"missing"`); `mgmt_key`; `drill`; `ledger_ok` (`ledger_ok()`);
     - `upstream` (`state.to_json()`);
-    - `spent_usd` = `budget.total_spent()` — число строки;
+    - `spent_usd` = `budget.page_spent()` — число строки, без резервов
+      идущих вызовов (Д4а-R11); `reserved_usd` = `ledger.reserved_open()`;
     - `ledger_usd` = `ledger.spent()`; `estimated_usd` = `ledger.estimated()`;
     - `key_spent_usd` = `key_spent_usd()`; `key_usage_usd`;
     - `total_usd`; `ops_usd` = `ledger.spent("ops")`;
@@ -1670,8 +1938,11 @@ LLM_MESSAGES = {
     Токенов, id вызывающих и текстов в ответе нет.
   - `async def poll(self) -> None`:
     - при выключателе или без ключа ничего не делает;
-    - иначе `key_info()`: `usage` → `key_usage_usd`. Нет `key_base_usd` в
-      журнале → `meta_set("key_base_usd", usage − ledger.spent())`.
+    - иначе `key_info()`: `usage` → `key_usage_usd`. Точка отсчёта
+      (Д4а-R13): при `LLM_KEY_DEDICATED=on`, если в журнале нет
+      `key_base_usd:<key_fingerprint>` и `not ledger.has_open_or_pending()` →
+      `meta_set(f"key_base_usd:{key_fingerprint}", usage − ledger.spent())`.
+      Точки других отпечатков не трогаются и не используются.
       `limit_remaining` ≤ 0 → `record("key_limit", source="poll")`, больше 0
       или `null` → `clear_money(now, "key_limit")`. `UpstreamError` →
       `record(kind, source="poll")`;
@@ -1684,22 +1955,39 @@ LLM_MESSAGES = {
       исправен (Д4а-R16);
     - в `finally` — `checked_at = wallclock()`.
   - `lifespan()`:
+    - `await asyncio.to_thread(ledger.open)`; `False` → `config_error`
+      дополняется «журнал вызовов не открылся: <last_error>»;
     - строки журнала при старте: «LLM-прокси: моделей N, доля $100, бюджет
       $1000»; при `DRILL_LLM` — «УЧЕНИЯ: DRILL_LLM=402»; при выключателе —
-      «LLM-прокси остановлен администратором (LLM_STATE=stopped)»;
+      «LLM-прокси остановлен администратором (LLM_STATE=stopped)»; при
+      `config_error` — «LLM-прокси: ошибка настройки: …», и дальше
+      фоновых циклов, кроме проверки журнала, нет;
     - `resolve_cost` для каждой строки `ledger.pending_to_resolve()` — цена,
-      которую не дождался прошлый запуск;
+      которую не дождался прошлый запуск (`ledger.resolve_started(id, now)`);
+    - фоновая проверка записи: `asyncio.to_thread(ledger.check)` сразу и раз
+      в `LEDGER_CHECK_S`;
     - цикл `poll` сразу и раз в `LLM_POLL_S`;
     - на выходе отменяются задачи `resolve_cost` (их строки остаются
       `pending` и возобновятся при следующем старте) и закрывается `upstream`.
-  - `async def resolve_cost(self, call_id: int, gen_id: str) -> None` — по
-    задержкам `cost_retry_delays`; нашлась цена → `set_cost(…, "generation")`,
-    иначе `set_cost(…, None, "unknown")` — в сумме остаётся оценка.
+  - `async def resolve_cost(self, call_id: int, gen_id: str) -> None` —
+    `ledger.resolve_started(call_id, wallclock())`, затем по задержкам
+    `cost_retry_delays`; нашлась цена → `set_cost(…, "generation")`, иначе
+    `set_cost(…, None, "unknown")` — в сумме остаётся оценка.
 - Produces (`main.py`):
-  - `egress_targets(settings: Settings, cfg: BdrvConfig) -> list[tuple[str, int | None]]` —
+  - `egress_targets(llm: LlmSettings, cfg: BdrvConfig) -> list[tuple[str, int | None]]` —
     `[(хост историана, порт), (хост OPENROUTER_BASE_URL, порт или 443/80)]`;
-    строка журнала — «охрана выхода: разрешено 2 направления»;
-  - `build_roles` добавляет `LlmRole(settings, tokens=TokenTable.from_file(settings.LLM_TOKENS_FILE), upstream=Upstream(…) if key else None, ledger=Ledger(settings.DB_PATH))`.
+    строка журнала — «охрана выхода: разрешено 2 направления». При ошибке
+    `LlmSettings` — адрес по умолчанию;
+  - `build_roles` (по образцу роли «данные» Д3а: ошибка — причина, процесс
+    жив) добавляет роль `llm`:
+    - `LlmSettings.from_env()` под `try`; `ValueError` → `LlmSettings()` и
+      причина «настройки: <текст>»;
+    - `TokenTable.from_file(LLM_TOKENS_FILE)` под `try`; `OSError`,
+      `ValueError` → `TokenTable.empty()` и причина «токены LLM не читаются»;
+    - `read_key_file` для обоих ключей; `KeyFileError` → ключа нет и причина
+      «ключ OpenRouter не читается»;
+    - `LlmRole(settings, llm, tokens=…, upstream=Upstream(…) if key and not problems else None, ledger=Ledger(settings.DB_PATH), key_fingerprint=…, config_error="; ".join(problems) or None)`.
+      `Ledger` и `Upstream` в конструкторе ничего не открывают.
 - `helpers.py`:
   - `LLM_TOKEN = "test-llm-token-student-01"`, `OPS_LLM_TOKEN = "test-llm-token-ops"`,
     `SES = "ses_" + "A" * 26`;
@@ -1709,12 +1997,16 @@ LLM_MESSAGES = {
     инструмент `pcbk_tag_now`, как в `OC_BODY` задачи 3;
   - `auth(token, session=None, parent=None) -> dict` — `Authorization`,
     `X-Session-Id`, при `parent` — `x-parent-session-id`;
-  - `make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key", mgmt: str | None = None, wallclock=None, **settings_overrides) -> LlmRole`:
+  - `LLM_SETTINGS = LlmSettings()`;
+  - `make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key", mgmt: str | None = None, wallclock=None, **llm_overrides) -> LlmRole`:
     - создаёт `tmp_path`, если его нет; `DB_PATH = tmp_path / "core.db"` —
-      тот же путь, что у `Ledger(str(tmp_path / "core.db"))` в тестах;
+      тот же путь, что у журнала в тестах;
     - при `fake` берёт `OPENROUTER_BASE_URL = fake.url`;
-    - `Settings` — через `replace(SETTINGS, …)`, без проверок `from_env`,
-      как в Д3а;
+    - `LlmSettings` — через `replace(LLM_SETTINGS, **llm_overrides)`, без
+      проверок `from_env`, как в Д3а;
+    - открывает журнал (`role.ledger.open()`), как `lifespan`: роли без
+      приложения (`anyio.run(role.poll)`) нужен открытый журнал;
+    - `key_fingerprint` — от `key`;
     - таблица из двух токенов, задержки дозапроса `(0.01, 0.01, 0.01)`;
   - `make_llm_app(tmp_path, fake=None, **kw) -> tuple[FastAPI, LlmRole]` —
     `create_app(settings, [role])`.
@@ -1903,6 +2195,21 @@ def test_client_disconnect_closes_upstream_and_costs_later(tmp_path, fake_or):  
         wait_until(lambda: fake_or.aborted == 1, timeout=3)
         wait_until(lambda: role.ledger.recent(1)[0].cost_source == "generation")
     assert role.ledger.recent(1)[0].status == "cancelled"
+    assert role.inflight.get("student-01", 0) == 0                              # учёт в finally не потерян при обрыве
+
+@pytest.mark.parametrize("word", ["FAKE500", "FAKEBREAK", "FAKEMIDERR", "FAKE402"])
+def test_inflight_back_to_zero(tmp_path, fake_or, word):                         # раунд 2: утечка счётчика = busy навсегда
+    app, role = make_llm_app(tmp_path, fake_or)
+    with TestClient(app) as c:
+        post(c, chat_body(text=f"q {word}"))
+        wait_until(lambda: role.inflight.get("student-01", 0) == 0, timeout=3)
+
+def test_upstream_error_before_answer_refunds_step(tmp_path, fake_or):          # раунд 2: сбой провайдера не ест шаги
+    app, role = make_llm_app(tmp_path, fake_or)
+    body = chat_body(text="q FAKEFLAKY")
+    with TestClient(app) as c:
+        codes = [post(c, body).status_code for _ in range(3)]                    # как повторы OpenCode: тело то же
+    assert codes == [502, 502, 200] and role.ledger.recent(1)[0].step == 1
 
 def test_stopped_switch_and_missing_key(tmp_path, fake_or):
     app, role = make_llm_app(tmp_path, fake_or, LLM_STATE="stopped")
@@ -1936,6 +2243,28 @@ def test_poll_sets_checked_at_usage_account_and_unreachable(tmp_path, fake_or): 
     j = down.health_json(t)
     assert (j["upstream"]["state"], j["checked_at"]) == ("unreachable", t.isoformat())   # неудачная попытка — тоже время
 
+def test_key_base_follows_key_fingerprint(tmp_path, fake_or):                   # раунд 2: смена ключа и off → on
+    a = make_llm_role(tmp_path, fake_or)
+    anyio.run(a.poll)                                                            # точка отсчёта ключа A
+    b = make_llm_role(tmp_path, fake_or, key="test-openrouter-key-b")           # та же core.db, ключ с прошлыми $50
+    async def polls():
+        await b.poll(); fake_or.add_usage(2.0, key="b"); await b.poll()
+    anyio.run(polls)
+    j = b.health_json(now_utc())
+    assert (j["key_spent_usd"], j["spent_usd"]) == (2.0, 2.0)                   # прошлые $50 не в бюджете, новые $2 видны
+    off = make_llm_role(tmp_path / "2", fake_or, LLM_KEY_DEDICATED="off")
+    anyio.run(off.poll)
+    assert off.ledger.meta_get(f"key_base_usd:{off.key_fingerprint}") is None   # при off точка не ставится
+    on = make_llm_role(tmp_path / "2", fake_or)
+    anyio.run(on.poll)
+    assert on.health_json(now_utc())["key_spent_usd"] == 0.0                    # off → on: своя точка отсчёта
+
+def test_key_base_waits_for_open_and_pending(tmp_path, fake_or):
+    role = make_llm_role(tmp_path, fake_or)
+    role.ledger.open_call(ts=now_utc(), caller="ops", session=None, model="m", step=1, estimate=0.5)
+    anyio.run(role.poll)
+    assert role.health_json(now_utc())["key_spent_usd"] is None                 # идёт вызов — точку не ставим
+
 def test_key_drift_and_budget_from_key(tmp_path, fake_or):                        # Review Focus 6; Д4а-R13
     role = make_llm_role(tmp_path, fake_or, LLM_TOTAL_USD=5.0)
     async def two_polls():                                                       # один цикл событий на клиента httpx
@@ -1944,14 +2273,14 @@ def test_key_drift_and_budget_from_key(tmp_path, fake_or):                      
         await role.poll()
     anyio.run(two_polls)
     j = role.health_json(now_utc())
-    assert (j["key_spent_usd"], j["ledger_usd"], j["spent_usd"]) == (6.0, 0.0, 6.0)
+    assert (j["key_spent_usd"], j["ledger_usd"], j["spent_usd"], j["reserved_usd"]) == (6.0, 0.0, 6.0, 0.0)
     assert role.budget.refusal("student-01") == "budget_spent" and role.health() == (False, "общий бюджет исчерпан")
     shared = make_llm_role(tmp_path / "2", fake_or, LLM_KEY_DEDICATED="off")    # ключ общий с Dify — сверки нет
     anyio.run(shared.poll)
     assert (shared.health_json(now_utc())["key_spent_usd"], shared.budget.refusal("student-01")) == (None, None)
 
 def test_pending_resolved_after_restart(tmp_path, fake_or):                       # Review Focus 2
-    led = Ledger(str(tmp_path / "core.db"))
+    led = Ledger(str(tmp_path / "core.db")); assert led.open()
     cid = led.open_call(ts=now_utc(), caller="ops", session=None, model="z-ai/glm-5.3", step=1, estimate=0.5)
     led.close_call(cid, status="cancelled", code="", http_status=200, provider=None, provider_ok=None,
                    generation_id="gen-old", usage=None, cost_source="pending", duration_ms=10)
@@ -1959,6 +2288,16 @@ def test_pending_resolved_after_restart(tmp_path, fake_or):                     
     with TestClient(app) as c:
         wait_until(lambda: role.ledger.recent(1)[0].cost_source == "generation")
     assert role.ledger.spent("ops") == pytest.approx(0.002)
+
+def test_health_does_no_io(tmp_path, fake_or, monkeypatch):                      # раунд 2: договор Role Д3а
+    role = make_llm_role(tmp_path, fake_or)
+    def no_io(*a, **k):
+        raise AssertionError("ввод-вывод в health()")
+    monkeypatch.setattr(role.ledger, "writable", no_io)
+    monkeypatch.setattr(role.ledger, "_connect", no_io)
+    assert role.health()[0] is True and role.health_json(now_utc())["ledger_ok"] is True
+    role.ledger.writable_ok = False                                              # фоновая проверка нашла сбой
+    assert role.health()[1].startswith("журнал вызовов не пишется")
 
 def test_ledger_failure_turns_health_red(tmp_path, fake_or, monkeypatch):
     app, role = make_llm_app(tmp_path, fake_or)
@@ -1981,10 +2320,10 @@ def test_health_json_keys_and_no_secrets(tmp_path, fake_or):
     with TestClient(app) as c:
         post(c, chat_body())
         r = c.get("/health/llm")
-    assert set(r.json()) == {"checked_at", "stopped", "key", "mgmt_key", "drill", "ledger_ok", "upstream", "spent_usd",
-                             "ledger_usd", "estimated_usd", "key_spent_usd", "key_usage_usd", "total_usd", "ops_usd",
-                             "shares", "pending", "pending_stuck", "cost_unknown_24h", "provider_mismatch_24h",
-                             "account_remaining_usd", "models"}
+    assert set(r.json()) == {"checked_at", "config_error", "stopped", "key", "mgmt_key", "drill", "ledger_ok", "upstream",
+                             "spent_usd", "reserved_usd", "ledger_usd", "estimated_usd", "key_spent_usd", "key_usage_usd",
+                             "total_usd", "ops_usd", "shares", "pending", "pending_stuck", "cost_unknown_24h",
+                             "provider_mismatch_24h", "account_remaining_usd", "models"}
     assert set(r.json()["upstream"]) == {"state", "text", "since"}
     assert not any(s in r.text for s in (LLM_TOKEN, "test-openrouter-key", "student-01"))
 
@@ -1998,19 +2337,34 @@ def test_log_line_without_content(tmp_path, fake_or, capfd):
 
 # core/tests/test_skeleton.py (+)
 def test_llm_settings_validation():
-    assert Settings.from_env({"LLM_MODELS": "z-ai/glm-5.3", "DRILL_LLM": "402"}).DRILL_LLM == "402"
-    assert Settings.from_env({}).LLM_MAX_BODY_BYTES == 1_048_576
+    assert LlmSettings.from_env({"LLM_MODELS": "z-ai/glm-5.3", "DRILL_LLM": "402"}).DRILL_LLM == "402"
+    assert LlmSettings.from_env({}).LLM_MAX_BODY_BYTES == 1_048_576
+    assert Settings.from_env({"LLM_MODELS": "openrouter/auto"})                # Settings Д3а поля LLM не читает
     for bad in ({"LLM_STATE": "off"}, {"DRILL_LLM": "403"}, {"LLM_MODELS": "openrouter/auto"},
                 {"LLM_MAX_TOKENS": "32000"}, {"LLM_TOTAL_USD": "0"}, {"OPENROUTER_BASE_URL": "ftp://x"},
                 {"LLM_MAX_BODY_BYTES": "8388608"}, {"LLM_CALLER_CONCURRENCY": "0"}, {"LLM_KEY_DEDICATED": "yes"}):
         with pytest.raises(ValueError):
-            Settings.from_env(bad)
+            LlmSettings.from_env(bad)
 
 def test_egress_targets_include_openrouter():
     cfg = BdrvConfig("h", 1433, "Runtime", "u", "p")
-    assert egress_targets(SETTINGS, cfg) == [("h", 1433), ("openrouter.ai", 443)]
-    local = replace(SETTINGS, OPENROUTER_BASE_URL="http://fake-openrouter:8080/api/v1")
+    assert egress_targets(LLM_SETTINGS, cfg) == [("h", 1433), ("openrouter.ai", 443)]
+    local = replace(LLM_SETTINGS, OPENROUTER_BASE_URL="http://fake-openrouter:8080/api/v1")
     assert egress_targets(local, cfg)[1] == ("fake-openrouter", 8080)
+
+@pytest.mark.parametrize("env,broken_tokens,reason", [
+    ({"LLM_MODELS": "openrouter/auto"}, False, "ошибка настройки: настройки: LLM_MODELS"),
+    ({}, True, "ошибка настройки: токены LLM не читаются")])
+def test_build_roles_llm_config_error_keeps_process(tmp_path, monkeypatch, env, broken_tokens, reason):   # раунд 2
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
+    tokens = tmp_path / "llm-tokens"
+    tokens.write_text("student-01 не-хеш\n" if broken_tokens else "")
+    monkeypatch.setenv("LLM_TOKENS_FILE", str(tokens))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    roles = {r.name: r for r in build_roles(settings)}                          # не бросает
+    assert set(roles) == {"data", "llm"} and roles["llm"].health()[1].startswith(reason)
+    assert not roles["data"].health()[1].startswith("ошибка настройки: настройки")   # служба данных своё не теряет
 ```
 
 `now_utc()` — помощник Д1/Д3а; `TOKEN` — токен данных Д3б; `c.portal` — портал
@@ -2054,7 +2408,11 @@ anyio у `TestClient` Starlette: `poll` идёт в цикле приложен�
 
     `fmt_total(x: float) -> str` — целое без дробной части (`$1000`).
   - `LLM_STALE_S = 180`, `ACCOUNT_WARN_USD = 20.0`, `DRIFT_WARN_USD = 1.0`,
-    `BUDGET_STEPS = (95, 80, 50)`
+    `BUDGET_STEPS = (95, 80, 50)`. Вывод `LLM_STALE_S` — комментарием над
+    константой, как у `HIST_STALE_S` Д3а: опрос раз в `LLM_POLL_S` (60 с), в
+    нём до двух запросов по `POLL_TIMEOUT_S` (15 с), такт сторожа 10 с и запас
+    60 с на медленный старт: 60 + 2 × 15 + 10 + 60 = 160 ≤ 180. Тест держит
+    неравенство;
   - `check_llm(component: str, title: str, url: str, now: datetime, timeout: float = NET_CHECK_TIMEOUT_S) -> Check` —
     первая подходящая строка. Порядок: сбои, затем «неизвестно», затем
     предупреждения о деньгах мимо учёта и о провайдере, и только в конце
@@ -2066,6 +2424,7 @@ anyio у `TestClient` Starlette: `poll` идёт в цикле приложен�
 |---|---|
 | нет соединения, таймаут, HTTP ≠ 200, не JSON | `fail` «LLM-прокси не отвечает» |
 | `stopped` | `fail` «LLM-прокси остановлен администратором» |
+| `config_error` не `null` | `fail` «ошибка настройки: {config_error}» (до 80 знаков; причина между тактами не меняется) |
 | `key == "missing"` | `fail` «нет ключа OpenRouter» |
 | `ledger_ok` ложно | `fail` «журнал вызовов не пишется» |
 | `spent_usd ≥ total_usd` | `fail` «бюджет {fmt_total} исчерпан — модель не отвечает» |
@@ -2082,9 +2441,14 @@ anyio у `TestClient` Starlette: `poll` идёт в цикле приложен�
 | `spent_usd / total_usd` больше 95, 80, 50 % (первый подходящий) | `warn` «израсходовано больше P % бюджета» |
 | иначе | `ok` `upstream.text` |
 
+  `spent_usd` здесь — без резервов идущих вызовов (Д4а-R11): полосы и
+  строка «бюджет исчерпан» не мигают на каждом открытии и закрытии вызова.
+
   `note` при разобранном JSON — всегда, по порядку:
   - «расход {fmt_usd(spent_usd)} из {fmt_total(total)}»;
-  - « · по оценке {fmt_usd(estimated_usd)}» при `estimated_usd > 0`;
+  - « · идёт на оценку {fmt_usd(reserved_usd)}» при `reserved_usd > 0`;
+  - « · по оценке {fmt_usd(estimated_usd − reserved_usd)}» при разности больше 0
+    (вызовы без цены, кроме идущих);
   - « · по ключу OpenRouter {fmt_usd(key_spent_usd)}», если не `null`;
   - « · отбор и проверки {fmt_usd(ops)}» при `ops_usd > 0`;
   - « · доля больше 80 %: N» при `shares.over_80 > 0`;
@@ -2100,9 +2464,10 @@ anyio у `TestClient` Starlette: `poll` идёт в цикле приложен�
 ```python
 # watchdog/tests/test_checks.py (+)
 def llm_obj(**kw):
-    base = {"checked_at": (T0 - timedelta(seconds=10)).isoformat(), "stopped": False, "key": "ok", "mgmt_key": "missing",
-            "drill": "", "ledger_ok": True, "upstream": {"state": "ok", "text": "OpenRouter отвечает", "since": None},
-            "spent_usd": 12.3456, "ledger_usd": 12.3456, "estimated_usd": 0.0, "key_spent_usd": None,
+    base = {"checked_at": (T0 - timedelta(seconds=10)).isoformat(), "config_error": None, "stopped": False, "key": "ok",
+            "mgmt_key": "missing", "drill": "", "ledger_ok": True,
+            "upstream": {"state": "ok", "text": "OpenRouter отвечает", "since": None},
+            "spent_usd": 12.3456, "reserved_usd": 0.0, "ledger_usd": 12.3456, "estimated_usd": 0.0, "key_spent_usd": None,
             "key_usage_usd": 12.3, "total_usd": 1000.0, "ops_usd": 0.0, "shares": {"over_80": 0, "spent": 0},
             "pending": 0, "pending_stuck": 0, "cost_unknown_24h": 0, "provider_mismatch_24h": 0,
             "account_remaining_usd": None, "models": ["z-ai/glm-5.3"]}
@@ -2112,7 +2477,7 @@ def up(state, text):
     return {"state": state, "text": text, "since": None}
 
 def spent(x, **kw):                                  # расход x по журналу, без оценок и сверки
-    return llm_obj(spent_usd=x, ledger_usd=x, **kw)
+    return llm_obj(**{"spent_usd": x, "ledger_usd": x, **kw})
 
 def llm(fake_core, obj):
     fake_core.set_llm(obj)
@@ -2144,6 +2509,11 @@ def test_llm_verdicts(fake_core):                                               
         (llm_obj(shares={"over_80": 2, "spent": 1}),
          ("ok", "OpenRouter отвечает", "расход $12.35 из $1000 · доля больше 80 %: 2 · доля исчерпана: 1")),
         (llm_obj(ledger_ok=False), ("fail", "журнал вызовов не пишется", "расход $12.35 из $1000")),
+        (llm_obj(config_error="токены LLM не читаются"),
+         ("fail", "ошибка настройки: токены LLM не читаются", "расход $12.35 из $1000")),
+        # резервы идущих вызовов полосу не двигают (раунд 2): $499.90 без резервов — ещё норма
+        (spent(499.9, reserved_usd=2.0, ledger_usd=501.9, estimated_usd=2.0),
+         ("ok", "OpenRouter отвечает", "расход $499.90 из $1000 · идёт на оценку $2.00")),
         (llm_obj(checked_at=(T0 - timedelta(seconds=200)).isoformat()),
          ("unknown", "LLM-прокси давно не опрашивал OpenRouter", "расход $12.35 из $1000")),
         (llm_obj(upstream=up("unreachable", "OpenRouter недоступен")),
@@ -2165,6 +2535,9 @@ def test_llm_verdicts(fake_core):                                               
     for obj, want in cases:
         r = llm(fake_core, obj)
         assert (r.state, r.detail, r.note) == want
+
+def test_llm_stale_rule():                                                      # вывод LLM_STALE_S, как у HIST_STALE_S
+    assert LLM_STALE_S >= 60 + 2 * 15 + 10 + 60                                  # LLM_POLL_S, 2 × POLL_TIMEOUT_S, такт, запас
 
 def test_llm_down_is_fail(fake_core):
     r = check_llm("llm", "LLM-прокси и бюджет", "http://127.0.0.1:9/health/llm", T0, timeout=0.5)
@@ -2322,8 +2695,11 @@ test('note without detail is still shown', async () => {
   сторож `:d4a`.
 - `test_core.py`:
   - «охрана выхода: разрешено 1 направление» → «разрешено 2 направления»;
-  - `test_egress_network_only_core` проверяет «в `pcbk-egress` только `core`»
-    по `prod_config()`, на живом тестовом стенде там ещё двойник.
+  - `test_egress_network_only_core` остаётся живой проверкой: в
+    `pcbk-egress` ровно `sorted(имена) == ["pcbk-core", "pcbk-test-openrouter"]`,
+    у `core` сети `pcbk-front` и `pcbk-egress`. «Только `core` по
+    `prod_config()`» уже проверяет `test_only_core_declares_egress` (Д3б),
+    его не трогаем.
 - `test_socket_proxy.py`: в `test_status_json_overall_ok` строк `absent` нет;
   строка `llm` — `ok`.
 
@@ -2440,7 +2816,9 @@ def test_openrouter_down_row(stack):                    # Review Focus 2; пос
     $1000 без сброса, `LLM_KEY_DEDICATED`; смена ключа — `rm -f`, запись,
     `docker compose up -d --no-build --force-recreate core` (без
     `--force-recreate` при прежнем окружении контейнер не пересоздаётся, а
-    привязанный файл — прежний inode);
+    привязанный файл — прежний inode). Сверка с `/key` после смены ключа
+    начинается заново: новая точка отсчёта у нового отпечатка, прошлый расход
+    нового ключа в бюджет не входит (Д4а-R13);
   - `llm-tokens`: как пересобрать из `*.llm-token`, новый студент — тоже
     «файл, затем `--force-recreate`»;
   - выключатель `LLM_STATE=stopped` и учение `DRILL_LLM=402`;
@@ -2503,7 +2881,11 @@ Expected: `11`; `444`, `400`. Токен `ops` — в `$JOB` без вывода
     (шаблон не пуст); `docker inspect pcbk-core | grep -c -F /run/secrets/openrouter.key` → не меньше `1`
     (конвейер читает `inspect`); `docker inspect pcbk-core | grep -c -F -f secrets/openrouter.key` → `0`;
   - память `core` меньше 70 % от 512 МиБ;
-  - время работы контейнеров Dify и мест не сброшено.
+  - время работы контейнеров Dify и мест не сброшено;
+  - ветка «ключ есть, денег нет» (шапка): вызов `luna.json` задачи 10 через
+    туннель токеном `ops` → 402, строка «сбой — на счёте OpenRouter кончились
+    деньги», снимок `00-money-out.png`. Так же — после каждого пересоздания
+    `core` в задаче 10.
 
   Откат:
   - вернуть `compose.yaml.d3b`;
@@ -2594,7 +2976,9 @@ chmod 0700 ~/pcbk-d4/llmrows
     `key_usage_usd` с задачи 1, шаг 2 (сверка с OpenRouter).
 
   Expected: не больше $0,05; оба числа расходятся не больше чем на цену
-  сырого потока задачи 1.
+  сырого потока задачи 1. При `LLM_KEY_DEDICATED=off` рост `key_usage_usd`
+  включает траты Dify: вердикт сверки — «не сверяется: ключ общий с Dify»,
+  число пишется только справочно.
 - [ ] **Step 7: Commit** (после проверки на секреты) — `git add docs/checks/ && git commit -m "Д4а: цена в потоке через прокси, два учения со снимками, денег на учения не потрачено"`.
 
 ---
@@ -2626,9 +3010,14 @@ chmod 0700 ~/pcbk-d4/llmrows
   Затем `git push origin main platform-d4a`. Чистый клон: снимки на месте,
   `(cd core && CORE_PYTEST)` проходит. Файлы `"$JOB"/ops-llm.*` и
   `"$JOB"/ops.hdr` остаются для Д4б, их удаляет его закрытие.
-- [ ] **Step 4: План и факт.** Строка в `docs/checks/D4a.md`: «план 13,7 ч /
-  факт Y ч по git». Y — от первого коммита ветки дня до тега:
-  `git log --reverse --format=%cI platform-d3b..platform-d4a | sed -n '1p;$p'`.
+- [ ] **Step 4: План и факт.** Две строки в `docs/checks/D4a.md`, помощники
+  `at`/`msg`/`pace` задачи 0, шаг 1a:
+  - темп кода до черты —
+    `pace "$(msg 'Серверный слой: один обработчик 422')" "$(msg 'LLM-прокси в компоновке')" 10.3`
+    (коммиты задач 2 и 8, между ними задачи 3–8 — 10,3 ч по шкале). Эту долю
+    берёт Д4б для правила «пересчитать до начала дня»;
+  - полное время дня — от `%aI` первого коммита задачи 0 до тега
+    `platform-d4a`, справочно: в него входят окно владельца и петля критика.
 - [ ] **Step 5: Владельцу** — «Д4а готов», снимки, сколько потрачено (по
   журналу и по `/key`). Вопросы — только требующие его решения: итог сырого
   потока, если он плохой; отдельный ключ и лимит $1000 без сброса, если их

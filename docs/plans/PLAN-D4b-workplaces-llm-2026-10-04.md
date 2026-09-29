@@ -2,6 +2,46 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Изменения по критике, раунд 2** (три критика Opus 5.5; блокеров ноль, здесь —
+major и дешёвые minor; находки о прокси правит Д4а). Находка → что поменялось:
+1. [major] `task` открыт в образе `:d4`: параллельные подагенты упирались в 3
+   вызова и в 16 шагов родителя → `"task": "deny"` в `opencode.json`, как
+   предполагает research/09 (задача 2, R20).
+2. [major] тест «без шторма повторов» не мог упасть: повтор отказа до
+   двойника не доходит → отказы считаются в журнале вызовов по сессии,
+   помощник `stack.llm_refusals` (задача 4).
+3. [major] `converse` не видел уточняющего вопроса модели (`question`) →
+   читает `/question` и `/permission` своей сессии, снимает их, отдаёт
+   `status: "asked"`; в таблице совместимости — «задала вопрос», не провал
+   п. 1, и один повтор с уточнением (задачи 4, 7).
+4. [major] основание темпа записано неверно → худшая доля по git — 0,30, часы
+   пересчитаны (шапка).
+5. [major] правило «пересчитать до начала дня» брало полное время Д4а с окном
+   и петлёй → берётся доля кода до черты из задачи 11 Д4а (шапка).
+6. [major] ветка Д4а «ключа нет» не была сшита с Д4б → ветка «ключа всё ещё
+   нет», ключ — в «Что нужно от владельца» и в строке Д4б дорожной карты, часы
+   хвостов Д4а в задаче 0 (шапка).
+7. [minor] сроки проверки здоровья → метка `-ge 50`, `read -t 3` как в Д2,
+   прогон ≤ 4,5 с, Review Focus 1 — «не позже 90 с», в R18 — два запроса с
+   401 на `connect` (задача 2, R18).
+8. [minor] требование R23 к Д5 без шага переноса → правка `PLAN-D5` в
+   закрытии (задача 8).
+9. [minor] сверка разговора без данных по абсолютным числам → по приращениям,
+   после того как у строк сессии нет `open`/`pending` (задача 6).
+10. [minor] нули до `.82` и `.84` без положительного контроля → пробы из
+    `pcbk-egress` (задача 4).
+11. [minor] у запрета `pcbk_*` не было положительного контроля, MCP-ресурсы
+    не проверялись → `mcp=connected` до разговора, тот же разговор без
+    запрета даёт `pcbk_tag_now`; ресурсов и подсказок у MCP службы нет — тест
+    (задачи 1, 4; R19).
+12. [minor] текст `busy` обещал повтор → «дождитесь и отправьте снова» (Д4а);
+    тест `busy` через OpenCode — в «Долг».
+13. [minor] серверные `converse` и `memwatch` описаны прозой → выписаны
+    `heredoc`-ом, `memwatch` читает cgroup (задача 6).
+14. [minor] живое условие сетей `core` в `test_core.py` упало бы → двенадцать
+    сетей и в живой проверке (задача 4).
+15. [minor] сверка `/key` при `LLM_KEY_DEDICATED=off` → «не сверяется» (задача 7).
+
 **Изменения по критике, раунд 1** (три критика Opus 5.5; находки о деньгах и
 прокси правит Д4а). Находка → что поменялось:
 1. [major] MCP переподключался через `dispose`: строка мигала, гонка с ходом
@@ -51,6 +91,10 @@
     — «внимание» (задача 3).
 
 **Долг** (осознанно не делаем в Д4б):
+- интеграционного теста «`pcbk_busy` через OpenCode» нет. На двойнике он не
+  детерминирован: повторы OpenCode через 2 с обычно успевают после короткого
+  вызова. Текст отказа и заголовок `Retry-After` проверяет модульный тест
+  Д4а `test_caller_concurrency_is_busy`;
 - отрицательный контроль `ip_forward` зондом с `NET_ADMIN` (маршрут через
   `.2`) — нет. Изоляция держится отсутствием маршрута у места, и это
   проверено; `ip_forward=0` проверяется настройкой (находка 15);
@@ -125,16 +169,16 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
 
 | Задача | Часы | Где |
 |---|---|---|
-| 0. Хвосты Д4а (второй раунд критика, слияние, перенесённое окно) | 0–0,5 | — |
-| 1. Служба данных перед подключением мест: нагрузка историана, ошибки инструментов, `returned` | 1,5 | локально |
-| 2. Образ места `:d4`; правка тестов образа Д2 под MCP | 1,5 | локально |
+| 0. Хвосты Д4а (второй раунд критика, слияние, перенесённое окно) | 0–0,5; в ветке «ключа всё ещё нет» после ключа — 1,6–2,1 (задачи 1 и 10 Д4а) | — |
+| 1. Служба данных перед подключением мест: нагрузка историана, ошибки инструментов, `returned`, у MCP нет ресурсов | 1,6 | локально |
+| 2. Образ места `:d4` (`task` закрыт); правка тестов образа Д2 под MCP | 1,6 | локально |
 | 3. Сторож: MCP мест и контейнер `core` | 1,0 | локально |
-| 4. Компоновка: `core` в сетях мест, токены данных, сквозной разговор | 2,25 | локально |
+| 4. Компоновка: `core` в сетях мест, токены данных, сквозной разговор, вопросы модели в `converse` | 2,6 | локально |
 | 5. Выкладка | 0,75 | сервер |
-| 6. Живые проверки (шаги 1–3 — без владельца, 4–5 — окно владельца) | 1,5 | сервер |
-| 7. Проверка совместимости семи моделей | 1,0 | сервер, **окно владельца** |
-| 8. Закрытие дня | 1,25 | — |
-| **Критический путь по плановой шкале** | **10,75** (с хвостами Д4а — до 11,25; до критики — 9,75) | |
+| 6. Живые проверки (шаги 1–3 — без владельца, 4–5 — окно владельца) | 1,6 | сервер |
+| 7. Проверка совместимости семи моделей | 1,1 | сервер, **окно владельца** |
+| 8. Закрытие дня | 1,35 | — |
+| **Критический путь по плановой шкале** | **11,6** (с хвостами Д4а — до 12,1; раунд 1 — 10,75; до критики — 9,75) | |
 
 **Окно владельца около 2 ч — вечером**, после задачи 6, шаги 1–3: задача 6,
 шаги 4–5 (разговор с числом из БДРВ, учение «`core` перезапущен» с проверкой
@@ -148,17 +192,22 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
    из описания тега для проверки совместимости; разговор и проверка
    совместимости — меньше $1 из $1000. Производственные данные читаются
    только при нём.
-2. Если по ветке Д4а «ключ есть, денег нет» счёт не пополнен — пополнить
+2. Ключ OpenRouter (отдельный, с лимитом $1000 без сброса), если его не дали
+   в Д4а, — до окна: он кладёт его сам (задача 9, шаг 1 Д4а). Без ключа
+   разговоры, §11 п. 4 и совместимость ждут.
+3. Если по ветке Д4а «ключ есть, денег нет» счёт не пополнен — пополнить
    до окна. Иначе разговоры и совместимость переносятся.
 
 **Основание «один день»** — как в Д4а: живой темп Д1/Д2/Д3а по git (доля
-0,14–0,25 плановой шкалы) и строка «план / факт» Д4а. По худшему темпу 10,75 ч
-— около 2,7 ч работы плюс окно. Если Д4а шёл хуже 0,5 плановой шкалы, план
-пересчитывается до начала дня.
+0,14–0,30 плановой шкалы, худшая — 0,30). По ней 11,6 ч — около 3,5 ч работы
+плюс окно. Правило пересчёта берёт долю кода Д4а до черты — первую строку
+«план / факт» задачи 11 Д4а (коммиты задач 2 и 8, 10,3 ч по шкале). Полное
+время дня Д4а с окном и петлёй критика для этого не годится. Если доля хуже
+0,5, план пересчитывается до начала дня, владельцу — строка с числами.
 
 **Черта отсечения — конец седьмого часа** плюс время хвостов Д4а. К черте
-зелёны задачи 1–4 и сделана выкладка (задача 5): по плановой шкале 7,0 ч, по
-живому темпу 1,2–1,8 ч. После черты порядок жёсткий: задача 6, шаги 1–3 (без
+зелёны задачи 1–4 и сделана выкладка (задача 5): по плановой шкале 7,55 ч, по
+доле 0,30 — ≈2,3 ч. После черты порядок жёсткий: задача 6, шаги 1–3 (без
 владельца) → окно владельца → задача 8.
 - **Задача 4 не зелёна к черте.** Выкладки нет. Видимый результат — снимки
   локального стенда (пометка «не на сервере»), способом Д3а:
@@ -179,8 +228,21 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
   учения MCP. При пустом счёте разговор шага 2 не делается, в снимке — строка
   «сбой — на счёте OpenRouter кончились деньги». Разговор с числом и
   совместимость ждут окна, владельцу уходит строка о сдвиге.
+- **Ключа всё ещё нет** (ветка Д4а «ключа сегодня нет», ключ и к Д4б не дан).
+  Задачи 1–5, шаги 1 и 3 задачи 6 идут. Прокси отвечает 403
+  `pcbk_key_missing`, поэтому разговор без данных (шаг 2) невозможен. Проверка
+  «ключа OpenRouter нет в месте» (шаг 1) даёт вердикт «не проверено — ключа
+  нет», а не «ключа нет»: критерий дня «неуспех 1» остаётся непроверенным.
+  Видимый результат — снимки учения MCP (шаг 3) и строки «LLM-прокси и бюджет
+  — сбой — нет ключа OpenRouter». §11 п. 4, разговоры и совместимость ждут
+  ключа, владельцу — строка тем же часом. Когда ключ появится, задача 0 берёт
+  задачи 1 и 10 Д4а (1,6–2,1 ч по шкале), затем шаги 1–2 задачи 6 заново.
 - **Модель не прошла п. 1–4 совместимости.** Это итог, а не сбой дня: в
   таблице — «не проходит», в финал Д8 идёт запасная из той же семёрки.
+- **Модель задала уточняющий вопрос** (`converse` → `status: "asked"`). Это не
+  провал п. 1: пометка «задала вопрос» и один повтор прогона с дополнением
+  «если подходят несколько тегов — возьми первый, не переспрашивай». Цена
+  повтора входит в потолок $1.
 
 ## Global Constraints
 
@@ -222,7 +284,8 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
   удаляется в конце задачи 7.
 - **Проверка здоровья места** печатает код ответа и одно слово состояния MCP
   (`200 mcp=connected`), больше ничего. `POST /mcp/pcbk/connect` она вызывает
-  только при слове `failed` и не чаще раза в 60 с. `dispose` она не вызывает:
+  только при слове `failed` и не чаще раза в 60 с (метка старше 50 с при такте
+  30 с — ровно каждый второй такт). `dispose` она не вызывает:
   он пересоздаёт экземпляр, рвёт поток `/event` и оборвал бы идущий ход.
 - **Проверки секретов — с положительным контролем.** Перед каждым «ключа
   нет» или «чужого токена нет» (`grep -c -F -f <файл>` → `0`):
@@ -259,20 +322,29 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
 Уже подключённый MCP после перезапуска `core` работает и так: сервер MCP без
 сессий (stateless, Д3б), критик раунда 1 проверил это живьём. **Цена
 ошибки:** место с неверным токеном данных будет получать `connect` раз в
-минуту — это один запрос к `core` с отказом 401. Сторож показывает
-«внимание».
+минуту. Это два запроса к `core` с отказом 401 (POST StreamableHTTP, затем
+GET SSE), оба — события журнала Д3б. Сторож показывает «внимание».
 
 **Д4б-R19 — токен данных — свой файл места.** Токены
 `student-NN.data-token` отдельны от `llm-token` — это имена Д3б. Утёкший токен
 данных не тратит денег, утёкший токен LLM не читает историан. Заголовок MCP
 берёт файл через `{file:…}`, не через окружение: секреты контейнерам — только
-файлами.
+файлами. Ресурсов и подсказок у MCP службы данных нет, только инструменты
+`pcbk_*`. Поэтому встроенные `list_mcp_resources`, `read_mcp_resource` и
+`list_mcp_resource_templates` (их OpenCode сверяет с разрешением `read`, а не
+`pcbk_*`) данных не отдают. Держит это тест задачи 1.
 
 **Д4б-R20 — модели в образе.** В провайдере `pcbk` — все семь кандидатов
 (`@ai-sdk/openai-compatible`, research/08 §6). В провайдере `pcbk-or` — Gemini
 3.8 Flash и Claude Sonnet 5.5 через встроенный `@openrouter/ai-sdk-provider`:
 он возвращает `reasoning_details` с подписями, прокси пропускает их как есть
 (Д4а, задача 3). Модель по умолчанию — `pcbk/z-ai/glm-5.3` (главный кандидат).
+Инструмент `task` закрыт: `"task": "deny"` в `permission`. OpenCode прямо
+велит модели запускать подагентов параллельно (`tool/task.txt:13`,
+выполнение без предела, `processor.ts:585–588`). Открытый `task` упёрся бы в
+3 одновременных вызова места и в 16 шагов хода родителя, а research/09 (стр.
+103, 125, 850) исходит из закрытого `task`. Счёт подагента в ход родителя в
+прокси остаётся защитой (Д4а).
 У каждой модели `limit: {context: 131072, output: 16000}`. Окно 131 072, а не
 1 млн: каждый шаг пересылает весь разговор, поэтому раннее сжатие разговора —
 защита бюджета. Границей цены вызова окно не служит. OpenCode сверяет
@@ -335,7 +407,8 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
    - строка места — «внимание — нет связи со службой данных (MCP)» и не
      мигает: `unknown` после переподключения не появляется;
    - после подъёма `core` MCP переподключается сам (`POST /mcp/pcbk/connect`)
-     не позже чем через 2 минуты, экземпляр не пересоздаётся, вызов
+     не позже чем через 90 с (попытка — не реже раза в 60 с, новое слово —
+     на следующем такте, ≤ 30 с), экземпляр не пересоздаётся, вызов
      инструмента проходит.
 
    Тесты — задача 2, `test_health_reports_mcp_without_core`,
@@ -345,8 +418,10 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
 2. **Отказ прокси в чате — один раз, без шторма повторов.** Речь о пределе
    шагов и об исчерпанном бюджете. Ожидание: в ошибке сообщения — русский
    текст прокси, к двойнику ушло ровно 16 запросов с инструментами этой сессии
-   (отбор по `session_id` тела: заголовков клиента прокси не пересылает),
-   новых не появляется. Тесты — задача 4,
+   (отбор по `session_id` тела: заголовков клиента прокси не пересылает). Повтор
+   отказа до двойника не доходит — его видно только в журнале вызовов: через
+   15 с строк `pcbk_turn_limit` этой сессии ровно 1, `pcbk_budget_spent` — не
+   больше 2 (шаг и заголовок). Тесты — задача 4,
    `test_turn_limit_shown_in_chat_without_retry_storm`, `test_budget_message_in_chat`.
 3. **`core` в десяти сетях становится мостом:** из места А к `core` в чужой
    сети, в сеть выхода, к двойнику OpenRouter. Ожидание: достижим только свой
@@ -413,8 +488,9 @@ docs/checks/D4b.md, docs/checks/D4b/*.png
 
 - [ ] **Step 1:** Всё, что черта Д4а перенесла сюда:
   - второй раунд критика, слияние и тег `platform-d4a`;
-  - перенесённое окно владельца. Тогда первыми идут задача 1 и задачи 9–10
-    Д4а, их шагами и коммитами.
+  - перенесённое окно владельца или ключ, которого в Д4а не было (ветка
+    «ключа всё ещё нет»). Тогда первыми идут задача 1 и задачи 9–10 Д4а, их
+    шагами и коммитами.
 
   Expected: у каждого хвоста есть вердикт в `docs/checks/D4a.md`; прокси на
   сервере, «LLM-прокси и бюджет» в норме; ветка Д4б — от `main` после тега.
@@ -428,7 +504,8 @@ docs/checks/D4b.md, docs/checks/D4b/*.png
   `core/pcbk_core/data/events.py`, `core/pcbk_core/data/__init__.py`,
   `watchdog/pcbk_watchdog/checks.py`
 - Test: `core/tests/test_gate.py` (+2), `core/tests/test_service.py` (+2),
-  `core/tests/test_events.py` (+1), `watchdog/tests/test_checks.py` (+1)
+  `core/tests/test_events.py` (+1), `core/tests/test_mcp.py` (+1, клиент и
+  фикстура сессии MCP Д3б), `watchdog/tests/test_checks.py` (+1)
 
 **Interfaces:**
 - Consumes: `HistorianGate`, `GateRefused`, `HistorianError`, `FakeHistorian`,
@@ -528,6 +605,13 @@ def test_old_table_gets_returned_column(tmp_path):
     log.write(replace(E, returned=("20FAKE_001_PV",)))
     assert log.recent()[0].returned == ("20FAKE_001_PV",)
 
+# core/tests/test_mcp.py (+) — у MCP службы только инструменты (Д4б-R19)
+async def test_mcp_has_no_resources_or_prompts(mcp_session):                  # фикстура сессии MCP Д3б
+    assert (await mcp_session.list_resources()).resources == []
+    assert (await mcp_session.list_resource_templates()).resourceTemplates == []
+    assert (await mcp_session.list_prompts()).prompts == []
+    assert {t.name for t in (await mcp_session.list_tools()).tools} >= {"tag_now", "tag_period", "catalog_search"}
+
 # watchdog/tests/test_checks.py (+)
 def test_historian_load_rows(fake_core):
     gate = {"user_paused": False, "p95_ms": 100}
@@ -542,7 +626,7 @@ def test_historian_load_rows(fake_core):
         assert (r.state, r.detail, r.note) == want
 ```
 
-- [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_gate.py tests/test_service.py tests/test_events.py; cd ../watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_checks.py`. Expected: FAIL.
+- [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_gate.py tests/test_service.py tests/test_events.py tests/test_mcp.py; cd ../watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_checks.py`. Expected: FAIL.
 - [ ] **Step 3: Implement по интерфейсам и таблице.**
 - [ ] **Step 4: Run both suites** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/)`. Expected: PASS.
 - [ ] **Step 5: Commit** — `git add core/ watchdog/ && git commit -m "Служба данных перед местами: p95 и пауза после сроков подряд, ошибки инструментов на странице, returned в событиях поиска"`.
@@ -584,7 +668,7 @@ def test_historian_load_rows(fake_core):
   "snapshot": false,
   "enabled_providers": ["pcbk", "pcbk-or"],
   "model": "pcbk/z-ai/glm-5.3",
-  "permission": {"external_directory": "deny", "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}},
+  "permission": {"external_directory": "deny", "task": "deny", "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}},
   "provider": {
     "pcbk": {
       "npm": "@ai-sdk/openai-compatible",
@@ -620,23 +704,31 @@ def test_historian_load_rows(fake_core):
 }
 ```
 
+  `"task": "deny"` убирает инструмент `task` из запроса к модели
+  (`Permission.disabled`, правило с шаблоном `*`). `PERMISSION` в
+  `test_student_image.py` Д2 дополняется тем же ключом: с ним сверяет
+  `test_external_read_refused_without_asking` (`out["permission"] == PERMISSION`).
   `baseURL` Д2 не меняется. Глобальный `opencode.json` OpenCode читает один раз
   (Д2), поэтому места пересоздаются, а не перечитывают его. Разрешение
   `pcbk_save_agent: deny` добавит Д7 вместе с самим инструментом.
 - Produces (`student/pcbk-health`) — порядок и сроки:
-  1. `GET /agent`, как в Д2 (`read -t 2`); не 200 — печатается код, выход 1.
+  1. `GET /agent`, как в Д2 (`read -r -t 3`, `student/pcbk-health:11`); не
+     200 — печатается код, выход 1.
   2. `GET /mcp` (`read -t 1`, ответ целиком). Слово — `status` у `pcbk` по
      регулярке `"pcbk":\{"status":"([a-z_]+)"`, иначе `unknown`. `unknown`
      бывает только в первые секунды после старта: первый `GET /mcp` ждёт
      ленивого подъёма MCP около 6 с.
-  3. Слово `failed`, а `/tmp/pcbk-mcp-retry` нет или он старше 60 с →
+  3. Слово `failed`, а `/tmp/pcbk-mcp-retry` нет или его возраст не меньше
+     50 с (такт проверки — 30 с: ровно каждый второй такт, раз в 60 с; при
+     «старше 60 с» такт с возрастом ровно 60 с пропускался бы) →
      `touch /tmp/pcbk-mcp-retry` и `POST /mcp/pcbk/connect` (`read -t 0.4`,
      ответ не ждётся: обрыв клиента `connect` не прерывает). Проверки простоя
      нет: `connect` меняет клиента одного MCP и экземпляр не трогает
      (Д4б-R18).
   4. Печатается `200 mcp=<слово>`, выход 0.
 
-  Весь прогон — не дольше 4 с, stderr пуст, пароля в выводе нет. Ни
+  Весь прогон — не дольше 4,5 с (3 + 1 + 0,4), срок `HEALTHCHECK` — 5 с;
+  stderr пуст, пароля в выводе нет. Ни
   `dispose`, ни путей `/instance…` в скрипте нет. Новый договор вывода: код и
   одно слово, а не только код (Д2).
 - `workplace.py`: `MODELS` — семь имён в порядке `select_models("")`;
@@ -648,6 +740,7 @@ def test_historian_load_rows(fake_core):
 # tests/integration/test_student_image.py (правки)
 MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True, "oauth": False,
                 "headers": {"Authorization": "Bearer {file:/run/secrets/data-token}"}}}
+# PERMISSION Д2 — плюс "task": "deny" (Д4б-R20)
 LIMIT = {"limit": {"context": 131072, "output": 16000}}
 
 def test_config_files():
@@ -695,6 +788,7 @@ def test_workplace_config_lists_same_models():                                  
     assert list(cfg["provider"]["pcbk"]["models"]) == list(select_models(""))
     assert set(cfg["provider"]["pcbk-or"]["models"]) <= set(select_models(""))
     assert cfg["model"].split("/", 1)[1] in select_models("")
+    assert cfg["permission"]["task"] == "deny"                                  # подагентов нет (Д4б-R20)
 ```
 
 `run_place(tmp_path, network, config=None) -> str` — помощник в
@@ -850,6 +944,10 @@ x-student: &student
       ```
     - `data_event_count(caller: str, channel: str) -> int` — тем же
       способом `SELECT COUNT(*)` (для «данные не читались»);
+    - `llm_refusals(session: str, code: str) -> int` — тем же способом, что
+      `llm_calls` Д4а: `SELECT COUNT(*) FROM llm_calls WHERE session = ? AND code = ?`.
+      Повтор отказа OpenCode шлёт в прокси, а прокси снова отказывает и в
+      двойник его не пересылает: шторм повторов видно только здесь;
     - `converse(n: int, question: str, *, model: str | None = None, tools: dict[str, bool] | None = None, timeout: float = 180.0, host: str | None = None, pw_file: Path | None = None) -> dict`.
 
   Как работает `converse`:
@@ -869,13 +967,21 @@ x-student: &student
      закрывает инструменты MCP на эту сессию: правило `deny` с шаблоном
      (`session/prompt.ts:1061–1067`), и такие инструменты не уходят в запрос
      к модели (`Permission.disabled` в `session/llm/request.ts:208–213`).
-  4. Раз в секунду до `timeout_s`: `GET /session/status` и
-     `GET /session/{id}/message`. Конец — сессии нет в статусе, а у
-     последнего сообщения ассистента есть `time.completed` или `error`.
-  5. Печатает один JSON: `session`, `status` (`done` | `timeout`),
-     `final_text` (текст последнего сообщения ассистента), `error` (его
-     `info.error` или `null`), `tools` (`[{tool, status, output}]` по всем
-     частям-инструментам хода), `assistant_messages`.
+  4. Раз в секунду до `timeout_s`: `GET /session/status`,
+     `GET /session/{id}/message`, `GET /question` и `GET /permission`.
+     Висящие вопрос и запрос разрешения своей сессии (отбор по `sessionID`)
+     снимаются: `POST /question/{id}/reject`,
+     `POST /permission/{id}/reply` с `{"reply": "reject"}`. Каждый снятый
+     попадает в `asked` как `{kind: "question" | "permission", tool}` — без
+     текста вопроса. Иначе ход с вопросом модели (`question.ask` ждёт
+     ответа, `tool/question.ts`; у `build` — `question: "allow"`,
+     `agent/agent.ts:148`) висел бы до срока. Конец — сессии нет в статусе, а
+     у последнего сообщения ассистента есть `time.completed` или `error`.
+  5. Печатает один JSON: `session`, `status` (`done` | `asked` | `timeout`;
+     `asked` — ход кончился, но по пути были снятые вопросы или разрешения),
+     `asked`, `final_text` (текст последнего сообщения ассистента), `error`
+     (его `info.error` или `null`), `tools` (`[{tool, status, output}]` по
+     всем частям-инструментам хода), `assistant_messages`.
 - `workplace.py`: `MOUNTS` — плюс `/run/secrets/data-token`.
 - `test_students.py`:
   - `test_each_workplace_uses_own_objects` — шесть источников, секреты
@@ -893,7 +999,10 @@ x-student: &student
 - `test_edge.py`: `IMAGES` — `core`, сторож `:d4b`, место `:d4`;
   `DECLARED_ENV["pcbk-core"]` + `LLM_TOTAL_USD` (только тестовый стенд).
 - `test_core.py`: у `pcbk-core` в `prod_config()` двенадцать сетей, в
-  `pcbk-stu-NN` — адрес `.2`.
+  `pcbk-stu-NN` — адрес `.2`. Живое условие `test_egress_network_only_core`
+  — тоже двенадцать: сети `pcbk-core` — `pcbk-front`, `pcbk-egress` и десять
+  `pcbk-stu-NN` (было две); в `pcbk-egress` по-прежнему `pcbk-core` и
+  двойник (Д4а).
 - `deploy/README.md`:
   - токены данных мест и `core-tokens`;
   - пересоздание мест с сохранением томов;
@@ -921,6 +1030,8 @@ def test_place_reaches_only_core(stack, place01):                              #
     stu = stack.stu_net
     assert stack.probe("pcbk-stu-01", f"{stu}.1.2", 8000) == 1                   # положительный контроль
     assert stack.probe("pcbk-stu-02", f"{stu}.2.2", 8000) == 1                   # .2.2 жив — ноль ниже не пустой
+    assert stack.probe("pcbk-egress", "172.31.250.82", 8000) == 1               # core в сети выхода жив
+    assert stack.probe("pcbk-egress", "172.31.250.84", 8080) == 1               # двойник OpenRouter жив
     for addr, port in ((f"{stu}.2.2", 8000), ("172.31.250.82", 8000), ("172.31.250.84", 8080)):
         assert stack.probe("pcbk-stu-01", addr, port) == 0, addr                 # держит отсутствие маршрута
     assert stack.inspect("pcbk-core")["HostConfig"]["Sysctls"]["net.ipv4.ip_forward"] == "0"   # второй слой
@@ -939,19 +1050,32 @@ def test_conversation_tool_via_mcp_and_cost(stack, place01):                    
     assert (e["caller"], e["channel"], e["tool"]) == ("student-01", "mcp", "tag_now")
 
 def test_conversation_without_tools_reads_no_data(stack, place01):             # задача 6, шаг 2 — тот же способ
+    def tool_names(session):
+        return {t["function"]["name"] for r in stack.fake_requests()
+                if r["body"].get("session_id") == f"student-01:{session}" for t in r["body"].get("tools", [])}
+    assert "mcp=connected" in stack.health_output("pcbk-student-01")            # иначе запрет проверял бы пустоту
+    control = stack.converse(1, "Ответь одним словом: да")                       # положительный контроль: без запрета
+    assert "pcbk_tag_now" in tool_names(control["session"])
     before = stack.data_event_count("student-01", "mcp")
     out = stack.converse(1, "Ответь одним словом: да", tools={"pcbk_*": False})
     assert out["status"] == "done" and not [t for t in out["tools"] if t["tool"].startswith("pcbk_")]
+    names = tool_names(out["session"])
+    assert "read" in names and not {n for n in names if n.startswith("pcbk_")}  # запрет снял только pcbk_*
     assert stack.data_event_count("student-01", "mcp") == before                # к данным не ходили
-    sent = [r["body"] for r in stack.fake_requests() if r["body"].get("session_id") == f"student-01:{out['session']}"]
-    assert sent and not any(t["function"]["name"].startswith("pcbk_") for b in sent for t in b.get("tools", []))
+
+def test_model_question_is_rejected_and_reported(stack, place01):               # раунд 2: уточняющий вопрос модели
+    out = stack.converse(1, "FAKEASK какой тег?", timeout=60)
+    assert out["status"] == "asked" and out["asked"] == [{"kind": "question", "tool": "question"}]
+    assert stack.oc(1, "GET", "/question", 1)[1].strip() == "[]"               # висящих вопросов нет
+    assert json.loads(stack.oc(1, "GET", "/session/status", 1)[1]).get(out["session"]) is None   # сессия не busy
 
 def test_turn_limit_shown_in_chat_without_retry_storm(stack, place01):          # Review Focus 2
     out = stack.converse(1, "FAKELOOP собери всё", timeout=240)
     assert len(tool_requests(stack, out["session"])) == 16
     assert "Предел шагов на ответ" in json.dumps(out["error"], ensure_ascii=False)
-    time.sleep(15)
-    assert len(tool_requests(stack, out["session"])) == 16                        # повторов нет
+    time.sleep(15)                                                                # первый повтор OpenCode — через 2 с
+    assert len(tool_requests(stack, out["session"])) == 16
+    assert stack.llm_refusals(out["session"], "pcbk_turn_limit") == 1            # повторов нет: их видно только в журнале
 
 def test_budget_message_in_chat(stack, place01):                                # Review Focus 2
     stack.recreate("core", {"LLM_TOTAL_USD": "0.001"})                            # в бюджет упрётся первый или второй вызов хода
@@ -959,6 +1083,8 @@ def test_budget_message_in_chat(stack, place01):                                
         wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-01"), timeout=90)
         out = stack.converse(1, Q)
         assert "Общий бюджет стенда на модель" in json.dumps(out["error"], ensure_ascii=False)
+        time.sleep(15)
+        assert stack.llm_refusals(out["session"], "pcbk_budget_spent") <= 2       # шаг и заголовок, без повторов
     finally:
         stack.recreate("core", {})
 
@@ -1069,15 +1195,47 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
 - `probe`, `oc`, `ocpid` (Д2) копируются из `$JOB` в начале задачи: Д2
   удалил свой каталог;
 - `llmrows` (Д4а) уже там;
-- новый `converse NN REQ.json [PWFILE] [HOST]` запускает одноразовый
+- новые `converse` и `memwatch` — выписаны ниже, копируются в `~/pcbk-d4/`
+  (`0700`). `converse NN REQ.json [PWFILE] [HOST]` запускает одноразовый
   `pcbk-reserve/student:d4` под `runsc` в сети места NN, как
   `stack.converse`. `HOST` — адрес OpenCode, по умолчанию `$STU.NN.3`
-  (задаче 7 нужен `$STU.1.9` места `ops`). Файл `converse.js` копируется из
-  `tests/integration/`. С хоста до мест пути нет (у мостов мест нет адреса
-  хоста, `docs/checks/D2.md`), поэтому разговор идёт только из сети места;
-- новый `memwatch NAME OUT` — раз в секунду
-  `docker stats --no-stream --format '{{.MemUsage}}' NAME` и `pids.current`
-  cgroup места в файл `OUT`, пока не убит; в журнал идёт только максимум.
+  (задаче 7 нужен `$STU.1.9` места `ops`). С хоста до мест пути нет (у мостов
+  мест нет адреса хоста, `docs/checks/D2.md`), поэтому разговор идёт только из
+  сети места. `REQ.json` — `{"question", "model"?, "tools"?, "timeout_s"?}`,
+  `url` дописывает сам `converse`. `memwatch NAME OUT` раз в секунду читает
+  `memory.current` и `pids.current` cgroup контейнера (путь — как в Д2:
+  `/sys/fs/cgroup/system.slice/docker-<id>.scope/`); `docker stats` на это не
+  годится, он сам идёт около 2 с. В журнал идёт только максимум.
+
+```bash
+cat > ~/pcbk-d4/converse <<'EOF'
+#!/bin/sh
+# converse NN REQ.json [PWFILE] [HOST] — разговор через API OpenCode из сети места NN; печатает JSON converse.js
+set -eu
+nn=$1; req=$2; pw=${3:-/opt/pcbk-reserve/secrets/student-$nn.pw}; stu=${STU_NET:?STU_NET не задан}
+host=${4:-$stu.$((10#$nn)).3}
+tmp=$(mktemp -d ~/pcbk-d4/conv.XXXXXX); trap 'rm -rf "$tmp"' EXIT
+python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); r["url"] = "http://" + sys.argv[2] + ":4096"; json.dump(r, open(sys.argv[3], "w"))' "$req" "$host" "$tmp/req.json"
+chmod 0444 "$tmp/req.json"
+exec docker run --rm --pull never --runtime=runsc --network "pcbk-stu-$nn" --label pcbk.oneshot=converse \
+  --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+  --memory 512m --pids-limit 256 --tmpfs /tmp:exec,mode=1777,size=64m \
+  -e BUN_BE_BUN=1 --entrypoint /usr/local/bin/opencode \
+  -v ~/pcbk-d4/converse.js:/app/converse.js:ro -v "$pw":/pw:ro -v "$tmp/req.json":/req.json:ro \
+  pcbk-reserve/student:d4 /app/converse.js
+EOF
+cat > ~/pcbk-d4/memwatch <<'EOF'
+#!/bin/sh
+# memwatch NAME OUT — раз в секунду «unix-время memory.current pids.current» cgroup контейнера, пока не убит
+cg=/sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' "$1").scope
+while :; do echo "$(date +%s) $(cat "$cg/memory.current") $(cat "$cg/pids.current")" >> "$2"; sleep 1; done
+EOF
+chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
+```
+
+  Максимум — `sort -k2,2n OUT | tail -1` и `sort -k3,3n OUT | tail -1`, в МиБ
+  и потоках. Пароль и токены идут в контейнер только файлами `:ro`;
+  `docker inspect` одноразового контейнера их не содержит.
 
 Файлы запросов пишутся в `$JOB` и копируются `scp` в `~/pcbk-d4/`, ответы
 возвращаются в `$JOB`; на сервере всё удаляет закрытие.
@@ -1113,11 +1271,13 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
 - [ ] **Step 2: Разговор без данных — §11 п. 4 через OpenCode (без
   владельца).** Вопрос `{"question": "Ответь одним словом: да", "tools": {"pcbk_*": false}}`
   — в `$JOB/q0.json`, копия — в `~/pcbk-d4/`. Инструменты MCP закрыты на эту
-  сессию: производственные данные не читаются. До разговора —
-  `spent_usd` с `/health/llm` и число событий `student-01`/`mcp` в журнале
-  событий (`stack.data_event_count` тем же однострочником). Во время
-  разговора — `memwatch pcbk-student-01 ~/pcbk-d4/mem0`.
-  `converse 01 ~/pcbk-d4/q0.json > ~/pcbk-d4/conv0.json`, копия — в `$JOB`.
+  сессию: производственные данные не читаются. До разговора — `mcp=connected`
+  в выводе здоровья места 01 (иначе запрет проверял бы пустоту), `spent_usd`
+  и `estimated_usd` с `/health/llm` и число событий `student-01`/`mcp` в
+  журнале событий (`stack.data_event_count` тем же однострочником).
+  `~/pcbk-d4/memwatch pcbk-student-01 ~/pcbk-d4/mem0 & MW=$!`, затем
+  `~/pcbk-d4/converse 01 ~/pcbk-d4/q0.json > ~/pcbk-d4/conv0.json; kill $MW`,
+  копия ответа — в `$JOB`.
   Expected:
   - `status done`, в `tools` нет `pcbk_*`;
   - событий `student-01`/`mcp` столько же, сколько до разговора — к данным
@@ -1125,8 +1285,13 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
     владельца», владельцу тем же часом;
   - `llmrows` по `session` из `conv0.json`: у всех строк
     `cost_source stream`, `cost > 0`, `provider_ok 1`, `caller student-01`;
-    строки `step = 0` (заголовок разговора) тоже с ценой;
-  - `spent_usd` вырос ровно на сумму их `cost`, `estimated_usd` = 0;
+    строки `step = 0` (заголовок разговора) тоже с ценой. Заголовок OpenCode
+    идёт фоном и может закончиться позже хода (`session/prompt.ts:1133–1139`):
+    сверка — после того как у строк сессии нет `open` и `pending`
+    (`llmrows` раз в 5 с, до 60 с);
+  - приращения, а не абсолютные числа: `spent_usd` вырос ровно на сумму
+    `cost` строк сессии, `estimated_usd` не изменился (в нём могут остаться
+    `unknown` Д4а);
   - снимок страницы с расходом — `01-spend.png`.
 - [ ] **Step 3: Учение «место поднято без `core`» (без владельца).**
   1. `docker stop pcbk-core; docker start pcbk-student-02`.
@@ -1143,8 +1308,11 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
      `probe-out/` закрытие Д3б удалило.
   2. Вопрос `{"question": "Что сейчас по тегу <тег>?"}` — в `$JOB/q.json`,
      копия — в `~/pcbk-d4/`.
-  3. `memwatch pcbk-student-01 ~/pcbk-d4/mem1 &`, затем
-     `converse 01 ~/pcbk-d4/q.json > ~/pcbk-d4/conv.json`, копия — в `$JOB`.
+  3. `~/pcbk-d4/memwatch pcbk-student-01 ~/pcbk-d4/mem1 & MW=$!`, затем
+     `~/pcbk-d4/converse 01 ~/pcbk-d4/q.json > ~/pcbk-d4/conv.json; kill $MW`,
+     копия — в `$JOB`. `status asked` — модель переспросила: вердикт «задала
+     вопрос», один повтор с дополнением «если подходят несколько тегов —
+     возьми первый, не переспрашивай».
      Сразу за ним — `tag_now` того же тега через туннель токеном `ops`:
      `$JOB/direct.json`, не позже 15 с — срок кэша `tag_now` в Д3б.
 
@@ -1213,7 +1381,8 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
   2. Флаги и лимиты — как у мест Д2 (`x-student` в `compose.yaml`): на
      сервере рядом работает Dify, а swap там 4 ГиБ (`docs/checks/D2.md`):
      `docker run -d --rm --name pcbk-ops-place --label pcbk.oneshot=ops --runtime=runsc --user 10001:10001 --init --ipc private --memory 1g --memory-swap 1g --cpus 1.0 --pids-limit 512 --network pcbk-stu-01 --ip $STU.1.9 --add-host core:$STU.1.2 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:exec,mode=1777,size=256m --tmpfs /var/lib/opencode:exec,uid=10001,gid=10001 --tmpfs /work:uid=10001,gid=10001 -v ~/pcbk-d4/opsplace/pw:/run/secrets/opencode-pw:ro -v ~/pcbk-d4/opsplace/llm-token:/run/secrets/llm-token:ro -v ~/pcbk-d4/opsplace/data-token:/run/secrets/data-token:ro pcbk-reserve/student:d4`.
-  3. `memwatch pcbk-ops-place ~/pcbk-d4/mem-ops &` — на всё время прогонов.
+  3. `~/pcbk-d4/memwatch pcbk-ops-place ~/pcbk-d4/mem-ops & MWOPS=$!` — на
+     всё время прогонов (`kill $MWOPS` в шаге 5).
 
   Expected: `healthy`, `mcp=connected`;
   `docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.PidsLimit}}' pcbk-ops-place`
@@ -1232,6 +1401,11 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
   - После каждого прогона — `ops_usd` и `estimated_usd`. Если сумма подошла
     к потолку, прокси остановит сам, и оставшиеся прогоны отмечаются «не
     прогнано: потолок».
+  - `status asked` — модель переспросила: вопрос многозначен по построению
+    (`catalog_search` отдаёт до 50 имён), и уточнить — разумное поведение.
+    `converse` снял вопрос, ход кончился. Один повтор прогона — с
+    дополнением к вопросу «если подходят несколько тегов — возьми первый, не
+    переспрашивай». Цена повтора входит в потолок $1.
 - [ ] **Step 4: Таблица.** По каждому прогону — вывод `converse` и `llmrows`
   по его `session`. Обращения берутся по столбцу `step` журнала вызовов, а не
   по порядку. Первым в каждой сессии OpenCode идёт заголовок разговора — без
@@ -1249,12 +1423,14 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
      «урезать встроенные инструменты через `permission`» для Д7/Д8.
 
   Столбец «обращений» — строки `step ≥ 1`; служебные (`step = 0`: заголовок,
-  сжатие) — отдельным числом в скобках.
+  сжатие) — отдельным числом в скобках. Столбец «вопрос» — «задала вопрос»,
+  если первый прогон вернул `asked`: это не провал п. 1, пункты 1–6 берутся по
+  повтору.
 
   В `docs/checks/D4b.md` — таблица без имён тегов и значений:
 
-  | Модель | Провайдер OpenCode | 1 цикл | 2 цена в потоке | 3 кэш | 4 провайдер | 5 русский и число | 6 вход, тыс. | обращений | цена прогона | вердикт |
-  |---|---|---|---|---|---|---|---|---|---|---|
+  | Модель | Провайдер OpenCode | вопрос | 1 цикл | 2 цена в потоке | 3 кэш | 4 провайдер | 5 русский и число | 6 вход, тыс. | обращений | цена прогона | вердикт |
+  |---|---|---|---|---|---|---|---|---|---|---|---|
 
   Вердикт по research/08 §8: «проходит» — пункты 1–4 выполнены; «не проходит
   (п. N)»; для Gemini и Claude — какой провайдер OpenCode годится. Решение о
@@ -1262,8 +1438,8 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
   Д7/Д8: примет ли модель сообщение ассистента последним (подсказка OpenCode о
   шагах, research/09 §9 п. 4) — у агента по умолчанию предела шагов нет.
 - [ ] **Step 5: Уборка.**
-  - `docker rm -f pcbk-ops-place`; `memwatch` остановлен, максимум `mem-ops`
-    — в журнал;
+  - `docker rm -f pcbk-ops-place`; `kill $MWOPS`, максимум `mem-ops` — в
+    журнал;
   - `rm -rf ~/pcbk-d4/opsplace ~/pcbk-d4/conv.json ~/pcbk-d4/conv0.json ~/pcbk-d4/mem*`;
   - дождаться, пока у строк `ops` не останется `pending` (до 10 минут), затем
     `docker compose up -d --no-build --force-recreate core` —
@@ -1276,7 +1452,8 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
 
   Expected: X меньше $1; K не больше X + $0,05 (иначе — строка владельцу:
   OpenRouter насчитал больше учёта); `docker ps -a --filter name=pcbk-ops`
-  пусто.
+  пусто. При `LLM_KEY_DEDICATED=off` K включает траты Dify: вердикт сверки —
+  «не сверяется: ключ общий с Dify», K пишется только справочно.
 - [ ] **Step 6: Commit** (после проверки на секреты) — `git add docs/checks/D4b.md && git commit -m "Д4б: совместимость семи моделей через OpenCode и прокси — таблица, меньше \$1"`.
 
 ---
@@ -1295,6 +1472,11 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
   - `docs/PLAN-platform-2026-09-29.md`: строка Д4б — «готово»; строка Д8 —
     «финалисты — по таблице Д4б».
   - `README.md`: «Д4 готов (Д4а и Д4б)», дальше Д5.
+  - `docs/plans/PLAN-D5-gateway-2026-10-05.md` — требование Д4б-R23:
+    строка Global Constraints и тест шлюза. Из сети места `/pcbk/api/*` → 404
+    (отдельный порт шлюза или проверка адреса назначения); `/health/llm` из
+    сети места — без `account_remaining_usd`, `key_usage_usd` и
+    `key_spent_usd`. Без этой правки долг «до Д5» пережил бы Д5.
 - [ ] **Step 2: Критик** (Opus 5.5); петля — до нуля блокеров, число раундов владелец не ограничил (29.09, «Не лимитирую LOOP»).
 - [ ] **Step 3: Слияние.** В `main`, тег `platform-d4b`. Перед пушем:
   - проверка на секреты по ветке;
@@ -1304,9 +1486,13 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
   `~/pcbk-d4/` и `~/pcbk-d4b-before.txt`; в `$JOB` — `ops-llm.*`, `ops.hdr`,
   `q.json`, `q0.json`, `compat.json`, `direct.json`, `conv.json`, `conv0.json`
   и вывод прогонов.
-- [ ] **Step 4: План и факт.** Строка «план 10,75 ч / факт Y ч по git» в
-  `docs/checks/D4b.md`
-  (`git log --reverse --format=%cI platform-d4a..platform-d4b | sed -n '1p;$p'`).
+- [ ] **Step 4: План и факт.** Две строки в `docs/checks/D4b.md`, помощники
+  `msg`/`pace` задачи 0, шаг 1a Д4а:
+  - темп кода до черты —
+    `pace "$(msg 'Служба данных перед местами')" "$(msg 'Выкладка Д4б')" 5.95`
+    (коммиты задач 1 и 5, между ними задачи 2–5 — 5,95 ч по шкале);
+  - полное время дня — от `%aI` первого коммита ветки до тега
+    `platform-d4b`, справочно (окно владельца и петля критика внутри).
 - [ ] **Step 5: Владельцу** — «Д4 готов», снимки, строка «число совпало»,
   таблица совместимости, потрачено за Д4. Вопросы:
   - финалисты Д8 по таблице (research/08 §8 предлагает GLM-5.3, DeepSeek-V4.1-Flash,
