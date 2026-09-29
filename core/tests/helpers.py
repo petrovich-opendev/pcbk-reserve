@@ -2,6 +2,7 @@
 import atexit
 import hashlib
 import itertools
+import os
 import shutil
 import socket
 import subprocess
@@ -16,6 +17,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import anyio
+import pytest
 from fastapi import APIRouter, FastAPI
 
 from fakes import WHITELIST, FakeHistorian
@@ -46,6 +49,9 @@ atexit.register(shutil.rmtree, SESSION_DIR, ignore_errors=True)
 (SESSION_DIR / "core-tokens").write_text(f"student-01 {sha(TOKEN)}\n", encoding="utf-8")
 # настройки тестов строятся напрямую: проверки from_env на них не действуют
 SETTINGS = Settings(DB_PATH=str(SESSION_DIR / "core.db"), TOKENS_FILE=str(SESSION_DIR / "core-tokens"))
+
+# тесты, где права отнимает chmod: от root права каталога и файла не действуют
+non_root = pytest.mark.skipif(os.geteuid() == 0, reason="от root chmod не отнимает права")
 
 # пример события вызова: берут test_events.py и test_role.py (F16)
 EVENT = CallEvent(ts=datetime(2026, 10, 1, 7, tzinfo=timezone.utc), caller="student-01", agent=None,
@@ -130,6 +136,15 @@ def wait_until(pred: Callable[[], bool], timeout: float = 5) -> None:
         if time.monotonic() > end:
             raise AssertionError(f"условие не выполнилось за {timeout} с")
         time.sleep(0.01)
+
+
+async def wait_until_async(pred: Callable[[], bool], timeout: float = 5) -> None:
+    """Ждёт условия в цикле событий теста, отдавая его фоновым задачам; не дождался — AssertionError."""
+    end = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > end:
+            raise AssertionError(f"условие не выполнилось за {timeout} с")
+        await anyio.sleep(0.01)
 
 
 async def dummy(scope, receive, send):

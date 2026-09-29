@@ -2,12 +2,14 @@
 import json
 import sqlite3
 import threading
+import time
 from dataclasses import replace
 from typing import get_args
 
 from helpers import EVENT as E            # пример события — в helpers: его берёт и test_role.py (F16)
-from pcbk_core.data.events import (EVENTS_CHECK_S, OUTCOME_BY_CODE, CallEvent, EventLog, Outcome,
-                                   outcome_for)
+from helpers import non_root
+from pcbk_core.data.events import (AGENT_CHARS, EVENTS_CHECK_S, OUTCOME_BY_CODE, SUMMARY_CHARS, WRITE_TIMEOUT_S,
+                                   CallEvent, EventLog, Outcome, outcome_for)
 from pcbk_core.data.freshness import ERROR_TEXTS
 from pcbk_core.data.historian import ErrorCode
 
@@ -20,6 +22,7 @@ def test_event_roundtrip_newest_first(tmp_path):
     assert log.writable() is True
 
 
+@non_root
 def test_readonly_db_is_not_writable(tmp_path):
     d = tmp_path / "ro"; d.mkdir()
     log = EventLog(str(d / "core.db"))
@@ -28,6 +31,7 @@ def test_readonly_db_is_not_writable(tmp_path):
     assert log.writable() is False and log.last_error
 
 
+@non_root
 def test_open_failure_is_recorded_not_raised(tmp_path):         # F4, F23: том от root — причина, не падение
     d = tmp_path / "ro"; d.mkdir(); d.chmod(0o500)
     log = EventLog(str(d / "core.db"))
@@ -102,6 +106,7 @@ def test_write_failure_counts_raises_and_success_resets(tmp_path, monkeypatch):
     assert log.consecutive_failures == 0 and log.count() == 1
 
 
+@non_root
 def test_check_sets_writable_ok_and_recovers(tmp_path):
     d = tmp_path / "ro"; d.mkdir(); d.chmod(0o500)
     log = EventLog(str(d / "core.db"))
@@ -132,3 +137,39 @@ def test_threads_share_log_without_check_same_thread(tmp_path):
     for t in threads:
         t.join()
     assert errors == [] and log.count() == 20
+
+
+# --- доводка по ревью ---
+
+def test_lone_surrogate_is_escaped_not_lost(tmp_path):                          # I1
+    log = EventLog(str(tmp_path / "core.db"))
+    e = replace(E, requested=("20FAKE_001_PV", "x\ud800y"), agent="агент\udfff", summary="причина \ud800")
+    assert (e.requested[1], e.agent, e.summary) == ("x\\ud800y", "агент\\udfff", "причина \\ud800")
+    log.write(e)
+    assert log.recent() == [e] and log.consecutive_failures == 0
+
+
+def test_free_text_caps():                                                      # M3
+    e = replace(E, agent="a" * 300, summary="s" * 900, requested=["\ud800" * 40])
+    assert (len(e.agent), len(e.summary), AGENT_CHARS, SUMMARY_CHARS) == (128, 500, 128, 500)
+    assert e.requested == ("\\ud800" * 21 + "\\u",)                          # срез — после экранирования
+    assert replace(E, agent=None).agent is None
+
+
+def test_locked_db_fails_write_fast(tmp_path):                                  # M1: не дольше WRITE_TIMEOUT_S
+    log = EventLog(str(tmp_path / "core.db"))
+    log.open()
+    holder = sqlite3.connect(tmp_path / "core.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        t = time.monotonic()
+        try:
+            log.write(E)
+        except sqlite3.OperationalError:
+            pass
+        took = time.monotonic() - t
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert WRITE_TIMEOUT_S == 0.5 and took < WRITE_TIMEOUT_S + 1.0
+    assert log.consecutive_failures == 1 and "locked" in log.last_error

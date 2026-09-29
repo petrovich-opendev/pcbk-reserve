@@ -7,7 +7,12 @@
 Конструктор без ввода-вывода (F4): файл, WAL и схема — в open() в начале lifespan роли
 или при первой операции. Соединение — на каждую операцию, как у журнала сторожа Д1:
 журнал пишут и читают потоки uvicorn, TestClient и asyncio.to_thread. writable() — проба
-записи с ожиданием блокировки до SQLITE_TIMEOUT_S: в цикле событий её не зовут (F9).
+записи с ожиданием блокировки до SQLITE_TIMEOUT_S: в цикле событий её не зовут (F9). Запись
+события ждёт блокировку не дольше WRITE_TIMEOUT_S, как журнал вызовов Д4а: долгая блокировка —
+сбой записи со счётчиком, а не задержка вызова или опроса.
+
+Свободный текст события (requested, agent, summary) чистится на входе: одиночный суррогат
+из JSON вызывающего SQLite не закодирует, и событие-доказательство пропало бы.
 """
 import json
 import sqlite3
@@ -32,9 +37,12 @@ OUTCOME_BY_CODE: dict[str, Outcome] = {
     "no_rows": "unavailable", "no_tags": "unavailable", "catalog": "unavailable",
 }
 EVENTS_CHECK_S = 30.0          # период фоновой проверки записи
-SQLITE_TIMEOUT_S = 5.0         # ожидание блокировки SQLite
+SQLITE_TIMEOUT_S = 5.0         # ожидание блокировки SQLite: схема, проба записи, чтение
+WRITE_TIMEOUT_S = 0.5          # ожидание блокировки у записи события
 REQUESTED_LINES = 16
 REQUESTED_CHARS = 128
+AGENT_CHARS = 128
+SUMMARY_CHARS = 500
 ERROR_CHARS = 200              # last_error: класс и начало текста
 
 _COLUMNS = ("ts", "caller", "agent", "channel", "tool", "requested", "tags", "sent", "period_start",
@@ -74,13 +82,21 @@ def _why(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:ERROR_CHARS]
 
 
+def _text(value: object, limit: int) -> str:
+    """Строка, которую закодирует UTF-8: одиночный суррогат → «\\udXXX»; затем срез до limit."""
+    return str(value).encode("utf-8", "backslashreplace").decode("utf-8")[:limit]
+
+
 @dataclass(frozen=True)
 class CallEvent:
     """Один вызов инструмента или служебный опрос.
 
-    requested — сырой ввод, не больше 16 строк по 128 знаков (обрезается здесь); tags — канонические
-    имена со статусами ok, no_value, no_data (и у попадания в кэш); sent — имена, переданные драйверу:
-    ворота возвращают их и при отказе входа, когда SQL в историан не попал (F12).
+    requested — сырой ввод, не больше 16 строк по 128 знаков; tags — канонические имена со статусами
+    ok, no_value, no_data (и у попадания в кэш); sent — имена, переданные драйверу: ворота возвращают
+    их и при отказе входа, когда SQL в историан не попал (F12).
+
+    Свободный текст чистится здесь: суррогаты — в «\\udXXX», затем срез — requested 16 × 128,
+    agent 128, summary 500 знаков. tags и sent не трогаются: это имена из каталога и ворот.
     """
 
     ts: datetime
@@ -102,7 +118,9 @@ class CallEvent:
 
     def __post_init__(self) -> None:
         raw = (self.requested,) if isinstance(self.requested, str) else tuple(self.requested)[:REQUESTED_LINES]
-        object.__setattr__(self, "requested", tuple(str(r)[:REQUESTED_CHARS] for r in raw))
+        object.__setattr__(self, "requested", tuple(_text(r, REQUESTED_CHARS) for r in raw))
+        object.__setattr__(self, "agent", None if self.agent is None else _text(self.agent, AGENT_CHARS))
+        object.__setattr__(self, "summary", _text(self.summary, SUMMARY_CHARS))
         object.__setattr__(self, "tags", tuple(self.tags))
         object.__setattr__(self, "sent", tuple(self.sent))
 
@@ -138,9 +156,9 @@ class EventLog:
         self._state_lock = threading.Lock()
 
     @contextmanager
-    def _db(self) -> Iterator[sqlite3.Connection]:
+    def _db(self, timeout: float = SQLITE_TIMEOUT_S) -> Iterator[sqlite3.Connection]:
         # соединение на операцию: журнал пишут и читают разные потоки (check_same_thread)
-        db = sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_S)
+        db = sqlite3.connect(self.path, timeout=timeout)
         try:
             with db:
                 yield db
@@ -176,7 +194,7 @@ class EventLog:
                   json.dumps(list(e.sent), ensure_ascii=False),
                   None if e.start is None else e.start.isoformat(), None if e.end is None else e.end.isoformat(),
                   e.outcome, e.summary, float(e.cost), e.cache, int(e.rows), int(e.duration_ms))
-        with self._db() as db:
+        with self._db(WRITE_TIMEOUT_S) as db:
             db.execute(_INSERT, values)
 
     def write(self, e: CallEvent) -> None:

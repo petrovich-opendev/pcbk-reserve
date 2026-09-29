@@ -24,7 +24,7 @@ from ..settings import Settings
 from .catalog import Catalog
 from .events import EVENTS_CHECK_S, CallEvent, EventLog, Outcome, outcome_for
 from .freshness import ERROR_TEXTS, FreshnessTracker
-from .gate import GateRefused, HistorianGate
+from .gate import GateRefused, GateResult, HistorianGate
 from .historian import HistClock, HistorianError, QueryFn, parse_clock
 from .sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql
 
@@ -159,46 +159,51 @@ class DataRole(RoleBase):
         """
         began = asyncio.get_running_loop().time()
         tags = self.freshness_tags
-        sent: tuple[str, ...] = ()
-        rows = 0
         if not self.catalog.loaded:
             # у прочих отказов ворот (unlisted) своего текста нет: для людей это «каталог не загружен»
             code = self.catalog_error if self.catalog_error in ERROR_TEXTS else "catalog"
             self._fail(code, len(tags))
-            summary = f"без SQL: {code}"
+            outcome, summary, sent, rows = outcome_for(code), f"без SQL: {code}", (), 0
         elif not tags:
-            code = "no_tags"
-            self._fail(code, 0)
-            summary = f"без SQL: {code}"
+            self._fail("no_tags", 0)
+            outcome, summary, sent, rows = outcome_for("no_tags"), "без SQL: no_tags", (), 0
         else:
-            code, summary, sent, rows = await self._poll_tags(tags)
-        await self._system_event("freshness", "ok" if code is None else outcome_for(code), summary, sent, rows,
-                                 began)
+            outcome, summary, sent, rows = await self._poll_tags(tags)
+        await self._system_event("freshness", outcome, summary, sent, rows, began)
 
-    async def _poll_tags(self, tags: tuple[str, ...]) -> tuple[str | None, str, tuple[str, ...], int]:
-        """(код или None, summary, sent, строк Live)."""
+    async def _poll_tags(self, tags: tuple[str, ...]) -> tuple[Outcome, str, tuple[str, ...], int]:
+        """(исход, summary, sent, строк Live); sent — только от ворот: GateResult или HistorianError."""
         try:
             result = await self.gate.run([clock_sql(), live_sql(tags)], lane="background")
         except HistorianError as err:
             self._fail(err.code, len(tags))
-            return err.code, err.public(), err.sent, 0
+            return outcome_for(err.code), err.public(), err.sent, 0
         except GateRefused as err:
             # фоновое место занимает только загрузка каталога; её окно укладывается в HIST_STALE_S
             log.info("свежесть: опрос пропущен — ворота: %s", err.code)
-            return err.code, f"опрос пропущен — ворота: {err.code}", (), 0
+            return outcome_for(err.code), f"опрос пропущен — ворота: {err.code}", (), 0
+        try:
+            return self._observe(tags, result)
+        except Exception as exc:        # SQL уже ушёл: событие несёт sent ворот; текст исключения — не в журнал
+            log.error("свежесть: непредвиденный сбой опроса (%s)", type(exc).__name__)
+            return "error", f"непредвиденный сбой ({type(exc).__name__})", result.sent, 0
+
+    def _observe(self, tags: tuple[str, ...], result: GateResult) -> tuple[Outcome, str, tuple[str, ...], int]:
         mono = self.monotonic()
         try:
             clock = parse_clock(result.rows[0])
         except ValueError:                              # часы не того вида
             self._fail("query", len(tags))
-            return "query", "query: часы не того вида", result.sent, 0
+            return outcome_for("query"), "query: часы не того вида", result.sent, 0
         self.clock, self.clock_mono = clock, mono
         was = self.freshness.error
         self.freshness.observe(clock, result.rows[1], len(tags), mono, self.wallclock())
         self._note_transition(was)
         code = self.freshness.error
         rows = len(result.rows[1])
-        return code, (f"тегов {len(tags)}, строк Live {rows}" if code is None else code), result.sent, rows
+        if code is None:
+            return "ok", f"тегов {len(tags)}, строк Live {rows}", result.sent, rows
+        return outcome_for(code), code, result.sent, rows
 
     def _fail(self, code: str, tags: int) -> None:
         was = self.freshness.error
@@ -219,7 +224,11 @@ class DataRole(RoleBase):
 
     async def _system_event(self, tool: str, outcome: Outcome, summary: str, sent: tuple[str, ...], rows: int,
                             began: float) -> None:
-        """Событие служебного опроса; запись — в потоке, её ошибка опрос не ломает (health покажет)."""
+        """Событие служебного опроса; запись — в потоке, её ошибка опрос не ломает (health покажет).
+
+        Опрос ждёт записи, но блокировку SQLite запись ждёт не дольше WRITE_TIMEOUT_S (0,5 с): дальше — сбой
+        записи со счётчиком, а не задержка опроса.
+        """
         took = asyncio.get_running_loop().time() - began
         try:
             event = CallEvent(ts=self.wallclock(), caller="system", agent=None, channel="system", tool=tool,
