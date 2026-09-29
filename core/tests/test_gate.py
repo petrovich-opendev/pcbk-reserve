@@ -217,7 +217,7 @@ async def test_literal_ok_does_not_open_names_and_names_do_not_open_literals():
     assert fake.calls == []
 
 
-async def test_driver_errors_carry_sent_and_log_no_detail(capfd):
+async def test_driver_errors_carry_sent_and_log_no_detail(capfd, restore_logging):
     setup_logging()                                    # обработчик берёт sys.stderr в момент записи
     fake = FakeHistorian(fail=HistorianError("query", "Invalid object name '20FAKE_001_PV' for user 'FAKEUSER'"))
     g = gate(fake)

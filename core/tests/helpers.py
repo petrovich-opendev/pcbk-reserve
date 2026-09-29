@@ -207,6 +207,7 @@ def serve_role(role: DataRole, *, wait_catalog: bool = True) -> Iterator[str]:
         server.should_exit = True
         thread.join(timeout=10)
         sock.close()
+        assert not thread.is_alive(), "uvicorn не остановился за 10 с"
 
 
 @asynccontextmanager

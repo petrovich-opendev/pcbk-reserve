@@ -4,16 +4,21 @@
 """
 import json
 import logging
+import os
+import re
+import subprocess
+import sys
 import urllib.error
 import urllib.request
 
 import pytest
 
-from helpers import TOKEN, http_post, make_role, mcp_session, run_python, serve_role
+from helpers import CORE_DIR, TOKEN, http_post, make_role, mcp_session, non_root, run_python, serve_role
 from pcbk_core.data import CONFIG_ERRORS
-from pcbk_core.data.mcp_server import TOOL_DESCRIPTIONS
+from pcbk_core.data.budget import PER_CALLER_LIMIT
+from pcbk_core.data.mcp_server import TOOL_DESCRIPTIONS, mcp_auth
 from pcbk_core.data.periods import PRESETS
-from pcbk_core.logs import setup_logging
+from pcbk_core.logs import RECORD_CHARS, OneLine, setup_logging
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}
@@ -169,3 +174,102 @@ def test_mcp_route_is_built_once(tmp_path):
     role, _ = make_role(db_dir=tmp_path)
     assert role.mounts() == [("/mcp", role.mcp_app)] and role.mounts()[0][1] is role.mcp_app
     assert not (tmp_path / "core.db").exists()                          # сборка MCP — без ввода-вывода (F4)
+
+
+# --- доводка по ревью ---
+
+NEW_ROLE = ("from pcbk_core.data import DataRole\n"
+            "from pcbk_core.settings import Settings\n"
+            "role = DataRole(Settings(DB_PATH='/nonexistent/core.db'), lambda s, t: [], frozenset())\n")
+
+
+def python_in(cwd, code: str, timeout: float = 20) -> subprocess.CompletedProcess:
+    """Код в свежем интерпретаторе с рабочим каталогом cwd; pcbk_core — из core/. Завис — TimeoutExpired."""
+    return subprocess.run([sys.executable, "-c", code], cwd=cwd, env={**os.environ, "PYTHONPATH": str(CORE_DIR)},
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def test_setup_logging_owns_root_one_line_records(tmp_path):
+    """Как в serve(): setup_logging, затем роль — basicConfig FastMCP ничего не добавляет; перевод строки
+    в тексте записи не рвёт строку журнала."""
+    r = python_in(tmp_path, "import logging\nfrom pcbk_core.logs import setup_logging\nsetup_logging()\n" + NEW_ROLE
+                  + "logging.getLogger('x').warning('a\\nb')\n"
+                    "print(len(logging.getLogger().handlers), logging.getLogger('pytds').isEnabledFor(logging.INFO))")
+    assert r.returncode == 0 and r.stdout.split() == ["1", "False"]
+    lines = r.stderr.splitlines()                   # формат Д3а: время со смещением, уровень, имя
+    assert len(lines) == 1, lines
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} WARNING x: a\\nb", lines[0]), lines
+
+
+def test_one_line_filter_escapes_truncates_and_keeps_original():
+    try:
+        raise ValueError("1 validation error for X\n  input_value='20FAKE_001_PV'")
+    except ValueError:
+        exc_info = sys.exc_info()
+    forged = logging.LogRecord("x", logging.WARNING, __file__, 1, "tool=%s", ("t\r\noutcome=ok",), None)
+    long = logging.LogRecord("x", logging.ERROR, __file__, 1, "%s", ("y" * 600,), exc_info)
+    failed = logging.LogRecord("x", logging.ERROR, __file__, 1, "сбой", (), exc_info)
+    line = OneLine().filter(forged)
+    assert line.getMessage() == "tool=t\\r\\noutcome=ok" and forged.getMessage() == "tool=t\r\noutcome=ok"
+    cut = OneLine().filter(long).getMessage()
+    assert len(cut) == RECORD_CHARS and cut.endswith("…")
+    summary = OneLine().filter(failed)
+    assert summary.getMessage() == "сбой | ValueError: 1 validation error for X" and summary.exc_info is None
+    assert failed.exc_info is exc_info                                  # запись других обработчиков — как была
+
+
+@pytest.mark.parametrize("kind", ["fifo", pytest.param("unreadable", marks=non_root)])
+def test_mcp_build_ignores_dotenv(tmp_path, kind):                            # F4
+    dotenv = tmp_path / ".env"
+    if kind == "fifo":
+        os.mkfifo(dotenv)                               # открытие на чтение ждало бы писателя вечно
+    else:
+        dotenv.write_text("FASTMCP_DEBUG=true\n", encoding="utf-8")
+        dotenv.chmod(0)
+    r = python_in(tmp_path, NEW_ROLE + "print(role.mcp.settings.debug)")
+    assert (r.returncode, r.stdout.strip()) == (0, "False"), r.stderr[-300:]
+
+
+@pytest.mark.anyio
+async def test_mcp_limit_schema_is_integer_and_null_is_default(core_server):
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        tools = {t.name: t for t in (await s.list_tools()).tools}
+        sc = (await s.call_tool("catalog_search", {"query": "FAKE", "limit": None})).structuredContent
+    limit = tools["catalog_search"].inputSchema["properties"]["limit"]
+    assert (limit["type"], limit["minimum"], limit["maximum"], limit["default"]) == ("integer", 1, 50, 10)
+    assert sc["status"] == "ok" and len(sc["matches"]) == min(10, sc["total"]) and sc["total"] > 1
+
+
+@pytest.mark.anyio
+async def test_mcp_auth_refuses_non_http_scopes(tmp_path):
+    role, _ = make_role(db_dir=tmp_path)
+    called, sent = [], []
+
+    async def inner(scope, receive, send):
+        called.append(scope["type"])
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(message):
+        sent.append(message)
+
+    guard = mcp_auth(inner, role)
+    headers = [(b"authorization", f"Bearer {TOKEN}".encode())]
+    await guard({"type": "websocket", "path": "/mcp", "headers": headers}, receive, send)
+    await guard({"type": "lifespan"}, receive, send)
+    assert called == [] and sent == [{"type": "websocket.close", "code": 1008}]
+
+
+@pytest.mark.anyio
+async def test_http_and_mcp_share_caller_rate_window(core_server):
+    half = PER_CALLER_LIMIT // 2
+    search = {"query": "расход"}
+    for _ in range(half):
+        assert json.loads(http_post(core_server.url + "/api/data/catalog_search", search, TOKEN)[1])["status"] == "ok"
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        for _ in range(PER_CALLER_LIMIT - half):
+            assert (await s.call_tool("catalog_search", search)).structuredContent["status"] == "ok"
+        over = (await s.call_tool("catalog_search", search)).structuredContent
+    _, body = http_post(core_server.url + "/api/data/catalog_search", search, TOKEN)
+    assert (over["status"], json.loads(body)["status"]) == ("rate", "rate")      # окно одно на вызывающего

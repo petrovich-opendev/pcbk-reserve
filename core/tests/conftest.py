@@ -27,13 +27,20 @@ def anyio_backend():
 
 @pytest.fixture
 def restore_logging():
-    """setup_logging меняет глобальные логгеры — после теста всё как было (caplog других тестов)."""
+    """setup_logging меняет глобальные логгеры — после теста всё как было (caplog других тестов).
+
+    С корня снимается только наш обработчик: свои обработчики pytest ставит и снимает на каждую фазу теста.
+    """
+    from pcbk_core.logs import _StderrHandler
+
     root, core = logging.getLogger(), logging.getLogger("pcbk_core")
     levels = {name: logging.getLogger(name).level for name in ("", "pcbk_core", "pytds", "mcp")}
-    propagate, handlers = core.propagate, list(core.handlers)
+    propagate, handlers, root_handlers = core.propagate, list(core.handlers), list(root.handlers)
     yield
     for h in [h for h in core.handlers if h not in handlers]:
         core.removeHandler(h)
+    for h in [h for h in root.handlers if isinstance(h, _StderrHandler) and h not in root_handlers]:
+        root.removeHandler(h)
     core.propagate = propagate
     for name, level in levels.items():
         logging.getLogger(name).setLevel(level)
