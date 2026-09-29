@@ -402,6 +402,8 @@ networks:
   pcbk-egress:
     name: pcbk-egress
     driver: bridge
+    # имя моста на хосте постоянное и при пересоздании сети — под будущие правила сетевого экрана
+    driver_opts: {com.docker.network.bridge.name: pcbk-egress}
     ipam: {config: [{subnet: 172.31.250.80/28, ip_range: 172.31.250.88/29}]}
   # сети мест: у каждого своя; динамические адреса — только из .8/29
   pcbk-stu-01:

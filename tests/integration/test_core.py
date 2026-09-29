@@ -1,5 +1,6 @@
 """Серверный слой в компоновке: строки сторожа, ручки здоровья, сеть выхода, секрет и список файлами."""
 import json
+import time
 
 CORE = "http://172.31.250.82:8000"
 
@@ -17,7 +18,11 @@ def test_core_health_routes_on_egress_address(stack):
     assert stack.http_host("GET", CORE + "/healthz")[0] == 200
     code, body = stack.http_host("GET", CORE + "/healthz/data")
     assert code == 200 and json.loads(body)["ok"] is True
-    j = json.loads(stack.http_host("GET", CORE + "/health/historian")[1])
+    # первая попытка каталога длится до срока входа (10 с): ждём её исход, а не порядок тестов
+    deadline = time.monotonic() + 30
+    while (j := json.loads(stack.http_host("GET", CORE + "/health/historian")[1]))["catalog_error"] is None:
+        assert time.monotonic() < deadline, f"за 30 с каталог не попробовал загрузиться: {j}"
+        time.sleep(1)
     assert j["catalog_error"] == "connect" and j["gate"]["refused_unlisted"] == 0
 
 
@@ -29,10 +34,28 @@ def test_edge_does_not_expose_core(stack):
 def test_egress_network_only_core(stack):
     n = stack.network("pcbk-egress")
     assert n["Internal"] is False
+    assert n["Options"]["com.docker.network.bridge.name"] == "pcbk-egress"
     assert n["Options"].get("com.docker.network.bridge.enable_ip_masquerade", "true") == "true"
     assert [c["Name"] for c in n["Containers"].values()] == ["pcbk-core"]
     nets = stack.inspect("pcbk-core")["NetworkSettings"]["Networks"]
     assert set(nets) == {"pcbk-front", "pcbk-egress"} and nets["pcbk-egress"]["IPAddress"] == "172.31.250.82"
+
+
+def test_only_core_declares_egress(stack):
+    # по компоновке, а не по живой сети: ловит и остановленные службы, и службы профилей
+    services = stack.prod_config()["services"]
+    assert [name for name, s in services.items() if "pcbk-egress" in (s.get("networks") or {})] == ["core"]
+
+
+def test_core_hardening(stack):
+    c = stack.inspect("pcbk-core")
+    hc = c["HostConfig"]
+    assert (hc["ReadonlyRootfs"], hc["CapDrop"], hc["CapAdd"], hc["Privileged"]) == (True, ["ALL"], None, False)
+    assert hc["SecurityOpt"] == ["no-new-privileges:true"]
+    assert c["Config"]["User"] == "10003:10003"
+    assert (hc["Memory"], hc["PidsLimit"]) == (256 * 1024 * 1024, 128)
+    assert hc["RestartPolicy"]["Name"] == "unless-stopped"
+    assert set(hc["Tmpfs"]) == {"/tmp"}
 
 
 def test_core_secret_and_list_are_readonly_files(stack):

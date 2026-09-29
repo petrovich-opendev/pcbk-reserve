@@ -8,7 +8,8 @@ CTL = "http://pcbk-sp-ctl:2375/v1.44"
 PASSED = (200, 204, 304, 404)      # прокси пропустил; ответ уже от Docker
 # таблица сетей из плана — одно место правды в compose.yaml, здесь сверка
 SUBNETS = {"pcbk-public": "172.31.250.16/28", "pcbk-front": "172.31.250.32/28",
-           "pcbk-ro": "172.31.250.48/28", "pcbk-ctl": "172.31.250.64/28"}
+           "pcbk-ro": "172.31.250.48/28", "pcbk-ctl": "172.31.250.64/28",
+           "pcbk-egress": "172.31.250.80/28"}
 
 
 def test_sp_ro_serves_watchdog_reads_only(stack):
@@ -106,6 +107,8 @@ def test_container_networks_exact(stack):
 def test_network_subnets_match_table(stack):
     for net, subnet in SUBNETS.items():
         assert [c["Subnet"] for c in stack.network(net)["IPAM"]["Config"]] == [subnet], net
+    # динамические адреса сети выхода — только .88/29: адрес .82 серверного слоя не займёт никто
+    assert [c.get("IPRange") for c in stack.network("pcbk-egress")["IPAM"]["Config"]] == ["172.31.250.88/29"]
 
 
 def test_status_json_overall_ok(stack):
