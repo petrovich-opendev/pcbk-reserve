@@ -1,5 +1,7 @@
-"""Роль «данные»: каталог со своим сроком и паузой, опрос свежести, ручки здоровья, учения, build_roles."""
+"""Роль «данные»: каталог со своим сроком и паузой, опрос свежести, ручки здоровья, учения, build_roles,
+журнал событий и токены."""
 import asyncio
+import sqlite3
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -9,9 +11,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fakes import SUMMARY, WHITELIST, FakeHistorian
-from helpers import SETTINGS, make_role, wait_until, write
+from helpers import EVENT as E
+from helpers import SETTINGS, TEST_TOKENS, TOKEN, make_role, wait_until, write
 from pcbk_core.app import create_app
-from pcbk_core.data import CONFIG_ERRORS, DataRole
+from pcbk_core.data import CONFIG_ERRORS, TOKENS_ERROR, DataRole
 from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.gate import SlidingWindow
 from pcbk_core.data.historian import HistorianError
@@ -286,6 +289,11 @@ def test_page_texts_fit_80_chars():                                     # сто
     role.catalog.whitelisted = 99999
     details.append(role.health()[1])
     assert details[-1] == "каталог: 99999 тегов в белом списке"
+    details.append(TOKENS_ERROR)                                        # Д3б, F10
+    role.events.consecutive_failures = 1
+    role.events.last_error = "x" * 200
+    details.append(role.health()[1])
+    assert details[-1].startswith("журнал событий не пишется: x")
     assert max(len(d) for d in details) <= 80
 
 
@@ -353,3 +361,172 @@ async def test_role_gate_passes_summary():
     r = await role.gate.run([summary_sql(["20FAKE_001_PV", "20FAKE_003_PV"], t6, t6 + timedelta(hours=8))])
     assert r.sent == ("20FAKE_001_PV", "20FAKE_003_PV") and role.gate.stats()["refused_unlisted"] == 0
     assert r.rows == [[("20FAKE_001_PV", *(SUMMARY["20FAKE_001_PV"][c] for c in SUMMARY_COLUMNS))]]
+
+
+# --- Д3б, задача 4: журнал событий, токены, здоровье ---
+
+async def test_freshness_poll_writes_sent():                                    # Review Focus 2
+    role, _ = make_role()
+    await role.refresh_catalog()
+    await role.poll_freshness()
+    fresh, catalog = role.events.recent()[:2]
+    assert (fresh.caller, fresh.channel, fresh.tool, fresh.outcome) == ("system", "system", "freshness", "ok")
+    assert set(fresh.sent) == {"20FAKE_004_PV", "20FAKE_001_PV", "20FAKE_002_SP"} <= WHITELIST
+    assert (catalog.tool, catalog.sent) == ("catalog", ()) and catalog.summary.startswith("без имён")
+
+
+async def test_system_event_outcome_is_outcome_not_raw_code():                  # F11
+    role, fake = make_role()
+    fake.fail = HistorianError("connect", "обрыв")
+    await role.refresh_catalog()
+    e = role.events.recent()[0]
+    assert (e.tool, e.outcome) == ("catalog", "unavailable") and "connect" in e.summary
+
+
+def test_events_disk_full_turns_health_red(monkeypatch):                       # Review Focus 4
+    role, _ = make_role()
+    def full(e): raise sqlite3.OperationalError("database or disk is full")
+    monkeypatch.setattr(role.events, "_insert", full)
+    with pytest.raises(sqlite3.OperationalError):
+        role.events.write(E)
+    ok, detail = role.health()
+    assert ok is False and detail.startswith("журнал событий не пишется") and "disk is full" in detail
+
+
+async def test_events_check_off_loop_and_health_without_io(tmp_path, monkeypatch):   # F9, Review Focus 4
+    d = tmp_path / "ro"; d.mkdir(); d.chmod(0o500)
+    role, _ = make_role(db_dir=d)
+    await role.check_events()                                   # в фоне: asyncio.to_thread
+    monkeypatch.setattr(role.events, "writable", lambda: pytest.fail("health() не делает ввода-вывода"))
+    ok, detail = role.health()
+    assert ok is False and detail.startswith("журнал событий не пишется: ") and len(detail) <= 80
+
+
+def test_constructor_without_io_and_empty_tokens(tmp_path):                     # F4, F18
+    role = DataRole(replace(SETTINGS, DB_PATH=str(tmp_path / "нет" / "core.db")), FakeHistorian(), WHITELIST)
+    assert role.tokens.ids == frozenset() and role.tokens.caller("x") is None
+    assert role.health() == (True, "каталог ещё не загружен") and not (tmp_path / "нет").exists()
+    assert make_role(tokens=TEST_TOKENS)[0].tokens.caller(TOKEN) == "student-01"
+
+
+# --- сверх брифа ---
+
+async def test_catalog_event_fields_and_duration():
+    role, _ = make_role()
+    await role.refresh_catalog()
+    [e] = role.events.recent()
+    assert (e.caller, e.agent, e.channel, e.requested, e.tags, e.cache, e.cost) == \
+           ("system", None, "system", (), (), "none", 0.0)
+    assert e.summary == "без имён: 13 тегов, в белом списке 6, нет в историане 0, живых 4"
+    assert e.rows == 1 + 13 + 5 and e.duration_ms >= 0 and e.ts.utcoffset() is not None
+
+
+async def test_catalog_gate_busy_event_is_timeout_with_raw_code():
+    role, fake = make_role(settings=replace(SETTINGS, CATALOG_DEADLINE_S=0.3))
+    fake.delay_s, fake.slow = 0.6, r"Value IS NOT NULL$"
+    hold = asyncio.ensure_future(role.gate.run([live_all_sql()], lane="background"))   # фоновое место занято
+    await anyio.sleep(0.05)
+    await role.refresh_catalog()
+    e = role.events.recent()[0]
+    assert (e.tool, e.outcome, e.sent) == ("catalog", "timeout", ()) and "busy" in e.summary
+    await hold
+
+
+@pytest.mark.parametrize("prepare, code, outcome", [
+    ("none", "catalog", "unavailable"),                                   # каталог не пробовали — без SQL
+    ("no_tags", "no_tags", "unavailable"),
+    ("query", "query", "error"),
+    ("no_rows", "no_rows", "unavailable"),
+])
+async def test_freshness_failures_are_events(prepare, code, outcome):
+    role, fake = make_role(whitelist=frozenset({"25FAKE_007_CLS"}) if prepare == "no_tags" else WHITELIST)
+    if prepare != "none":
+        await role.refresh_catalog()
+    if prepare == "query":
+        fake.fail = HistorianError("query", "Invalid object name")
+    if prepare == "no_rows":
+        fake.live.clear()
+    await role.poll_freshness()
+    e = role.events.recent()[0]
+    assert (e.tool, e.outcome, role.freshness.error) == ("freshness", outcome, code) and code in e.summary
+    assert e.sent == (() if prepare in ("none", "no_tags") else role.freshness_tags)
+
+
+async def test_freshness_skipped_by_gate_is_busy_event():
+    role, fake = make_role()
+    await role.refresh_catalog()
+    role.gate.deadline_s = 0.3                                          # опрос ждёт место не дольше 0,2 с
+    fake.delay_s, fake.slow = 0.6, r"FROM Tag t "
+    reload = asyncio.ensure_future(role.refresh_catalog())             # каталог держит фоновое место
+    await anyio.sleep(0.05)
+    await role.poll_freshness()
+    e = role.events.recent()[0]
+    assert (e.tool, e.outcome, e.sent) == ("freshness", "busy", ()) and "busy" in e.summary
+    assert await reload is True
+
+
+async def test_event_write_failure_does_not_break_poll(monkeypatch):
+    role, _ = make_role()
+    def full(e): raise sqlite3.OperationalError("database or disk is full")
+    monkeypatch.setattr(role.events, "_insert", full)
+    assert await role.refresh_catalog() is True
+    await role.poll_freshness()
+    assert role.freshness.error is None and role.events.consecutive_failures == 2
+    assert role.health() == (False, "журнал событий не пишется: OperationalError: database or disk is full")
+
+
+async def test_unexpected_loop_failures_are_error_events():
+    role, _ = make_role(settings=replace(SETTINGS, FRESH_POLL_S=0.05))
+
+    async def broken():
+        raise KeyError("20FAKE_001_PV")
+
+    role.refresh_catalog = broken
+    role.poll_freshness = broken
+    async with role.lifespan():
+        await anyio.sleep(0.15)
+    catalog = role.events.recent(channel="system")[-1]
+    assert (catalog.tool, catalog.outcome, catalog.sent) == ("catalog", "error", ())
+    assert catalog.summary == "без имён: непредвиденный сбой (KeyError)"               # текст исключения — нет
+    fresh = role.events.recent()[0]
+    assert (fresh.tool, fresh.outcome) == ("freshness", "error") and "FAKE" not in fresh.summary
+
+
+async def test_lifespan_opens_db_first_and_checks_in_background(tmp_path):     # F23, F9
+    role, _ = make_role(db_dir=tmp_path)
+    async with role.lifespan():
+        assert (tmp_path / "core.db").exists()                                  # сразу после старта
+        await anyio.sleep(0.1)
+        assert role.events.writable_ok is True
+    bad = DataRole(replace(SETTINGS, DB_PATH=str(tmp_path / "cfg" / "core.db")), FakeHistorian(), WHITELIST,
+                   config_error=CONFIG_ERRORS["bdrv_invalid"])
+    (tmp_path / "cfg").mkdir()
+    async with bad.lifespan():
+        assert (tmp_path / "cfg" / "core.db").exists()                          # и при ошибке настройки
+    assert bad.events.writable_ok is None                                       # фоновых циклов нет
+
+
+async def test_lifespan_with_unopenable_db_lives_with_reason(tmp_path, capfd, restore_logging):   # F4
+    setup_logging()
+    d = tmp_path / "ro"; d.mkdir(); d.chmod(0o500)
+    role, _ = make_role(db_dir=d, settings=replace(SETTINGS, FRESH_POLL_S=0.05))
+    async with role.lifespan():
+        await anyio.sleep(0.2)
+        ok, detail = role.health()
+        assert ok is False and detail.startswith("журнал событий не пишется: ") and role.catalog.loaded
+    assert "журнал событий" in capfd.readouterr().err
+
+
+def test_health_order_config_whitelist_tokens_events():
+    role, _ = make_role()
+    role.events.consecutive_failures = 1
+    role.tokens_error = TOKENS_ERROR
+    assert role.health() == (False, TOKENS_ERROR)
+    role.whitelist = frozenset()
+    assert role.health() == (False, "белый список пуст или не найден")
+    role.config_error = CONFIG_ERRORS["bdrv_invalid"]
+    assert role.health() == (False, CONFIG_ERRORS["bdrv_invalid"])
+    assert len(TOKENS_ERROR) == 44
+    fresh, _ = make_role()
+    fresh.events.writable_ok = False
+    assert fresh.health() == (False, "журнал событий не пишется: нет записи")

@@ -1,14 +1,19 @@
 """Общие константы и помощники тестов серверного слоя (импорт явный: from helpers import …)."""
+import atexit
 import hashlib
 import itertools
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI
@@ -16,14 +21,37 @@ from fastapi import APIRouter, FastAPI
 from fakes import WHITELIST, FakeHistorian
 from pcbk_core.app import RoleBase
 from pcbk_core.data import DataRole
+from pcbk_core.data.events import CallEvent
+from pcbk_core.secrets import TokenTable
 from pcbk_core.settings import Settings
 
-# настройки тестов строятся напрямую: проверки from_env на них не действуют
-SETTINGS = Settings()
 # каталог core/: из него подпроцессы импортируют pcbk_core
 CORE_DIR = Path(__file__).resolve().parent.parent
 
 _files = itertools.count(1)
+
+
+def sha(text: str) -> str:
+    """sha256 строки в шестнадцатеричном виде — как в файле core-tokens."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# тестовый токен — не 48 шестнадцатеричных знаков: шаблон проверки на секреты Д2 его не ловит (F17)
+TOKEN = "test-token-student-01"
+TEST_TOKENS = TokenTable({"student-01": sha(TOKEN)})
+
+# каталог сессии тестов: журнал событий и core-tokens — здесь, не в /var/lib/pcbk-core и /run/secrets (F4)
+SESSION_DIR = Path(tempfile.mkdtemp(prefix="pcbk-core-tests-"))
+atexit.register(shutil.rmtree, SESSION_DIR, ignore_errors=True)
+(SESSION_DIR / "core-tokens").write_text(f"student-01 {sha(TOKEN)}\n", encoding="utf-8")
+# настройки тестов строятся напрямую: проверки from_env на них не действуют
+SETTINGS = Settings(DB_PATH=str(SESSION_DIR / "core.db"), TOKENS_FILE=str(SESSION_DIR / "core-tokens"))
+
+# пример события вызова: берут test_events.py и test_role.py (F16)
+EVENT = CallEvent(ts=datetime(2026, 10, 1, 7, tzinfo=timezone.utc), caller="student-01", agent=None,
+                  channel="http", tool="tag_now", requested=("20FAKE_001_PV", "X' OR 1=1--"),
+                  tags=("20FAKE_001_PV",), sent=("20FAKE_001_PV",), start=None, end=None, outcome="partial",
+                  summary="", cost=0.0, cache="miss", rows=1, duration_ms=12)
 
 
 def write(tmp_path, text: str) -> str:
@@ -31,11 +59,6 @@ def write(tmp_path, text: str) -> str:
     path = tmp_path / f"file-{next(_files)}.env"
     path.write_text(text, encoding="utf-8")
     return str(path)
-
-
-def sha(text: str) -> str:
-    """sha256 строки в шестнадцатеричном виде — как в файле core-tokens."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def run_python(code: str) -> str:
@@ -85,12 +108,19 @@ class FakeMono:
 
 
 def make_role(settings: Settings = SETTINGS, fake: FakeHistorian | None = None,
-              whitelist: frozenset[str] = WHITELIST, mono: Callable[[], float] | None = None,
+              whitelist: frozenset[str] = WHITELIST, mono: Callable[[], float] | None = None, *,
+              db_dir: str | Path | None = None, tokens: TokenTable = TEST_TOKENS,
               ) -> tuple[DataRole, FakeHistorian]:
-    """Роль «данные» на двойнике историана; часы по умолчанию — FakeMono(1000.0)."""
+    """Роль «данные» на двойнике историана; часы по умолчанию — FakeMono(1000.0).
+
+    Журнал событий — core.db в db_dir, по умолчанию в новом каталоге внутри каталога сессии: у каждой
+    роли свой журнал. Каталог только запоминается — роль его не трогает до lifespan или записи.
+    """
     fake = FakeHistorian() if fake is None else fake
     mono = FakeMono(1000.0) if mono is None else mono
-    return DataRole(settings, fake, whitelist, monotonic=mono), fake
+    db_dir = tempfile.mkdtemp(dir=SESSION_DIR) if db_dir is None else db_dir
+    settings = replace(settings, DB_PATH=str(Path(db_dir) / "core.db"))
+    return DataRole(settings, fake, whitelist, monotonic=mono, tokens=tokens), fake
 
 
 def wait_until(pred: Callable[[], bool], timeout: float = 5) -> None:
