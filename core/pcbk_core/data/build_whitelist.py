@@ -38,6 +38,9 @@ from .sql import SAFE_NAME, catalog_sql
 
 RULE_VERSION = "d3-1"
 SECTION_PREFIX = re.compile(r"2[0-5]")
+# прежнее правило участка (ИМЯ_УЧАСТКА) требовало букву третьим знаком; d3-1 его не требует, и такие
+# имена построитель только считает — выбор правила за владельцем
+PRIOR_SECTION = re.compile(r"2[0-5][A-Za-z]")
 SERVICE_TAILS = ("_LMN", "_TH", "_HMI", "_SP_HMI", "_MV1", "_m3")
 STATE_TAILS = ("_RUN", "_OPN", "_CLS", "_ON", "_OFF", "_STOP", "_FLT", "_ALM")
 CATALOG_TIMEOUT_S = 120.0
@@ -109,6 +112,7 @@ def summary_lines(tag_rows: list[Row], extra: frozenset[str], base: frozenset[st
     kind_of = {row[0]: KIND_BY_TYPE.get(row[2]) for row in rows}
     chosen = Counter(kind_of.get(n) for n in selected)
     tails = Counter(_tail_label(n) for n in selected)
+    no_letter = sum(1 for n in selected if SECTION_PREFIX.match(n) and not PRIOR_SECTION.match(n))
 
     catalog = f"каталог: всего {len(rows)}, аналоговых {kinds['analog']}, дискретных {kinds['discrete']}"
     if kinds["other"]:
@@ -125,6 +129,7 @@ def summary_lines(tag_rows: list[Row], extra: frozenset[str], base: frozenset[st
         + ", ".join(f"{tail} {by_service[tail]}" for tail in SERVICE_TAILS),
         f"отсечено правилом 5 (дискретные не состояния): {verdicts['rule5']}",
         f"белый список: {len(selected)} — аналоговых {chosen['analog']}, дискретных {chosen['discrete']}",
+        f"участок 20–25 без буквы третьим знаком: {no_letter}",
     ]
     order = [t for t in REPORT_TAILS if tails[t]] + [t for t in ("прочие", "без хвоста") if tails[t]]
     lines.append("по хвостам: " + (", ".join(f"{t} {tails[t]}" for t in order) or "—"))

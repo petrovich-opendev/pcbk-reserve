@@ -4,7 +4,7 @@ import pytest
 from fakes import CATALOG_ROWS, EXTRA, WHITELIST, FakeHistorian
 from helpers import write
 from pcbk_core.data import build_whitelist
-from pcbk_core.data.build_whitelist import RULE_VERSION, main, select_whitelist, write_list
+from pcbk_core.data.build_whitelist import RULE_VERSION, main, select_whitelist, summary_lines, write_list
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.names import load_names
 from pcbk_core.data.sql import catalog_sql
@@ -71,6 +71,27 @@ def test_extra_and_base_need_catalog_and_rule_1():
            == ["QFAKE_010"]
 
 
+def test_rule5_applies_to_extra_and_base():         # правило 6: дискретные из extra и base — только состояния
+    rows = [("QFAKE_DIAG", "", 2, None, None, None), ("QFAKE_PUMP_RUN", "", 2, None, None, None)]
+    both = frozenset({"QFAKE_DIAG", "QFAKE_PUMP_RUN"})
+    assert select_whitelist(rows, both) == ["QFAKE_PUMP_RUN"]
+    assert select_whitelist(rows, frozenset(), base=both) == ["QFAKE_PUMP_RUN"]
+
+
+def test_summary_counts_section_names_without_letter_third():
+    count = "участок 20–25 без буквы третьим знаком: {}"
+    selected = select_whitelist(CATALOG_ROWS, EXTRA)
+    assert count.format(0) in summary_lines(CATALOG_ROWS, EXTRA, None, selected)
+    rows = CATALOG_ROWS + [("209FAKE_001_PV", "", 1, 0.0, 1.0, "None"), ("20_FAKE_002_PV", "", 1, 0.0, 1.0, "None"),
+                           ("269FAKE_003_PV", "", 1, 0.0, 1.0, "None")]    # 26 — вне участка, не считается
+    selected = select_whitelist(rows, EXTRA)
+    assert "209FAKE_001_PV" in selected and "20_FAKE_002_PV" in selected
+    lines = summary_lines(rows, EXTRA, None, selected)
+    assert count.format(2) in lines and not any("FAKE" in line for line in lines)
+    only_digit = summary_lines(rows, EXTRA, None, [n for n in selected if n != "20_FAKE_002_PV"])
+    assert count.format(1) in only_digit
+
+
 def test_write_list_replaces_read_only_file_and_checks_input(tmp_path):
     p = tmp_path / "whitelist.txt"
     write_list(str(p), ["20FAKE_001_PV"], {"rule": RULE_VERSION})
@@ -120,6 +141,7 @@ def test_main_builds_list_with_one_catalog_query_and_prints_only_counts(monkeypa
                  "_LMN 2, _TH 0, _HMI 0, _SP_HMI 1, _MV1 0, _m3 0",
                  "отсечено правилом 5 (дискретные не состояния): 1",
                  "белый список: 6 — аналоговых 5, дискретных 1",
+                 "участок 20–25 без буквы третьим знаком: 0",
                  "по хвостам: _PV 3, _SP 1, _CLS 1, без хвоста 1"):
         assert line in printed.out.splitlines()
 
