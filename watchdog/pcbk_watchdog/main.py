@@ -54,6 +54,8 @@ class Settings:
     JOURNAL_PATH: str = "/var/lib/pcbk-watchdog/journal.db"
     MEMINFO_PATH: str = "/proc/meminfo"
     COMPONENTS_PATH: str = "/app/components.json"
+    # учения «цикл молчит при живом HTTP»: 1 — после первого такта цикл замирает
+    DRILL_FREEZE_LOOP: bool = False
 
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:
@@ -90,6 +92,11 @@ class Settings:
         for f in fields(cls):
             raw = env.get(f.name, "")
             if raw == "":
+                continue
+            if isinstance(f.default, bool):   # bool("0") — истина, поэтому только 0 или 1
+                if raw not in ("0", "1"):
+                    raise ValueError(f"{f.name}: ожидается 0 или 1, получено {raw!r}")
+                values[f.name] = raw == "1"
                 continue
             try:
                 values[f.name] = type(f.default)(raw)
@@ -257,12 +264,17 @@ def tick(state: WatchState, journal: Journal, components: list[dict], docker: Do
 
 def run_loop(state: WatchState, journal: Journal, components: list[dict], docker: DockerReader,
              settings: Settings, stop: threading.Event) -> None:
+    if settings.DRILL_FREEZE_LOOP:
+        log.warning("учения DRILL_FREEZE_LOOP=1: после первого такта цикл замрёт, HTTP продолжит отвечать")
     while not stop.is_set():
         started = time.monotonic()
         try:
             tick(state, journal, components, docker, settings, datetime.now(settings.tz))
         except Exception:
             log.exception("такт упал")
+        if settings.DRILL_FREEZE_LOOP:
+            stop.wait()   # учения: снимок стареет, страница должна показать полосу молчания
+            return
         stop.wait(max(0.0, settings.TICK_S - (time.monotonic() - started)))
 
 

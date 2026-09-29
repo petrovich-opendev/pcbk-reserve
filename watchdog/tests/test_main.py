@@ -22,8 +22,12 @@ def test_settings_defaults_and_env():
     assert Settings.from_env({}) == Settings()
     s = Settings.from_env({"TICK_S": "1", "DISPLAY_TZ": "Asia/Yekaterinburg", "LISTEN_PORT": "9000"})
     assert (s.TICK_S, s.LISTEN_PORT, s.STALE_AFTER_S, s.tz.key) == (1.0, 9000, 30, "Asia/Yekaterinburg")
+    assert Settings().DRILL_FREEZE_LOOP is False                      # учения выключены
+    assert Settings.from_env({"DRILL_FREEZE_LOOP": "1"}).DRILL_FREEZE_LOOP is True
+    assert Settings.from_env({"DRILL_FREEZE_LOOP": "0"}).DRILL_FREEZE_LOOP is False
     for bad in ({"STALE_AFTER_S": "abc"}, {"TICK_S": "40"}, {"DISPLAY_TZ": "Нет/Такого"},
-                {"STALE_AFTER_S": "12"}):   # срок такта min(11, 6) − 2·3 = 0 — отказ
+                {"STALE_AFTER_S": "12"},    # срок такта min(11, 6) − 2·3 = 0 — отказ
+                {"DRILL_FREEZE_LOOP": "yes"}):
         with pytest.raises(ValueError):
             Settings.from_env(bad)
 
@@ -116,6 +120,38 @@ def test_loop_keeps_snapshot_fresh_with_slow_proxy(slow_proxy_url, tmp_path, mon
         stop.set()
         loop.join(5)
     assert stale == [] and len(ticks) >= 4
+
+
+def test_drill_freeze_loop_goes_stale_while_http_serves(tmp_path, monkeypatch, caplog):
+    # учения «цикл молчит при живом HTTP»: первый такт есть, дальше снимок стареет
+    monkeypatch.setattr(pcbk_watchdog.main, "NET_CHECK_TIMEOUT_S", 0.1)
+    settings = replace(SETTINGS, STALE_AFTER_S=1, TICK_S=0.2, DOCKER_TIMEOUT_S=0.1,
+                       DRILL_FREEZE_LOOP=True)
+    state, stop = WatchState(), threading.Event()
+    srv = start_test_server(state, settings=settings)
+    comps = [{"id": "memory", "title": "Память сервера", "kind": "memory"}]
+    caplog.set_level("INFO", logger="pcbk_watchdog")
+    loop = threading.Thread(target=run_loop, daemon=True, args=(
+        state, Journal(str(tmp_path / "j.db")), comps, DockerReader("http://127.0.0.1:9", 0.1),
+        settings, stop))
+    loop.start()
+    try:
+        first_by = time.monotonic() + 2
+        while state.snapshot is None and time.monotonic() < first_by:
+            time.sleep(0.02)
+        first = state.snapshot
+        assert first is not None and http_status(srv, "/healthz") == 200
+        time.sleep(1.5)                                  # > STALE_AFTER_S, при такте 0,2 с
+        assert state.snapshot is first                   # тактов больше не было
+        assert http_status(srv, "/healthz") == 503
+        code, _, body = http_get(srv, "/status")
+        assert code == 200 and re.search(r'id="silence"(?![^>]*hidden)', body.decode())
+        assert json.loads(http_get(srv, "/status.json")[2])["stale"] is True
+    finally:
+        stop.set()
+        loop.join(2)
+    assert not loop.is_alive()                           # замерший цикл выходит по stop
+    assert len([r for r in caplog.records if "DRILL_FREEZE_LOOP" in r.getMessage()]) == 1
 
 
 def test_loop_survives_tick_exception(monkeypatch):
