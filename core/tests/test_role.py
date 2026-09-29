@@ -7,10 +7,11 @@ import anyio
 import pytest
 from fastapi.testclient import TestClient
 
-from fakes import WHITELIST
+from fakes import WHITELIST, FakeHistorian
 from helpers import SETTINGS, make_role, wait_until, write
 from pcbk_core.app import create_app
-from pcbk_core.data import DataRole
+from pcbk_core.data import CONFIG_ERRORS, DataRole
+from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.gate import SlidingWindow
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.sql import live_all_sql, live_sql, names_in
@@ -91,7 +92,7 @@ def poll_calls(fake) -> int:
     return sum(1 for call in fake.calls if len(call) == 2 and "FROM Live WHERE TagName IN" in call[1])
 
 
-async def test_refresh_catalog_logs_counts_without_names(capfd):
+async def test_refresh_catalog_logs_counts_without_names(capfd, restore_logging):
     setup_logging()                                    # обработчик берёт sys.stderr в момент записи
     role, fake = make_role()
     assert role.health() == (True, "каталог ещё не загружен")
@@ -145,10 +146,10 @@ async def test_catalog_refused_by_gate_counts_as_failure():
     hold = asyncio.ensure_future(role.gate.run([live_all_sql()], lane="background"))   # фоновое место занято
     await anyio.sleep(0.05)
     assert await role.refresh_catalog() is False
-    assert (role.catalog_error, role.catalog_failures) == ("busy", 1)
-    await role.poll_freshness()                                         # у «busy» нет текста — «каталог не загружен»
+    assert (role.catalog_error, role.catalog_failures) == ("timeout", 1)   # фон не дождался места — как срок
+    await role.poll_freshness()
     j = role.freshness.to_json(role.monotonic())
-    assert (j["error"], j["error_text"]) == ("catalog", "каталог тегов не загружен")
+    assert (j["error"], j["error_text"]) == ("timeout", "историан не ответил вовремя")
     await hold
 
 
@@ -201,7 +202,7 @@ async def test_poll_updates_clock_fields():
     assert (role.clock.local.minute, role.clock_mono) == (1, 1030.0)
 
 
-async def test_lifespan_drill_freeze_stamps_logs_and_cancels_loops(capfd):
+async def test_lifespan_drill_freeze_stamps_logs_and_cancels_loops(capfd, restore_logging):
     setup_logging()
     role, fake = make_role(settings=replace(SETTINGS, FRESH_POLL_S=0.05, DRILL_FRESHNESS="freeze_stamps"))
     assert role.freshness.freeze_stamps is True
@@ -214,7 +215,7 @@ async def test_lifespan_drill_freeze_stamps_logs_and_cancels_loops(capfd):
     assert poll_calls(fake) == polls                                    # на выходе циклы отменены
 
 
-async def test_lifespan_without_drill_polls_after_catalog_attempt(capfd):
+async def test_lifespan_without_drill_polls_after_catalog_attempt(capfd, restore_logging):
     setup_logging()
     role, fake = make_role(settings=replace(SETTINGS, FRESH_POLL_S=0.05))
     fake.fail = HistorianError("connect", "обрыв")
@@ -248,10 +249,95 @@ def test_build_roles_reads_whitelist_and_credentials(tmp_path):
     assert role.gate.allowed == frozenset({"20FAKE_001_PV"}) and role.settings is settings
 
 
-def test_build_roles_without_whitelist_file_is_empty(tmp_path, capfd):
+def test_build_roles_without_whitelist_file_is_empty(tmp_path, capfd, restore_logging):
     setup_logging()
     settings = replace(SETTINGS, BDRV_ENV_FILE=write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"),
                        WHITELIST_PATH=str(tmp_path / "нет.txt"))
     [role] = build_roles(settings)
     assert role.gate.allowed == frozenset() and role.health() == (False, "белый список пуст или не найден")
     assert "белый список не найден" in capfd.readouterr().err
+
+
+async def test_unexpected_catalog_failure_is_query_and_loop_lives(capfd, restore_logging):
+    setup_logging()
+    role, fake = make_role(settings=replace(SETTINGS, FRESH_POLL_S=0.05))
+    attempts = []
+
+    async def broken():
+        attempts.append(1)
+        raise KeyError("20FAKE_001_PV")                                  # текст исключения — не в журнал
+
+    role.refresh_catalog = broken
+    async with role.lifespan():
+        await anyio.sleep(0.2)
+    assert (attempts, role.catalog_error, role.catalog_failures) == ([1], "query", 1)
+    j = role.freshness.to_json(role.monotonic())
+    assert (j["error"], j["error_text"]) == ("query", "историан вернул ошибку")
+    err = capfd.readouterr().err
+    assert "KeyError" in err and "FAKE" not in err
+
+
+def test_page_texts_fit_80_chars():                                     # сторож показывает 80 знаков
+    role, _ = make_role()
+    details = [role.health()[1], make_role(whitelist=frozenset())[0].health()[1], *CONFIG_ERRORS.values(),
+               "; ".join(CONFIG_ERRORS[k] for k in ("bdrv_invalid", "whitelist_unreadable"))]
+    role.catalog = Catalog({}, frozenset(), loaded=True)
+    role.catalog.whitelisted = 99999
+    details.append(role.health()[1])
+    assert details[-1] == "каталог: 99999 тегов в белом списке"
+    assert max(len(d) for d in details) <= 80
+
+
+async def test_config_error_role_starts_no_loops():
+    fake = FakeHistorian()
+    role = DataRole(replace(SETTINGS, FRESH_POLL_S=0.05), fake, WHITELIST, config_error=CONFIG_ERRORS["bdrv_invalid"])
+    assert role.health() == (False, "bdrv.env: не заданы BDRV_* или неверная строка")
+    async with role.lifespan():
+        await anyio.sleep(0.2)
+    assert fake.calls == [] and role.catalog_failures == 0
+    assert role.freshness.to_json(role.monotonic())["checked_at"] is None
+
+
+def bdrv(tmp_path, text="BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"):
+    return write(tmp_path, text)
+
+
+def listed(tmp_path, text="20FAKE_001_PV\n"):
+    return write(tmp_path, text)
+
+
+def raw(tmp_path, data: bytes) -> str:
+    path = tmp_path / "raw.bin"
+    path.write_bytes(data)
+    return str(path)
+
+
+@pytest.mark.parametrize("make_env, make_list, reason", [
+    (lambda t: str(t / "нет.env"), listed, "bdrv.env не читается (нет файла или прав)"),
+    (lambda t: str(t), listed, "bdrv.env не читается (нет файла или прав)"),                    # каталог
+    (lambda t: bdrv(t, "BDRV_HOST=h\nBDRV_USER=u\n"), listed, "bdrv.env: не заданы BDRV_* или неверная строка"),
+    (lambda t: bdrv(t, "BDRV_HOST=h\nсекрет-строка\n"), listed, "bdrv.env: не заданы BDRV_* или неверная строка"),
+    (lambda t: raw(t, b"BDRV_PW=\xff\n"), listed, "bdrv.env: не заданы BDRV_* или неверная строка"),
+    (bdrv, lambda t: listed(t, "20FAKE BAD\n"), "белый список не читается"),                   # недопустимое имя
+    (bdrv, lambda t: raw(t, b"\xff\xfe20FAKE_001_PV\n"), "белый список не читается"),         # не UTF-8
+    (bdrv, lambda t: str(t), "белый список не читается"),                                         # каталог
+    (lambda t: str(t / "нет.env"), lambda t: str(t),
+     "bdrv.env не читается (нет файла или прав); белый список не читается"),
+])
+def test_build_roles_bad_config_is_503_without_loops(tmp_path, capfd, restore_logging, make_env, make_list, reason):
+    setup_logging()
+    (tmp_path / "d").mkdir()
+    settings = replace(SETTINGS, BDRV_ENV_FILE=make_env(tmp_path / "d"), WHITELIST_PATH=make_list(tmp_path),
+                       FRESH_POLL_S=0.05)
+    [role] = build_roles(settings)
+    assert role.health() == (False, reason) and len(reason) <= 80
+    with TestClient(create_app(settings, [role])) as c:
+        time.sleep(0.2)
+        r = c.get("/healthz/data")
+        assert (r.status_code, r.json()["detail"]) == (503, reason)
+        assert c.get("/healthz").status_code == 503
+        j = c.get("/health/historian").json()
+        assert (j["checked_at"], j["catalog_error"], j["gate"]["sent_names_total"]) == (None, None, 0)
+    assert role.catalog_failures == 0 and role.gate.stats()["in_flight"] == {"user": 0, "background": 0}
+    err = capfd.readouterr().err
+    assert "ERROR" in err and "секрет" not in err and "FAKE" not in err and "0xff" not in err

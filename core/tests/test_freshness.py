@@ -2,7 +2,6 @@
 from datetime import datetime, timedelta, timezone
 
 from pcbk_core.data.freshness import ERROR_TEXTS, FreshnessTracker
-from pcbk_core.data.gate import AUTH_LATCH_TEXT
 from pcbk_core.data.historian import HistClock
 
 CLOCK = HistClock(local=datetime(2026, 10, 1, 12, 0, 0), utc=datetime(2026, 10, 1, 7, 0, 0))
@@ -46,7 +45,7 @@ def test_error_texts():
     f = FreshnessTracker()
     assert f.to_json(0.0)["checked_at"] is None
     f.fail("auth", 8, mono=1.0, wall=W)
-    assert f.to_json(1.0)["error_text"] == AUTH_LATCH_TEXT                     # текст защёлки ворот (b04fa25)
+    assert f.to_json(1.0)["error_text"] == "историан отклонил вход — проверьте bdrv.env и базу, перезапустите службу"
     f.observe(CLOCK, [], 8, mono=2.0, wall=W)
     assert f.to_json(2.0)["error"] == "no_rows"
 
@@ -112,3 +111,4 @@ def test_age_rounded_to_tenth():
 def test_error_texts_cover_all_codes():
     assert set(ERROR_TEXTS) == {"connect", "timeout", "query", "auth", "catalog", "no_tags", "no_rows"}
     assert all(isinstance(t, str) and t for t in ERROR_TEXTS.values())
+    assert max(len(t) for t in ERROR_TEXTS.values()) <= 80                      # сторож показывает 80 знаков

@@ -18,24 +18,52 @@ if TYPE_CHECKING:
 USAGE = "использование: python -m pcbk_core.main [--healthcheck]"
 
 
+def _why(exc: Exception) -> str:
+    """Причина для журнала без строк файла: у ValueError чтения файлов текст — номер строки, не она сама."""
+    if isinstance(exc, UnicodeDecodeError):
+        return "файл не в UTF-8"
+    if isinstance(exc, OSError):
+        return f"{type(exc).__name__}: {exc.strerror or 'ошибка чтения'}"
+    return str(exc)
+
+
 def build_roles(settings: Settings) -> list[Role]:
     """Роли процесса: в Д3а — «данные»; Д4 добавит LLM-прокси.
 
     Нет файла белого списка — роль с пустым списком: /healthz/data отвечает 503
-    с причиной, ворота не пускают ни одного имени. Учётные данные — только файлом.
+    с причиной, ворота не пускают ни одного имени. bdrv.env или белый список не
+    читаются — роль «с ошибкой настройки»: 503 с причиной, без фоновых циклов и
+    входов в историан; процесс живёт, и сторож видит причину. Учётные данные —
+    только файлом.
     """
-    from .data import DataRole
-    from .data.historian import tds_query
+    from .data import CONFIG_ERRORS, DataRole
+    from .data.historian import HistorianError, QueryFn, tds_query
     from .data.names import load_names
     from .secrets import BdrvConfig
 
+    log = logging.getLogger("pcbk_core.main")
+    problems: list[str] = []
+
+    def no_credentials(statements, remaining_s):
+        raise HistorianError("connect", "учётные данные историана не прочитаны")
+
+    query: QueryFn = no_credentials
+    try:
+        query = tds_query(BdrvConfig.from_env_file(settings.BDRV_ENV_FILE))
+    except (OSError, ValueError) as exc:
+        log.error("учётные данные %s: %s", settings.BDRV_ENV_FILE, _why(exc))
+        problems.append(CONFIG_ERRORS["bdrv_unreadable" if isinstance(exc, OSError) else "bdrv_invalid"])
+
+    whitelist: frozenset[str] = frozenset()
     try:
         whitelist = load_names(settings.WHITELIST_PATH)
     except FileNotFoundError:
-        logging.getLogger("pcbk_core.main").error(
-            "белый список не найден: %s — роль «данные» без тегов", settings.WHITELIST_PATH)
-        whitelist = frozenset()
-    return [DataRole(settings, tds_query(BdrvConfig.from_env_file(settings.BDRV_ENV_FILE)), whitelist)]
+        log.error("белый список не найден: %s — роль «данные» без тегов", settings.WHITELIST_PATH)
+    except (OSError, ValueError) as exc:
+        log.error("белый список %s: %s", settings.WHITELIST_PATH, _why(exc))
+        problems.append(CONFIG_ERRORS["whitelist_unreadable"])
+
+    return [DataRole(settings, query, whitelist, config_error="; ".join(problems) or None)]
 
 
 def healthcheck(settings: Settings) -> int:

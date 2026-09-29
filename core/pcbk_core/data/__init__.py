@@ -26,17 +26,28 @@ from .sql import catalog_sql, clock_sql, live_all_sql, live_sql
 FRESH_TAGS = 8
 BACKOFF_BASE_S = 60.0
 BACKOFF_MAX_S = 900.0
+# причины «настройка с ошибкой» для /healthz/data: не длиннее 80 знаков, без строк файлов
+CONFIG_ERRORS = {
+    "bdrv_unreadable": "bdrv.env не читается (нет файла или прав)",
+    "bdrv_invalid": "bdrv.env: не заданы BDRV_* или неверная строка",
+    "whitelist_unreadable": "белый список не читается",
+}
 
 log = logging.getLogger("pcbk_core.data")
 
 
 class DataRole(RoleBase):
+    """config_error — настройка с ошибкой (bdrv.env или белый список не читаются): здоровье — 503 с
+    этой причиной, фоновые циклы не запускаются, к историану ни одного входа."""
+
     name = "data"
 
     def __init__(self, settings: Settings, query: QueryFn, whitelist: frozenset[str], *,
                  monotonic: Callable[[], float] = time.monotonic,
-                 wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 config_error: str | None = None):
         self.settings = settings
+        self.config_error = config_error
         self.whitelist = whitelist
         self.monotonic = monotonic
         self.wallclock = wallclock
@@ -76,7 +87,8 @@ class DataRole(RoleBase):
         except HistorianError as err:
             return self._catalog_failed(err.code, err.public())
         except GateRefused as err:
-            return self._catalog_failed(err.code, f"ворота: {err.code}")
+            # фон не дождался места к сроку: место держит вызов, который историан не дочитал, — это срок
+            return self._catalog_failed("timeout" if err.code == "busy" else err.code, f"ворота: {err.code}")
         except (ValueError, TypeError) as err:          # ответ не того вида; текст ответа — не в журнал
             return self._catalog_failed("query", f"ответ не того вида ({type(err).__name__})")
         self.catalog = catalog
@@ -107,7 +119,7 @@ class DataRole(RoleBase):
     async def poll_freshness(self) -> None:
         tags = self.freshness_tags
         if not self.catalog.loaded:
-            # у отказа ворот (busy) своего текста нет: для людей это «каталог не загружен»
+            # у прочих отказов ворот (unlisted) своего текста нет: для людей это «каталог не загружен»
             code = self.catalog_error if self.catalog_error in ERROR_TEXTS else "catalog"
             self._fail(code, len(tags))
             return
@@ -151,6 +163,8 @@ class DataRole(RoleBase):
     # --- протокол роли ---
 
     def health(self) -> tuple[bool, str]:
+        if self.config_error:
+            return False, self.config_error
         if not self.whitelist:
             return False, "белый список пуст или не найден"
         if self.catalog.loaded:
@@ -178,6 +192,10 @@ class DataRole(RoleBase):
 
     @asynccontextmanager
     async def _lifespan(self):
+        if self.config_error:
+            log.error("служба данных: фоновые циклы не запущены — %s", self.config_error)
+            yield
+            return
         mode = self.settings.DRILL_FRESHNESS
         if mode:
             log.warning("УЧЕНИЯ: DRILL_FRESHNESS=%s", mode)
@@ -197,6 +215,7 @@ class DataRole(RoleBase):
                 ok = await self.refresh_catalog()
             except Exception as exc:        # цикл не умирает; текст исключения может нести имя тега
                 log.error("каталог: непредвиденный сбой (%s)", type(exc).__name__)
+                self.catalog_error = "query"
                 self.catalog_failures += 1
                 ok = False
             finally:
