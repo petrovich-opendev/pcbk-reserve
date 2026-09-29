@@ -1,12 +1,14 @@
 #!/bin/bash
 # student/pcbk-health — GET /agent (ручка экземпляра); печатает только код, вывод видит сторож
+trap '' PIPE   # сброс соединения — не смерть от SIGPIPE без вывода, а код 000
 pw=""
 { IFS= read -r pw < /run/secrets/opencode-pw; } 2>/dev/null || true
 auth=$(printf '%s:%s' "$OPENCODE_SERVER_USERNAME" "$pw" | base64 -w0)
 code=000
 if { exec 3<>/dev/tcp/127.0.0.1/4096; } 2>/dev/null; then   # ошибку соединения — не в вывод
-  printf 'GET /agent HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\nConnection: close\r\n\r\n' "$auth" >&3
-  if read -r -t 3 _ status _ <&3 && [[ $status =~ ^[0-9]{3}$ ]]; then code=$status; fi
+  # ошибки записи и чтения (сброс, обрыв) — тоже не в вывод: в журнале здоровья только код
+  if printf 'GET /agent HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\nConnection: close\r\n\r\n' "$auth" >&3 2>/dev/null \
+     && read -r -t 3 _ status _ <&3 2>/dev/null && [[ $status =~ ^[0-9]{3}$ ]]; then code=$status; fi
 fi
 echo "$code"
 [ "$code" = 200 ]

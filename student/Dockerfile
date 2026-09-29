@@ -25,6 +25,8 @@ COPY --chown=0:0 config/ /etc/pcbk-opencode/opencode/
 # права не зависят от umask рабочей копии: каталоги 0755, файлы 0644
 RUN find /etc/pcbk-opencode -type d -exec chmod 0755 {} + \
  && find /etc/pcbk-opencode -type f -exec chmod 0644 {} +
+# без setuid/setgid: su, mount, passwd и прочие из базы — не ступенька к root
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 
 ENV HOME=/home/pcbk \
     XDG_CONFIG_HOME=/etc/pcbk-opencode \

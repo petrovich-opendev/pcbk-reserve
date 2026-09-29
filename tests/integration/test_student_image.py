@@ -37,6 +37,9 @@ Bun.serve({hostname: "0.0.0.0", port: 8000, async fetch(req) {
     {headers: {"content-type": "text/event-stream"}})
 }})
 """
+# сервер на 127.0.0.1:4096, который сразу сбрасывает соединение (RST)
+RESET_SERVER_JS = ('require("node:net").createServer(s => s.resetAndDestroy())'
+                   '.listen(4096, "127.0.0.1", () => console.log("up"))')
 # клиент изнутри места: пароль — из файла, не в argv; печатает правила, разговор и висящие запросы
 CLIENT_JS = """\
 const pw = (await Bun.file("/run/secrets/opencode-pw").text()).trim()
@@ -65,6 +68,12 @@ console.log(JSON.stringify(out))
 
 def docker(*args, timeout=60):
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def ok(r: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
+    """Код 0 — иначе падение с хвостом stderr, а не непонятная ошибка ниже."""
+    assert r.returncode == 0, f"{' '.join(r.args[:4])}…: код {r.returncode}\n{r.stderr[-2000:]}"
+    return r
 
 
 def test_config_files():
@@ -122,6 +131,29 @@ def test_health_prints_only_code(student_image, tmp_path):
     assert (r.returncode, r.stdout, r.stderr) == (1, "000\n", "")     # сервера нет — только код
 
 
+def test_health_survives_reset_connection(student_image):
+    """Сервер рвёт соединение (RST): в журнале здоровья — одна строка с кодом, без ошибок bash и SIGPIPE."""
+    cid = ok(docker("run", "-d", "--network", "none", "--read-only", "--no-healthcheck", "--label", ONESHOT_LABEL,
+                    "-e", "BUN_BE_BUN=1", "--entrypoint", "/usr/local/bin/opencode", IMAGE,
+                    "-e", RESET_SERVER_JS)).stdout.strip()
+    try:
+        deadline = time.monotonic() + 10
+        while "up" not in docker("logs", cid).stdout:        # иначе 000 от «порт закрыт» — пустая проверка
+            assert time.monotonic() < deadline, "сервер со сбросом не поднялся за 10 с"
+            time.sleep(0.2)
+        runs = [docker("exec", cid, "/usr/local/bin/pcbk-health") for _ in range(20)]
+        assert {(r.returncode, r.stdout, r.stderr) for r in runs} == {(1, "000\n", "")}
+    finally:
+        docker("rm", "-f", cid)
+
+
+def test_no_setuid_binaries(student_image):
+    """Ни одного setuid/setgid-файла: su, mount, passwd и прочие — не лазейка к root."""
+    r = ok(docker("run", "--rm", "--network", "none", "--user", "0:0", "--entrypoint", "find", IMAGE,
+                  "/", "-xdev", "-perm", "/6000", "-type", "f"))
+    assert r.stdout == ""
+
+
 @pytest.mark.parametrize("broken", [False, True])
 def test_health_needs_working_instance(student_image, tmp_path, broken):         # Review Focus 3
     for name, value in (("pw", "probe-secret"), ("llm", "probe-token")):
@@ -138,7 +170,7 @@ def test_health_needs_working_instance(student_image, tmp_path, broken):        
         for p in [cfg, *cfg.rglob("*")]:
             p.chmod(0o755 if p.is_dir() else 0o644)
         args += ["-v", f"{cfg}:/etc/pcbk-opencode/opencode:ro"]
-    cid = docker("run", "-d", *args, IMAGE).stdout.strip()
+    cid = ok(docker("run", "-d", *args, IMAGE)).stdout.strip()
     try:
         codes, deadline = [], time.monotonic() + 30
         while codes[-1:] != ["200"] and time.monotonic() < deadline:
@@ -178,17 +210,17 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
     assert docker("network", "create", "--internal", "--label", ONESHOT_LABEL, net).returncode == 0
     try:
         # модель — тот же образ: бинарник OpenCode с BUN_BE_BUN=1 работает как Bun
-        cids.append(docker("run", "-d", "--network", net, "--network-alias", "core", "--label", ONESHOT_LABEL,
-                           "--read-only", "--no-healthcheck", "--tmpfs", "/tmp:exec,mode=1777",
-                           "-e", "BUN_BE_BUN=1", "-v", f"{tmp_path / 'llm.js'}:/fake/llm.js:ro",
-                           "--entrypoint", "/usr/local/bin/opencode", IMAGE, "/fake/llm.js").stdout.strip())
-        cid = docker("run", "-d", *place, IMAGE).stdout.strip()
+        cids.append(ok(docker("run", "-d", "--network", net, "--network-alias", "core", "--label", ONESHOT_LABEL,
+                              "--read-only", "--no-healthcheck", "--tmpfs", "/tmp:exec,mode=1777",
+                              "-e", "BUN_BE_BUN=1", "-v", f"{tmp_path / 'llm.js'}:/fake/llm.js:ro",
+                              "--entrypoint", "/usr/local/bin/opencode", IMAGE, "/fake/llm.js")).stdout.strip())
+        cid = ok(docker("run", "-d", *place, IMAGE)).stdout.strip()
         cids.append(cid)
         deadline = time.monotonic() + 30
         while docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.strip() != "200":
             assert time.monotonic() < deadline, "место не ответило 200 за 30 с"
             time.sleep(1)
-        r = docker("exec", "-e", "BUN_BE_BUN=1", cid, "/usr/local/bin/opencode", "-e", CLIENT_JS, timeout=60)
+        r = ok(docker("exec", "-e", "BUN_BE_BUN=1", cid, "/usr/local/bin/opencode", "-e", CLIENT_JS, timeout=60))
         out = json.loads(r.stdout)
         tools = [p for m in out["messages"] for p in m["parts"] if p["type"] == "tool"]
         assert out["prompt"] == 204 and [p["tool"] for p in tools] == ["read"]
