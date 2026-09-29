@@ -1,7 +1,8 @@
 # Стенд: прокси входа, сторож и две копии прокси сокета (Д1), десять рабочих мест (Д2,
-# профиль students). Переменные — из .env выкладки (deploy/env.example).
+# профиль students), серверный слой (Д3а). Переменные — из .env выкладки (deploy/env.example).
 # Сторонние образы — только по тегу из deploy/images.lock, без pull.
-# Наружу публикуется только 8443 контейнера edge; docker.sock — только у sp-ro и sp-ctl.
+# Наружу публикуется только 8443 контейнера edge; docker.sock — только у sp-ro и sp-ctl;
+# сеть выхода pcbk-egress — только у core.
 
 # имя проекта не зависит от каталога: том журнала и метки те же; тесты задают -p pcbk-test
 name: pcbk-reserve
@@ -81,7 +82,8 @@ services:
 
   watchdog:
     build: ./watchdog
-    image: pcbk-reserve/watchdog:d2
+    # :d2 остаётся на сервере для отката
+    image: pcbk-reserve/watchdog:d3a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -107,6 +109,11 @@ services:
       MEM_FAIL_MIB: ${MEM_FAIL_MIB:-1024}
       # учения «цикл молчит при живом HTTP»: 1 — цикл замирает после первого такта
       DRILL_FREEZE_LOOP: ${DRILL_FREEZE_LOOP:-0}
+      # свежесть историана (Д3а): возраст метки — «внимание» / «сбой»; опрос службы данных
+      # старше HIST_STALE_S — «неизвестно» (формула — задача 1 Д3а, шаг 5; учения меняют HIST_*)
+      HIST_WARN_S: ${HIST_WARN_S:-300}
+      HIST_FAIL_S: ${HIST_FAIL_S:-900}
+      HIST_STALE_S: ${HIST_STALE_S:-140}
     volumes:
       # только сертификат: им сторож проверяет, что edge отдаёт именно его
       - type: bind
@@ -175,6 +182,36 @@ services:
         bind:
           create_host_path: false
     networks: [pcbk-ctl]
+
+  # Серверный слой: роль «данные» (Д3а) — каталог тегов и свежесть историана. Учётные данные
+  # историана — только файлом-секретом, белый список — файлом только для чтения. В сеть выхода
+  # pcbk-egress — только он (Д3а-R2); сети мест и pcbk-ctl — с Д4 и Д5. Порт 8000 не публикуется.
+  core:
+    build: ./core
+    image: pcbk-reserve/core:d3a
+    pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
+    container_name: pcbk-core
+    user: "10003:10003"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
+    restart: unless-stopped
+    environment:                    # только несекретное
+      CORE_PORT: "8000"
+      FRESH_POLL_S: ${FRESH_POLL_S:-30}
+      CATALOG_DEADLINE_S: ${CATALOG_DEADLINE_S:-60}
+      # учения свежести: freeze_stamps — метки не растут, freeze_poll — опрос встаёт; пусто — нет
+      DRILL_FRESHNESS: ${DRILL_FRESHNESS:-}
+    volumes:
+      - {type: bind, source: "${DATA_DIR:?DATA_DIR не задан}/whitelist.txt", target: /app/data/whitelist.txt,
+         read_only: true, bind: {create_host_path: false}}
+    secrets: [{source: bdrv-env, target: bdrv.env}]
+    networks:
+      pcbk-front: {}
+      pcbk-egress: {ipv4_address: 172.31.250.82}
 
   # Рабочие места 01…10: только своя сеть (место .3, серверный слой .2 через extra_hosts —
   # под gVisor DNS Docker не работает), свои тома, агенты и секреты; портов нет.
@@ -329,7 +366,7 @@ networks:
     ipam:
       config:
         - subnet: 172.31.250.16/28
-  # edge и сторож; без адреса хоста на мосту — службы хоста отсюда не видны
+  # edge, сторож и серверный слой; без адреса хоста на мосту — службы хоста отсюда не видны
   pcbk-front:
     name: pcbk-front
     driver: bridge
@@ -359,6 +396,13 @@ networks:
     ipam:
       config:
         - subnet: 172.31.250.64/28
+  # выход серверного слоя к историану (Д3а-R2): только core на .82, динамические адреса —
+  # только .88/29; маскарад включён. Охраны выхода в процессе до Д3б нет: на уровне сети
+  # отсюда открыт любой адрес, включая сервер через шлюз моста (.81) — остаточный риск Д3а
+  pcbk-egress:
+    name: pcbk-egress
+    driver: bridge
+    ipam: {config: [{subnet: 172.31.250.80/28, ip_range: 172.31.250.88/29}]}
   # сети мест: у каждого своя; динамические адреса — только из .8/29
   pcbk-stu-01:
     name: pcbk-stu-01
@@ -450,6 +494,8 @@ volumes:
 # пароль сервера OpenCode и токен LLM мест — только файлами (в Config.Env их нет);
 # 48 шестнадцатеричных знаков без перевода строки, порождаются на сервере
 secrets:
+  # учётные данные историана (BDRV_*): копия файла Dify, install -m 0444 в SECRETS_DIR (0700)
+  bdrv-env: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/bdrv.env"}
   student-01-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.pw"}
   student-01-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.llm-token"}
   student-02-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-02.pw"}

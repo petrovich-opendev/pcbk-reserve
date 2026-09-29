@@ -59,8 +59,9 @@ class Settings:
     HIST_WARN_S: int = 300
     HIST_FAIL_S: int = 900
     # опрос службы данных старше этого — «неизвестно»:
-    # max(120, CATALOG_DEADLINE_S + 2 × FRESH_POLL_S + 10) — задача 1 Д3а, шаг 5
-    HIST_STALE_S: int = 130
+    # max(120, CATALOG_DEADLINE_S + 2 × FRESH_POLL_S + 20) — задача 1 Д3а, шаг 5;
+    # худшее окно без опроса — D + 2P + 15, 20 с — запас на вход и неровный срок
+    HIST_STALE_S: int = 140
 
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:

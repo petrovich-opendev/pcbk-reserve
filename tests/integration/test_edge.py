@@ -5,13 +5,16 @@ import time
 DECLARED_ENV = {                   # наши переменные сверх переменных базового образа — ровно эти
     "pcbk-watchdog": {"LISTEN_PORT", "TICK_S", "STALE_AFTER_S", "DISPLAY_TZ", "DOCKER_URL",
                       "DOCKER_TIMEOUT_S", "MEM_WARN_MIB", "MEM_FAIL_MIB", "TLS_CAFILE",
-                      "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH", "DRILL_FREEZE_LOOP"},
+                      "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH", "DRILL_FREEZE_LOOP",
+                      "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S"},
+    "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS"},
     "pcbk-edge": set(),
     "pcbk-sp-ro": set(),
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d2", "pcbk-edge": "nginx:1.30.5-alpine",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d3a", "pcbk-core": "pcbk-reserve/core:d3a",
+          "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d2"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")

@@ -1,8 +1,9 @@
 """Стенд для проверок компоновки: проект pcbk-test на локальном Docker, порт 127.0.0.1:18443.
 
-Образы — только через deploy/images.lock; тестовый TLS, секреты и агенты мест, test.env —
-во временном каталоге; в конце — `down -v` и тома мест по метке, даже при сбое. Чужие
-контейнеры, сети и тома мест с нашими именами тест не трогает — отказывается запускаться.
+Образы — только через deploy/images.lock; тестовый TLS, секреты и агенты мест, данные
+серверного слоя, test.env — во временном каталоге; в конце — `down -v` и тома мест по
+метке, даже при сбое. Чужие контейнеры, сети и тома мест с нашими именами тест не
+трогает — отказывается запускаться.
 """
 import http.client
 import json
@@ -12,6 +13,8 @@ import secrets
 import ssl
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +41,12 @@ TEST_VOLUME_LABEL = "pcbk-test.volume"
 # переменные компоновки: берутся только из test.env, не из окружения оболочки
 STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRETS_DIR", "AGENTS_DIR",
                         "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S",
-                        "DRILL_FREEZE_LOOP"})
+                        "DRILL_FREEZE_LOOP", "DATA_DIR", "FRESH_POLL_S", "CATALOG_DEADLINE_S",
+                        "DRILL_FRESHNESS", "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S"})
+# учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
+TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
+# белый список стенда — одно синтетическое имя
+TEST_WHITELIST = ("20FAKE_001_PV",)
 # запрос изнутри сторожа: argv — метод и адрес; печатает код ответа
 WATCHDOG_REQUEST = """\
 import http.client, sys
@@ -123,6 +131,15 @@ def make_test_places(secrets_dir: Path, agents_root: Path) -> None:
         d.chmod(0o755)
 
 
+def make_test_core_data(secrets_dir: Path, data_dir: Path) -> None:
+    """Как на сервере: bdrv.env — в каталоге секретов (0700), белый список — в DATA_DIR (0700); файлы 0444."""
+    data_dir.mkdir(mode=0o700)
+    data_dir.chmod(0o700)
+    for f, lines in ((secrets_dir / "bdrv.env", TEST_BDRV_ENV), (data_dir / "whitelist.txt", TEST_WHITELIST)):
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        f.chmod(0o444)
+
+
 def locked_image(repo: str) -> str:
     """Имя:тег образа из images.lock — одно место правды для версий."""
     return next(name for name, _, _ in read_lock() if name.rsplit(":", 1)[0] == repo)
@@ -130,6 +147,13 @@ def locked_image(repo: str) -> str:
 
 def docker_gid() -> str:
     return _run(["getent", "group", "docker"]).stdout.strip().split(":")[2]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """3xx — ответ как есть: urllib не идёт по Location."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class Stack:
@@ -148,6 +172,7 @@ class Stack:
             "pcbk-watchdog": self._watchdog_ready,
             "pcbk-edge": self._edge_ready,
             "pcbk-sp-ro": self._sp_ro_ready,
+            "pcbk-core": self._core_ready,
         }
 
     # --- docker compose и docker ---
@@ -271,14 +296,41 @@ class Stack:
         return self._docker("exec", "pcbk-watchdog", "python", "-c", WATCHDOG_BODY, url).stdout
 
     def http_as(self, name: str, network: str, method: str, url: str) -> int:
-        """Одноразовый curl с этим именем в этой сети; путь — как есть, без нормализации."""
-        r = self._docker("run", "--rm", "--pull", "never", "--name", name, "--network", network,
+        """Одноразовый curl, видимый в этой сети под именем name; путь — как есть, без нормализации.
+
+        Имя контейнера своё (pcbk-oneshot-…), name — псевдоним в сети: иначе клиент от имени
+        pcbk-core упирается в настоящий pcbk-core («name already in use»). -allowfrom прокси
+        разрешает имя через DNS сети — псевдоним проходит так же, как имя контейнера.
+        """
+        r = self._docker("run", "--rm", "--pull", "never", "--name", f"pcbk-oneshot-{secrets.token_hex(4)}",
+                         "--network", network, "--network-alias", name,
                          "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
                          "--security-opt", "no-new-privileges:true", locked_image("curlimages/curl"),
                          "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--path-as-is",
                          # stop места ждёт stop_grace_period (10 с)
                          "--max-time", "20", "-X", method, url)
         return int(r.stdout.strip())
+
+    def http_host(self, method: str, url: str, body: dict | None = None) -> tuple[int, str]:
+        """Запрос с хоста теста (адрес серверного слоя в pcbk-egress): urllib без прокси и перенаправлений.
+
+        Код ответа и тело; ответ с ошибкой HTTP — тоже результат, а не исключение.
+        """
+        data = None if body is None else json.dumps(body).encode()
+        headers = {} if body is None else {"Content-Type": "application/json"}
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+        try:
+            with opener.open(urllib.request.Request(url, data=data, headers=headers, method=method),
+                             timeout=20) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read().decode("utf-8", "replace")
+
+    def logs(self, name: str) -> str:
+        """Журнал контейнера: stdout и stderr вместе (серверный слой пишет в stderr)."""
+        r = self._docker("logs", name)
+        return r.stdout + r.stderr
 
     def oc(self, n: int, method: str, path: str, pw_of: int | None, timeout: float = 10.0) -> tuple[int, str]:
         """Запрос к OpenCode места n из его сети; пароль места pw_of — файлом, не в argv и не в окружении."""
@@ -343,6 +395,11 @@ class Stack:
         r = self._docker("exec", "pcbk-edge", "wget", "-q", "-T", "2", "-O", "-",
                          "http://127.0.0.1:8080/healthz", check=False)
         return r.returncode == 0 and r.stdout.strip() == "ok"
+
+    def _core_ready(self) -> bool:
+        # тот же вызов, что HEALTHCHECK образа: /healthz 200 изнутри
+        return self._docker("exec", "pcbk-core", "python", "-m", "pcbk_core.main",
+                            "--healthcheck", check=False).returncode == 0
 
     def _sp_ro_ready(self) -> bool:
         # ping через прокси тем же путём, что сторож
@@ -485,6 +542,7 @@ def stack(tmp_path_factory, student_image):
     work = tmp_path_factory.mktemp("pcbk-stack")
     make_test_tls(work / "tls")
     make_test_places(work / "secrets", work / "agents")
+    make_test_core_data(work / "secrets", work / "data")
     env_file = work / "test.env"
     env_file.write_text("\n".join([
         f"DOCKER_GID={docker_gid()}",
@@ -493,6 +551,7 @@ def stack(tmp_path_factory, student_image):
         "DISPLAY_TZ=Europe/Moscow",
         f"SECRETS_DIR={work / 'secrets'}",
         f"AGENTS_DIR={work / 'agents'}",
+        f"DATA_DIR={work / 'data'}",
         "MEM_WARN_MIB=64",
         "MEM_FAIL_MIB=32",
     ]) + "\n", encoding="utf-8")

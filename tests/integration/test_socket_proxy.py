@@ -109,15 +109,22 @@ def test_network_subnets_match_table(stack):
 
 
 def test_status_json_overall_ok(stack):
-    data = stack.wait_status(lambda d: d["overall"] == "ok", timeout=30)
+    # в тестовом стенде историана нет: его строка — не норма, итог страницы — тоже;
+    # остальные строки — норма, «ещё не установлен» — только LLM (с Д4)
+    def all_ok(d):
+        return all(c["state"] == ("absent" if c["component"] == "llm" else "ok")
+                   for c in d["checks"] if c["component"] != "historian")
+    data = stack.wait_status(all_ok, timeout=30)
     absent = {c["component"] for c in data["checks"] if c["state"] == "absent"}
-    assert absent >= {"core"} and "student-01" not in absent     # места под наблюдением с Д2
+    assert absent == {"llm"}                                     # места и служба данных под наблюдением
 
 
 def test_watchdog_sees_socket_proxy_loss(stack):
     stack.stop("pcbk-sp-ro")
     try:
-        data = stack.wait_status(lambda d: d["overall"] == "fail", timeout=30)
+        # итог и так «сбой» из-за строки историана — ждём саму строку sp-ro
+        data = stack.wait_status(lambda d: any(c["component"] == "sp-ro" and c["state"] == "fail"
+                                               for c in d["checks"]), timeout=30)
         states = {c["component"]: c["state"] for c in data["checks"]}
         assert states["sp-ro"] == "fail" and states["sp-ctl"] == "unknown"
     finally:

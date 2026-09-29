@@ -10,7 +10,7 @@ import pytest
 import pcbk_watchdog.main
 from helpers import (CHROME, SETTINGS, T0, chrome_dom, http_get, http_status, now_utc,
                      start_test_server)
-from pcbk_watchdog.checks import Check
+from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
 from pcbk_watchdog.journal import Journal
 from pcbk_watchdog.main import (LazyJournal, Settings, WatchState, load_components, run_checks,
@@ -38,6 +38,12 @@ def test_tick_budget_keeps_age_under_stale():
     assert Settings().tick_budget_s == 9          # min(30 − 10, 15) − 2·max(3, 3)
     assert Settings(TICK_S=1).tick_budget_s == 9
     assert Settings(STALE_AFTER_S=60, DOCKER_TIMEOUT_S=5).tick_budget_s == 30 - 10
+    # запас на начатую проверку — 2 срока сокета; HTTP-проверка целиком идёт не дольше
+    # HTTP_CHECK_SPANS сроков, поэтому больше запаса константа быть не может
+    s = Settings()
+    socket_s = max(s.DOCKER_TIMEOUT_S, NET_CHECK_TIMEOUT_S)
+    reserve = (min(s.STALE_AFTER_S - s.TICK_S, s.STALE_AFTER_S / 2) - s.tick_budget_s) / socket_s
+    assert HTTP_CHECK_SPANS <= reserve == 2
 
 
 def test_run_checks_docker_down_marks_containers_unknown():
@@ -259,7 +265,7 @@ def test_hist_settings_validation():
     for warn, fail in ((0, 900), (900, 300), (300, 300)):
         with pytest.raises(ValueError):
             replace(SETTINGS, HIST_WARN_S=warn, HIST_FAIL_S=fail)
-    assert (Settings().HIST_WARN_S, Settings().HIST_FAIL_S, Settings().HIST_STALE_S) == (300, 900, 130)
+    assert (Settings().HIST_WARN_S, Settings().HIST_FAIL_S, Settings().HIST_STALE_S) == (300, 900, 140)
     for bad in ({"HIST_STALE_S": "0"}, {"HIST_STALE_S": "-5"}, {"HIST_WARN_S": "-1"},
                 {"HIST_FAIL_S": "abc"}):
         with pytest.raises(ValueError):
