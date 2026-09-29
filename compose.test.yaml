@@ -1,6 +1,10 @@
 # Локальные тесты (tests/integration): поверх compose.yaml, проект pcbk-test.
 # 8443 на машине разработчика занят — только 127.0.0.1:18443.
 # Тестовые пути и пороги — в test.env, который пишет фикстура stack.
+# gVisor на машине разработчика нет: у мест только runtime: runc, остальное — из compose.yaml.
+x-runc: &runc
+  runtime: runc
+
 services:
   edge:
     ports: !override
@@ -17,3 +21,14 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+
+  student-01: *runc
+  student-02: *runc
+  student-03: *runc
+  student-04: *runc
+  student-05: *runc
+  student-06: *runc
+  student-07: *runc
+  student-08: *runc
+  student-09: *runc
+  student-10: *runc

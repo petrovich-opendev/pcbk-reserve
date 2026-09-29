@@ -34,10 +34,13 @@ def test_student_range_boundaries(stack, name):
 
 
 def test_student_range_upper_bound_passes(stack):
-    # положительный контроль границы: 10 — последнее место, прокси пропускает, Docker — 404
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + "/containers/pcbk-student-10/start") in PASSED
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/pcbk-student-10/json") in PASSED
-    assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-student-10/json") in PASSED
+    # положительный контроль границы: 10 — последнее место, прокси пропускает
+    try:
+        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + "/containers/pcbk-student-10/start") in PASSED
+        assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/pcbk-student-10/json") in PASSED
+        assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-student-10/json") in PASSED
+    finally:
+        stack.stop("pcbk-student-10")      # место есть — Docker его запускает, тест возвращает в сон
 
 
 def test_socket_only_in_hardened_proxies(stack):
@@ -104,7 +107,8 @@ def test_network_subnets_match_table(stack):
 
 def test_status_json_overall_ok(stack):
     data = stack.wait_status(lambda d: d["overall"] == "ok", timeout=30)
-    assert {c["component"] for c in data["checks"] if c["state"] == "absent"} >= {"core", "student-01"}
+    absent = {c["component"] for c in data["checks"] if c["state"] == "absent"}
+    assert absent >= {"core"} and "student-01" not in absent     # места под наблюдением с Д2
 
 
 def test_watchdog_sees_socket_proxy_loss(stack):

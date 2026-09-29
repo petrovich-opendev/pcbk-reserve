@@ -1,13 +1,14 @@
 """Стенд для проверок компоновки: проект pcbk-test на локальном Docker, порт 127.0.0.1:18443.
 
-Образы — только через deploy/images.lock; тестовый TLS и test.env — во временном
-каталоге; в конце — `down -v` даже при сбое. Чужие контейнеры и сети с нашими
-именами тест не трогает — отказывается запускаться.
+Образы — только через deploy/images.lock; тестовый TLS, секреты и агенты мест, test.env —
+во временном каталоге; в конце — `down -v` и тома мест по метке, даже при сбое. Чужие
+контейнеры, сети и тома мест с нашими именами тест не трогает — отказывается запускаться.
 """
 import http.client
 import json
 import os
 import re
+import secrets
 import ssl
 import subprocess
 import time
@@ -28,6 +29,12 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 READY_TIMEOUT_S = 60
 COMPOSE_TIMEOUT_S = 600
 COMPOSE_FILES = ("compose.yaml", "compose.test.yaml")
+# профиль мест: без него compose не видит student-NN
+PROFILE = "students"
+STUDENT_PREFIX = "pcbk-student-"
+PLACES = range(1, 11)
+# метка томов мест, созданных тестом: уборка удаляет только их
+TEST_VOLUME_LABEL = "pcbk-test.volume"
 # переменные компоновки: берутся только из test.env, не из окружения оболочки
 STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRETS_DIR", "AGENTS_DIR",
                         "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S",
@@ -41,6 +48,21 @@ conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=10)
 conn.request(sys.argv[1], u.path + ("?" + u.query if u.query else ""))
 print(conn.getresponse().status)
 """
+# то же, но GET и тело ответа; не 200 — ненулевой код
+WATCHDOG_BODY = """\
+import http.client, sys
+from urllib.parse import urlsplit
+u = urlsplit(sys.argv[1])
+conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=10)
+conn.request("GET", u.path + ("?" + u.query if u.query else ""))
+r = conn.getresponse()
+body = r.read()
+if r.status != 200:
+    sys.exit(f"HTTP {r.status}")
+sys.stdout.write(body.decode("utf-8"))
+"""
+# D1: соединение есть, если curl -v его сообщил
+CONNECTED = re.compile(r"Established connection|Connected to")
 
 
 def _run(cmd: list[str], *, timeout: float = 120, check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -85,6 +107,22 @@ def make_test_tls(tls_dir: Path) -> None:
         (tls_dir / f).chmod(0o644)
 
 
+def make_test_places(secrets_dir: Path, agents_root: Path) -> None:
+    """Как на сервере: секреты — 48 hex без перевода строки, каталог 0700, файлы 0444;
+    агенты — корень 0700, каталоги мест 0755."""
+    for d in (secrets_dir, agents_root):
+        d.mkdir(mode=0o700)
+        d.chmod(0o700)
+    for n in PLACES:
+        for suffix in ("pw", "llm-token"):
+            f = secrets_dir / f"student-{n:02d}.{suffix}"
+            f.write_text(secrets.token_hex(24), encoding="ascii")
+            f.chmod(0o444)
+        d = agents_root / f"student-{n:02d}"
+        d.mkdir(mode=0o755)
+        d.chmod(0o755)
+
+
 def locked_image(repo: str) -> str:
     """Имя:тег образа из images.lock — одно место правды для версий."""
     return next(name for name, _, _ in read_lock() if name.rsplit(":", 1)[0] == repo)
@@ -99,7 +137,13 @@ class Stack:
         self.env_file = env_file
         self.env = {k: v for k, v in os.environ.items()
                     if k not in STACK_VARS and not k.startswith("COMPOSE_")}
-        # готовность после start/restart/unpause; прочим контейнерам хватает Running
+        values = self.test_env()
+        self.stu_net: str = values["STU_NET"]
+        self.secrets_dir = Path(values["SECRETS_DIR"])
+        self.agents_root = Path(values["AGENTS_DIR"])
+        self._prod_config: dict | None = None
+        # готовность после start/restart/unpause; прочим контейнерам хватает Running,
+        # местам — healthy (wait_ready); места сюда не входят, up() их не ждёт
         self.ready: dict[str, Callable[[], bool]] = {
             "pcbk-watchdog": self._watchdog_ready,
             "pcbk-edge": self._edge_ready,
@@ -111,12 +155,18 @@ class Stack:
     def compose(self, *args: str, timeout: float = COMPOSE_TIMEOUT_S, check: bool = True,
                 files: tuple[str, ...] = COMPOSE_FILES) -> str:
         cmd = ["docker", "compose", "-p", PROJECT, "--env-file", str(self.env_file),
-               *(a for f in files for a in ("-f", f)), *args]
+               *(a for f in files for a in ("-f", f)), "--profile", PROFILE, *args]
         return _run(cmd, timeout=timeout, check=check, cwd=REPO, env=self.env).stdout
 
     def config(self, files: tuple[str, ...] = COMPOSE_FILES) -> dict:
         """Итоговая компоновка; files=("compose.yaml",) — как на сервере, без тестовых правок."""
         return json.loads(self.compose("config", "--format", "json", files=files))
+
+    def prod_config(self) -> dict:
+        """compose.yaml как на сервере (без compose.test.yaml), с профилем мест; один раз за прогон."""
+        if self._prod_config is None:
+            self._prod_config = self.config(files=("compose.yaml",))
+        return self._prod_config
 
     def _docker(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return _run(["docker", *args], check=check)
@@ -138,6 +188,31 @@ class Stack:
     def exec(self, name: str, *cmd: str) -> str:
         return self._docker("exec", name, *cmd).stdout.strip()
 
+    def sh(self, name: str, script: str) -> tuple[int, str, str]:
+        """bash -c внутри контейнера; ненулевой код — не исключение, а результат."""
+        r = self._docker("exec", name, "bash", "-c", script, check=False)
+        return r.returncode, r.stdout, r.stderr
+
+    def opencode_pid(self, name: str) -> int:
+        """PID OpenCode в месте — по exe, а не по argv."""
+        script = ('for p in /proc/[0-9]*; do [ "$(readlink "$p/exe" 2>/dev/null)" = /usr/local/bin/opencode ] '
+                  '&& echo "${p#/proc/}"; done; true')
+        pids = self.sh(name, script)[1].split()
+        if len(pids) != 1:
+            raise RuntimeError(f"{name}: процессов OpenCode {len(pids)}, ждали один")
+        return int(pids[0])
+
+    # --- секреты и агенты мест (файлы фикстуры) ---
+
+    def password(self, n: int) -> str:
+        return (self.secrets_dir / f"student-{n:02d}.pw").read_text(encoding="ascii")
+
+    def llm_token(self, n: int) -> str:
+        return (self.secrets_dir / f"student-{n:02d}.llm-token").read_text(encoding="ascii")
+
+    def agents_dir(self, n: int) -> Path:
+        return self.agents_root / f"student-{n:02d}"
+
     def env_names(self, name: str) -> set[str]:
         return {e.split("=", 1)[0] for e in self.inspect(name)["Config"]["Env"] or []}
 
@@ -157,6 +232,10 @@ class Stack:
                 raise RuntimeError(f"{name}: моста {bridge} нет на хосте")
             addrs += [a["local"] for i in ifaces for a in i.get("addr_info", []) if a.get("family") == "inet"]
         return addrs
+
+    def host_lan(self) -> str:
+        """Первый адрес IPv4 хоста из hostname -I."""
+        return next(a for a in _run(["hostname", "-I"]).stdout.split() if ":" not in a)
 
     # --- запросы к стенду ---
 
@@ -187,14 +266,54 @@ class Stack:
         r = self._docker("exec", "pcbk-watchdog", "python", "-c", WATCHDOG_REQUEST, method, url)
         return int(r.stdout.strip())
 
+    def body_from_watchdog(self, url: str) -> str:
+        """GET изнутри pcbk-watchdog, как http_from_watchdog, но тело ответа; не 200 — исключение."""
+        return self._docker("exec", "pcbk-watchdog", "python", "-c", WATCHDOG_BODY, url).stdout
+
     def http_as(self, name: str, network: str, method: str, url: str) -> int:
         """Одноразовый curl с этим именем в этой сети; путь — как есть, без нормализации."""
         r = self._docker("run", "--rm", "--pull", "never", "--name", name, "--network", network,
                          "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
                          "--security-opt", "no-new-privileges:true", locked_image("curlimages/curl"),
                          "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--path-as-is",
-                         "--max-time", "10", "-X", method, url)
+                         # stop места ждёт stop_grace_period (10 с)
+                         "--max-time", "20", "-X", method, url)
         return int(r.stdout.strip())
+
+    def oc(self, n: int, method: str, path: str, pw_of: int | None, timeout: float = 10.0) -> tuple[int, str]:
+        """Запрос к OpenCode места n из его сети; пароль места pw_of — файлом, не в argv и не в окружении."""
+        auth = [] if pw_of is None else ["--variable", "PW@/pw", "--expand-user", "opencode:{{PW}}"]
+        mount = [] if pw_of is None else ["-v", f"{self.secrets_dir / f'student-{pw_of:02d}.pw'}:/pw:ro"]
+        r = self._docker("run", "--rm", "--pull", "never", "--network", f"pcbk-stu-{n:02d}",
+                         "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
+                         "--security-opt", "no-new-privileges:true", *mount, locked_image("curlimages/curl"),
+                         "curl", "-s", "--max-time", str(timeout), "-X", method, *auth,
+                         "-w", "\n%{http_code}", f"http://{self.stu_net}.{n}.3:4096{path}", check=False)
+        body, _, code = r.stdout.rpartition("\n")
+        return int(code or 0), body
+
+    def wait_oc(self, n: int, timeout: float = 30.0) -> None:
+        """GET /global/health места n со своим паролем, по 2 с на попытку, до 200."""
+        deadline = time.monotonic() + timeout
+        while True:
+            code = self.oc(n, "GET", "/global/health", n, timeout=2)[0]
+            if code == 200:
+                return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"место {n:02d}: /global/health не ответил 200 за {timeout} с, код {code}")
+            time.sleep(0.5)
+
+    def probe(self, network: str, addr: str, port: int) -> int:
+        """Способ Д1 из одноразового curl в сети network: 1 — соединение есть, 0 — нет. Только порт, без пароля."""
+        r = self._docker("run", "--rm", "--pull", "never", "--network", network,
+                         "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
+                         "--security-opt", "no-new-privileges:true", locked_image("curlimages/curl"),
+                         "curl", "-sv", "--connect-timeout", "3", "-m", "4", f"telnet://{addr}:{port}",
+                         check=False)
+        # 125–127 — сбой docker run, а не отказ соединения: иначе проба дала бы ложный 0
+        if r.returncode in (125, 126, 127):
+            raise RuntimeError(f"проба в {network}: docker run, код {r.returncode}\n{r.stderr[-1000:]}")
+        return 1 if CONNECTED.search(r.stdout + r.stderr) else 0
 
     def wait_status(self, pred: Callable[[dict], bool], timeout: float) -> dict:
         """/status.json через edge, пока pred не станет истинным; по сроку — AssertionError."""
@@ -234,8 +353,27 @@ class Stack:
     def _state(self, name: str) -> dict:
         return self.inspect(name)["State"]
 
+    def wait_healthy(self, name: str, timeout: float = READY_TIMEOUT_S) -> None:
+        """Проверка здоровья образа дала healthy — или отказ: State.Error, выход
+        (при restart: unless-stopped он виден как Restarting), срок истёк."""
+        deadline = time.monotonic() + timeout
+        while True:
+            st = self._state(name)
+            health = (st.get("Health") or {}).get("Status")
+            if st["Running"] and not st["Restarting"] and not st["Paused"] and health == "healthy":
+                return
+            if st.get("Error") or not st["Running"] or st["Restarting"]:
+                raise RuntimeError(f"{name}: не работает — {st['Status']}, код {st['ExitCode']}, "
+                                   f"{st.get('Error') or 'без ошибки Docker'}")
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{name}: не healthy за {timeout} с, сейчас {health}")
+            time.sleep(0.5)
+
     def wait_ready(self, name: str, timeout: float = READY_TIMEOUT_S) -> None:
-        """Готов — или явный отказ: контейнер вышел, либо срок истёк."""
+        """Готов — или явный отказ: контейнер вышел, либо срок истёк. Место готово, когда healthy."""
+        if name.startswith(STUDENT_PREFIX):
+            self.wait_healthy(name, timeout)
+            return
         probe = self.ready.get(name, lambda: self._state(name)["Running"])
         deadline = time.monotonic() + timeout
         while True:
@@ -287,9 +425,23 @@ class Stack:
             labels = json.loads(r.stdout) or {}
             if labels.get("com.docker.compose.project") != PROJECT:
                 pytest.fail(f"{kind} {name} уже есть и принадлежит не проекту {PROJECT} — тест его не трогает")
+        # тома мест внешние: том без метки теста — данные студента, их не трогаем
+        for vol in cfg.get("volumes", {}).values():
+            name = vol.get("name") or ""
+            if not (vol.get("external") and name.startswith(STUDENT_PREFIX)):
+                continue
+            r = self._docker("volume", "inspect", "--format", "{{json .Labels}}", name, check=False)
+            if r.returncode == 0 and TEST_VOLUME_LABEL not in (json.loads(r.stdout) or {}):
+                pytest.fail(f"том {name} уже есть и создан не тестом — тест его не трогает")
 
     def up(self) -> None:
-        self.compose("up", "-d", "--build")
+        cfg = self.config()                          # compose() уже передаёт --profile students
+        places = sorted(n for n, s in cfg["services"].items() if PROFILE in (s.get("profiles") or []))
+        for name in places:                          # тома мест внешние: создаёт фикстура, на сервере — выкладка
+            for kind in ("state", "work"):
+                self._docker("volume", "create", "--label", TEST_VOLUME_LABEL, f"pcbk-{name}-{kind}")
+        self.compose("create", "--no-build", *places)
+        self.compose("up", "-d", "--build", *(n for n in cfg["services"] if n not in places))
         for name in self.ready:
             self.wait_ready(name)
         ready_at = datetime.now(timezone.utc)
@@ -313,6 +465,11 @@ class Stack:
         if leftovers:
             self._docker("rm", "-f", *leftovers)
         self.compose("down", "-v", "--remove-orphans", "--timeout", "10")
+        # внешние тома мест compose не удаляет; удаляем только созданные тестом — по метке
+        volumes = self._docker("volume", "ls", "-q", "--filter", f"label={TEST_VOLUME_LABEL}",
+                               "--filter", f"name={STUDENT_PREFIX}").stdout.split()
+        if volumes:
+            self._docker("volume", "rm", *volumes)
 
 
 @pytest.fixture(scope="session")
@@ -323,10 +480,11 @@ def student_image() -> str:
 
 
 @pytest.fixture(scope="session")
-def stack(tmp_path_factory):
+def stack(tmp_path_factory, student_image):
     prepare_images()
     work = tmp_path_factory.mktemp("pcbk-stack")
     make_test_tls(work / "tls")
+    make_test_places(work / "secrets", work / "agents")
     env_file = work / "test.env"
     env_file.write_text("\n".join([
         f"DOCKER_GID={docker_gid()}",

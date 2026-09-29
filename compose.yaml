@@ -1,10 +1,36 @@
-# Стенд Д1: прокси входа, сторож и две копии прокси сокета. Переменные — из .env
-# выкладки (deploy/env.example).
+# Стенд: прокси входа, сторож и две копии прокси сокета (Д1), десять рабочих мест (Д2,
+# профиль students). Переменные — из .env выкладки (deploy/env.example).
 # Сторонние образы — только по тегу из deploy/images.lock, без pull.
 # Наружу публикуется только 8443 контейнера edge; docker.sock — только у sp-ro и sp-ctl.
 
 # имя проекта не зависит от каталога: том журнала и метки те же; тесты задают -p pcbk-test
 name: pcbk-reserve
+
+# общее для десяти мест. Только runsc: runc — лишь в compose.test.yaml.
+# Профиль students: команды выкладки без имён служб места не поднимают — их создают
+# create и будит серверный слой (с Д5) или администратор.
+# Секции build нет: образ один на десять мест, собирается локально и едет docker save/load.
+# healthcheck не задаётся: работает проверка образа (GET /agent, печатает только код).
+x-student: &student
+  image: pcbk-reserve/student:d2
+  pull_policy: never
+  runtime: runsc
+  profiles: [students]
+  user: "10001:10001"
+  init: true
+  ipc: private
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp:exec,mode=1777,size=256m"]
+  # лимиты меняются только по замеру Д2: порог — память > 700 МиБ или потоки > 358
+  mem_limit: 1g
+  memswap_limit: 1g                      # swap = 0
+  cpus: 1.0
+  pids_limit: 512
+  restart: unless-stopped
+  stop_grace_period: 10s
+  labels: {pcbk.role: student}
 
 services:
   edge:
@@ -55,7 +81,7 @@ services:
 
   watchdog:
     build: ./watchdog
-    image: pcbk-reserve/watchdog:d1
+    image: pcbk-reserve/watchdog:d2
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -150,6 +176,149 @@ services:
           create_host_path: false
     networks: [pcbk-ctl]
 
+  # Рабочие места 01…10: только своя сеть (место .3, серверный слой .2 через extra_hosts —
+  # под gVisor DNS Docker не работает), свои тома, агенты и секреты; портов нет.
+  # Блоки 02–10 — копия 01 с точностью до номера (тест test_student_hardening).
+  student-01:
+    <<: *student
+    container_name: pcbk-student-01
+    networks: {pcbk-stu-01: {ipv4_address: "${STU_NET:-172.31}.1.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.1.2"]
+    volumes:
+      - pcbk-student-01-state:/var/lib/opencode
+      - pcbk-student-01-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-01", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-01-pw, target: opencode-pw}
+      - {source: student-01-llm, target: llm-token}
+
+  student-02:
+    <<: *student
+    container_name: pcbk-student-02
+    networks: {pcbk-stu-02: {ipv4_address: "${STU_NET:-172.31}.2.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.2.2"]
+    volumes:
+      - pcbk-student-02-state:/var/lib/opencode
+      - pcbk-student-02-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-02", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-02-pw, target: opencode-pw}
+      - {source: student-02-llm, target: llm-token}
+
+  student-03:
+    <<: *student
+    container_name: pcbk-student-03
+    networks: {pcbk-stu-03: {ipv4_address: "${STU_NET:-172.31}.3.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.3.2"]
+    volumes:
+      - pcbk-student-03-state:/var/lib/opencode
+      - pcbk-student-03-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-03", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-03-pw, target: opencode-pw}
+      - {source: student-03-llm, target: llm-token}
+
+  student-04:
+    <<: *student
+    container_name: pcbk-student-04
+    networks: {pcbk-stu-04: {ipv4_address: "${STU_NET:-172.31}.4.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.4.2"]
+    volumes:
+      - pcbk-student-04-state:/var/lib/opencode
+      - pcbk-student-04-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-04", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-04-pw, target: opencode-pw}
+      - {source: student-04-llm, target: llm-token}
+
+  student-05:
+    <<: *student
+    container_name: pcbk-student-05
+    networks: {pcbk-stu-05: {ipv4_address: "${STU_NET:-172.31}.5.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.5.2"]
+    volumes:
+      - pcbk-student-05-state:/var/lib/opencode
+      - pcbk-student-05-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-05", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-05-pw, target: opencode-pw}
+      - {source: student-05-llm, target: llm-token}
+
+  student-06:
+    <<: *student
+    container_name: pcbk-student-06
+    networks: {pcbk-stu-06: {ipv4_address: "${STU_NET:-172.31}.6.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.6.2"]
+    volumes:
+      - pcbk-student-06-state:/var/lib/opencode
+      - pcbk-student-06-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-06", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-06-pw, target: opencode-pw}
+      - {source: student-06-llm, target: llm-token}
+
+  student-07:
+    <<: *student
+    container_name: pcbk-student-07
+    networks: {pcbk-stu-07: {ipv4_address: "${STU_NET:-172.31}.7.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.7.2"]
+    volumes:
+      - pcbk-student-07-state:/var/lib/opencode
+      - pcbk-student-07-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-07", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-07-pw, target: opencode-pw}
+      - {source: student-07-llm, target: llm-token}
+
+  student-08:
+    <<: *student
+    container_name: pcbk-student-08
+    networks: {pcbk-stu-08: {ipv4_address: "${STU_NET:-172.31}.8.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.8.2"]
+    volumes:
+      - pcbk-student-08-state:/var/lib/opencode
+      - pcbk-student-08-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-08", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-08-pw, target: opencode-pw}
+      - {source: student-08-llm, target: llm-token}
+
+  student-09:
+    <<: *student
+    container_name: pcbk-student-09
+    networks: {pcbk-stu-09: {ipv4_address: "${STU_NET:-172.31}.9.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.9.2"]
+    volumes:
+      - pcbk-student-09-state:/var/lib/opencode
+      - pcbk-student-09-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-09", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-09-pw, target: opencode-pw}
+      - {source: student-09-llm, target: llm-token}
+
+  student-10:
+    <<: *student
+    container_name: pcbk-student-10
+    networks: {pcbk-stu-10: {ipv4_address: "${STU_NET:-172.31}.10.3"}}
+    extra_hosts: ["core:${STU_NET:-172.31}.10.2"]
+    volumes:
+      - pcbk-student-10-state:/var/lib/opencode
+      - pcbk-student-10-work:/work
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}/student-10", target: /etc/pcbk-opencode/opencode/agents,
+         read_only: true, bind: {create_host_path: false}}
+    secrets:
+      - {source: student-10-pw, target: opencode-pw}
+      - {source: student-10-llm, target: llm-token}
+
 networks:
   # только edge — ради публикации 8443; без маскарада: наружу edge не ходит
   pcbk-public:
@@ -190,8 +359,114 @@ networks:
     ipam:
       config:
         - subnet: 172.31.250.64/28
+  # сети мест: у каждого своя; динамические адреса — только из .8/29
+  pcbk-stu-01:
+    name: pcbk-stu-01
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.1.0/28", ip_range: "${STU_NET:-172.31}.1.8/29"}]}
+  pcbk-stu-02:
+    name: pcbk-stu-02
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.2.0/28", ip_range: "${STU_NET:-172.31}.2.8/29"}]}
+  pcbk-stu-03:
+    name: pcbk-stu-03
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.3.0/28", ip_range: "${STU_NET:-172.31}.3.8/29"}]}
+  pcbk-stu-04:
+    name: pcbk-stu-04
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.4.0/28", ip_range: "${STU_NET:-172.31}.4.8/29"}]}
+  pcbk-stu-05:
+    name: pcbk-stu-05
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.5.0/28", ip_range: "${STU_NET:-172.31}.5.8/29"}]}
+  pcbk-stu-06:
+    name: pcbk-stu-06
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.6.0/28", ip_range: "${STU_NET:-172.31}.6.8/29"}]}
+  pcbk-stu-07:
+    name: pcbk-stu-07
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.7.0/28", ip_range: "${STU_NET:-172.31}.7.8/29"}]}
+  pcbk-stu-08:
+    name: pcbk-stu-08
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.8.0/28", ip_range: "${STU_NET:-172.31}.8.8/29"}]}
+  pcbk-stu-09:
+    name: pcbk-stu-09
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.9.0/28", ip_range: "${STU_NET:-172.31}.9.8/29"}]}
+  pcbk-stu-10:
+    name: pcbk-stu-10
+    driver: bridge
+    internal: true
+    driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated}
+    ipam: {config: [{subnet: "${STU_NET:-172.31}.10.0/28", ip_range: "${STU_NET:-172.31}.10.8/29"}]}
 
 volumes:
   # журнал переходов сторожа (SQLite); имя — с префиксом проекта, тестовый
   # проект pcbk-test не может удалить журнал выкладки
   pcbk-watchdog-journal:
+  # данные студентов: внешние — Compose их не создаёт и не удаляет (down -v их не тронет)
+  pcbk-student-01-state: {name: pcbk-student-01-state, external: true}
+  pcbk-student-01-work: {name: pcbk-student-01-work, external: true}
+  pcbk-student-02-state: {name: pcbk-student-02-state, external: true}
+  pcbk-student-02-work: {name: pcbk-student-02-work, external: true}
+  pcbk-student-03-state: {name: pcbk-student-03-state, external: true}
+  pcbk-student-03-work: {name: pcbk-student-03-work, external: true}
+  pcbk-student-04-state: {name: pcbk-student-04-state, external: true}
+  pcbk-student-04-work: {name: pcbk-student-04-work, external: true}
+  pcbk-student-05-state: {name: pcbk-student-05-state, external: true}
+  pcbk-student-05-work: {name: pcbk-student-05-work, external: true}
+  pcbk-student-06-state: {name: pcbk-student-06-state, external: true}
+  pcbk-student-06-work: {name: pcbk-student-06-work, external: true}
+  pcbk-student-07-state: {name: pcbk-student-07-state, external: true}
+  pcbk-student-07-work: {name: pcbk-student-07-work, external: true}
+  pcbk-student-08-state: {name: pcbk-student-08-state, external: true}
+  pcbk-student-08-work: {name: pcbk-student-08-work, external: true}
+  pcbk-student-09-state: {name: pcbk-student-09-state, external: true}
+  pcbk-student-09-work: {name: pcbk-student-09-work, external: true}
+  pcbk-student-10-state: {name: pcbk-student-10-state, external: true}
+  pcbk-student-10-work: {name: pcbk-student-10-work, external: true}
+
+# пароль сервера OpenCode и токен LLM мест — только файлами (в Config.Env их нет);
+# 48 шестнадцатеричных знаков без перевода строки, порождаются на сервере
+secrets:
+  student-01-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.pw"}
+  student-01-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.llm-token"}
+  student-02-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-02.pw"}
+  student-02-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-02.llm-token"}
+  student-03-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-03.pw"}
+  student-03-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-03.llm-token"}
+  student-04-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-04.pw"}
+  student-04-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-04.llm-token"}
+  student-05-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-05.pw"}
+  student-05-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-05.llm-token"}
+  student-06-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-06.pw"}
+  student-06-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-06.llm-token"}
+  student-07-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-07.pw"}
+  student-07-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-07.llm-token"}
+  student-08-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-08.pw"}
+  student-08-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-08.llm-token"}
+  student-09-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-09.pw"}
+  student-09-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-09.llm-token"}
+  student-10-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-10.pw"}
+  student-10-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-10.llm-token"}
