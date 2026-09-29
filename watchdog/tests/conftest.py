@@ -5,7 +5,7 @@ import ssl
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -140,6 +140,53 @@ def serve_http(handler):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@contextmanager
+def serve_raw(respond):
+    """Сырой TCP-двойник: читает запрос, дальше respond(conn, stop) шлёт ответ сам."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.05)
+    stop, threads = threading.Event(), []
+
+    def handle(conn):
+        with conn:
+            try:
+                conn.settimeout(2)
+                conn.recv(65536)   # GET без тела приходит одним пакетом
+                respond(conn, stop)
+            except OSError:
+                pass
+
+    def accept():
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            thread = threading.Thread(target=handle, args=(conn,), daemon=True)
+            thread.start()
+            threads.append(thread)
+
+    acceptor = threading.Thread(target=accept, daemon=True)
+    acceptor.start()
+    try:
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        stop.set()
+        acceptor.join()
+        for thread in threads:
+            thread.join(5)
+        listener.close()
+
+
+@pytest.fixture
+def raw_http():
+    """raw_http(respond) → адрес сырого двойника; гасятся при выходе из теста."""
+    with ExitStack() as stack:
+        yield lambda respond: stack.enter_context(serve_raw(respond))
 
 
 @pytest.fixture

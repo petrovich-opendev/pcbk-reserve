@@ -1,9 +1,11 @@
 """Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана."""
 import http.client
+import io
 import json
 import re
 import socket
 import ssl
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -30,6 +32,9 @@ CERT_NOT_YET_VALID = 9
 CERT_HAS_EXPIRED = 10
 # срок ответа для сетевых проверок, с (на операцию сокета)
 NET_CHECK_TIMEOUT_S = 3.0
+# HTTP-проверка целиком (соединение, запрос, заголовки, тело) — не дольше стольких
+# сроков сокета: столько на начатую проверку закладывает правило срока такта
+HTTP_CHECK_SPANS = 2
 # тело ответа ручки здоровья читаем не больше этого
 MAX_BODY_BYTES = 64 * 1024
 # причину из ответа на страницу — не длиннее
@@ -38,6 +43,7 @@ HTTP_OK_DETAIL = "отвечает"
 # каталог тегов старше двух суток — предупреждение
 CATALOG_MAX_AGE_S = 172800
 CORE_DOWN_DETAIL = "служба данных не отвечает — свежесть неизвестна"
+OFF_CONTRACT_DETAIL = "служба данных ответила не по договору — свежесть неизвестна"
 
 
 @dataclass(frozen=True)
@@ -123,21 +129,59 @@ def _reason(text: str) -> str:
     return HOST_PATH.sub("…", text.strip())[:REASON_CHARS]
 
 
-def _http_get(url: str, timeout: float, read_body) -> tuple[int, bytes]:
-    """GET без перенаправлений и без прокси из окружения.
+class _DeadlineReader(io.RawIOBase):
+    """Чтение сокета под общий срок: каждое чтение ждёт не дольше остатка срока."""
 
+    def __init__(self, sock: socket.socket, deadline: float):
+        self._sock, self._deadline = sock, deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buf) -> int:
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("срок проверки истёк")
+        self._sock.settimeout(left)
+        return self._sock.recv_into(buf)
+
+
+class _DeadlineSocket:
+    """Сокет для HTTPResponse: ему нужен только makefile("rb")."""
+
+    def __init__(self, sock: socket.socket, deadline: float):
+        self._sock, self._deadline = sock, deadline
+
+    def makefile(self, mode: str):
+        return io.BufferedReader(_DeadlineReader(self._sock, self._deadline))
+
+
+def _http_get(url: str, timeout: float, read_body) -> tuple[int, bytes]:
+    """GET без перенаправлений и без прокси из окружения, под общим сроком.
+
+    Соединение — не дольше timeout на адрес; вся проверка — не дольше HTTP_CHECK_SPANS × timeout:
+    срок на каждую операцию сокета не ловит ответ, который капает по байту.
     Тело читается (не больше MAX_BODY_BYTES), только если read_body(код) истинно;
-    сбой чтения тела при известном коде — пустое тело. Нет связи — OSError или
-    HTTPException наружу.
+    сбой чтения тела при известном коде — пустое тело. Нет связи или срок вышел до
+    кода — OSError (TimeoutError) или HTTPException наружу.
     """
     parts = urlsplit(url)
     if parts.scheme != "http" or not parts.hostname:
         raise ValueError(f"нужен адрес http://, получен {url!r}")
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    deadline = time.monotonic() + HTTP_CHECK_SPANS * timeout
     conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
     try:
+        conn.connect()
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("срок проверки истёк")
+        conn.sock.settimeout(left)   # запрос мал, но и его отправка — под сроком
         conn.request("GET", path)
-        resp = conn.getresponse()
+        # ответ читаем сами, не через getresponse(): тот при Connection: close
+        # закрыл бы сокет, а наш читатель не держит ссылку, как makefile сокета
+        resp = http.client.HTTPResponse(_DeadlineSocket(conn.sock, deadline), method="GET")
+        resp.begin()
         body = b""
         if read_body(resp.status):
             try:
@@ -149,26 +193,24 @@ def _http_get(url: str, timeout: float, read_body) -> tuple[int, bytes]:
         conn.close()
 
 
-def _json_object(body: bytes) -> dict | None:
-    try:
-        obj = json.loads(body)
-    except ValueError:   # в том числе UnicodeDecodeError
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
 def check_http(component: str, title: str, url: str, timeout: float = 3.0,
                ok_detail: str = HTTP_OK_DETAIL) -> Check:
-    """2xx — ok с ok_detail; иначе fail с причиной из JSON-поля detail, если она есть."""
+    """2xx — ok с ok_detail; 503 — fail с причиной из JSON-поля detail, если она есть (Д3а-R5);
+    иначе — fail с кодом."""
     try:
-        status, body = _http_get(url, timeout, lambda code: not 200 <= code < 300)
+        status, body = _http_get(url, timeout, lambda code: code == 503)
     except (OSError, http.client.HTTPException):
         return Check(component, title, "fail", "не отвечает")
     if 200 <= status < 300:
         return Check(component, title, "ok", ok_detail)
-    detail = (_json_object(body) or {}).get("detail")
-    if isinstance(detail, str) and detail.strip():
-        return Check(component, title, "fail", _reason(detail))
+    if status == 503:
+        try:
+            reply = json.loads(body)
+        except (ValueError, RecursionError):   # в том числе UnicodeDecodeError
+            reply = None
+        detail = reply.get("detail") if isinstance(reply, dict) else None
+        if isinstance(detail, str) and detail.strip():
+            return Check(component, title, "fail", _reason(detail))
     return Check(component, title, "fail", f"отвечает ошибкой HTTP {status}")
 
 
@@ -176,12 +218,14 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def historian_verdict(reply: dict, now: datetime, warn_s: int, fail_s: int,
+def historian_verdict(reply, now: datetime, warn_s: int, fail_s: int,
                       stale_s: int) -> tuple[State, str]:
     """Вердикт по ответу /health/historian; первая подходящая строка таблицы задачи 6 Д3а.
 
-    Ответ не по договору — ValueError, TypeError или KeyError.
+    Ответ не по договору — ValueError, TypeError, KeyError или OverflowError.
     """
+    if not isinstance(reply, dict):
+        raise TypeError("ответ — не объект JSON")
     checked_raw = reply["checked_at"]
     if checked_raw is None:
         return "unknown", "служба ещё не опрашивала историан"
@@ -218,13 +262,16 @@ def check_historian(component: str, title: str, url: str, now: datetime, warn_s:
         status, body = _http_get(url, timeout, lambda code: code == 200)
     except (OSError, http.client.HTTPException):
         return Check(component, title, "unknown", CORE_DOWN_DETAIL)
-    reply = _json_object(body) if status == 200 else None
-    if reply is None:
+    if status != 200:
+        return Check(component, title, "unknown", CORE_DOWN_DETAIL)
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
         return Check(component, title, "unknown", CORE_DOWN_DETAIL)
     try:
         state, detail = historian_verdict(reply, now, warn_s, fail_s, stale_s)
-    except (KeyError, TypeError, ValueError):
-        return Check(component, title, "unknown", CORE_DOWN_DETAIL)   # ответ не по договору
+    except (KeyError, TypeError, ValueError, OverflowError):   # OverflowError — age_s = -Infinity
+        return Check(component, title, "unknown", OFF_CONTRACT_DETAIL)
     return Check(component, title, state, detail)
 
 

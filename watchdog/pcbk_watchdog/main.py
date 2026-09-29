@@ -89,8 +89,11 @@ class Settings:
         checked_at — начало такта, период цикла — max(TICK_S, d), поэтому перед
         следующим снимком возраст прежнего доходит до max(TICK_S, d) + d. Он не
         больше STALE_AFTER_S, если длина такта d ≤ min(STALE − TICK, STALE / 2).
-        Начатая до срока проверка идёт ещё до двух сроков сокета (соединение и
-        чтение) — их запас вычитается.
+        Начатая до срока проверка идёт ещё до двух сроков сокета — их запас
+        вычитается. У http и historian это общий срок всей проверки
+        (checks.HTTP_CHECK_SPANS): соединение, заголовки и тело. У tls и Docker —
+        срок на соединение и на каждое чтение: ответ, капающий по байту, их
+        продлил бы — это свои службы стенда.
         """
         socket_s = max(self.DOCKER_TIMEOUT_S, NET_CHECK_TIMEOUT_S)
         return min(self.STALE_AFTER_S - self.TICK_S, self.STALE_AFTER_S / 2) - 2 * socket_s

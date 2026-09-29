@@ -1,3 +1,4 @@
+import time
 from datetime import timedelta, timezone
 
 from helpers import T0, insp, now_utc
@@ -159,16 +160,20 @@ def test_check_http_ok_detail_and_reason(fake_core):
     assert (r.state, r.detail) == ("fail", "белый список пуст или не найден")
 
 
-def test_check_http_reason_fallbacks(fake_core):
+def test_check_http_reason_only_for_503(fake_core):
     url = fake_core.base + "/healthz/data"
     fake_core.set_health(200, {"ok": True, "detail": "каталог: 6"})
     assert check_http("web", "Веб", url).detail == "отвечает"                  # по умолчанию, как в Д1
     fake_core.set_health(503, {"ok": False, "detail": "ф" * 100})
     assert check_http("core", "Служба данных", url).detail == "ф" * 80          # первые 80 знаков
     for body in ({"ok": False}, {"detail": ["не строка"]}, ["detail"], {"detail": ""}):
-        fake_core.set_health(500, body)
+        fake_core.set_health(503, body)
         r = check_http("core", "Служба данных", url)
-        assert (r.state, r.detail) == ("fail", "отвечает ошибкой HTTP 500")
+        assert (r.state, r.detail) == ("fail", "отвечает ошибкой HTTP 503")
+    for code in (404, 500, 502):                                                 # причина — только при 503 (Д3а-R5)
+        fake_core.set_health(code, {"detail": "Not Found"})
+        r = check_http("core", "Служба данных", url)
+        assert (r.state, r.detail) == ("fail", f"отвечает ошибкой HTTP {code}")
     r = check_http("core", "Служба данных", fake_core.base + "/nope")             # не JSON
     assert (r.state, r.detail) == ("fail", "отвечает ошибкой HTTP 404")
 
@@ -226,18 +231,78 @@ def test_historian_core_down_or_garbage_is_unknown(fake_core):
     assert check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5).state == "unknown"
 
 
+DOWN = ("unknown", "служба данных не отвечает — свежесть неизвестна")
+OFF_CONTRACT = ("unknown", "служба данных ответила не по договору — свежесть неизвестна")
+
+
 def test_historian_bad_reply_is_unknown(fake_core):
-    down = ("unknown", "служба данных не отвечает — свежесть неизвестна")
-    r = check_historian("historian", "Историан БДРВ", fake_core.base + "/nope", T0, 300, 900, 120, 0.5)
-    assert (r.state, r.detail) == down                                            # HTTP ≠ 200
-    for obj in ("не json", [fresh(5)], {"checked_at": T0.isoformat()}, fresh("5"), fresh(True),
-                fresh(5, checked_at="вчера"), fresh(5, checked_at=12)):
-        if isinstance(obj, str):
-            fake_core.set_raw(obj)
-        else:
-            fake_core.set(obj)
+    for url in (fake_core.base + "/nope", fake_core.base + "/healthz/data"):     # HTTP ≠ 200
+        fake_core.set_health(503, fresh(5))                                       # тело по договору не спасает
+        r = check_historian("historian", "Историан БДРВ", url, T0, 300, 900, 120, 0.5)
+        assert (r.state, r.detail) == DOWN, url
+    for raw in ("не json", "", "{\"checked_at\": ", "[" * 100_000):
+        fake_core.set_raw(raw)
         r = check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5)
-        assert (r.state, r.detail) == down, obj
+        assert (r.state, r.detail) == DOWN, raw
+
+
+def test_historian_off_contract_reply_has_own_text(fake_core):
+    # JSON пришёл, но не по договору: состояние то же, текст — свой
+    for obj in ([fresh(5)], "строка", 7, None, {"checked_at": T0.isoformat()}, fresh("5"),
+                fresh(True), fresh(5, checked_at="вчера"), fresh(5, checked_at=12),
+                fresh(5, catalog_age_s="много"), fresh(float("-inf")), fresh(float("nan"))):
+        fake_core.set(obj)
+        r = check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5)
+        assert (r.state, r.detail) == OFF_CONTRACT, obj
+
+
+# срок сокета в тестах сроков; вся проверка — не дольше двух таких сроков (правило срока такта)
+SOCK_S = 0.3
+BOUND_S = 2 * SOCK_S + 0.25   # запас на планировщик
+
+
+def headers_then_stall(conn, stop):
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{")
+    stop.wait(3)   # потом закрыть: сломанный срок даст провал теста, а не зависание
+
+
+def drip(head: bytes):
+    """Ответ по байту раз в 0,1 с: каждое чтение сокета укладывается в свой срок.
+    Через 3 с двойник закрывает соединение — чтобы старый код не висел вечно."""
+    def respond(conn, stop):
+        conn.sendall(head)
+        until = time.monotonic() + 3
+        while time.monotonic() < until and not stop.wait(0.1):
+            conn.sendall(b"x")
+    return respond
+
+
+def timed(fn, *args, **kw):
+    started = time.monotonic()
+    result = fn(*args, **kw)
+    return result, time.monotonic() - started
+
+
+def test_historian_body_stall_is_bounded(raw_http):
+    url = raw_http(headers_then_stall)
+    r, took = timed(check_historian, "historian", "Историан БДРВ", url, T0, 300, 900, 120, SOCK_S)
+    assert (r.state, r.detail) == DOWN and took < BOUND_S
+
+
+def test_http_checks_bounded_by_one_deadline(raw_http):
+    # заголовки пришли, тело капает: срок на операцию сокета не истекает никогда
+    slow_body = raw_http(drip(b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n{"))
+    r, took = timed(check_historian, "historian", "Историан БДРВ", slow_body, T0, 300, 900, 120, SOCK_S)
+    assert (r.state, r.detail) == DOWN and took < BOUND_S
+    slow_503 = raw_http(drip(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 500\r\n\r\n{"))
+    r, took = timed(check_http, "core", "Служба данных", slow_503, timeout=SOCK_S)
+    assert (r.state, r.detail) == ("fail", "отвечает ошибкой HTTP 503") and took < BOUND_S
+    # заголовки капают
+    slow_head = raw_http(drip(b"HTTP/1.1 200 OK\r\nX-Slow: "))
+    r, took = timed(check_http, "core", "Служба данных", slow_head, timeout=SOCK_S)
+    assert (r.state, r.detail) == ("fail", "не отвечает") and took < BOUND_S
+    r, took = timed(check_historian, "historian", "Историан БДРВ", slow_head, T0, 300, 900, 120, SOCK_S)
+    assert (r.state, r.detail) == DOWN and took < BOUND_S
 
 
 def test_tls_verdict_ok_warn_fail():
