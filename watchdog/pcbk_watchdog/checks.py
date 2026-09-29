@@ -1,5 +1,6 @@
 """Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат."""
 import http.client
+import re
 import socket
 import ssl
 from dataclasses import dataclass
@@ -13,6 +14,14 @@ State = Literal["ok", "warn", "fail", "absent", "unknown"]
 RECENT_RESTART = timedelta(minutes=15)
 # столько перезапусков при свежем запуске — цикл падений
 CRASH_LOOP_RESTARTS = 3
+# текст постоянный: с числом перезапусков журнал писал бы событие на каждый
+CRASH_LOOP_DETAIL = "падает в цикле (перезапуски подряд)"
+# проверка здоровья места: интервал 30 с + срок 5 с с запасом
+HEALTH_SILENCE = timedelta(minutes=2)
+HEALTH_SILENT_DETAIL = "проверка здоровья молчит"
+UNHEALTHY_DETAIL = "OpenCode не отвечает"
+# пути каталога выкладки в State.Error (секреты мест) на страницу не выводим
+HOST_PATH = re.compile(r"/opt/pcbk-reserve[^\s\"':]*")
 # рабочее место спит: вышло само, SIGKILL или SIGTERM
 SLEEP_EXIT_CODES = frozenset({0, 137, 143})
 # коды OpenSSL X509_V_ERR_CERT_NOT_YET_VALID и X509_V_ERR_CERT_HAS_EXPIRED
@@ -50,18 +59,9 @@ def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Ch
     return Check("memory", title, "ok", f"свободно {mib} МиБ")
 
 
-def _restarts(n: int) -> str:
-    """«N перезапусков» с верным окончанием."""
-    if n % 10 == 1 and n % 100 != 11:
-        return f"{n} перезапуск"
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return f"{n} перезапуска"
-    return f"{n} перезапусков"
-
-
 def check_container(component: str, title: str, inspect: dict | None, *,
                     sleeping_ok: bool, now: datetime) -> Check:
-    """Вердикт по inspect Docker; порядок правил — таблица задачи 1."""
+    """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1 и задачи 2 Д2."""
     def result(state: State, detail: str) -> Check:
         return Check(component, title, state, detail)
 
@@ -76,9 +76,17 @@ def check_container(component: str, title: str, inspect: dict | None, *,
         return result("fail", "приостановлен")
     if st["Running"] or st["Restarting"]:
         if restarts >= CRASH_LOOP_RESTARTS and recent:
-            return result("fail", f"падает в цикле: {_restarts(restarts)}")
+            return result("fail", CRASH_LOOP_DETAIL)
         if st["Restarting"]:
             return result("warn", "перезапускается")
+        health = st.get("Health")
+        if health:   # у остановленного Health прошлого запуска не смотрим
+            # монитор Docker ждёт exec без срока: заклинившая проверка молчит
+            ends = [datetime.fromisoformat(e["End"]) for e in health.get("Log") or []]
+            if now - max([started, *ends]) > HEALTH_SILENCE:
+                return result("fail", HEALTH_SILENT_DETAIL)
+            if health.get("Status") == "unhealthy":
+                return result("fail", UNHEALTHY_DETAIL)
         if restarts > 0 and recent:
             # время — в поясе now и с явным смещением
             at = started.astimezone(now.tzinfo).strftime("%H:%M UTC%:z")
@@ -91,7 +99,8 @@ def check_container(component: str, title: str, inspect: dict | None, *,
         return result("fail", "убит по памяти")
     error = st.get("Error") or ""
     if error:
-        return result("fail", f"не запускается: {error[:80]}")
+        # сперва маска, потом обрезка: иначе уцелело бы начало пути
+        return result("fail", f"не запускается: {HOST_PATH.sub('…', error)[:80]}")
     code = st["ExitCode"]
     if sleeping_ok and code in SLEEP_EXIT_CODES:
         return result("ok", "спит")

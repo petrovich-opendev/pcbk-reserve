@@ -20,11 +20,22 @@ def now_utc() -> datetime:
 
 
 def insp(running=False, oom=False, code=0, restarts=0, restarting=False, paused=False,
-         error="", started=T0 - timedelta(hours=1)):
-    """Ответ Docker inspect в объёме, который читает сторож."""
-    return {"State": {"Running": running, "Paused": paused, "OOMKilled": oom, "ExitCode": code,
-                      "Restarting": restarting, "Error": error,
-                      "StartedAt": started.isoformat()}, "RestartCount": restarts}
+         error="", started=T0 - timedelta(hours=1), health: str | None = None,
+         last_end: datetime | None = T0 - timedelta(seconds=10)):
+    """Ответ Docker inspect в объёме, который читает сторож.
+
+    health — State.Health.Status; last_end — конец последней проверки здоровья,
+    None — журнал проверок пуст.
+    """
+    state = {"Running": running, "Paused": paused, "OOMKilled": oom, "ExitCode": code,
+             "Restarting": restarting, "Error": error, "StartedAt": started.isoformat()}
+    if health is not None:
+        log = [] if last_end is None else [
+            {"Start": (last_end - timedelta(seconds=1)).isoformat(), "End": last_end.isoformat(),
+             "ExitCode": 0 if health == "healthy" else 1, "Output": "200\n"}]
+        state["Health"] = {"Status": health, "FailingStreak": 3 if health == "unhealthy" else 0,
+                           "Log": log}
+    return {"State": state, "RestartCount": restarts}
 
 
 # /proc/meminfo для тестов: памяти с запасом; файл удаляется при выходе

@@ -222,12 +222,14 @@ def test_journal_unopenable_at_start_shows_on_page(tmp_path):
     assert state.snapshot.checks == ()
 
 
-def test_components_file_d1():
+def test_components_file_d2():
     comps = load_components("components.json")
     assert [c["id"] for c in comps][:4] == ["edge", "sp-ro", "sp-ctl", "memory"]
-    assert comps[0]["kind"] == "tls"
-    assert {c["id"] for c in comps if c["kind"] == "absent"} == \
-           {f"student-{n:02d}" for n in range(1, 11)} | {"core", "historian", "llm"}
+    students = [c for c in comps if c["id"].startswith("student-")]
+    assert [(c["id"], c["title"], c["kind"], c["container"], c["sleeping_ok"]) for c in students] == \
+           [(f"student-{n:02d}", f"Рабочее место {n:02d}", "container", f"pcbk-student-{n:02d}", True)
+            for n in range(1, 11)]
+    assert {c["id"] for c in comps if c["kind"] == "absent"} == {"core", "historian", "llm"}
 
 
 def test_components_file_d1_details():

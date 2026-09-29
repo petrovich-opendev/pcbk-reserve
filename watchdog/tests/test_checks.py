@@ -3,6 +3,7 @@ from datetime import timedelta, timezone
 from helpers import T0, insp, now_utc
 from pcbk_watchdog.checks import (check_container, check_http, check_memory, check_tls,
                                   not_installed, tls_verdict)
+from pcbk_watchdog.journal import Journal
 
 MEMINFO = "MemTotal: 16384000 kB\nMemAvailable: {} kB\n"
 
@@ -63,6 +64,45 @@ def test_crash_loop_is_fail():
         assert stu(i).state == "fail" and "падает в цикле" in stu(i).detail
 
 
+def test_crash_loop_detail_is_constant(tmp_path):
+    # число перезапусков в тексте дало бы новое событие журнала на каждый перезапуск
+    loops = [stu(insp(running=True, restarts=n, started=T0 - timedelta(seconds=20)))
+             for n in (3, 4, 5, 11, 22)]
+    assert {(c.state, c.detail) for c in loops} == {("fail", "падает в цикле (перезапуски подряд)")}
+    journal = Journal(str(tmp_path / "journal.db"))
+    assert sum(len(journal.record([c], T0 + timedelta(seconds=10 * i)))
+               for i, c in enumerate(loops)) == 1
+
+
+def test_health_unhealthy_is_fail():
+    r = stu(insp(running=True, health="unhealthy"))
+    assert (r.state, r.detail) == ("fail", "OpenCode не отвечает")
+    fresh = stu(insp(running=True, restarts=1, started=T0 - timedelta(minutes=3), health="unhealthy"))
+    assert (fresh.state, fresh.detail) == ("fail", "OpenCode не отвечает")    # сильнее «перезапущен после сбоя»
+
+
+def test_health_row_only_for_running_container():                            # Review Focus 3
+    starting = stu(insp(running=True, health="starting", last_end=None, started=T0 - timedelta(seconds=30)))
+    assert (starting.state, starting.detail) == ("ok", "работает")
+    assert stu(insp(running=True, health="healthy")).detail == "работает"
+    stale = stu(insp(code=143, health="unhealthy", last_end=T0 - timedelta(hours=2)))
+    assert (stale.state, stale.detail) == ("ok", "спит")
+    assert stu(insp(running=True, paused=True, health="unhealthy")).detail == "приостановлен"
+    loop = stu(insp(running=True, restarts=3, started=T0 - timedelta(seconds=20), health="unhealthy"))
+    assert loop.state == "fail" and "падает в цикле" in loop.detail
+
+
+def test_health_silence_is_fail():                                            # Review Focus 3
+    silent = stu(insp(running=True, health="healthy", last_end=T0 - timedelta(minutes=5)))
+    assert (silent.state, silent.detail) == ("fail", "проверка здоровья молчит")
+    empty = stu(insp(running=True, health="starting", last_end=None))          # запуск час назад, журнала нет
+    assert (empty.state, empty.detail) == ("fail", "проверка здоровья молчит")
+    assert stu(insp(running=True, health="healthy", last_end=T0 - timedelta(seconds=30))).state == "ok"
+    restarted = stu(insp(running=True, health="healthy", last_end=T0 - timedelta(minutes=5),
+                         started=T0 - timedelta(seconds=20)))                   # старый журнал, свежий старт
+    assert restarted.state == "ok"
+
+
 def test_paused_is_fail():
     r = check_container("sp-ctl", "Прокси сокета серверного слоя", insp(running=True, paused=True),
                         sleeping_ok=False, now=T0)
@@ -72,6 +112,19 @@ def test_paused_is_fail():
 def test_failed_start_is_fail():
     r = stu(insp(code=127, error="OCI runtime create failed: unknown runtime runsc"))
     assert r.state == "fail" and r.detail.startswith("не запускается: OCI runtime create failed")
+
+
+def test_failed_start_hides_host_paths():
+    # пути выкладки (каталог секретов) на страницу и в журнал не попадают
+    err = ('error mounting "/opt/pcbk-reserve/secrets/student-01.pw" to rootfs at "/run/secrets/pw": '
+           "mkdir /opt/pcbk-reserve/secrets: permission denied")
+    r = stu(insp(code=127, error=err))
+    assert r.state == "fail" and "/opt/" not in r.detail and "student-01.pw" not in r.detail
+    assert r.detail == ('не запускается: error mounting "…" to rootfs at "/run/secrets/pw": '
+                        "mkdir …: permission denied")
+    # сперва маска, потом обрезка до 80 знаков: иначе начало пути уцелело бы
+    cut = stu(insp(code=127, error="x" * 75 + " /opt/pcbk-reserve/secrets/student-01.pw"))
+    assert cut.detail == "не запускается: " + "x" * 75 + " …"
 
 
 def test_odd_exit_code_is_fail_even_for_student():
