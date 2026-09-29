@@ -627,7 +627,7 @@ test('banner hides after recovery', ...)  // после сбоя удачный 
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_page.py tests/test_main.py; node --test tests/js/`
+Run: `cd watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_page.py tests/test_main.py; node --test tests/js/*.test.mjs`
 Expected: FAIL — `ImportError` и нет `status.js`
 
 - [ ] **Step 3: Implement `page.py`, `status.js`, `main.py`, `components.json`, `Dockerfile` по интерфейсам выше**
@@ -639,7 +639,7 @@ Expected: FAIL — `ImportError` и нет `status.js`
 
 - [ ] **Step 4: Run all watchdog tests**
 
-Run: `cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/`
+Run: `cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -905,7 +905,7 @@ Expected: FAIL — нет служб `sp-ro`, `sp-ctl`
 
 - [ ] **Step 4: Run the whole local suite**
 
-Run: `(cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/) && uv run --python 3.12 --with pytest pytest -q tests/integration`
+Run: `(cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs) && uv run --python 3.12 --with pytest pytest -q tests/integration`
 Expected: PASS; после прогона нет контейнеров, сетей и томов `pcbk-test`
 
 - [ ] **Step 5: Commit**
