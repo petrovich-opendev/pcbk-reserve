@@ -464,7 +464,7 @@ Expected: ответ на каждый из 6 запросов (вердикт �
 | О11: 8-й по свежести тег набора моложе 100 с | `HIST_WARN_S=300`, `HIST_FAIL_S=900` | те же |
 | О11: он старше 100 с | `HIST_WARN_S` = 3 × его возраст (вверх до минуты), `HIST_FAIL_S` = 3 × `HIST_WARN_S` | — |
 | запросы 5 + 6 дольше 10 с | `CATALOG_DEADLINE_S` = 3 × их сумма (вверх до 10 с) | `60` |
-| всегда | `HIST_STALE_S` = max(120, `CATALOG_DEADLINE_S` + 2 × `FRESH_POLL_S` + 10): загрузка каталога занимает место фона, и опрос свежести на это время замолкает; драйвер держит место не дольше срока, 10 с — запас на вход | `130` |
+| всегда | `HIST_STALE_S` = max(120, `CATALOG_DEADLINE_S` + 2 × `FRESH_POLL_S` + 20): загрузка каталога занимает место фона, и опрос свежести на это время замолкает; драйвер держит место не дольше срока, 20 с — запас на вход и неровный срок (по ревью задачи 5: худшее окно D + 2P + 15) | `140` |
 | в адресе экземпляр, `BDRV_PORT` не задан | порт не передаётся, `pytds` находит его сам; охрана выхода Д3б пускает историан на любой TCP-порт | — |
 | О1, О3, О4 (язык) | только вердикт; пояс служба берёт из `GETDATE() − GETUTCDATE()` | — |
 
@@ -1336,7 +1336,7 @@ git commit -m "Служба данных: свежесть по росту ме�
   - `KINDS["historian"] = ("url",)`; `_check_one` для этого вида вызывает
     `check_historian(cid, title, comp["url"], now, settings.HIST_WARN_S, settings.HIST_FAIL_S, settings.HIST_STALE_S)`.
   - `Settings`: `HIST_WARN_S: int = 300`, `HIST_FAIL_S: int = 900`,
-    `HIST_STALE_S: int = 130` (формула задачи 1, шаг 5); `0 < HIST_WARN_S < HIST_FAIL_S`,
+    `HIST_STALE_S: int = 140` (формула задачи 1, шаг 5); `0 < HIST_WARN_S < HIST_FAIL_S`,
     `HIST_STALE_S > 0`, иначе `ValueError`.
   - `components.json`:
     - `core` →
@@ -1487,7 +1487,7 @@ git commit -m "Сторож: вид historian, строка службы дан�
 ```
 
   - сторож: `image: pcbk-reserve/watchdog:d3a`, `HIST_WARN_S: ${HIST_WARN_S:-300}`,
-    `HIST_FAIL_S: ${HIST_FAIL_S:-900}`, `HIST_STALE_S: ${HIST_STALE_S:-130}`
+    `HIST_FAIL_S: ${HIST_FAIL_S:-900}`, `HIST_STALE_S: ${HIST_STALE_S:-140}`
   - `compose.test.yaml`: `core` — `environment: {FRESH_POLL_S: "5"}`
   - `deploy/env.example`: `DATA_DIR=`, `HIST_WARN_S=`, `HIST_FAIL_S=`,
     `HIST_STALE_S=`, `CATALOG_DEADLINE_S=` — без значений;
