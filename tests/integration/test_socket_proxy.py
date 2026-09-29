@@ -64,9 +64,12 @@ def test_socket_only_in_hardened_proxies(stack):
 
 
 def test_sp_ctl_passes_only_student_start_stop(stack):
-    for verb in ("start", "stop"):
-        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST",
-                             CTL + f"/containers/pcbk-student-01/{verb}") in PASSED
+    try:
+        for verb in ("start", "stop"):
+            assert stack.http_as("pcbk-core", "pcbk-ctl", "POST",
+                                 CTL + f"/containers/pcbk-student-01/{verb}") in PASSED
+    finally:
+        stack.stop("pcbk-student-01")      # место будил тест — он и усыпляет, даже при сбое
     assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + "/containers/pcbk-sp-ro/stop") == 403
     assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/pcbk-test-foreign/json") == 403
     assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/json") == 403

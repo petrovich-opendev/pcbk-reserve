@@ -2,6 +2,8 @@
 import json
 import os
 import re
+import socket
+import struct
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,10 @@ RUNTIME_ENV = {"HOSTNAME", "PWD", "SHLVL", "_", "OLDPWD"}         # добавл
 PROBE_AGENT = "---\ndescription: Проба видимости агента\nmode: primary\n---\nТы — проба.\n"
 BYPASS_TOOL = 'export default { description: "BYPASS real shell", args: {}, async execute() { return "x" } }'
 BYPASS_CONFIG = '{"agent": {"bypass": {"description": "обход", "mode": "primary"}}}'
+# ключи блока места в compose config (не-null): якорь x-student и поля самого места
+STUDENT_KEYS = {"image", "pull_policy", "runtime", "profiles", "user", "init", "ipc", "read_only", "cap_drop",
+                "security_opt", "tmpfs", "mem_limit", "memswap_limit", "cpus", "pids_limit", "restart",
+                "stop_grace_period", "labels", "container_name", "networks", "extra_hosts", "volumes", "secrets"}
 
 
 @pytest.fixture(scope="module")
@@ -53,9 +59,9 @@ def test_every_workplace_is_watched(stack, asleep):                # Review Focu
     comps = json.loads((ROOT / "watchdog" / "components.json").read_text())
     watched = {c["container"] for c in comps if c["kind"] == "container" and c["sleeping_ok"]}
     assert in_compose == watched == WORKPLACES
-    data = stack.wait_status(lambda d: len(student_rows(d)) == 10 and
-                             all(s == "ok" for s, _ in student_rows(d).values()), timeout=30)
-    assert set(student_rows(data).values()) == {("ok", "спит")}
+    # ждём целевое состояние, а не любое ok: старый снимок с «работает» не проходит
+    stack.wait_status(lambda d: len(student_rows(d)) == 10 and
+                      set(student_rows(d).values()) == {("ok", "спит")}, timeout=30)
 
 
 def test_each_workplace_uses_own_objects(stack):                   # Review Focus 2
@@ -86,10 +92,13 @@ def test_each_workplace_uses_own_objects(stack):                   # Review Focu
 
 def test_sp_ctl_really_starts_and_stops_student(stack):
     url = CTL + "/containers/pcbk-student-03"
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/start") == 204
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/start") == 304
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/stop") == 204
-    assert stack.inspect("pcbk-student-03")["State"]["Running"] is False
+    try:
+        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/start") == 204
+        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/start") == 304
+        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/stop") == 204
+        assert stack.inspect("pcbk-student-03")["State"]["Running"] is False
+    finally:
+        stack.stop("pcbk-student-03")                              # будил тест — он и усыпляет, даже при сбое
     stack.wait_status(lambda d: student_rows(d).get("student-03") == ("ok", "спит"), timeout=30)
 
 
@@ -97,7 +106,8 @@ def test_student_hardening(stack, running):                        # Review Focu
     c = stack.inspect("pcbk-student-01")
     hc = c["HostConfig"]
     assert (hc["ReadonlyRootfs"], hc["CapDrop"], hc["CapAdd"], hc["Privileged"]) == (True, ["ALL"], None, False)
-    assert "no-new-privileges:true" in hc["SecurityOpt"]
+    assert hc["SecurityOpt"] == ["no-new-privileges:true"]         # без seccomp=unconfined, apparmor=unconfined
+    assert (hc["UsernsMode"], hc["CgroupnsMode"], hc.get("Sysctls") or {}) == ("", "private", {})
     assert (hc["Memory"], hc["MemorySwap"], hc["PidsLimit"], hc["NanoCpus"], hc["Init"]) == \
            (1024 ** 3, 1024 ** 3, 512, 10 ** 9, True)
     assert (hc["PidMode"], hc["IpcMode"], hc["Devices"] or [], hc["PortBindings"] or {}) == ("", "private", [], {})
@@ -112,6 +122,7 @@ def test_student_hardening(stack, running):                        # Review Focu
     assert status["Uid"].split() == ["10001"] * 4
     assert stack.exec("pcbk-student-01", "cat", "/proc/1/comm") == "docker-init"
     image_hc = json.loads(stack._docker("image", "inspect", IMAGE).stdout)[0]["Config"]["Healthcheck"]
+    assert image_hc and image_hc["Test"][0] == "CMD"               # иначе сравнение ниже пустое
     for name in sorted(WORKPLACES):                                # окружение — ровно образ, со значениями
         cfg = stack.inspect(name)["Config"]
         assert dict(e.split("=", 1) for e in cfg["Env"]) == WORKPLACE_ENV, name
@@ -120,10 +131,12 @@ def test_student_hardening(stack, running):                        # Review Focu
     s = services["student-01"]
     assert (s["runtime"], s["read_only"], s["cap_drop"], s["init"], s["profiles"], s["ipc"]) == \
            ("runsc", True, ["ALL"], True, ["students"], "private")
-    assert "no-new-privileges:true" in s["security_opt"] and not s.get("ports") and not s.get("environment")
+    assert s["security_opt"] == ["no-new-privileges:true"] and not s.get("ports") and not s.get("environment")
     # compose config пишет command и entrypoint: null у каждой службы — запрещено любое не-null значение
     forbidden = ("command", "entrypoint", "privileged", "cap_add", "devices", "pid", "healthcheck")
     assert [k for k in forbidden if s.get(k) is not None] == []
+    # ровно эти ключи: новый ключ в якоре или блоке (userns_mode, sysctls, cgroup…) — повод для ревью
+    assert {k for k, v in s.items() if v is not None} == STUDENT_KEYS
     assert (int(s["mem_limit"]), int(s["memswap_limit"]), s["pids_limit"], float(s["cpus"])) == \
            (1024 ** 3, 1024 ** 3, 512, 1.0)
     agents = next(v for v in s["volumes"] if v["target"] == "/etc/pcbk-opencode/opencode/agents")
@@ -200,6 +213,12 @@ def test_readonly_where_it_matters(stack, running):
     assert list(stack.agents_dir(1).iterdir()) == []
 
 
+def routes(table: str) -> list[tuple[str, str]]:
+    """/proc/net/route → (сеть, маска); адреса там — шестнадцатеричные, порядок байт хоста (x86 — little-endian)."""
+    addr = lambda h: socket.inet_ntoa(struct.pack("<I", int(h, 16)))
+    return [(addr(f[1]), addr(f[7])) for f in (line.split() for line in table.splitlines()[1:]) if f]
+
+
 def test_no_route_anywhere(stack, running):
     stu = stack.stu_net
     nets = [f"pcbk-stu-{n:02d}" for n in range(1, 11)]
@@ -214,6 +233,8 @@ def test_no_route_anywhere(stack, running):
     assert list(eps) == ["pcbk-stu-01"] and eps["pcbk-stu-01"]["IPAddress"] == f"{stu}.1.3"
     assert stack.sh("pcbk-student-01", "getent hosts core")[1].split()[0] == f"{stu}.1.2"
     assert "eth0" not in stack.sh("pcbk-student-01", "cat /proc/net/if_inet6")[1]   # у места нет IPv6
+    assert routes(stack.sh("pcbk-student-01", "cat /proc/net/route")[1]) == \
+           [(f"{stu}.1.0", "255.255.255.240")]                    # маршрута по умолчанию нет
     assert stack.probe("pcbk-stu-01", f"{stu}.1.3", 4096) == 1    # положительный контроль: своё место
     assert stack.probe("pcbk-stu-02", f"{stu}.2.3", 4096) == 1    # место 02 живо — его 0 ниже не пустой
     gateway = stack.network("pcbk-stu-01")["IPAM"]["Config"][0].get("Gateway")
@@ -233,8 +254,10 @@ def test_password_not_visible_to_watchdog(stack, running):
     assert all(re.fullmatch(r"\d{3}\n?", e["Output"]) for e in log) and log[-1]["Output"].strip() == "200"
     r = stack._docker("logs", "pcbk-student-01")
     logs = r.stdout + r.stderr
+    # булевы — до assert: при сбое pytest печатает только их, а не тело inspect или журнал
     leaked = any(secret in text for secret in (stack.password(1), stack.llm_token(1)) for text in (body, logs))
-    assert leaked is False and "OPENCODE_SERVER_PASSWORD" not in body   # значения не попадают в вывод pytest
+    env_name = "OPENCODE_SERVER_PASSWORD" in body
+    assert (leaked, env_name) == (False, False)
 
 
 def test_env_holds_only_own_secret(stack, running):
