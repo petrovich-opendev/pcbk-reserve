@@ -5,6 +5,10 @@
 tagname»), а второй LIKE отвергает. Поэтому здесь нет ни LIKE, ни параметров:
 имя попадает в SQL литералом через TagName IN (…), не больше 16 имён и только
 из безопасного набора символов. IN и OR на ww-столбцы не ставятся.
+
+Каждый шаблон регистрируется формой в TEMPLATE_FORMS: ворота пускают только
+инструкцию, целиком совпавшую с одной из форм, — так NOT, OR, вторая
+инструкция или комментарий не проходят даже с именами из белого списка.
 """
 import re
 from collections.abc import Sequence
@@ -46,11 +50,33 @@ def live_all_sql() -> str:
     return "SELECT TagName, DateTime, Value, Quality FROM Live WHERE Value IS NOT NULL"
 
 
+_LIVE_HEAD = "SELECT TagName, DateTime, Value, Quality FROM Live WHERE TagName IN "
+
+
 def live_sql(names: Sequence[str]) -> str:
     if isinstance(names, str) or not 0 < len(names) <= MAX_NAMES:
         raise ValueError(f"нужно от 1 до {MAX_NAMES} имён тегов")
-    return ("SELECT TagName, DateTime, Value, Quality FROM Live WHERE TagName IN ("
-            + ", ".join(lit_name(n) for n in names) + ")")
+    return _LIVE_HEAD + "(" + ", ".join(lit_name(n) for n in names) + ")"
+
+
+# список имён в форме — ровно как его пишет live_sql: от 1 до MAX_NAMES литералов SAFE_NAME через ", "
+_NAME_LITERAL = r"'[A-Za-z0-9_]{1,128}'"
+_NAME_LIST = rf"\({_NAME_LITERAL}(?:, {_NAME_LITERAL}){{0,{MAX_NAMES - 1}}}\)"
+# формы всех инструкций службы (Д3б добавит свои); сверка — fullmatch
+TEMPLATE_FORMS: dict[str, re.Pattern[str]] = {
+    "clock": re.compile(re.escape(clock_sql())),
+    "catalog": re.compile(re.escape(catalog_sql())),
+    "live_all": re.compile(re.escape(live_all_sql())),
+    "live": re.compile(re.escape(_LIVE_HEAD) + _NAME_LIST),
+}
+
+
+def template_of(sql: str) -> str | None:
+    """Имя шаблона, форме которого инструкция соответствует целиком, иначе None."""
+    for name, form in TEMPLATE_FORMS.items():
+        if form.fullmatch(sql):
+            return name
+    return None
 
 
 def _unquote(literal: str) -> str:
@@ -79,5 +105,10 @@ def literals(sql: str) -> tuple[str, ...]:
 
 
 def plain(sql: str) -> bool:
-    """Одна инструкция, которую scan_literals разбирает однозначно."""
+    """Вне литералов нет того, что сбивает scan_literals: комментариев, двойных кавычек, [имён], «;»
+    и незакрытой «'».
+
+    Одну инструкцию и её форму это не гарантирует (вторая инструкция без «;», NOT, OR проходят) —
+    их проверяет template_of.
+    """
     return _LEX_BREAKERS.search(_LITERAL_RE.sub(" ", sql)) is None

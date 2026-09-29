@@ -6,10 +6,16 @@
 Место берётся, только если после этого остаётся не меньше min(5 с, срок / 3), и
 держится до возврата драйвера, даже если вызов уже закончился по сроку. Общий
 предел 300 запросов за 5 минут считается только для людей и только после
-взятого места. В SQL пускаются лишь литералы-имена белого списка внутри
-TagName IN (…) и то, что пропускает literal_ok. Отказ входа по учётным данным
-закрывает ворота до перезапуска службы: учётка общая с Dify, её блокировка
-положит курс. После обрыва связи 30 с новые попытки сразу получают отказ.
+взятого места.
+
+В SQL пускается только инструкция, целиком совпавшая с формой шаблона
+(sql.TEMPLATE_FORMS); литералы в ней — имена белого списка внутри
+TagName IN (…) и то, что пропускает literal_ok.
+
+Учётка общая с Dify, её блокировка положит курс. Поэтому до первого удачного
+вызова после запуска входит только один вызов за раз, остальные ждут его
+исхода; отказ входа по учётным данным закрывает ворота до перезапуска службы.
+После обрыва связи 30 с новые попытки сразу получают отказ.
 """
 import asyncio
 import logging
@@ -22,7 +28,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .historian import HistorianError, QueryFn, Row
-from .sql import clock_sql, plain, scan_literals
+from .sql import clock_sql, plain, scan_literals, template_of
 
 GLOBAL_LIMIT = 300
 RATE_WINDOW_S = 300.0
@@ -31,6 +37,9 @@ BACKGROUND_SLOTS = 1
 CALL_DEADLINE_S = 15.0
 Q_MIN_S = 5.0
 CONNECT_COOLDOWN_S = 30.0
+# 4060 («база недоступна») приходит вместе с 18456 и выглядит как отказ учётных данных
+AUTH_LATCH_TEXT = ("историан отклонил учётные данные — обновите bdrv.env или проверьте, не была ли база "
+                   "историана недоступна, и перезапустите службу")
 
 Lane = Literal["user", "background"]
 LANES: tuple[Lane, ...] = ("user", "background")
@@ -95,6 +104,9 @@ class HistorianGate:
         # потоков ровно столько, сколько мест: место держится до возврата драйвера, поток всегда свободен
         self._pool = ThreadPoolExecutor(max_workers=user_slots + background_slots,
                                         thread_name_prefix="historian")
+        # до первого удачного вызова вход пробует один вызов за раз; замок держится до возврата драйвера
+        self._first_login = asyncio.Lock()
+        self._login_ok = False
         self._in_flight: dict[Lane, int] = {"user": 0, "background": 0}
         self._sent_names_total = 0
         self._refused_unlisted = 0
@@ -123,7 +135,7 @@ class HistorianGate:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + budget
 
-        # 1. белый список — до всего остального, без SQL
+        # 1. белый список и форма шаблона — до всего остального, без SQL
         sent = self._check(statements, lane)
         # 2. защёлка входа и пауза после обрыва — без входа
         self._raise_if_closed()
@@ -134,27 +146,47 @@ class HistorianGate:
             await asyncio.wait_for(slot.acquire(), timeout=deadline - q_min - loop.time())
         except TimeoutError:
             raise GateRefused("busy") from None
+        probe = False
         try:
-            # пока ждали места, чужой вызов мог получить отказ входа или обрыв
+            # до первого удачного вызова — ждать исхода того, кто уже входит
+            if not self._login_ok:
+                wait = deadline - q_min - loop.time()
+                if wait <= 0:
+                    raise GateRefused("busy")
+                try:
+                    await asyncio.wait_for(self._first_login.acquire(), timeout=wait)
+                except TimeoutError:
+                    raise GateRefused("busy") from None
+                if self._login_ok:
+                    self._first_login.release()
+                else:
+                    probe = True
+            # пока ждали места или первого входа, чужой вызов мог получить отказ входа или обрыв
             self._raise_if_closed()
             if deadline - loop.time() < q_min:
                 raise GateRefused("busy")
             # 4. общий предел — только людям и только с местом
             if lane == "user" and not self.global_window.allow(WINDOW_KEY, self.monotonic()):
                 raise GateRefused("rate")
-            # 5. запрос — в пул ворот; место отпустит колбэк после возврата драйвера
-            waiter = self._submit(loop, lane, statements, deadline - loop.time())
+            # 5. запрос — в пул ворот; место (и замок первого входа) отпустит колбэк после возврата драйвера
+            waiter = self._submit(loop, lane, probe, statements, deadline - loop.time())
         except BaseException:
+            if probe:
+                self._first_login.release()
             slot.release()
             raise
         self._sent_names_total += len(sent)
-        # 6. результат ждём не дольше остатка срока; по сроку запрос дорабатывает с местом
+        # 6. результат ждём не дольше остатка срока; по сроку запрос дорабатывает с местом.
+        # 7. защёлку и паузу ставит _finish. Ошибка бросается после блока: без __context__
+        failure: HistorianError | None = None
         try:
             rows = await asyncio.wait_for(waiter, timeout=deadline - loop.time())
         except TimeoutError:
-            raise HistorianError("timeout", "срок вызова истёк, запрос дорабатывает с местом", sent) from None
-        except HistorianError as err:       # 7. защёлку и паузу уже поставил _finish
-            raise err.with_sent(sent) from None
+            failure = HistorianError("timeout", "срок вызова истёк, запрос дорабатывает с местом", sent)
+        except HistorianError as err:
+            failure = err.with_sent(sent)
+        if failure is not None:
+            raise failure
         return GateResult(rows=rows, sent=sent)
 
     def _check(self, statements: tuple[str, ...], lane: Lane) -> tuple[str, ...]:
@@ -168,7 +200,8 @@ class HistorianGate:
         return tuple(sent)
 
     def _statement_ok(self, sql: str, lane: Lane) -> bool:
-        if not isinstance(sql, str) or not plain(sql):
+        # форма шаблона целиком: NOT, OR, вторая инструкция, комментарий не проходят и с именами из списка
+        if not isinstance(sql, str) or not plain(sql) or template_of(sql) is None:
             return False
         found = scan_literals(sql)
         for text, in_names in found:
@@ -182,21 +215,19 @@ class HistorianGate:
 
     def _raise_if_closed(self) -> None:
         if self._auth_latched:
-            raise HistorianError("auth", "защёлка: историан отклонил учётные данные — "
-                                         "обновите bdrv.env и перезапустите службу")
+            raise HistorianError("auth", f"защёлка: {AUTH_LATCH_TEXT}")
         if self._pause_until is not None and self.monotonic() < self._pause_until:
             raise HistorianError("connect", "пауза после обрыва")
 
     def _note_failure(self, err: HistorianError) -> None:
         if err.code == "auth" and not self._auth_latched:
             self._auth_latched = True
-            log.error("ворота: историан отклонил учётные данные (%s) — входа не будет до перезапуска службы",
-                      err.public())
+            log.error("ворота: %s (%s); до перезапуска входа не будет", AUTH_LATCH_TEXT, err.public())
         elif err.code == "connect":
             self._pause_until = self.monotonic() + CONNECT_COOLDOWN_S
             log.warning("ворота: нет связи с историаном (%s) — пауза %g с", err.public(), CONNECT_COOLDOWN_S)
 
-    def _submit(self, loop: asyncio.AbstractEventLoop, lane: Lane, statements: tuple[str, ...],
+    def _submit(self, loop: asyncio.AbstractEventLoop, lane: Lane, probe: bool, statements: tuple[str, ...],
                 remaining_s: float) -> asyncio.Future:
         waiter = loop.create_future()
         future = self._pool.submit(self._query, statements, remaining_s)
@@ -204,22 +235,27 @@ class HistorianGate:
 
         def done(f: Future) -> None:        # в потоке драйвера (или сразу, если уже готово)
             try:
-                loop.call_soon_threadsafe(self._finish, lane, f, waiter)
+                loop.call_soon_threadsafe(self._finish, lane, probe, f, waiter)
             except RuntimeError:            # цикл закрыт: отпускать некому
                 pass
 
         future.add_done_callback(done)
         return waiter
 
-    def _finish(self, lane: Lane, future: Future, waiter: asyncio.Future) -> None:
+    def _finish(self, lane: Lane, probe: bool, future: Future, waiter: asyncio.Future) -> None:
         """В цикле событий после возврата драйвера.
 
-        Защёлка и пауза ставятся до того, как место отпущено: следующий в очереди,
-        взяв его, уже видит отказ — и так же, если вызов закончился по сроку раньше.
+        Удача, защёлка и пауза отмечаются до того, как отпущены замок первого входа и
+        место: следующий, взяв их, уже видит исход — и так же, если вызов закончился
+        по сроку раньше.
         """
         exc = None if future.cancelled() else future.exception()
         if isinstance(exc, HistorianError):
             self._note_failure(exc)
+        elif exc is None and not future.cancelled():
+            self._login_ok = True
+        if probe:
+            self._first_login.release()
         self._in_flight[lane] -= 1
         self._slots[lane].release()
         if waiter.done():                   # вызов уже закончился по сроку или отменён

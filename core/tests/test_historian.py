@@ -1,9 +1,13 @@
 """Соединение python-tds: аргументы входа, прелюдия, срок, разбор ошибок; часы историана."""
+import importlib.metadata
+import inspect
 import socket
 from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytds
+import pytds.connection
+import pytds.tds_socket
 import pytest
 
 from fakes import RecordingConnect, auth_operational_error
@@ -86,3 +90,41 @@ def test_clock_offsets_and_bad_rows():
     for bad in ([], [(1, 2)], [(datetime(2026, 10, 2, 7), datetime(2026, 10, 1, 7))]):
         with pytest.raises(ValueError):
             parse_clock(bad)
+
+
+# ревью задачи 3: срок — на весь вызов, ошибка без следов pytds, вход не дольше остатка срока
+
+
+def test_deadline_spans_whole_call():
+    rec = RecordingConnect(results=[[(1,)], [(2,)]], execute_delay_s=0.2)
+    with pytest.raises(HistorianError) as e:
+        tds_query(CFG, connect=rec)(["SELECT 1", "SELECT 2"], 0.3)
+    assert e.value.code == "timeout" and rec.closed
+    assert rec.executed == [(PRELUDE,), ("SELECT 1",)]                  # SELECT 2 после срока не ушёл
+    first, second = rec.read_timeouts
+    assert first <= 0.3 and second < 0.15                                # предел чтения — остаток срока
+
+
+def test_read_timeout_is_capped_and_login_timeout_shrinks():
+    rec = RecordingConnect(results=[[(1,)]])
+    tds_query(CFG, connect=rec)(["SELECT 1"], 99.0)
+    assert rec.read_timeouts == [45, 45]
+    rec = RecordingConnect(results=[[(1,)]])
+    tds_query(CFG, connect=rec)(["SELECT 1"], 3.0)
+    assert (rec.kwargs["login_timeout"], rec.kwargs["timeout"]) == (3.0, 3.0)
+
+
+@pytest.mark.parametrize("where", ["connect", "execute"])
+def test_error_keeps_no_pytds_exception(where):
+    exc = auth_operational_error(18456, "Login failed for user 'FAKEUSER'")
+    rec = RecordingConnect(**{f"fail_on_{where}": exc})
+    with pytest.raises(HistorianError) as e:
+        tds_query(CFG, connect=rec)(["SELECT 1"], 15.0)
+    assert e.value.__cause__ is None and e.value.__context__ is None
+
+
+def test_read_timeout_path_matches_pinned_pytds():
+    # предел чтения на инструкцию — через conn._tds_socket.sock: публичного пути у pytds нет
+    assert importlib.metadata.version("python-tds") == "1.17.1"
+    assert "self._tds_socket" in inspect.getsource(pytds.connection.BaseConnection.__init__)
+    assert "self.sock = sock" in inspect.getsource(pytds.tds_socket._TdsSocket.__init__)

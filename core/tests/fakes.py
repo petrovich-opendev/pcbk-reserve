@@ -3,6 +3,7 @@ import re
 import threading
 import time
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytds
 
@@ -53,6 +54,8 @@ class _RecordingCursor:
 
     def execute(self, *args) -> None:
         self._rec.executed.append(args)
+        if self._rec.execute_delay_s:
+            time.sleep(self._rec.execute_delay_s)
         if self._rec.fail_on_execute is not None:
             raise self._rec.fail_on_execute
         if args[0] == PRELUDE:
@@ -67,9 +70,19 @@ class _RecordingCursor:
         return rows
 
 
+class _RecordingSocket:
+    def __init__(self, rec: "RecordingConnect"):
+        self._rec = rec
+
+    def settimeout(self, timeout: float | None) -> None:
+        self._rec.read_timeouts.append(timeout)
+
+
 class _RecordingConn:
     def __init__(self, rec: "RecordingConnect"):
         self._rec = rec
+        # как у pytds 1.17.1: соединение → _tds_socket → sock (предел чтения ставится на нём)
+        self._tds_socket = SimpleNamespace(sock=_RecordingSocket(rec))
 
     def cursor(self) -> _RecordingCursor:
         return _RecordingCursor(self._rec)
@@ -79,13 +92,18 @@ class _RecordingConn:
 
 
 class RecordingConnect:
-    """Двойник pytds.connect: запоминает аргументы входа и инструкции, отдаёт results по порядку."""
+    """Двойник pytds.connect: запоминает аргументы входа, инструкции и пределы чтения, отдаёт results по порядку.
+
+    execute_delay_s — задержка каждой инструкции (срок вызова между инструкциями).
+    """
 
     def __init__(self, results: list[list[Row]] | None = None, fail_on_connect: BaseException | None = None,
-                 fail_on_execute: BaseException | None = None):
+                 fail_on_execute: BaseException | None = None, execute_delay_s: float = 0.0):
         self.results = list(results or [])
         self.fail_on_connect = fail_on_connect
         self.fail_on_execute = fail_on_execute
+        self.execute_delay_s = execute_delay_s
+        self.read_timeouts: list[float | None] = []
         self.kwargs: dict | None = None
         self.connect_count = 0
         self.executed: list[tuple] = []

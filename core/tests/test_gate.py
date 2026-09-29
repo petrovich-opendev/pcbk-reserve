@@ -7,7 +7,7 @@ import pytest
 
 from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian
 from helpers import FakeMono
-from pcbk_core.data.gate import CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
+from pcbk_core.data.gate import AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, live_sql
 from pcbk_core.logs import setup_logging
@@ -19,6 +19,13 @@ SLOW_Q = r"IN \('20FAKE_001_PV'\)$"          # медленны только з�
 
 def gate(fake, **kw):
     return HistorianGate(fake, allowed=WHITELIST, **kw)
+
+
+async def warmed(fake, **kw):
+    """Ворота после первого удачного входа: как у службы, где первым идёт каталог."""
+    g = gate(fake, **kw)
+    await g.run([clock_sql()], lane="background")
+    return g
 
 
 async def test_gate_caps_user_concurrency_and_returns_sent():
@@ -84,7 +91,7 @@ async def test_gate_late_acquire_is_busy_not_run():                             
 
 async def test_background_lane_not_starved():                                   # Review Focus 2
     fake = FakeHistorian(delay_s=1.0, slow=SLOW_Q)
-    g = gate(fake, global_window=SlidingWindow(2, 300))
+    g = await warmed(fake, global_window=SlidingWindow(2, 300))          # до первого входа — по одному
     users = [asyncio.ensure_future(g.run([Q])) for _ in range(2)]
     await anyio.sleep(0.05)
     t = time.monotonic()
@@ -99,7 +106,7 @@ async def test_background_lane_not_starved():                                   
 
 async def test_background_survives_twenty_waiting_users():                     # Review Focus 2
     fake = FakeHistorian(delay_s=1.0, slow=SLOW_Q)
-    g = gate(fake, deadline_s=2.5)
+    g = await warmed(fake, deadline_s=2.5)
     users = [asyncio.ensure_future(g.run([Q])) for _ in range(20)]         # 18 ждут места, не потоки
     await anyio.sleep(0.05)
     t = time.monotonic()
@@ -163,10 +170,11 @@ async def test_connect_failure_pauses_attempts():
 
 
 async def test_waiting_calls_do_not_log_in_after_auth_failure():               # Review Focus 1
-    fake = FakeHistorian(delay_s=0.2, fail=HistorianError("auth", "18456"))
-    g = gate(fake, user_slots=1)
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=1)                 # вход уже удавался: очередь только за местом
+    fake.delay_s, fake.fail = 0.2, HistorianError("auth", "18456")
     rs = await asyncio.gather(*(g.run([Q]) for _ in range(3)), return_exceptions=True)
-    assert [r.code for r in rs] == ["auth"] * 3 and len(fake.calls) == 1
+    assert [r.code for r in rs] == ["auth"] * 3 and len(fake.calls) == 2
 
 
 async def test_gate_refuses_what_breaks_literal_parsing():
@@ -214,3 +222,86 @@ def test_sliding_window_forgets_old_calls():
     assert w.allow("k", 0.0) and w.allow("k", 1.0) and not w.allow("k", 5.0)
     assert w.allow("other", 5.0)                                         # ключи не делят окно
     assert w.allow("k", 10.5) and not w.allow("k", 10.6)                 # отказ не записывается
+
+
+# ревью задачи 3: форма инструкции, один вход до первой удачи, место до окна, текст защёлки
+
+BYPASSES = [
+    "SELECT TagName, DateTime, Value, Quality FROM Live WHERE NOT TagName IN ('20FAKE_001_PV')",
+    Q + " OR 1 = 1",
+    Q + " OR TagName = CHAR(49)",
+    Q + " SELECT TagName, DateTime, Value, Quality FROM Live WHERE Value IS NOT NULL",   # вторая инструкция без ;
+    Q + " -- x",
+    Q + " /* x */",
+]
+
+
+@pytest.mark.parametrize("lane", ["user", "background"])
+async def test_gate_refuses_statements_outside_template_forms(lane):
+    fake = FakeHistorian()
+    g = gate(fake)
+    for sql in BYPASSES:
+        with pytest.raises(GateRefused) as e:
+            await g.run([sql], lane=lane)
+        assert e.value.code == "unlisted"
+    with pytest.raises(GateRefused):
+        await g.run([clock_sql(), Q + " OR 1 = 1"], lane=lane)          # одна чужая инструкция — отказ всему
+    assert fake.calls == [] and g.stats()["refused_unlisted"] == len(BYPASSES) + 1
+
+
+async def test_first_login_is_single_until_success():                          # учётка общая с Dify
+    fake = FakeHistorian(delay_s=0.2, fail=HistorianError("auth", "18456"))
+    g = gate(fake)
+    rs = await asyncio.gather(g.run([Q]), g.run([Q]), g.run([clock_sql()], lane="background"),
+                              return_exceptions=True)
+    assert [r.code for r in rs] == ["auth"] * 3 and len(fake.calls) == 1
+
+
+async def test_first_login_waits_for_driver_not_deadline():
+    fake = FakeHistorian(delay_s=0.7)
+    g = gate(fake)
+    with pytest.raises(HistorianError):
+        await g.run([Q], deadline_s=0.3)                 # срок вышел, а вход ещё идёт
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q], deadline_s=0.3)                 # второй вход не начинается, пока первый не вернулся
+    assert e.value.code == "busy" and len(fake.calls) == 1
+    await anyio.sleep(0.3)
+    fake.delay_s = 0.0
+    await g.run([Q])
+    assert len(fake.calls) == 2
+
+
+async def test_busy_call_does_not_spend_window():
+    fake = FakeHistorian(delay_s=0.9)
+    g = gate(fake, user_slots=1, q_min_s=0.4, global_window=SlidingWindow(2, 300))
+    first = asyncio.ensure_future(g.run([Q]))
+    await anyio.sleep(0.05)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q], deadline_s=1.2)
+    assert e.value.code == "busy"
+    await first
+    fake.delay_s = 0.0
+    await g.run([Q])                                     # второе место окна — этому вызову, не отказанному
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "rate"
+
+
+async def test_waiting_calls_recheck_connect_pause():
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=1)
+    fake.delay_s, fake.fail = 0.2, HistorianError("connect", "refused")
+    rs = await asyncio.gather(*(g.run([Q]) for _ in range(3)), return_exceptions=True)
+    assert [r.code for r in rs] == ["connect"] * 3 and len(fake.calls) == 2
+    assert [r.detail for r in rs[1:]] == ["пауза после обрыва"] * 2
+
+
+async def test_latch_text_names_both_causes():
+    fake = FakeHistorian(fail=HistorianError("auth", "18456"))
+    g = gate(fake)
+    with pytest.raises(HistorianError):
+        await g.run([clock_sql()])
+    with pytest.raises(HistorianError) as e:
+        await g.run([clock_sql()])
+    assert AUTH_LATCH_TEXT in e.value.detail
+    assert "обновите bdrv.env или проверьте, не была ли база историана недоступна" in AUTH_LATCH_TEXT

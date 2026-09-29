@@ -1,12 +1,15 @@
 """Соединение с историаном через python-tds и часы историана.
 
 Одно соединение на вызов: вход, прелюдия, инструкции по одной, закрытие.
-Срок вызова ограничивает и вход, и каждое чтение из сокета: брошенный по сроку
-запрос не держит историан дольше срока. Текст ошибок SQL Server бывает с
-учётной записью («Login failed for user …») и с началом SQL, поэтому он живёт
-только в HistorianError.detail и из процесса не выходит.
+Срок — на весь вызов: вход не дольше остатка, перед каждой инструкцией предел
+чтения сокета — остаток срока, после срока следующая инструкция не уходит.
+Текст ошибок SQL Server бывает с учётной записью («Login failed for user …») и
+с началом SQL, поэтому он живёт только в HistorianError.detail и из процесса не
+выходит; исключение pytds к HistorianError не цепляется ни причиной, ни
+контекстом.
 """
 import math
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -87,11 +90,22 @@ def _read_code(exc: BaseException) -> ErrorCode:
     return "query"              # pytds.Error и всё прочее при чтении
 
 
+def _set_read_timeout(conn: Any, seconds: float) -> None:
+    """Предел чтения сокета на следующую инструкцию.
+
+    Публичного пути у pytds 1.17.1 нет: сокет — conn._tds_socket.sock, его же
+    перенастраивает сам pytds при откате транзакции. Путь сверяет тест
+    test_read_timeout_path_matches_pinned_pytds.
+    """
+    conn._tds_socket.sock.settimeout(seconds)
+
+
 def tds_query(cfg: BdrvConfig, connect: Callable[..., Any] = pytds.connect) -> QueryFn:
     def query(statements: Sequence[str], remaining_s: float) -> list[list[Row]]:
         # timeout=0 у pytds — «без предела»: исчерпанный срок не входит вовсе
         if not (remaining_s > 0 and math.isfinite(remaining_s)):
             raise HistorianError("timeout", "срок вызова исчерпан до входа")
+        end = time.monotonic() + remaining_s
         kwargs: dict[str, Any] = dict(
             dsn=cfg.host, database=cfg.database, user=cfg.user, password=cfg.password,
             autocommit=True, login_timeout=min(LOGIN_TIMEOUT_S, remaining_s),
@@ -101,25 +115,38 @@ def tds_query(cfg: BdrvConfig, connect: Callable[..., Any] = pytds.connect) -> Q
         )
         if cfg.port is not None:            # None — в адресе экземпляр, порт находит pytds
             kwargs["port"] = cfg.port
+        # ошибка собирается внутри except, а бросается после блока: иначе исключение pytds
+        # с текстом SQL Server осталось бы в __context__
+        failure: HistorianError | None = None
         try:
             conn = connect(**kwargs)
         except Exception as exc:
-            raise _error(_login_code(exc), exc) from None
+            failure = _error(_login_code(exc), exc)
+        if failure is not None:
+            raise failure
+        out: list[list[Row]] = []
         try:
             cur = conn.cursor()
-            cur.execute(PRELUDE)            # строк не даёт: fetchall после неё — ошибка pytds
-            out = []
-            for sql in statements:
+            # PRELUDE строк не даёт: fetchall после неё — ошибка pytds
+            for n, sql in enumerate((PRELUDE, *statements)):
+                left = end - time.monotonic()
+                if left <= 0:
+                    failure = HistorianError("timeout", "срок вызова истёк между инструкциями")
+                    break
+                _set_read_timeout(conn, min(READ_TIMEOUT_S, left))
                 cur.execute(sql)            # одним аргументом: без параметров драйвера
-                out.append(cur.fetchall())
-            return out
+                if n:
+                    out.append(cur.fetchall())
         except Exception as exc:
-            raise _error(_read_code(exc), exc) from None
+            failure = _error(_read_code(exc), exc)
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+        if failure is not None:
+            raise failure
+        return out
 
     return query
 

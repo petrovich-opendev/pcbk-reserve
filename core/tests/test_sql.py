@@ -3,8 +3,8 @@ import re
 
 import pytest
 
-from pcbk_core.data.sql import (catalog_sql, clock_sql, lit_name, literals, live_all_sql, live_sql, names_in,
-                                plain, scan_literals)
+from pcbk_core.data.sql import (MAX_NAMES, catalog_sql, clock_sql, lit_name, literals, live_all_sql, live_sql,
+                                names_in, plain, scan_literals, template_of)
 
 SAMPLES = [clock_sql(), catalog_sql(), live_all_sql(), live_sql(["20FAKE_001_PV", "20FAKE_002_SP"])]
 
@@ -52,3 +52,28 @@ def test_plain_rejects_what_breaks_literal_parsing():
     for bad in ("SELECT 1 -- '", "SELECT 1 /* ' */", 'SELECT "x"', "SELECT [a'b]", "SELECT 1; SELECT 2",
                 "SELECT 1 WHERE a = 'open"):
         assert not plain(bad)
+
+
+# ревью задачи 3: ворота сверяют форму инструкции, а не только литералы
+
+Q = live_sql(["20FAKE_001_PV"])
+BYPASSES = [
+    "SELECT TagName, DateTime, Value, Quality FROM Live WHERE NOT TagName IN ('20FAKE_001_PV')",
+    Q + " OR 1 = 1",
+    Q + " OR TagName = CHAR(49)",
+    Q + " SELECT TagName, DateTime, Value, Quality FROM Live WHERE Value IS NOT NULL",   # вторая инструкция без ;
+    Q + " -- x",
+    Q + " /* x */",
+    "SELECT TagName FROM Live WHERE TagName = '20FAKE_001_PV'",
+    Q + "\n",
+]
+
+
+def test_every_template_has_its_form():
+    assert [template_of(s) for s in SAMPLES] == ["clock", "catalog", "live_all", "live"]
+    assert template_of(live_sql([f"20FAKE_{i:03d}_PV" for i in range(MAX_NAMES)])) == "live"
+
+
+@pytest.mark.parametrize("sql", BYPASSES)
+def test_bypasses_match_no_template(sql):
+    assert template_of(sql) is None
