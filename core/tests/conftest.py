@@ -1,6 +1,7 @@
 """Фикстуры серверного слоя: асинхронные тесты — через плагин anyio на asyncio."""
 import logging
 import socket
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,3 +38,13 @@ def restore_logging():
     for name, level in levels.items():
         logging.getLogger(name).setLevel(level)
     assert root.level == levels[""]
+
+
+@pytest.fixture
+def core_server(tmp_path):
+    """Роль «данные» на двойнике историана (FakeHistorian, FakeMono) под uvicorn: url и role; каталог загружен."""
+    from helpers import make_role, serve_role      # helpers тянет fastapi и uvicorn — только тем, кому нужно
+
+    role, _ = make_role(db_dir=tmp_path)
+    with serve_role(role) as url:
+        yield SimpleNamespace(url=url, role=role)

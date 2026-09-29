@@ -1,5 +1,5 @@
 """Роль «данные»: каталог тегов, свежесть историана, журнал событий, ручки здоровья и инструменты
-(DataService — service.py; HTTP /api/data/* — http_api.py).
+(DataService — service.py; HTTP /api/data/* — http_api.py; MCP /mcp — mcp_server.py).
 
 Два фоновых цикла делят одно фоновое место ворот. Каталог грузится сразу при
 старте и дальше раз в CATALOG_REFRESH_S, после неудачи — с растущей паузой.
@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp
 
 from ..app import RoleBase
 from ..secrets import TokenTable
@@ -29,6 +30,7 @@ from .freshness import ERROR_TEXTS, FreshnessTracker
 from .gate import GateRefused, GateResult, HistorianGate
 from .historian import HistClock, HistorianError, QueryFn, parse_clock
 from .http_api import MAX_BODY_BYTES, BodyLimit, data_router, validation_handler
+from .mcp_server import MCP_PATH, build_mcp, mcp_auth
 from .service import DataService
 from .sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql
 
@@ -55,7 +57,8 @@ class DataRole(RoleBase):
 
     tokens — всегда TokenTable: не передан — пустая, всем 401 (F18); tokens_error — причина, если
     core-tokens не прочитан. Конструктор без ввода-вывода (F4): журнал событий только запоминает путь,
-    служба (service) — кэш, single-flight и окно частоты в памяти.
+    служба (service) — кэш, single-flight и окно частоты в памяти, MCP (mcp, mcp_app) строится один
+    раз — его session_manager.run() SDK даёт однажды, и его запускает lifespan.
     """
 
     name = "data"
@@ -85,6 +88,8 @@ class DataRole(RoleBase):
         self.clock: HistClock | None = None
         self.clock_mono: float | None = None
         self.service = DataService(self)
+        self.mcp = build_mcp(self)
+        self.mcp_app = mcp_auth(self.mcp.streamable_http_app(), self)
 
     # --- каталог ---
 
@@ -298,31 +303,38 @@ class DataRole(RoleBase):
         app.add_exception_handler(RequestValidationError, validation_handler(self))
         app.add_middleware(BodyLimit, max_bytes=MAX_BODY_BYTES)
 
+    def mounts(self) -> list[tuple[str, ASGIApp]]:
+        """Точный маршрут /mcp без Mount("/"): чужие пути ролей Д4/Д5 он не перехватит, /mcp/ — 404."""
+        return [(MCP_PATH, self.mcp_app)]
+
     def lifespan(self):
         return self._lifespan()
 
     @asynccontextmanager
     async def _lifespan(self):
-        # первым делом — core.db и схема (F23), и при ошибке настройки; сбой — причина здоровья, не падение
-        if not await asyncio.to_thread(self.events.open):
-            log.error("журнал событий: не открыт (%s)", self.events.last_error)
-        if self.config_error:
-            log.error("служба данных: фоновые циклы не запущены — %s", self.config_error)
-            yield
-            return
-        mode = self.settings.DRILL_FRESHNESS
-        if mode:
-            log.warning("УЧЕНИЯ: DRILL_FRESHNESS=%s", mode)
-        tried = asyncio.Event()
-        tasks = [asyncio.create_task(self._catalog_loop(tried), name="data-catalog"),
-                 asyncio.create_task(self._freshness_loop(tried), name="data-freshness"),
-                 asyncio.create_task(self._events_loop(), name="data-events")]
-        try:
-            yield
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # MCP — самым внешним и до ветки config_error (F8): без run() /mcp отвечает 500 «Task group is
+        # not initialized»; run() SDK даёт один раз — роль входит в lifespan однажды
+        async with self.mcp.session_manager.run():
+            # первым делом — core.db и схема (F23), и при ошибке настройки; сбой — причина здоровья, не падение
+            if not await asyncio.to_thread(self.events.open):
+                log.error("журнал событий: не открыт (%s)", self.events.last_error)
+            if self.config_error:
+                log.error("служба данных: фоновые циклы не запущены — %s", self.config_error)
+                yield
+                return
+            mode = self.settings.DRILL_FRESHNESS
+            if mode:
+                log.warning("УЧЕНИЯ: DRILL_FRESHNESS=%s", mode)
+            tried = asyncio.Event()
+            tasks = [asyncio.create_task(self._catalog_loop(tried), name="data-catalog"),
+                     asyncio.create_task(self._freshness_loop(tried), name="data-freshness"),
+                     asyncio.create_task(self._events_loop(), name="data-events")]
+            try:
+                yield
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _catalog_loop(self, tried: asyncio.Event) -> None:
         while True:

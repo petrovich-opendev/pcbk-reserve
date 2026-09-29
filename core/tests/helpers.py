@@ -2,24 +2,30 @@
 import atexit
 import hashlib
 import itertools
+import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import anyio
+import httpx
 import pytest
+import uvicorn
 from fastapi import APIRouter, FastAPI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
 from fakes import WHITELIST, FakeHistorian
 from pcbk_core.app import RoleBase, create_app
@@ -176,6 +182,61 @@ async def wait_until_async(pred: Callable[[], bool], timeout: float = 5) -> None
         if time.monotonic() > end:
             raise AssertionError(f"условие не выполнилось за {timeout} с")
         await anyio.sleep(0.01)
+
+
+@contextmanager
+def serve_role(role: DataRole, *, wait_catalog: bool = True) -> Iterator[str]:
+    """create_app с одной ролью под uvicorn в потоке на 127.0.0.1 (порт выбирает ядро); отдаёт url.
+
+    wait_catalog — ждать загрузки каталога (роль с ошибкой настройки его не грузит). Журнал uvicorn не
+    настраивается, доступ не пишется — как в serve().
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(create_app(SETTINGS, [role]), lifespan="on", log_config=None,
+                                           access_log=False))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, name="serve-role", daemon=True)
+    thread.start()
+    try:
+        wait_until(lambda: server.started or not thread.is_alive(), timeout=10)
+        assert server.started, "uvicorn не поднялся"
+        if wait_catalog:
+            wait_until(lambda: role.catalog.loaded)
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        sock.close()
+
+
+@asynccontextmanager
+async def mcp_session(url: str, token: str) -> AsyncIterator[ClientSession]:
+    """Клиент MCP SDK с Bearer-токеном: Streamable HTTP → ClientSession → initialize().
+
+    streamable_http_client с готовым httpx-клиентом — то же, что устаревший streamablehttp_client(url,
+    headers=…), без предупреждения; trust_env=False — мимо прокси окружения.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(10, read=30), trust_env=False) as client:
+        async with streamable_http_client(url, http_client=client) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+
+def http_post(url: str, body: object, token: str | None = None) -> tuple[int, str]:
+    """POST JSON мимо прокси окружения: (код, тело), в том числе 4xx и 5xx."""
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=10) as r:
+            return r.status, r.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, e.read().decode("utf-8")
 
 
 async def dummy(scope, receive, send):
