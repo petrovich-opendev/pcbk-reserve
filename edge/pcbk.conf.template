@@ -1,0 +1,85 @@
+# Прокси входа стенда. Образ nginx кладёт этот шаблон в conf.d внутри http{} —
+# здесь только server-блоки. Переменных окружения в шаблоне нет: envsubst
+# меняет только имена из окружения, а у edge своих переменных нет.
+
+# 8443 — вход для людей: заглушка и страница состояния сторожа
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name _;
+    server_tokens off;
+
+    ssl_certificate     /etc/nginx/tls/cert.pem;
+    ssl_certificate_key /etc/nginx/tls/key.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # сторож разрешается в момент запроса: nginx стартует и без него
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    resolver_timeout 3s;
+    set $pcbk_watchdog pcbk-watchdog:8090;
+
+    root /usr/share/nginx/pcbk;
+
+    # 502/503/504 от самого nginx (сторож умер или завис) — своя страница, код сохраняется;
+    # ответы сторожа (503 до первого снимка) проходят как есть
+    error_page 502 503 504 /watchdog-down.html;
+
+    # на всё, что отдаёт edge, — без кэша; одноимённые заголовки сторожа заменяются
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    proxy_hide_header Cache-Control;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header Referrer-Policy;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_connect_timeout 3s;
+    proxy_send_timeout 5s;
+    proxy_read_timeout 5s;
+
+    location = / {
+        charset utf-8;
+        try_files /index.html =404;
+    }
+
+    location = /status {
+        proxy_pass http://$pcbk_watchdog;
+    }
+
+    location = /status.js {
+        proxy_pass http://$pcbk_watchdog;
+    }
+
+    location = /status.json {
+        access_log off;   # открытая страница опрашивает каждые 5 с
+        proxy_pass http://$pcbk_watchdog;
+    }
+
+    location = /watchdog-down.html {
+        internal;
+        charset utf-8;
+    }
+
+    location / {
+        default_type "text/plain; charset=utf-8";
+        return 404 "не найдено\n";
+    }
+}
+
+# 8080 — только проверка живости изнутри; не публикуется
+server {
+    listen 8080;
+    server_name _;
+    server_tokens off;
+    access_log off;
+
+    location = /healthz {
+        default_type "text/plain; charset=utf-8";
+        return 200 "ok\n";
+    }
+
+    location / {
+        return 404;
+    }
+}

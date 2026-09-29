@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="refresh" content="10">
+<title>Сторож не отвечает</title>
+<style>
+:root { color-scheme: light dark; --fg: #1f2328; --bg: #f6f8fa; --muted: #6b7280; --fail: #c62828; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #e6edf3; --bg: #0d1117; --muted: #8b949e; --fail: #ff6b6b; } }
+body { margin: 0; font: 16px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+.silence { padding: .9rem 1rem; text-align: center; font-weight: 700; font-size: 1.15rem;
+  color: #fff; background: #c62828; }
+main { max-width: 44rem; margin: 0 auto; padding: 1rem; }
+h1 { font-size: 1.4rem; margin: 1rem 0 .5rem; color: var(--fail); }
+p { margin: .5rem 0; }
+.meta { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="silence" role="alert">Сторож не отвечает — состояние неизвестно</div>
+<main>
+<h1>Состояние резервного стенда неизвестно</h1>
+<p>Служба, которая следит за стендом, не ответила. Считайте, что стенд может быть неисправен, пока страница состояния не откроется снова.</p>
+<p class="meta">Страница сама пробует открыться снова каждые 10 с. Учебный стенд: не для ведения технологического процесса.</p>
+</main>
+</body>
+</html>

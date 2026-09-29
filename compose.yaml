@@ -1,0 +1,113 @@
+# Стенд Д1: прокси входа и сторож. Переменные — из .env выкладки (deploy/env.example).
+# Сторонние образы — только по тегу из deploy/images.lock, без pull.
+# Наружу публикуется только 8443 контейнера edge.
+
+# имя проекта не зависит от каталога: том журнала и метки те же; тесты задают -p pcbk-test
+name: pcbk-reserve
+
+services:
+  edge:
+    image: nginx:1.30.5-alpine
+    pull_policy: never
+    container_name: pcbk-edge
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /etc/nginx/conf.d
+    cap_drop: [ALL]
+    # мастер от root: CHOWN — каталоги кэша, SETUID/SETGID — рабочие процессы от nginx
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "8443:8443"
+    volumes:
+      - type: bind
+        source: ./edge/pcbk.conf.template
+        target: /etc/nginx/templates/pcbk.conf.template
+        read_only: true
+      - type: bind
+        source: ./edge/static
+        target: /usr/share/nginx/pcbk
+        read_only: true
+      # cert.pem и key.pem; без DAC_* мастер читает ключ, только если каталог 0755,
+      # а ключ принадлежит root (на сервере 0600) или открыт на чтение (только тестовый)
+      - type: bind
+        source: ${TLS_DIR:?TLS_DIR не задан}
+        target: /etc/nginx/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [pcbk-public, pcbk-front]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  watchdog:
+    build: ./watchdog
+    image: pcbk-reserve/watchdog:d1
+    # свой образ: без never compose сперва ищет это имя на Docker Hub
+    pull_policy: never
+    container_name: pcbk-watchdog
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    environment:
+      # порт и пути связаны с edge и томами ниже — не настраиваются
+      LISTEN_PORT: "8090"
+      DOCKER_URL: http://pcbk-sp-ro:2375
+      TLS_CAFILE: /app/tls/cert.pem
+      JOURNAL_PATH: /var/lib/pcbk-watchdog/journal.db
+      MEMINFO_PATH: /proc/meminfo
+      COMPONENTS_PATH: /app/components.json
+      # настраиваются из .env или оболочки (учения меняют TICK_S и MEM_WARN_MIB)
+      TICK_S: ${TICK_S:-10}
+      STALE_AFTER_S: ${STALE_AFTER_S:-30}
+      DOCKER_TIMEOUT_S: ${DOCKER_TIMEOUT_S:-3}
+      DISPLAY_TZ: ${DISPLAY_TZ:-UTC}
+      MEM_WARN_MIB: ${MEM_WARN_MIB:-2048}
+      MEM_FAIL_MIB: ${MEM_FAIL_MIB:-1024}
+    volumes:
+      # только сертификат: им сторож проверяет, что edge отдаёт именно его
+      - type: bind
+        source: ${TLS_DIR:?TLS_DIR не задан}/cert.pem
+        target: /app/tls/cert.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: pcbk-watchdog-journal
+        target: /var/lib/pcbk-watchdog
+    networks: [pcbk-front]
+
+networks:
+  # только edge — ради публикации 8443; без маскарада: наружу edge не ходит
+  pcbk-public:
+    name: pcbk-public
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: 172.31.250.16/28
+  # edge и сторож; без адреса хоста на мосту — службы хоста отсюда не видны
+  pcbk-front:
+    name: pcbk-front
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        - subnet: 172.31.250.32/28
+
+volumes:
+  # журнал переходов сторожа (SQLite); имя — с префиксом проекта, тестовый
+  # проект pcbk-test не может удалить журнал выкладки
+  pcbk-watchdog-journal:
