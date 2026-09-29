@@ -1,11 +1,18 @@
-"""Учётные данные историана — только из файла; ни пароль, ни строки файла не попадают в ошибки."""
+"""Учётные данные историана и хеши токенов вызывающих — только из файлов; ни пароль, ни строки файлов
+не попадают в ошибки."""
+import hashlib
+import hmac
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # KEY=VALUE, как в файле для `set -a; . файл` (Dify: /opt/dify/scripts/.bdrv.env)
 _LINE = re.compile(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)")
 DEFAULT_PORT = 1433
 DEFAULT_DATABASE = "Runtime"
+# core-tokens: «<id> <sha256 hex>»; id попадает в события и журнал, поэтому набор узкий
+TOKEN_ID = re.compile(r"[a-z0-9-]{1,32}")
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 
 
 def read_env_file(path: str) -> dict[str, str]:
@@ -61,3 +68,67 @@ class BdrvConfig:
         else:
             port = DEFAULT_PORT
         return cls(host, port, env.get("BDRV_DB") or DEFAULT_DATABASE, env["BDRV_USER"], env["BDRV_PW"])
+
+
+class TokenTable:
+    """Вызывающие по токену: id → sha256 токена; самих токенов служба не хранит.
+
+    Сверка — hmac.compare_digest со всеми записями, без раннего выхода. Пустая
+    таблица (empty()) не пускает никого: всем 401 (F18).
+    """
+
+    def __init__(self, hashes: Mapping[str, str]):
+        table: dict[str, bytes] = {}
+        for caller_id, digest in hashes.items():
+            if not (isinstance(caller_id, str) and TOKEN_ID.fullmatch(caller_id)):
+                raise ValueError("id вызывающего — [a-z0-9-]{1,32}")
+            if not (isinstance(digest, str) and _SHA256_HEX.fullmatch(digest)):
+                raise ValueError("хеш токена — 64 шестнадцатеричных знака sha256")
+            table[caller_id] = bytes.fromhex(digest)
+        self._hashes = table
+        self.ids: frozenset[str] = frozenset(table)
+
+    @classmethod
+    def empty(cls) -> "TokenTable":
+        return cls({})
+
+    @classmethod
+    def from_file(cls, path: str) -> "TokenTable":
+        """Строки «<id> <sha256 hex>»; `#` и пустые строки пропускаются.
+
+        Ошибка — OSError или ValueError с именем файла и номером строки, без её содержимого.
+        """
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except UnicodeDecodeError:
+            raise ValueError(f"{path}: файл не в UTF-8") from None
+        hashes: dict[str, str] = {}
+        for n, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if not (len(parts) == 2 and TOKEN_ID.fullmatch(parts[0]) and _SHA256_HEX.fullmatch(parts[1])):
+                raise ValueError(f"{path}: строка {n} — не «id sha256»")
+            if parts[0] in hashes:
+                raise ValueError(f"{path}: строка {n} — id повторяется")
+            hashes[parts[0]] = parts[1]
+        return cls(hashes)
+
+    def caller(self, bearer: str | None) -> str | None:
+        """id вызывающего по токену; нет токена или он чужой — None."""
+        if not bearer:
+            return None
+        try:
+            digest = hashlib.sha256(bearer.encode("utf-8")).digest()
+        except UnicodeEncodeError:          # одиночный суррогат: такого токена нет ни у кого
+            return None
+        found = None
+        for caller_id, expected in self._hashes.items():
+            if hmac.compare_digest(digest, expected):
+                found = caller_id
+        return found
+
+    def __repr__(self) -> str:
+        return f"TokenTable(ids={sorted(self.ids)})"

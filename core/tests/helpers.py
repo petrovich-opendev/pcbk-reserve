@@ -1,8 +1,15 @@
 """Общие константы и помощники тестов серверного слоя (импорт явный: from helpers import …)."""
+import hashlib
 import itertools
+import socket
+import subprocess
+import sys
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from contextlib import nullcontext
+from pathlib import Path
 
 from fastapi import APIRouter, FastAPI
 
@@ -13,6 +20,8 @@ from pcbk_core.settings import Settings
 
 # настройки тестов строятся напрямую: проверки from_env на них не действуют
 SETTINGS = Settings()
+# каталог core/: из него подпроцессы импортируют pcbk_core
+CORE_DIR = Path(__file__).resolve().parent.parent
 
 _files = itertools.count(1)
 
@@ -22,6 +31,44 @@ def write(tmp_path, text: str) -> str:
     path = tmp_path / f"file-{next(_files)}.env"
     path.write_text(text, encoding="utf-8")
     return str(path)
+
+
+def sha(text: str) -> str:
+    """sha256 строки в шестнадцатеричном виде — как в файле core-tokens."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def run_python(code: str) -> str:
+    """Код в свежем интерпретаторе из каталога core/; ненулевой код — CalledProcessError.
+
+    stdout — результат; stderr не перехватывается: pytest покажет его у упавшего теста.
+    """
+    return subprocess.run([sys.executable, "-c", code], cwd=CORE_DIR, check=True,
+                          stdout=subprocess.PIPE, text=True).stdout
+
+
+def free_port() -> int:
+    """Свободный сейчас TCP-порт на 127.0.0.1."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_http(url: str, timeout: float = 10) -> tuple[int, str]:
+    """GET, пока слушатель не ответит: (код, тело), в том числе 503; не дождался — AssertionError."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # мимо прокси окружения
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            with opener.open(url, timeout=2) as r:
+                return r.status, r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read().decode("utf-8")
+        except (urllib.error.URLError, OSError):
+            if time.monotonic() > end:
+                raise AssertionError(f"{url}: слушатель не ответил за {timeout} с") from None
+            time.sleep(0.1)
 
 
 class FakeMono:

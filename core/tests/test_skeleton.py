@@ -14,11 +14,11 @@ import pytest
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
-from helpers import SETTINGS, DummyRole, dummy, write
+from helpers import SETTINGS, DummyRole, dummy, sha, write
 from pcbk_core.app import create_app
 from pcbk_core.logs import setup_logging
 from pcbk_core.main import healthcheck, main
-from pcbk_core.secrets import BdrvConfig, read_env_file
+from pcbk_core.secrets import BdrvConfig, TokenTable, read_env_file
 from pcbk_core.settings import Settings
 
 
@@ -48,6 +48,14 @@ def test_bdrv_config_explicit_port_and_database(tmp_path):
     assert (cfg.host, cfg.port, cfg.database, cfg.user) == ("h\\INST", 1500, "Hist", "u")
     with pytest.raises(ValueError, match="BDRV_PORT"):
         BdrvConfig.from_env_file(write(tmp_path, "BDRV_HOST=h\nBDRV_PORT=x\nBDRV_USER=u\nBDRV_PW=<p>\n"))
+
+
+def test_token_table(tmp_path):                      # F15: рядом с BdrvConfig, write — оттуда же
+    t = TokenTable.from_file(write(tmp_path, f"ops {sha('tok-b')}\nstudent-01 {sha('tok-a')}\n"))
+    assert (t.caller("tok-a"), t.caller("tok-b"), t.caller("x"), t.caller(None)) == ("student-01", "ops", None, None)
+    assert TokenTable.empty().ids == frozenset() and TokenTable.empty().caller("tok-a") is None
+    with pytest.raises(ValueError):
+        TokenTable.from_file(write(tmp_path, "Student_01 abc\n"))
 
 
 def test_settings_from_env():

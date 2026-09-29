@@ -15,6 +15,10 @@ class Settings:
     CORE_PORT: int = 8000
     BDRV_ENV_FILE: str = "/run/secrets/bdrv.env"
     WHITELIST_PATH: str = "/app/data/whitelist.txt"
+    # хеши токенов вызывающих: строки «<id> <sha256 hex>», сами токены — только у вызывающих
+    TOKENS_FILE: str = "/run/secrets/core-tokens"
+    # журнал событий (SQLite) на томе pcbk-core-data
+    DB_PATH: str = "/var/lib/pcbk-core/core.db"
     FRESH_POLL_S: float = 30.0
     CATALOG_REFRESH_S: float = 86400.0
     CATALOG_DEADLINE_S: float = 60.0

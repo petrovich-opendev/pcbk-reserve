@@ -1,7 +1,8 @@
-"""Вход серверного слоя: настройки, журнал, роли, uvicorn; --healthcheck для образа.
+"""Вход серверного слоя: настройки, журнал, охрана выхода, роли, uvicorn; --healthcheck для образа.
 
 FastAPI и uvicorn грузятся только в ветке сервера: проба здоровья раз в 30 с
-тянет лишь http.client.
+тянет лишь http.client. Охрана выхода ставится только в serve() — точке входа
+процесса: хук не снимается, а main() и build_roles тесты зовут в процессе pytest.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from .settings import Settings
 
 if TYPE_CHECKING:
     from .app import Role
+    from .secrets import BdrvConfig
 
 USAGE = "использование: python -m pcbk_core.main [--healthcheck]"
 
@@ -25,6 +27,17 @@ def _why(exc: Exception) -> str:
     if isinstance(exc, OSError):
         return f"{type(exc).__name__}: {exc.strerror or 'ошибка чтения'}"
     return str(exc)
+
+
+def read_bdrv(settings: Settings) -> tuple[BdrvConfig | None, OSError | ValueError | None]:
+    """Учётные данные историана из BDRV_ENV_FILE: (cfg, None) или (None, ошибка); в журнал не пишет."""
+    from .secrets import BdrvConfig
+
+    try:
+        return BdrvConfig.from_env_file(settings.BDRV_ENV_FILE), None
+    except (OSError, ValueError) as exc:
+        # без трассы: её кадры держали бы строки файла
+        return None, exc.with_traceback(None)
 
 
 def build_roles(settings: Settings) -> list[Role]:
@@ -39,7 +52,6 @@ def build_roles(settings: Settings) -> list[Role]:
     from .data import CONFIG_ERRORS, DataRole
     from .data.historian import HistorianError, QueryFn, tds_query
     from .data.names import load_names
-    from .secrets import BdrvConfig
 
     log = logging.getLogger("pcbk_core.main")
     problems: list[str] = []
@@ -48,9 +60,10 @@ def build_roles(settings: Settings) -> list[Role]:
         raise HistorianError("connect", "учётные данные историана не прочитаны")
 
     query: QueryFn = no_credentials
-    try:
-        query = tds_query(BdrvConfig.from_env_file(settings.BDRV_ENV_FILE))
-    except (OSError, ValueError) as exc:
+    cfg, exc = read_bdrv(settings)
+    if cfg is not None:
+        query = tds_query(cfg)
+    elif exc is not None:
         log.error("учётные данные %s: %s", settings.BDRV_ENV_FILE, _why(exc))
         problems.append(CONFIG_ERRORS["bdrv_unreadable" if isinstance(exc, OSError) else "bdrv_invalid"])
 
@@ -79,12 +92,19 @@ def healthcheck(settings: Settings) -> int:
 
 
 def serve(settings: Settings) -> None:
+    """Точка входа службы: охрана выхода — до ролей; плохой bdrv.env — охрана без направлений (только
+    петля), причину показывает config_error роли, процесс живёт (Д3а, I2)."""
+    # до охраны (F14): pytds/login.py импортирует ctypes, а import ctypes под хуком на 3.14 падает
+    import ctypes  # noqa: F401
+    import pytds  # noqa: F401
     import uvicorn
 
     from .app import create_app
+    from .egress import install_historian_guard
     from .logs import setup_logging
 
     log = setup_logging()
+    install_historian_guard(read_bdrv(settings)[0])
     roles = build_roles(settings)
     log.info("серверный слой слушает порт %s, роли: %s",
              settings.CORE_PORT, ", ".join(r.name for r in roles) or "нет")

@@ -16,6 +16,11 @@
 Имя из whitelist.extra или прежнего списка, которого нет в каталоге, в список не идёт: без каталога
 неизвестен вид тега, и правила 4–5 к нему не применить. Печатаются только числа: имена тегов —
 производственные данные заказчика.
+
+Охрана выхода (Д3б-R6) ставится только при запуске модулем (`__main__` → main(guard=True)): сразу после
+чтения входных файлов, до входа в историан. main() без guard её не ставит — хук не снимается, а тесты
+зовут main в процессе pytest (F2). pytds импортируется при загрузке модуля (через .historian), то есть
+до охраны.
 """
 import argparse
 import contextlib
@@ -28,6 +33,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Literal
 
+from ..egress import install_historian_guard
 from ..logs import setup_logging
 from ..secrets import BdrvConfig
 from ..settings import Settings
@@ -188,8 +194,11 @@ def _load(path: str) -> frozenset[str]:
         raise ValueError(f"{path}: {e}") from None
 
 
-def main(argv: list[str] | None = None) -> int:
-    """0 — список записан; 1 — ошибка входных файлов, историана или пустой результат (файл цел)."""
+def main(argv: list[str] | None = None, *, guard: bool = False) -> int:
+    """0 — список записан; 1 — ошибка входных файлов, историана или пустой результат (файл цел).
+
+    guard=True — охрана выхода с одним направлением (историан) до входа в историан; так зовёт __main__.
+    """
     parser = argparse.ArgumentParser(prog="python -m pcbk_core.data.build_whitelist",
                                      description="Белый список тегов по правилу d3-1; печатает только числа.")
     parser.add_argument("--out", required=True, help="куда записать список (права 0444)")
@@ -207,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as e:
         print(f"построитель: {e}", file=sys.stderr)
         return 1
+    if guard:
+        install_historian_guard(cfg)
     try:
         rows = tds_query(cfg)([catalog_sql()], CATALOG_TIMEOUT_S)[0]
     except HistorianError as e:
@@ -231,4 +242,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(guard=True))

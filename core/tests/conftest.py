@@ -1,7 +1,22 @@
 """Фикстуры серверного слоя: асинхронные тесты — через плагин anyio на asyncio."""
 import logging
+import socket
 
 import pytest
+
+
+@pytest.fixture
+def listeners():
+    """Два слушающих сокета на 127.0.0.1 — их порты (a, b); соединения принимает ядро, accept не нужен."""
+    socks = [socket.socket(), socket.socket()]
+    try:
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+            s.listen(8)
+        yield tuple(s.getsockname()[1] for s in socks)
+    finally:
+        for s in socks:
+            s.close()
 
 
 @pytest.fixture
