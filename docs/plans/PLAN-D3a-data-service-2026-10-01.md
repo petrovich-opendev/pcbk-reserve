@@ -1422,7 +1422,7 @@ Expected: FAIL — нет `check_historian`
 
 - [ ] **Step 4: Run all watchdog tests**
 
-Run: `cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/`
+Run: `cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1583,7 +1583,7 @@ Expected: FAIL — нет службы `core`
 
 - [ ] **Step 4: Run the whole local suite**
 
-Run: `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/) && uv run --python 3.12 --with pytest pytest -q tests/integration && docker network ls --filter name=pcbk- -q | wc -l`
+Run: `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs) && uv run --python 3.12 --with pytest pytest -q tests/integration && docker network ls --filter name=pcbk- -q | wc -l`
 Expected: PASS; сетей `pcbk-` после прогона — 0
 
 - [ ] **Step 5: Commit**
