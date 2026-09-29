@@ -617,3 +617,36 @@ async def test_locked_journal_holds_poll_at_most_write_timeout(tmp_path):       
         holder.close()
     assert took < WRITE_TIMEOUT_S + 1.0 and role.freshness.error is None
     assert role.events.consecutive_failures == 1 and "locked" in role.events.last_error
+
+
+# --- Д3б, задача 5: токены в build_roles (F4) ---
+
+def test_build_roles_unreadable_tokens_is_red_not_crash(tmp_path, capfd, restore_logging):
+    setup_logging()
+    settings = replace(SETTINGS, BDRV_ENV_FILE=write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"),
+                       WHITELIST_PATH=write(tmp_path, "20FAKE_001_PV\n"), TOKENS_FILE=str(tmp_path / "нет"))
+    [role] = build_roles(settings)
+    assert role.config_error is None and role.tokens.ids == frozenset()
+    assert role.health() == (False, TOKENS_ERROR) and "токены" in capfd.readouterr().err
+
+
+# --- сверх брифа ---
+
+def test_build_roles_reads_tokens_and_bad_line_is_named_without_content(tmp_path, capfd, restore_logging):
+    setup_logging()
+    base = dict(BDRV_ENV_FILE=write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"),
+                WHITELIST_PATH=write(tmp_path, "20FAKE_001_PV\n"))
+    [role] = build_roles(replace(SETTINGS, **base))                       # файл сессии тестов: student-01
+    assert role.tokens.caller(TOKEN) == "student-01" and role.tokens_error is None
+    [bad] = build_roles(replace(SETTINGS, **base, TOKENS_FILE=write(tmp_path, "student-01 секрет-строка\n")))
+    assert bad.tokens.ids == frozenset() and bad.health() == (False, TOKENS_ERROR) and bad.config_error is None
+    err = capfd.readouterr().err
+    assert "строка 1" in err and "секрет" not in err
+
+
+async def test_tokens_error_keeps_background_loops(tmp_path):
+    role, fake = make_role(db_dir=tmp_path, tokens=None, settings=replace(SETTINGS, FRESH_POLL_S=0.05))
+    role.tokens_error = TOKENS_ERROR
+    async with role.lifespan():
+        await wait_until_async(lambda: role.catalog.loaded)                # это не ошибка настройки
+    assert role.health() == (False, TOKENS_ERROR) and fake.calls

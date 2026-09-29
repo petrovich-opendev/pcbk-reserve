@@ -47,11 +47,13 @@ def build_roles(settings: Settings) -> list[Role]:
     с причиной, ворота не пускают ни одного имени. bdrv.env или белый список не
     читаются — роль «с ошибкой настройки»: 503 с причиной, без фоновых циклов и
     входов в историан; процесс живёт, и сторож видит причину. Учётные данные —
-    только файлом.
+    только файлом. core-tokens не читается — это не ошибка настройки (F4): пустая
+    таблица (всем 401), причина TOKENS_ERROR на странице, фоновые циклы идут.
     """
-    from .data import CONFIG_ERRORS, DataRole
+    from .data import CONFIG_ERRORS, TOKENS_ERROR, DataRole
     from .data.historian import HistorianError, QueryFn, tds_query
     from .data.names import load_names
+    from .secrets import TokenTable
 
     log = logging.getLogger("pcbk_core.main")
     problems: list[str] = []
@@ -76,7 +78,16 @@ def build_roles(settings: Settings) -> list[Role]:
         log.error("белый список %s: %s", settings.WHITELIST_PATH, _why(exc))
         problems.append(CONFIG_ERRORS["whitelist_unreadable"])
 
-    return [DataRole(settings, query, whitelist, config_error="; ".join(problems) or None)]
+    tokens, tokens_error = TokenTable.empty(), None
+    try:
+        tokens = TokenTable.from_file(settings.TOKENS_FILE)
+    except (OSError, ValueError) as exc:
+        # _why: у ValueError чтения — имя файла и номер строки, без самой строки
+        log.error("токены %s: %s", settings.TOKENS_FILE, _why(exc))
+        tokens_error = TOKENS_ERROR
+
+    return [DataRole(settings, query, whitelist, config_error="; ".join(problems) or None,
+                     tokens=tokens, tokens_error=tokens_error)]
 
 
 def healthcheck(settings: Settings) -> int:

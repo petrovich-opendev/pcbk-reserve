@@ -22,9 +22,13 @@ import pytest
 from fastapi import APIRouter, FastAPI
 
 from fakes import WHITELIST, FakeHistorian
-from pcbk_core.app import RoleBase
+from pcbk_core.app import RoleBase, create_app
 from pcbk_core.data import DataRole
+from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.events import CallEvent
+from pcbk_core.data.historian import parse_clock
+from pcbk_core.data.service import DataService
+from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
 from pcbk_core.secrets import TokenTable
 from pcbk_core.settings import Settings
 
@@ -116,7 +120,7 @@ class FakeMono:
 def make_role(settings: Settings = SETTINGS, fake: FakeHistorian | None = None,
               whitelist: frozenset[str] = WHITELIST, mono: Callable[[], float] | None = None, *,
               db_dir: str | Path | None = None, tokens: TokenTable = TEST_TOKENS,
-              ) -> tuple[DataRole, FakeHistorian]:
+              config_error: str | None = None) -> tuple[DataRole, FakeHistorian]:
     """Роль «данные» на двойнике историана; часы по умолчанию — FakeMono(1000.0).
 
     Журнал событий — core.db в db_dir, по умолчанию в новом каталоге внутри каталога сессии: у каждой
@@ -126,7 +130,34 @@ def make_role(settings: Settings = SETTINGS, fake: FakeHistorian | None = None,
     mono = FakeMono(1000.0) if mono is None else mono
     db_dir = tempfile.mkdtemp(dir=SESSION_DIR) if db_dir is None else db_dir
     settings = replace(settings, DB_PATH=str(Path(db_dir) / "core.db"))
-    return DataRole(settings, fake, whitelist, monotonic=mono, tokens=tokens), fake
+    return DataRole(settings, fake, whitelist, monotonic=mono, tokens=tokens, config_error=config_error), fake
+
+
+def make_service(tmp_path, **kwargs) -> tuple[DataService, FakeHistorian]:
+    """Служба роли с загруженным каталогом; fake.calls очищены.
+
+    Каталог грузится теми же запросами, что refresh_catalog, но прямо через двойник, без ворот и цикла
+    событий: помощник синхронный. Первый вызов инструмента поэтому — первый вход ворот.
+    """
+    role, fake = make_role(db_dir=tmp_path, **kwargs)
+    clock_rows, tag_rows = fake([clock_sql(), catalog_sql()], 10.0)
+    [live_rows] = fake([live_all_sql()], 10.0)
+    role._catalog_loaded(Catalog.from_rows(tag_rows, live_rows, role.whitelist), parse_clock(clock_rows),
+                         role.monotonic())
+    fake.calls.clear()
+    fake.timeouts.clear()
+    return role.service, fake
+
+
+def make_app(tmp_path, **kwargs) -> tuple[FastAPI, DataRole]:
+    """Приложение с одной ролью «данные» на двойнике; каталог грузит lifespan (TestClient)."""
+    role, _ = make_role(db_dir=tmp_path, **kwargs)
+    return create_app(SETTINGS, [role]), role
+
+
+def sent_of(fake: FakeHistorian) -> list[str]:
+    """Имена из names_in всех SQL, переданных двойнику, по порядку."""
+    return [name for call in fake.calls for sql in call for name in names_in(sql)]
 
 
 def wait_until(pred: Callable[[], bool], timeout: float = 5) -> None:

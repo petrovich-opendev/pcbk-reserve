@@ -1,4 +1,5 @@
-"""Роль «данные»: каталог тегов, свежесть историана, журнал событий, ручки здоровья; Д3б добавит инструменты.
+"""Роль «данные»: каталог тегов, свежесть историана, журнал событий, ручки здоровья и инструменты
+(DataService — service.py; HTTP /api/data/* — http_api.py).
 
 Два фоновых цикла делят одно фоновое место ворот. Каталог грузится сразу при
 старте и дальше раз в CATALOG_REFRESH_S, после неудачи — с растущей паузой.
@@ -15,7 +16,8 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import APIRouter
+from fastapi import APIRouter, FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from ..app import RoleBase
@@ -26,6 +28,8 @@ from .events import EVENTS_CHECK_S, CallEvent, EventLog, Outcome, outcome_for
 from .freshness import ERROR_TEXTS, FreshnessTracker
 from .gate import GateRefused, GateResult, HistorianGate
 from .historian import HistClock, HistorianError, QueryFn, parse_clock
+from .http_api import MAX_BODY_BYTES, BodyLimit, data_router, validation_handler
+from .service import DataService
 from .sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql
 
 FRESH_TAGS = 8
@@ -50,7 +54,8 @@ class DataRole(RoleBase):
     этой причиной, фоновые циклы не запускаются, к историану ни одного входа.
 
     tokens — всегда TokenTable: не передан — пустая, всем 401 (F18); tokens_error — причина, если
-    core-tokens не прочитан. Конструктор без ввода-вывода (F4): журнал событий только запоминает путь.
+    core-tokens не прочитан. Конструктор без ввода-вывода (F4): журнал событий только запоминает путь,
+    служба (service) — кэш, single-flight и окно частоты в памяти.
     """
 
     name = "data"
@@ -79,6 +84,7 @@ class DataRole(RoleBase):
         # часы историана и момент их получения: «сейчас историана» для Д3б без лишнего запроса
         self.clock: HistClock | None = None
         self.clock_mono: float | None = None
+        self.service = DataService(self)
 
     # --- каталог ---
 
@@ -283,7 +289,14 @@ class DataRole(RoleBase):
             body["gate"] = self.gate.stats()
             return JSONResponse(body)
 
+        router.include_router(data_router(self))
         return router
+
+    def install(self, app: FastAPI) -> None:
+        """Крючки уровня приложения: 422/401/503 для ошибок разбора /api/data/* и предел тела до
+        маршрутизации — на всём приложении, в том числе на /mcp."""
+        app.add_exception_handler(RequestValidationError, validation_handler(self))
+        app.add_middleware(BodyLimit, max_bytes=MAX_BODY_BYTES)
 
     def lifespan(self):
         return self._lifespan()
