@@ -25,7 +25,9 @@
 1. Образы — с машины разработчика, без выхода сервера в интернет:
    `docker save <образ> | gzip | ssh <сервер> 'gunzip | docker load'`;
    список сторонних образов — `deploy/images.lock` (строки `# test` не
-   возить); свой образ — `pcbk-reserve/watchdog:<день>`. Сверка: слои
+   возить, кроме `curlimages/curl` — он остаётся на сервере как инструмент
+   проверок); свои образы — `pcbk-reserve/watchdog:<день>` и
+   `pcbk-reserve/student:<день>` (собирать из чистого дерева, `git archive`). Сверка: слои
    `docker image inspect -f '{{json .RootFS.Layers}}'` совпадают.
 2. `compose.yaml` и каталог `edge/` — в `/opt/pcbk-reserve` (`scp`; без
    удаления: `tls/`, `.env`, `secrets/`, `agents/` не трогаются). Права:
@@ -40,8 +42,8 @@
 
 1. Секреты — на сервере, в чат и git не попадают:
    ```bash
-   cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && AD=$(grep '^AGENTS_DIR=' .env | cut -d= -f2)
-   umask 077 && install -d -m 0700 "$SD" "$AD"
+   cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && AD=$(grep '^AGENTS_DIR=' .env | cut -d= -f2) &&
+   [ -n "$SD" ] && [ -n "$AD" ] && umask 077 && install -d -m 0700 "$SD" "$AD" &&
    for n in $(seq -w 1 10); do
      for s in pw llm-token; do f=$SD/student-$n.$s
        [ -e "$f" ] || { openssl rand -hex 24 | tr -d '\n' > "$f"; chmod 0444 "$f"; }   # не перезаписывать
@@ -61,7 +63,9 @@
 
 ### Новый студент
 - **Смена студента в слоте 01–10:** новые файлы `student-NN.pw` и
-  `student-NN.llm-token` (старые удалить), пустой каталог агентов места;
+  `student-NN.llm-token` (старые удалить); прежний каталог агентов места
+  переименовать и сохранить (удалять — только по решению владельца), создать
+  пустой;
   старые тома места — только по решению владельца; `docker compose
   --profile students create --force-recreate --no-build student-NN`.
 - **Место 11 и дальше:** правка регулярок `sp-ro`/`sp-ctl`, подсеть N, блок
