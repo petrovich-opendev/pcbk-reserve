@@ -3,3 +3,5 @@
 # Строки «# test» — только для локальных тестов, на сервер не возятся.
 nginx:1.30.5-alpine sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
 curlimages/curl:8.16.0 sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 # test
+wollomatic/socket-proxy:1.13.1 sha256:3935b709275e4ec35d6ed5a5c4a1f0d01ed31eec5e7234efc3357ecd47689002
+busybox:1.38.0 sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e # test

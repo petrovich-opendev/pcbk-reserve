@@ -5,3 +5,15 @@ services:
   edge:
     ports: !override
       - "127.0.0.1:18443:8443"
+
+  # мишень проверок прокси: чужой для прокси контейнер — его inspect должен получать 403
+  foreign:
+    image: busybox:1.38.0
+    pull_policy: never
+    container_name: pcbk-test-foreign
+    command: ["sleep", "infinity"]
+    init: true
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]

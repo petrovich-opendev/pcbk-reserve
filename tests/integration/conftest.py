@@ -24,9 +24,22 @@ LOCK = REPO / "deploy" / "images.lock"
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 READY_TIMEOUT_S = 60
 COMPOSE_TIMEOUT_S = 600
+COMPOSE_FILES = ("compose.yaml", "compose.test.yaml")
 # переменные компоновки: берутся только из test.env, не из окружения оболочки
 STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRETS_DIR", "AGENTS_DIR",
-                        "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S"})
+                        "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S",
+                        "DRILL_FREEZE_LOOP"})
+# метка одноразовых клиентов http_as: уборка снимает только их
+ONESHOT_LABEL = "pcbk-test.oneshot"
+# запрос изнутри сторожа: argv — метод и адрес; печатает код ответа
+WATCHDOG_REQUEST = """\
+import http.client, sys
+from urllib.parse import urlsplit
+u = urlsplit(sys.argv[2])
+conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=10)
+conn.request(sys.argv[1], u.path + ("?" + u.query if u.query else ""))
+print(conn.getresponse().status)
+"""
 
 
 def _run(cmd: list[str], *, timeout: float = 120, check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -71,6 +84,11 @@ def make_test_tls(tls_dir: Path) -> None:
         (tls_dir / f).chmod(0o644)
 
 
+def locked_image(repo: str) -> str:
+    """Имя:тег образа из images.lock — одно место правды для версий."""
+    return next(name for name, _, _ in read_lock() if name.rsplit(":", 1)[0] == repo)
+
+
 def docker_gid() -> str:
     return _run(["getent", "group", "docker"]).stdout.strip().split(":")[2]
 
@@ -84,17 +102,20 @@ class Stack:
         self.ready: dict[str, Callable[[], bool]] = {
             "pcbk-watchdog": self._watchdog_ready,
             "pcbk-edge": self._edge_ready,
+            "pcbk-sp-ro": self._sp_ro_ready,
         }
 
     # --- docker compose и docker ---
 
-    def compose(self, *args: str, timeout: float = COMPOSE_TIMEOUT_S, check: bool = True) -> str:
+    def compose(self, *args: str, timeout: float = COMPOSE_TIMEOUT_S, check: bool = True,
+                files: tuple[str, ...] = COMPOSE_FILES) -> str:
         cmd = ["docker", "compose", "-p", PROJECT, "--env-file", str(self.env_file),
-               "-f", "compose.yaml", "-f", "compose.test.yaml", *args]
+               *(a for f in files for a in ("-f", f)), *args]
         return _run(cmd, timeout=timeout, check=check, cwd=REPO, env=self.env).stdout
 
-    def config(self) -> dict:
-        return json.loads(self.compose("config", "--format", "json"))
+    def config(self, files: tuple[str, ...] = COMPOSE_FILES) -> dict:
+        """Итоговая компоновка; files=("compose.yaml",) — как на сервере, без тестовых правок."""
+        return json.loads(self.compose("config", "--format", "json", files=files))
 
     def _docker(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return _run(["docker", *args], check=check)
@@ -107,6 +128,9 @@ class Stack:
 
     def containers(self) -> list[str]:
         return self.compose("ps", "-a", "--format", "{{.Name}}").split()
+
+    def exec(self, name: str, *cmd: str) -> str:
+        return self._docker("exec", name, *cmd).stdout.strip()
 
     def env_names(self, name: str) -> set[str]:
         return {e.split("=", 1)[0] for e in self.inspect(name)["Config"]["Env"] or []}
@@ -130,7 +154,7 @@ class Stack:
 
     # --- запросы к стенду ---
 
-    def https(self, path: str, timeout: float = 20.0) -> tuple[int, str]:
+    def _https_get(self, path: str, timeout: float) -> tuple[int, http.client.HTTPMessage, str]:
         """GET к https://127.0.0.1:18443 без проверки сертификата, без прокси и перенаправлений."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -139,9 +163,32 @@ class Stack:
         try:
             conn.request("GET", path)
             resp = conn.getresponse()
-            return resp.status, resp.read().decode("utf-8", "replace")
+            return resp.status, resp.msg, resp.read().decode("utf-8", "replace")
         finally:
             conn.close()
+
+    def https(self, path: str, timeout: float = 20.0) -> tuple[int, str]:
+        code, _, body = self._https_get(path, timeout)
+        return code, body
+
+    def https_headers(self, path: str, timeout: float = 20.0) -> tuple[int, http.client.HTTPMessage]:
+        """Код и заголовки; повторы одного заголовка — через get_all."""
+        code, headers, _ = self._https_get(path, timeout)
+        return code, headers
+
+    def http_from_watchdog(self, method: str, url: str) -> int:
+        """Запрос http.client изнутри pcbk-watchdog — от имени сторожа, как его DockerReader."""
+        r = self._docker("exec", "pcbk-watchdog", "python", "-c", WATCHDOG_REQUEST, method, url)
+        return int(r.stdout.strip())
+
+    def http_as(self, name: str, network: str, method: str, url: str) -> int:
+        """Одноразовый curl с этим именем в этой сети; путь — как есть, без нормализации."""
+        r = self._docker("run", "--rm", "--pull", "never", "--name", name, "--network", network,
+                         "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
+                         "--security-opt", "no-new-privileges:true", locked_image("curlimages/curl"),
+                         "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--path-as-is",
+                         "--max-time", "10", "-X", method, url)
+        return int(r.stdout.strip())
 
     def wait_status(self, pred: Callable[[dict], bool], timeout: float) -> dict:
         """/status.json через edge, пока pred не станет истинным; по сроку — AssertionError."""
@@ -171,6 +218,12 @@ class Stack:
         r = self._docker("exec", "pcbk-edge", "wget", "-q", "-T", "2", "-O", "-",
                          "http://127.0.0.1:8080/healthz", check=False)
         return r.returncode == 0 and r.stdout.strip() == "ok"
+
+    def _sp_ro_ready(self) -> bool:
+        # ping через прокси тем же путём, что сторож
+        r = self._docker("exec", "pcbk-watchdog", "python", "-c", WATCHDOG_REQUEST,
+                         "GET", "http://pcbk-sp-ro:2375/v1.44/_ping", check=False)
+        return r.returncode == 0 and r.stdout.strip() == "200"
 
     def _state(self, name: str) -> dict:
         return self.inspect(name)["State"]
@@ -249,6 +302,10 @@ class Stack:
                          and datetime.fromisoformat(d["checked_at"]) > ready_at, READY_TIMEOUT_S)
 
     def down(self) -> None:
+        # одноразовые клиенты http_as, оставшиеся после оборванного прогона, — только с нашей меткой
+        leftovers = self._docker("ps", "-aq", "--filter", f"label={ONESHOT_LABEL}").stdout.split()
+        if leftovers:
+            self._docker("rm", "-f", *leftovers)
         self.compose("down", "-v", "--remove-orphans", "--timeout", "10")
 
 

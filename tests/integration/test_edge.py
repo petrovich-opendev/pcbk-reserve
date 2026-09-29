@@ -2,12 +2,17 @@
 import re
 import time
 
-DECLARED_ENV = {                   # наши переменные сверх переменных базового образа
+DECLARED_ENV = {                   # наши переменные сверх переменных базового образа — ровно эти
     "pcbk-watchdog": {"LISTEN_PORT", "TICK_S", "STALE_AFTER_S", "DISPLAY_TZ", "DOCKER_URL",
                       "DOCKER_TIMEOUT_S", "MEM_WARN_MIB", "MEM_FAIL_MIB", "TLS_CAFILE",
-                      "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH"},
+                      "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH", "DRILL_FREEZE_LOOP"},
     "pcbk-edge": set(),
+    "pcbk-sp-ro": set(),
+    "pcbk-sp-ctl": set(),
 }
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d1", "pcbk-edge": "nginx:1.30.5-alpine",
+          "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1"}
+WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 
 
 def test_edge_serves_status_from_watchdog(stack):
@@ -30,8 +35,9 @@ def test_watchdog_checks_edge_tls(stack):
 def test_edge_shows_watchdog_down_page(stack):
     stack.stop("pcbk-watchdog")
     try:
-        code, body = stack.https("/status")
-        assert code in (502, 504) and "Сторож не отвечает" in body and "nginx" not in body.lower()
+        for path in WATCHDOG_PATHS:
+            code, body = stack.https(path)
+            assert code in (502, 504) and "Сторож не отвечает" in body and "nginx" not in body.lower(), path
     finally:
         stack.start("pcbk-watchdog")
 
@@ -50,7 +56,9 @@ def test_hung_watchdog_gives_down_page_within_timeout(stack):
     try:
         started = time.monotonic()
         code, body = stack.https("/status")
-        assert code == 504 and "Сторож не отвечает" in body and time.monotonic() - started < 10
+        elapsed = time.monotonic() - started
+        # ≥ 4 с — ответ дал срок чтения proxy_read_timeout, а не мгновенный отказ соединения
+        assert code == 504 and "Сторож не отвечает" in body and 4 <= elapsed < 10, elapsed
     finally:
         stack.unpause("pcbk-watchdog")
 
@@ -59,6 +67,37 @@ def test_only_edge_publishes_one_port(stack):
     published = {n: [p for p in (stack.inspect(n)["NetworkSettings"]["Ports"] or {}).values() if p]
                  for n in stack.containers()}
     assert {n: len(p) for n, p in published.items() if p} == {"pcbk-edge": 1}
+
+
+def test_production_config_publishes_only_edge_8443(stack):
+    # compose.test.yaml подменяет порты edge — боевые видны только в compose.yaml без него
+    services = stack.config(files=("compose.yaml",))["services"]
+    ports = {name: s["ports"] for name, s in services.items() if s.get("ports")}
+    assert list(ports) == ["edge"]
+    assert [(p["target"], str(p["published"]), p.get("protocol", "tcp")) for p in ports["edge"]] == \
+        [(8443, "8443", "tcp")]
+    assert not [name for name, s in services.items() if s.get("network_mode") == "host"]
+
+
+def test_status_headers_single_no_store_nosniff(stack):
+    for path in ("/status", "/status.json"):
+        code, headers = stack.https_headers(path)
+        cache = headers.get_all("Cache-Control") or []
+        assert code == 200 and len(cache) == 1 and "no-store" in cache[0], (path, cache)
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], path
+
+
+def test_edge_tmpfs_root_owned_0755(stack):
+    paths = ("/etc/nginx/conf.d", "/var/cache/nginx", "/var/run")
+    # режим задан явно, а не унаследован от каталога образа (у runc он копируется с каталога)
+    assert stack.inspect("pcbk-edge")["HostConfig"]["Tmpfs"] == {p: "mode=0755" for p in paths}
+    for path in paths:
+        assert stack.exec("pcbk-edge", "stat", "-L", "-c", "%a %U", path) == "755 root", path
+
+
+def test_edge_limits(stack):
+    host = stack.inspect("pcbk-edge")["HostConfig"]
+    assert (host["Memory"], host["PidsLimit"]) == (64 * 1024 * 1024, 64)
 
 
 def test_networks_d1_front(stack):
@@ -73,7 +112,7 @@ def test_networks_d1_front(stack):
 
 
 def test_env_holds_only_known_names(stack):
-    for name, image in (("pcbk-watchdog", "pcbk-reserve/watchdog:d1"), ("pcbk-edge", "nginx:1.30.5-alpine")):
-        extra = stack.env_names(name) - stack.image_env_names(image) - DECLARED_ENV[name]
-        assert extra == set(), f"{name}: лишние переменные {extra}"
+    for name, image in IMAGES.items():
+        added = stack.env_names(name) - stack.image_env_names(image)
+        assert added == DECLARED_ENV[name], f"{name}: сверх образа {added}"
         assert not {n for n in stack.env_names(name) if re.search(r"PASSWORD|SECRET|TOKEN|APIKEY", n)}

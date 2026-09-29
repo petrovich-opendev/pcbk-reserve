@@ -1,6 +1,7 @@
-# Стенд Д1: прокси входа и сторож. Переменные — из .env выкладки (deploy/env.example).
+# Стенд Д1: прокси входа, сторож и две копии прокси сокета. Переменные — из .env
+# выкладки (deploy/env.example).
 # Сторонние образы — только по тегу из deploy/images.lock, без pull.
-# Наружу публикуется только 8443 контейнера edge.
+# Наружу публикуется только 8443 контейнера edge; docker.sock — только у sp-ro и sp-ctl.
 
 # имя проекта не зависит от каталога: том журнала и метки те же; тесты задают -p pcbk-test
 name: pcbk-reserve
@@ -12,14 +13,19 @@ services:
     container_name: pcbk-edge
     restart: unless-stopped
     read_only: true
+    # пишет только мастер от root; режим явно, а не 1777 и не от каталога образа
     tmpfs:
-      - /var/cache/nginx
-      - /var/run
-      - /etc/nginx/conf.d
+      - /var/cache/nginx:mode=0755
+      - /var/run:mode=0755
+      - /etc/nginx/conf.d:mode=0755
     cap_drop: [ALL]
     # мастер от root: CHOWN — каталоги кэша, SETUID/SETGID — рабочие процессы от nginx
     cap_add: [CHOWN, SETUID, SETGID]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    # worker_processes auto — по процессу на ядро; число задаётся только в nginx.conf образа,
+    # поэтому предел на процессы: мастер + рабочие + проверка живости
+    pids_limit: 64
     ports:
       - "8443:8443"
     volumes:
@@ -73,6 +79,8 @@ services:
       DISPLAY_TZ: ${DISPLAY_TZ:-UTC}
       MEM_WARN_MIB: ${MEM_WARN_MIB:-2048}
       MEM_FAIL_MIB: ${MEM_FAIL_MIB:-1024}
+      # учения «цикл молчит при живом HTTP»: 1 — цикл замирает после первого такта
+      DRILL_FREEZE_LOOP: ${DRILL_FREEZE_LOOP:-0}
     volumes:
       # только сертификат: им сторож проверяет, что edge отдаёт именно его
       - type: bind
@@ -84,7 +92,63 @@ services:
       - type: volume
         source: pcbk-watchdog-journal
         target: /var/lib/pcbk-watchdog
-    networks: [pcbk-front]
+    networks: [pcbk-front, pcbk-ro]
+
+  # Прокси сокета Docker. Права — флагами ниже, прокси сам дописывает ^…$ (альтернативы — в скобках);
+  # метод без списка → 405, путь вне списка → 403, клиент не из -allowfrom → 403.
+  # Списка контейнеров нет ни у кого: GET /containers/json отдаёт все контейнеры сервера
+  # с Command (у Dify там пароли), а строку запроса с фильтром прокси не проверяет.
+  # :ro на сокете от записи в Docker не защищает — защищает только фильтр.
+
+  # сторожу — только чтение: ping и inspect рабочих мест и sp-ctl
+  sp-ro:
+    image: wollomatic/socket-proxy:1.13.1
+    pull_policy: never
+    container_name: pcbk-sp-ro
+    restart: unless-stopped
+    # пользователь образа; группа docker — доступ к сокету
+    user: "65534:${DOCKER_GID:?DOCKER_GID не задан}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 32m
+    command:
+      - '-listenip=0.0.0.0'
+      - '-allowfrom=pcbk-watchdog'
+      - '-allowGET=(/v1\.[0-9]+)?/(_ping|containers/pcbk-(student-(0[1-9]|10)|sp-ctl)/json)'
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [pcbk-ro]
+
+  # серверному слою (с Д5) — inspect, start и stop только рабочих мест
+  sp-ctl:
+    image: wollomatic/socket-proxy:1.13.1
+    pull_policy: never
+    container_name: pcbk-sp-ctl
+    restart: unless-stopped
+    user: "65534:${DOCKER_GID:?DOCKER_GID не задан}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 32m
+    command:
+      - '-listenip=0.0.0.0'
+      - '-allowfrom=pcbk-core'
+      - '-allowGET=(/v1\.[0-9]+)?/(_ping|containers/pcbk-student-(0[1-9]|10)/json)'
+      - '-allowPOST=(/v1\.[0-9]+)?/containers/pcbk-student-(0[1-9]|10)/(start|stop)'
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [pcbk-ctl]
 
 networks:
   # только edge — ради публикации 8443; без маскарада: наружу edge не ходит
@@ -106,6 +170,26 @@ networks:
     ipam:
       config:
         - subnet: 172.31.250.32/28
+  # сторож и sp-ro
+  pcbk-ro:
+    name: pcbk-ro
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        - subnet: 172.31.250.48/28
+  # sp-ctl (с Д5 — и серверный слой)
+  pcbk-ctl:
+    name: pcbk-ctl
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        - subnet: 172.31.250.64/28
 
 volumes:
   # журнал переходов сторожа (SQLite); имя — с префиксом проекта, тестовый

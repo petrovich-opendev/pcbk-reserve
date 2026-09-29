@@ -20,10 +20,6 @@ server {
 
     root /usr/share/nginx/pcbk;
 
-    # 502/503/504 от самого nginx (сторож умер или завис) — своя страница, код сохраняется;
-    # ответы сторожа (503 до первого снимка) проходят как есть
-    error_page 502 503 504 /watchdog-down.html;
-
     # на всё, что отдаёт edge, — без кэша; одноимённые заголовки сторожа заменяются
     add_header Cache-Control "no-store" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -43,16 +39,22 @@ server {
         try_files /index.html =404;
     }
 
+    # в путях сторожа 502/503/504 от самого nginx (сторож умер или завис) — своя страница,
+    # код сохраняется; ответы сторожа (503 до первого снимка) проходят как есть.
+    # Только здесь: у других будущих путей своя беда, не «Сторож не отвечает»
     location = /status {
+        error_page 502 503 504 /watchdog-down.html;
         proxy_pass http://$pcbk_watchdog;
     }
 
     location = /status.js {
+        error_page 502 503 504 /watchdog-down.html;
         proxy_pass http://$pcbk_watchdog;
     }
 
     location = /status.json {
         access_log off;   # открытая страница опрашивает каждые 5 с
+        error_page 502 503 504 /watchdog-down.html;
         proxy_pass http://$pcbk_watchdog;
     }
 
