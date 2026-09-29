@@ -1,0 +1,6 @@
+# Серверный слой pcbk-core: только точные версии; lock с хешами —
+# uv pip compile core/requirements.in --python-version 3.12 --generate-hashes -o core/requirements.lock
+python-tds==1.17.1
+mcp==1.30.0  # последний 1.x: 2.x — другой API (FastMCP → MCPServer), переход отдельной задачей
+fastapi==0.142.0
+uvicorn==0.54.0

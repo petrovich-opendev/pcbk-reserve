@@ -1,0 +1,11 @@
+[project]
+name = "pcbk-core"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+# uv run не создаёт здесь .venv и uv.lock
+[tool.uv]
+managed = false

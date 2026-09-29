@@ -1,0 +1,5 @@
+# в образ — только lock и пакет, без тестов и кэшей хоста
+*
+!requirements.lock
+!pcbk_core/
+**/__pycache__
