@@ -29,58 +29,75 @@ SQLite; pydantic.
 (§3 п. 3, §4, §9 «Успех 2», «Успех 4»); [`docs/research/05-d3-historian-facts.md`](../research/05-d3-historian-facts.md)
 (рекомендации 2, 6–8, 10, 11); первая половина —
 [`PLAN-D3a-data-service-2026-10-01.md`](PLAN-D3a-data-service-2026-10-01.md) —
-её имена, Global Constraints и Ruling 1–5 действуют здесь; формат и `stack` —
-планы Д1 и Д2.
+её имена, Global Constraints и решения Д3а-R1…R5 действуют здесь; решения
+этого плана пронумерованы дальше — Д3б-R6…R10. Формат и `stack` — планы Д1
+и Д2; поток `/event` OpenCode и `edge` — [`docs/research/07-gateway-whitelist.md`](../research/07-gateway-whitelist.md)
+(для Д5).
 
 **Предпосылка.** Д3а влит в `main` с тегом `platform-d3a`; ветка дня —
 `d3b/tag-answers`.
 
 **Влезает ли в день — оценка по часам.** Задачи последовательны; в часы задач
-с кодом входят 15 минут ревью и правок.
+с кодом входят 15 минут ревью и правок. Шкала — плановая, по ставкам Д1 и Д2,
+без сжатия.
 
 | Задача | Часы | Где |
 |---|---|---|
 | 0. Хвосты Д3а (второй раунд критика, чистый клон — по черте Д3а) | 0–0,5 | — |
-| 1. Эталон сверки и проба: запросы 7–15, режим `verify` | 1,25 | локально, сервер — **нужен владелец** |
+| 1. Эталон сверки и проба: запросы 7–15, режим `verify` | 1,75 | локально, сервер — **нужен владелец** |
 | 2. Шаблоны с датами и периоды | 0,75 | локально |
 | 3. Охрана выхода, токены, бюджет, кэш, single-flight | 1 | локально |
 | 4. Разбор имён, поиск и журнал событий | 1 | локально |
-| 5. Инструменты и HTTP | 1,5 | локально |
+| 5. Инструменты и HTTP | 2 | локально |
 | 6. MCP | 0,75 | локально |
-| 7. Компоновка и выкладка | 1 | локально, сервер |
+| 7. Компоновка и выкладка | 1,5 | локально, сервер |
 | 8. Живые проверки | 1 | сервер, **нужен владелец** |
+| 8а. Перевыкладка по `AVG_KIND`, если сверка подтвердила другой вид (условно) | (0,5) | локально, сервер |
 | 9. Закрытие дня | 1,25 | — |
-| **Критический путь** | **9,5** (с хвостами Д3а — до 10) | |
+| **Критический путь по плановой шкале** | **11,0** (с хвостами Д3а и 8а — до 12) | |
 
-**Черта отсечения — конец седьмого часа.** К ней зелёны задачи 1–6 (по оценке
-— 6,25 ч). После черты порядок жёсткий: задача 7, задача 8, задача 9. **В Д4
-ничего не переносится:** Д4 начинается после тега `platform-d3b`.
+**Принятое основание «один день»** — то же, что в Д3а: живой темп Д1 (план в
+9,5 ч по этой шкале выполнен примерно за 2 ч 20 мин по часам, с субагентами).
+Плановая шкала остаётся честной, а день укладывается в рабочий день по живому
+темпу. Если темп Д3а оказался вдвое медленнее Д1 или хуже, план Д3б
+пересчитывается до его начала, и владелец получает строку с числами — или его
+явное «да» на день длиннее.
+
+**Черта отсечения — конец восьмого часа** плюс время хвостов Д3а. К ней зелёны
+задачи 1–6 (по оценке — 7,25 ч). После черты порядок жёсткий: задача 7,
+задача 8, при нужде 8а, задача 9. **В Д4 ничего не переносится:** Д4
+начинается после тега `platform-d3b`.
 - **Задача 5 или 6 не зелёна к черте.** Незелёная задача доделывается в тот же
-  день сверх оценки. Если к девятому часу её всё ещё нет — выкладки нет, а
+  день сверх оценки. Если к десятому часу её всё ещё нет — выкладки нет, а
   владельцу в тот же час уходит строка: Д3б кончится завтрашним утром, Д4
   сдвигается на полдня. Решение о сдвиге — его.
 - **Утром нет владельца.** Задачи 2–6 идут первыми; проба (задача 1, шаги 5–6)
   — когда он появится. Вечерние шаги 3–6 задачи 8 без него не делаются;
   тогда владельцу — строка о сдвиге, как выше.
-- **Сверка не подтвердила вид среднего** (задача 8, шаг 4). Правка одной
-  константы, перевыкладка и повтор шагов 3–4 — до 0,5 ч в пределах задачи 8.
+- **Сверка подтвердила другой вид среднего** (задача 8, шаг 4) — строка 8а:
+  правка одной константы, перевыкладка, повтор шагов 3–4 задачи 8.
 
 ## Global Constraints
 
 Действуют Global Constraints Д3а целиком. Д3б добавляет:
 
-- **Охрана выхода в процессе** (Ruling 1) ставится при старте службы и
-  построителя. Список разрешённого: историан (`BDRV_HOST:BDRV_PORT`) и петля;
+- **Проверка на секреты** перед каждым коммитом задач 1, 7, 8, 9 — тем же
+  `git diff --cached … | grep -E -i -f <шаблоны>`.
+- **Охрана выхода в процессе** (Д3б-R6) ставится при старте службы и
+  построителя. Список разрешённого: историан (`BDRV_HOST` на `BDRV_PORT`, а
+  если порт не задан из-за экземпляра — на любом TCP-порту) и петля.
   OpenRouter добавит Д4.
 - **Токены:** хеши sha256 в `${SECRETS_DIR}/core-tokens`; сами токены — файлы
-  `<id>.data-token` только на сервере. В Д3б есть только `ops.data-token`,
-  токены `student-NN.data-token` заводит Д4. В `.gitignore` — `core-tokens` и
-  `*.data-token`.
+  `<id>.data-token` только на сервере, по 48 шестнадцатеричных знаков
+  (`openssl rand -hex 24`) — их ловит шаблон проверки Д2. В Д3б есть только
+  `ops.data-token`, токены `student-NN.data-token` заводит Д4. В `.gitignore`
+  — `core-tokens` и `*.data-token`.
 - **Контракт:**
   - не больше 16 тегов, окно не длиннее 31 суток, до 288 точек (Д9), до 24
     тего-суток (для одного тега — 31); окно короче часа считается за час;
   - 60 вызовов за 5 минут на вызывающего;
-  - строка тега — не длиннее 128 знаков, тело запроса — не больше 64 КиБ.
+  - строка тега — не длиннее 128 знаков, тело запроса — не больше 64 КиБ
+    (считаются прочитанные байты, и тело без длины тоже).
 - **Кэш:** закрытый период (конец старше 300 с) — 3600 с, открытый — 30 с,
   текущие значения — 15 с; «сейчас» — вниз до 30 с; до 256 записей, при
   переполнении уходит четверть с самым ранним сроком; single-flight. Ошибки и
@@ -89,15 +106,21 @@ SQLite; pydantic.
   допущение смен, качество, возраст, доля достоверных. «Нет тега», «нет
   данных», «не в белом списке», «дискретный» — разными словами.
 - **Событие на каждый вызов**, включая отказы, неверные аргументы (HTTP 422,
-  проверка аргументов MCP) и служебные опросы. В событии — `requested` (сырой
-  ввод) и `sent` (имена из выполненного SQL, их возвращают ворота). 401 и 413
-  пишутся строкой журнала без токена.
-- **MCP:** `mcp==1.30.0`, инструменты возвращают `dict[str, Any]`, режим
-  stateless с ответом JSON, путь ровно `/mcp`.
+  любые ошибки аргументов MCP), неожиданные исключения (`outcome=error`) и
+  служебные опросы. В событии — `requested` (сырой ввод), `tags`
+  (канонические имена после разбора) и `sent` (имена из выполненного SQL, их
+  возвращают ворота — и при ошибке после отправки). 401 и 413 пишутся
+  строкой журнала без токена.
+- **Крючки уровня приложения** (обработчик 422, ограничитель тела) ставятся
+  только через `Role.install(app)` из Д3а; `app.py` в Д3б не меняется.
+- **MCP:** `mcp==1.30.0`, `FastMCP(..., log_level="WARNING")`, инструменты
+  возвращают `dict[str, Any]`, режим stateless с ответом JSON, точный маршрут
+  `/mcp`. Аннотации аргументов свободные, их тип проверяет служба теми же
+  моделями, что HTTP.
 
 ## Решения по умолчанию (Ruling)
 
-**Ruling 1 — охрана выхода.** Аудит-хук Python на события:
+**Д3б-R6 — охрана выхода.** Аудит-хук Python на события:
 - `socket.connect`: адрес вне списка → `EgressDenied` до системного вызова.
   Имя хоста в кортеже разрешается через кэш, и проверяется каждый адрес; не
   разрешилось — отказ;
@@ -116,16 +139,20 @@ SQLite; pydantic.
 Закрывается правилами `DOCKER-USER` — предложение владельцу на Д12, с его
 `sudo`.
 
-**Ruling 2 — журнал доказывает белый список.** Ворота Д3а извлекают литералы
-из каждого выполненного SQL и возвращают их (`GateResult.sent`). Имя вне белого
-списка ворота не пускают в SQL и считают в `refused_unlisted`. В событии —
-`requested` и `sent`. Служебные вызовы пишутся с `caller="system"`,
-`channel="system"`; у каталога и полного снимка `Live` `sent` пуст, а
-`summary` — «без имён». Живая проверка сравнивает `sent` всех событий с
-`whitelist.txt` и делает отрицательный контроль: существующее имя вне списка и
-строка-инъекция.
+**Д3б-R7 — журнал доказывает белый список.**
+- Ворота Д3а пускают в SQL только литералы-имена из `TagName IN (…)` белого
+  списка; Д3б добавляет даты по `DATE_FMT` и закрытый набор ww-значений. Имена
+  из выполненного SQL они возвращают (`GateResult.sent`, а при ошибке —
+  `HistorianError.sent`).
+- Чужое имя и шаблон с `TagName = '…'` ворота не пускают и считают в
+  `refused_unlisted`.
+- В событии — `requested`, `tags` и `sent`. Служебные вызовы пишутся с
+  `caller="system"`, `channel="system"`; у каталога и полного снимка `Live`
+  `sent` пуст, а `summary` — «без имён».
+- Живая проверка сравнивает `sent` всех событий с `whitelist.txt` и делает
+  отрицательный контроль: существующее имя вне списка и строка-инъекция.
 
-**Ruling 3 — вид среднего и σ** (О2; тип интерполяции задаётся и на уровне
+**Д3б-R8 — вид среднего и σ** (О2; тип интерполяции задаётся и на уровне
 тега):
 1. Проба пробует сводку с `wwInterpolationType = 'STAIRSTEP'` (равенство, не
    `IN`). Если провайдер параметр принял, а `Average` совпал со средним по
@@ -139,14 +166,14 @@ SQLite; pydantic.
 **Цена ошибки:** неверное «взвешено по времени» в ответе. Ловит его вечерняя
 сверка, которая печатает различимость.
 
-**Ruling 4 — мёртвые теги.**
+**Д3б-R9 — мёртвые теги.**
 - Строка `Live` с `Value IS NULL` → `no_value` («нет текущего значения»),
   время и качество сохраняются.
 - Строка сводки, где `Average`, `Minimum` или `Maximum` — `NULL` или
   `PercentGood == 0`, → `no_data` («за период данных нет»).
 - Нет строки — то же.
 
-**Ruling 5 — прочее.**
+**Д3б-R10 — прочее.**
 - Дискретный тег в `tag_period` → отказ по тегу со словами «наработка — в
   следующих слайсах».
 - Имя агента в событии — `NULL`, решается в Д5 или Д7.
@@ -154,28 +181,38 @@ SQLite; pydantic.
   он совпал с `Delta`.
 - Метаданные тегов вне белого списка (описание, единица, шкала) в ответах не
   появляются.
-- Пределы аргументов MCP проверяет служба: схема сообщает `maxItems` модели,
-  а отказ идёт событием с русским текстом.
+- Аргументы MCP проверяет служба: схема сообщает типы и `maxItems` модели,
+  а любой отказ (строка вместо списка, нет тегов, неизвестный период, 17
+  тегов) идёт событием с русским текстом.
 - `GET /mcp` → 405: клиент TS SDK понимает это как «поток не поддерживается».
+- Сервер MCP строится один раз, в конструкторе роли; `session_manager.run()`
+  идёт один раз, в `lifespan()` роли.
 
 ## Review Focus
 
 1. **Мёртвый тег белого списка приходит строкой с `NULL`.** Ожидание:
    `no_value` / `no_data`, а не `ok` со значением `null`. Тесты — задача 5,
    `test_tag_now_null_value_is_no_value`, `test_tag_period_null_row_is_no_data`.
-2. **Журнал пишет, что ушло в SQL, а не что прошло проверку.** Иначе проверка
-   «успеха 4» тавтологична. Тесты — задача 5, `test_events_requested_vs_sent`;
-   задача 4, `test_freshness_poll_writes_sent`.
-3. **Отказ случился до кода службы** — 422 по HTTP, 17 тегов по MCP, 401.
-   Ожидание: событие `refused` (или строка журнала для 401) с русским текстом.
-   Тесты — задача 5, `test_http_422_is_refused_event`, `test_401_is_logged`;
-   задача 6, `test_mcp_17_tags_is_refused_event`.
-4. **Журнал событий перестал писаться** (диск полон). Ожидание: инструмент
-   отвечает, а строка «Служба данных» красная — «журнал событий не пишется».
-   Тест — задача 4, `test_events_disk_full_turns_health_red`.
-5. **Смена через полночь и смена, которая только началась.** Ожидание: 22:00–06:00
-   и отказ словами «период короче минуты». Тесты — задача 2,
-   `test_shift_presets_cross_midnight`, `test_period_shorter_than_minute_refused`.
+2. **Журнал пишет, что ушло в SQL, а не что прошло проверку**, — и при сбое
+   после отправки. Иначе проверка «успеха 4» тавтологична. Тесты — задача 5,
+   `test_events_requested_vs_sent`, `test_timeout_event_keeps_sent`; задача 4,
+   `test_freshness_poll_writes_sent`.
+3. **Отказ случился до кода службы:** строка вместо списка или 17 тегов по MCP,
+   422 и битый JSON без токена по HTTP, тело без длины больше 64 КиБ.
+   Ожидание: событие `refused` с русским текстом; без токена — 401 и строка
+   журнала, без события; 413 — строкой журнала. Тесты — задача 6,
+   `test_mcp_bad_arg_types_are_refused_events`; задача 5,
+   `test_http_422_is_refused_event`, `test_bad_json_without_token_is_401`,
+   `test_chunked_body_over_limit_is_413`.
+4. **Журнал событий не пишется** — диск полон или свежий том принадлежит root.
+   Ожидание: инструмент отвечает, строка «Служба данных» красная — «журнал
+   событий не пишется»; на выкладке том пишется от uid 10003. Тесты — задача
+   4, `test_events_disk_full_turns_health_red`; задача 5,
+   `test_tool_answers_when_events_fail`; задача 7,
+   `test_core_state_volume_writable`.
+5. **MCP не ломает роль и чужие пути:** роль без приложения запускается, MCP
+   строится один раз, `/mcp` — точный маршрут, Host `core:8000` проходит.
+   Тесты — задача 6, `test_lifespan_without_app_runs`, `test_mcp_auth_host_and_get`.
 
 ---
 
@@ -188,24 +225,26 @@ core/pcbk_core/egress.py              охрана выхода (аудит-ху
 core/pcbk_core/secrets.py             + TokenTable
 core/pcbk_core/settings.py            + TOKENS_FILE, DB_PATH
 core/pcbk_core/main.py                + охрана выхода, токены
-core/pcbk_core/data/sql.py            + DATE_FMT, PIN_INTERPOLATION, SUMMARY_COLUMNS, HAS_LAST, lit_dt, summary_sql
-core/pcbk_core/data/periods.py        готовые периоды и смены
+core/pcbk_core/data/sql.py            + DATE_FMT, PIN_INTERPOLATION, SUMMARY_COLUMNS, HAS_LAST, lit_dt, summary_sql, allowed_literal
+core/pcbk_core/data/periods.py        round_now, готовые периоды и смены
 core/pcbk_core/data/budget.py         Limits, cost_tag_days, check_budget
-core/pcbk_core/data/cache.py          TTLCache, SingleFlight, round_now, ttl_for, cache_key
+core/pcbk_core/data/cache.py          TTLCache, SingleFlight, ttl_for, cache_key (round_now — из periods)
 core/pcbk_core/data/catalog.py        + lookup, search, похожие
 core/pcbk_core/data/events.py         CallEvent, EventLog
 core/pcbk_core/data/service.py        DataService: три инструмента
 core/pcbk_core/data/http_api.py       POST /api/data/{tool}; 422, 401, 413
 core/pcbk_core/data/mcp_server.py     MCP Streamable HTTP
-core/pcbk_core/data/__init__.py       DataRole: + события, служба, роутер, MCP
+core/pcbk_core/data/__init__.py       DataRole: + события, служба, роутер, install, MCP
+core/pcbk_core/data/gate.py           + clear_pause; ворота пускают даты и ww-значения через allowed_literal
 core/pcbk_core/data/build_whitelist.py  + охрана выхода
+core/Dockerfile                       + каталог /var/lib/pcbk-core от uid 10003
 compose.yaml                          core :d3b, секрет core-tokens, том pcbk-core-data
 .gitignore                            + core-tokens, *.data-token
 deploy/README.md                      + токены, журнал событий, MCP
 tests/integration/conftest.py         + тестовый токен; http_host(..., token=)
 tests/integration/test_core.py        + вызовы через egress, 401, журнал
 tests/integration/test_edge.py        IMAGES: core :d3b
-docs/checks/D3b.md, docs/checks/D3b/*.png
+docs/checks/D3b.md, docs/checks/D3b/*.png  журнал и снимок страницы после выкладки
 ```
 
 Имена: образ `pcbk-reserve/core:d3b`; том `pcbk-core-data` →
@@ -219,7 +258,7 @@ docs/checks/D3b.md, docs/checks/D3b/*.png
 - [ ] **Step 1:** Всё, что черта Д3а перенесла сюда: второй раунд критика
   (тогда слияние и тег `platform-d3a` — после него), проверка чистым клоном,
   факты о сети выхода (задача 9 Д3а, шаг 5 — тогда они делаются в задаче 8,
-  шаг 7). Expected: у каждого хвоста вердикт в `docs/checks/D3a.md`; ветка Д3б
+  шаг 6). Expected: у каждого хвоста вердикт в `docs/checks/D3a.md`; ветка Д3б
   — от `main` после тега.
 
 ---
@@ -229,7 +268,9 @@ docs/checks/D3b.md, docs/checks/D3b/*.png
 **Нужен владелец:** шаг 6 читает производственные данные. Проба закрывает О4
 (формат даты) и О2 (столбцы сводки, вид среднего и σ, интерполяция). Кроме
 того, она выбирает тег для вечерней сверки и имя для отрицательного контроля.
-Эталон `delta_stats` — в репозитории с тестами. Скрипт пробы — в `$JOB`.
+Эталон `delta_stats` — в репозитории с тестами. Скрипт пробы `probe_b.py` —
+самостоятельный, в `$JOB` этой сессии: на исходники пробы Д3а он не
+опирается.
 
 **Files:**
 - Create: `core/verify/delta_stats.py`, `core/verify/test_delta_stats.py`, `docs/checks/D3b.md`
@@ -297,11 +338,15 @@ Expected: FAIL — `ModuleNotFoundError: delta_stats`
 
 - [ ] **Step 4: Run tests to verify they pass** — та же команда. Expected: PASS (4 теста).
 
-- [ ] **Step 5: Пробный образ `pcbk-probe/tds:d3b` (в `$JOB/probe/`)**
+- [ ] **Step 5: Пробный образ `pcbk-probe/tds:d3b` (в `$JOB/probe-b/`)**
 
-Образ Д3а плюс копия `core/verify/delta_stats.py`. `probe.py` дополняется
-режимами:
-- правила Д3а в силе: печатаются только агрегаты, имён и значений нет;
+`FROM pcbk-probe/tds:1.17.1` — образ Д3а с python-tds; он есть локально и на
+сервере. Сверху — копия `core/verify/delta_stats.py` и самостоятельный
+`probe_b.py` с режимами `morning-b` и `verify`,
+`ENTRYPOINT ["python", "/app/probe_b.py"]`. Правила:
+- учётные данные — из `/run/secrets/bdrv.env` (разбор как у `read_env_file`),
+  соединение — как у службы;
+- печатаются только агрегаты, имён и значений нет;
 - литерал даты — собственная функция пробы, не `sql.py`;
 - окно — последний полный час по `GETDATE()`; если сегодня день равен месяцу
   (10.10), — тот же час вчера: такой день форматы не различает.
@@ -320,12 +365,13 @@ Expected: FAIL — `ModuleNotFoundError: delta_stats`
 `AND wwCycleCount = 200000`, и печатает:
 - `bounds`: 06/14/22, длина 8 ч, пояс ответа равен своему;
 - `d` и `gap` к трём средним и двум σ;
-- вид: «подтверждён <вид>», только если `d ≥ 0,01` и расхождение с ним хотя бы
-  в 10 раз меньше, чем со вторым; иначе «вид не различим на этом теге» или
-  «не сошёлся»;
+- вид: «подтверждён <вид>», только если `d ≥ 0,01`, расхождение с ним не
+  больше `1e-3` и хотя бы в 10 раз меньше, чем со вторым; иначе «вид не
+  различим на этом теге» или «не сошёлся»;
 - `min`, `max` (`gap ≤ 1e-9`);
 - `last`, если поле есть;
-- `rows`: порядок числа строк и «обрезано», если их 200000.
+- `rows`: порядок числа строк и «обрезано», если их 200000;
+- `outside`: число строк `Delta` вне `[start, end]` — ожидание 0.
 
 - [ ] **Step 6: Проба `morning-b` (при владельце)**
 
@@ -357,9 +403,10 @@ Expected: вердикты и таблица с принятыми значен�
 ### Task 2: Шаблоны с датами и периоды
 
 **Files:**
-- Modify: `core/pcbk_core/data/sql.py`, `core/tests/fakes.py` (сводка)
+- Modify: `core/pcbk_core/data/sql.py`, `core/pcbk_core/data/__init__.py`
+  (ворота получают `literal_ok=allowed_literal`), `core/tests/fakes.py` (сводка)
 - Create: `core/pcbk_core/data/periods.py`
-- Test: `core/tests/test_sql.py` (+3), `core/tests/test_periods.py`
+- Test: `core/tests/test_sql.py` (+3), `core/tests/test_gate.py` (+1), `core/tests/test_periods.py`
 
 **Interfaces:**
 - Consumes: `lit_name`, `names_in`, `SAFE_NAME`, `MAX_NAMES` — Д3а; решения
@@ -373,6 +420,10 @@ Expected: вердикты и таблица с принятыми значен�
   - `summary_sql(names, start, end) -> str` =
     `SELECT TagName, <SUMMARY_COLUMNS> FROM AnalogSummaryHistory WHERE TagName IN (…) AND StartDateTime >= <lit_dt> AND EndDateTime <= <lit_dt> AND wwCycleCount = 1`,
     плюс `AND wwInterpolationType = '<PIN_INTERPOLATION>'`, если задан
+  - `WW_CONSTANTS = frozenset({"STAIRSTEP"})`;
+    `allowed_literal(text: str) -> bool` — дата по `DATE_FMT` или значение из
+    `WW_CONSTANTS`. `DataRole` передаёт её воротам как `literal_ok`; прочие
+    литералы по-прежнему должны быть именами из `TagName IN (…)`
 - Produces (`periods.py`):
   - `round_now(now: datetime) -> datetime` — вниз до 30 с (ею же пользуется
     кэш задачи 3);
@@ -406,6 +457,18 @@ def test_summary_template_rules():
     assert ("wwInterpolationType = 'STAIRSTEP'" in s) is (PIN_INTERPOLATION == "STAIRSTEP")
     assert "wwResolution" not in s and names_in(s) == ("20FAKE_001_PV",)
 
+def test_allowed_literals():
+    assert allowed_literal(lit_dt(T6).strip("'")) and allowed_literal("STAIRSTEP")
+    assert not allowed_literal("16FAKE_009_PV") and not allowed_literal("Delta")
+
+# core/tests/test_gate.py (+)
+@pytest.mark.anyio
+async def test_gate_passes_summary_literals_only():
+    g = HistorianGate(FakeHistorian(), allowed=WHITELIST, literal_ok=allowed_literal)
+    assert (await g.run([summary_sql(["20FAKE_001_PV"], T6, T14)])).sent == ("20FAKE_001_PV",)
+    with pytest.raises(GateRefused):
+        await g.run(["SELECT TagName FROM AnalogHistory WHERE TagName = '20FAKE_001_PV' AND wwRetrievalMode = 'Delta'"])
+
 def test_date_literal():
     want = {"%Y%m%d %H:%M:%S.000": "'20261001 06:00:00.000'",
             "%Y-%m-%d %H:%M:%S.000": "'2026-10-01 06:00:00.000'"}[DATE_FMT]
@@ -426,14 +489,14 @@ def test_presets_basic():
     assert (p(preset="yesterday").start, p(preset="today").start) == (datetime(2026, 9, 30), datetime(2026, 10, 1))
     assert p(preset="prev_shift").shift_assumed and not p(preset="last_hour").shift_assumed
 
-def test_shift_presets_cross_midnight():                                        # Review Focus 5
+def test_shift_presets_cross_midnight():
     at = lambda h, m, preset: p(now=datetime(2026, 10, 1, h, m), preset=preset)
     assert (at(5, 59, "current_shift").start, at(5, 59, "prev_shift").start, at(5, 59, "prev_shift").end) == \
            (datetime(2026, 9, 30, 22), datetime(2026, 9, 30, 14), datetime(2026, 9, 30, 22))
     assert (at(23, 10, "current_shift").start, at(6, 10, "prev_shift").start) == \
            (datetime(2026, 10, 1, 22), datetime(2026, 9, 30, 22))
 
-def test_period_shorter_than_minute_refused():                                  # Review Focus 5
+def test_period_shorter_than_minute_refused():
     with pytest.raises(PeriodError, match="короче минуты"):
         p(now=datetime(2026, 10, 1, 6, 0, 20), preset="current_shift")
 
@@ -476,7 +539,9 @@ def test_bad_periods(kw):
 - Consumes: `SlidingWindow` — Д3а; `BdrvConfig`.
 - Produces:
   - `class EgressDenied(PermissionError)`;
-    `install_egress_guard(allowed: Sequence[tuple[str, int]], allowed_nets: Sequence[str] = ("127.0.0.0/8", "::1/128")) -> None`:
+    `install_egress_guard(allowed: Sequence[tuple[str, int | None]], allowed_nets: Sequence[str] = ("127.0.0.0/8", "::1/128")) -> None`
+    — порт `None` значит «любой TCP-порт этого хоста» (адрес с экземпляром,
+    Д3а):
     - `sys.addaudithook`; повторная установка → `RuntimeError`;
     - `socket.connect` (AF_INET/AF_INET6): имя хоста в кортеже разрешается
       через кэш (повтор при промахе — не чаще раза в 60 с), проверяется
@@ -485,7 +550,7 @@ def test_bad_periods(kw):
     - `subprocess.Popen`, `os.system`, `os.exec`, `os.posix_spawn`,
       `ctypes.dlopen` → `PermissionError("запуск процессов и нативный код запрещены")`;
     - `egress_guard_installed() -> bool`.
-  - `main`: после `setup_logging` — `install_egress_guard([(cfg.host, cfg.port)])` и строка
+  - `main`: после `setup_logging` — `install_egress_guard([(cfg.host.split("\\")[0], cfg.port)])` и строка
     журнала «охрана выхода: разрешено 1 направление»; то же в `build_whitelist.main`.
   - `class TokenTable`: `from_file(path) -> TokenTable`;
     `caller(bearer: str | None) -> str | None`; `ids: frozenset[str]`. Строка
@@ -643,16 +708,21 @@ async def test_single_flight_shares_and_clears_on_error():
 - Produces (`events.py`):
   - `Outcome = Literal["ok", "partial", "refused", "budget", "rate", "busy", "timeout", "unavailable", "error"]`;
     `Channel = Literal["mcp", "http", "system"]`; `CacheState = Literal["hit", "miss", "shared", "none"]`
-  - `@dataclass(frozen=True) class CallEvent: ts: datetime; caller: str; agent: str | None; channel: Channel; tool: str; requested: tuple[str, ...]; sent: tuple[str, ...]; start: datetime | None; end: datetime | None; outcome: Outcome; summary: str; cost: float; cache: CacheState; rows: int; duration_ms: int` —
-    `requested` обрезается до 16 строк по 128 знаков
+  - `@dataclass(frozen=True) class CallEvent: ts: datetime; caller: str; agent: str | None; channel: Channel; tool: str; requested: tuple[str, ...]; tags: tuple[str, ...]; sent: tuple[str, ...]; start: datetime | None; end: datetime | None; outcome: Outcome; summary: str; cost: float; cache: CacheState; rows: int; duration_ms: int`:
+    `requested` — сырой ввод, обрезается до 16 строк по 128 знаков; `tags` —
+    канонические имена после разбора со статусами `ok`, `no_value`,
+    `no_data` (их слой событий мнемосхем М4 ставит «у своего тега»; есть и
+    у попадания в кэш); `sent` — имена из выполненного SQL
   - `class EventLog`:
-    - `__init__(self, path: str)` — SQLite (WAL, включается при открытии),
-      таблица `agent_events` (`requested`, `sent` — JSON);
+    - `__init__(self, path: str)` — SQLite; соединение открывается на каждую
+      операцию, как журнал сторожа Д1: из потоков TestClient и uvicorn нет
+      ошибки `check_same_thread`. WAL включается при создании; таблица
+      `agent_events` (`requested`, `tags`, `sent` — JSON);
     - `write(self, e: CallEvent) -> None` — при ошибке `consecutive_failures += 1`,
       `last_error = <класс и текст>`, исключение дальше; удача сбрасывает
       счётчик;
-    - `writable(self) -> bool` — проба как у журнала сторожа Д1:
-      `BEGIN IMMEDIATE`, `INSERT`, `ROLLBACK`;
+    - `writable(self) -> bool` — на новом соединении, как у журнала сторожа
+      Д1: `BEGIN IMMEDIATE`, `INSERT`, `ROLLBACK`;
     - `recent(self, limit: int = 50) -> list[CallEvent]` — новые сверху.
 - `DataRole` (правки):
   - конструктор получает `tokens: TokenTable | None = None`; поле
@@ -688,7 +758,8 @@ def test_search_words_yo_all_words_and_similar(cat):
 
 # core/tests/test_events.py
 E = CallEvent(ts=datetime(2026, 10, 1, 7, tzinfo=timezone.utc), caller="student-01", agent=None, channel="http",
-              tool="tag_now", requested=("20FAKE_001_PV", "X' OR 1=1--"), sent=("20FAKE_001_PV",),
+              tool="tag_now", requested=("20FAKE_001_PV", "X' OR 1=1--"), tags=("20FAKE_001_PV",),
+              sent=("20FAKE_001_PV",),
               start=None, end=None, outcome="partial", summary="…", cost=0.0, cache="miss", rows=1, duration_ms=12)
 
 def test_event_roundtrip_newest_first(tmp_path):
@@ -724,8 +795,9 @@ def test_events_disk_full_turns_health_red(monkeypatch):                       #
 ```
 
 `_insert` — внутренний метод `EventLog`, которым пользуется `write`; тест
-подменяет его, `write` остаётся настоящим. `make_role` ставит `DB_PATH` во
-временный каталог.
+подменяет его, `write` остаётся настоящим. `make_role` получает `db_dir`
+(по умолчанию — новый временный каталог) для `DB_PATH` и тестовый
+`TokenTable` с токеном `student-01`.
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_catalog.py tests/test_events.py tests/test_role.py`. Expected: FAIL.
 
@@ -741,8 +813,8 @@ def test_events_disk_full_turns_health_red(monkeypatch):                       #
 
 **Files:**
 - Create: `core/pcbk_core/data/service.py`, `core/pcbk_core/data/http_api.py`
-- Modify: `core/pcbk_core/data/__init__.py` (`DataRole.service`, `router`),
-  `core/pcbk_core/data/gate.py` (`clear_pause`),
+- Modify: `core/pcbk_core/data/__init__.py` (`DataRole.service`, `router`,
+  `install` — обработчик 422 и ограничитель тела), `core/pcbk_core/data/gate.py` (`clear_pause`),
   `core/pcbk_core/main.py` (`build_roles` с `TokenTable`), `core/tests/helpers.py`
   (`make_service`, `make_app`, `TOKEN`, `sent_of`)
 - Test: `core/tests/test_service.py`, `core/tests/test_http.py`
@@ -786,10 +858,20 @@ def test_events_disk_full_turns_health_red(monkeypatch):                       #
     6. кэш → single-flight → ворота;
     7. сборка ответа → кэш → событие → строка журнала.
 
-    **Любой отказ до ворот не шлёт SQL.** Событие пишется на каждый вызов, с
-    `requested` (сырой ввод) и `sent` (из `GateResult`; у попадания в кэш и
-    у ожидающего single-flight — пусто). Ошибка записи события ответ не
-    ломает. Строка журнала —
+    «Сейчас историана» — `role.clock.local` плюс прошедшее по `monotonic` с
+    `role.clock_mono`; опрос свежести обновляет их раз в 30 с, отдельный
+    `[clock_sql()]` идёт, только если часы старше 300 с.
+
+    **Любой отказ до ворот не шлёт SQL.** Событие пишется на каждый вызов:
+    - `requested` — сырой ввод;
+    - `tags` — канонические имена со статусами `ok`/`no_value`/`no_data`, в
+      том числе при попадании в кэш;
+    - `sent` — из `GateResult` или `HistorianError.sent`: и при сроке или сбое
+      после отправки; у попадания в кэш и у ожидающего single-flight — пусто.
+
+    Неожиданное исключение в инструменте → ответ `status: error`, событие
+    `outcome=error` и строка журнала с классом ошибки. Ошибка записи события
+    ответ не ломает. Строка журнала —
     `tool=… caller=… channel=… tags=N period=…..… cost=0.333 cache=miss rows=N ms=N outcome=ok`,
     без значений.
   - Контракт ответов (JSON: только str, float, int, bool, null, списки,
@@ -841,12 +923,20 @@ def test_events_disk_full_turns_health_red(monkeypatch):                       #
       `Authorization: Bearer` → вызывающий;
     - нет или неверный токен → `401 {"detail": "нужен токен"}` и строка
       журнала `outcome=unauthorized channel=http path=…` (без токена);
-    - ответ инструмента — `200`;
-    - `RequestValidationError` на `/api/data/*` → `422` с телом
-      `service.refuse_args(...)` (русская причина: поля и короткий текст) и
-      событием;
-  - промежуточное звено приложения: тело больше 64 КиБ → `413` и строка
-    журнала; стоит на всём приложении, в том числе на `/mcp`
+    - ответ инструмента — `200`.
+  - `DataRole.install(app)` — единственное место крючков уровня приложения
+    (протокол `Role` из Д3а; `app.py` не меняется):
+    - `app.add_exception_handler(RequestValidationError, …)`: для путей
+      `/api/data/*` сначала проверяется токен — нет или неверный → `401` и
+      строка журнала, без события (битый JSON без токена не пишет мусор в
+      журнал). С токеном → `422` с телом `service.refuse_args(...)` (русская
+      причина: поля и короткий текст) и событием. Прочие пути — обработчик
+      FastAPI по умолчанию;
+    - `app.add_middleware(BodyLimit, max_bytes=65536)` — чистое ASGI-звено.
+      Оно считает прочитанные из `receive` байты, поэтому ловит и тело без
+      `Content-Length`. Больше предела → `413` и строка журнала
+      `outcome=too_large path=…`; стоит на всём приложении, в том числе на
+      `/mcp`.
   - `DataRole.router()` — роутер Д3а плюс `data_router`;
     `main.build_roles` передаёт `TokenTable.from_file(TOKENS_FILE)`
 
@@ -953,6 +1043,33 @@ async def test_historian_errors_are_named(svc):
         assert (r["status"], r["message"]) == ("unavailable", want)
         s.role.gate.clear_pause()          # сброс паузы и защёлки между случаями
 
+async def test_timeout_event_keeps_sent(svc):                                   # Review Focus 2
+    s, fake = svc
+    fake.fail = HistorianError("timeout", "долго")      # ворота добавят sent — SQL уже ушёл
+    r = await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    e = s.role.events.recent()[0]
+    assert (r["status"], e.outcome, e.sent) == ("timeout", "timeout", ("20FAKE_001_PV",))
+
+async def test_cache_hit_event_has_tags(svc):
+    s, _ = svc
+    await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    await s.tag_now("student-02", "http", ["20fake_001_pv"])
+    e = s.role.events.recent()[0]
+    assert (e.cache, e.tags, e.sent) == ("hit", ("20FAKE_001_PV",), ())
+
+async def test_unexpected_error_is_error_event(svc):
+    s, fake = svc
+    fake.fail = RuntimeError("boom")
+    r = await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert r["status"] == "error" and s.role.events.recent()[0].outcome == "error"
+
+async def test_tool_answers_when_events_fail(svc, monkeypatch):                 # Review Focus 4
+    s, _ = svc
+    def full(e): raise sqlite3.OperationalError("database or disk is full")
+    monkeypatch.setattr(s.role.events, "_insert", full)
+    assert (await s.tag_now("student-01", "http", ["20FAKE_001_PV"]))["status"] == "ok"
+    assert s.role.health()[0] is False
+
 async def test_call_log_line_without_values(svc, capfd):
     s, _ = svc
     await s.tag_period("student-01", "http", ["20FAKE_001_PV"], period="prev_shift")
@@ -978,15 +1095,31 @@ def test_http_422_is_refused_event(tmp_path):                                   
         e = role.events.recent()[0]
         assert (e.outcome, e.channel, e.tool) == ("refused", "http", "tag_now")
         assert c.post("/api/data/tag_now", json={"tags": ["20FAKE_001_PV"]}, headers=auth).json()["status"] == "ok"
-        assert c.post("/api/data/tag_now", content=b"x" * 70_000, headers=auth).status_code == 413
+
+def test_bad_json_without_token_is_401(tmp_path):                               # Review Focus 3
+    app, role = make_app(tmp_path)
+    with TestClient(app) as c:
+        wait_until(lambda: role.catalog.loaded)
+        before = len(role.events.recent())
+        r = c.post("/api/data/tag_now", content=b"{bad", headers={"Content-Type": "application/json"})
+        assert r.status_code == 401 and len(role.events.recent()) == before   # мусора в журнале нет
+
+def test_chunked_body_over_limit_is_413(tmp_path, capfd):                       # Review Focus 3
+    app, _ = make_app(tmp_path)
+    auth = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+    with TestClient(app) as c:
+        chunks = (b"x" * 10_000 for _ in range(7))          # без Content-Length
+        assert c.post("/api/data/tag_now", content=chunks, headers=auth).status_code == 413
+        assert c.post("/mcp", content=b"x" * 70_000, headers=auth).status_code == 413
+    assert "outcome=too_large" in capfd.readouterr().err
 ```
 
 `make_service(tmp_path)` строит `DataRole` с `FakeHistorian` и `FakeMono`,
 загружает каталог, чистит `fake.calls` и возвращает `(role.service, fake)`;
 у `DataService` есть поле `role`. `sent_of(fake)` — имена из `names_in` всех
-отправленных SQL. `gate.clear_pause()` — метод ворот Д3а, дописывается здесь:
-снимает защёлку и паузу; им пользуются тесты и строка README «после смены
-пароля — перезапуск».
+отправленных SQL. `gate.clear_pause()` — метод ворот, дописывается здесь:
+снимает защёлку и паузу; им пользуются только тесты, у людей защёлку снимает
+перезапуск службы. У `FakeHistorian` поле `fail` принимает любое исключение.
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_service.py tests/test_http.py`. Expected: FAIL.
 
@@ -1002,31 +1135,43 @@ def test_http_422_is_refused_event(tmp_path):                                   
 
 **Files:**
 - Create: `core/pcbk_core/data/mcp_server.py`
-- Modify: `core/pcbk_core/data/__init__.py` (`mounts`, `lifespan`), `core/tests/{conftest,helpers}.py`
-  (`core_server`, `mcp_session`, `http_post`)
+- Modify: `core/pcbk_core/data/__init__.py` (конструктор строит MCP; `mounts`, `lifespan`),
+  `core/tests/{conftest,helpers}.py` (`core_server`, `mcp_session`, `http_post`)
 - Test: `core/tests/test_mcp.py`
 
 **Interfaces:**
-- Consumes: `DataService`, `TokenTable`, модели аргументов — задача 5;
-  `create_app` ставит монтирования последними — Д3а.
+- Consumes: `DataService`, `refuse_args`, `TokenTable`, модели
+  `CatalogSearchArgs`, `TagNowArgs`, `TagPeriodArgs` — задача 5; `Role`,
+  `RoleBase`, точные маршруты `mounts()` — Д3а.
 - Produces:
   - `build_mcp(role: DataRole) -> FastMCP` —
-    `FastMCP("pcbk-data", stateless_http=True, json_response=True, streamable_http_path="/mcp", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))`:
+    `FastMCP("pcbk-data", stateless_http=True, json_response=True, streamable_http_path="/mcp", log_level="WARNING", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))`:
+    - `log_level="WARNING"`: иначе FastMCP включает INFO на корневом логгере,
+      и `pytds` пишет в журнал адрес историана и начало SQL;
     - защита от DNS rebinding выключена: хост разный (`core:8000`,
       `${STU_NET}.N.2:8000`, туннель), защищает токен на каждом запросе;
     - три инструмента с аннотацией `-> dict[str, Any]` (с `-> dict`
       `structuredContent` пуст), `readOnlyHint=True`, `openWorldHint=False`;
-    - параметры: `tags: Annotated[list[str], Field(json_schema_extra={"minItems": 1, "maxItems": 16})]`
-      — предел видит модель, а проверяет служба: больше 16 → `refuse_args`
-      с событием;
+    - аргументы свободные, схему для модели задаёт `json_schema_extra`:
+      `tags: Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "string", "maxLength": 128}, "minItems": 1, "maxItems": 16})] = None`,
+      `period: Annotated[Any, Field(json_schema_extra={"type": "string", "enum": list(PRESETS)})] = None`,
+      `start`, `end`, `query` — `Any` со схемой строки, `limit: Any = 10`.
+      Внутри — `TagNowArgs.model_validate(...)` и т. д. Ошибка проверки →
+      `role.service.refuse_args(...)` с событием. Строка вместо списка, нет
+      тегов, неизвестный период и 17 тегов дают событие, а не английский
+      отказ FastMCP до функции;
     - канал `"mcp"`; вызывающий — `role.tokens.caller` по заголовку
       `Authorization` из `ctx.request_context.request`.
   - `mcp_auth(app: ASGIApp, role: DataRole) -> ASGIApp` — чистое ASGI (не
-    `BaseHTTPMiddleware`: тот ломает потоковые ответы). Для пути `/mcp`:
-    `GET` → `405`; без верного `Bearer` → `401 {"detail": "нужен токен"}` и
-    строка журнала `outcome=unauthorized channel=mcp`.
-  - `DataRole.mounts()` → `[("/", mcp_auth(mcp.streamable_http_app(), role))]`;
-    `lifespan()` входит ещё и в `mcp.session_manager.run()`.
+    `BaseHTTPMiddleware`: тот ломает потоковые ответы). Для `/mcp`: `GET` →
+    `405`; без верного `Bearer` → `401 {"detail": "нужен токен"}` и строка
+    журнала `outcome=unauthorized channel=mcp`.
+  - `DataRole.__init__` строит `self.mcp = build_mcp(self)` и
+    `self.mcp_app = mcp_auth(self.mcp.streamable_http_app(), self)` один раз.
+    `mounts()` → `[("/mcp", self.mcp_app)]` — точный маршрут, без `Mount("/")`,
+    чужие пути ролей Д4/Д5 он не перехватит. `lifespan()` входит в
+    `self.mcp.session_manager.run()` ровно один раз; `run()` второй раз SDK не
+    даёт.
   - `TOOL_DESCRIPTIONS` (их читает модель; текст постоянный):
     - `catalog_search`: «Поиск тегов БДРВ участка по словам в имени и описании. Описания в историане обрезаны на 50 символах: если точного совпадения нет, вернутся похожие — покажите их студенту на выбор, не угадывайте.»
     - `tag_now`: «Текущее значение тегов БДРВ (до 16 за вызов): значение, единица, время с поясом, возраст и качество. Имена берите точно из catalog_search.»
@@ -1060,7 +1205,8 @@ async def test_mcp_lists_three_readonly_tools(core_server):
         tools = {t.name: t for t in (await s.list_tools()).tools}
     assert set(tools) == {"catalog_search", "tag_now", "tag_period"}
     assert all(t.annotations.readOnlyHint for t in tools.values())
-    assert tools["tag_now"].inputSchema["properties"]["tags"]["maxItems"] == 16
+    tags = tools["tag_now"].inputSchema["properties"]["tags"]
+    assert (tags["type"], tags["maxItems"], tags["items"]["maxLength"]) == ("array", 16, 128)
     assert tools["tag_now"].description == TOOL_DESCRIPTIONS["tag_now"]
 
 @pytest.mark.anyio
@@ -1072,34 +1218,55 @@ async def test_mcp_and_http_give_same_answer(core_server):
     assert code == 200 and sc is not None and drop(sc) == drop(json.loads(body))
 
 @pytest.mark.anyio
-async def test_mcp_17_tags_is_refused_event(core_server):                      # Review Focus 3
+async def test_mcp_bad_arg_types_are_refused_events(core_server):              # Review Focus 3
+    bad = [("tag_now", {"tags": "20FAKE_001_PV"}), ("tag_now", {}),
+           ("tag_period", {"tags": ["20FAKE_001_PV"], "period": "last_year"}),
+           ("tag_now", {"tags": [f"20FAKE_{i:03d}_PV" for i in range(17)]})]
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
-        sc = (await s.call_tool("tag_now", {"tags": [f"20FAKE_{i:03d}_PV" for i in range(17)]})).structuredContent
-    assert sc["status"] == "refused" and "неверные аргументы" in sc["message"]
-    e = core_server.role.events.recent()[0]
-    assert (e.outcome, e.channel, e.caller, e.sent) == ("refused", "mcp", "student-01", ())
+        for tool, args in bad:
+            sc = (await s.call_tool(tool, args)).structuredContent
+            assert sc["status"] == "refused" and "неверные аргументы" in sc["message"], args
+            e = core_server.role.events.recent()[0]
+            assert (e.outcome, e.channel, e.caller, e.sent) == ("refused", "mcp", "student-01", ())
 
-def test_mcp_auth_host_and_get(core_server):                                    # 401, Host, GET, слэш
+def test_mcp_auth_host_and_get(core_server):                                    # Review Focus 5
     url = core_server.url + "/mcp"
     assert raw(url) == 401 and raw(url, Authorization="Bearer nope") == 401
     for host in ("core:8000", "172.31.1.2:8000"):
         assert raw(url, Authorization=f"Bearer {TOKEN}", Host=host) == 200
     assert raw(url, method="GET", Authorization=f"Bearer {TOKEN}") == 405
+    assert raw(url + "/", Authorization=f"Bearer {TOKEN}") == 404                  # точный маршрут
+
+@pytest.mark.anyio
+async def test_lifespan_without_app_runs(tmp_path):                             # Review Focus 5
+    role, _ = make_role(db_dir=tmp_path)
+    async with role.lifespan():                       # MCP построен в конструкторе, run() — один раз
+        pass
+    assert not logging.getLogger("pytds").isEnabledFor(logging.INFO)
+    assert not logging.getLogger().isEnabledFor(logging.INFO)          # FastMCP не поднял корневой журнал
 ```
+
+`make_role(db_dir=…)` — вариант помощника Д3а с `DB_PATH` во временном
+каталоге и тестовым `TokenTable`.
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_mcp.py`. Expected: FAIL.
 
-- [ ] **Step 3: Implement `build_mcp`, `mcp_auth`, монтирование и жизненный цикл**
+- [ ] **Step 3: Implement `build_mcp`, `mcp_auth`, построение в конструкторе, точный маршрут и жизненный цикл**
 
-- [ ] **Step 4: Run the whole core suite** — `cd core && CORE_PYTEST`. Expected: PASS.
+- [ ] **Step 4: Run the whole core suite** — `cd core && CORE_PYTEST`. Expected: PASS (включая `test_drill_freeze_poll_stops_loop` Д3а — роль без приложения).
 
-- [ ] **Step 5: Commit** — `git add core/ && git commit -m "Служба данных по MCP 1.30.0: те же инструменты, токен на каждый запрос, отказы аргументов — событиями"`.
+- [ ] **Step 5: Commit** — `git add core/ && git commit -m "Служба данных по MCP 1.30.0: точный маршрут /mcp, любые ошибки аргументов — событиями, журнал без INFO SDK"`.
 
 ---
 
 ### Task 7: Компоновка и выкладка
 
 **Files:**
+- Modify: `core/Dockerfile` — до `USER`:
+  `RUN install -d -o 10003 -g 10003 -m 0750 /var/lib/pcbk-core`, как у
+  сторожа Д1. Новый именованный том наследует владельца каталога образа; без
+  каталога том получит `root:root 0755`, `EventLog` не откроет `core.db`, и
+  служба уйдёт в цикл перезапусков.
 - Modify: `compose.yaml` (у `core` — `image: pcbk-reserve/core:d3b`, секрет
   `core-tokens`, том `pcbk-core-data:/var/lib/pcbk-core`), `.gitignore`
   (`core-tokens`, `*.data-token`), `tests/integration/conftest.py` (тестовый
@@ -1118,11 +1285,15 @@ def test_tool_over_egress_answers_and_journals(stack):
     assert stack.http_host("POST", CORE + "/api/data/tag_now", {"tags": ["x"]})[0] == 401
     assert "outcome=unauthorized channel=http" in stack.logs("pcbk-core")
 
-def test_core_guard_and_state_volume(stack):
+def test_core_state_volume_writable(stack):                                     # Review Focus 4
     assert "охрана выхода: разрешено 1 направление" in stack.logs("pcbk-core")
     mounts = {m["Destination"]: m for m in stack.inspect("pcbk-core")["Mounts"]}
     assert mounts["/var/lib/pcbk-core"]["Type"] == "volume"
     assert (mounts["/run/secrets/core-tokens"]["Type"], mounts["/run/secrets/core-tokens"]["RW"]) == ("bind", False)
+    stack.exec("pcbk-core", "test", "-w", "/var/lib/pcbk-core")               # при отказе exec бросит исключение
+    assert stack.exec("pcbk-core", "stat", "-c", "%u", "/var/lib/pcbk-core/core.db") == "10003"
+    code, body = stack.http_host("GET", CORE + "/healthz/data")
+    assert code == 200 and json.loads(body)["ok"] is True
 ```
 
 - [ ] **Step 2: Run tests to verify they fail** — `uv run --python 3.12 --with pytest pytest -q tests/integration/test_core.py`. Expected: FAIL.
@@ -1131,7 +1302,7 @@ def test_core_guard_and_state_volume(stack):
 
 - [ ] **Step 4: Run the whole local suite** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q) && uv run --python 3.12 --with pytest pytest -q tests/integration`. Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git add compose.yaml .gitignore tests/integration/ && git commit -m "Серверный слой: токены и журнал событий в компоновке"`.
+- [ ] **Step 5: Commit** — `git add core/Dockerfile compose.yaml .gitignore tests/integration/ && git commit -m "Серверный слой: каталог журнала от uid 10003, токены и журнал событий в компоновке"`.
 
 - [ ] **Step 6: Выкладка**
 
@@ -1140,7 +1311,7 @@ def test_core_guard_and_state_volume(stack):
 ```bash
 cd /opt/pcbk-reserve/secrets && umask 077
 if [ ! -e core-tokens ]; then
-  t=$(openssl rand -hex 32); printf '%s' "$t" > ops.data-token && chmod 0400 ops.data-token
+  t=$(openssl rand -hex 24); printf '%s' "$t" > ops.data-token && chmod 0400 ops.data-token   # 48 знаков — под шаблоном Д2
   printf 'ops %s\n' "$(printf '%s' "$t" | sha256sum | cut -d' ' -f1)" > core-tokens && chmod 0444 core-tokens
 fi
 stat -c '%a %n' core-tokens ops.data-token
@@ -1153,14 +1324,16 @@ stat -c '%a %n' core-tokens ops.data-token
 `cp -p compose.yaml compose.yaml.d3a`; `rsync compose.yaml`;
 `docker compose up -d --no-build core`.
 Expected:
-- `healthy`; на странице «Служба данных — жива», историан в норме;
+- `healthy`; на странице «Служба данных — жива», историан в норме — снимок
+  `docs/checks/D3b/01-after-deploy.png` способом Д3а;
 - `docker logs pcbk-core 2>&1 | grep -c 'охрана выхода'` → 1;
+- `docker exec pcbk-core stat -c '%u %a' /var/lib/pcbk-core` → `10003 750`;
 - память меньше 70 % от 256 МиБ.
 
 Откат: `compose.yaml.d3a` и `docker compose up -d --no-build core` (образ
 `:d3a`); том `pcbk-core-data` не удаляется.
 
-- [ ] **Step 7: Commit** — `git add deploy/README.md docs/checks/D3b.md && git commit -m "Выкладка Д3б: инструменты службы данных на сервере"`.
+- [ ] **Step 7: Commit** (после проверки на секреты) — `git add deploy/README.md docs/checks/D3b.md docs/checks/D3b/ && git commit -m "Выкладка Д3б: инструменты службы данных на сервере"`.
 
 ---
 
@@ -1197,8 +1370,8 @@ Expected:
   `grep -E -i -f <шаблоны> "$JOB/verify.json"` — пусто.
   Expected: `bounds`, `min`, `max`, `last` (если есть) — «сошлось»; печатается
   `d` и вердикт вида. Дальше по вердикту:
-  - вид «подтверждён», но не тот, что в `avg_kind`: `AVG_KIND` правится
-    одним коммитом, перевыкладка, шаги 3–4 повторяются;
+  - вид «подтверждён», но не тот, что в `avg_kind`: строка 8а таблицы —
+    `AVG_KIND` правится одним коммитом, перевыкладка, шаги 3–4 повторяются;
   - «не различим на этом теге»: так и записать; вид остаётся по пробе;
   - «не сошёлся»: `AVG_KIND = "unverified"`, вопрос владельцу.
 
@@ -1228,13 +1401,27 @@ Expected:
 
 - [ ] **Step 1: Документы.**
   - `docs/DESIGN-platform-2026-09-29.md`: §4 — инструменты как построены
-    (имена, контракт ответа, ссылка на план); §13 — п. 8 «Д3б» (Ruling 1–5).
+    (имена, контракт ответа, ссылка на план); §13 — п. 8 «Д3б» (решения
+    Д3б-R6…R10).
   - Предпосылки Д4 — в §13 и в строке Д4 `docs/PLAN-platform-2026-09-29.md`:
     - у MCP места `"oauth": false` и URL ровно `http://core:8000/mcp`;
-    - токены `student-NN.data-token` и перезапуск `core`;
+    - токены `student-NN.data-token` (`openssl rand -hex 24`) и перезапуск
+      `core`;
     - `pcbk-core` в сетях мест на `.2`;
-    - с Д5 — конфликт псевдонима `pcbk-core` в `http_as` для `sp-ctl`, когда
-      сам `core` войдёт в `pcbk-ctl`.
+    - `core` поднимается раньше мест. OpenCode v1.18.33 не переподключает
+      remote MCP сам: если при старте места `core` недоступен или токен
+      неверен, сервер MCP остаётся в `failed` до перезапуска OpenCode.
+      Шлюз или сторож проверяет состояние MCP каждого места и при `failed`
+      вызывает переподключение. Учение «`core` перезапущен при работающих
+      местах» — вызов после перезапуска проходит без ручных действий;
+    - крючки уровня приложения ролей `llm` и `gateway` — только через
+      `Role.install(app)`, свои маршруты — точные, как `/mcp`.
+  - Предпосылки Д5 — там же:
+    - конфликт псевдонима `pcbk-core` в `http_as` для `sp-ctl`, когда сам
+      `core` войдёт в `pcbk-ctl`;
+    - поток `/event` OpenCode `edge` не должен рвать: у него свой `location`
+      без `proxy_read_timeout 5s`, который сейчас стоит у ручек сторожа
+      (`docs/research/07-gateway-whitelist.md`).
   - `README.md` — «Д3 готов (Д3а и Д3б)».
 - [ ] **Step 2: Критик** (Opus 5.5); петля — до нуля блокеров, не больше двух
   раундов; третий — после разговора с владельцем.
