@@ -10,7 +10,7 @@ from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian
 from helpers import FakeMono
 from pcbk_core.data.gate import AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
 from pcbk_core.data.historian import HistorianError
-from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql, summary_sql
+from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, lit_dt, live_all_sql, live_sql, summary_sql
 from pcbk_core.logs import setup_logging
 
 pytestmark = pytest.mark.anyio
@@ -322,3 +322,19 @@ async def test_gate_passes_summary_literals_only():
         await g.run(["SELECT TagName FROM AnalogHistory WHERE TagName = '20FAKE_001_PV' AND wwRetrievalMode = 'Delta'"])
     with pytest.raises(GateRefused):                              # имя вне списка и в верной форме
         await g.run([summary_sql(["16FAKE_009_PV"], T6, T14)])
+
+
+async def test_gate_refuses_summary_with_non_ascii_digits():                   # ревью I1
+    fake = FakeHistorian()
+    g = HistorianGate(fake, allowed=WHITELIST, literal_ok=allowed_literal)
+    good = summary_sql(["20FAKE_001_PV"], T6, T14)
+    start = lit_dt(T6)
+    # год и вторая цифра секунд — там strptime берёт любые цифры; форма на \d — тоже
+    bads = [good.replace(start, start.replace("2026", "٢٠٢٦", 1).replace(":00.000", ":0٥.000")),
+            good.replace(start, start.replace("2026", "２０２６", 1))]
+    assert all(bad != good for bad in bads)
+    for bad in bads:
+        with pytest.raises(GateRefused) as e:
+            await g.run([bad])
+        assert e.value.code == "unlisted"
+    assert fake.calls == [] and g.stats()["refused_unlisted"] == 2

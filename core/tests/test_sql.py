@@ -1,10 +1,13 @@
 """Шаблоны SQL к историану: только литералы, без LIKE и без параметров драйвера."""
+import importlib.util
 import re
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
+import pcbk_core.data.sql as sql_module
 from pcbk_core.data.sql import (DATE_FMT, HAS_LAST, MAX_NAMES, PIN_INTERPOLATION, SHAPE, SUMMARY_COLUMNS,
                                 TEMPLATE_FORMS, SummaryShape, allowed_literal, catalog_sql, clock_sql, lit_dt,
                                 lit_name, literals, live_all_sql, live_sql, names_in, plain, scan_literals,
@@ -99,6 +102,29 @@ def test_summary_template_rules():
 def test_allowed_literals():
     assert allowed_literal(lit_dt(T6).strip("'")) and allowed_literal("STAIRSTEP")
     assert not allowed_literal("16FAKE_009_PV") and not allowed_literal("Delta")
+    assert not any(allowed_literal(v) for v in date_variants(DATE_FMT))            # ревью I1
+
+
+# ревью I1: цифры не ASCII (\d и strptime их принимают) и вольности strptime — не дата по формату
+_ARABIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+_FULLWIDTH = str.maketrans("0123456789", "０１２３４５６７８９")
+
+
+def date_variants(fmt: str) -> list[str]:
+    r"""Подделки даты T6 по fmt: те же числа, но текст не тот, что пишет lit_dt.
+
+    strptime берёт цифры не ASCII в %Y и во второй цифре %S (там у него \d), форма на \d — везде.
+    """
+    good = T6.strftime(fmt)                                       # «… 06:00:00.000»
+    body, tail = good[:-4], good[-4:]                             # «.000» — буквальная часть формата
+    year_ar, year_fw = "2026".translate(_ARABIC), "2026".translate(_FULLWIDTH)
+    out = [good.replace("2026", year_ar, 1).replace(":00.000", ":0٥.000"),   # пример ревью
+           good.replace("2026", year_fw, 1),
+           good.replace(":00.000", ":0٥.000"),                    # одна цифра не ASCII
+           body.translate(_ARABIC) + tail, body.translate(_FULLWIDTH) + tail,
+           good.replace(" ", "  ", 1), good.replace(" 06:", " 6:")]  # лишний пробел, час без нуля
+    assert good not in out and len(set(out)) == len(out)
+    return out
 
 
 # F1: форма и SQL — из одних констант; каждое сочетание, которое может выбрать окно владельца
@@ -118,7 +144,9 @@ def test_summary_form_built_from_same_constants(shape):
                 s.replace("TagName IN (", "TagName NOT IN ("), s + " OR 1=1",
                 s.replace("wwCycleCount = 1", "wwCycleCount = 100"),
                 s.replace(" AND wwCycleCount = 1", " AND wwRetrievalMode = 'Delta' AND wwCycleCount = 1")]
-    assert not any(form.fullmatch(t) for t in tampered)
+    start = lit_dt(T6, shape.date_fmt)
+    tampered += [s.replace(start, f"'{v}'") for v in date_variants(shape.date_fmt)]   # ревью I1
+    assert all(t != s for t in tampered) and not any(form.fullmatch(t) for t in tampered)
 
 
 def test_summary_form_registered_from_module_constants():
@@ -134,3 +162,29 @@ def test_date_literal():
     assert lit_dt(datetime(2026, 10, 1, 6, 0, 0, 999_999)) == want
     with pytest.raises(ValueError):
         lit_dt(datetime(2026, 10, 1, 6, tzinfo=timezone.utc))
+
+
+# ревью M1: значение интерполяции вне WW_CONSTANTS и неизвестная директива даты — ValueError при импорте
+
+
+@pytest.mark.parametrize("line, bad", [(r"PIN_INTERPOLATION: str \| None = .*", 'PIN_INTERPOLATION: str | None = "Delta"'),
+                                       (r"PIN_INTERPOLATION: str \| None = .*",
+                                        'PIN_INTERPOLATION: str | None = "STAIRSTEP\' OR 1=1 --"'),
+                                       (r"DATE_FMT: str = .*", 'DATE_FMT: str = "%y-%m-%d %H:%M:%S.000"')])
+def test_bad_probe_constants_fail_at_import(tmp_path, line, bad):
+    source = Path(sql_module.__file__).read_text(encoding="utf-8")
+    patched, n = re.subn(rf"(?m)^{line}$", lambda _: bad, source, count=1)
+    assert n == 1
+    path = tmp_path / "sql_patched.py"
+    path.write_text(patched, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("sql_patched", path)
+    with pytest.raises(ValueError):
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+
+def test_pin_outside_ww_constants_refused():
+    for bad in ("Delta", "STAIRSTEP' OR 1=1 --"):
+        with pytest.raises(ValueError):
+            summary_form(SummaryShape(pin=bad))
+        with pytest.raises(ValueError):
+            summary_sql(["20FAKE_001_PV"], T6, T14, SummaryShape(pin=bad))

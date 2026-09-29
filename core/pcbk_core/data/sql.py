@@ -120,6 +120,10 @@ def _summary_head(shape: SummaryShape) -> str:
 
 
 def _summary_tail(shape: SummaryShape) -> str:
+    # значение интерполяции — только из WW_CONSTANTS: иначе ворота не пустили бы ни одной сводки,
+    # а кавычка в нём сломала бы литерал; для PIN_INTERPOLATION это ValueError уже при импорте
+    if shape.pin is not None and shape.pin not in WW_CONSTANTS:
+        raise ValueError("интерполяция сводки — только значение из WW_CONSTANTS")
     return _SUMMARY_CYCLES + ("" if shape.pin is None else f" AND wwInterpolationType = '{shape.pin}'")
 
 
@@ -132,9 +136,10 @@ def summary_sql(names: Sequence[str], start: datetime, end: datetime, shape: Sum
             + _summary_tail(shape))
 
 
-# директивы формата даты и их регулярки; другая директива — ValueError (при импорте — для DATE_FMT)
-_DATE_DIRECTIVES = {"%Y": r"\d{4}", "%m": r"\d{2}", "%d": r"\d{2}", "%H": r"\d{2}", "%M": r"\d{2}",
-                    "%S": r"\d{2}"}
+# директивы формата даты и их регулярки; другая директива — ValueError (при импорте — для DATE_FMT).
+# Только [0-9]: \d без re.ASCII берёт любые цифры Юникода («٢٠٢٦», «２０２６»)
+_DATE_DIRECTIVES = {"%Y": "[0-9]{4}", "%m": "[0-9]{2}", "%d": "[0-9]{2}", "%H": "[0-9]{2}", "%M": "[0-9]{2}",
+                    "%S": "[0-9]{2}"}
 
 
 def _date_form(date_fmt: str) -> str:
@@ -157,18 +162,21 @@ def summary_form(shape: SummaryShape = SHAPE) -> re.Pattern[str]:
     """Форма сводки: та же строка, что пишет summary_sql, по тем же частям; список имён — как у live."""
     date = _date_form(shape.date_fmt)
     return re.compile(re.escape(_summary_head(shape)) + _NAME_LIST + re.escape(_SUMMARY_START) + date
-                      + re.escape(_SUMMARY_END) + date + re.escape(_summary_tail(shape)))
+                      + re.escape(_SUMMARY_END) + date + re.escape(_summary_tail(shape)), re.ASCII)
 
 
 def allowed_literal(text: str, shape: SummaryShape = SHAPE) -> bool:
-    """Литерал вне TagName IN (…), который ворота пускают: дата по shape.date_fmt или значение WW_CONSTANTS."""
+    """Литерал вне TagName IN (…), который ворота пускают: дата по shape.date_fmt или значение WW_CONSTANTS.
+
+    Дата — только ровно та строка, что пишет lit_dt: strptime вольный (цифры Юникода в %Y и %S,
+    час без нуля, лишние пробелы), поэтому разобранное печатается обратно и сверяется с текстом.
+    """
     if text in WW_CONSTANTS:
         return True
     try:
-        datetime.strptime(text, shape.date_fmt)
+        return datetime.strptime(text, shape.date_fmt).strftime(shape.date_fmt) == text
     except (TypeError, ValueError):
         return False
-    return True
 
 
 # формы всех инструкций службы; сверка — fullmatch
