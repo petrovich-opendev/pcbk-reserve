@@ -2,6 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Изменения по предпроверке Д4а** (решения П1–П26 плана Д4а, 29.09; что
+меняет входы Д4б):
+1. Доля кода Д4а до черты (правило «пересчитать до начала дня») — коммиты задач 2 и 8 Д4а, **13,1 ч** по шкале, а не 10,3; если задача 8 Д4а ждала задачу 7 Д3б — коммиты задач 2 и 7, 10,95 ч (задача 11 Д4а, шаг 4).
+2. Строки `llm_calls` пишет поток-писатель `Ledger` (П5): строка появляется в файле с задержкой до долей секунды после ответа прокси. `stack.llm_calls` и `stack.llm_refusals` сразу после разговора читаются через `wait_for`, а не одним запросом.
+3. Нечитаемый `llm-tokens` — не `config_error`, а `tokens_error` (П23): `/llm/` всем 401, строка «токены LLM не читаются», опрос идёт; в `/health/llm` — 24 ключа, новый `tokens_error`.
+4. 413 на `/llm/` — в форме OpenAI, `code` `pcbk_body_too_large`, текст без чисел (П19); 401 — `pcbk_unauthorized` с `WWW-Authenticate: Bearer`.
+5. Д4а вливается в `main` только после `platform-d3b` (П1); предпосылка Д4б (`platform-d4a`) не меняется.
+
 **Изменения по критике, раунд 2** (три критика Opus 5.5; блокеров ноль, здесь —
 major и дешёвые minor; находки о прокси правит Д4а). Находка → что поменялось:
 1. [major] `task` открыт в образе `:d4`: параллельные подагенты упирались в 3
