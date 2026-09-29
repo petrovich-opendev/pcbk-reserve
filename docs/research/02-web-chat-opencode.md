@@ -200,3 +200,20 @@ v1.18.33: стабильный канал, готовый адаптер инт�
 7. В закрытом контуре выключить внешний трафик: `OPENCODE_DISABLE_MODELS_FETCH`,
    `OPENCODE_DISABLE_AUTOUPDATE`, `share: disabled` (аналоги в v2 — [?]).
 8. Переподключение SSE через шлюз без потерь (v2 — через `after`).
+
+## Поправки критика (Opus 5.5, 29.09.2026)
+
+Критик проверил ключевые утверждения по сети и исходникам v1.18.33 и v2.0.19 —
+все верны, блокеров нет. Поправки:
+
+* **Важно для шлюза.** Белый список ручек адаптера сам по себе не безопасен. В
+  v1 `PATCH /session/:id` (`session.update`, адаптер его вызывает) и
+  `POST /session` принимают поле `permission` (`groups/session.ts:49–52`,
+  `session/session.ts:267`); `prompt_async` принимает поле `tools`, которое
+  становится разрешением allow для сессии (`session/prompt.ts:1061–1066`), и
+  поле `system`. Шлюз для v1 обязан **вырезать `permission`, `tools`,
+  `system` и проверять `agent`** — а не только `permissions` и `directory`, как
+  сказано в варианте A.
+* Адаптер assistant-ui вызывает ещё `experimental.session.list`,
+  `question.list/reject`, `permission.list` и `unrevert`.
+* v2 не «8 дней»: v2.0.0 вышла 11.09, ей 18 дней; 8 дней — ветке 2.0.12+.
