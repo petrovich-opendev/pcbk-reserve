@@ -15,7 +15,8 @@ RECENT_RESTART = timedelta(minutes=15)
 CRASH_LOOP_RESTARTS = 3
 # рабочее место спит: вышло само, SIGKILL или SIGTERM
 SLEEP_EXIT_CODES = frozenset({0, 137, 143})
-# код OpenSSL X509_V_ERR_CERT_HAS_EXPIRED
+# коды OpenSSL X509_V_ERR_CERT_NOT_YET_VALID и X509_V_ERR_CERT_HAS_EXPIRED
+CERT_NOT_YET_VALID = 9
 CERT_HAS_EXPIRED = 10
 
 
@@ -41,8 +42,12 @@ def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Ch
             break
     else:
         return Check("memory", title, "unknown", "нет данных о свободной памяти")
-    state: State = "fail" if mib < fail_mib else "warn" if mib < warn_mib else "ok"
-    return Check("memory", title, state, f"свободно {mib} МиБ")
+    # в warn/fail текст постоянный: иначе журнал пишет событие каждый такт
+    if mib < fail_mib:
+        return Check("memory", title, "fail", f"свободно меньше {fail_mib} МиБ")
+    if mib < warn_mib:
+        return Check("memory", title, "warn", f"свободно меньше {warn_mib} МиБ")
+    return Check("memory", title, "ok", f"свободно {mib} МиБ")
 
 
 def _restarts(n: int) -> str:
@@ -75,7 +80,8 @@ def check_container(component: str, title: str, inspect: dict | None, *,
         if st["Restarting"]:
             return result("warn", "перезапускается")
         if restarts > 0 and recent:
-            at = started.astimezone(now.tzinfo).strftime("%H:%M")
+            # время — в поясе now и с явным смещением
+            at = started.astimezone(now.tzinfo).strftime("%H:%M UTC%:z")
             return result("warn", f"перезапущен после сбоя в {at} ({restarts} с последнего запуска)")
         if restarts > 0:
             return result("ok", f"работает, сбоев с последнего запуска: {restarts}")
@@ -134,6 +140,8 @@ def check_tls(component: str, title: str, host: str, port: int, cafile: str, now
     except ssl.SSLCertVerificationError as e:
         if e.verify_code == CERT_HAS_EXPIRED:
             return Check(component, title, "fail", "сертификат истёк")
+        if e.verify_code == CERT_NOT_YET_VALID:
+            return Check(component, title, "fail", "сертификат ещё не действителен")
         return Check(component, title, "fail", "отдаёт не тот сертификат")
     except OSError:
         return Check(component, title, "fail", "не отвечает")

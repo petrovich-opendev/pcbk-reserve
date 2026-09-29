@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from helpers import T0, insp, now_utc
 from pcbk_watchdog.checks import (check_container, check_http, check_memory, check_tls,
@@ -12,6 +12,17 @@ def test_memory_ok_warn_fail():
     assert check_memory(MEMINFO.format(1_500 * 1024)).state == "warn"
     assert check_memory(MEMINFO.format(900 * 1024)).state == "fail"
     assert "11700 МиБ" in check_memory(MEMINFO.format(11_700 * 1024)).detail
+
+
+def test_memory_warn_fail_detail_is_constant_threshold():
+    # в warn/fail текст не зависит от числа — иначе журнал пишет событие каждый такт
+    assert check_memory(MEMINFO.format(1_500 * 1024)).detail == "свободно меньше 2048 МиБ"
+    assert check_memory(MEMINFO.format(1_400 * 1024)).detail == "свободно меньше 2048 МиБ"
+    assert check_memory(MEMINFO.format(900 * 1024)).detail == "свободно меньше 1024 МиБ"
+    custom = check_memory(MEMINFO.format(3_000 * 1024), warn_mib=4096, fail_mib=512)
+    assert (custom.state, custom.detail) == ("warn", "свободно меньше 4096 МиБ")
+    custom = check_memory(MEMINFO.format(300 * 1024), warn_mib=4096, fail_mib=512)
+    assert (custom.state, custom.detail) == ("fail", "свободно меньше 512 МиБ")
 
 
 def test_memory_without_field_is_unknown():
@@ -33,8 +44,17 @@ def test_student_states():
 def test_recent_policy_restart_is_warn_then_ok():
     fresh = stu(insp(running=True, restarts=2, started=T0 - timedelta(minutes=3)))
     assert fresh.state == "warn" and "перезапущен после сбоя" in fresh.detail
+    assert "в 11:57 UTC+00:00" in fresh.detail   # время — с явным смещением
     old = stu(insp(running=True, restarts=2, started=T0 - timedelta(minutes=30)))
     assert old.state == "ok" and "сбоев с последнего запуска: 2" in old.detail
+
+
+def test_restart_time_in_zone_of_now_with_offset():
+    now = T0.astimezone(timezone(timedelta(hours=5)))
+    r = check_container("student-01", "Рабочее место 01",
+                        insp(running=True, restarts=1, started=T0 - timedelta(minutes=3)),
+                        sleeping_ok=True, now=now)
+    assert r.state == "warn" and "в 16:57 UTC+05:00" in r.detail
 
 
 def test_crash_loop_is_fail():
@@ -92,3 +112,16 @@ def test_tls_wrong_certificate_is_fail(tls_server, other_cert):   # сервер
 def test_tls_matching_certificate_reports_days(tls_server):
     r = check_tls("edge", "Входной прокси", "127.0.0.1", tls_server.port, tls_server.cafile, now_utc())
     assert r.state == "ok" and "дн." in r.detail
+
+
+def test_tls_expired_certificate_fails_handshake(expired_tls_server):
+    # при CERT_REQUIRED просроченный сертификат рвёт рукопожатие (код 10) раньше tls_verdict
+    r = check_tls("edge", "Входной прокси", "127.0.0.1", expired_tls_server.port,
+                  expired_tls_server.cafile, now_utc())
+    assert (r.state, r.detail) == ("fail", "сертификат истёк")
+
+
+def test_tls_not_yet_valid_certificate(future_tls_server):
+    r = check_tls("edge", "Входной прокси", "127.0.0.1", future_tls_server.port,
+                  future_tls_server.cafile, now_utc())
+    assert (r.state, r.detail) == ("fail", "сертификат ещё не действителен")
