@@ -1,5 +1,7 @@
 # секреты — никогда в git
 .env
+.env.*
+!.env.example
 *.env
 *_cookies.txt
 *credentials*
