@@ -27,7 +27,8 @@ def test_core_health_routes_on_egress_address(stack):
 
 
 def test_edge_does_not_expose_core(stack):
-    for path in ("/healthz/data", "/health/historian", "/api/data/tag_now", "/mcp"):
+    for path in ("/healthz/data", "/health/historian", "/api/data/tag_now", "/mcp",
+                 "/llm/v1/chat/completions", "/health/llm"):
         assert stack.https(path)[0] == 404
 
 
@@ -67,6 +68,11 @@ def test_core_secret_and_list_are_readonly_files(stack):
     prod = stack.prod_config()["services"]["core"]
     assert "env_file" not in prod and "BDRV" not in json.dumps(prod.get("environment", {}))
     assert prod["pull_policy"] == "never"
+    # двойник OpenRouter и частый опрос — только в compose.test.yaml; на сервере — настоящий OpenRouter
+    assert not {"OPENROUTER_BASE_URL", "LLM_POLL_S"} & set(prod["environment"])
+    # секреты core — ровно эти пять файлов, ключи OpenRouter — среди них, а не в окружении
+    assert sorted(x["target"] for x in prod["secrets"]) == \
+        ["bdrv.env", "core-tokens", "llm-tokens", "openrouter-mgmt.key", "openrouter.key"]
 
 
 def test_oneshot_alias_keeps_sp_ctl_controls(stack):               # настоящий pcbk-core уже работает
@@ -88,6 +94,10 @@ def test_core_state_volume_writable(stack):                                     
     # core.db создаётся в начале lifespan роли (F23) — файл есть до первого вызова инструмента
     mounts = {m["Destination"]: m for m in stack.inspect("pcbk-core")["Mounts"]}
     assert mounts["/var/lib/pcbk-core"]["Type"] == "volume"
+    # имя тома — с префиксом проекта (без name: в compose.yaml): down -v тестового проекта pcbk-test
+    # не может задеть том выкладки pcbk-reserve_pcbk-core-data
+    assert mounts["/var/lib/pcbk-core"]["Name"] == "pcbk-test_pcbk-core-data"
+    assert stack.prod_config()["volumes"]["pcbk-core-data"]["name"] == "pcbk-test_pcbk-core-data"
     assert (mounts["/run/secrets/core-tokens"]["Type"], mounts["/run/secrets/core-tokens"]["RW"]) == ("bind", False)
     stack.exec("pcbk-core", "test", "-w", "/var/lib/pcbk-core")               # при отказе exec бросит исключение
     assert stack.exec("pcbk-core", "stat", "-c", "%u", "/var/lib/pcbk-core/core.db") == "10003"

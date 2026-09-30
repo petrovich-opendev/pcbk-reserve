@@ -94,7 +94,12 @@ CONNECTED = re.compile(r"Established connection|Connected to")
 
 
 def wait_for(pred: Callable[[], bool], timeout: float, step: float = 1.0) -> None:
-    """Ждать, пока pred() не станет истинным, опрос раз в step с; по сроку — AssertionError."""
+    """Ждать, пока pred() не станет истинным, опрос раз в step с; по сроку — AssertionError.
+
+    Исключение из pred() не ловится и не повторяется — оно сразу выходит к тесту (сбой сети или
+    неверный ответ — это ошибка, а не «ещё не готово»). Ждать того, что может временно не отвечать, —
+    ловить в самом pred().
+    """
     deadline = time.monotonic() + timeout
     while not pred():
         if time.monotonic() > deadline:

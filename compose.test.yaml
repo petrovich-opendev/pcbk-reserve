@@ -19,20 +19,18 @@ services:
       LLM_POLL_S: "5"
 
   # двойник OpenRouter (core/tests/fake_openrouter.py, только stdlib) в сети выхода рядом с core;
-  # с хоста теста — http://172.31.250.84:8080 (ручки /_requests и др.). Адрес вне динамических .88/29
+  # с хоста теста — http://172.31.250.84:8080 (ручки /_requests и др.). Адрес вне динамических .88/29.
+  # Свой образ от закреплённой базы (core/tests/Dockerfile.fake): общий тег python:3.12-slim машины не трогается
   fake-openrouter:
-    image: python:3.12-slim
+    build: {context: ./core/tests, dockerfile: Dockerfile.fake}
+    image: pcbk-test/fake-openrouter:d4a
     pull_policy: never
     container_name: pcbk-test-openrouter
-    command: ["python", "/app/fake_openrouter.py"]
     init: true                      # SIGTERM доходит до python: stop без 10 с ожидания
     user: "65534:65534"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    volumes:
-      - {type: bind, source: ./core/tests/fake_openrouter.py, target: /app/fake_openrouter.py,
-         read_only: true, bind: {create_host_path: false}}
     networks:
       pcbk-egress: {ipv4_address: 172.31.250.84}
 

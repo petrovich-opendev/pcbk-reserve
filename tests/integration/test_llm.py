@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from conftest import wait_for
+from conftest import TEST_OPENROUTER_KEY, wait_for
 
 CORE = "http://172.31.250.82:8000"
 CHAT = {"model": "z-ai/glm-5.3", "stream": True, "messages": [{"role": "user", "content": "вопрос"}]}
@@ -31,8 +31,8 @@ def test_llm_call_counted_on_status_page(stack):                                
     wait_for(lambda: stack.llm_health()["spent_usd"] == pytest.approx(before + 0.0012), timeout=15)
     want = f"расход {usd(before + 0.0012)} из $1000"
     assert want != f"расход {usd(before)} из $1000"                                 # иначе сверка пустая
-    data = stack.wait_status(lambda d: row(d, "llm")[2].split(" · ")[0] == want, timeout=40)
-    assert row(data, "llm")[:2] == ("ok", "OpenRouter отвечает")
+    stack.wait_status(lambda d: row(d, "llm")[:2] == ("ok", "OpenRouter отвечает")
+                      and row(d, "llm")[2].split(" · ")[0] == want, timeout=40)
     sent = stack.fake_requests()[-1]["body"]
     assert sent["provider"]["zdr"] is True and sent["user"] == "pcbk-student-01"
     assert stack.llm_health()["egress"]["alive"] is True                        # serve() запустил поток адресов
@@ -50,8 +50,8 @@ def test_llm_refusals_without_upstream(stack):
 def test_stop_switch_keeps_data_row_green(stack):                                   # Д4а-R15
     stack.recreate("core", {"LLM_STATE": "stopped"})
     try:
-        data = stack.wait_status(lambda d: row(d, "llm")[0] == "fail" and row(d, "core")[0] == "ok", timeout=90)
-        assert row(data, "llm")[1] == "LLM-прокси остановлен администратором"
+        stack.wait_status(lambda d: row(d, "llm")[:2] == ("fail", "LLM-прокси остановлен администратором")
+                          and row(d, "core")[0] == "ok", timeout=90)
         code, text = chat(stack, stack.llm_token(1))
         assert code == 403 and "остановлен" in json.loads(text)["error"]["message"]
     finally:
@@ -64,8 +64,8 @@ def test_drill_402_row_and_upstream_untouched(stack):
         before = len(stack.fake_requests())
         code, text = chat(stack, stack.ops_llm_token)
         assert code == 402 and json.loads(text)["error"]["message"].endswith("(учения)")
-        data = stack.wait_status(lambda d: row(d, "llm")[0] == "fail", timeout=60)
-        assert row(data, "llm")[1] == "на счёте OpenRouter кончились деньги (учения)"
+        stack.wait_status(lambda d: row(d, "llm")[:2] == ("fail", "на счёте OpenRouter кончились деньги (учения)"),
+                          timeout=60)
         assert len(stack.fake_requests()) == before                                 # ни одного запроса к двойнику
     finally:
         stack.recreate("core", {})
@@ -79,8 +79,8 @@ def test_core_healthy_without_key(stack):
     try:
         assert stack.inspect("pcbk-core")["State"]["Health"]["Status"] in ("starting", "healthy")
         stack.wait_healthy("pcbk-core")
-        data = stack.wait_status(lambda d: row(d, "llm")[0] == "fail", timeout=60)
-        assert row(data, "llm")[1] == "нет ключа OpenRouter" and row(data, "core")[0] == "ok"
+        stack.wait_status(lambda d: row(d, "llm")[:2] == ("fail", "нет ключа OpenRouter")
+                          and row(d, "core")[0] == "ok", timeout=60)
     finally:
         key.chmod(0o644); key.write_text(saved); key.chmod(0o444)
         stack.recreate("core", {})
@@ -92,14 +92,20 @@ def test_keys_and_tokens_are_files_not_env(stack):
         assert (mounts[dest]["Type"], mounts[dest]["RW"]) == ("bind", False), dest
     dump = json.dumps(stack.inspect("pcbk-core"))
     assert "test-openrouter-key" not in dump and "test-mgmt-key" not in dump
-    assert "test-openrouter-key" not in stack.logs("pcbk-core")
+    logs = stack.logs("pcbk-core")
+    for secret in ("test-openrouter-key", "test-mgmt-key", stack.ops_llm_token, stack.llm_token(1)):
+        assert secret not in logs
 
 
 def test_openrouter_down_row(stack):                    # Review Focus 2; последний в модуле: двойник теряет счётчики
+    # своя подготовка, а не finally прошлых тестов: ключ на месте, core с умолчаниями, строка в норме
+    assert (stack.secrets_dir / "openrouter.key").read_text() == TEST_OPENROUTER_KEY
+    stack.recreate("core", {})
+    stack.wait_status(lambda d: row(d, "llm")[:2] == ("ok", "OpenRouter отвечает"), timeout=40)
     stack.stop("pcbk-test-openrouter")
     try:                                                # ≤ 2 опроса по 5 с и такт сторожа 10 с
-        data = stack.wait_status(lambda d: row(d, "llm")[0] == "fail", timeout=40)
-        assert row(data, "llm")[1] == "OpenRouter недоступен" and row(data, "core")[0] == "ok"
+        stack.wait_status(lambda d: row(d, "llm")[:2] == ("fail", "OpenRouter недоступен")
+                          and row(d, "core")[0] == "ok", timeout=40)
     finally:
         stack.start("pcbk-test-openrouter")
     stack.wait_status(lambda d: row(d, "llm")[:2] == ("ok", "OpenRouter отвечает"), timeout=40)
