@@ -11,10 +11,12 @@ WWW-Authenticate. Порядок проверок: зона (front_only, вне 
 (clear_cookies): строки собираются здесь, короткие, сумма байт ограничена COOKIE_HEADERS_BUDGET при любом
 Host. Номер места — только из учётки сессии.
 
-Вход: замок (store.locked) → очередь сверок (не больше LOGIN_PARALLEL попыток разом, ждущих — не больше
-LOGIN_QUEUE, иначе 429 без scrypt) → в одном задании потока повторная проверка замка и сверка. Неудача —
-401 сразу; запись неудачи в замок и строка журнала — в задаче попытки после итога, ответ их не ждёт (время
-ответа не выдаёт, существует ли логин), а место очереди освобождается только после записи (LoginGate).
+Вход: замок (store.locked вместе с незаписанными неудачами логина) → очередь сверок (не больше
+LOGIN_PARALLEL попыток разом, ждущих — не больше LOGIN_QUEUE, незаписанных неудач — не больше LOGIN_BACKLOG,
+иначе 429 без scrypt) → в одном задании потока повторная проверка замка и сверка. Неудача — 401 сразу и метка
+в незаписанных неудачах логина в памяти до освобождения места; запись в замок с той же меткой и строка
+журнала — потом, в писателе LoginGate вне места очереди: ни ответ, ни освобождение места не ждут записи и не
+выдают временем, существует ли логин.
 Нет маршрута или метода под /pcbk/api/ и на /health/gateway — 404 без Allow в любой зоне; предел тела вне
 pcbk-front — тоже 404. В журнале нет ни паролей, ни cookie, ни заголовков; логин — только существующий,
 иначе «<неизвестный>».
@@ -37,7 +39,7 @@ from starlette.types import Receive, Scope, Send
 from .. import zones
 from ..hooks import safe_path
 from . import clip
-from .accounts import Account, AccountStore, StoreError
+from .accounts import Account, AccountStore, StoreError, login_key
 
 if TYPE_CHECKING:
     from . import GatewayRole
@@ -49,6 +51,8 @@ COOKIE = "pcbk_session"
 COOKIE_PATH = PREFIX + "/"
 LOGIN_PARALLEL = 2
 LOGIN_QUEUE = 8
+# незаписанных неудач входа (заданий писателя LoginGate): больше — вход «перегружен» без scrypt
+LOGIN_BACKLOG = 64
 
 GW_MESSAGES = {
     "need_login": "Нужно войти",
@@ -322,20 +326,23 @@ def _credentials(raw: bytes) -> tuple[str, str] | None:
 LOCKED = object()
 
 
-def _check_and_verify(store: AccountStore, login: str, password: str) -> Account | object | None:
+def _check_and_verify(store: AccountStore, login: str, password: str,
+                      pending: tuple[float, ...]) -> Account | object | None:
     """Замок и сверка в одном задании потока, уже с местом в очереди: пока запрос ждал, неудачи соседних
-    попыток того же логина могли его запереть (ревью А4, M1) — тогда LOCKED без scrypt."""
-    if store.locked(login):
+    попыток того же логина — записанные и ещё нет (pending) — могли его запереть (ревью А4, M1) — тогда LOCKED
+    без scrypt."""
+    if store.locked(login, pending):
         return LOCKED
     return store.verify(login, password)
 
 
-def _refused_line(store: AccountStore, login: str, kind: str) -> None:
-    """В потоке, после ответа: неудача сверки — в замок; строка «gw login refused» — логин, только если он
-    существует (точечный запрос store.status). kind: password (сверка не прошла), locked, busy."""
+def _refused_line(store: AccountStore, login: str, kind: str, at: float | None = None) -> None:
+    """В потоке, после ответа: неудача сверки — в замок (с меткой at, если шлюз её уже учёл); строка «gw login
+    refused» — логин, только если он существует (точечный запрос store.status). kind: password (сверка не
+    прошла), locked, busy."""
     if kind == "password":
         try:
-            store.failure(login)
+            store.failure(login, at)
         except Exception as exc:
             log.warning("шлюз: неудачный вход не записан (%s)", type(exc).__name__)
     shown, reason = "<неизвестный>", "unknown" if kind == "password" else kind
@@ -350,13 +357,15 @@ def _refused_line(store: AccountStore, login: str, kind: str) -> None:
     log.warning("gw login refused login=%s reason=%s", shown, reason)
 
 
-def _after_verify(store: AccountStore, login: str) -> Callable[[object], None]:
-    """after попытки LoginGate: неудача сверки — в замок и в журнал, замок — в журнал; удача — ничего."""
-    def after(result: object) -> None:
+def _after_verify(store: AccountStore, login: str) -> Callable[[object, float | None], Callable[[], None] | None]:
+    """after попытки LoginGate — задание писателю: неудача сверки — в замок с меткой шлюза и в журнал, замок — в
+    журнал; удача — ничего."""
+    def after(result: object, at: float | None) -> Callable[[], None] | None:
         if result is None:
-            _refused_line(store, login, "password")
-        elif result is LOCKED:
-            _refused_line(store, login, "locked")
+            return lambda: _refused_line(store, login, "password", at)
+        if result is LOCKED:
+            return lambda: _refused_line(store, login, "locked")
+        return None
     return after
 
 
@@ -376,21 +385,21 @@ def auth_router(role: "GatewayRole") -> APIRouter:
         if creds is None:
             return _error(400, "bad_body")
         name, password = creds
-        store = role.store
+        store, gate, key = role.store, role.login_gate, login_key(name)
         try:
-            locked = await asyncio.to_thread(store.locked, name)
+            # метки незаписанных неудач — до чтения базы: записанная между чтениями видна в обоих, считается раз
+            locked = await asyncio.to_thread(store.locked, name, gate.pending_of(key))
         except StoreError:
             return _error(503, "store")
         if locked:
             return _error(429, "locked", background=BackgroundTask(_refused_line, store, name, "locked"))
-        gate = role.login_gate
         if gate.full():                  # без scrypt
             role.stats.event("login_busy")
             return _error(429, "busy", background=BackgroundTask(_refused_line, store, name, "busy"))
         try:
-            # неудача пишется в замок после ответа, но до того, как место очереди отдано следующей попытке
-            account = await gate.attempt(lambda: _check_and_verify(store, name, password),
-                                         _after_verify(store, name))
+            # неудача ложится в память до того, как место очереди отдано следующей попытке, в замок — потом
+            account = await gate.attempt(key, lambda pending: _check_and_verify(store, name, password, pending),
+                                         lambda result: result is None, _after_verify(store, name))
         except StoreError:
             return _error(503, "store")
         if account is LOCKED:

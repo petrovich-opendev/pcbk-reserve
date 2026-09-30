@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -190,9 +190,19 @@ def _stamps_locked(stamps: deque[float] | None, now: float) -> bool:
     return stamps is not None and len(stamps) >= LOCK_FAILURES and stamps[-LOCK_FAILURES] > now - LOCK_WINDOW_S
 
 
-def _key(login: object) -> bytes:
-    """Ключ счётчика неизвестных логинов: sha256 — память не держит ни длинных строк, ни пароля, набранного
-    в поле логина."""
+def _locked_by(stamps: Iterable[float], pending: Iterable[float], now: float) -> bool:
+    """Замок по записанным меткам и меткам pending, ещё не записанным: метка pending, которая уже есть среди
+    записанных (записали между чтениями), второй раз не считается. Записанные считаются все, и с одинаковым
+    временем: метки шлюза различны, а вход без метки (failure(login)) пишет время часов."""
+    horizon = now - LOCK_WINDOW_S
+    recorded = [t for t in stamps if t > horizon]
+    seen = set(recorded)
+    return len(recorded) + sum(1 for t in set(pending) if t > horizon and t not in seen) >= LOCK_FAILURES
+
+
+def login_key(login: object) -> bytes:
+    """Ключ счётчиков по логину — неизвестных логинов здесь и незаписанных неудач у шлюза: sha256 — память не
+    держит ни длинных строк, ни пароля, набранного в поле логина."""
     text = login if isinstance(login, str) else repr(login)
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest()
 
@@ -541,41 +551,48 @@ class AccountStore:
 
     # --- замок входа ---
 
-    def locked(self, login: str) -> bool:
+    def locked(self, login: str, pending: Iterable[float] = ()) -> bool:
         """LOCK_FAILURES неудачных входов за LOCK_WINDOW_S — замок. Существующий логин — по таблице (переживает
-        перезапуск), прочие — по памяти; ответ для обоих одинаков (нет оракула)."""
+        перезапуск), прочие — по памяти; ответ для обоих одинаков (нет оракула).
+
+        pending — метки неудач этого логина, которые шлюз уже насчитал, но ещё не записал (итоговое ревью Д5а,
+        А4-m1); запись идёт с той же меткой (failure(login, at)). Вызывающий берёт их до вызова: неудача,
+        записанная между двумя чтениями, видна в обоих и считается один раз, а снятая из pending после записи
+        уже есть в таблице — счёт точный, без ожидания записи."""
         now = self.clock()
         if isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
             with self._op() as db:
                 if db.execute("SELECT 1 FROM gw_accounts WHERE login = ?", (login,)).fetchone() is not None:
-                    n = db.execute("SELECT count(*) FROM gw_login_failures WHERE login = ? AND at > ?",
-                                   (login, now - LOCK_WINDOW_S)).fetchone()[0]
-                    return n >= LOCK_FAILURES
+                    rows = db.execute("SELECT at FROM gw_login_failures WHERE login = ? AND at > ?",
+                                      (login, now - LOCK_WINDOW_S)).fetchall()
+                    return _locked_by((row[0] for row in rows), pending, now)
         with self._unknown_lock:
-            return _stamps_locked(self.unknown_failures.get(_key(login)), now)
+            stamps = list(self.unknown_failures.get(login_key(login)) or ())
+        return _locked_by(stamps, pending, now)
 
-    def failure(self, login: str) -> None:
-        """Неудачный вход. Существующий логин — строка таблицы (в ней только окно и не больше LOCK_FAILURES
-        строк логина), прочие — память: UNKNOWN_KEYS ключей; вытесняется самый старый незапертый, запертые —
-        последними (ревью А2, M2)."""
+    def failure(self, login: str, at: float | None = None) -> None:
+        """Неудачный вход с меткой at (без неё — сейчас). Существующий логин — строка таблицы (в ней только
+        окно и не больше LOCK_FAILURES строк логина), прочие — память: UNKNOWN_KEYS ключей; вытесняется самый
+        старый незапертый, запертые — последними (ревью А2, M2)."""
         now = self.clock()
+        stamp = now if at is None else at
         if isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
             with self._op(write=True) as db:
                 if db.execute("SELECT 1 FROM gw_accounts WHERE login = ?", (login,)).fetchone() is not None:
                     db.execute("BEGIN IMMEDIATE")
-                    db.execute("INSERT INTO gw_login_failures (login, at) VALUES (?, ?)", (login, now))
+                    db.execute("INSERT INTO gw_login_failures (login, at) VALUES (?, ?)", (login, stamp))
                     db.execute("DELETE FROM gw_login_failures WHERE at <= ?", (now - LOCK_WINDOW_S,))
                     db.execute("DELETE FROM gw_login_failures WHERE login = ? AND rowid NOT IN (SELECT rowid"
                                " FROM gw_login_failures WHERE login = ? ORDER BY at DESC, rowid DESC LIMIT ?)",
                                (login, login, LOCK_FAILURES))
                     db.execute("COMMIT")
                     return
-        key = _key(login)
+        key = login_key(login)
         with self._unknown_lock:
             stamps = self.unknown_failures.get(key)
             if stamps is None:
                 stamps = self.unknown_failures[key] = deque(maxlen=LOCK_FAILURES)
-            stamps.append(now)
+            stamps.append(stamp)
             self._unknown_open.pop(key, None)
             self._unknown_locked.pop(key, None)
             (self._unknown_locked if _stamps_locked(stamps, now) else self._unknown_open)[key] = None
@@ -601,7 +618,7 @@ class AccountStore:
         self._forget_unknown(login)
 
     def _forget_unknown(self, login: object) -> None:
-        key = _key(login)
+        key = login_key(login)
         with self._unknown_lock:
             self.unknown_failures.pop(key, None)
             self._unknown_open.pop(key, None)

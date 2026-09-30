@@ -193,6 +193,23 @@ def test_verify_one_scrypt_in_every_case(tmp_path, monkeypatch):                
     assert s.verify("ivanov", PW) is not None and len(calls) == 1                     # положительный контроль
 
 
+def test_lock_counts_pending_stamps_once(tmp_path):                                   # итоговое ревью Д5а, А4-m1 (R7)
+    """Метки неудач, которые шлюз учёл, но ещё не записал (pending), считаются вместе с записанными; неудача,
+    видная и там и там (записали между чтениями), — один раз; метки вне окна — нет. Таблица и память — одинаково."""
+    clock = FakeMono(5000.0)
+    s = store(tmp_path, clock=clock)
+    s.add("ivanov", "student", 3, PW)
+    stamps = [4990.0 + i for i in range(LOCK_FAILURES)]
+    old = [5000.0 - LOCK_WINDOW_S - 1, 5000.0 - LOCK_WINDOW_S]                        # окно — строго позже
+    for name in ("ivanov", "nobody7", "Не-Логин!"):
+        for t in stamps[:3]:
+            s.failure(name, t)
+        assert not s.locked(name, stamps[:3] + old), name                              # 3, а не 6 и не 8
+        assert not s.locked(name, stamps[2:4]), name                                   # 4
+        assert s.locked(name, stamps[2:]), name                                        # 5
+    assert s.locked("ivanov") is False and s.locked("ivanov", ()) is False
+
+
 def test_store_errors_counted_without_paths(tmp_path, monkeypatch):
     s = store(tmp_path)
     monkeypatch.setattr(sqlite3, "connect", fail_connect)

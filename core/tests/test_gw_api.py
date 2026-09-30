@@ -14,8 +14,8 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.routing import Match
 
-from helpers import ORIGIN, PW, login, make_gateway, serve_app, wait_until
-from pcbk_core.gateway import accounts
+from helpers import ORIGIN, PW, login, make_gateway, serve_app, wait_until, wait_until_async
+from pcbk_core.gateway import LoginGate, accounts
 from pcbk_core.gateway.api import (COOKIE_HEADERS_BUDGET, COOKIE_PATH_MAX_LEN, GW_MESSAGES, LOGIN_PARALLEL,
                                    MAX_SESSION_COOKIES, catch_all_router, clear_cookies)
 
@@ -203,10 +203,10 @@ def test_wrong_password_answer_does_not_wait_for_failure_record(tmp_path, monkey
     app, role = make_gateway(tmp_path)
     entered, release, real = threading.Event(), threading.Event(), role.store.failure
 
-    def blocked(name):
+    def blocked(name, *at):
         entered.set()
         release.wait(10)
-        real(name)
+        real(name, *at)
     monkeypatch.setattr(role.store, "failure", blocked)
     with serve_app(app) as url:                                                        # uvicorn: ответ — до фона
         try:
@@ -288,17 +288,23 @@ def test_no_route_is_404_without_allow_in_any_zone(tmp_path):                   
                 assert "allow" not in r.headers, (base, method, path)
 
 
-async def test_relock_before_verify_bounds_scrypt(tmp_path, monkeypatch):             # F4 (ревью A, M1)
-    """30 одновременных неверных входов одного логина: неудача ложится в замок до того, как место очереди
-    отдано следующей попытке, и та перед сверкой видит замок — сверок не больше LOCK_FAILURES - 1 + LOGIN_PARALLEL."""
+async def test_relock_before_verify_bounds_scrypt(tmp_path, monkeypatch):             # F4 (ревью A, M1); R7, R9
+    """30 одновременных неверных входов одного логина: неудача учтена в памяти до того, как место очереди отдано
+    следующей попытке, и та перед сверкой видит её в замке, хотя в базу она ещё не записана (запись нарочно
+    медленнее сверки, R9) — сверок не больше LOCK_FAILURES - 1 + LOGIN_PARALLEL."""
     app, role = make_gateway(tmp_path)
-    calls, real = [], accounts.verify_password
+    calls, real, record = [], accounts.verify_password, role.store.failure
 
     def slow(pw, stored):
         calls.append(1)
         time.sleep(0.1)
         return real(pw, stored)
+
+    def slow_record(name, *at):
+        time.sleep(0.15)
+        record(name, *at)
     monkeypatch.setattr(accounts, "verify_password", slow)
+    monkeypatch.setattr(role.store, "failure", slow_record)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
         rs = await asyncio.gather(*(c.post("/pcbk/api/auth/login", json={"login": "stu-03", "password": "неверный-1"},
@@ -308,6 +314,72 @@ async def test_relock_before_verify_bounds_scrypt(tmp_path, monkeypatch):       
     assert len(calls) <= accounts.LOCK_FAILURES - 1 + LOGIN_PARALLEL, len(calls)
     assert codes.count(401) == len(calls) and set(codes) <= {401, 429}
     assert failures(tmp_path) == accounts.LOCK_FAILURES                                 # таблица держит не больше порога
+    assert role.login_gate.pending == {}                                                # записано — из памяти ушло
+
+
+async def test_queue_slot_freed_before_failure_record(tmp_path, monkeypatch):         # итоговое ревью Д5а, А4-m1 (R7)
+    """Место очереди освобождается сразу после сверки: запись неудачи в замок стоит, а попыток подряд больше, чем
+    мест, — все получают ответ; неудачи не теряются и после записи уходят из памяти."""
+    app, role = make_gateway(tmp_path)
+    entered, release, record = threading.Event(), threading.Event(), role.store.failure
+
+    def blocked(name, *at):
+        entered.set()
+        release.wait(10)
+        record(name, *at)
+    monkeypatch.setattr(role.store, "failure", blocked)
+    n = LOGIN_PARALLEL + 2                                                              # меньше порога замка
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
+        try:
+            for _ in range(n):
+                r = await asyncio.wait_for(c.post("/pcbk/api/auth/login", headers={"Origin": ORIGIN},
+                                                  json={"login": "stu-03", "password": "неверный-1"}), 5)
+                assert r.status_code == 401
+            assert entered.is_set() and failures(tmp_path) == 0                        # запись первой всё ещё стоит
+            assert len(role.login_gate.pending_of(accounts.login_key("stu-03"))) == n  # а в памяти — все
+            r = await asyncio.wait_for(c.post("/pcbk/api/auth/login", headers={"Origin": ORIGIN},
+                                              json={"login": "stu-03", "password": PW}), 5)
+            assert r.status_code == 200                                                 # n + 0 < порога — вход есть
+        finally:
+            release.set()
+        await role.login_gate.drain()
+    assert failures(tmp_path) == n and role.login_gate.pending == {}
+
+
+async def test_unrecorded_failures_lock_before_queue(tmp_path, monkeypatch):           # R7: замок и до очереди
+    """Незаписанные неудачи логина запирают вход уже на первой проверке замка — без места в очереди и scrypt."""
+    app, role = make_gateway(tmp_path)
+    gate = role.login_gate
+    gate.pending[accounts.login_key("stu-03")] = [time.time() - i for i in range(accounts.LOCK_FAILURES)]
+    calls, real, attempt = [], accounts._scrypt, gate.attempt
+    monkeypatch.setattr(accounts, "_scrypt", lambda pw, salt: (calls.append(1), real(pw, salt))[1])
+    monkeypatch.setattr(gate, "attempt", lambda *a: (calls.append("место"), attempt(*a))[1])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
+        r = await c.post("/pcbk/api/auth/login", headers={"Origin": ORIGIN}, json={"login": "stu-03", "password": PW})
+        assert (r.status_code, r.json()["data"]["message"], calls) == (429, GW_MESSAGES["locked"], [])
+        r = await c.post("/pcbk/api/auth/login", headers={"Origin": ORIGIN}, json={"login": "stu-05", "password": PW})
+        assert (r.status_code, calls) == (200, ["место", 1])                            # чужой логин не заперт
+
+
+async def test_cancelled_attempt_does_not_hang_request():                             # итоговое ревью Д5а, А4-m2 (R8)
+    """Задачу попытки отменили (остановка, отмена задач цикла): запрос получает отмену, а не ждёт вечно; место
+    очереди свободно."""
+    gate = LoginGate(1, 1, 8)
+    started, release = threading.Event(), threading.Event()
+
+    def check(pending):
+        started.set()
+        release.wait(10)
+    try:
+        request = asyncio.create_task(gate.attempt(b"k", check, lambda r: r is None, lambda r, at: None))
+        await wait_until_async(started.is_set)
+        [attempt] = gate._tasks
+        attempt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, 2)                                           # висящий запрос — TimeoutError
+    finally:
+        release.set()
+    assert not gate._sem.locked() and gate.pending == {}
 
 
 def test_refused_line_is_point_query(tmp_path, monkeypatch, gwlog):                      # F5 (ревью A, M2)

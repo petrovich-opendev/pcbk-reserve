@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -59,23 +61,51 @@ class LoginGate:
     """Сверки scrypt входа (Д5-R25): не больше parallel попыток разом, ждущих — не больше queue.
 
     full() и attempt() зовутся подряд без await между ними — решение и постановка в очередь атомарны в цикле
-    событий. Попытка — своя задача, запрос её не отменяет: check (замок и сверка) идёт в потоке, итог
-    отдаётся запросу сразу, затем в потоке — after(итог) (запись неудачи в замок), и только после него место
-    освобождается. Так ответ не ждёт записи неудачи (время ответа не выдаёт, есть ли логин), а следующая
-    попытка того же логина уже видит её в замке (ревью А4, M1): сверок одного логина при наплыве — не больше
-    LOCK_FAILURES - 1 + parallel. Отменённый запрос не открывает дорогу лишнему scrypt и не теряет неудачу.
+    событий. Попытка — своя задача, запрос её не отменяет: check(pending) (замок и сверка) идёт в потоке, и
+    место освобождается сразу после неё. Неудача сверки (failed) получает метку времени — строго растущую — и
+    ложится в память, pending[key], в той же задаче без await, до освобождения места: следующая попытка того же
+    логина видит её в замке ещё до записи (ревью А4, M1), сверок одного логина при наплыве — не больше
+    LOCK_FAILURES - 1 + parallel. Запись в замок с той же меткой и строка журнала (задание after(итог, метка))
+    идут потом, по одному, в задаче-писателе вне места очереди (итоговое ревью Д5а, А4-m1): место
+    освобождается одинаково быстро, куда бы ни писалась неудача — в таблицу (логин есть) или в память (нет), и
+    ответ записи не ждёт. Метка уходит из pending после записи; замок считает метки таблицы и pending
+    объединением — точно, без ожидания записи. Незаписанных заданий больше backlog — full(): при долгой чужой
+    блокировке базы вход «перегружен» без scrypt, а память и пул потоков не растут. Отменённый запрос не
+    открывает дорогу лишнему scrypt и не теряет неудачу; отменённая задача попытки отменяет и ответ — запрос не
+    висит (А4-m2).
     """
 
-    def __init__(self, parallel: int, queue: int):
+    def __init__(self, parallel: int, queue: int, backlog: int, clock: Callable[[], float] = time.time):
         self._sem = asyncio.Semaphore(parallel)
         self._queue = queue
+        self._backlog = backlog
+        self._clock = clock
+        self._last_stamp = float("-inf")
         self._tasks: set[asyncio.Task] = set()
+        self._jobs: deque[tuple[bytes, float | None, Callable[[], None] | None]] = deque()
+        self._writer: asyncio.Task | None = None
+        self.pending: dict[bytes, list[float]] = {}
         self.waiting = 0
 
     def full(self) -> bool:
-        return self._sem.locked() and self.waiting >= self._queue
+        return (self._sem.locked() and self.waiting >= self._queue) or len(self._jobs) >= self._backlog
 
-    async def attempt(self, check: Callable[[], _T], after: Callable[[_T], None]) -> _T:
+    def pending_of(self, key: bytes) -> tuple[float, ...]:
+        """Метки незаписанных неудач логина — снимок; вызывающий берёт его до чтения замка (AccountStore.locked)."""
+        return tuple(self.pending.get(key, ()))
+
+    def _stamp(self) -> float:
+        """Метка неудачи: время часов, строго больше прежней — метки двух неудач не совпадают никогда."""
+        t = self._clock()
+        if t <= self._last_stamp:
+            t = math.nextafter(self._last_stamp, math.inf)
+        self._last_stamp = t
+        return t
+
+    async def attempt(self, key: bytes, check: Callable[[tuple[float, ...]], _T], failed: Callable[[_T], bool],
+                      after: Callable[[_T, float | None], Callable[[], None] | None]) -> _T:
+        """key — ключ логина (login_key); check(pending) — в потоке, с местом; failed(итог) — неудача сверки: ей
+        метка в pending; after(итог, метка) — задание писателю (в потоке, вне места) или None."""
         self.waiting += 1
         try:
             await self._sem.acquire()
@@ -83,7 +113,7 @@ class LoginGate:
             self.waiting -= 1
         verdict: asyncio.Future = asyncio.get_running_loop().create_future()
         try:
-            task = asyncio.create_task(self._run(check, after, verdict), name="gw-login")
+            task = asyncio.create_task(self._run(key, check, failed, after, verdict), name="gw-login")
         except BaseException:
             self._sem.release()
             raise
@@ -91,25 +121,54 @@ class LoginGate:
         task.add_done_callback(self._tasks.discard)
         return await asyncio.shield(verdict)
 
-    async def _run(self, check: Callable[[], _T], after: Callable[[_T], None], verdict: asyncio.Future) -> None:
+    async def _run(self, key: bytes, check: Callable[[tuple[float, ...]], _T], failed: Callable[[_T], bool],
+                   after: Callable[[_T, float | None], Callable[[], None] | None], verdict: asyncio.Future) -> None:
         try:
             try:
-                result = await asyncio.to_thread(check)
+                result = await asyncio.to_thread(check, self.pending_of(key))
             except Exception as exc:
                 verdict.set_exception(exc)
                 verdict.exception()     # забрано: ушедший запрос не оставит «исключение не получено»
                 return
+            stamp = self._stamp() if failed(result) else None
+            job = after(result, stamp)
+            if stamp is not None:       # без await и до освобождения места
+                self.pending.setdefault(key, []).append(stamp)
+            if stamp is not None or job is not None:
+                self._enqueue(key, stamp, job)
             verdict.set_result(result)
-            try:
-                await asyncio.to_thread(after, result)
-            except Exception as exc:
-                log.warning("шлюз: после сверки входа — %s", type(exc).__name__)
         finally:
+            if not verdict.done():      # задачу отменили (остановка): запрос получает отмену, а не ждёт вечно
+                verdict.cancel()
             self._sem.release()
 
+    def _enqueue(self, key: bytes, stamp: float | None, job: Callable[[], None] | None) -> None:
+        self._jobs.append((key, stamp, job))
+        if self._writer is None or self._writer.done():
+            self._writer = asyncio.create_task(self._write(), name="gw-login-record")
+
+    async def _write(self) -> None:
+        """Писатель: задания по одному, в потоке; метка уходит из pending после записи — и после её сбоя."""
+        while self._jobs:
+            key, stamp, job = self._jobs.popleft()
+            try:
+                if job is not None:
+                    await asyncio.to_thread(job)
+            except Exception as exc:
+                log.warning("шлюз: после сверки входа — %s", type(exc).__name__)
+            finally:
+                if stamp is not None:
+                    stamps = self.pending.get(key, [])
+                    if stamp in stamps:
+                        stamps.remove(stamp)
+                    if not stamps:
+                        self.pending.pop(key, None)
+
     async def drain(self) -> None:
-        """Дождаться идущих попыток (запись неудач) — на остановке роли и в тестах."""
+        """Дождаться идущих попыток и записи их неудач — на остановке роли и в тестах."""
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        while self._writer is not None and not self._writer.done():
+            await asyncio.gather(self._writer, return_exceptions=True)
 
 
 class GatewayRole(RoleBase):
@@ -121,7 +180,7 @@ class GatewayRole(RoleBase):
                  stats: GatewayStats, config_error: str | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
-        from .api import LOGIN_PARALLEL, LOGIN_QUEUE
+        from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
 
         self.settings = settings
         self.gw = gw
@@ -132,7 +191,7 @@ class GatewayRole(RoleBase):
         self.monotonic = monotonic
         self.wallclock = wallclock
         self.started_at = wallclock()           # checked_at до первого такта — время запуска роли
-        self.login_gate = LoginGate(LOGIN_PARALLEL, LOGIN_QUEUE)
+        self.login_gate = LoginGate(LOGIN_PARALLEL, LOGIN_QUEUE, LOGIN_BACKLOG, clock=store.clock)
         self._reaper: asyncio.Task | None = None
 
     # --- маршруты и крючки ---
