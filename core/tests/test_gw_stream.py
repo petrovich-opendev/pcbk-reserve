@@ -436,7 +436,7 @@ def test_event_open_answers_mapped(tmp_path, gwlog):                            
         login(c, "stu-03")
         fp.force_status[3] = (500, {})                                                   # место ответило, но не 200
         r = c.get("/pcbk/api/oc/event")
-        assert (r.status_code, r.json()) == (503, {"name": "WorkplaceNotReady",
+        assert (r.status_code, r.json()) == (502, {"name": "BadGateway",                  # N4: место готово — не «спит»
                                                    "data": {"message": PROXY_MESSAGES["no_answer"]}})
         assert role.workplaces.is_ready(3) and role.stats.count_1h("upstream_failed") == 1   # N4: счёт без снятия
         fp.force_status[3] = (200, {"content-encoding": "gzip"})                         # сжатый поток не разобрать
@@ -456,7 +456,7 @@ def test_event_open_answers_mapped(tmp_path, gwlog):                            
         assert (r.status_code, r.json()["data"]["message"]) == (502, PROXY_MESSAGES["place_auth"])
         assert "www-authenticate" not in r.headers
     text = gwlog.text
-    assert "rule=event status=503" in text and "place_status=500" in text and "error=RemoteProtocolError" in text
+    assert "rule=event status=502" in text and "place_status=500" in text and "error=RemoteProtocolError" in text
     assert "zqMARKqz" not in text
     assert role.stats.count_1h("place_auth_failed") == 1 and role.stats.streams == 0 and fp.event_open[3] == 0
     assert role.stats.count_1h("upstream_failed") == 3                                   # 500, сжатый поток и обрыв
@@ -874,10 +874,12 @@ def test_event_not_stream_counted_and_rolled(tmp_path, gwlog):                  
     fp.force_status[3] = (500, {})                                                       # место живо, но не отдаёт поток
     with TestClient(app, base_url=BASE) as c:
         login(c, "stu-03")
-        codes = [c.get("/pcbk/api/oc/event").status_code for _ in range(5)]           # цикл переподключения адаптера
-    assert codes == [503] * 5 and role.workplaces.is_ready(3)                           # «готово» не снято
+        answers = [c.get("/pcbk/api/oc/event") for _ in range(5)]                      # цикл переподключения адаптера
+    assert [(r.status_code, r.json()) for r in answers] == \
+           [(502, {"name": "BadGateway", "data": {"message": PROXY_MESSAGES["no_answer"]}})] * 5
+    assert role.workplaces.is_ready(3)                                                   # «готово» не снято: не «спит»
     assert role.stats.count_1h("upstream_failed") == 5                                   # сторож видит каждый
-    lines = re.findall(r"WARNING \S+ gw oc login=stu-03 place=03 rule=event status=503 ms=[0-9]+ reason=no_answer "
+    lines = re.findall(r"WARNING \S+ gw oc login=stu-03 place=03 rule=event status=502 ms=[0-9]+ reason=no_answer "
                        r"place_status=500 n=([0-9]+) since_s=[0-9]+", gwlog.text)
     assert lines == ["1"]                                                                # строка — одна на место за минуту
 

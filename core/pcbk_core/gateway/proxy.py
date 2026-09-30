@@ -42,9 +42,10 @@ not_ready: без счётчика, строка журнала — одна н�
 переподключается так же часто); место не готово — 503 not_ready (не будит); у GET есть тело (Content-Length > 0 или
 Transfer-Encoding) — 400 bad_body до потока места: иначе тело держало бы общий бюджет тел всю жизнь потока. Затем
 поток места (Workplaces.stream): срок заголовков STREAM_OPEN_S и ошибка соединения — 503 no_answer, место неготово,
-upstream_failed; занятый пул клиента места — 503 busy, как у вызовов; 401 — 502 place_auth; иначе не 200 — 503
-no_answer и upstream_failed без снятия «готово», строка — одна на место за NOT_READY_LOG_S (итоговая доводка Д5б,
-N4: адаптер переподключается до 6 раз в секунду); сжатый поток — как нет ответа. Слот учётки занимается только после 200 места, прямо перед
+upstream_failed; занятый пул клиента места — 503 busy, как у вызовов; 401 — 502 place_auth; иначе не 200 — 502
+BadGateway с текстом no_answer и upstream_failed без снятия «готово» (не 503 WorkplaceNotReady: место готово, чат не
+должен звать «Разбудить»), строка — одна на место за NOT_READY_LOG_S (итоговая доводка Д5б, N4: адаптер
+переподключается до 6 раз в секунду); сжатый поток — как нет ответа. Слот учётки занимается только после 200 места, прямо перед
 StreamingResponse (гонка вкладок — тот же 429); владение слотом и потоком места ответ принимает в момент return, до
 него их возвращает finally обработчика (сначала слот, затем поток места).
 
@@ -700,9 +701,10 @@ async def stream_events(role: GatewayRole, account: Account, token: str, n: int,
             role.stats.event("upstream_failed")
             rolled = not_stream.refused(n) if not_stream is not None else (1, 0)
             if rolled is not None:
-                _oc_line(call, _EVENT_RULE, 503, started, " reason=no_answer place_status=%d n=%d since_s=%d"
+                _oc_line(call, _EVENT_RULE, 502, started, " reason=no_answer place_status=%d n=%d since_s=%d"
                          % (status, *rolled), warn=True)
-            return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["no_answer"])
+            # 502 BadGateway, не 503 WorkplaceNotReady: место готово, и «Разбудить» в чате Д6 ходило бы по кругу
+            return gw_error(502, "BadGateway", PROXY_MESSAGES["no_answer"])
         if response.headers.get("content-encoding", "").strip().lower() not in ("", "identity"):
             role.workplaces.mark_unready(n)         # как сжатый ответ вызова (PlaceAnswerEncoded): не разобрать
             role.stats.event("upstream_failed")
