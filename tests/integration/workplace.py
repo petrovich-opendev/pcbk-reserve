@@ -1,6 +1,11 @@
 """Константы рабочего места для тестов: образ, окружение, точки монтирования, метки."""
 
-IMAGE = "pcbk-reserve/student:d2"
+IMAGE = "pcbk-reserve/student:d4"
+# модели места — ровно список прокси по порядку select_models("") (core/pcbk_core/llm/models.py)
+MODELS = ["z-ai/glm-5.3", "deepseek/deepseek-v4.1-flash", "google/gemini-3.8-flash", "openai/gpt-6-sol",
+          "z-ai/glm-5.3-flash", "openai/gpt-6-luna", "anthropic/claude-sonnet-5.5"]
+# те же имена через @openrouter/ai-sdk-provider: reasoning_details с подписями (Д4б-R20)
+OR_MODELS = ["google/gemini-3.8-flash", "anthropic/claude-sonnet-5.5"]
 # начало описания каждой заглушки bash/edit/write/apply_patch
 STUB_PREFIX = "Отключено на учебном стенде"
 # окружение образа места — ровно эти переменные сверх PATH базового образа

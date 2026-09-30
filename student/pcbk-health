@@ -1,5 +1,9 @@
 #!/bin/bash
-# student/pcbk-health — GET /agent (ручка экземпляра); печатает только код, вывод видит сторож
+# student/pcbk-health — GET /agent (ручка экземпляра) и состояние MCP службы данных; вывод видит сторож:
+# не 200 — только код, выход 1; 200 — «200 mcp=<слово>», выход 0. Больше ничего, stderr пуст.
+# MCP в состоянии failed (core лежал при старте места) — POST /mcp/pcbk/connect не чаще раза в 60 с:
+# connect меняет клиента одного MCP, экземпляр, поток /event и идущий ход не трогает (Д4б-R18).
+# Сроки: 3 + 1 + 0,4 с — весь прогон ≤ 4,5 с при сроке HEALTHCHECK 5 с.
 trap '' PIPE   # сброс соединения — не смерть от SIGPIPE без вывода, а код 000
 pw=""
 { IFS= read -r pw < /run/secrets/opencode-pw; } 2>/dev/null || true
@@ -9,6 +13,39 @@ if { exec 3<>/dev/tcp/127.0.0.1/4096; } 2>/dev/null; then   # ошибку со�
   # ошибки записи и чтения (сброс, обрыв) — тоже не в вывод: в журнале здоровья только код
   if printf 'GET /agent HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\nConnection: close\r\n\r\n' "$auth" >&3 2>/dev/null \
      && read -r -t 3 _ status _ <&3 2>/dev/null && [[ $status =~ ^[0-9]{3}$ ]]; then code=$status; fi
+  exec 3<&-
 fi
-echo "$code"
-[ "$code" = 200 ]
+if [ "$code" != 200 ]; then
+  echo "$code"
+  exit 1
+fi
+
+# слово — status у pcbk из GET /mcp; нет ответа за 1 с (первый GET ждёт ленивого подъёма MCP) — unknown
+word=unknown
+resp=""
+if { exec 3<>/dev/tcp/127.0.0.1/4096; } 2>/dev/null; then
+  if printf 'GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\nConnection: close\r\n\r\n' "$auth" >&3 2>/dev/null; then
+    IFS= read -r -d '' -t 1 resp <&3 2>/dev/null   # ответ целиком: до закрытия соединения или срока
+  fi
+  exec 3<&-
+fi
+re='"pcbk":\{"status":"([a-z_]+)"'
+if [[ $resp =~ $re ]]; then word=${BASH_REMATCH[1]}; fi
+
+# переподключение: метка старше 50 с при такте 30 с — ровно каждый второй такт, раз в 60 с
+if [ "$word" = failed ]; then
+  mark=/tmp/pcbk-mcp-retry
+  printf -v now '%(%s)T' -1
+  last=$(stat -c %Y "$mark" 2>/dev/null)
+  if ! [[ $last =~ ^[0-9]+$ ]] || (( now - last >= 50 )); then
+    # без метки нет и попытки: иначе предел «раз в 60 с» не держится
+    if touch "$mark" 2>/dev/null && { exec 3<>/dev/tcp/127.0.0.1/4096; } 2>/dev/null; then
+      # ответа не ждём: обрыв клиента connect не прерывает
+      printf 'POST /mcp/pcbk/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' "$auth" >&3 2>/dev/null \
+        && read -r -t 0.4 _ <&3 2>/dev/null
+      exec 3<&-
+    fi
+  fi
+fi
+echo "200 mcp=$word"
+exit 0
