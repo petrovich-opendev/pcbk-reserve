@@ -1,8 +1,9 @@
 """Тело запроса к OpenRouter — заново из белого списка — и метка хода для предела шагов.
 
 От клиента не пересылается ничего сверх белого списка: платные и опасные поля (`models`, `route`,
-`plugins`, `preset`, `service_tier`, `transforms`, свой `provider`, серверные инструменты, вложения)
-пропадают при сборке. Свои поля — модель, точка, усилие, `max_price`, `user`, `session_id` — ставит
+`plugins`, `preset`, `service_tier`, `transforms`, свой `provider`, серверные инструменты) пропадают при
+сборке, а вложения (картинки, файлы, звук) заменяются постоянной частью ATTACHMENT_TEXT — ни одного их
+байта наверх не уходит. Свои поля — модель, точка, усилие, `max_price`, `user`, `session_id` — ставит
 прокси. Тексты `BodyRefused` идут клиенту после «Запрос к модели отклонён: », поэтому они постоянные:
 без чисел (OpenCode ищет в тексте ошибки 429|500|502…) и без значений из запроса.
 """
@@ -21,6 +22,11 @@ MAX_MESSAGES = 4000
 SESSION_RE = re.compile(r"ses_[0-9A-Za-z]{26}")
 # текст сообщения сжатия (OpenCode 1.18.33, session/message-v2.ts:235)
 SUMMARY_PROMPT = "What did we do so far?"
+# первая часть сообщения `user`, которым OpenCode передаёт вложения из ответа инструмента
+# (OpenCode 1.18.33, session/message-v2.ts:46, :382–399): это шаг хода, а не вопрос человека
+SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
+# чем заменяется часть, не являющаяся текстом (доводка ревью, раунд 2): сессия не застревает на отказе
+ATTACHMENT_TEXT = "[вложение не передаётся на учебном стенде]"
 
 _NOT_OBJECT = "тело запроса — не объект JSON"
 _NO_MESSAGES = "в запросе нет списка сообщений"
@@ -28,7 +34,6 @@ _TOO_MANY = "в разговоре слишком много сообщений 
 _BAD_MESSAGE = "сообщение разговора — не объект JSON"
 _BAD_ROLE = "роль сообщения не поддерживается: нужны system, user, assistant или tool"
 _BAD_CONTENT = "содержимое сообщения — не текст"
-_NOT_TEXT = "стенд принимает только текст: картинки, файлы и звук в сообщениях не пропускаются"
 _BAD_TOOL_CALL = "вызов инструмента в истории разговора собран неверно"
 _BAD_TOOL_RESULT = "у ответа инструмента нет id вызова"
 _NOT_ENCODABLE = "в запросе есть значения, которые нельзя передать модели (NaN или неверные символы)"
@@ -58,13 +63,14 @@ def _is_number_in(value: object, lo: float, hi: float) -> bool:
 
 
 def _text_part(part: object) -> dict:
+    """Часть `text` заново; любая другая (`image_url`, `file`, `input_audio`, кривая) — ATTACHMENT_TEXT."""
     if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
         return {"type": "text", "text": part["text"]}
-    raise BodyRefused(_NOT_TEXT)
+    return {"type": "text", "text": ATTACHMENT_TEXT}
 
 
 def _text_content(content: object) -> str | list[dict]:
-    """Строка или список частей `text`; `cache_control` частей пропадает."""
+    """Строка или список частей: текст остаётся, вложения заменяются; `cache_control` частей пропадает."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -197,7 +203,8 @@ def rebuild_body(raw: object, policy: ModelPolicy, *, caller: str, session: str 
                  max_tokens_cap: int = MAX_TOKENS_CAP) -> dict:
     """Новое тело для OpenRouter: только поля белого списка и свои поля прокси.
 
-    Не собрать (не объект, плохие сообщения, вложения, значение не в JSON/UTF-8) — `BodyRefused`.
+    Не собрать (не объект, плохие сообщения, значение не в JSON/UTF-8) — `BodyRefused`; вложения не
+    отказ — они заменяются ATTACHMENT_TEXT.
     """
     if not isinstance(raw, dict):
         raise BodyRefused(_NOT_OBJECT)
@@ -284,6 +291,11 @@ def _is_user(msg: object) -> bool:
     return isinstance(msg, dict) and msg.get("role") == "user"
 
 
+def _is_tool_media(texts: list[str]) -> bool:
+    """Сообщение OpenCode с вложениями из ответа инструмента: первая часть — SYNTHETIC_ATTACHMENT_PROMPT."""
+    return bool(texts) and texts[0] == SYNTHETIC_ATTACHMENT_PROMPT
+
+
 def _is_continue(texts: list[str]) -> bool:
     """Продолжение после сжатия (session/compaction.ts:529–531), в том числе с префиксом о вложениях
     и с соседними частями PROMPT_PLAN / BUILD_SWITCH."""
@@ -291,11 +303,12 @@ def _is_continue(texts: list[str]) -> bool:
 
 
 def turn_mark(body: dict) -> TurnMark:
-    """Метка хода по собранному телу (Global Constraints, «Ход и предел шагов»; доводка ревью, I1).
+    """Метка хода по собранному телу (Global Constraints, «Ход и предел шагов»; доводка ревью, I1, раунд 2).
 
-    - последнее сообщение не `user` — `other`;
+    - последнее сообщение не `user` или `user` OpenCode с вложениями из ответа инструмента — `other`;
     - последнее `user` — продолжение после сжатия: `continue` с хешем «настоящего» `user` (не
-      продолжение и не ровно SUMMARY_PROMPT), если он стоит **прямо перед** продолжением, иначе `None`.
+      продолжение, не ровно SUMMARY_PROMPT, не вложения инструмента), если он стоит **прямо перед**
+      продолжением, иначе `None`.
       После сжатия модели уходит `[сжатие, сводка, …хвост…, продолжение]` (session/message-v2.ts:582):
       на первом шаге нового вопроса хвост кончается этим вопросом, посреди хода — ответом модели или
       инструмента;
@@ -309,11 +322,13 @@ def turn_mark(body: dict) -> TurnMark:
     if not messages or not _is_user(messages[-1]):
         return TurnMark("other", None, n)
     texts = _texts(messages[-1])
+    if _is_tool_media(texts):
+        return TurnMark("other", None, n)
     if not _is_continue(texts):
         return TurnMark("user", _text_hash(texts), n)
     before = messages[-2] if n >= 2 else None
     if _is_user(before):
         earlier = _texts(before)
-        if not _is_continue(earlier) and _own_text(earlier) != SUMMARY_PROMPT:
+        if not (_is_continue(earlier) or _is_tool_media(earlier) or _own_text(earlier) == SUMMARY_PROMPT):
             return TurnMark("continue", _text_hash(earlier), n)
     return TurnMark("continue", None, n)

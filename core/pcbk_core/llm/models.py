@@ -9,10 +9,13 @@
 - у точки со скидкой (Gemini на `google-vertex/global`, `discount` 0,5) — цена без скидки: цена в
   списке уже со скидкой, оценка должна пережить её конец.
 
-Вход оценивается по байтам собранного тела: `ceil(байты / bytes_per_token)` токенов. У семейства Gemini
-`bytes_per_token = 1`: его токенизатор режет числа по цифре, а ответы историана — почти одни цифры. У
-остальных — 3 (`BYTES_PER_TOKEN`). Остаток: нарочно подобранный текст (байтовый откат токенизатора — до
-токена на байт) у остальных моделей может стоить до трёх раз больше оценки; упор — лимит ключа $1000.
+Вход оценивается как `ceil(байты собранного тела / BYTES_PER_TOKEN)`, делитель — 1 у всех моделей
+(доводка ревью, раунд 2). Ответы историана — почти одни цифры: Gemini режет числа по цифре, а
+предразбивка cl100k, o200k и DeepSeek дробит такие данные до ≈1,33 байта на токен, так что делитель 3
+верхней оценкой не был. Байтовый откат токенизатора даёт не больше токена на байт — для текста тела
+оценка верхняя. Служебных токенов провайдера (шаблон чата, описание инструментов) в байтах тела нет; их
+перекрывают служебные байты JSON (ключи, кавычки, поля прокси) — это не доказано, упор по-прежнему
+лимит ключа $1000.
 
 Модуль без сторонних зависимостей: его импортирует `LlmSettings.from_env` (П8).
 """
@@ -20,8 +23,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal
 
-# делитель верхней оценки входа по умолчанию (байт на токен); у Gemini — 1, см. строку таблицы
-BYTES_PER_TOKEN = 3
+# делитель верхней оценки входа (байт на токен): 1 у всех моделей — токенов не больше, чем байт
+BYTES_PER_TOKEN = 1
 
 
 @dataclass(frozen=True)
@@ -37,11 +40,10 @@ class ModelPolicy:
     tier_in_usd_m: float = 0.0
     tier_out_usd_m: float = 0.0
     tier_write_usd_m: float = 0.0
-    bytes_per_token: int = BYTES_PER_TOKEN      # делитель оценки входа
 
     def input_tokens(self, body_bytes: int) -> int:
-        """Оценённые токены входа: ceil(байты / bytes_per_token), в целых — без округления float."""
-        return -(-body_bytes // self.bytes_per_token)
+        """Оценённые токены входа: ceil(байты / BYTES_PER_TOKEN), в целых — без округления float."""
+        return -(-body_bytes // BYTES_PER_TOKEN)
 
     def _prices(self, n: int) -> tuple[float, float, float]:
         """(вход, выход, запись) при n токенах входа: с `tier_tokens` и больше — цены длинного входа."""
@@ -72,8 +74,8 @@ CANDIDATES: tuple[ModelPolicy, ...] = (
     ModelPolicy("z-ai/glm-5.3", "fireworks", "high", 1.40, 4.40, 0.0),
     # максимум — fireworks/us (точка fireworks: 0.22 / 0.66)
     ModelPolicy("deepseek/deepseek-v4.1-flash", "fireworks", "high", 0.45, 1.80, 0.45),
-    # без скидки 0,5: 0.75 / 3.75 × 2; токен на цифру — байт на токен
-    ModelPolicy("google/gemini-3.8-flash", "google-vertex/global", "medium", 1.50, 7.50, 0.0, bytes_per_token=1),
+    # без скидки 0,5: 0.75 / 3.75 × 2
+    ModelPolicy("google/gemini-3.8-flash", "google-vertex/global", "medium", 1.50, 7.50, 0.0),
     # максимум — azure/us, azure/eu (+10 %); длинный вход 4.00 / 15.00 / 5.00 + те же 10 %
     ModelPolicy("openai/gpt-6-sol", "azure", "medium", 2.20, 11.00, 2.75,
                 tier_tokens=272_000, tier_in_usd_m=4.40, tier_out_usd_m=16.50, tier_write_usd_m=5.50),

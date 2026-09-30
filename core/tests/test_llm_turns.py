@@ -2,7 +2,7 @@
 import pytest
 
 from helpers import FakeMono
-from pcbk_core.llm.request import SUMMARY_PROMPT, TurnMark, turn_mark
+from pcbk_core.llm.request import SUMMARY_PROMPT, SYNTHETIC_ATTACHMENT_PROMPT, TurnMark, turn_mark
 from pcbk_core.llm.turns import COMPACTION_CONTINUE, TURN_CALLS, TURN_IDLE_S, TurnLimiter, TurnLimitReached
 
 M1, M1_AGAIN_LATER = TurnMark("user", "h1", 2), TurnMark("user", "h1", 6)
@@ -159,3 +159,26 @@ def test_same_short_question_with_compaction_on_first_step_is_new_turn():
     assert t.step("student-01", "ses_a", first) == 1
     assert t.step("student-01", "ses_a", turn_mark({"messages": [*squeezed, user(COMPACTION_CONTINUE), call(1),
                                                                  result(1)]})) == 2
+
+
+# --- доводка по ревью задачи 3, раунд 2 ---
+
+def test_same_continue_mark_repeated_counts_up():
+    """Та же метка «продолжение прямо после вопроса» (повтор OpenCode) ход не сбрасывает: 1…7."""
+    t = TurnLimiter(monotonic=FakeMono(0.0))
+    for _ in range(5):
+        t.step("student-01", "ses_a", M1)                                     # прошлый ход — на шаге 5
+    first = TurnMark("continue", "h2", 7)
+    assert [t.step("student-01", "ses_a", first) for _ in range(7)] == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_tool_media_steps_do_not_start_turns():
+    """Вложения ответа инструмента OpenCode шлёт отдельным `user` в конце тела — это шаги хода, не вопросы."""
+    t = TurnLimiter(monotonic=FakeMono(0.0))
+    media = {"role": "user", "content": [{"type": "text", "text": SYNTHETIC_ATTACHMENT_PROMPT},
+                                         {"type": "text", "text": "[вложение не передаётся на учебном стенде]"}]}
+    marks = [turn_mark({"messages": [SYS, user("вопрос"), *steps_of(i)] + ([media] if i > 1 else [])})
+             for i in range(1, 17)]
+    assert [t.step("student-01", "ses_a", m) for m in marks] == list(range(1, 17))
+    with pytest.raises(TurnLimitReached):
+        t.step("student-01", "ses_a", turn_mark({"messages": [SYS, user("вопрос"), *steps_of(17), media]}))
