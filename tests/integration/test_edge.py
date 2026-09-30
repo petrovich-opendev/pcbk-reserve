@@ -20,10 +20,10 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d5b", "pcbk-core": "pcbk-reserve/core:d5b",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d6a", "pcbk-core": "pcbk-reserve/core:d6a",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
-          "pcbk-student-01": "pcbk-reserve/student:d4"}
+          "pcbk-student-01": "pcbk-reserve/student:d6a"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 
 
