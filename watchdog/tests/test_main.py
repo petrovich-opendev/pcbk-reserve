@@ -9,7 +9,7 @@ import pytest
 
 import pcbk_watchdog.main
 from helpers import (CHROME, SETTINGS, T0, chrome_dom, gw, http_get, http_status, insp, llm_obj, now_utc,
-                     start_test_server)
+                     put_build, start_test_server)
 from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
 from pcbk_watchdog.journal import Journal
@@ -263,7 +263,7 @@ def test_components_file_d4a():                    # было test_components_fi
 def test_components_file_d4b():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
-    assert ids[-5:] == ["core", "core-container", "historian", "llm", "gateway"]
+    assert ids[-6:-1] == ["core", "core-container", "historian", "llm", "gateway"]
     cc = comps[ids.index("core-container")]
     assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
            ("container", "pcbk-core", False, "Серверный слой — контейнер")
@@ -277,8 +277,28 @@ def test_components_file_d5a():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
     g = comps[ids.index("gateway")]
-    assert ids[-1] == "gateway"
+    assert ids[-2] == "gateway"
     assert (g["title"], g["kind"], g["url"]) == ("Шлюз и вход", "gateway", "http://pcbk-core:8000/health/gateway")
+
+
+def test_components_have_web_row():
+    comps = load_components("components.json")
+    assert comps[-1] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/"}
+
+
+def test_run_checks_web_kind(web_site):                                        # M2 предпроверки Д6а
+    # вид web идёт через _check_one в check_web; note доходит до снимка
+    assert pcbk_watchdog.main.KINDS["web"] == ("url",)
+    assert "web" not in pcbk_watchdog.main.LOCAL_KINDS
+    root, url = web_site
+    put_build(root)
+    comps = [{"id": "web", "title": "Веб-чат", "kind": "web", "url": url}]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert [(c.component, c.title, c.state, c.detail, c.note) for c in checks] == [
+        ("web", "Веб-чат", "ok", "страница чата отдаётся", "сборка abc123")]
+    comps[0]["url"] = "http://127.0.0.1:9/chat/"
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "не отвечает")
 
 
 def test_gw_stale_setting():
@@ -373,6 +393,7 @@ def test_load_components_rejects_bad_config(tmp_path):
                 [{"id": "a", "title": "A", "kind": "historian"}],                      # нет url
                 [{"id": "a", "title": "A", "kind": "llm"}],                            # нет url
                 [{"id": "a", "title": "A", "kind": "gateway"}],                        # нет url
+                [{"id": "a", "title": "A", "kind": "web"}],                            # нет url
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": ""}],
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": 1}],
                 [{"id": "a", "title": "A", "kind": "historian", "url": "http://x/", "ok_detail": "жив"}],

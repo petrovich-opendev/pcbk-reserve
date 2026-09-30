@@ -291,6 +291,18 @@ server {
         return 200 "ok\n";
     }
 
+    # статика чата для строки сторожа «Веб-чат» (Д6-R46): тот же корень, что у 8443, но без TLS; опись
+    # /chat/build.json сторож читает только здесь. Своего root у server 8080 нет — задан в location
+    location = /chat/ {
+        root /usr/share/nginx/pcbk;
+        try_files /chat/index.html =404;
+    }
+
+    location ^~ /chat/ {
+        root /usr/share/nginx/pcbk;
+        try_files $uri =404;
+    }
+
     location / {
         return 404;
     }

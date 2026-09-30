@@ -1,5 +1,5 @@
 """Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана,
-LLM-прокси и бюджет, шлюз и вход."""
+LLM-прокси и бюджет, шлюз и вход, веб-чат."""
 import http.client
 import io
 import json
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 State = Literal["ok", "warn", "fail", "absent", "unknown"]
 
@@ -114,6 +114,20 @@ GW_KEYS_D5A = frozenset({"checked_at", "config_error", "store_ok", "sp_ctl", "ru
                          "wake_failed_1h", "stop_failed_1h", "place_auth_failed_1h", "logins_failed_1h",
                          "origin_refused_1h", "login_busy_1h", "cookies_duplicate_1h", "drill"})
 GW_KEYS_D5B = frozenset({"refused_1h", "streams", "stream_broken_1h", "upstream_failed_1h"})
+
+# строка «Веб-чат» (задача А1 Д6а, Д6-R46): страница чата и опись сборки build.json через внутренний 8080 edge.
+# Договор описи с задачей А2 (плагин pcbkBuildInfo и check-dist): {"build": str, "files": {путь: sha256 hex}};
+# метка страницы — ровно в форме WEB_META_RE; путь — WEB_FILE_RE целиком; записей — от 1 до WEB_MAX_FILES
+WEB_MAX_FILES = 8
+WEB_META_RE = re.compile(r'<meta name="pcbk-build" content="([A-Za-z0-9._-]{1,64})">')
+# assets/* сборки и загрузчик Д6б boot.js из public/ (сторож Д6а его уже понимает)
+WEB_FILE_RE = re.compile(r"assets/[A-Za-z0-9._-]{1,100}|boot\.js")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+WEB_DOWN_DETAIL = "не отвечает"
+WEB_PAGE_DETAIL = "страница чата не отдаётся"
+WEB_PARTIAL_DETAIL = "сборка чата неполная"
+WEB_OK_DETAIL = "страница чата отдаётся"
+WEB_BAD_MANIFEST = "опись неверна"
 
 
 @dataclass(frozen=True)
@@ -261,11 +275,14 @@ class _DeadlineSocket:
         return io.BufferedReader(_DeadlineReader(self._sock, self._deadline))
 
 
-def _http_get(url: str, timeout: float, read_body) -> tuple[int, bytes]:
+def _http_get(url: str, timeout: float, read_body, deadline: float | None = None) -> tuple[int, bytes]:
     """GET без перенаправлений и без прокси из окружения, под общим сроком.
 
     Соединение — не дольше timeout на адрес; вся проверка — не дольше HTTP_CHECK_SPANS × timeout:
     срок на каждую операцию сокета не ловит ответ, который капает по байту.
+    deadline — абсолютный срок по time.monotonic() (один на несколько запросов, Д6-R46): соединение —
+    не дольше min(timeout, остаток), весь запрос — не дальше min(свой срок, deadline); остатка нет —
+    TimeoutError без соединения.
     Тело читается (не больше MAX_BODY_BYTES), только если read_body(код) истинно;
     сбой чтения тела при известном коде — пустое тело. Нет связи или срок вышел до
     кода — OSError (TimeoutError) или HTTPException наружу.
@@ -274,8 +291,14 @@ def _http_get(url: str, timeout: float, read_body) -> tuple[int, bytes]:
     if parts.scheme != "http" or not parts.hostname:
         raise ValueError(f"нужен адрес http://, получен {url!r}")
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-    deadline = time.monotonic() + HTTP_CHECK_SPANS * timeout
-    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    now = time.monotonic()
+    connect_s, own_deadline = timeout, now + HTTP_CHECK_SPANS * timeout
+    if deadline is not None:
+        connect_s, own_deadline = min(timeout, deadline - now), min(own_deadline, deadline)
+        if connect_s <= 0:
+            raise TimeoutError("срок проверки истёк")
+    deadline = own_deadline
+    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=connect_s)
     try:
         conn.connect()
         left = deadline - time.monotonic()
@@ -809,6 +832,68 @@ def check_gateway(component: str, title: str, url: str, now: datetime, stale_s: 
     if parsed.drill:
         note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
     return Check(component, title, state, detail, note)
+
+
+def _web_manifest(body: bytes) -> tuple[str, list[str]] | None:
+    """Опись build.json → (сборка, пути по порядку описи); не JSON или не той формы — None."""
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # в том числе UnicodeDecodeError и тело, не дочитанное к сроку
+        return None
+    if not isinstance(reply, dict):
+        return None
+    build, files = reply.get("build"), reply.get("files")
+    # пустая опись ничего не проверила бы: у сборки Vite всегда есть хотя бы один файл assets/
+    if not isinstance(build, str) or not isinstance(files, dict) or not 0 < len(files) <= WEB_MAX_FILES:
+        return None
+    for path, digest in files.items():
+        # «assets/..» и «assets/.» шаблон пропускает, а edge свёл бы их к самому /chat/
+        if (not WEB_FILE_RE.fullmatch(path) or path.rsplit("/", 1)[-1] in (".", "..")
+                or not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest)):
+            return None
+    return build, list(files)
+
+
+def check_web(component: str, title: str, url: str, timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
+    """Страница чата и опись сборки (таблица Д6-R46): GET url (тело — метка сборки) → GET build.json →
+    GET каждого файла описи (тело не читается).
+
+    Один срок HTTP_CHECK_SPANS × timeout от начала на все запросы — так проверка, начатая до конца такта,
+    кончается не позже запаса tick_budget_s. Нет соединения или срок — «не отвечает», в том числе когда
+    срок оборвал тело страницы или описи.
+    """
+    deadline = time.monotonic() + HTTP_CHECK_SPANS * timeout
+
+    def get(target: str, read_body) -> tuple[int, bytes]:
+        status, body = _http_get(target, timeout, read_body, deadline=deadline)
+        if time.monotonic() >= deadline:   # тело могло оборваться сроком — это срок, а не «нет метки»
+            raise TimeoutError("срок проверки истёк")
+        return status, body
+
+    def fail(detail: str, note: str = "") -> Check:
+        return Check(component, title, "fail", detail, note)
+
+    try:
+        status, body = get(url, lambda code: code == 200)
+        if status != 200:
+            return fail(WEB_PAGE_DETAIL, f"HTTP {status}")
+        meta = WEB_META_RE.search(body.decode("utf-8", "replace"))
+        if meta is None:
+            return fail(WEB_PAGE_DETAIL, "нет метки сборки")
+        status, body = get(urljoin(url, "build.json"), lambda code: code == 200)
+        manifest = _web_manifest(body) if status == 200 else None
+        if manifest is None:
+            return fail(WEB_PARTIAL_DETAIL, WEB_BAD_MANIFEST)
+        build, files = manifest
+        if build != meta.group(1):
+            return fail(WEB_PARTIAL_DETAIL, "страница и опись разных сборок")
+        for path in files:
+            status, _ = get(urljoin(url, path), lambda code: False)
+            if status != 200:
+                return fail(WEB_PARTIAL_DETAIL, f"нет {path}")
+    except (OSError, http.client.HTTPException):
+        return fail(WEB_DOWN_DETAIL)
+    return Check(component, title, "ok", WEB_OK_DETAIL, f"сборка {build}")
 
 
 def tls_verdict(not_after: datetime, now: datetime, warn_days: int = 14) -> tuple[State, str]:
