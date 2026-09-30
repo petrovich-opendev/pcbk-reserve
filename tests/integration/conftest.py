@@ -14,6 +14,7 @@ import re
 import secrets
 import ssl
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -45,14 +46,15 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S",
                         "DRILL_FREEZE_LOOP", "DATA_DIR", "FRESH_POLL_S", "CATALOG_DEADLINE_S",
                         "DRILL_FRESHNESS", "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
-                        "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED"})
+                        "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
+                        "LLM_TOTAL_USD"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
 # белый список стенда — одно синтетическое имя
 TEST_WHITELIST = ("20FAKE_001_PV",)
-# токен службы данных места 01: не 48 шестнадцатеричных знаков — шаблон проверки на секреты его не ловит;
-# в core-tokens — только его sha256
-TEST_CORE_TOKEN = "test-token-student-01"
+# токен службы данных ops (Д3б): не 48 шестнадцатеричных знаков — шаблон проверки на секреты его не ловит;
+# токены мест — student-NN.data-token из make_test_places; в core-tokens — только их sha256
+TEST_OPS_DATA_TOKEN = "test-data-token-ops"
 # LLM-прокси: ключи — те, что знает двойник OpenRouter (core/tests/fake_openrouter.py), токен ops —
 # не 48 шестнадцатеричных знаков; токены мест — student-NN.llm-token из make_test_places
 TEST_OPENROUTER_KEY = "test-openrouter-key"
@@ -67,6 +69,28 @@ LLM_CALLS_PY = ("import json, sqlite3, sys; "
                 "c.row_factory = sqlite3.Row; "
                 "print(json.dumps([dict(r) for r in c.execute("
                 "'SELECT * FROM llm_calls ORDER BY id DESC LIMIT ?', (int(sys.argv[1]),))]))")
+# отказы прокси одной сессии в журнале вызовов: argv — сессия и code. Повтор отказа OpenCode шлёт в прокси, а
+# прокси снова отказывает и в двойник его не пересылает — шторм повторов видно только здесь
+LLM_REFUSALS_PY = ("import sqlite3, sys; "
+                   "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
+                   "print(c.execute('SELECT COUNT(*) FROM llm_calls WHERE session = ? AND code = ?', "
+                   "(sys.argv[1], sys.argv[2])).fetchone()[0])")
+# события службы данных изнутри pcbk-core: только четыре столбца agent_events, новые сверху; argv — сколько и
+# канал (пусто — любой). Канал отсеивает события system опроса свежести и каталога между вызовами
+DATA_EVENTS_PY = ("import json, sqlite3, sys; "
+                  "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
+                  "ch = sys.argv[2] or None; "
+                  "q = 'SELECT caller, channel, tool, outcome FROM agent_events' "
+                  "+ (' WHERE channel = ?' if ch else '') + ' ORDER BY rowid DESC LIMIT ?'; "
+                  "print(json.dumps([dict(zip(('caller', 'channel', 'tool', 'outcome'), r)) "
+                  "for r in c.execute(q, ((ch,) if ch else ()) + (int(sys.argv[1]),))]))")
+# число событий вызывающего в канале: argv — вызывающий и канал
+DATA_EVENT_COUNT_PY = ("import sqlite3, sys; "
+                       "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
+                       "print(c.execute('SELECT COUNT(*) FROM agent_events WHERE caller = ? AND channel = ?', "
+                       "(sys.argv[1], sys.argv[2])).fetchone()[0])")
+# разговор через API OpenCode места (Bun из образа места): converse.js рядом с этим файлом
+CONVERSE_JS = REPO / "tests" / "integration" / "converse.js"
 # запрос изнутри сторожа: argv — метод и адрес; печатает код ответа
 WATCHDOG_REQUEST = """\
 import http.client, sys
@@ -150,13 +174,13 @@ def make_test_tls(tls_dir: Path) -> None:
 
 
 def make_test_places(secrets_dir: Path, agents_root: Path) -> None:
-    """Как на сервере: секреты — 48 hex без перевода строки, каталог 0700, файлы 0444;
-    агенты — корень 0700, каталоги мест 0755."""
+    """Как на сервере: секреты — пароль, токены LLM и данных, 48 hex без перевода строки, каталог 0700,
+    файлы 0444; агенты — корень 0700, каталоги мест 0755."""
     for d in (secrets_dir, agents_root):
         d.mkdir(mode=0o700)
         d.chmod(0o700)
     for n in PLACES:
-        for suffix in ("pw", "llm-token"):
+        for suffix in ("pw", "llm-token", "data-token"):
             f = secrets_dir / f"student-{n:02d}.{suffix}"
             f.write_text(secrets.token_hex(24), encoding="ascii")
             f.chmod(0o444)
@@ -171,11 +195,17 @@ def token_line(caller: str, token: str) -> str:
 
 
 def make_test_core_data(secrets_dir: Path, data_dir: Path) -> None:
-    """Как на сервере: bdrv.env и core-tokens — в каталоге секретов (0700), белый список — в DATA_DIR (0700);
-    файлы 0444."""
+    """Как на сервере: bdrv.env, ops.data-token и core-tokens — в каталоге секретов (0700), белый список — в
+    DATA_DIR (0700); файлы 0444. core-tokens — хеши токенов данных ops и мест (student-NN.data-token, их пишет
+    make_test_places)."""
     data_dir.mkdir(mode=0o700)
     data_dir.chmod(0o700)
-    core_tokens = (token_line("student-01", TEST_CORE_TOKEN),)
+    ops = secrets_dir / "ops.data-token"
+    ops.write_text(TEST_OPS_DATA_TOKEN, encoding="ascii")
+    ops.chmod(0o444)
+    core_tokens = [token_line("ops", TEST_OPS_DATA_TOKEN)]
+    core_tokens += [token_line(f"student-{n:02d}", (secrets_dir / f"student-{n:02d}.data-token").read_text("ascii"))
+                    for n in PLACES]
     for f, lines in ((secrets_dir / "bdrv.env", TEST_BDRV_ENV), (data_dir / "whitelist.txt", TEST_WHITELIST),
                      (secrets_dir / "core-tokens", core_tokens)):
         f.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -220,8 +250,8 @@ class Stack:
         self.stu_net: str = values["STU_NET"]
         self.secrets_dir = Path(values["SECRETS_DIR"])
         self.agents_root = Path(values["AGENTS_DIR"])
-        # токен службы данных места 01 (в core-tokens — его хеш)
-        self.core_token: str = TEST_CORE_TOKEN
+        # токен службы данных места 01 (в core-tokens — его хеш), он же файл student-01.data-token
+        self.core_token: str = self.data_token(1)
         # токен LLM администратора, он же файл ops.llm-token (в llm-tokens — его хеш)
         self.ops_llm_token: str = TEST_OPS_LLM_TOKEN
         self._prod_config: dict | None = None
@@ -294,6 +324,9 @@ class Stack:
 
     def llm_token(self, n: int) -> str:
         return (self.secrets_dir / f"student-{n:02d}.llm-token").read_text(encoding="ascii")
+
+    def data_token(self, n: int) -> str:
+        return (self.secrets_dir / f"student-{n:02d}.data-token").read_text(encoding="ascii")
 
     def agents_dir(self, n: int) -> Path:
         return self.agents_root / f"student-{n:02d}"
@@ -408,6 +441,63 @@ class Stack:
     def llm_calls(self, last: int = 5) -> list[dict]:
         """Последние строки журнала вызовов LLM (новые — первыми): только столбцы llm_calls."""
         return json.loads(self._docker("exec", "pcbk-core", "python", "-c", LLM_CALLS_PY, str(last)).stdout)
+
+    def llm_refusals(self, session: str, code: str) -> int:
+        """Сколько отказов прокси с этим code у сессии OpenCode в журнале вызовов."""
+        return int(self._docker("exec", "pcbk-core", "python", "-c", LLM_REFUSALS_PY, session, code).stdout)
+
+    def data_events(self, last: int = 5, channel: str | None = None) -> list[dict]:
+        """Последние события службы данных (новые — первыми): caller, channel, tool, outcome; channel — отбор."""
+        return json.loads(self._docker("exec", "pcbk-core", "python", "-c", DATA_EVENTS_PY, str(last),
+                                       channel or "").stdout)
+
+    def data_event_count(self, caller: str, channel: str) -> int:
+        """Сколько событий службы данных у вызывающего в канале (для «данные не читались»)."""
+        return int(self._docker("exec", "pcbk-core", "python", "-c", DATA_EVENT_COUNT_PY, caller, channel).stdout)
+
+    def health_log(self, name: str) -> list[str]:
+        """Output записей State.Health.Log этого запуска (End не раньше StartedAt), старые первыми.
+
+        Docker хранит журнал проверки здоровья (последние пять записей) и через stop/start: запись прошлого
+        запуска (например, «200 mcp=connected» до остановки core) не выдаётся за нынешнее состояние.
+        """
+        st = self._state(name)
+        started = datetime.fromisoformat(st["StartedAt"])          # RFC 3339 с наносекундами: Python 3.12 читает
+        return [e["Output"] for e in (st.get("Health") or {}).get("Log") or []
+                if datetime.fromisoformat(e["End"]) >= started]
+
+    def health_output(self, name: str) -> str:
+        """Output последней записи State.Health.Log этого запуска; записей этого запуска нет — пусто."""
+        log = self.health_log(name)
+        return log[-1] if log else ""
+
+    def converse(self, n: int, question: str, *, model: str | None = None, tools: dict[str, bool] | None = None,
+                 timeout: float = 180.0, host: str | None = None, pw_file: Path | None = None) -> dict:
+        """Разговор через API OpenCode места n: converse.js в одноразовом контейнере образа места в сети
+        pcbk-stu-NN; пароль (места n или pw_file) и запрос — файлами только для чтения. JSON из stdout.
+
+        model — «провайдер/модель» («pcbk/z-ai/glm-5.3»); tools — карта OpenCode «инструмент → разрешён»
+        ({"pcbk_*": False} закрывает инструменты MCP на эту сессию). host — адрес OpenCode вместо STU.N.3.
+        """
+        ref = None
+        if model is not None:
+            provider, _, model_id = model.partition("/")
+            ref = {"providerID": provider, "modelID": model_id}
+        request = {"url": f"http://{host or f'{self.stu_net}.{n}.3'}:4096", "question": question, "model": ref,
+                   "tools": tools, "timeout_s": timeout}
+        pw = pw_file or self.secrets_dir / f"student-{n:02d}.pw"
+        with tempfile.TemporaryDirectory(prefix="pcbk-converse-", dir=self.env_file.parent) as tmp:
+            req = Path(tmp) / "req.json"
+            req.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+            req.chmod(0o444)
+            mounts = [a for src, dst in ((CONVERSE_JS, "/app/converse.js"), (pw, "/pw"), (req, "/req.json"))
+                      for a in ("--mount", f"type=bind,source={src},target={dst},readonly")]
+            r = _run(["docker", "run", "--rm", "--pull", "never", "--network", f"pcbk-stu-{n:02d}",
+                      "--label", ONESHOT_LABEL, "--read-only", "--tmpfs", "/tmp:exec", "--no-healthcheck",
+                      "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", *mounts,
+                      "--entrypoint", "/usr/local/bin/opencode", "-e", "BUN_BE_BUN=1", STUDENT_IMAGE,
+                      "/app/converse.js"], timeout=timeout + 60)
+        return json.loads(r.stdout)
 
     def logs(self, name: str) -> str:
         """Журнал контейнера: stdout и stderr вместе (серверный слой пишет в stderr)."""

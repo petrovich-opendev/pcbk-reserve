@@ -1,0 +1,161 @@
+"""Сквозной разговор места: OpenCode → LLM-прокси (двойник OpenRouter) → служба данных по MCP; core на .2 в сети
+места, токен данных файлом; отказы прокси в чате без шторма повторов; MCP переподключается после core."""
+import json
+import re
+import time
+
+import pytest
+
+from conftest import TEST_MGMT_KEY, TEST_OPENROUTER_KEY, wait_for
+
+Q = "что сейчас по тегу 20FAKE_001_PV?"
+MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
+
+
+@pytest.fixture(scope="module")
+def place01(stack):                          # своя фикстура: running Д2 (test_students.py) держит и место 02
+    stack.start("pcbk-student-01")
+    wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-01"), timeout=90)
+    yield
+    stack.stop("pcbk-student-01")
+
+
+def tool_requests(stack, session):           # заголовков клиента прокси не пересылает — сессия только в теле
+    return [r for r in stack.fake_requests()
+            if r["body"].get("session_id") == f"student-01:{session}" and r["body"].get("tools")]
+
+
+def settled(stack, session):                 # К10: строки пишет поток-писатель, заголовок OpenCode идёт фоном
+    rows = lambda: [c for c in stack.llm_calls(50) if c["session"] == session]
+    wait_for(lambda: bool(rows()) and all(r["status"] != "open" and r["cost_source"] != "pending" for r in rows()),
+             timeout=30)
+    return rows()
+
+
+def test_mcp_unknown_only_while_starting(stack, place01):                       # «unknown» не держится при живом core
+    words = [m.group(1) if (m := MCP_WORD.search(o)) else None for o in stack.health_log("pcbk-student-01")]
+    assert "connected" in words, words
+    first = words.index("connected")
+    # до первого connected — только ленивый подъём MCP (unknown) или ещё не 200 (без слова); после — только connected
+    assert set(words[:first]) <= {"unknown", None} and set(words[first:]) == {"connected"}, words
+    assert words.count("unknown") <= 2, words                                     # не дольше первых тактов
+    stack.wait_status(lambda d: next((c["state"], c["detail"]) for c in d["checks"]
+                                     if c["component"] == "student-01") == ("ok", "работает"), timeout=60)
+
+
+def test_place_reaches_only_core(stack, place01):                              # Review Focus 3
+    stu = stack.stu_net
+    assert stack.probe("pcbk-stu-01", f"{stu}.1.2", 8000) == 1                   # положительный контроль
+    assert stack.probe("pcbk-stu-02", f"{stu}.2.2", 8000) == 1                   # .2.2 жив — ноль ниже не пустой
+    assert stack.probe("pcbk-egress", "172.31.250.82", 8000) == 1               # core в сети выхода жив
+    assert stack.probe("pcbk-egress", "172.31.250.84", 8080) == 1               # двойник OpenRouter жив
+    for addr, port in ((f"{stu}.2.2", 8000), ("172.31.250.82", 8000), ("172.31.250.84", 8080)):
+        assert stack.probe("pcbk-stu-01", addr, port) == 0, addr                 # держит отсутствие маршрута
+    assert stack.inspect("pcbk-core")["HostConfig"]["Sysctls"]["net.ipv4.ip_forward"] == "0"   # второй слой
+
+
+def test_conversation_tool_via_mcp_and_cost(stack, place01):                    # Review Focus 5
+    before = stack.data_event_count("student-01", "mcp")
+    out = stack.converse(1, Q)
+    assert (out["status"], out["error"]) == ("done", None) and out["final_text"].startswith("Готово:")
+    tool = next(t for t in out["tools"] if t["tool"] == "pcbk_tag_now")
+    assert tool["status"] == "completed" and json.loads(tool["output"])["status"] == "unavailable"   # историана нет — словами
+    calls = settled(stack, out["session"])
+    assert len(calls) >= 2 and {c["caller"] for c in calls} == {"student-01"}
+    assert {c["cost_source"] for c in calls} == {"stream"}
+    assert stack.data_event_count("student-01", "mcp") == before + 1
+    e = stack.data_events(1, channel="mcp")[0]
+    assert (e["caller"], e["channel"], e["tool"]) == ("student-01", "mcp", "tag_now")
+
+
+def test_openrouter_key_never_in_workplace(stack, place01):                     # «неуспех 1»: ключа в месте нет
+    keys = (TEST_OPENROUTER_KEY, TEST_MGMT_KEY)
+    # положительный контроль: ключи — в секретах core, поиск их видит
+    for key, path in zip(keys, ("/run/secrets/openrouter.key", "/run/secrets/openrouter-mgmt.key")):
+        assert stack.exec("pcbk-core", "grep", "-c", "-F", key, path) == "1", path
+    pid = stack.opencode_pid("pcbk-student-01")
+    # всё, что место хранит и видит: окружение OpenCode, секреты, конфигурация, данные (там же разговоры), /work, /tmp
+    where = f"/proc/{pid}/environ /run/secrets /etc/pcbk-opencode /var/lib/opencode /work /tmp"
+    grep = lambda pattern: stack.sh("pcbk-student-01", f"grep -r -l -a -F -e '{pattern}' {where}")
+    # положительный контроль источника: свой токен LLM и строка разговора прошлого теста находятся тем же поиском;
+    # найденное — списки файлов, сами токены в текст сбоя не попадают
+    own_files = grep(stack.llm_token(1))[1].split()
+    talk_files = grep("Готово:")[1].split()
+    assert "/run/secrets/llm-token" in own_files and any(f.startswith("/var/lib/opencode/") for f in talk_files)
+    for key in keys:
+        code, found, _ = grep(key)
+        assert (code, found) == (1, ""), key                                     # 1 — grep ничего не нашёл
+    code, body = stack.oc(1, "GET", "/config", 1)
+    own, leaked = stack.llm_token(1) in body, [k for k in keys if k in body]     # {file:} подставлен — ответ тот
+    assert (code, own, leaked) == (200, True, [])
+
+
+def test_conversation_without_tools_reads_no_data(stack, place01):             # задача 6, шаг 2 — тот же способ
+    def tool_names(session):
+        return {t["function"]["name"] for r in stack.fake_requests()
+                if r["body"].get("session_id") == f"student-01:{session}" for t in r["body"].get("tools", [])}
+    assert "mcp=connected" in stack.health_output("pcbk-student-01")            # иначе запрет проверял бы пустоту
+    control = stack.converse(1, "Ответь одним словом: да")                       # положительный контроль: без запрета
+    assert "pcbk_tag_now" in tool_names(control["session"])
+    before = stack.data_event_count("student-01", "mcp")
+    out = stack.converse(1, "Ответь одним словом: да", tools={"pcbk_*": False})
+    assert out["status"] == "done" and not [t for t in out["tools"] if t["tool"].startswith("pcbk_")]
+    names = tool_names(out["session"])
+    assert "read" in names and not {n for n in names if n.startswith("pcbk_")}  # запрет снял только pcbk_*
+    assert stack.data_event_count("student-01", "mcp") == before                # к данным не ходили
+
+
+def test_model_question_is_rejected_and_reported(stack, place01):               # раунд 2: уточняющий вопрос модели
+    out = stack.converse(1, "FAKEASK какой тег?", timeout=60)
+    assert out["status"] == "asked" and out["asked"] == [{"kind": "question", "tool": "question"}]
+    assert stack.oc(1, "GET", "/question", 1)[1].strip() == "[]"               # висящих вопросов нет
+    assert json.loads(stack.oc(1, "GET", "/session/status", 1)[1]).get(out["session"]) is None   # сессия не busy
+
+
+def test_turn_limit_shown_in_chat_without_retry_storm(stack, place01):          # Review Focus 2
+    out = stack.converse(1, "FAKELOOP собери всё", timeout=240)
+    assert len(tool_requests(stack, out["session"])) == 16
+    assert "Предел шагов на ответ" in json.dumps(out["error"], ensure_ascii=False)
+    time.sleep(15)                                                                # первый повтор OpenCode — через 2 с
+    settled(stack, out["session"])
+    assert len(tool_requests(stack, out["session"])) == 16
+    assert stack.llm_refusals(out["session"], "pcbk_turn_limit") == 1            # повторов нет: их видно только в журнале
+
+
+def test_budget_message_in_chat(stack, place01):                                # Review Focus 2
+    stack.recreate("core", {"LLM_TOTAL_USD": "0.001"})                            # в бюджет упрётся первый или второй вызов хода
+    try:
+        wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-01"), timeout=90)
+        out = stack.converse(1, Q)
+        assert "Общий бюджет стенда на модель" in json.dumps(out["error"], ensure_ascii=False)
+        time.sleep(15)
+        settled(stack, out["session"])
+        assert stack.llm_refusals(out["session"], "pcbk_budget_spent") <= 2       # шаг и заголовок, без повторов
+    finally:
+        stack.recreate("core", {})
+
+
+def test_mcp_reconnects_after_core_restart(stack):                               # Review Focus 1; последний в модуле
+    if stack.inspect("pcbk-student-02")["State"]["Running"]:
+        stack.stop("pcbk-student-02")                                             # иначе MCP уже подключён — тест пустой
+    stack.stop("pcbk-core")
+    try:
+        stack.start("pcbk-student-02")                                            # место встаёт без core
+        wait_for(lambda: "mcp=failed" in stack.health_output("pcbk-student-02"), timeout=90)
+        data = stack.wait_status(lambda d: any(c["component"] == "student-02" and c["state"] == "warn"
+                                               for c in d["checks"]), timeout=60)
+        assert next(c["detail"] for c in data["checks"] if c["component"] == "student-02") == \
+               "нет связи со службой данных (MCP)"
+        seen = set()
+        for _ in range(3):                                                        # три такта проверки здоровья (30 с)
+            time.sleep(31)
+            seen.add(stack.health_output("pcbk-student-02").strip())
+        assert seen == {"200 mcp=failed"}                                         # не мигает: unknown не появляется
+    finally:
+        stack.start("pcbk-core")
+    try:
+        wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-02"), timeout=150)
+        out = stack.converse(2, Q)
+        assert any(t["tool"] == "pcbk_tag_now" and t["status"] == "completed" for t in out["tools"])
+    finally:
+        stack.stop("pcbk-student-02")

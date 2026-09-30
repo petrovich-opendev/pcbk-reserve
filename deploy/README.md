@@ -26,7 +26,7 @@
    `docker save <образ> | gzip | ssh <сервер> 'gunzip | docker load'`;
    список сторонних образов — `deploy/images.lock` (строки `# test` не
    возить, кроме `curlimages/curl` — он остаётся на сервере как инструмент
-   проверок); свои образы — `pcbk-reserve/watchdog:<день>` и
+   проверок); свои образы — `pcbk-reserve/watchdog:<день>`, `pcbk-reserve/core:<день>` и
    `pcbk-reserve/student:<день>` (собирать из чистого дерева, `git archive`). Сверка: слои
    `docker image inspect -f '{{json .RootFS.Layers}}'` совпадают.
 2. `compose.yaml` и каталог `edge/` — в `/opt/pcbk-reserve` (`scp`; без
@@ -61,11 +61,58 @@
 4. Образ места собирается из чистого дерева (`git archive`): `COPY config/`
    заберёт в образ любой лишний файл из рабочей копии.
 
+### Токены данных мест и `core-tokens` (с Д4б)
+
+У каждого места три секрета-файла: пароль OpenCode `student-NN.pw`, токен
+LLM-прокси `student-NN.llm-token` и токен службы данных
+`student-NN.data-token` (в месте — `/run/secrets/data-token`, заголовок MCP
+`pcbk`). Все — 48 шестнадцатеричных знаков, `0444` в каталоге `0700`, только
+на сервере, при повторе не перезаписываются. Без файла `data-token` место не
+создаётся (секрет Compose), а образ `:d4` без него падает в цикле: ссылка
+`{file:…}` делает конфигурацию неверной. Хеши токенов данных `ops` и мест
+лежат в `core-tokens`, хеши токенов LLM — в `llm-tokens` (Д4а); сами токены
+ни в чат, ни в git, ни в вывод команд не идут.
+
+```bash
+cd /opt/pcbk-reserve/secrets && umask 077
+for n in $(seq -w 1 10); do f=student-$n.data-token
+  [ -e "$f" ] || { openssl rand -hex 24 | tr -d '\n' > "$f"; chmod 0444 "$f"; }   # не перезаписывать
+done
+for f in ops.data-token student-*.data-token; do printf '%s %s\n' "${f%.data-token}" "$(sha256sum < "$f" | cut -c1-64)"; done > core-tokens.new
+chmod 0444 core-tokens.new && mv core-tokens.new core-tokens
+wc -l < core-tokens; stat -c '%a %s' student-*.data-token | sort -u
+cat student-*.data-token student-*.llm-token student-*.pw ops.*-token | fold -w48 | sort -u | wc -l
+```
+
+Ожидается `11`; `444 48`; `32` различных значения (три разных секрета у
+каждого места и два токена `ops`). `core` читает `core-tokens` только при
+старте (привязанный файл — прежний inode): после нового файла —
+`docker compose up -d --no-build --force-recreate core`.
+
+`core` стоит в каждой сети места на `.2` (у мест — `core` в `extra_hosts`) с
+`net.ipv4.ip_forward=0`. Проверка: `docker inspect -f '{{len .NetworkSettings.Networks}}' pcbk-core` → `12`.
+
+### Пересоздание мест с сохранением томов
+
+Новый образ места, новые секреты или правка блока места в `compose.yaml`:
+
+1. `docker ps -a --filter label=pcbk.role=student --format '{{.Names}} {{.State}}'` —
+   пересоздание работающего места рвёт разговор студента: сначала выяснить,
+   кто его поднял, и дождаться конца.
+2. `docker compose --profile students create --force-recreate --no-build $(printf 'student-%02d ' $(seq 1 10))`
+   (или имена нужных мест). Тома мест внешние — `create --force-recreate` их
+   не трогает: разговоры и работы студентов остаются. Места после этого спят.
+3. **Не** `docker compose down`, **не** `up` без имён служб, **не** удаление
+   томов `pcbk-student-NN-*`.
+
 ### Новый студент
-- **Смена студента в слоте 01–10:** новые файлы `student-NN.pw` и
-  `student-NN.llm-token` (старые удалить); прежний каталог агентов места
-  переименовать и сохранить (удалять — только по решению владельца), создать
-  пустой;
+- **Смена студента в слоте 01–10:** новые файлы `student-NN.pw`,
+  `student-NN.llm-token` и `student-NN.data-token` (старые удалить) — к
+  трём секретам места с Д4б добавился токен данных; затем заново
+  `llm-tokens` (Д4а) и `core-tokens` (выше) и
+  `docker compose up -d --no-build --force-recreate core`; прежний каталог
+  агентов места переименовать и сохранить (удалять — только по решению
+  владельца), создать пустой;
   старые тома места — только по решению владельца; `docker compose
   --profile students create --force-recreate --no-build student-NN`.
 - **Место 11 и дальше:** правка регулярок `sp-ro`/`sp-ctl`, подсеть N, блок
@@ -99,6 +146,15 @@
   `docker network rm $(printf 'pcbk-stu-%02d ' $(seq 1 10))`; тома — только
   по именам `pcbk-student-NN-*`; вернуть `compose.yaml.d1` и
   `docker compose up -d --no-build watchdog` (образ `:d1`).
+- Д4б (места `:d4` и `core` в сетях мест) — назад к Д4а, тома и токены
+  сохраняются:
+  1. вернуть `compose.yaml.d4a` (копия `cp -p compose.yaml compose.yaml.d4a`
+     перед выкладкой Д4б);
+  2. `docker compose up -d --no-build --force-recreate core sp-ro watchdog` —
+     `core` и сторож на `:d4a`, `core` выходит из сетей мест;
+  3. `docker compose --profile students create --force-recreate --no-build $(printf 'student-%02d ' $(seq 1 10))`
+     — места на `:d2`, тома сохраняются, места спят;
+  4. токены данных `student-NN.data-token` и `core-tokens` не удаляются.
 - Тома мест, `secrets/` и `agents/` удаляются только до первого входа
   студента и только по именам: после — там разговоры и агенты студентов.
 - `rm -rf /opt/pcbk-reserve` (с `sudo`) — только до первого входа. После —

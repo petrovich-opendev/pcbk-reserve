@@ -1,5 +1,6 @@
 """Серверный слой в компоновке: строки сторожа, ручки здоровья, сеть выхода, секрет и список файлами."""
 import json
+import re
 import time
 
 CORE = "http://172.31.250.82:8000"
@@ -32,6 +33,9 @@ def test_edge_does_not_expose_core(stack):
         assert stack.https(path)[0] == 404
 
 
+STU_NETS = [f"pcbk-stu-{n:02d}" for n in range(1, 11)]
+
+
 def test_egress_network_only_core(stack):
     n = stack.network("pcbk-egress")
     assert n["Internal"] is False
@@ -39,8 +43,22 @@ def test_egress_network_only_core(stack):
     assert n["Options"].get("com.docker.network.bridge.enable_ip_masquerade", "true") == "true"
     # двойник OpenRouter — только в тестовом стенде (compose.test.yaml)
     assert sorted(c["Name"] for c in n["Containers"].values()) == ["pcbk-core", "pcbk-test-openrouter"]
+    # двенадцать сетей: pcbk-front, pcbk-egress и десять сетей мест на .2 (Д4б-R23)
     nets = stack.inspect("pcbk-core")["NetworkSettings"]["Networks"]
-    assert set(nets) == {"pcbk-front", "pcbk-egress"} and nets["pcbk-egress"]["IPAddress"] == "172.31.250.82"
+    assert set(nets) == {"pcbk-front", "pcbk-egress", *STU_NETS} and nets["pcbk-egress"]["IPAddress"] == "172.31.250.82"
+    assert {name: nets[name]["IPAddress"] for name in STU_NETS} == \
+           {name: f"{stack.stu_net}.{n}.2" for n, name in enumerate(STU_NETS, 1)}
+
+
+def test_core_in_workplace_networks_on_dot2(stack):                         # Д4б-R23, по компоновке сервера
+    nets = stack.prod_config()["services"]["core"]["networks"]
+    assert set(nets) == {"pcbk-front", "pcbk-egress", *STU_NETS}
+    assert {name: nets[name]["ipv4_address"] for name in STU_NETS} == \
+           {name: f"{stack.stu_net}.{n}.2" for n, name in enumerate(STU_NETS, 1)}
+    # тот же адрес, что у места в extra_hosts: место зовёт core по имени (под gVisor DNS нет)
+    places = stack.prod_config()["services"]
+    assert [[tuple(re.split(r"[:=]", h, maxsplit=1)) for h in places[f"student-{n:02d}"]["extra_hosts"]]
+            for n in range(1, 11)] == [[("core", f"{stack.stu_net}.{n}.2")] for n in range(1, 11)]
 
 
 def test_only_core_declares_egress(stack):
@@ -56,7 +74,10 @@ def test_core_hardening(stack):
     assert hc["SecurityOpt"] == ["no-new-privileges:true"]
     assert c["Config"]["User"] == "10003:10003"
     assert (hc["Memory"], hc["PidsLimit"]) == (512 * 1024 * 1024, 128)
-    assert hc["Sysctls"] == {"net.ipv4.tcp_fastopen": "0"}                        # Д3б-R6
+    assert hc["Sysctls"] == {"net.ipv4.tcp_fastopen": "0", "net.ipv4.ip_forward": "0"}   # Д3б-R6, Д4б-R23 (К9)
+    # в самом netns контейнера: без настройки он наследует пересылку хоста (на машине Docker — 1)
+    assert stack.exec("pcbk-core", "cat", "/proc/sys/net/ipv4/ip_forward", "/proc/sys/net/ipv4/tcp_fastopen").split() == \
+           ["0", "0"]
     assert hc["RestartPolicy"]["Name"] == "unless-stopped"
     assert set(hc["Tmpfs"]) == {"/tmp"}
 

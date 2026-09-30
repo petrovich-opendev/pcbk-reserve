@@ -20,8 +20,8 @@ IMAGE_ENV = {
     "OPENCODE_SERVER_USERNAME": "opencode",
 }
 WORKPLACE_ENV = IMAGE_ENV | {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-# точки монтирования места в компоновке (задача 3): секреты, агенты, два тома
-MOUNTS = {"/run/secrets/opencode-pw", "/run/secrets/llm-token", "/etc/pcbk-opencode/opencode/agents",
-          "/var/lib/opencode", "/work"}
+# точки монтирования места в компоновке (задача 3 Д2, токен данных — Д4б): секреты, агенты, два тома
+MOUNTS = {"/run/secrets/opencode-pw", "/run/secrets/llm-token", "/run/secrets/data-token",
+          "/etc/pcbk-opencode/opencode/agents", "/var/lib/opencode", "/work"}
 # метка одноразовых контейнеров тестов: уборка снимает только их
 ONESHOT_LABEL = "pcbk-test.oneshot"

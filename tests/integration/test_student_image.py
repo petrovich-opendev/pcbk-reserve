@@ -51,6 +51,15 @@ Bun.serve({hostname: "0.0.0.0", port: 8000, async fetch(req) {
     {headers: {"content-type": "text/event-stream"}})
 }})
 """
+# двойник core, который держит /mcp HOLD_MCP_S с, потом 404: ленивый подъём MCP места дольше секунды, что ждёт
+# GET /mcp проверки здоровья (ветка unknown); два транспорта OpenCode (StreamableHTTP, затем SSE) — вдвое дольше
+HOLD_MCP_S = 8
+HOLD_MCP_JS = f"""\
+Bun.serve({{hostname: "0.0.0.0", port: 8000, async fetch(req) {{
+  if (new URL(req.url).pathname === "/mcp") await Bun.sleep({HOLD_MCP_S * 1000})
+  return new Response("", {{status: 404}})
+}}}})
+"""
 # сервер на 127.0.0.1:4096, который сразу сбрасывает соединение (RST)
 RESET_SERVER_JS = ('require("node:net").createServer(s => s.resetAndDestroy())'
                    '.listen(4096, "127.0.0.1", () => console.log("up"))')
@@ -240,6 +249,36 @@ def test_health_reports_mcp_without_core(student_image, tmp_path):             #
             assert (mark() != str(now - age)) is retried, age
     finally:
         docker("rm", "-f", cid)
+
+
+def test_health_reports_unknown_while_mcp_starts(student_image, tmp_path):      # Д4б-R18, ветка unknown
+    """core держит /mcp дольше секунды: GET /mcp ждёт ленивого подъёма MCP — «200 mcp=unknown»; core ответил
+    404 — «200 mcp=failed». Слово unknown — только пока MCP поднимается, а не вместо ответа."""
+    (tmp_path / "core.js").write_text(HOLD_MCP_JS)
+    (tmp_path / "core.js").chmod(0o444)
+    net = f"pcbk-test-mcp-{uuid.uuid4().hex[:8]}"
+    cids = []
+    assert docker("network", "create", "--internal", "--label", ONESHOT_LABEL, net).returncode == 0
+    try:
+        cids.append(ok(docker("run", "-d", "--network", net, "--network-alias", "core", "--label", ONESHOT_LABEL,
+                              "--read-only", "--no-healthcheck", "--tmpfs", "/tmp:exec,mode=1777",
+                              "-e", "BUN_BE_BUN=1", "-v", f"{tmp_path / 'core.js'}:/fake/core.js:ro",
+                              "--entrypoint", "/usr/local/bin/opencode", IMAGE, "/fake/core.js")).stdout.strip())
+        cid = run_place(tmp_path, network=net)
+        cids.append(cid)
+        outs, deadline = [], time.monotonic() + 4 * HOLD_MCP_S + 30
+        while "200 mcp=failed" not in outs and time.monotonic() < deadline:
+            outs.append(docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.strip())
+            time.sleep(1)
+        assert all(re.fullmatch(r"\d{3}( mcp=[a-z_]+)?", o) for o in outs), outs
+        words = [o for o in outs if o.startswith("200")]
+        # сначала unknown (MCP ещё поднимается), потом failed; между ними ничего другого
+        assert words and words[0] == "200 mcp=unknown" and words[-1] == "200 mcp=failed", outs
+        assert set(words) == {"200 mcp=unknown", "200 mcp=failed"}, outs
+    finally:
+        if cids:
+            docker("rm", "-f", *cids)
+        docker("network", "rm", net)
 
 
 def test_health_never_disposes():                                               # Review Focus 1; Д4б-R18
