@@ -7,10 +7,11 @@ import anyio
 import pytds
 import pytest
 
-from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian, RecordingConnect
+from fakes import CLOCK_ROWS, LIVE_ROWS, WHITELIST, FakeHistorian, RecordingConnect
 from helpers import FakeMono
 from pcbk_core.data.gate import (AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, P95_MIN_CALLS, PAUSE_AFTER_TIMEOUTS,
-                                 STATS_WINDOW_S, USER_PAUSE_S, GateRefused, HistorianGate, SlidingWindow)
+                                 STATS_WINDOW_S, USER_PAUSE_S, GateRefused, GateResult, HistorianGate,
+                                 SlidingWindow)
 from pcbk_core.data.historian import HistorianError, tds_query
 from pcbk_core.secrets import BdrvConfig
 from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, lit_dt, live_all_sql, live_sql, summary_sql
@@ -526,3 +527,71 @@ async def test_hung_historian_deadline_timeouts_count_toward_pause():         # 
     with pytest.raises(GateRefused) as e:
         await g.run([Q])
     assert e.value.code == "busy" and len(fake.calls) == sent
+
+
+# доводка по ревью задачи 1, раунд 2: драйвер отвечает ровно к сроку — исход считается один раз, удача не теряется
+
+
+def at_deadline(fake: FakeHistorian, state: dict):
+    """QueryFn: пока state["hang"] — спит ровно свой срок (как чтение pytds с settimeout(остаток)) и отдаёт
+    state["fail"] или ответ двойника; иначе сразу отвечает двойник."""
+    def driver(statements, timeout):
+        if state["hang"]:
+            time.sleep(timeout)
+            if state["fail"] is not None:
+                raise state["fail"]
+        return fake(statements, timeout)
+    return driver
+
+
+async def test_driver_timeout_at_deadline_counts_once():                       # N1
+    mono = FakeMono(1000.0)
+    state = {"hang": False, "fail": HistorianError("timeout", "чтение")}
+    g = HistorianGate(at_deadline(FakeHistorian(), state), allowed=WHITELIST, deadline_s=0.3, monotonic=mono)
+    await g.run([clock_sql()], lane="background")
+    state["hang"] = True
+    for _ in range(2):                                   # два раунда: после паузы снова нужны три срока
+        for _ in range(PAUSE_AFTER_TIMEOUTS - 1):
+            with pytest.raises(HistorianError) as e:
+                await g.run([Q])
+            assert e.value.code == "timeout"
+            await anyio.sleep(0.02)                      # драйвер вернулся, место отпущено
+        assert g.stats()["user_paused"] is False
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+        assert g.stats()["user_paused"] is True
+        mono.advance(USER_PAUSE_S)
+        await anyio.sleep(0.02)
+    assert g.stats()["timeouts_5m"] == 2 * PAUSE_AFTER_TIMEOUTS
+
+
+@pytest.mark.parametrize("outcome", ["ok", "timeout"])
+async def test_outcome_delivered_at_deadline_is_the_calls_outcome(outcome):   # N1, гонка — наверняка
+    """Цикл событий занят через срок: исход драйвера (_finish) и таймер срока ворот — в одном обороте цикла,
+    _finish первым. Так идёт гонка «ровно к сроку», и её исход не зависит от планировщика."""
+    fake = FakeHistorian()
+    state = {"hang": False, "fail": HistorianError("timeout", "чтение") if outcome == "timeout" else None}
+
+    def driver(statements, timeout):
+        if state["hang"]:
+            time.sleep(timeout - 0.05)                   # вернётся за 0,05 с до срока, пока цикл занят
+            if state["fail"] is not None:
+                raise state["fail"]
+        return fake(statements, timeout)
+
+    g = HistorianGate(driver, allowed=WHITELIST, deadline_s=0.3)
+    await g.run([clock_sql()], lane="background")
+    state["hang"] = True
+
+    async def busy_loop():
+        await anyio.sleep(0.2)
+        time.sleep(0.2)                                  # цикл занят 0,2–0,4 с: срок ворот (0,3 с) — внутри
+
+    for _ in range(PAUSE_AFTER_TIMEOUTS - 1 if outcome == "timeout" else 1):
+        call, _ = await asyncio.gather(g.run([Q]), busy_loop(), return_exceptions=True)
+        if outcome == "ok":
+            assert isinstance(call, GateResult) and call.rows == [[LIVE_ROWS[0]]]   # удача к сроку не теряется
+            assert call.sent == ("20FAKE_001_PV",) and g.stats()["timeouts_5m"] == 0
+        else:
+            assert isinstance(call, HistorianError) and call.code == "timeout" and call.sent == ("20FAKE_001_PV",)
+    assert g.stats()["user_paused"] is False             # два срока драйвера ровно к сроку — не пауза

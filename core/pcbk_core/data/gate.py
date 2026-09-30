@@ -92,9 +92,12 @@ class GateRefused(Exception):
 
 @dataclass
 class _Attempt:
-    """Вызов людей дошёл до драйвера — отмечает _call после передачи запроса в пул ворот."""
+    """Один вызов: reached — дошёл до драйвера (отмечает _call после передачи запроса в пул ворот); counted —
+    его исход уже в счёте сроков подряд. Исход считают срок ворот (_call) и возврат драйвера (_finish) — кто
+    увидит первым; второй не считает: драйвер, ответивший ровно к сроку, видят оба."""
 
     reached: bool = False
+    counted: bool = False
 
 
 @dataclass(frozen=True)
@@ -230,7 +233,7 @@ class HistorianGate:
             if lane == "user" and not self.global_window.allow(WINDOW_KEY, self.monotonic()):
                 raise GateRefused("rate")
             # 5. запрос — в пул ворот; место (и замок первого входа) отпустит колбэк после возврата драйвера
-            waiter = self._submit(loop, lane, probe, statements, deadline - loop.time())
+            waiter = self._submit(loop, lane, probe, statements, deadline - loop.time(), attempt)
             attempt.reached = True
         except BaseException:
             if probe:
@@ -240,13 +243,22 @@ class HistorianGate:
         self._sent_names_total += len(sent)
         # 6. результат ждём не дольше остатка срока; по сроку запрос дорабатывает с местом.
         # 7. защёлку и паузу ставит _finish. Ошибка бросается после блока: без __context__
-        failure: HistorianError | None = None
+        failure: BaseException | None = None
         try:
             rows = await asyncio.wait_for(waiter, timeout=deadline - loop.time())
         except TimeoutError:
-            failure = HistorianError("timeout", "срок вызова истёк, запрос дорабатывает с местом", sent)
-            if lane == "user":              # место ещё держит драйвер: ждущий, взяв его, увидит паузу
-                self._count_timeouts("timeout")
+            if waiter.done() and not waiter.cancelled():
+                # драйвер ответил ровно к сроку: _finish уже отдал исход и посчитал его, а таймер срока успел
+                # отменить задачу. Исход вызова — ответ драйвера: удача не теряется, срок не считается дважды
+                failure = waiter.exception()
+                if failure is None:
+                    rows = waiter.result()
+                elif isinstance(failure, HistorianError):
+                    failure = failure.with_sent(sent)
+            else:
+                failure = HistorianError("timeout", "срок вызова истёк, запрос дорабатывает с местом", sent)
+                # место ещё держит драйвер: ждущий, взяв его, увидит паузу
+                self._count_outcome(lane, attempt, "timeout")
         except HistorianError as err:
             failure = err.with_sent(sent)
         if failure is not None:
@@ -293,12 +305,19 @@ class HistorianGate:
         now = self.monotonic()
         self._user_window(now).append((now, max(0, round(took_s * 1000)), code, reached))
 
+    def _count_outcome(self, lane: Lane, attempt: _Attempt, code: str) -> None:
+        """Исход вызова людей — в счёт сроков подряд ровно один раз, кто бы его ни увидел первым."""
+        if lane != "user" or attempt.counted:
+            return
+        attempt.counted = True
+        self._count_timeouts(code)
+
     def _count_timeouts(self, code: str) -> None:
         """Счёт сроков подряд у людей по исходу вызова, дошедшего до историана: срок — +1, прочий исход — ноль.
 
-        Зовут его в момент исхода, до того как отпущены место и замок первого входа (срок ворот, _finish):
-        ждущий их, взяв, уже видит паузу. Отказы без SQL (busy, пауза, unlisted, rate, защёлка) сюда не
-        приходят и счёт не трогают.
+        Зовут его (через _count_outcome) в момент исхода, до того как отпущены место и замок первого входа
+        (срок ворот, _finish): ждущий их, взяв, уже видит паузу. Отказы без SQL (busy, пауза, unlisted, rate,
+        защёлка) сюда не приходят и счёт не трогают.
         """
         if code != "timeout":
             self._timeouts_in_row = 0
@@ -325,21 +344,21 @@ class HistorianGate:
             log.warning("ворота: нет связи с историаном (%s) — пауза %g с", err.public(), CONNECT_COOLDOWN_S)
 
     def _submit(self, loop: asyncio.AbstractEventLoop, lane: Lane, probe: bool, statements: tuple[str, ...],
-                remaining_s: float) -> asyncio.Future:
+                remaining_s: float, attempt: _Attempt) -> asyncio.Future:
         waiter = loop.create_future()
         future = self._pool.submit(self._query, statements, remaining_s)
         self._in_flight[lane] += 1
 
         def done(f: Future) -> None:        # в потоке драйвера (или сразу, если уже готово)
             try:
-                loop.call_soon_threadsafe(self._finish, lane, probe, f, waiter)
+                loop.call_soon_threadsafe(self._finish, lane, probe, f, waiter, attempt)
             except RuntimeError:            # цикл закрыт: отпускать некому
                 pass
 
         future.add_done_callback(done)
         return waiter
 
-    def _finish(self, lane: Lane, probe: bool, future: Future, waiter: asyncio.Future) -> None:
+    def _finish(self, lane: Lane, probe: bool, future: Future, waiter: asyncio.Future, attempt: _Attempt) -> None:
         """В цикле событий после возврата драйвера.
 
         Удача, защёлка, пауза и счёт сроков подряд людей отмечаются до того, как отпущены
@@ -351,8 +370,9 @@ class HistorianGate:
             self._note_failure(exc)
         elif exc is None and not future.cancelled():
             self._login_ok = True
-        if lane == "user" and not waiter.done() and not future.cancelled():
-            self._count_timeouts("ok" if exc is None else exc.code if isinstance(exc, HistorianError) else "error")
+        if not waiter.done() and not future.cancelled():
+            self._count_outcome(lane, attempt,
+                                "ok" if exc is None else exc.code if isinstance(exc, HistorianError) else "error")
         if probe:
             self._first_login.release()
         self._in_flight[lane] -= 1
