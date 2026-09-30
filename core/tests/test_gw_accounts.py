@@ -6,10 +6,11 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import closing
 
 import pytest
 
-from helpers import PW, FakeMono, fail_connect, store
+from helpers import PW, FakeMono, fail_connect, full_disk, store
 from pcbk_core.gateway import accounts
 from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, UNKNOWN_KEYS, AccountStore, StoreError,
                                         hash_password, verify_password)
@@ -166,6 +167,32 @@ def test_unknown_lock_survives_junk_flood(tmp_path):                            
     assert hashlib.sha256(b"Junk-51").digest() in s.unknown_failures                  # а не самый старый незапертый
 
 
+def scrypt_spy(monkeypatch) -> list[int]:
+    """Шпион на accounts._scrypt: список, куда каждый вызов кладёт 1 (зовут из потоков — append атомарен)."""
+    calls, real = [], accounts._scrypt
+
+    def spy(password, salt):
+        calls.append(1)
+        return real(password, salt)
+    monkeypatch.setattr(accounts, "_scrypt", spy)
+    return calls
+
+
+def test_verify_one_scrypt_in_every_case(tmp_path, monkeypatch):                      # итоговое ревью Д5а, I1 (R1)
+    """Выравнивание времени verify: ровно один scrypt на каждый вызов — неверный пароль, отключённая учётка с
+    верным, неизвестный логин верного вида и логин неверного вида (свой хеш или хеш-пустышка)."""
+    s = store(tmp_path)                                                                # open() посчитал пустышку
+    s.add("ivanov", "student", 3, PW)
+    s.add("petrov", "student", 4, PW)
+    s.disable("petrov")
+    calls = scrypt_spy(monkeypatch)
+    for login, pw in (("ivanov", "неверный-1"), ("petrov", PW), ("nobody7", PW), ("Не-Логин!", PW)):
+        calls.clear()
+        assert s.verify(login, pw) is None and len(calls) == 1, login
+    calls.clear()
+    assert s.verify("ivanov", PW) is not None and len(calls) == 1                     # положительный контроль
+
+
 def test_store_errors_counted_without_paths(tmp_path, monkeypatch):
     s = store(tmp_path)
     monkeypatch.setattr(sqlite3, "connect", fail_connect)
@@ -191,6 +218,38 @@ def test_probe_sees_readonly_and_keeps_operation_failures(tmp_path):            
     assert s.ping() is True and (s.probe_failures, s.op_failures) == (0, 1)            # проба сбой операций не снимает
     s.open_session("ivanov")
     assert s.op_failures == 0                                                          # снимает удачная операция
+
+
+def test_full_disk_write_failure_outlives_reads(tmp_path):                           # итоговое ревью Д5а, M2 (R3)
+    """Переполненный диск: пульс ping() — настоящая запись с COMMIT и видит его; сбой записи операции не снимают
+    ни удачные чтения, ни удачный пульс — только удачная запись."""
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    with full_disk(s):
+        assert s.ping() is False and s.probe_failures == 1                             # INSERT + ROLLBACK прошёл бы
+        with pytest.raises(StoreError):
+            s.open_session("ivanov")                                                   # вход пишет — сбой
+        assert (s.write_failures, s.read_failures) == (1, 0)
+        assert s.verify("ivanov", PW) is not None and s.session("чужой") is None       # чтения идут
+        assert s.locked("ivanov") is False and s.op_failures == 1                      # и сбой записи не снимают
+    assert s.ping() is True and (s.probe_failures, s.op_failures) == (0, 1)            # пульс — тоже (Д5-R28)
+    s.close_session("чужой")                                                           # DELETE без строк — не запись
+    assert s.op_failures == 1
+    s.open_session("ivanov")
+    assert s.op_failures == 0                                                          # снимает удачная запись
+    with closing(sqlite3.connect(tmp_path / "core.db")) as db:
+        assert db.execute("SELECT count(*) FROM gw_heartbeat").fetchone()[0] == 1      # одна строка пульса
+
+
+def test_read_failure_cleared_by_read(tmp_path, monkeypatch):                          # R3: сбой чтения — как прежде
+    s = store(tmp_path)
+    with monkeypatch.context() as m:
+        m.setattr(sqlite3, "connect", fail_connect)
+        with pytest.raises(StoreError):
+            s.students()
+    assert (s.read_failures, s.write_failures) == (1, 0)
+    s.students()
+    assert s.op_failures == 0
 
 
 def test_probe_sees_lock_and_missing_file(tmp_path, monkeypatch):                      # Д5-R28, р4

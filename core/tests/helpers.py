@@ -428,6 +428,33 @@ def fail_connect(*a, **k):
     raise sqlite3.OperationalError("database is locked")
 
 
+class FullDisk:
+    """Соединение SQLite как на переполненном диске: COMMIT падает SQLITE_FULL, чтения и запись до COMMIT идут
+    (в WAL вставка без COMMIT на диск не пишет). Подмена AccountStore._connect: full_disk(store)."""
+
+    def __init__(self, db: sqlite3.Connection):
+        self._db = db
+
+    def execute(self, sql: str, *args):
+        if sql.strip().upper() == "COMMIT":
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._db.execute(sql, *args)
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
+
+
+@contextmanager
+def full_disk(s: AccountStore) -> Iterator[None]:
+    """На время блока соединения хранилища s — FullDisk; после — прежние."""
+    real = s._connect
+    s._connect = lambda create=False: FullDisk(real(create))
+    try:
+        yield
+    finally:
+        del s._connect
+
+
 # --- Шлюз: места (Д5а, задача А3) ---
 
 # настройки шлюза тестов строятся напрямую: проверки from_env (задача А4) на них не действуют

@@ -333,6 +333,38 @@ def test_body_limit_after_zone(tmp_path):                                       
         assert (r.status_code, r.json()["name"]) == (413, "PayloadTooLarge")
 
 
+def test_login_one_scrypt_per_request(tmp_path, monkeypatch):                          # итоговое ревью Д5а, I1 (R1)
+    """Вход по HTTP: ровно один scrypt на запрос во всех четырёх случаях неудачи — время ответа не выдаёт, есть ли
+    логин и отключён ли он; положительный контроль — удачный вход."""
+    app, role = make_gateway(tmp_path)
+    role.store.disable("stu-05")
+    calls, real = [], accounts._scrypt
+
+    def spy(password, salt):
+        calls.append(1)
+        return real(password, salt)
+    monkeypatch.setattr(accounts, "_scrypt", spy)
+    with TestClient(app, base_url=BASE) as c:
+        for name, pw, code in (("stu-03", "неверный-1", 401), ("stu-05", PW, 401), ("nobody7", PW, 401),
+                               ("Не-Логин!", PW, 401), ("stu-03", PW, 200)):
+            calls.clear()
+            assert (login(c, name, pw).status_code, len(calls)) == (code, 1), name
+
+
+def test_wake_needs_origin(tmp_path):                                                   # итоговое ревью Д5а, M1 (R2)
+    app, role = make_gateway(tmp_path)
+    with TestClient(app, base_url=BASE) as c:
+        assert login(c, "stu-03").status_code == 200
+        r = c.post("/pcbk/api/workplace/wake")                                         # ни Origin, ни Sec-Fetch-Site
+        assert r.status_code == 403 and r.json()["data"]["message"] == GW_MESSAGES["origin"]
+        assert role.stats.count_1h("origin_refused") == 1 and role.workplaces.view(3).state == "sleeping"
+        r = c.post("/pcbk/api/workplace/wake", headers={"Origin": ORIGIN})             # положительный контроль
+        assert (r.status_code, r.json()["place"]) == (202, "03")
+        assert role.stats.count_1h("origin_refused") == 1
+        wait_until(lambda: ("start", 3) in role.fake_docker.calls)
+    assert [call for call in role.fake_docker.calls if call[0] == "start"] == [("start", 3)]
+
+
 def test_disabled_answer_equals_unknown(tmp_path):                                      # F8 (ревью A, M5)
     app, role = make_gateway(tmp_path)
     role.store.disable("stu-05")

@@ -14,8 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fake_places import FakeDocker, FakePlaces
-from helpers import (BDRV_CFG, CORE_DIR, LLM_ENV, LLM_SETTINGS, LLM_TOKEN, SETTINGS, TOKEN, chat_body, gateway_role,
-                     login, make_app, make_gateway, make_llm_role, wait_until, wait_until_async)
+from helpers import (BDRV_CFG, CORE_DIR, LLM_ENV, LLM_SETTINGS, LLM_TOKEN, SETTINGS, TOKEN, chat_body, full_disk,
+                     gateway_role, login, make_app, make_gateway, make_llm_role, wait_until, wait_until_async)
 from pcbk_core.app import create_app
 from pcbk_core.gateway import places
 from pcbk_core.gateway.accounts import AccountStore, StoreError
@@ -116,6 +116,28 @@ def test_reaper_probe_keeps_row_red(tmp_path):                                  
         assert c.get("/healthz/gateway").json()["ok"] is False, store_state(role)     # проба ок, сбой входа не снят
         assert login(c, "stu-03").status_code == 200
         assert c.get("/healthz/gateway").json() == {"ok": True, "detail": "принимает вход"}
+
+
+def test_full_disk_row_not_greened_by_reads(tmp_path):                                # итоговое ревью Д5а, M2 (R3)
+    """Переполненный диск (COMMIT падает, чтения идут): строка store не зеленеет от чтений — ни пока диск полон,
+    ни после удачного пульса; зеленеет после удачной записи (вход)."""
+    app, role = make_gateway(tmp_path)
+    junk = {"Cookie": "pcbk_session=junk-session"}                                     # /auth/me читает базу
+    with TestClient(app, base_url=BASE) as c:
+        wait_until(lambda: role.workplaces.ticks == 1)                                 # пульс первого такта — позади
+        with full_disk(role.store):
+            assert role.store.ping() is False                                          # пульс пишет с COMMIT
+            assert login(c, "stu-03").status_code == 503, store_state(role)            # сессия не записана
+            for _ in range(3):
+                assert c.get("/pcbk/api/auth/me", headers=junk).status_code == 401     # чтения идут
+                assert c.get("/health/gateway").json()["store_ok"] is False
+        assert role.store.ping() is True                                               # диск освободился
+        assert c.get("/pcbk/api/auth/me", headers=junk).status_code == 401
+        assert c.get("/healthz/gateway").json() == {"ok": False, "detail": "учётные записи недоступны"}, \
+            store_state(role)
+        assert login(c, "stu-03").status_code == 200                                   # удачная запись
+        assert c.get("/healthz/gateway").json() == {"ok": True, "detail": "принимает вход"}
+        assert c.get("/health/gateway").json()["store_ok"] is True
 
 
 def store_state(role) -> str:

@@ -16,10 +16,11 @@
 Договор Role: конструктор только запоминает; файл, WAL и таблицы — open() (роль зовёт её через
 asyncio.to_thread в начале lifespan). Соединение — на каждую операцию, операции идут из потоков.
 Операции открывают файл с mode=rw: пропавший файл не превращается в пустую «исправную» базу, создаёт
-её только open(). Сбой SQLite в операции — StoreError без пути и значений, op_failures растёт,
-удачная операция его обнуляет. ping() — проба записи со своим счётчиком probe_failures; op_failures
-она не трогает (Д5-R28). scrypt — вне открытой транзакции записи: core.db делят журналы, их запись
-ждёт блокировку не дольше 0,5 с (Г14).
+её только open(). Сбой SQLite в операции — StoreError без пути и значений. Сбои считаются раздельно:
+сбой чтения снимает любая удачная операция, сбой записи — только удачная запись (итоговое ревью Д5а, M2: на
+переполненном диске чтения идут, и строка мигала бы). ping() — пульс, настоящая запись с COMMIT, со своим
+счётчиком probe_failures; сбои операций она не трогает (Д5-R28). scrypt — вне открытой транзакции записи:
+core.db делят журналы, их запись ждёт блокировку не дольше 0,5 с (Г14).
 
 Пароль не попадает ни в базу (только хеш), ни в тексты исключений, ни в журнал. Команда
 администратора — main(): python -m pcbk_core.gateway.accounts.
@@ -68,8 +69,6 @@ SALT_BYTES = 16
 HASH_BYTES = 32
 _HASH_PREFIX = f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}$"
 _HASH_TAIL = re.compile(r"([0-9a-f]{32})\$([0-9a-f]{64})")
-# ключ пробной строки ping(): не проходит LOGIN_RE, со строками логинов не совпадёт; строка откатывается
-_PROBE_KEY = "~ping"
 _SQLITE_CODE = re.compile(r"SQLITE_[A-Z_]{1,40}")
 
 _LOGIN_RULE = "логин: 3…32 знака из a-z, 0-9, «.», «_», «-», первый — буква a-z"
@@ -104,6 +103,11 @@ _SCHEMA = (
         at REAL NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS gw_login_failures_login ON gw_login_failures (login, at)",
+    # пульс ping(): одна служебная строка, её перезаписывает каждый такт уборщика
+    """CREATE TABLE IF NOT EXISTS gw_heartbeat (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        at REAL NOT NULL
+    )""",
 )
 _ACCOUNT = "SELECT login, role, place, disabled, pw_hash FROM gw_accounts WHERE login = ?"
 
@@ -220,9 +224,10 @@ def _store_error(exc: sqlite3.Error) -> StoreError:
 class AccountStore:
     """Учётки, закрепления мест, сессии и замок входа в core.db. Конструктор только запоминает.
 
-    Поля для health() роли — из памяти: op_failures — сбоев настоящих операций подряд (снимает удачная
-    операция), probe_failures — сбоев ping() подряд (снимает удачная проба), last_error — класс последней
-    ошибки. unknown_failures — счётчик неизвестных логинов: sha256 логина → метки неудачных входов;
+    Поля для health() роли — из памяти: read_failures — сбоев чтения подряд (снимает удачная операция),
+    write_failures — сбоев записи подряд (снимает только удачная запись: операция, изменившая строки и
+    закрывшая транзакцию), op_failures — их сумма, probe_failures — сбоев ping() подряд (снимает удачный
+    пульс), last_error — класс последней ошибки. unknown_failures — счётчик неизвестных логинов: sha256 логина → метки неудачных входов;
     очередь вытеснения — _unknown_open (незапертые, по последнему неудачному входу) и _unknown_locked
     (запертые, по времени запирания).
     """
@@ -231,7 +236,8 @@ class AccountStore:
         self.path = db_path
         self.ttl_s = ttl_s
         self.clock = clock
-        self.op_failures = 0
+        self.read_failures = 0
+        self.write_failures = 0
         self.probe_failures = 0
         self.last_error: str | None = None
         self.unknown_failures: dict[bytes, deque[float]] = {}
@@ -248,23 +254,37 @@ class AccountStore:
         uri = f"{Path(self.path).absolute().as_uri()}?mode={'rwc' if create else 'rw'}"
         return sqlite3.connect(uri, uri=True, timeout=SQLITE_TIMEOUT_S, isolation_level=None)
 
+    @property
+    def op_failures(self) -> int:
+        """Сбоев настоящих операций: чтения и записи вместе."""
+        return self.read_failures + self.write_failures
+
     @contextmanager
-    def _op(self) -> Iterator[sqlite3.Connection]:
-        """Соединение настоящей операции. Сбой SQLite — op_failures, last_error и StoreError без текста
-        SQLite; удача — op_failures = 0. Отказ по правилам (ValueError) счётчик не трогает."""
+    def _op(self, write: bool = False) -> Iterator[sqlite3.Connection]:
+        """Соединение настоящей операции. Сбой SQLite — write_failures у операции записи (write), иначе
+        read_failures, и last_error, StoreError без текста SQLite. Удача обнуляет read_failures, а
+        write_failures — только если операция изменила строки и закрыла транзакцию: удачное чтение сбой
+        записи не снимает. Отказ по правилам (ValueError) счётчики не трогает."""
+        wrote = False
         try:
             db = self._connect()
             try:
                 yield db
+                wrote = db.total_changes > 0 and not db.in_transaction
             finally:
                 db.close()          # незавершённая транзакция откатывается при закрытии
         except sqlite3.Error as exc:
             with self._state_lock:
-                self.op_failures += 1
+                if write:
+                    self.write_failures += 1
+                else:
+                    self.read_failures += 1
                 self.last_error = type(exc).__name__
             raise _store_error(exc) from None
         with self._state_lock:
-            self.op_failures = 0
+            self.read_failures = 0
+            if wrote:
+                self.write_failures = 0
 
     def open(self) -> bool:
         """Файл, WAL, таблицы и индексы; идемпотентна. Сбой не бросает: last_error и False.
@@ -290,9 +310,11 @@ class AccountStore:
         return True
 
     def ping(self) -> bool:
-        """Проба записи (Д5-R28): mode=rw, SELECT count(*), BEGIN IMMEDIATE, INSERT пробной строки, ROLLBACK.
+        """Пульс (Д5-R28; итоговое ревью Д5а, M2): mode=rw, SELECT count(*), BEGIN IMMEDIATE, UPSERT служебной
+        строки gw_heartbeat, COMMIT. Запись настоящая: в WAL вставка без COMMIT на диск не идёт, и переполненный
+        диск (SQLITE_FULL) проба с ROLLBACK не видела.
 
-        Не бросает. Итог — probe_failures (удача обнуляет) и last_error; op_failures не трогает: сбой
+        Не бросает. Итог — probe_failures (удача обнуляет) и last_error; сбои операций не трогает: сбой
         настоящей операции снимает только удачная операция.
         """
         try:
@@ -301,8 +323,9 @@ class AccountStore:
                 db.execute("SELECT count(*) FROM gw_accounts").fetchone()
                 db.execute("BEGIN IMMEDIATE")
                 # одного BEGIN IMMEDIATE мало: на файле только для чтения он проходит
-                db.execute("INSERT INTO gw_login_failures (login, at) VALUES (?, 0)", (_PROBE_KEY,))
-                db.execute("ROLLBACK")
+                db.execute("INSERT INTO gw_heartbeat (id, at) VALUES (1, ?)"
+                           " ON CONFLICT (id) DO UPDATE SET at = excluded.at", (self.clock(),))
+                db.execute("COMMIT")
             finally:
                 db.close()
         except Exception as exc:
@@ -335,7 +358,7 @@ class AccountStore:
         _check_password(password)
         pw_hash = hash_password(password)           # scrypt — до транзакции записи (Г14)
         now = _iso(self.clock())
-        with self._op() as db:
+        with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM gw_accounts WHERE login = ?", (login,)).fetchone() is not None:
                 raise ValueError(f"логин: {login} уже есть")
@@ -370,7 +393,7 @@ class AccountStore:
         _check_login(login)
         _check_password(password)
         pw_hash = hash_password(password)           # scrypt — до транзакции записи (Г14)
-        with self._op() as db:
+        with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("UPDATE gw_accounts SET pw_hash = ? WHERE login = ?", (pw_hash, login)).rowcount != 1:
                 raise ValueError(f"учётки {login} нет")
@@ -382,7 +405,7 @@ class AccountStore:
     def disable(self, login: str) -> None:
         """Учётка отключается, её сессии закрываются; закрепление места остаётся."""
         _check_login(login)
-        with self._op() as db:
+        with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("UPDATE gw_accounts SET disabled = 1 WHERE login = ?", (login,)).rowcount != 1:
                 raise ValueError(f"учётки {login} нет")
@@ -392,7 +415,7 @@ class AccountStore:
     def remove(self, login: str) -> None:
         """Удаляет только отключённую учётку; gw_places не трогает — логин остаётся за местом (надгробие)."""
         _check_login(login)
-        with self._op() as db:
+        with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT disabled FROM gw_accounts WHERE login = ?", (login,)).fetchone()
             if row is None:
@@ -408,7 +431,7 @@ class AccountStore:
         """Снимает закрепление места — только за пробной учёткой (PROBE_LOGIN) и без действующей учётки на месте."""
         if type(place) is not int or place not in PLACES:
             raise ValueError("место: 1…10")
-        with self._op() as db:
+        with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             bound = db.execute("SELECT login FROM gw_places WHERE place = ?", (place,)).fetchone()
             active = db.execute("SELECT 1 FROM gw_accounts WHERE place = ? AND disabled = 0", (place,)).fetchone()
@@ -478,7 +501,7 @@ class AccountStore:
         Заодно удаляются истёкшие сессии. Нет учётки или она отключена — ValueError."""
         token = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
         now = self.clock()
-        with self._op() as db:
+        with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM gw_sessions WHERE expires_at <= ?", (now,))
             added = db.execute("INSERT INTO gw_sessions (token_sha, login, created_at, expires_at)"
@@ -490,18 +513,20 @@ class AccountStore:
         return token
 
     def session(self, token: str | None) -> Account | None:
-        """Учётка сессии; нет токена, нет сессии, отключённая учётка — None. Истёкшая сессия удаляется."""
+        """Учётка сессии; нет токена, нет сессии, отключённая учётка — None. Истёкшая сессия удаляется —
+        своей операцией записи: чтение и запись считают сбои раздельно."""
         if not isinstance(token, str) or not token:
             return None
         sha, now = _sha(token), self.clock()
         with self._op() as db:
             row = db.execute("SELECT s.expires_at, a.login, a.role, a.place, a.disabled FROM gw_sessions s"
                              " LEFT JOIN gw_accounts a ON a.login = s.login WHERE s.token_sha = ?", (sha,)).fetchone()
-            if row is None:
-                return None
-            if row[0] <= now:
-                db.execute("DELETE FROM gw_sessions WHERE token_sha = ?", (sha,))
-                return None
+        if row is None:
+            return None
+        if row[0] <= now:
+            with self._op(write=True) as db:
+                db.execute("DELETE FROM gw_sessions WHERE token_sha = ? AND expires_at <= ?", (sha, now))
+            return None
         _, login, role, place, disabled = row
         if login is None or disabled:
             return None
@@ -511,7 +536,7 @@ class AccountStore:
         """Закрывает сессию по токену; неизвестный токен — ничего."""
         if not isinstance(token, str) or not token:
             return
-        with self._op() as db:
+        with self._op(write=True) as db:
             db.execute("DELETE FROM gw_sessions WHERE token_sha = ?", (_sha(token),))
 
     # --- замок входа ---
@@ -535,7 +560,7 @@ class AccountStore:
         последними (ревью А2, M2)."""
         now = self.clock()
         if isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
-            with self._op() as db:
+            with self._op(write=True) as db:
                 if db.execute("SELECT 1 FROM gw_accounts WHERE login = ?", (login,)).fetchone() is not None:
                     db.execute("BEGIN IMMEDIATE")
                     db.execute("INSERT INTO gw_login_failures (login, at) VALUES (?, ?)", (login, now))
@@ -571,7 +596,7 @@ class AccountStore:
     def unlock(self, login: str) -> None:
         """Снимает замок логина: строки таблицы и счётчик в памяти."""
         if isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
-            with self._op() as db:
+            with self._op(write=True) as db:
                 db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
         self._forget_unknown(login)
 
