@@ -41,6 +41,11 @@
 4. `cd /opt/pcbk-reserve && docker compose up -d --no-build edge watchdog sp-ro sp-ctl`
    — **с именами служб**: рабочие места (с Д2) создаются отдельно и не
    стартуют сами.
+   **Сторож — раньше `core`, когда день добавляет ключ в `/health/gateway`** (Д5б: `refused_1h`,
+   `streams`, `stream_broken_1h`, `upstream_failed_1h`). Прежний сторож лишний ключ считает
+   нарушением договора, новый понимает и старый ответ. Порядок: `docker compose up -d --no-build
+   watchdog`, дождаться `stale: false`, затем `docker compose up -d --no-build core`. Иначе, пока
+   сторож прежний, строка «Шлюз и вход» — «шлюз ответил не по договору».
 5. Проверка: `curl -sk https://127.0.0.1:8443/status.json` — `stale: false`.
 
 ## Рабочие места (с Д2)

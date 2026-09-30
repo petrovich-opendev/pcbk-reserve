@@ -1,4 +1,4 @@
-"""Клиент шлюза для интеграционных тестов (Д5а): вход, выход, рабочее место через edge по HTTPS.
+"""Клиент шлюза для интеграционных тестов (Д5а): вход, выход, рабочее место через edge по HTTPS; поток /event (Д5б).
 
 Соединение — по адресу из base (127.0.0.1:18443), заголовок Host — свой (host), так имя стенда нигде не
 разрешается. TLS без проверки сертификата: сертификат тестовый, на сервере — туннель. Путь уходит как есть
@@ -10,11 +10,13 @@ import http.client
 import json
 import ssl
 import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
 COOKIE = "pcbk_session"
 WAKE_POLL_S = 1.0
+EVENT_PATH = "/pcbk/api/oc/event"
 
 
 class GwClient:
@@ -90,6 +92,54 @@ class GwClient:
         result = self.call("POST", "/pcbk/api/auth/logout")
         self.cookie = None
         return result
+
+    def events(self, seconds: float, on_open: Callable[[], None] | None = None) -> tuple[list[dict], float]:
+        """Поток /pcbk/api/oc/event через edge: события (JSON кадров data:) до срока seconds или конца потока и
+        длительность от запроса, с. on_open зовётся один раз после первого события (в нём тест шлёт сообщение).
+
+        Каждое чтение строки — под остатком срока; срок вышел — поток закрывается клиентом. Конец потока сервером —
+        пустое чтение. Код не 200 — AssertionError с кодом и телом ответа."""
+        started = time.monotonic()
+        deadline = started + seconds
+        conn = http.client.HTTPSConnection(self.addr, self.port, context=self._ctx, timeout=self.timeout)
+        events: list[dict] = []
+        try:
+            conn.putrequest("GET", EVENT_PATH, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", self.host)
+            if self.cookie is not None:
+                conn.putheader("Cookie", f"{COOKIE}={self.cookie}")
+            conn.putheader("Accept", "text/event-stream")
+            conn.endheaders()
+            sock = conn.sock                            # getresponse может отдать сокет ответу и обнулить conn.sock
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raise AssertionError(f"поток: код {resp.status}, {_parse(resp.read())}")
+            data: list[bytes] = []
+            opened = on_open is None
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                sock.settimeout(left)
+                try:
+                    line = resp.readline()
+                except TimeoutError:                    # срок вышел посреди ожидания
+                    break
+                if not line:                            # конец потока сервером
+                    break
+                line = line.rstrip(b"\r\n")
+                if line.startswith(b"data:"):
+                    value = line[5:]
+                    data.append(value[1:] if value.startswith(b" ") else value)
+                elif not line and data:                 # пустая строка — конец события
+                    events.append(json.loads(b"\n".join(data)))
+                    data = []
+                    if not opened:
+                        opened = True
+                        on_open()
+            return events, time.monotonic() - started
+        finally:
+            conn.close()
 
     def wake_and_wait(self, timeout: float = 90.0) -> dict:
         """POST /pcbk/api/workplace/wake (ждём 202), затем GET /pcbk/api/workplace раз в секунду до ready или

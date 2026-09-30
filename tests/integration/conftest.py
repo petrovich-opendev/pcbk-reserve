@@ -489,19 +489,20 @@ class Stack:
         return int(r.stdout.strip())
 
     def http_host(self, method: str, url: str, body: dict | None = None,
-                  token: str | None = None) -> tuple[int, str]:
+                  token: str | None = None, headers: dict | None = None) -> tuple[int, str]:
         """Запрос с хоста теста (адрес серверного слоя в pcbk-egress): urllib без прокси и перенаправлений.
 
-        token — заголовок Authorization: Bearer. Код ответа и тело; ответ с ошибкой HTTP — тоже результат,
-        а не исключение.
+        token — заголовок Authorization: Bearer; headers — ещё заголовки (Д5б), поверх Content-Type и
+        Authorization. Код ответа и тело; ответ с ошибкой HTTP — тоже результат, а не исключение.
         """
         data = None if body is None else json.dumps(body).encode()
-        headers = {} if body is None else {"Content-Type": "application/json"}
+        sent = {} if body is None else {"Content-Type": "application/json"}
         if token is not None:
-            headers["Authorization"] = f"Bearer {token}"
+            sent["Authorization"] = f"Bearer {token}"
+        sent.update(headers or {})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
         try:
-            with opener.open(urllib.request.Request(url, data=data, headers=headers, method=method),
+            with opener.open(urllib.request.Request(url, data=data, headers=sent, method=method),
                              timeout=20) as resp:
                 return resp.status, resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:

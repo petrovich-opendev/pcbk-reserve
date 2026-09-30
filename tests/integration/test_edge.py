@@ -107,6 +107,16 @@ def test_edge_tmpfs_root_owned_0755(stack):
         assert stack.exec("pcbk-edge", "stat", "-L", "-c", "%a %U", path) == "755 root", path
 
 
+def test_edge_temp_files_on_disk_volume(stack):
+    """Д5б: временные файлы тел и ответов core — на томе (диск), не в tmpfs 64m; каталоги создал мастер для рабочих."""
+    mounts = {m["Destination"]: m for m in stack.inspect("pcbk-edge")["Mounts"]}
+    temp = mounts["/var/lib/pcbk-edge"]
+    assert (temp["Type"], temp["Name"], temp["RW"]) == ("volume", "pcbk-test_pcbk-edge-temp", True)
+    assert "/var/lib/pcbk-edge" not in stack.inspect("pcbk-edge")["HostConfig"]["Tmpfs"]
+    for d in ("client", "proxy"):
+        assert stack.exec("pcbk-edge", "stat", "-c", "%a %U", f"/var/lib/pcbk-edge/{d}") == "700 nginx", d
+
+
 def test_edge_limits(stack):
     host = stack.inspect("pcbk-edge")["HostConfig"]
     assert (host["Memory"], host["PidsLimit"]) == (64 * 1024 * 1024, 64)

@@ -3,12 +3,35 @@
 # Переменных окружения в шаблоне нет: envsubst меняет только имена из окружения,
 # а у edge своих переменных нет.
 
-# вне server{}: сырой URI под /pcbk/api/ с кодированными точками и слэшами, «/.» или «//» — отказ до core
+# вне server{}: сырой путь под /pcbk/api/ (до первого «?») с кодированными точками и слэшами, «/.» или «//» —
+# отказ до core. Строку запроса edge не судит: её фильтрует шлюз (filter_query), и %2F, «[», «]» в ней законны
 map $request_uri $pcbk_bad_api_uri {
     default 0;
-    "~(%2[eEfF]|%5[cC]|/\.|//)" 1;
+    "~^[^?]*(%2[eEfF]|%5[cC]|/\.|//)" 1;
 }
 limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;
+
+# ответы под /pcbk/api/ — не страница: CSP default-src 'none' (Д5б). Пустое значение nginx не отправляет — у
+# страниц сторожа и входа заголовка от этой строки нет (у входа свой CSP в его location)
+map $request_uri $pcbk_api_csp {
+    default "";
+    "~^/pcbk/api(?:[/?]|$)" "default-src 'none'";
+}
+
+# /pcbk/api/oc/: одновременных запросов на cookie сессии и всего (Д5б). Ключ — значение cookie только своего вида
+# (token_urlsafe(32), 43 знака); иное — общая корзина «-»; без cookie — не считается (шлюз ответит 401)
+map $cookie_pcbk_session $pcbk_oc_session {
+    default "-";
+    "" "";
+    "~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;
+}
+limit_conn_zone $pcbk_oc_session zone=pcbk_oc_session:1m;
+limit_conn_zone $server_port zone=pcbk_oc_all:1m;               # ключ один на server 8443 — общий предел
+
+# временные файлы тел запросов и ответов core — на томе pcbk-edge-temp (диск), не в tmpfs: tmpfs считается в
+# mem_limit 64m edge, а ответ core — до 4 МиБ (Д5-R36), тело /pcbk/api/oc/ — до 512 КиБ. Каталоги создаёт мастер
+client_body_temp_path /var/lib/pcbk-edge/client;
+proxy_temp_path       /var/lib/pcbk-edge/proxy;
 
 # 8443 — вход для людей: заглушка, страница входа, пути шлюза /pcbk/api/ и страница состояния сторожа
 server {
@@ -33,6 +56,7 @@ server {
     add_header Cache-Control "no-store" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "no-referrer" always;
+    add_header Content-Security-Policy $pcbk_api_csp always;   # только под /pcbk/api/ (map выше)
     proxy_hide_header Cache-Control;
     proxy_hide_header X-Content-Type-Options;
     proxy_hide_header Referrer-Policy;
@@ -62,6 +86,7 @@ server {
     error_page 494 =400 /pcbk-errors/400.json;            # большие заголовки и cookie (cookie Dify на том же хосте)
     error_page 429 /pcbk-errors/429.json;
     error_page 502 503 504 =503 /pcbk-errors/503.json;    # «=503»: без него код остался бы 502 или 504
+    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn под /pcbk/api/oc/ (509 — только его код)
 
     location = /pcbk-errors/400.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
     location = /pcbk-errors/405.json { internal; default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
@@ -69,6 +94,7 @@ server {
     location = /pcbk-errors/414.json { internal; default_type application/json; return 414 '{"name":"URITooLong","data":{"message":"Адрес запроса слишком длинный"}}'; }
     location = /pcbk-errors/429.json { internal; default_type application/json; return 429 '{"name":"TooManyAttempts","data":{"message":"Слишком много попыток входа — подождите"}}'; }
     location = /pcbk-errors/503.json { internal; default_type application/json; return 503 '{"name":"Unavailable","data":{"message":"Серверный слой не отвечает"}}'; }
+    location = /pcbk-errors/busy.json { internal; default_type application/json; return 503 '{"name":"WorkplaceBusy","data":{"message":"Слишком много одновременных запросов — повторите позже"}}'; }
 
     # р4: Host — ввод клиента (он же X-Forwarded-Host для core): имя из не больше шести меток [a-z0-9-]
     # или адрес IPv4, иначе 400 JSON до core. rewrite, а не «return 400»: серверный rewrite повторяется
@@ -133,8 +159,8 @@ server {
         try_files /login.css =404;
     }
 
-    # пути шлюза в core — только эти (Д5а); error_page, буферы, Connection "" и X-Forwarded-Host —
-    # от server: своих error_page, proxy_set_header и add_header здесь нет
+    # пути шлюза в core — только эти (Д5а, /pcbk/api/oc/ — Д5б); error_page, буферы, Connection "", X-Forwarded-Host
+    # и заголовки ответа — от server: своих error_page, proxy_set_header и add_header здесь нет
     location /pcbk/api/auth/ {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
@@ -158,6 +184,41 @@ server {
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
         client_max_body_size 64k;
         proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    # вызовы адаптера OpenCode (Д5б): метод, путь и тело сверяет шлюз по белому списку, edge — сырой путь, предел
+    # тела, число запросов и сроки. Срок edge больше срока хода у core (25 с, Д5-R30). Тело читается целиком до
+    # core: медленное тело держит edge, а не бюджет тел core (16 МиБ). Ответ core читается без остановки: сверх
+    # буферов server (32k + 8 × 32k) — во временный файл на томе (proxy_temp_path выше), ответ core — до 4 МиБ
+    location /pcbk/api/oc/ {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_conn pcbk_oc_session 10;
+        limit_conn pcbk_oc_all 64;
+        limit_conn_status 509;
+        client_max_body_size 512k;
+        proxy_request_buffering on;
+        proxy_max_temp_file_size 8m;
+        proxy_read_timeout 45s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    # поток событий: без буфера и сжатия; пульс места — 10 с, шлюз рвёт первым через 60 с тишины (Д5-R35);
+    # браузер, не читающий 60 с, edge отключает — очередь шлюза не копит
+    location = /pcbk/api/oc/event {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_conn pcbk_oc_session 10;
+        limit_conn pcbk_oc_all 64;
+        limit_conn_status 509;
+        client_max_body_size 512k;
+        proxy_request_buffering on;
+        proxy_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_read_timeout 90s;
+        send_timeout 60s;
         proxy_pass http://$pcbk_core;
     }
 
