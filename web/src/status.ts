@@ -48,9 +48,18 @@ export function statusView(data: unknown, ownPlace: string | null): StatusView {
 
 type StatusFetch = (url: string, init: RequestInit) => Promise<Response>;
 
+// документ для visibilitychange; Document браузера подходит как есть
+export interface VisibilityDoc {
+  readonly hidden: boolean;
+  addEventListener(type: "visibilitychange", listener: () => void): void;
+  removeEventListener(type: "visibilitychange", listener: () => void): void;
+}
+
 // Опрос раз в pollMs со сроком запроса timeoutMs и пересчёт раз в секунду по часам — как startPolling в
 // status.js сторожа. onView — только при смене вида; до первого ответа (в пределах срока запроса) — молчит,
-// чтобы на каждой загрузке не мигало «неизвестно». Возвращает остановку.
+// чтобы на каждой загрузке не мигало «неизвестно». Вкладка вернулась из фона (visibilitychange, !hidden) —
+// запрос сразу: таймеры фоновой вкладки браузер душит. doc — по умолчанию globalThis.document (в Node его нет,
+// null — без подписки). Возвращает остановку: интервалы, запросы в пути и подписка снимаются.
 export function startStatusPolling(o: {
   onView(v: StatusView): void;
   ownPlace: string | null;
@@ -62,6 +71,7 @@ export function startStatusPolling(o: {
   clearIntervalImpl?: (id: unknown) => void;
   pollMs?: number;
   timeoutMs?: number;
+  doc?: VisibilityDoc | null;
 }): () => void {
   const fetchImpl: StatusFetch = o.fetchImpl ?? ((url, init) => fetch(url, init));
   const nowMs = o.nowMs ?? (() => performance.now());
@@ -71,6 +81,7 @@ export function startStatusPolling(o: {
   const clearIntervalImpl = o.clearIntervalImpl ?? ((id) => clearInterval(id as ReturnType<typeof setInterval>));
   const pollMs = o.pollMs ?? 10000;
   const timeoutMs = o.timeoutMs ?? 4000;
+  const doc: VisibilityDoc | null = o.doc !== undefined ? o.doc : (globalThis.document ?? null);
 
   const startedMs = nowMs();
   let lastOkMs: number | null = null;   // последний свежий ответ (stale: false)
@@ -128,10 +139,15 @@ export function startStatusPolling(o: {
 
   const pollTimer = setIntervalImpl(() => void poll(), pollMs);
   const clockTimer = setIntervalImpl(update, 1000);   // вид по часам — даже когда запрос повис
+  const onVisible = (): void => {
+    if (doc !== null && !doc.hidden) void poll();
+  };
+  doc?.addEventListener("visibilitychange", onVisible);
   void poll();
 
   return () => {
     stopped = true;
+    doc?.removeEventListener("visibilitychange", onVisible);
     clearIntervalImpl(pollTimer);
     clearIntervalImpl(clockTimer);
     for (const ctl of inFlight) ctl.abort();

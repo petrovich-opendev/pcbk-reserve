@@ -4,7 +4,7 @@
 // Среда node: Request и AbortController — одной реализации (в jsdom сигнал jsdom Request Node не примет).
 import { expect, test, vi } from "vitest";
 import {
-  classify, createGatewayFetch, eventDelayMs, explainError, HaltedError, streamLine, type StreamState,
+  classify, createGatewayFetch, eventDelayMs, explainError, HaltedError, SHORT_STREAM_S, streamLine, type StreamState,
 } from "../src/gateway";
 import { T_BUSY, T_OFFLINE, T_STREAM_RETRY, T_TOO_MANY_TABS, T_UNKNOWN } from "../src/texts";
 
@@ -25,6 +25,13 @@ test("classify_table", () => {
   expect(classify(401, "<html>")).toBe("signed_out");                                    // 401 — с любым телом
   expect(classify(503, { name: "Другое", data: { message: "т" } })).toBe("unknown");     // незнакомое имя 503
   expect(classify(403, { data: { message: "т" } })).toBe("unknown");                     // не вида OpenCode
+});
+
+test("classify_other_5xx_is_unknown", () => {
+  // 5xx, кроме 502 и 503, — и с JSON вида OpenCode (UnknownError самого OpenCode) — не «отказ» с текстом (доводка 1)
+  for (const s of [500, 501, 504]) expect(classify(s, { name: "UnknownError", data: { message: "т" } }), String(s)).toBe("unknown");
+  expect(classify(502, { name: "BadGateway", data: { message: "т" } })).toBe("refused");
+  expect(classify(499, { name: "X", data: { message: "т" } })).toBe("refused");
 });
 
 test("explain_error_texts", () => {
@@ -73,6 +80,17 @@ test("short_stream_counts_as_failure", async () => {                     // ра
   await f(ev()); t += 60_000;                                                 // этот прожил минуту
   await f(ev());
   expect(waits).toEqual([0, 1000, 2000, 0]);                                   // конец или обрыв — всё равно сбой; долгий — сброс
+});
+
+test("short_stream_boundary_is_inclusive", async () => {
+  // ровно SHORT_STREAM_S после 200 — поток живой (>=), на миллисекунду раньше — сбой (доводка 1)
+  const waits: number[] = []; let t = 0;
+  const f = createGatewayFetch({ onHalt: vi.fn(), onStream: vi.fn(), random: () => 0.5, now: () => t,
+    sleep: async (ms) => { waits.push(ms); }, fetchImpl: async () => new Response("data: {}\n\n", { status: 200 }) });
+  await f(ev()); t += SHORT_STREAM_S * 1000;
+  await f(ev()); t += SHORT_STREAM_S * 1000 - 1;
+  await f(ev());
+  expect(waits).toEqual([0, 0, 1000]);
 });
 
 test("halt_stops_stream_and_rejects_calls", async () => {
@@ -161,6 +179,52 @@ test("busy_call_gives_up_after_retries", async () => {
   expect(waits).toEqual([1000, 2000, 4000]);
 });
 
+test("halt_during_busy_pause_rejects_retry", async () => {
+  // вызов ждёт паузу повтора busy, а другой вызов получил 401: повтор в сеть не уходит (доводка 1)
+  let release!: () => void;
+  const paused = new Promise<void>((r) => { release = r; });
+  const fetchImpl = vi.fn(async (r: Request) => new URL(r.url).pathname.endsWith("/busy") ? json(503, "WorkplaceBusy") : json(401, "Unauthorized"));
+  const onHalt = vi.fn();
+  const f = createGatewayFetch({ onHalt, onStream: vi.fn(), fetchImpl, random: () => 0.5, sleep: async () => { await paused; } });
+  const busy = f(new Request("https://s/pcbk/api/oc/busy"));
+  await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));             // первый ответ busy — ждёт паузу
+  expect((await f(ses())).status).toBe(401);
+  release();
+  await expect(busy).rejects.toBeInstanceOf(HaltedError);
+  expect(fetchImpl).toHaveBeenCalledTimes(2); expect(onHalt).toHaveBeenCalledTimes(1);
+});
+
+test("default_sleep_waits_and_abort_interrupts", async () => {
+  // пауза по умолчанию (без внедрённого sleep): идёт своим таймером, отмена сигналом её прерывает
+  vi.useFakeTimers();
+  try {
+    const fetchImpl = vi.fn(async () => json(503, "WorkplaceBusy"));
+    const f = createGatewayFetch({ onHalt: vi.fn(), onStream: vi.fn(), fetchImpl, random: () => 0.5 });
+    await f(ev());                                                                  // сбой — следующая пауза 1000 мс
+    const ctl = new AbortController();
+    const cut = f(new Request("https://s/pcbk/api/oc/event", { signal: ctl.signal }));
+    const cutDone = expect(cut).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(999);
+    ctl.abort(); await cutDone;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);                                     // прерванная пауза в сеть не ушла
+    const next = f(ev());                                                           // сбой не добавился: снова 1000 мс
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await next).status).toBe(503); expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const busyCtl = new AbortController();                                          // и пауза повтора busy обычного вызова
+    const call = f(new Request("https://s/pcbk/api/oc/session", { signal: busyCtl.signal }));
+    const callDone = expect(call).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(500);
+    busyCtl.abort(); await callDone;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("other_refusals_not_retried", async () => {
   for (const [code, name] of [[503, "Unavailable"], [403, "Forbidden"], [429, "TooManyRequests"], [500, undefined]] as const) {
     const fetchImpl = vi.fn(async () => json(code, name)); const sleep = vi.fn(async () => {});
@@ -172,7 +236,9 @@ test("other_refusals_not_retried", async () => {
 
 test("non_json_refusal_is_unknown", async () => {
   // 503 без content-type application/json (HTML прокси) — не «спит» и не «занято»: без остановки и повтора
-  const fetchImpl = vi.fn(async () => new Response('{"name":"WorkplaceNotReady"}', { status: 503, headers: { "content-type": "text/html" } }));
+  // тело — полноценный отказ вида OpenCode: разбор при любом content-type дал бы «спит» и остановку (доводка 1)
+  const fetchImpl = vi.fn(async () => new Response('{"name":"WorkplaceNotReady","data":{"message":"т"}}',
+    { status: 503, headers: { "content-type": "text/html" } }));
   const onHalt = vi.fn(); const states: StreamState[] = [];
   const f = createGatewayFetch({ onHalt, onStream: (s) => states.push(s), fetchImpl, random: () => 0.5, sleep: async () => {} });
   await f(ses()); await f(ev());

@@ -29,6 +29,11 @@ test("status_view_filters_and_levels", () => {
   expect(statusView("<html>", "03").text).toBe("Состояние стенда неизвестно — сторож не отвечает");
   expect(statusView({ stale: false, checks: "x" }, "03").text).toBe(T_STATUS_UNKNOWN);  // не той формы
   expect(statusView(st([c("student-03", "Рабочее место 03", "fail")]), null).level).toBe("ok");  // без места — ни одного
+  // доводка 1: незнакомое состояние строки — «неизвестно», не «норма»; ответ без stale — страница не по договору
+  expect(statusView(st([c("edge", "Входной прокси", "ok"), c("core", "Служба данных", "непонятно")]), "03"))
+    .toEqual({ level: "unknown", text: "Состояние неизвестно: Служба данных" });
+  expect(statusView({ stale_after_s: 30, checks: [c("edge", "Входной прокси", "ok")] }, "03"))
+    .toEqual({ level: "unknown", text: T_STATUS_UNKNOWN });
 });
 
 // --- опрос: часы и таймеры — поддельные (vi.useFakeTimers), fetch — управляемый ---
@@ -84,11 +89,12 @@ test("polling_bad_answers_are_unknown", async () => {
     { status: 200, body: st([c("edge", "Входной прокси", "warn")]) },
     { status: 200, body: st([], { stale: true }) },
     { status: 200, body: "не json" },
+    { status: 200, body: { stale_after_s: 30, checks: [c("edge", "Входной прокси", "ok")] } },   // без stale
     { status: 200, body: st([c("edge", "Входной прокси", "ok")], { stale_after_s: 60 }) },
   ]);
   const seen: string[] = [];
-  for (let i = 0; i < 6; i++) { await vi.advanceTimersByTimeAsync(i === 0 ? 0 : 10_000); seen.push(p.views.at(-1)!.level); }
-  expect(seen).toEqual(["warn", "unknown", "warn", "unknown", "unknown", "ok"]);
+  for (let i = 0; i < 7; i++) { await vi.advanceTimersByTimeAsync(i === 0 ? 0 : 10_000); seen.push(p.views.at(-1)!.level); }
+  expect(seen).toEqual(["warn", "unknown", "warn", "unknown", "unknown", "unknown", "ok"]);
   await vi.advanceTimersByTimeAsync(55_000);                                      // stale_after_s из ответа — 60 с
   expect(p.views.at(-1)!.level).toBe("ok");
   p.stop();
@@ -108,4 +114,60 @@ test("polling_request_timeout_aborts", async () => {
   expect(signals[0].aborted).toBe(true);
   expect(views).toEqual([{ level: "unknown", text: T_STATUS_UNKNOWN }]);          // первый же запрос повис — неизвестно
   stop();
+});
+
+test("stop_aborts_request_in_flight", async () => {
+  vi.useFakeTimers();
+  const signals: AbortSignal[] = [];
+  const views: StatusView[] = [];
+  const stop = startStatusPolling({ onView: (v) => views.push(v), ownPlace: "03", nowMs: () => Date.now(), doc: null,
+    fetchImpl: (_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
+      const s = init!.signal!; signals.push(s); s.addEventListener("abort", () => reject(s.reason));
+    }) });
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(signals).toHaveLength(1); expect(signals[0].aborted).toBe(false);
+  stop();
+  expect(signals[0].aborted).toBe(true);                                          // запрос в пути отменён остановкой
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(signals).toHaveLength(1); expect(views).toEqual([]);                     // ни запроса, ни вида после остановки
+});
+
+test("visible_again_polls_at_once", async () => {
+  // вкладка вернулась из фона — запрос сразу, не через 10 с; скрытие запроса не даёт; остановка снимает подписку
+  const live = new Set<() => void>();                                             // подписки на visibilitychange
+  const doc = { hidden: false,
+    addEventListener: (_t: "visibilitychange", fn: () => void) => { live.add(fn); },
+    removeEventListener: (_t: "visibilitychange", fn: () => void) => { live.delete(fn); },
+    dispatchEvent: (_e: Event) => { for (const fn of live) fn(); } };
+  const p = poller([], { doc });
+  expect(live.size).toBe(1);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(p.fetchImpl).toHaveBeenCalledTimes(1);
+  doc.hidden = true; doc.dispatchEvent(new Event("visibilitychange"));
+  expect(p.fetchImpl).toHaveBeenCalledTimes(1);
+  doc.hidden = false; doc.dispatchEvent(new Event("visibilitychange"));
+  expect(p.fetchImpl).toHaveBeenCalledTimes(2);
+  p.stop();
+  expect(live.size).toBe(0);                                                      // остановка сняла подписку
+  doc.dispatchEvent(new Event("visibilitychange"));
+  expect(p.fetchImpl).toHaveBeenCalledTimes(2);
+});
+
+test("default_doc_is_global_document", async () => {
+  // в среде node document нет — подписки нет, опрос работает; подложенный globalThis.document подхватывается
+  const doc = Object.assign(new EventTarget(), { hidden: false });
+  vi.stubGlobal("document", doc);
+  try {
+    const p = poller([]);
+    await vi.advanceTimersByTimeAsync(0);
+    doc.dispatchEvent(new Event("visibilitychange"));
+    expect(p.fetchImpl).toHaveBeenCalledTimes(2);
+    p.stop();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+  const q = poller([]);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(q.fetchImpl).toHaveBeenCalledTimes(1);
+  q.stop();
 });

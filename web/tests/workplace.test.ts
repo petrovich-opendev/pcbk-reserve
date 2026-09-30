@@ -112,6 +112,38 @@ test("wake_and_wait_aborted_stops_polling", async () => {
   expect(idle.calls).toEqual([]);
 });
 
+test("abort_during_request_ignores_late_reply", async () => {
+  // доводка 1: отмена, пока запрос места в пути, — поздний ответ не даёт ни вида, ни нового опроса
+  vi.useFakeTimers();
+  let answer!: (r: Reply) => void;
+  const calls: string[] = [];
+  const api: Api = {
+    me: vi.fn(), logout: vi.fn(),
+    wake: async () => { calls.push("wake"); return R(202, { state: "starting" }); },
+    workplace: () => { calls.push("workplace"); return new Promise<Reply>((r) => { answer = r; }); },
+  };
+  const ctl = new AbortController(); const onView = vi.fn();
+  const done = wakeAndWait({ api, onView, signal: ctl.signal });
+  await vi.advanceTimersByTimeAsync(1_000);                                       // первый опрос ушёл и висит
+  expect(calls).toEqual(["wake", "workplace"]); expect(onView).toHaveBeenCalledTimes(1);
+  ctl.abort();
+  expect(await done).toBe("aborted");
+  answer(R(200, { state: "starting" }));                                          // ответ пришёл после отмены
+  await vi.advanceTimersByTimeAsync(100_000);
+  expect(calls).toEqual(["wake", "workplace"]); expect(onView).toHaveBeenCalledTimes(1);
+
+  let woke!: (r: Reply) => void;                                                  // то же для ответа wake
+  const api2: Api = { me: vi.fn(), logout: vi.fn(), workplace: vi.fn(),
+    wake: () => new Promise<Reply>((r) => { woke = r; }) };
+  const ctl2 = new AbortController(); const onView2 = vi.fn();
+  const done2 = wakeAndWait({ api: api2, onView: onView2, signal: ctl2.signal });
+  ctl2.abort();
+  expect(await done2).toBe("aborted");
+  woke(R(202, { state: "starting" }));
+  await vi.advanceTimersByTimeAsync(100_000);
+  expect(onView2).not.toHaveBeenCalled(); expect(api2.workplace).not.toHaveBeenCalled();
+});
+
 test("wake_and_wait_custom_timers", async () => {
   // таймеры внедряются (App в тестах А4 — без секундного ожидания): опрос через pollMs, срок — giveUpS
   const pending: { fn: () => void; ms: number }[] = [];
