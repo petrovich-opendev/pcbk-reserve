@@ -1,9 +1,12 @@
 """HTTP службы данных: токен → ошибка настройки → инструмент; 401, 422, 413 и 503 при ошибке настройки."""
 import json
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
-from helpers import SETTINGS, TOKEN, make_app, make_role, wait_until
+from helpers import (LLM_TOKEN, SETTINGS, TOKEN, chat_body, gateway_role, make_app, make_llm_role, make_role,
+                     wait_until, wait_until_async)
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data.http_api import MAX_BODY_BYTES, BodyLimit
@@ -135,3 +138,75 @@ def test_413_text_follows_limit():                                              
         assert c.post("/x", content=b"x" * limit).status_code == 200
         r = c.post("/x", content=b"x" * (limit + 1))
         assert (r.status_code, r.json()) == (413, {"detail": f"тело запроса больше {text}"})
+
+
+# --- Ш25: токен места — только из его сети (защита в глубину) ---
+
+@pytest.mark.anyio
+async def test_place_token_only_from_its_network(tmp_path):
+    # адрес источника — scope["client"]; TestClient(client=…) на каждый адрес заходил бы в lifespan заново, а
+    # run() сессий MCP роли «данные» SDK даёт один раз — клиенты httpx на одном lifespan
+    app, role = make_app(tmp_path)
+    auth, body = {"Authorization": f"Bearer {TOKEN}"}, {"tags": ["20FAKE_001_PV"]}   # токен student-01
+    async with app.router.lifespan_context(app):
+        await wait_until_async(lambda: role.catalog.loaded)
+        for client, code in ((("172.31.1.3", 40000), 200), (("172.31.2.3", 40000), 401),  # своё место / чужое
+                             (("172.31.250.81", 40000), 200), (("10.9.9.9", 40000), 401)):  # хост в pcbk-egress / прочие
+            async with from_address(app, client) as c:
+                before = len(role.events.recent(channel="http"))
+                assert (await c.post("/api/data/tag_now", json=body, headers=auth)).status_code == code, client
+                if code == 401:
+                    assert len(role.events.recent(channel="http")) == before          # как чужой токен — без события
+
+
+def from_address(app, client: tuple[str, int]) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=client), base_url="http://testserver")
+
+
+def shape(r):
+    try:
+        body = r.json()
+    except ValueError:
+        return r.status_code, r.headers.get("content-type"), r.text
+    return r.status_code, r.headers.get("content-type"), sorted(body) if isinstance(body, dict) else type(body).__name__
+
+
+def test_error_shapes_unchanged_with_gateway(tmp_path, fake_or):                         # чужие ответы не тронуты
+    def responses(extra):
+        (tmp_path / f"d{len(extra)}").mkdir()                                          # make_app каталог не создаёт
+        llm = make_llm_role(tmp_path / f"l{len(extra)}", fake_or)                     # П3: без сети (Ш7)
+        app, _ = make_app(tmp_path / f"d{len(extra)}", extra_roles=[llm, *extra])
+        with TestClient(app) as c:
+            return [shape(r) for r in (
+                c.post("/api/data/tag_now", json={"tags": "не список"}, headers={"Authorization": f"Bearer {TOKEN}"}),
+                c.post("/api/data/tag_now", json={"tags": ["x"]}),                     # без токена
+                c.post("/llm/v1/chat/completions", json=chat_body()),                   # без токена
+                c.get("/nothing/here"),
+                c.request("PUT", "/healthz"))]
+    assert responses([]) == responses([gateway_role(tmp_path / "gw")])
+
+
+# --- сверх брифа ---
+
+@pytest.mark.anyio
+async def test_place_token_network_checked_on_mcp_and_llm(tmp_path, fake_or):          # все места сверки (Ш25)
+    """/mcp (звено mcp_auth и инструмент) и /llm/ — та же сверка сети. STU_NET шлюза не по умолчанию: транспорт
+    MCP заменяет scope["app"] собой, и инструмент берёт STU_NET из scope, куда его кладёт mcp_auth."""
+    llm = make_llm_role(tmp_path / "llm", fake_or)
+    (tmp_path / "d").mkdir()
+    app, role = make_app(tmp_path / "d", extra_roles=[llm, gateway_role(tmp_path / "gw", STU_NET="10.50")])
+    headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json, text/event-stream"}
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "tag_now", "arguments": {"tags": ["20FAKE_001_PV"]}}}
+    async with app.router.lifespan_context(app):
+        await wait_until_async(lambda: role.catalog.loaded)
+        for client, ok in ((("10.50.1.3", 40000), True), (("10.50.2.3", 40000), False),
+                           (("172.31.1.3", 40000), False)):                             # сеть места 01 по умолчанию
+            async with from_address(app, client) as c:
+                r = await c.post("/mcp", json=call, headers=headers)
+                assert r.status_code == (200 if ok else 401), client
+                if ok:
+                    assert r.json()["result"]["structuredContent"]["status"] == "ok"   # инструмент узнал вызывающего
+                r = await c.post("/llm/v1/chat/completions", json=chat_body(),
+                                 headers={"Authorization": f"Bearer {LLM_TOKEN}"})
+                assert (r.status_code != 401) is ok, client

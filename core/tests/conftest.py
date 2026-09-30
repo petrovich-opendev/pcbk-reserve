@@ -50,6 +50,29 @@ def restore_logging():
     assert root.level == levels[""]
 
 
+@pytest.fixture
+def gwlog(capfd, restore_logging):
+    """Строки журнала процесса (F13): setup_logging() и накопительный .text из capfd.readouterr().err.
+
+    У корня — WARNING, и строки INFO до caplog не доходят; capfd видит и поток uvicorn и потоки to_thread.
+    """
+    from pcbk_core.logs import setup_logging
+
+    setup_logging()
+    return _Log(capfd)
+
+
+class _Log:
+    def __init__(self, capfd):
+        self._capfd = capfd
+        self._seen: list[str] = []
+
+    @property
+    def text(self) -> str:
+        self._seen.append(self._capfd.readouterr().err)
+        return "".join(self._seen)
+
+
 class FakeOpenRouter:
     """Клиент ручек двойника OpenRouter (как у стенда — по HTTP, мимо прокси окружения): url — …/api/v1."""
 

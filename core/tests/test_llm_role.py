@@ -25,6 +25,7 @@ from pcbk_core.llm.upstream import Upstream, UpstreamError, classify
 from pcbk_core.logs import setup_logging
 from pcbk_core.main import egress_targets
 from pcbk_core.secrets import BdrvConfig, TokenTable, key_fingerprint
+from pcbk_core.settings import GatewaySettings
 
 
 def post(c, body, token=LLM_TOKEN, session=SES, parent=None):
@@ -474,13 +475,13 @@ def test_log_line_without_content(tmp_path, fake_or, capfd, restore_logging):   
 
 
 def test_egress_targets_include_openrouter():                                   # П26: здесь его ждёт Д5; П3: cfg None
-    cfg = BdrvConfig("h", 1433, "Runtime", "u", "p")
-    assert egress_targets(LLM_SETTINGS, cfg) == [("h", 1433), ("openrouter.ai", 443)]
+    cfg, gw = BdrvConfig("h", 1433, "Runtime", "u", "p"), GatewaySettings()      # Д5: за ними — sp-ctl и места (Ш3)
+    assert egress_targets(LLM_SETTINGS, gw, cfg)[:2] == [("h", 1433), ("openrouter.ai", 443)]
     local = replace(LLM_SETTINGS, OPENROUTER_BASE_URL="http://fake-openrouter:8080/api/v1")
-    assert egress_targets(local, cfg)[1] == ("fake-openrouter", 8080)
-    assert egress_targets(LLM_SETTINGS, None) == [("openrouter.ai", 443)]         # bdrv.env не читается
+    assert egress_targets(local, gw, cfg)[1] == ("fake-openrouter", 8080)
+    assert egress_targets(LLM_SETTINGS, gw, None)[:1] == [("openrouter.ai", 443)]   # bdrv.env не читается
     inst = BdrvConfig("h\\INST", None, "Runtime", "u", "p")
-    assert egress_targets(LLM_SETTINGS, inst)[0] == ("h", None)                   # экземпляр — любой порт, как Д3б
+    assert egress_targets(LLM_SETTINGS, gw, inst)[0] == ("h", None)               # экземпляр — любой порт, как Д3б
 
 
 def test_abort_before_first_byte_finishes_call(tmp_path, fake_or):               # П7: генератор не начат
@@ -882,4 +883,14 @@ def test_health_json_egress_is_for_openrouter_host(tmp_path, fake_or, monkeypatc
     role = make_llm_role(tmp_path, fake_or, OPENROUTER_BASE_URL="http://OR.Example:8080/api/v1")
     assert role.health_json(now_utc())["egress"] == {"alive": True, "last_ok_age_s": 1.0}
     assert asked == ["or.example"]                                               # хост так же, как в egress_targets
-    assert egress_targets(role.llm, None) == [("or.example", 8080)]
+    assert egress_targets(role.llm, GatewaySettings(), None)[:1] == [("or.example", 8080)]
+
+
+def test_health_llm_redacted_off_admin(tmp_path, fake_or):                              # Д4б-R23
+    app, _ = make_llm_app(tmp_path, fake_or)                                           # П3: без сети (Ш7)
+    money = {"account_remaining_usd", "key_usage_usd", "key_spent_usd"}
+    for base, full in (("http://172.31.6.2:8000", False), ("http://172.31.250.82:8000", True),
+                       ("http://172.31.250.34:8000", True)):
+        with TestClient(app, base_url=base) as c:
+            keys = set(c.get("/health/llm").json())
+            assert (money & keys) == (money if full else set()) and "spent_usd" in keys, base

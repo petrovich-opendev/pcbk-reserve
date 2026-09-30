@@ -1,11 +1,14 @@
 """Крючки уровня приложения: один обработчик 422 и один предел тела по префиксу пути; живость /healthz/live."""
 import pytest
+from fastapi import HTTPException as FastApiHTTPException
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from helpers import SETTINGS, TOKEN, DummyRole, make_app, serve_app, wait_until
 from pcbk_core.app import create_app
-from pcbk_core.hooks import DEFAULT_BODY_LIMIT, AppHooks, BodyLimit, size_text
+from pcbk_core.hooks import DEFAULT_BODY_LIMIT, AppHooks, BodyLimit, hooks_of, size_text
 from pcbk_core.logs import setup_logging
 from pcbk_core.main import main
 
@@ -144,3 +147,50 @@ async def test_receive_after_buffer_goes_to_original():
     h = AppHooks()
     await BodyLimit(app, hooks=h)({"type": "http", "path": "/x", "headers": []}, receive, send)
     assert [m["type"] for m in seen] == ["http.request", "http.disconnect"] and seen[0]["body"] == b"ab"
+
+
+# --- реестр HTTPException (Д5, решение контролёра р2, Ш5) ---
+
+async def HANDLER_A(request, exc):
+    return JSONResponse({"by": "a"}, status_code=exc.status_code)
+
+
+async def HANDLER_B(request, exc):
+    return JSONResponse({"by": "b"}, status_code=exc.status_code)
+
+
+def test_http_exception_dispatch_by_prefix():
+    h = AppHooks()
+    h.http_exception("/pcbk/api/", HANDLER_A); h.http_exception("/pcbk/api/oc/", HANDLER_B)
+    assert (h.http_handler_for("/pcbk/api/oc/x"), h.http_handler_for("/pcbk/api/auth/me"),
+            h.http_handler_for("/api/data/tag_now")) == (HANDLER_B, HANDLER_A, None)
+    with pytest.raises(ValueError):
+        h.http_exception("/pcbk/api/", HANDLER_B)
+
+
+def test_role_own_http_exception_handler_is_refused():                                 # Ш5: как у 422
+    class Bypass(DummyRole):
+        def install(self, app):
+            app.add_exception_handler(StarletteHTTPException, lambda request, exc: None)
+    with pytest.raises(ValueError, match="реестр"):
+        create_app(SETTINGS, [Bypass("llm", (True, "ок"))])
+
+    class FastApiBypass(DummyRole):                # подкласс FastAPI нашёлся бы раньше общего по MRO
+        def install(self, app):
+            app.add_exception_handler(FastApiHTTPException, lambda request, exc: None)
+    with pytest.raises(ValueError, match="реестр"):
+        create_app(SETTINGS, [FastApiBypass("llm", (True, "ок"))])
+
+
+def test_http_exception_registry_used_by_app():
+    """404 и 405 маршрутизации под префиксом роли — её обработчик; прочие пути — ответ FastAPI по умолчанию."""
+    class Registered(DummyRole):
+        def install(self, app):
+            super().install(app)
+            hooks_of(app).http_exception("/dummy-llm/", HANDLER_A)
+
+    with TestClient(create_app(SETTINGS, [Registered("llm", (True, "ок"), validates="/dummy-llm/")])) as c:
+        assert (c.get("/dummy-llm/nothing").status_code, c.get("/dummy-llm/nothing").json()) == (404, {"by": "a"})
+        assert c.get("/dummy-llm/typed").json() == {"by": "a"}                     # 405: маршрут только POST
+        assert c.get("/nothing").json() == {"detail": "Not Found"}
+        assert (c.put("/healthz").status_code, c.put("/healthz").json()) == (405, {"detail": "Method Not Allowed"})

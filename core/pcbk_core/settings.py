@@ -153,10 +153,17 @@ class LlmSettings:
         return cls(**{name: env[name] for name in _LLM_FILE_FIELDS if env.get(name, "")})
 
 
+# шлюз (Д5а): режимы учений; GW_ORIGIN — https://хост[:порт] без пути, хост строчными (Origin браузера —
+# строчными, иначе он не совпал бы никогда); STU_NET — два октета
+DRILL_GATEWAY_MODES = frozenset({"", "freeze_reaper", "bad_place_pw"})
+_GW_ORIGIN = re.compile(r"https://[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::(?P<port>[0-9]{1,5}))?")
+_STU_NET = re.compile(r"([0-9]{1,3})\.([0-9]{1,3})")
+
+
 @dataclass(frozen=True)
 class GatewaySettings:
     """Шлюз Д5: отдельный класс, как LlmSettings, — ошибка в GW_* не роняет main() и службу данных, её
-    показывает роль gateway как config_error. Проверки from_env — задача А4; тесты строят класс напрямую."""
+    показывает роль gateway как config_error. Проверки — только from_env; тесты строят класс напрямую."""
     GW_ORIGIN: str = ""                       # https://хост[:порт] страницы входа; пусто — ни с чем не совпадает
     GW_IDLE_STOP_S: float = 1800.0            # простой до сна места (Д5-R28)
     GW_REAPER_TICK_S: float = 30.0            # такт уборщика
@@ -166,6 +173,54 @@ class GatewaySettings:
     SP_CTL_URL: str = "http://pcbk-sp-ctl:2375"
     STU_NET: str = "172.31"                   # первые два октета сетей мест: место N — {STU_NET}.N.0/28
     DRILL_GATEWAY: str = ""                   # учения: freeze_reaper, bad_place_pw
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "GatewaySettings":
+        """Пустое значение — умолчание; ошибка — ValueError с именем поля и правилом, но без самого значения
+        (Ш9): текст идёт в config_error, на страницу состояния и в ответ 503, а в GW_ORIGIN по ошибке может
+        попасть путь или токен. env — только он, иначе os.environ."""
+        env = os.environ if env is None else env
+        values = {}
+        for f in fields(cls):
+            raw = env.get(f.name, "")
+            if raw == "":
+                continue
+            if type(f.default) is str:
+                values[f.name] = raw
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                raise ValueError(f"{f.name}: не число") from None
+            if not math.isfinite(value):
+                raise ValueError(f"{f.name}: нужно конечное число")
+            values[f.name] = value
+        gw = cls(**values)
+        origin = _GW_ORIGIN.fullmatch(gw.GW_ORIGIN) if gw.GW_ORIGIN else None
+        port = None if origin is None else origin["port"]
+        if gw.GW_ORIGIN and (origin is None or (port is not None and not 1 <= int(port) <= 65535)):
+            raise ValueError("GW_ORIGIN: нужно пусто или https://хост[:порт] без пути, хост строчными")
+        if gw.GW_IDLE_STOP_S < 60:
+            raise ValueError("GW_IDLE_STOP_S: нужно не меньше 60 с")
+        if not 0 < gw.GW_REAPER_TICK_S <= gw.GW_IDLE_STOP_S / 2:
+            raise ValueError("GW_REAPER_TICK_S: нужно больше нуля и не больше половины GW_IDLE_STOP_S")
+        if not 10 <= gw.GW_WAKE_TIMEOUT_S <= 300:
+            raise ValueError("GW_WAKE_TIMEOUT_S: нужно от 10 до 300 с")
+        if gw.GW_SESSION_TTL_S < 300:
+            raise ValueError("GW_SESSION_TTL_S: нужно не меньше 300 с")
+        try:
+            sp_ctl = urlsplit(gw.SP_CTL_URL)
+            sp_ctl.port                               # порт вне 0…65535 или не число — ValueError
+        except ValueError:
+            raise ValueError("SP_CTL_URL: адрес не разбирается") from None
+        if sp_ctl.scheme != "http" or not sp_ctl.hostname:
+            raise ValueError("SP_CTL_URL: нужен адрес http:// с хостом")
+        m = _STU_NET.fullmatch(gw.STU_NET)
+        if m is None or int(m[1]) > 255 or int(m[2]) > 255:
+            raise ValueError("STU_NET: нужны два октета вида 172.31, каждый не больше 255")
+        if gw.DRILL_GATEWAY not in DRILL_GATEWAY_MODES:
+            raise ValueError("DRILL_GATEWAY: допустимо пусто, freeze_reaper или bad_place_pw")
+        return gw
 
 
 def _check_base_url(url: str) -> None:

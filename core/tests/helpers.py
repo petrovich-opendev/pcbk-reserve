@@ -40,6 +40,7 @@ from pcbk_core.data.events import CallEvent
 from pcbk_core.data.historian import parse_clock
 from pcbk_core.data.service import DataService
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
+from pcbk_core.gateway import GatewayRole
 from pcbk_core.gateway.accounts import AccountStore
 from pcbk_core.gateway.places import SpCtl, Workplaces
 from pcbk_core.gateway.stats import GatewayStats
@@ -47,7 +48,7 @@ from pcbk_core.hooks import hooks_of
 from pcbk_core.llm import LlmRole
 from pcbk_core.llm.ledger import Ledger
 from pcbk_core.llm.upstream import Upstream
-from pcbk_core.secrets import TokenTable, key_fingerprint
+from pcbk_core.secrets import BdrvConfig, TokenTable, key_fingerprint
 from pcbk_core.settings import GatewaySettings, LlmSettings, Settings
 
 # каталог core/: из него подпроцессы импортируют pcbk_core
@@ -188,10 +189,12 @@ def make_service(tmp_path, **kwargs) -> tuple[DataService, FakeHistorian]:
 def make_app(tmp_path, *, extra_roles: Sequence[Role] = (), **kwargs) -> tuple[FastAPI, DataRole]:
     """Приложение с ролью «данные» на двойнике и extra_roles за ней; каталог грузит lifespan (TestClient).
 
-    kwargs — в make_role.
+    kwargs — в make_role. Пометка zone_names_ok: имя «testserver» клиента тестов — своя зона (Д5-R31).
     """
     role, _ = make_role(db_dir=tmp_path, **kwargs)
-    return create_app(SETTINGS, [role, *extra_roles]), role
+    app = create_app(SETTINGS, [role, *extra_roles])
+    app.state.zone_names_ok = True          # клиент тестов в процессе — свой: имя вместо адреса (Д5-R31)
+    return app, role
 
 
 def sent_of(fake: FakeHistorian) -> list[str]:
@@ -402,7 +405,9 @@ def make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key
 def make_llm_app(tmp_path, fake=None, **kw) -> tuple[FastAPI, LlmRole]:
     """create_app с одной ролью llm (make_llm_role); у приложения тот же core.db."""
     role = make_llm_role(tmp_path, fake, **kw)
-    return create_app(replace(SETTINGS, DB_PATH=role.settings.DB_PATH), [role]), role
+    app = create_app(replace(SETTINGS, DB_PATH=role.settings.DB_PATH), [role])
+    app.state.zone_names_ok = True          # /health/llm полностью — как из pcbk-front (Д5-R31)
+    return app, role
 
 
 # --- Шлюз: учётные записи (Д5а, задача А2) ---
@@ -469,3 +474,62 @@ def ready_place(workplaces: Workplaces, docker: FakeDocker, n: int) -> None:
     """Место n работает в двойнике Docker и готово у шлюза без пробуждения — как после такта (А4
     gateway_role(ready=…), Д5б): первый такт его не трогает."""
     workplaces.set_ready_for_tests(n, docker.run(n))
+
+
+# --- Шлюз: роль (Д5а, задача А4) ---
+
+# учётные данные историана для egress_targets: несекретная заглушка
+BDRV_CFG = BdrvConfig("h", 1433, "Runtime", "u", "p")
+# публичный origin страницы входа в тестах (GW_ORIGIN)
+ORIGIN = "https://stand.test:8443"
+
+
+def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),
+                 stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
+                 accounts: bool = True, **gw_overrides) -> GatewayRole:
+    """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
+    GatewaySettings (без проверок from_env). stream_recheck_s — параметр роли Д5б, в Д5а не используется.
+
+    tmp_path создаётся; база — db_path или tmp_path/core.db. accounts — завести отдельным AccountStore с open()
+    учётки stu-03 (место 3), stu-05 (место 5) и teach (преподаватель), у всех пароль PW; иначе база заранее не
+    открывается. Места из ready работают в двойнике Docker и готовы без пробуждения: первый такт их не трогает.
+    Роли для тестов добавлены fake_docker, fake_places, mono.
+    """
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = Path(db_path) if db_path is not None else tmp_path / "core.db"
+    docker = FakeDocker() if docker is None else docker
+    oc = FakePlaces() if oc is None else oc
+    gw = replace(GW_SETTINGS, **{"GW_PLACE_PW_DIR": str(pw_dir(tmp_path)), "GW_ORIGIN": ORIGIN, **gw_overrides})
+    mono = FakeMono(1000.0)
+    stats = GatewayStats(monotonic=mono)
+    oc.stu_net = gw.STU_NET
+    workplaces = Workplaces(gw, SpCtl(gw.SP_CTL_URL, transport=httpx.MockTransport(docker)), stats=stats,
+                            transport=httpx.MockTransport(oc), monotonic=mono, sleep=fast_sleep(mono))
+    if accounts:
+        s = AccountStore(str(db))
+        assert s.open(), s.last_error
+        s.add("stu-03", "student", 3, PW)
+        s.add("stu-05", "student", 5, PW)
+        s.add("teach", "teacher", None, PW)
+    for n in ready:
+        ready_place(workplaces, docker, n)
+    role = GatewayRole(replace(SETTINGS, DB_PATH=str(db)), gw, store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S),
+                       workplaces=workplaces, stats=stats, config_error=config_error, monotonic=mono)
+    role.fake_docker, role.fake_places, role.mono = docker, oc, mono
+    return role
+
+
+def make_gateway(tmp_path, **kw) -> tuple[FastAPI, GatewayRole]:
+    """create_app(SETTINGS, [gateway_role(tmp_path, **kw)]) и пометка zone_names_ok: клиент тестов — свой."""
+    role = gateway_role(tmp_path, **kw)
+    app = create_app(SETTINGS, [role])
+    app.state.zone_names_ok = True
+    return app, role
+
+
+def login(c, name: str, pw: str = PW, **headers) -> httpx.Response:
+    """POST /pcbk/api/auth/login; Origin: ORIGIN, если не передан другой; заголовок с пустым значением не шлётся."""
+    sent = {"Origin": ORIGIN, **headers}
+    return c.post("/pcbk/api/auth/login", json={"login": name, "password": pw},
+                  headers={k: v for k, v in sent.items() if v != ""})

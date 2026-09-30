@@ -1,11 +1,12 @@
-"""Крючки уровня приложения: один обработчик 422 и один предел тела на приложение, разбор по префиксу пути.
+"""Крючки уровня приложения: один обработчик 422, один обработчик HTTPException и один предел тела на
+приложение, разбор по префиксу пути.
 
-Роли наполняют реестр AppHooks в install(app) через hooks_of(app): обработчик ошибок разбора тела и
-предел тела (с ответом 413) — на свой префикс пути. create_app после install всех ролей ставит один
-обработчик RequestValidationError и одно звено BodyLimit — самым внешним внутри ServerErrorMiddleware,
-так что 413 выходит раньше звеньев ролей. Выбор — по самому длинному подходящему префиксу; путь без
-префикса — обработчик FastAPI по умолчанию и предел DEFAULT_BODY_LIMIT. Модуль не импортирует
-pcbk_core.data: реестр общий для всех ролей.
+Роли наполняют реестр AppHooks в install(app) через hooks_of(app): обработчик ошибок разбора тела,
+обработчик HTTPException (Д5) и предел тела (с ответом 413) — на свой префикс пути. create_app после
+install всех ролей ставит один обработчик RequestValidationError, один обработчик HTTPException Starlette и
+одно звено BodyLimit — самым внешним внутри ServerErrorMiddleware, так что 413 выходит раньше звеньев ролей.
+Выбор — по самому длинному подходящему префиксу; путь без префикса — обработчик FastAPI по умолчанию и
+предел DEFAULT_BODY_LIMIT. Модуль не импортирует pcbk_core.data: реестр общий для всех ролей.
 """
 import logging
 from collections import deque
@@ -16,12 +17,14 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 DEFAULT_BODY_LIMIT = 65536
 PATH_LOG_CHARS = 100
 
 ValidationHandler = Callable[[Request, RequestValidationError], Awaitable[Response]]
+HttpExceptionHandler = Callable[[Request, StarletteHTTPException], Awaitable[Response]]
 # тело ответа 413 по пределу префикса: у /llm/ — в форме OpenAI (П19)
 Refusal = Callable[[int], dict]
 
@@ -53,16 +56,26 @@ def _check_prefix(prefix: str, table: dict, what: str) -> None:
 
 
 class AppHooks:
-    """Реестр крючков приложения по префиксу пути: обработчики 422 и пределы тела с ответом 413."""
+    """Реестр крючков приложения по префиксу пути: обработчики 422 и HTTPException, пределы тела с ответом 413."""
 
     def __init__(self) -> None:
         self._handlers: dict[str, ValidationHandler] = {}
+        self._http_handlers: dict[str, HttpExceptionHandler] = {}
         self._limits: dict[str, tuple[int, Refusal | None]] = {}
 
     def validation(self, prefix: str, handler: ValidationHandler) -> None:
         """Обработчик RequestValidationError для путей с этим префиксом; повтор префикса — ValueError."""
         _check_prefix(prefix, self._handlers, "обработчик 422")
         self._handlers[prefix] = handler
+
+    def http_exception(self, prefix: str, handler: HttpExceptionHandler) -> None:
+        """Обработчик HTTPException Starlette (404 и 405 маршрутизации, отказы зависимостей) для путей с этим
+        префиксом; повтор префикса — ValueError."""
+        _check_prefix(prefix, self._http_handlers, "обработчик HTTPException")
+        self._http_handlers[prefix] = handler
+
+    def http_handler_for(self, path: str) -> HttpExceptionHandler | None:
+        return _longest(self._http_handlers, path)
 
     def body_limit(self, prefix: str, max_bytes: int, *, refusal: Refusal | None = None) -> None:
         """Предел тела для путей с этим префиксом; refusal(предел) — тело ответа 413 вместо {"detail": …}."""

@@ -215,16 +215,17 @@ CRASH = re.compile(r"EgressDenied|PermissionError|Traceback| \| [A-Z]\w*(?:Error
 
 
 @pytest.mark.parametrize("bdrv_text, code, line", [
-    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 2 направления"),
-    (None, 503, "разрешено 1 направление"),              # нет bdrv.env → config_error, процесс жив (I2); OpenRouter — всегда
-])
+    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 13 направлений"),
+    (None, 503, "разрешено 12 направлений"),             # нет bdrv.env → config_error, процесс жив (I2); OpenRouter,
+])                                                       # sp-ctl и десять мест (Д5) — всегда
 def test_serve_installs_guard_and_stays_up(tmp_path, bdrv_text, code, line):
     port, closed = free_port(), free_port()             # на closed никто не слушает
     env = {**os.environ, "CORE_PORT": str(port), "FRESH_POLL_S": "3600",
            "BDRV_ENV_FILE": write(tmp_path, bdrv_text.format(closed=closed)) if bdrv_text else str(tmp_path / "нет.env"),
            "WHITELIST_PATH": write(tmp_path, "20FAKE_001_PV\n"),
            "TOKENS_FILE": write(tmp_path, f"ops {sha('tok')}\n"), "DB_PATH": str(tmp_path / "core.db"),
-           **LLM_ENV, "OPENROUTER_BASE_URL": "http://localhost:9/api/v1"}   # П3: тесты не ходят в DNS за openrouter.ai
+           **LLM_ENV, "OPENROUTER_BASE_URL": "http://localhost:9/api/v1",   # П3: тесты не ходят в DNS за openrouter.ai
+           "SP_CTL_URL": f"http://127.0.0.1:{closed}"}   # Ш3: и за pcbk-sp-ctl; STU_NET — по умолчанию (литералы)
     p = subprocess.Popen([sys.executable, "-m", "pcbk_core.main"], cwd=CORE_DIR, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:

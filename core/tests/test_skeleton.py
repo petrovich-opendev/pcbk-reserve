@@ -314,7 +314,7 @@ def test_build_roles_llm_config_error_keeps_process(tmp_path, env, broken_tokens
     tokens = tmp_path / "llm-tokens"
     tokens.write_text("student-01 не-хеш\n" if broken_tokens else "")
     roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "LLM_TOKENS_FILE": str(tokens), **env})}   # не бросает
-    assert set(roles) == {"data", "llm"} and roles["llm"].health()[1].startswith(health)
+    assert set(roles) == {"data", "llm", "gateway"} and roles["llm"].health()[1].startswith(health)
     assert (roles["llm"].config_error is None) is broken_tokens
     data = roles["data"].health()[1]                                             # П25: настоящая причина роли data
     assert data == "bdrv.env не читается (нет файла или прав)" and "LLM" not in data and "OpenRouter" not in data
