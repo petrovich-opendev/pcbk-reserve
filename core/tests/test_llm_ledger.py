@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from helpers import wait_until
 from pcbk_core.llm.ledger import WRITE_TIMEOUT_S, Budget, Ledger, Usage
 
 
@@ -98,11 +99,13 @@ def test_locked_db_write_is_counted_not_waited(tmp_path):                       
         t = time.monotonic()
         opened(led, est=0.5)
         assert time.monotonic() - t < 0.1
-        led.flush()
-        assert time.monotonic() - t < WRITE_TIMEOUT_S + 1.0
+        wait_until(lambda: led.consecutive_failures >= 1)                        # ревью I1: сбой — счётчик,
+        assert time.monotonic() - t < WRITE_TIMEOUT_S + 1.0                      # а не ожидание в 5 с
+        assert "locked" in led.last_error and led.spent() == pytest.approx(0.5) and led.queue_size == 1
     finally:
         holder.execute("ROLLBACK"); holder.close()
-    assert led.consecutive_failures == 1 and "locked" in led.last_error and led.spent() == pytest.approx(0.5)
+    led.flush()                                                                  # блокировку сняли — строка дошла
+    assert led.consecutive_failures == 0 and [r.status for r in led.recent()] == ["open"]
 
 def test_open_call_after_crash_is_lost_at_estimate(tmp_path):                    # Review Focus 2
     p = str(tmp_path / "core.db")
@@ -144,10 +147,14 @@ def test_pending_survives_restart_for_resolve_and_stuck(tmp_path):              
 def test_write_failure_keeps_memory_and_flags(tmp_path, monkeypatch):
     led = lg(str(tmp_path / "core.db"))
     monkeypatch.setattr(led, "_connect", lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError("database or disk is full")))
+    led.retry_pause_s = 0.01
     opened(led, est=0.5)
     assert led.spent() == pytest.approx(0.5)                                   # память — сразу
-    led.flush()
-    assert led.consecutive_failures == 1 and "disk is full" in led.last_error
+    wait_until(lambda: led.consecutive_failures >= 2)                          # ревью I1: повтор, счётчик растёт
+    assert "disk is full" in led.last_error and led.write_failures_total >= 2
+    assert (led.queue_size, led.writer_alive) == (1, True)
+    monkeypatch.undo(); led.flush()
+    assert led.consecutive_failures == 0 and [r.id for r in led.recent()] == [1]
 
 def test_meta_roundtrip(tmp_path):
     p = str(tmp_path / "core.db")
@@ -332,12 +339,13 @@ def test_writer_calls_connect_without_arguments(tmp_path, monkeypatch):         
     led = lg(str(tmp_path / "core.db"))
     boom = lambda: (_ for _ in ()).throw(sqlite3.OperationalError("database or disk is full"))
     monkeypatch.setattr(led, "_connect", boom)
+    led.retry_pause_s = 0.01
     opened(led); opened(led)
-    led.flush()
-    assert led.consecutive_failures == 2 and led.last_error == "OperationalError: database or disk is full"
+    wait_until(lambda: led.consecutive_failures >= 2)
+    assert led.last_error == "OperationalError: database or disk is full" and led.queue_size == 2
     monkeypatch.undo()
     opened(led); led.flush()                                                    # удача сбрасывает счётчик
-    assert led.consecutive_failures == 0 and [r.id for r in led.recent()] == [3]
+    assert led.consecutive_failures == 0 and [r.id for r in led.recent()] == [3, 2, 1]
 
 
 def test_flush_times_out_and_writer_survives(tmp_path, monkeypatch):
@@ -371,3 +379,134 @@ def test_writable_check_and_close(tmp_path):
     assert led.spent() == pytest.approx(1.0) and len(led.recent()) == 1
     assert led.open() is True and led.spent() == pytest.approx(0.5)              # новый open() — с нуля, по файлу
     assert led.recent(1)[0].status == "lost"
+
+
+# --- доводка по ревью ---
+
+def test_failed_write_is_retried_not_dropped(tmp_path):                          # I1: иначе после перезапуска $0
+    p = str(tmp_path / "core.db")
+    led = lg(p)
+    led.retry_pause_s = 0.02
+    holder = sqlite3.connect(p, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        opened(led, est=0.5)                                                    # INSERT упирается в блокировку
+        wait_until(lambda: led.consecutive_failures >= 2)                       # повторяет, счётчик растёт
+        opened(led, caller="student-02", est=0.25)                              # следующая операция — за ней
+        assert (led.queue_size, led.writer_alive) == (2, True)
+    finally:
+        holder.execute("ROLLBACK"); holder.close()
+    led.flush()
+    total = led.write_failures_total
+    assert (led.consecutive_failures, led.queue_size) == (0, 0) and total >= 2  # удача сбросила только «подряд»
+    again = lg(p)                                                               # «падение» без close()
+    assert again.spent("student-01") == pytest.approx(0.5) and again.spent() >= 0.75
+    assert led.write_failures_total == total                                    # счётчик не убывает
+
+
+def test_retry_after_landed_write_is_idempotent(tmp_path, monkeypatch):          # I1: каждая операция повторяема
+    led = lg(str(tmp_path / "core.db"))
+    led.retry_pause_s = 0.01
+    real, seen = led._connect, set()
+
+    class LandedButFailed:                                                      # запись легла, а ответ — сбой:
+        def __init__(self, db):                                                 # у каждой операции первая попытка
+            self.db = db
+        def execute(self, sql, params=()):
+            cur = self.db.execute(sql, params)
+            if sql.startswith("INSERT") and params not in seen:
+                seen.add(params)
+                raise sqlite3.OperationalError("disk I/O error")
+            return cur
+        def close(self):
+            self.db.close()
+
+    monkeypatch.setattr(led, "_connect", lambda *a: LandedButFailed(real(*a)))
+    cid = opened(led)
+    led.refused(ts=T, caller="student-02", session=None, model="x", code="pcbk_turn_limit", http_status=403)
+    led.meta_set("k", 1.0)
+    led.flush()                                                                 # повтор не застрял на UNIQUE
+    assert (led.write_failures_total, led.consecutive_failures) == (3, 0)
+    assert [r.id for r in led.recent()] == [cid + 1, cid]
+
+
+def test_close_on_broken_disk_gives_up_and_counts(tmp_path, monkeypatch):        # I1: что теряется при остановке
+    led = lg(str(tmp_path / "core.db"))
+    led.retry_pause_s = 0.01
+    monkeypatch.setattr(led, "_connect", lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")))
+    opened(led); opened(led)
+    wait_until(lambda: led.consecutive_failures >= 1)
+    t = time.monotonic()
+    led.close(timeout=0.2)                                                      # не бросает: lifespan выходит
+    assert time.monotonic() - t < 2.0 and led.opened is False
+    wait_until(lambda: not led.writer_alive)                                    # остановка прервала повторы
+    assert (led.queue_size, led.writes_dropped_total) == (0, 2)
+
+
+def test_fresh_says_the_table_was_just_created(tmp_path):                        # ревью: пропавшая core.db
+    p = str(tmp_path / "core.db")
+    led = Ledger(p)
+    assert led.fresh is None
+    assert led.open() is True and led.fresh is True
+    assert led.open() is True and led.fresh is True                             # второй open() — тот же ответ
+    assert lg(p).fresh is False
+    other = tmp_path / "other.db"                                               # файл есть, таблицы нет
+    db = sqlite3.connect(other); db.execute("CREATE TABLE x (a)"); db.commit(); db.close()
+    assert lg(str(other)).fresh is True
+
+
+def test_close_call_unknown_status_is_stored_as_unknown(tmp_path):               # M1
+    led = lg(str(tmp_path / "core.db"))
+    for status in ("weird", "open"):                                            # open у закрытой строки — тоже
+        led.close_call(opened(led), status=status, code="", http_status=200, provider="X", provider_ok=True,
+                       generation_id="g", usage=U, cost_source="stream", duration_ms=1)
+    led.close_call(opened(led), status="cancelled", code="", http_status=200, provider="X", provider_ok=True,
+                   generation_id="g", usage=U, cost_source="stream", duration_ms=1)
+    assert [r.status for r in led.recent()] == ["cancelled", "unknown", "unknown"]
+    assert led.spent() == pytest.approx(3 * 0.0123)
+
+
+def test_ts_is_stored_in_utc_so_sql_order_holds(tmp_path):                       # M2
+    p = tmp_path / "core.db"
+    led = lg(str(p))
+    msk = timezone(timedelta(hours=3))
+    a = led.open_call(ts=datetime(2026, 10, 3, 10, tzinfo=msk), caller="ops", session=None, model="m", step=1,
+                      estimate=0.1)                                             # 07:00 UTC
+    b = led.open_call(ts=datetime(2026, 10, 3, 8, tzinfo=timezone.utc), caller="ops", session=None, model="m",
+                      step=1, estimate=0.1)
+    led.flush()
+    db = sqlite3.connect(p)
+    assert [r[0] for r in db.execute("SELECT id FROM llm_calls ORDER BY ts")] == [a, b]
+    rows = led.recent()
+    assert {r.ts.utcoffset() for r in rows} == {timedelta(0)}
+    assert rows[1].ts == datetime(2026, 10, 3, 7, tzinfo=timezone.utc)
+
+
+def test_only_open_creates_the_file(tmp_path):                                   # M5
+    p = tmp_path / "core.db"
+    led = Ledger(str(p))
+    assert led.writable() is False and not p.exists()
+    with pytest.raises(sqlite3.OperationalError):
+        led.recent()
+    assert not p.exists() and led.writer_alive is False and led.queue_size == 0
+    assert led.open() is True and p.exists()
+    for f in tmp_path.glob("core.db*"):                                         # файл пропал на ходу
+        f.unlink()
+    opened(led)
+    wait_until(lambda: led.consecutive_failures >= 1)
+    assert not p.exists()                                                       # писатель пустую базу не заводит
+    led.close(timeout=0.1)
+
+
+def test_open_joins_previous_writer(tmp_path, monkeypatch):                      # M6
+    led = lg(str(tmp_path / "core.db"))
+    gate, real = threading.Event(), led._connect
+    monkeypatch.setattr(led, "_connect", lambda *a: (gate.wait(5), real(*a))[1])
+    opened(led, est=0.5)                                                        # писатель застрял в записи
+    led.close(timeout=0.1)
+    assert led.opened is False and led.writer_alive                             # прежний писатель ещё жив
+    monkeypatch.undo()
+    threading.Timer(0.3, gate.set).start()
+    assert led.open() is True                                                   # сначала дождался прежнего
+    assert led.spent() == pytest.approx(0.5) and led.recent(1)[0].status == "lost"
+    assert sum(t.name == "pcbk-ledger-writer" and t.is_alive() for t in threading.enumerate()) >= 1

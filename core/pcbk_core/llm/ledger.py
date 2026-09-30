@@ -9,10 +9,14 @@ cost_est, поставленная при открытии вызова (Д4а-R
 
 Память — синхронно, SQLite — один поток-писатель (П5). Методы записи меняют память в
 вызывающем потоке без ожидания и ставят операцию в очередь FIFO; её выполняет один поток
-pcbk-ledger-writer, соединение на операцию со сроком WRITE_TIMEOUT_S. Порядок INSERT →
-INSERT OR REPLACE одной строки держится, цикл событий SQLite не касается никогда (F9), а
-бюджет держится и при сбое диска, пока жив процесс. Сбой записи — счётчик и last_error,
-а не ожидание и не исключение вызывающему.
+pcbk-ledger-writer, соединение на операцию со сроком WRITE_TIMEOUT_S. Порядок операций одной
+строки держится, цикл событий SQLite не касается никогда (F9), а бюджет держится и при сбое
+диска, пока жив процесс. Сбой записи — счётчик и last_error, а не ожидание и не исключение
+вызывающему. Неудавшаяся операция не выбрасывается (ревью I1): писатель повторяет её во
+главе очереди через retry_pause_s, пока она не пройдёт или не придёт остановка; очередь за
+ней ждёт, consecutive_failures растёт. Поэтому каждая операция повторяема — INSERT OR REPLACE
+строки целиком по id из памяти. Файл создаёт только open(); писатель, writable() и recent()
+открывают его с mode=rw и пустую базу вместо пропавшей не заводят.
 
 Конструктор без ввода-вывода (F4). open() — в начале lifespan через asyncio.to_thread:
 файл, WAL, таблицы, память с нуля по файлу, поток-писатель. Суммы по вызывающим — за всё
@@ -28,6 +32,7 @@ import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
 log = logging.getLogger("pcbk_core.llm.ledger")
@@ -37,12 +42,14 @@ WRITE_TIMEOUT_S = 0.5          # ожидание блокировки у зап
 SQLITE_TIMEOUT_S = 5.0         # ожидание блокировки у open, writable/check и чтения
 ERROR_CHARS = 200              # last_error: класс и начало текста
 PENDING_STUCK_S = 900          # дозапрос цены идёт около 9 минут; старше 15 минут — не идёт
+WRITE_RETRY_S = 1.0            # пауза писателя перед повтором неудавшейся записи (ревью I1)
 COUNTERS_WINDOW = timedelta(hours=24)
 WRITER_NAME = "pcbk-ledger-writer"
 OPS = "ops"
 
 Refusal = Literal["budget_spent", "share_spent"]
 STATUSES = ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lost")
+CLOSED_STATUSES = tuple(s for s in STATUSES if s != "open")   # закрытая строка open быть не может
 COST_SOURCES = ("stream", "body", "generation", "pending", "unknown", "none")
 PRICED = ("stream", "body", "generation")   # цена пришла
 
@@ -68,8 +75,8 @@ def _count(value: object) -> int:
 
 
 def _aware(moment: datetime) -> datetime:
-    """Время без смещения считается UTC: сравнения окон не падают на смеси."""
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+    """В UTC (без смещения — считается UTC): ts в файле сравнимы строками, окна не падают на смеси."""
+    return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -168,7 +175,7 @@ _SCHEMA_CALLS = """CREATE TABLE IF NOT EXISTS llm_calls (
 )"""
 _SCHEMA_INDEX = "CREATE INDEX IF NOT EXISTS llm_calls_ts ON llm_calls (ts)"
 _SCHEMA_META = "CREATE TABLE IF NOT EXISTS llm_meta (key TEXT PRIMARY KEY, value REAL)"
-_INSERT = f"INSERT INTO llm_calls ({', '.join(_COLUMNS)}) VALUES ({', '.join('?' * len(_COLUMNS))})"
+# каждая запись строки — целиком по id: повтор после сбоя не упирается в UNIQUE (ревью I1)
 _REPLACE = f"INSERT OR REPLACE INTO llm_calls ({', '.join(_COLUMNS)}) VALUES ({', '.join('?' * len(_COLUMNS))})"
 _SELECT = f"SELECT {', '.join(_COLUMNS)} FROM llm_calls"
 _META_SET = "INSERT OR REPLACE INTO llm_meta (key, value) VALUES (?, ?)"
@@ -186,6 +193,8 @@ _FLAGS = "SELECT id, ts, cost_source, provider_ok FROM llm_calls WHERE cost_sour
 _PROBE = ("INSERT INTO llm_calls (ts, caller, model, step, status, code, http_status, cost_est, cost_source,"
           " prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, duration_ms)"
           " VALUES ('', 'probe', 'probe', 0, 'refused', '', 0, 0, 'none', 0, 0, 0, 0, 0, 0)")
+
+_TABLE_EXISTS = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'llm_calls'"
 
 _SQL, _MARK, _STOP = "sql", "mark", "stop"
 
@@ -267,38 +276,63 @@ def _settled_cost(source: str, cost: object, call_id: int) -> tuple[str, float |
 class Ledger:
     """Журнал вызовов: память — синхронно, SQLite — один поток-писатель; конструктор без ввода-вывода.
 
-    opened — open() удался и писатель запущен; writable_ok — итог последней check() (None до
-    первой); consecutive_failures — неудачных записей писателя подряд; last_error — «<класс>:
-    <текст>» последнего сбоя. health() роли читает только эти поля.
+    Поля для health() роли — без ввода-вывода:
+    - opened — open() удался и писатель запущен; fresh — open() только что создал llm_calls (None до
+      первого удачного open()): пустая база при ненулевом расходе ключа — пропавшая core.db;
+    - writable_ok — итог последней check() (None до первой);
+    - consecutive_failures — неудачных попыток записи подряд (растёт и на повторах одной операции);
+      write_failures_total — всех неудачных попыток, не убывает; writes_dropped_total — операций,
+      брошенных при остановке после неудачи; last_error — «<класс>: <текст>» последнего сбоя;
+    - queue_size — операций, ещё не записанных писателем; writer_alive — поток-писатель жив.
     """
 
     def __init__(self, path: str, *, wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         self.path = path
         self.wallclock = wallclock
         self.opened = False
+        self.fresh: bool | None = None
         self.writable_ok: bool | None = None
         self.consecutive_failures = 0
+        self.write_failures_total = 0
+        self.writes_dropped_total = 0
         self.last_error: str | None = None
+        self.retry_pause_s = WRITE_RETRY_S
         self._mem = _Memory()
         self._queue: queue.SimpleQueue | None = None
-        self._thread: threading.Thread | None = None
+        self._stop: threading.Event | None = None
+        self._thread: threading.Thread | None = None     # остаётся и после close(): open() его дождётся
+        self._backlog = 0
         self._lock = threading.Lock()          # память и очередь; писатель его не берёт
-        self._state_lock = threading.Lock()    # признаки сбоев
+        self._state_lock = threading.Lock()    # признаки сбоев и длина очереди
         self._open_lock = threading.Lock()
+
+    @property
+    def writer_alive(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    @property
+    def queue_size(self) -> int:
+        with self._state_lock:
+            return self._backlog
 
     # --- SQLite: соединение на операцию ---
 
-    def _connect(self, timeout: float = WRITE_TIMEOUT_S) -> sqlite3.Connection:
-        """Точка подмены в тестах: писатель зовёт без аргументов, open/writable/recent — с SQLITE_TIMEOUT_S."""
-        return sqlite3.connect(self.path, timeout=timeout, isolation_level=None)
+    def _connect(self, timeout: float = WRITE_TIMEOUT_S, create: bool = False) -> sqlite3.Connection:
+        """Точка подмены в тестах: писатель зовёт без аргументов, writable/recent — с SQLITE_TIMEOUT_S,
+        open() — (SQLITE_TIMEOUT_S, True). Создаёт файл только create (mode=rwc), иначе mode=rw."""
+        uri = f"{Path(self.path).absolute().as_uri()}?mode={'rwc' if create else 'rw'}"
+        return sqlite3.connect(uri, uri=True, timeout=timeout, isolation_level=None)
 
-    def _load(self, now: datetime) -> _Memory:
-        db = self._connect(SQLITE_TIMEOUT_S)
+    def _load(self, now: datetime) -> tuple[_Memory, bool]:
+        """Память с нуля по файлу и признак «llm_calls только что создана»."""
+        db = self._connect(SQLITE_TIMEOUT_S, True)
         try:
             db.execute("PRAGMA journal_mode=WAL")
+            db.execute("BEGIN IMMEDIATE")
+            fresh = db.execute(_TABLE_EXISTS).fetchone() is None
             for statement in (_SCHEMA_CALLS, _SCHEMA_INDEX, _SCHEMA_META):
                 db.execute(statement)
-            db.execute("BEGIN IMMEDIATE")
             db.execute(_MARK_LOST)
             db.execute(_MARK_UNKNOWN)
             sums = db.execute(_SUMS).fetchall()
@@ -318,21 +352,29 @@ class Ledger:
             mem.since[row.id] = _aware(now)          # дозапрос после перезапуска начинается заново
         for call_id, ts, source, provider_ok in flags:
             mem.flags[call_id] = (_aware(datetime.fromisoformat(ts)), source == "unknown", provider_ok == 0)
-        return mem
+        return mem, fresh
 
     def open(self) -> bool:
         """Файл, WAL, таблицы, память с нуля по файлу, поток-писатель. Уже открыт — ничего не делает (П11).
 
-        Сбой не бросает: opened = False, last_error, False. Ввод-вывод до SQLITE_TIMEOUT_S — не в
-        цикле событий (роль зовёт через asyncio.to_thread).
+        Писатель прошлого open() ещё дописывает после close() — сначала его дождаться (ревью M6),
+        иначе память построится по файлу без его строк. Сбой не бросает: opened = False,
+        last_error, False. Ввод-вывод до SQLITE_TIMEOUT_S — не в цикле событий (роль зовёт через
+        asyncio.to_thread).
         """
         with self._open_lock:
             if self.opened:
                 return True
             try:
-                mem = self._load(self.wallclock())
+                previous = self._thread
+                if previous is not None and previous.is_alive():
+                    previous.join(SQLITE_TIMEOUT_S)
+                    if previous.is_alive():
+                        raise TimeoutError("прежний писатель журнала ещё пишет")
+                mem, fresh = self._load(self.wallclock())
                 q: queue.SimpleQueue = queue.SimpleQueue()
-                thread = threading.Thread(target=self._drain, args=(q,), name=WRITER_NAME, daemon=True)
+                stop = threading.Event()
+                thread = threading.Thread(target=self._drain, args=(q, stop), name=WRITER_NAME, daemon=True)
                 thread.start()
             except Exception as exc:
                 with self._state_lock:
@@ -340,12 +382,17 @@ class Ledger:
                     self.last_error = _why(exc)
                 return False
             with self._lock:
-                self._mem, self._queue, self._thread = mem, q, thread
+                self._mem, self._queue, self._stop, self._thread = mem, q, stop, thread
+                self.fresh = fresh
+                with self._state_lock:
+                    self._backlog = 0
                 self.opened = True
             return True
 
-    def _drain(self, q: queue.SimpleQueue) -> None:
-        """Поток-писатель: операции по порядку; сбой считается и не убивает поток."""
+    def _drain(self, q: queue.SimpleQueue, stop: threading.Event) -> None:
+        """Поток-писатель: операции по порядку. Неудавшаяся повторяется во главе очереди через
+        retry_pause_s, пока не пройдёт; остановка прерывает паузу — последняя попытка, и операция
+        брошена. Сбой считается и не убивает поток."""
         while True:
             item = q.get()
             if item[0] == _STOP:
@@ -354,41 +401,58 @@ class Ledger:
                 item[1].set()
                 continue
             _, sql, params = item
+            done = self._write(sql, params)
+            while not done and not stop.is_set():
+                stop.wait(self.retry_pause_s)
+                done = self._write(sql, params)
+            with self._state_lock:
+                self._backlog -= 1
+                if not done:
+                    self.writes_dropped_total += 1
+            if not done:
+                log.warning("журнал вызовов: при остановке запись брошена — %s", self.last_error)
+
+    def _write(self, sql: str, params: tuple) -> bool:
+        try:
+            db = self._connect()
             try:
-                db = self._connect()
-                try:
-                    db.execute(sql, params)
-                finally:
-                    db.close()
-            except Exception as exc:
-                self._write_failed(exc)
-            else:
-                self._write_ok()
+                db.execute(sql, params)
+            finally:
+                db.close()
+        except Exception as exc:
+            self._write_failed(exc)
+            return False
+        self._write_ok()
+        return True
 
     def _write_failed(self, exc: Exception) -> None:
         with self._state_lock:
             first = self.consecutive_failures == 0
             self.consecutive_failures += 1
+            self.write_failures_total += 1
             self.last_error = _why(exc)
             why = self.last_error
         if first:
-            log.warning("журнал вызовов: запись не удалась — %s", why)
+            log.warning("журнал вызовов: запись не удалась, писатель повторяет — %s", why)
 
     def _write_ok(self) -> None:
         with self._state_lock:
             failed, self.consecutive_failures = self.consecutive_failures, 0
         if failed:
-            log.info("журнал вызовов: запись снова идёт, сбоев подряд было %d", failed)
+            log.info("журнал вызовов: запись снова идёт, неудачных попыток подряд было %d", failed)
 
     def _put(self, sql: str, params: tuple) -> None:
         """В очередь писателя — под self._lock, в порядке изменений памяти; не открыт — только память."""
         if self._queue is not None:
+            with self._state_lock:
+                self._backlog += 1
             self._queue.put((_SQL, sql, params))
 
     def flush(self, timeout: float = 5.0) -> None:
         """Ждёт, пока писатель выполнит всё, что поставлено до вызова; не успел — TimeoutError.
 
-        Писатель не запущен — сразу выходит. Для тестов и close(); в цикле событий не зовётся.
+        Пока запись не проходит, писатель её повторяет, и flush() ждёт до срока. Писатель не
+        запущен — сразу выходит. Для тестов и close(); в цикле событий не зовётся.
         """
         with self._lock:
             if self._queue is None:
@@ -398,27 +462,38 @@ class Ledger:
         if not done.wait(timeout):
             raise TimeoutError(f"журнал вызовов: писатель не успел за {timeout:g} с")
 
-    def close(self) -> None:
-        """flush(), остановка писателя, opened = False: дальше — только память, до нового open()."""
-        late: TimeoutError | None = None
+    def close(self, timeout: float = 5.0) -> None:
+        """flush(timeout), остановка писателя, opened = False: дальше — только память, до нового open().
+
+        Не бросает: роль зовёт её на выходе из lifespan. Если за timeout очередь не записалась
+        (диск не принимает запись), остановка прерывает повторы: каждая оставшаяся операция
+        получает ещё одну попытку и, не пройдя, бросается (writes_dropped_total, WARNING). Что
+        при этом теряется в файле (в памяти процесса всё учтено до конца):
+        - INSERT идущего вызова — строки нет, после перезапуска его оценка в сумму не войдёт;
+          расход по ключу (/key, Д4а-R13) это расхождение покажет;
+        - закрытие вызова — строка остаётся open и после перезапуска стоит оценкой (lost);
+        - цена дозапроса — строка остаётся pending, дозапрос после перезапуска повторится;
+        - отказ прокси — строки нет, денег в ней не было; точка отсчёта llm_meta — поставится заново.
+        """
         try:
-            self.flush()
-        except TimeoutError as exc:
-            late = exc
+            self.flush(timeout)
+        except TimeoutError:
+            log.warning("журнал вызовов: при остановке не записано операций: %d — последние теряются",
+                        self.queue_size)
         with self._lock:
-            q, thread = self._queue, self._thread
-            self._queue, self._thread = None, None
+            q, stop, thread = self._queue, self._stop, self._thread
+            self._queue = self._stop = None
             self.opened = False
             if q is not None:
                 q.put((_STOP,))         # всё, что встало до остановки, писатель ещё допишет
-        if thread is not None and late is None:
-            thread.join(SQLITE_TIMEOUT_S)
-        if late is not None:
-            raise late
+        if stop is not None:
+            stop.set()                  # после flush: повторы больше не ждут
+        if thread is not None:
+            thread.join(timeout)
 
     def writable(self) -> bool:
         """Проба записи на новом соединении: BEGIN IMMEDIATE, INSERT, ROLLBACK. Ввод-вывод до
-        SQLITE_TIMEOUT_S ожидания блокировки — не в цикле событий (F9)."""
+        SQLITE_TIMEOUT_S ожидания блокировки — не в цикле событий (F9). Файла нет — False."""
         try:
             db = self._connect(SQLITE_TIMEOUT_S)
             try:
@@ -466,13 +541,16 @@ class Ledger:
                           completion_tokens=0, cached_tokens=0, cache_write_tokens=0, reasoning_tokens=0,
                           duration_ms=0)
             m.open[row.id] = row
-            self._put(_INSERT, _values(row))
+            self._put(_REPLACE, _values(row))
         return row.id
 
     def close_call(self, call_id: int, *, status: str, code: str, http_status: int, provider: str | None,
                    provider_ok: bool | None, generation_id: str | None, usage: Usage | None, cost_source: str,
                    duration_ms: int, now: datetime | None = None) -> None:
-        """Оценка сменяется charge закрытой строки. pending — ожидание цены с now или ts + duration."""
+        """Оценка сменяется charge закрытой строки. pending — ожидание цены с now или ts + duration.
+
+        Статус не из CLOSED_STATUSES (и open у закрытой строки) — WARNING и unknown (ревью M1).
+        """
         u = usage if usage is not None else NO_USAGE
         with self._lock:
             m = self._mem
@@ -480,6 +558,9 @@ class Ledger:
             if row is None:
                 log.warning("журнал вызовов: закрытие неизвестного вызова id=%d — пропущено", call_id)
                 return
+            if status not in CLOSED_STATUSES:
+                log.warning("журнал вызовов: id=%d неизвестный статус %.40r — записан unknown", call_id, status)
+                status = "unknown"
             source, cost = _settled_cost(cost_source, u.cost, call_id)
             closed = replace(row, status=status, code=code, http_status=http_status, provider=provider,
                              provider_ok=provider_ok, generation_id=generation_id, cost=cost, cost_source=source,
@@ -509,7 +590,7 @@ class Ledger:
                           completion_tokens=0, cached_tokens=0, cache_write_tokens=0, reasoning_tokens=0,
                           duration_ms=0)
             m.settle(row)
-            self._put(_INSERT, _values(row))
+            self._put(_REPLACE, _values(row))
 
     def set_cost(self, call_id: int, cost: float | None, source: str) -> None:
         """pending → generation (в сумме оценку сменяет цена) или unknown (остаётся оценка).
