@@ -256,7 +256,7 @@ class GatewayRole(RoleBase):
         return True, "принимает вход"
 
     def health_json(self, now: datetime) -> dict:
-        """Договор сторожа (задача А1): ровно эти ключи, только числа и тексты."""
+        """Договор сторожа (задача А1; Б1 — четыре ключа прокси): ровно эти ключи, только числа и тексты."""
         w, count = self.workplaces, self.stats.count_1h
         checked = w.checked_at if w.checked_at is not None else self.started_at
         return {
@@ -275,6 +275,11 @@ class GatewayRole(RoleBase):
             "login_busy_1h": count("login_busy"),
             "cookies_duplicate_1h": count("cookies_duplicate"),
             "drill": self.gw.DRILL_GATEWAY,
+            # Д5б (Б1): сторож читает все четыре вместе или ни одного
+            "refused_1h": count("refused"),
+            "streams": self.stats.streams,
+            "stream_broken_1h": count("stream_broken"),
+            "upstream_failed_1h": count("upstream_failed"),
         }
 
     # --- жизненный цикл ---

@@ -108,6 +108,12 @@ LOGIN_FAILS_WARN = 30
 # drill — "" или режим DRILL_GATEWAY. Прочее — ответ не по договору
 GW_SP_CTL_STATES = frozenset({"ok", "down", "unknown"})
 GW_DRILL_MODES = frozenset({"freeze_reaper", "bad_place_pw"})
+# ключи ответа: 15 Д5а обязательны; четыре ключа прокси Д5б (Б1) — все вместе или ни одного
+# (core :d5a во время выкладки); любой другой ключ — ответ не по договору
+GW_KEYS_D5A = frozenset({"checked_at", "config_error", "store_ok", "sp_ctl", "running_n", "ready_n", "wake_ok_1h",
+                         "wake_failed_1h", "stop_failed_1h", "place_auth_failed_1h", "logins_failed_1h",
+                         "origin_refused_1h", "login_busy_1h", "cookies_duplicate_1h", "drill"})
+GW_KEYS_D5B = frozenset({"refused_1h", "streams", "stream_broken_1h", "upstream_failed_1h"})
 
 
 @dataclass(frozen=True)
@@ -679,8 +685,8 @@ def _gw_count(obj: dict, key: str, *, optional: bool = False) -> int | None:
 class GatewayReply:
     """Поля ответа /health/gateway, которые читает сторож; типы проверены при разборе.
 
-    Ключи Д5а обязательны. Ключи Д5б (refused_1h, streams, stream_broken_1h, upstream_failed_1h) —
-    нет: во время выкладки сторож может читать core :d5a; тогда они None.
+    Ключи Д5а обязательны. Ключи Д5б (refused_1h, streams, stream_broken_1h, upstream_failed_1h) — все
+    четыре или ни одного: во время выкладки сторож может читать core :d5a; тогда все четыре None.
     """
     checked_at: datetime | None
     config_error: str | None
@@ -704,11 +710,15 @@ class GatewayReply:
 
     @classmethod
     def parse(cls, reply) -> "GatewayReply":
-        """Ответ не по договору — только ValueError (Ш8): не объект JSON, нет ключа Д5а, тип не тот,
-        счётчик меньше нуля, sp_ctl не из GW_SP_CTL_STATES, пустая причина config_error, drill не ""
-        и не из GW_DRILL_MODES."""
+        """Ответ не по договору — только ValueError (Ш8): не объект JSON, нет ключа Д5а, лишний ключ, часть
+        ключей Д5б, тип не тот, счётчик меньше нуля, sp_ctl не из GW_SP_CTL_STATES, пустая причина
+        config_error, drill не "" и не из GW_DRILL_MODES."""
         if not isinstance(reply, dict):
             raise ValueError("ответ — не объект JSON")
+        if not set(reply) <= GW_KEYS_D5A | GW_KEYS_D5B:
+            raise ValueError("в ответе шлюза лишний ключ")
+        if len(GW_KEYS_D5B & set(reply)) not in (0, len(GW_KEYS_D5B)):
+            raise ValueError("в ответе шлюза часть ключей прокси")
         try:
             r = cls(
                 checked_at=_time(reply, "checked_at"),   # не ISO — ValueError из fromisoformat
@@ -739,7 +749,8 @@ class GatewayReply:
 
 
 def gateway_verdict(r: GatewayReply, now: datetime, stale_s: int) -> tuple[State, str, str]:
-    """Первая подходящая строка таблицы задачи А1 Д5а: (состояние, detail, note без учений).
+    """Первая подходящая строка таблицы задачи А1 Д5а с двумя строками прокси Б1 Д5б после «не приняло пароль
+    шлюза»: (состояние, detail, note без учений).
 
     В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
     """
@@ -756,16 +767,21 @@ def gateway_verdict(r: GatewayReply, now: datetime, stale_s: int) -> tuple[State
     if r.wake_failed_1h >= WAKE_FAILS_FAIL and r.wake_ok_1h == 0:
         return "fail", "рабочие места не поднимаются", f"{r.wake_failed_1h} за час"
     for count, detail in ((r.place_auth_failed_1h, "рабочее место не приняло пароль шлюза"),
+                          (r.upstream_failed_1h, "рабочее место не отвечает шлюзу"),     # Д5б; core :d5a — None
+                          (r.stream_broken_1h, "поток событий рвётся"),
                           (r.cookies_duplicate_1h, "подброшена cookie сессии"),
                           (r.origin_refused_1h, "вход отклоняется проверкой источника — проверьте GW_ORIGIN"),
                           (r.login_busy_1h, "вход перегружен"),
                           (r.wake_failed_1h, "рабочее место не поднялось по входу"),
                           (r.stop_failed_1h, "уборщик не смог усыпить место")):
-        if count > 0:
+        if count is not None and count > 0:
             return "warn", detail, f"{count} за час"
     if r.logins_failed_1h >= LOGIN_FAILS_WARN:
         return "warn", "много неверных паролей", f"{r.logins_failed_1h} за час"
-    return "ok", "принимает вход", f"работает мест: {r.running_n}"
+    note = f"работает мест: {r.running_n}"
+    if r.streams is not None:           # ответ core :d5b — все четыре ключа прокси (parse)
+        note += f"; потоков: {r.streams}; отказов за час: {r.refused_1h}"
+    return "ok", "принимает вход", note
 
 
 def check_gateway(component: str, title: str, url: str, now: datetime, stale_s: int,
