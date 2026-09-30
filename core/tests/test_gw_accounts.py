@@ -40,6 +40,8 @@ def test_secrets_at_rest(tmp_path):                                             
     tok = s.open_session("ivanov")
     raw = db_bytes(tmp_path)                                                           # соединения закрыты после операций
     assert tok.encode() not in raw and PW.encode("utf-8") not in raw
+    # положительный контроль побайтного скана (ревью А2, M4): записанное скан видит
+    assert hashlib.sha256(tok.encode()).hexdigest().encode() in raw and b"scrypt$16384$8$1$" in raw
     con = sqlite3.connect(tmp_path / "core.db")                                        # положительный контроль
     assert [r[0] for r in con.execute("SELECT token_sha FROM gw_sessions")] == [hashlib.sha256(tok.encode()).hexdigest()]
     assert con.execute("SELECT pw_hash FROM gw_accounts").fetchone()[0].startswith("scrypt$16384$8$1$")
@@ -81,6 +83,28 @@ def test_place_bound_forever(tmp_path):                                         
         s.release_place(10)                                                            # пробная, но действует
     s.disable("d5-probe-a"); s.release_place(10)
     assert s.add("petrov", "student", 10, PW).place == 10
+
+
+def test_same_person_only_own_place(tmp_path):                                          # ревью А2, I1
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    s.disable("ivanov"); s.remove("ivanov")
+    for args in (("ivanov", "student", 4, PW), ("ivanov", "teacher", None, PW)):      # чужое место, роль teacher
+        with pytest.raises(ValueError) as e:
+            s.add(*args, same_person=True)
+        assert "логин ivanov закреплён за местом 03 — тот же человек возвращается только на своё место" in str(e.value)
+    assert s.list() == [] and s.bindings() == [(3, "ivanov", False)]                  # отказ ничего не записал
+    assert s.add("ivanov", "student", 3, PW, same_person=True).place == 3
+
+
+def test_bindings_account_by_login_and_place(tmp_path):                                # ревью А2, M5
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    con = sqlite3.connect(tmp_path / "core.db")
+    with con:                                                                          # учётка того же логина на другом месте
+        con.execute("UPDATE gw_accounts SET place = 4 WHERE login = 'ivanov'")
+    con.close()
+    assert s.bindings() == [(3, "ivanov", False)]
 
 
 def test_verify_and_sessions(tmp_path):
@@ -125,6 +149,21 @@ def test_login_lock_no_oracle_persisted_and_unlocked(tmp_path):
         s.failure("ivanov")
     clock.advance(LOCK_WINDOW_S)
     assert not s.locked("ivanov")
+
+
+def test_unknown_lock_survives_junk_flood(tmp_path):                                   # ревью А2, M2
+    clock = FakeMono(0.0)
+    s = store(tmp_path, clock=clock)
+    for _ in range(LOCK_FAILURES):
+        s.failure("victim")
+    for i in range(UNKNOWN_KEYS + 50):
+        s.failure(f"Junk-{i}")                                                         # не вид логина: только память
+    assert s.locked("victim") and len(s.unknown_failures) == UNKNOWN_KEYS             # вытеснены незапертые
+    clock.advance(LOCK_WINDOW_S)                                                       # замок истёк — вытесняется первым
+    s.failure("Junk-new")
+    assert not s.locked("victim") and len(s.unknown_failures) == UNKNOWN_KEYS
+    assert hashlib.sha256(b"victim").digest() not in s.unknown_failures                # ключ — sha256 логина
+    assert hashlib.sha256(b"Junk-51").digest() in s.unknown_failures                  # а не самый старый незапертый
 
 
 def test_store_errors_counted_without_paths(tmp_path, monkeypatch):

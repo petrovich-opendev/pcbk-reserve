@@ -8,8 +8,10 @@
   только release_place: у пробных учёток dN-probe-* и без действующей учётки на месте;
 - gw_sessions — сессии: sha256 значения cookie, сам токен в базе не лежит. Срок — от открытия;
 - gw_login_failures — неудачные входы существующих логинов в окне LOCK_WINDOW_S. Неизвестные
-  логины — только в памяти (OrderedDict на UNKNOWN_KEYS ключей под threading.Lock, ключ — sha256
-  логина): замок для всех одинаков, перебор чужих логинов не растит базу и память.
+  логины — только в памяти (UNKNOWN_KEYS ключей под threading.Lock, ключ — sha256 логина): замок
+  для всех одинаков, перебор чужих логинов не растит базу и память. При переполнении вытесняется
+  самый старый незапертый ключ (истёкший замок — тоже незапертый), действующие замки — последними:
+  поток мусорных логинов замок не смывает (ревью А2, M2).
 
 Договор Role: конструктор только запоминает; файл, WAL и таблицы — open() (роль зовёт её через
 asyncio.to_thread в начале lifespan). Соединение — на каждую операцию, операции идут из потоков.
@@ -179,6 +181,11 @@ def _sha(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def _stamps_locked(stamps: deque[float] | None, now: float) -> bool:
+    """Замок по меткам неудачных входов: не меньше LOCK_FAILURES за последние LOCK_WINDOW_S."""
+    return stamps is not None and len(stamps) >= LOCK_FAILURES and stamps[-LOCK_FAILURES] > now - LOCK_WINDOW_S
+
+
 def _key(login: object) -> bytes:
     """Ключ счётчика неизвестных логинов: sha256 — память не держит ни длинных строк, ни пароля, набранного
     в поле логина."""
@@ -215,7 +222,9 @@ class AccountStore:
 
     Поля для health() роли — из памяти: op_failures — сбоев настоящих операций подряд (снимает удачная
     операция), probe_failures — сбоев ping() подряд (снимает удачная проба), last_error — класс последней
-    ошибки. unknown_failures — счётчик неизвестных логинов: sha256 логина → метки неудачных входов.
+    ошибки. unknown_failures — счётчик неизвестных логинов: sha256 логина → метки неудачных входов;
+    очередь вытеснения — _unknown_open (незапертые, по последнему неудачному входу) и _unknown_locked
+    (запертые, по времени запирания).
     """
 
     def __init__(self, db_path: str, *, ttl_s: float = 43200.0, clock: Callable[[], float] = time.time):
@@ -225,7 +234,9 @@ class AccountStore:
         self.op_failures = 0
         self.probe_failures = 0
         self.last_error: str | None = None
-        self.unknown_failures: OrderedDict[bytes, deque[float]] = OrderedDict()
+        self.unknown_failures: dict[bytes, deque[float]] = {}
+        self._unknown_open: OrderedDict[bytes, None] = OrderedDict()
+        self._unknown_locked: OrderedDict[bytes, None] = OrderedDict()
         self._unknown_lock = threading.Lock()
         self._state_lock = threading.Lock()
 
@@ -310,7 +321,8 @@ class AccountStore:
         """Новая учётка. Отказ — ValueError с русским текстом без пароля.
 
         Место, закреплённое за другим логином, не выдаётся; логин удалённой учётки (надгробие) — только
-        с same_person, со строкой журнала. Первая выдача места пишет gw_places.
+        с same_person, только студентом на своё же место и со строкой журнала. Первая выдача места пишет
+        gw_places.
         """
         _check_login(login)
         if role not in ROLES:
@@ -327,9 +339,15 @@ class AccountStore:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM gw_accounts WHERE login = ?", (login,)).fetchone() is not None:
                 raise ValueError(f"логин: {login} уже есть")
-            held = db.execute("SELECT min(place) FROM gw_places WHERE login = ?", (login,)).fetchone()[0]
+            places = [row[0] for row in db.execute("SELECT place FROM gw_places WHERE login = ? ORDER BY place",
+                                                   (login,))]
+            held = places[0] if places else None
             if held is not None and not same_person:
                 raise ValueError(f"логин {login} был у студента места {_nn(held)} — новому человеку нужен новый логин")
+            if held is not None and (role != "student" or place not in places):
+                # тот же человек — только на своё место и только студентом (ревью А2, I1)
+                raise ValueError(f"логин {login} закреплён за местом {_nn(held)} — тот же человек возвращается"
+                                 " только на своё место")
             if place is not None:
                 if db.execute("SELECT 1 FROM gw_accounts WHERE place = ? AND disabled = 0",
                               (place,)).fetchone() is not None:
@@ -407,9 +425,11 @@ class AccountStore:
         return [Account(login, role, place, bool(disabled)) for login, role, place, disabled in rows]
 
     def bindings(self) -> list[tuple[int, str, bool]]:
-        """Закрепления мест: (место, логин, есть ли учётка), в том числе за удалёнными логинами."""
+        """Закрепления мест: (место, логин, есть ли учётка этого логина на этом месте), в том числе за
+        удалёнными логинами."""
         with self._op() as db:
-            rows = db.execute("SELECT p.place, p.login, EXISTS (SELECT 1 FROM gw_accounts a WHERE a.login = p.login)"
+            rows = db.execute("SELECT p.place, p.login, EXISTS (SELECT 1 FROM gw_accounts a"
+                              " WHERE a.login = p.login AND a.place = p.place)"
                               " FROM gw_places p ORDER BY p.place").fetchall()
         return [(place, login, bool(has)) for place, login, has in rows]
 
@@ -496,14 +516,12 @@ class AccountStore:
                                    (login, now - LOCK_WINDOW_S)).fetchone()[0]
                     return n >= LOCK_FAILURES
         with self._unknown_lock:
-            stamps = self.unknown_failures.get(_key(login))
-            return (stamps is not None and len(stamps) >= LOCK_FAILURES
-                    and stamps[-LOCK_FAILURES] > now - LOCK_WINDOW_S)
+            return _stamps_locked(self.unknown_failures.get(_key(login)), now)
 
     def failure(self, login: str) -> None:
         """Неудачный вход. Существующий логин — строка таблицы (в ней только окно и не больше LOCK_FAILURES
-        строк логина), прочие — память: UNKNOWN_KEYS ключей, вытесняется тот, чей последний неудачный вход
-        старше всех."""
+        строк логина), прочие — память: UNKNOWN_KEYS ключей; вытесняется самый старый незапертый, запертые —
+        последними (ревью А2, M2)."""
         now = self.clock()
         if isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
             with self._op() as db:
@@ -521,11 +539,23 @@ class AccountStore:
             stamps = self.unknown_failures.get(key)
             if stamps is None:
                 stamps = self.unknown_failures[key] = deque(maxlen=LOCK_FAILURES)
-                while len(self.unknown_failures) > UNKNOWN_KEYS:
-                    self.unknown_failures.popitem(last=False)
-            else:
-                self.unknown_failures.move_to_end(key)
             stamps.append(now)
+            self._unknown_open.pop(key, None)
+            self._unknown_locked.pop(key, None)
+            (self._unknown_locked if _stamps_locked(stamps, now) else self._unknown_open)[key] = None
+            while len(self.unknown_failures) > UNKNOWN_KEYS:
+                self._evict_unknown(now)
+
+    def _evict_unknown(self, now: float) -> None:
+        """Один ключ вон (под _unknown_lock): самый старый запертый, если его замок истёк, иначе самый старый
+        незапертый; запертый действующий — только когда незапертых нет. O(1): очереди по порядку."""
+        oldest_locked = next(iter(self._unknown_locked), None)
+        if oldest_locked is not None and not _stamps_locked(self.unknown_failures[oldest_locked], now):
+            queue = self._unknown_locked
+        else:
+            queue = self._unknown_open if self._unknown_open else self._unknown_locked
+        key, _ = queue.popitem(last=False)
+        del self.unknown_failures[key]
 
     def unlock(self, login: str) -> None:
         """Снимает замок логина: строки таблицы и счётчик в памяти."""
@@ -535,8 +565,11 @@ class AccountStore:
         self._forget_unknown(login)
 
     def _forget_unknown(self, login: object) -> None:
+        key = _key(login)
         with self._unknown_lock:
-            self.unknown_failures.pop(_key(login), None)
+            self.unknown_failures.pop(key, None)
+            self._unknown_open.pop(key, None)
+            self._unknown_locked.pop(key, None)
 
 
 # --- команда администратора: python -m pcbk_core.gateway.accounts ---
