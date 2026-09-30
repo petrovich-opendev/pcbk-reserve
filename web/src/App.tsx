@@ -1,0 +1,167 @@
+// Страница чата (Д6-R39, R42, R44). Фазы: загрузка → ошибка /me | преподаватель | рабочее место → чат;
+// из чата — «место спит» (кнопка «Разбудить», сам не будит: Д5-R27). Конец сессии в любой фазе и «Выйти» —
+// на /login. Шапка — во всех фазах, кроме загрузки. App помнит последний открытый разговор
+// (onThreadIdChange) и после «Разбудить» монтирует чат с ним.
+import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
+import { replyText, type Api, type Reply } from "./api";
+import { Chat, type ChatProps } from "./components/Chat";
+import { Header } from "./components/Header";
+import { WorkplaceScreen } from "./components/WorkplaceScreen";
+import { startStatusPolling } from "./status";
+import { T_ASLEEP, T_LOADING, T_RETRY, T_TEACHER, T_UNKNOWN, T_WAKE } from "./texts";
+import { placeView, type Timers } from "./workplace";
+
+export interface AppProps {
+  api: Api;
+  navigate(url: string): void;
+  ChatImpl?: ComponentType<ChatProps>;
+  startPolling?: typeof startStatusPolling;
+  pollMs?: number;              // опрос места — для тестов (preflight M11)
+  timers?: Timers;
+}
+
+type Phase =
+  | { kind: "loading" }
+  | { kind: "error"; text: string }
+  | { kind: "teacher" }
+  | { kind: "workplace" }
+  | { kind: "asleep" }
+  | { kind: "chat"; mount: number; sessionId: string | undefined }
+  | { kind: "leaving" };                                 // уход на /login: чат снят, поток закрыт
+
+interface Who { login: string; role: "student" | "teacher"; place: string | null }
+
+const LOGIN_URL = "/login";
+
+const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object";
+
+// ответ /me → учётка; null — ответ не той формы
+function parseMe(r: Reply): Who | null {
+  if (r.status !== 200 || !isObject(r.body)) return null;
+  const { login, role, place } = r.body;
+  if (typeof login !== "string" || (role !== "student" && role !== "teacher")) return null;
+  return { login, role, place: typeof place === "string" ? place : null };
+}
+
+const noAnswer = (): Reply => ({ status: 0, body: null });
+
+export function App(p: AppProps) {
+  const ChatImpl = p.ChatImpl ?? Chat;
+  const startPolling = p.startPolling ?? startStatusPolling;
+  const [phase, setPhase] = useState<Phase>({ kind: "loading" });
+  const [who, setWho] = useState<Who | null>(null);
+  const [attempt, setAttempt] = useState(0);            // «Повторить» после сбоя /me
+  const props = useRef(p);
+  props.current = p;
+  const lastSession = useRef<string | undefined>(undefined);
+  const mounts = useRef(0);                             // номер монтирования чата
+  const leaving = useRef(false);
+
+  const goLogin = useCallback((): void => {
+    if (leaving.current) return;
+    leaving.current = true;
+    setPhase({ kind: "leaving" });
+    props.current.navigate(LOGIN_URL);
+  }, []);
+
+  const openChat = useCallback((): void => {
+    mounts.current += 1;
+    setPhase({ kind: "chat", mount: mounts.current, sessionId: lastSession.current });
+  }, []);
+
+  // вход: кто я → у студента место (готово — чат, иначе будим)
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const { api } = props.current;
+      const me = await api.me().catch(noAnswer);
+      if (cancelled) return;
+      if (me.status === 401) return goLogin();
+      const user = parseMe(me);
+      if (user === null) {
+        setPhase({ kind: "error", text: me.status === 200 ? T_UNKNOWN : replyText(me) });
+        return;
+      }
+      setWho(user);
+      if (user.role === "teacher") {                    // ни мест, ни чата, ни одного вызова /pcbk/api/oc
+        setPhase({ kind: "teacher" });
+        return;
+      }
+      const place = await api.workplace().catch(noAnswer);
+      if (cancelled) return;
+      if (place.status === 401) return goLogin();
+      if (place.status === 200 && placeView(place.body).ok) openChat();
+      else setPhase({ kind: "workplace" });
+    })();
+    return () => { cancelled = true; };
+  }, [attempt, goLogin, openChat]);
+
+  const logout = async (): Promise<void> => {
+    if (leaving.current) return;
+    leaving.current = true;
+    setPhase({ kind: "leaving" });                      // чат снят до выхода — поток закрыт
+    await props.current.api.logout().catch(noAnswer);
+    props.current.navigate(LOGIN_URL);
+  };
+
+  let body;
+  switch (phase.kind) {
+    case "loading":
+      body = <p className="phase">{T_LOADING}</p>;
+      break;
+    case "error":
+      body = (
+        <section className="phase">
+          <p data-kind="fail">{phase.text}</p>
+          <button type="button" onClick={() => { setPhase({ kind: "loading" }); setAttempt((n) => n + 1); }}>
+            {T_RETRY}
+          </button>
+        </section>
+      );
+      break;
+    case "teacher":
+      body = <p className="phase">{T_TEACHER}</p>;
+      break;
+    case "workplace":
+      body = <WorkplaceScreen api={p.api} onReady={openChat} onSignedOut={goLogin} pollMs={p.pollMs} timers={p.timers} />;
+      break;
+    case "asleep":
+      body = (
+        <section className="phase">
+          <p>{T_ASLEEP}</p>
+          <button type="button" onClick={() => setPhase({ kind: "workplace" })}>{T_WAKE}</button>
+        </section>
+      );
+      break;
+    case "chat": {
+      const mount = phase.mount;
+      body = (
+        <ChatImpl
+          key={mount}
+          initialSessionId={phase.sessionId}
+          onThreadIdChange={(id) => { if (mount === mounts.current) lastSession.current = id; }}
+          onHalt={(kind) => {
+            if (mount !== mounts.current) return;       // снятый чат не решает за нынешний
+            if (kind === "signed_out") goLogin();
+            else setPhase({ kind: "asleep" });
+          }}
+        />
+      );
+      break;
+    }
+    case "leaving":
+      body = null;
+      break;
+  }
+
+  const header = phase.kind !== "loading" && !(phase.kind === "leaving" && who === null);
+  return (
+    <div className="app">
+      {header && (
+        <Header login={who?.login ?? null} ownPlace={who?.place ?? null} startPolling={startPolling}
+                onLogout={() => void logout()} leaving={phase.kind === "leaving"} />
+      )}
+      <main className="main">{body}</main>
+    </div>
+  );
+}
