@@ -22,8 +22,10 @@ TagName IN (…) и то, что пропускает literal_ok.
 до драйвера; длительность — от входа в run() до исхода, с ожиданием места: это видит
 студент. Отказы без SQL (busy, пауза, unlisted, rate, защёлка) p95 не разбавляют. После
 PAUSE_AFTER_TIMEOUTS сроков подряд полоса людей стоит USER_PAUSE_S: новые вызовы сразу
-получают busy, без места и SQL; фон паузы не знает. Счёт обнуляет только исход, с которым
-SQL дошёл до историана (удача, ошибка query, connect, auth); отказы без SQL его не трогают.
+получают busy, без места и SQL, и ждущие места или первого входа — тоже; фон паузы не знает.
+Счёт обнуляет только исход, с которым SQL дошёл до историана (удача, ошибка query, connect,
+auth); отказы без SQL его не трогают. Счёт ведётся в момент исхода, до того как отпущено
+место: срок ворот — пока место держит драйвер, исход драйвера — в _finish.
 """
 import asyncio
 import logging
@@ -80,8 +82,8 @@ class SlidingWindow:
 
 
 class GateRefused(Exception):
-    """Ворота не пустили вызов, SQL не ушёл: rate — общий предел, busy — нет места к сроку,
-    unlisted — SQL вне белого списка."""
+    """Ворота не пустили вызов, SQL не ушёл: rate — общий предел, busy — нет места к сроку или полоса людей
+    на паузе после сроков подряд, unlisted — SQL вне белого списка."""
 
     def __init__(self, code: Literal["rate", "busy", "unlisted"]):
         super().__init__(code)
@@ -218,8 +220,10 @@ class HistorianGate:
                     self._first_login.release()
                 else:
                     probe = True
-            # пока ждали места или первого входа, чужой вызов мог получить отказ входа или обрыв
+            # пока ждали места или первого входа, чужой вызов мог получить отказ входа или обрыв, а люди — паузу
             self._raise_if_closed()
+            if lane == "user" and self._user_paused(self.monotonic()):
+                raise GateRefused("busy")
             if deadline - loop.time() < q_min:
                 raise GateRefused("busy")
             # 4. общий предел — только людям и только с местом
@@ -241,6 +245,8 @@ class HistorianGate:
             rows = await asyncio.wait_for(waiter, timeout=deadline - loop.time())
         except TimeoutError:
             failure = HistorianError("timeout", "срок вызова истёк, запрос дорабатывает с местом", sent)
+            if lane == "user":              # место ещё держит драйвер: ждущий, взяв его, увидит паузу
+                self._count_timeouts("timeout")
         except HistorianError as err:
             failure = err.with_sent(sent)
         if failure is not None:
@@ -282,20 +288,25 @@ class HistorianGate:
         return self._user_pause_until is not None and now < self._user_pause_until
 
     def _note_user(self, exc: Exception | None, took_s: float, reached: bool) -> None:
-        """Исход вызова людей: в окно нагрузки. Срок — в счёт подряд; прочий исход, с которым SQL дошёл до
-        историана, счёт обнуляет; отказ без SQL (busy, пауза, unlisted, rate, защёлка) его не трогает."""
+        """Исход вызова людей — в окно нагрузки (p95, сроки, busy); счёт сроков подряд здесь не ведётся."""
         code = "ok" if exc is None else exc.code if isinstance(exc, (HistorianError, GateRefused)) else "error"
         now = self.monotonic()
         self._user_window(now).append((now, max(0, round(took_s * 1000)), code, reached))
-        if not reached:
-            return
+
+    def _count_timeouts(self, code: str) -> None:
+        """Счёт сроков подряд у людей по исходу вызова, дошедшего до историана: срок — +1, прочий исход — ноль.
+
+        Зовут его в момент исхода, до того как отпущены место и замок первого входа (срок ворот, _finish):
+        ждущий их, взяв, уже видит паузу. Отказы без SQL (busy, пауза, unlisted, rate, защёлка) сюда не
+        приходят и счёт не трогают.
+        """
         if code != "timeout":
             self._timeouts_in_row = 0
             return
         self._timeouts_in_row += 1
         if self._timeouts_in_row >= PAUSE_AFTER_TIMEOUTS:
             self._timeouts_in_row = 0           # следующая пауза — снова после стольких же сроков подряд
-            self._user_pause_until = now + USER_PAUSE_S
+            self._user_pause_until = self.monotonic() + USER_PAUSE_S
             log.warning("ворота: сроки подряд у людей (%d) — пауза полосы людей %g с", PAUSE_AFTER_TIMEOUTS,
                         USER_PAUSE_S)
 
@@ -331,15 +342,17 @@ class HistorianGate:
     def _finish(self, lane: Lane, probe: bool, future: Future, waiter: asyncio.Future) -> None:
         """В цикле событий после возврата драйвера.
 
-        Удача, защёлка и пауза отмечаются до того, как отпущены замок первого входа и
-        место: следующий, взяв их, уже видит исход — и так же, если вызов закончился
-        по сроку раньше.
+        Удача, защёлка, пауза и счёт сроков подряд людей отмечаются до того, как отпущены
+        замок первого входа и место: следующий, взяв их, уже видит исход — и так же, если
+        вызов закончился по сроку раньше (тогда его срок уже посчитан, а исход драйвера — нет).
         """
         exc = None if future.cancelled() else future.exception()
         if isinstance(exc, HistorianError):
             self._note_failure(exc)
         elif exc is None and not future.cancelled():
             self._login_ok = True
+        if lane == "user" and not waiter.done() and not future.cancelled():
+            self._count_timeouts("ok" if exc is None else exc.code if isinstance(exc, HistorianError) else "error")
         if probe:
             self._first_login.release()
         self._in_flight[lane] -= 1

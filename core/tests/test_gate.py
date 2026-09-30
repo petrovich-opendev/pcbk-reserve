@@ -484,3 +484,45 @@ async def test_p95_only_calls_that_reached_driver():
     assert g.stats()["p95_ms"] is None                   # до драйвера дошли только четыре
     await g.run([Q])
     assert g.stats()["p95_ms"] >= 90                     # сто отказов по 0 мс его не тянут вниз
+
+
+# доводка по ревью задачи 1: ждущий места после третьего срока не входит (I1), завис историан — срок ворот (M3)
+
+
+@pytest.mark.parametrize("hung", [False, True], ids=["driver_timeout", "gate_deadline"])
+async def test_caller_waiting_for_slot_at_third_timeout_gets_busy(hung):        # I1
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=1)
+    fake.fail = HistorianError("timeout", "долго")
+    for _ in range(PAUSE_AFTER_TIMEOUTS - 1):
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+    # третий срок: его отдаёт сам драйвер через 0,3 с или ставят ворота (0,5 с), пока драйвер висит 1 с
+    fake.delay_s, fake.fail = (1.0, None) if hung else (0.3, fake.fail)
+    third = asyncio.ensure_future(g.run([Q], deadline_s=0.5 if hung else None))
+    await anyio.sleep(0.05)
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])                                 # ждёт места, пока его держит третий
+    assert e.value.code == "busy" and len(fake.calls) == sent
+    with pytest.raises(HistorianError) as e:
+        await third
+    assert e.value.code == "timeout" and g.stats()["user_paused"] is True
+
+
+async def test_hung_historian_deadline_timeouts_count_toward_pause():         # M3
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=PAUSE_AFTER_TIMEOUTS)
+    fake.delay_s = 1.0                                   # драйвер дольше срока: срок ставят сами ворота
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        t = time.monotonic()
+        with pytest.raises(HistorianError) as e:
+            await g.run([Q], deadline_s=0.3)
+        assert e.value.code == "timeout" and time.monotonic() - t < 0.6
+    s = g.stats()
+    assert (s["user_paused"], s["timeouts_5m"], s["in_flight"]["user"]) == (True, PAUSE_AFTER_TIMEOUTS,
+                                                                           PAUSE_AFTER_TIMEOUTS)
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == sent
