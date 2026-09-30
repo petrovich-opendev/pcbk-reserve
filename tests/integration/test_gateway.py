@@ -373,13 +373,15 @@ def test_edge_limits_oc_connections(stack, users):                              
     assert core_creates(stack) == created
 
 
-def flood(cookie: str, total: int, threads: int = 4) -> list[int]:
+def flood(cookie: str, total: int, threads: int = 4) -> tuple[list[int], dict]:
     """total запросов GET /pcbk/api/oc/config (отказ правил — строка «gw refused» в core) одной cookie: threads потоков,
-    у каждого своё соединение keep-alive (HTTP/1.1), иначе рукопожатия TLS растянули бы поток дольше запаса."""
+    у каждого своё соединение keep-alive (HTTP/1.1), иначе рукопожатия TLS растянули бы поток дольше запаса. Коды и
+    по одному телу каждого кода (JSON)."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     codes: list[int] = []
+    bodies: dict = {}
     lock = threading.Lock()
 
     def worker(n: int) -> None:
@@ -393,7 +395,7 @@ def flood(cookie: str, total: int, threads: int = 4) -> list[int]:
                         conn.putheader("Cookie", f"pcbk_session={cookie}")
                         conn.endheaders()
                         r = conn.getresponse()
-                        r.read()
+                        raw = r.read()
                         break
                     except (http.client.HTTPException, OSError):
                         conn.close()
@@ -402,6 +404,7 @@ def flood(cookie: str, total: int, threads: int = 4) -> list[int]:
                             raise
                 with lock:
                     codes.append(r.status)
+                    bodies.setdefault(r.status, (r.getheader("Content-Type"), json.loads(raw)))
         finally:
             conn.close()
 
@@ -410,7 +413,7 @@ def flood(cookie: str, total: int, threads: int = 4) -> list[int]:
         w.start()
     for w in workers:
         w.join()
-    return codes
+    return codes, bodies
 
 
 def test_edge_limits_oc_rate(stack, users):                                             # итоговая доводка Д5б, N1
@@ -418,11 +421,13 @@ def test_edge_limits_oc_rate(stack, users):                                     
     COOKIES.append(f.cookie)
     rules0, _ = settled(lambda: refused_counts(stack))
     t = time.monotonic()
-    codes = flood(f.cookie, 300)
+    codes, bodies = flood(f.cookie, 300)
     elapsed = time.monotonic() - t
     rules1, _ = settled(lambda: refused_counts(stack))
     forbidden, busy = codes.count(403), codes.count(503)
     assert (len(codes), forbidden + busy) == (300, 300) and busy > 0                    # часть — 503 от edge
+    assert bodies[503] == ("application/json", {"name": "WorkplaceBusy", "data": {           # как занятость места:
+        "message": "Слишком много одновременных запросов — повторите позже"}})             # чат Д6 его повторит
     assert rules1 - rules0 == forbidden <= EDGE_OC_BURST + 1 + EDGE_OC_RATE * elapsed   # журнал core — не больше запаса
     assert "limiting requests" in stack.logs("pcbk-edge")
     print(f"поток 300 запросов за {elapsed:.1f} с: 403 — {forbidden}, 503 — {busy}")

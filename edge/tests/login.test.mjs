@@ -471,6 +471,18 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
   }
   assert.ok(loc("/pcbk/api/oc/").body.includes("limit_req zone=pcbk_oc_rate burst=200 nodelay;"));   // N1: ≥ 124
   assert.ok(loc("/pcbk/api/oc/event").body.includes("limit_req zone=pcbk_oc_event burst=60 nodelay;"));
+  // отказ limit_req и limit_conn: код 509 → error_page на уровне server → busy.json → 503 WorkplaceBusy, как у
+  // занятости места в core. Не 429: error_page 429 отдаёт «Слишком много попыток входа», и чат Д6 его не повторяет
+  for (const path of oc) {
+    for (const kind of ["limit_req", "limit_conn"]) {
+      const codes = [...loc(path).body.matchAll(new RegExp(`${kind}_status (\\d+);`, "g"))].map((m) => m[1]);
+      assert.deepEqual(codes, ["509"], `${path}: ${kind}_status`);
+    }
+  }
+  assert.equal(conf.match(/error_page 509 /g).length, 1);
+  assert.ok(conf.includes("error_page 509 =503 /pcbk-errors/busy.json;"));
+  assert.match(loc("/pcbk-errors/busy.json").body,
+    /return 503 '\{"name":"WorkplaceBusy","data":\{"message":"Слишком много одновременных запросов — повторите позже"\}\}';/);
   const call = loc("/pcbk/api/oc/").body;                                               // срок edge больше хода core (25 с)
   assert.ok(call.includes("proxy_read_timeout 45s;") && call.includes("proxy_max_temp_file_size 8m;"));
   assert.doesNotMatch(call, /proxy_buffering off|proxy_max_temp_file_size 0/);          // ответ core читается без остановки
