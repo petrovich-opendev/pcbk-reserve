@@ -15,8 +15,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
-                     check_container, check_historian, check_http, check_llm, check_memory, check_tls,
-                     not_installed)
+                     check_container, check_gateway, check_historian, check_http, check_llm, check_memory,
+                     check_tls, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
 from .page import Snapshot, is_stale, render_html, status_json
@@ -27,7 +27,7 @@ log = logging.getLogger("pcbk_watchdog")
 KINDS: dict[str, tuple[str, ...]] = {
     "memory": (), "http": ("url",), "tls": ("host", "port"), "docker_ping": (),
     "container": ("container", "sleeping_ok"), "absent": (), "historian": ("url",),
-    "llm": ("url",),
+    "llm": ("url",), "gateway": ("url",),
 }
 # виды без сети — их срок такта не отменяет
 LOCAL_KINDS = frozenset({"memory", "absent"})
@@ -64,6 +64,9 @@ class Settings:
     # max(120, CATALOG_DEADLINE_S + 2 × FRESH_POLL_S + 20) — задача 1 Д3а, шаг 5;
     # худшее окно без опроса — D + 2P + 15, 20 с — запас на вход и неровный срок
     HIST_STALE_S: int = 140
+    # уборщик простоя шлюза молчит дольше этого, с — «места не засыпают» (Д5-R29); не меньше
+    # 4 × GW_REAPER_TICK_S core; учения freeze_reaper ставят 20
+    GW_STALE_S: int = 120
 
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:
@@ -80,6 +83,9 @@ class Settings:
             raise ValueError("нужно 0 < HIST_WARN_S < HIST_FAIL_S")
         if self.HIST_STALE_S <= 0:
             raise ValueError("HIST_STALE_S должен быть больше нуля")
+        # GW_STALE_S, как HIST_*, правило срока такта не затрагивает: проверка шлюза — один HTTP-запрос
+        if self.GW_STALE_S <= 0:
+            raise ValueError("GW_STALE_S должен быть больше нуля")
 
     @property
     def tz(self) -> ZoneInfo:
@@ -175,6 +181,8 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
                                timeout=NET_CHECK_TIMEOUT_S)
     if kind == "llm":
         return check_llm(cid, title, comp["url"], now, timeout=NET_CHECK_TIMEOUT_S)
+    if kind == "gateway":
+        return check_gateway(cid, title, comp["url"], now, settings.GW_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "tls":
         return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
                          timeout=NET_CHECK_TIMEOUT_S)

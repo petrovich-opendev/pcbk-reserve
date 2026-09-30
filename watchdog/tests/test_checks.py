@@ -3,11 +3,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from helpers import T0, insp, llm_obj, now_utc
+import pytest
+
+from helpers import T0, gw, insp, llm_obj, now_utc
 from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD, EGRESS_STALE_S,
-                                  LLM_STALE_S, check_container, check_historian, check_http, check_llm,
-                                  check_memory, check_tls, fmt_total, fmt_usd, not_installed,
-                                  tls_verdict)
+                                  GW_OFF_CONTRACT_DETAIL, LLM_STALE_S, LOGIN_FAILS_WARN, REASON_CHARS,
+                                  WAKE_FAILS_FAIL, GatewayReply, check_container, check_gateway,
+                                  check_historian, check_http, check_llm, check_memory, check_tls, fmt_total,
+                                  fmt_usd, not_installed, tls_verdict)
 from pcbk_watchdog.journal import Journal
 
 MEMINFO = "MemTotal: 16384000 kB\nMemAvailable: {} kB\n"
@@ -786,3 +789,152 @@ def test_llm_junction_with_real_health_json(fake_core):                         
         r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", at + timedelta(seconds=5),
                       timeout=0.5)
         assert (r.state, r.detail, r.note) == want[name], name
+
+
+# строка «Шлюз и вход» (задача А1 Д5а); gw — ответ /health/gateway из helpers
+def gate_check(fake_core, obj):
+    fake_core.set_gateway(obj)
+    return check_gateway("gateway", "Шлюз и вход", fake_core.base + "/health/gateway", T0, 120, timeout=0.5)
+
+
+def test_gateway_verdicts(fake_core):
+    cases = [(gw(), ("ok", "принимает вход", "работает мест: 1")),
+             (gw(config_error="настройки шлюза: GW_ORIGIN — нужен https://хост[:порт]"),
+              ("fail", "ошибка настройки: настройки шлюза: GW_ORIGIN — нужен https://хост[:порт]", "")),
+             (gw(store_ok=False), ("fail", "учётные записи недоступны", "")),
+             (gw(age=121), ("fail", "уборщик простоя молчит — места не засыпают", "")),
+             (gw(checked_at=None), ("unknown", "уборщик простоя ещё не проходил", "")),
+             (gw(sp_ctl="down"), ("fail", "нет связи с прокси сокета — места не будятся", "")),
+             (gw(wake_ok_1h=0, wake_failed_1h=3), ("fail", "рабочие места не поднимаются", "3 за час")),
+             (gw(place_auth_failed_1h=1, wake_failed_1h=1), ("warn", "рабочее место не приняло пароль шлюза", "1 за час")),
+             (gw(origin_refused_1h=4), ("warn", "вход отклоняется проверкой источника — проверьте GW_ORIGIN", "4 за час")),
+             (gw(cookies_duplicate_1h=1, origin_refused_1h=1), ("warn", "подброшена cookie сессии", "1 за час")),
+             (gw(login_busy_1h=2), ("warn", "вход перегружен", "2 за час")),
+             (gw(wake_failed_1h=2), ("warn", "рабочее место не поднялось по входу", "2 за час")),
+             (gw(stop_failed_1h=1), ("warn", "уборщик не смог усыпить место", "1 за час")),
+             (gw(logins_failed_1h=30), ("warn", "много неверных паролей", "30 за час")),
+             (gw(logins_failed_1h=29), ("ok", "принимает вход", "работает мест: 1")),
+             (gw(drill="freeze_reaper", age=121),
+              ("fail", "уборщик простоя молчит — места не засыпают", "учения: freeze_reaper"))]
+    for obj, want in cases:
+        r = gate_check(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+
+
+def test_gateway_unreachable_or_garbage_is_fail(fake_core):
+    r = check_gateway("gateway", "Шлюз и вход", "http://127.0.0.1:9/health/gateway", T0, 120, timeout=0.5)
+    assert (r.state, r.detail) == ("fail", "шлюз не отвечает")
+    fake_core.set_gateway_raw("не json")
+    r = check_gateway("gateway", "Шлюз и вход", fake_core.base + "/health/gateway", T0, 120, timeout=0.5)
+    assert (r.state, r.detail) == ("fail", "шлюз не отвечает")
+    bad = gw(); del bad["store_ok"]
+    for obj in (bad, gw(store_ok="да"), gw(running_n="1"), [1, 2]):                   # Ш8: не KeyError, а внятная строка
+        fake_core.set_gateway(obj)
+        r = check_gateway("gateway", "Шлюз и вход", fake_core.base + "/health/gateway", T0, 120, timeout=0.5)
+        assert (r.state, r.detail) == ("fail", "шлюз ответил не по договору"), obj
+
+
+def test_gateway_constants():
+    assert (WAKE_FAILS_FAIL, LOGIN_FAILS_WARN, REASON_CHARS) == (3, 30, 80)
+    assert GW_OFF_CONTRACT_DETAIL == "шлюз ответил не по договору"
+
+
+def test_gateway_http_errors_are_down(fake_core):
+    down = ("fail", "шлюз не отвечает", "")
+    for url in (fake_core.base + "/nope", fake_core.base + "/healthz/data"):     # HTTP ≠ 200 — 404 и 503
+        fake_core.set_health(503, gw())
+        r = check_gateway("gateway", "Шлюз и вход", url, T0, 120, timeout=0.5)
+        assert (r.state, r.detail, r.note) == down, url
+    for raw in ("", "{\"checked_at\": ", "[" * 100_000):
+        fake_core.set_gateway_raw(raw)
+        r = check_gateway("gateway", "Шлюз и вход", fake_core.base + "/health/gateway", T0, 120, timeout=0.5)
+        assert (r.state, r.detail, r.note) == down, raw[:20]
+
+
+def test_gateway_boundaries_and_order(fake_core):
+    ok = ("ok", "принимает вход", "работает мест: 1")
+    cases = [(gw(age=120), ok),                                                   # ровно stale_s — ещё свежо
+             (gw(age=-30), ok),                                                   # часы core впереди — не молчание
+             (gw(checked_at="2026-09-29T11:59:55"), ok),                          # без пояса — договор ISO UTC
+             (gw(wake_ok_1h=0, wake_failed_1h=2), ("warn", "рабочее место не поднялось по входу", "2 за час")),
+             (gw(wake_ok_1h=1, wake_failed_1h=5), ("warn", "рабочее место не поднялось по входу", "5 за час")),
+             (gw(running_n=0, ready_n=0, wake_ok_1h=0), ("ok", "принимает вход", "работает мест: 0")),
+             # первая подходящая сверху
+             (gw(config_error="x", store_ok=False, checked_at=None, sp_ctl="down"),
+              ("fail", "ошибка настройки: x", "")),
+             (gw(store_ok=False, checked_at=None, sp_ctl="down"), ("fail", "учётные записи недоступны", "")),
+             (gw(checked_at=None, sp_ctl="down", wake_ok_1h=0, wake_failed_1h=3),
+              ("unknown", "уборщик простоя ещё не проходил", "")),
+             (gw(age=121, sp_ctl="down"), ("fail", "уборщик простоя молчит — места не засыпают", "")),
+             (gw(sp_ctl="down", wake_ok_1h=0, wake_failed_1h=3),
+              ("fail", "нет связи с прокси сокета — места не будятся", "")),
+             (gw(wake_ok_1h=0, wake_failed_1h=4, place_auth_failed_1h=2),
+              ("fail", "рабочие места не поднимаются", "4 за час")),
+             (gw(place_auth_failed_1h=2, cookies_duplicate_1h=1, origin_refused_1h=1, login_busy_1h=1,
+                 wake_failed_1h=1, stop_failed_1h=1, logins_failed_1h=99),
+              ("warn", "рабочее место не приняло пароль шлюза", "2 за час")),
+             (gw(origin_refused_1h=3, login_busy_1h=1, wake_failed_1h=1),
+              ("warn", "вход отклоняется проверкой источника — проверьте GW_ORIGIN", "3 за час")),
+             (gw(login_busy_1h=5, wake_failed_1h=1, stop_failed_1h=1), ("warn", "вход перегружен", "5 за час")),
+             (gw(wake_failed_1h=1, stop_failed_1h=1, logins_failed_1h=40),
+              ("warn", "рабочее место не поднялось по входу", "1 за час")),
+             (gw(stop_failed_1h=2, logins_failed_1h=40), ("warn", "уборщик не смог усыпить место", "2 за час"))]
+    for obj, want in cases:
+        r = gate_check(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+
+
+def test_gateway_drill_goes_first_in_note(fake_core):
+    cases = [(gw(drill="freeze_reaper"), ("ok", "принимает вход", "учения: freeze_reaper; работает мест: 1")),
+             (gw(drill="bad_place_pw", place_auth_failed_1h=2),
+              ("warn", "рабочее место не приняло пароль шлюза", "учения: bad_place_pw; 2 за час")),
+             (gw(drill="freeze_reaper", checked_at=None),
+              ("unknown", "уборщик простоя ещё не проходил", "учения: freeze_reaper")),
+             (gw(drill="bad_place_pw", config_error="x"), ("fail", "ошибка настройки: x", "учения: bad_place_pw"))]
+    for obj, want in cases:
+        r = gate_check(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+
+
+def test_gateway_details_fit_80_chars_and_config_error_is_cut(fake_core):       # правило Д3а
+    objs = [gw(config_error="х" * 200), gw(store_ok=False), gw(checked_at=None), gw(age=999), gw(sp_ctl="down"),
+            gw(wake_ok_1h=0, wake_failed_1h=3), gw(place_auth_failed_1h=1), gw(cookies_duplicate_1h=1),
+            gw(origin_refused_1h=1), gw(login_busy_1h=1), gw(wake_failed_1h=1), gw(stop_failed_1h=1),
+            gw(logins_failed_1h=30), gw()]
+    details = [gate_check(fake_core, o).detail for o in objs] + ["шлюз не отвечает", GW_OFF_CONTRACT_DETAIL]
+    assert all(len(d) <= REASON_CHARS for d in details), [d for d in details if len(d) > REASON_CHARS]
+    assert gate_check(fake_core, gw(config_error="х" * 200)).detail == ("ошибка настройки: " + "х" * 200)[:80]
+
+
+def test_gateway_number_changes_are_not_journal_events(fake_core, tmp_path):    # числа — только в note
+    journal = Journal(str(tmp_path / "j.db"))
+    rows = [gate_check(fake_core, gw(origin_refused_1h=k)) for k in (1, 2, 7, 30)]
+    rows += [gate_check(fake_core, gw(running_n=n)) for n in (1, 4, 10)]
+    assert [(r.state, r.detail) for r in rows] == \
+           [("warn", "вход отклоняется проверкой источника — проверьте GW_ORIGIN")] * 4 + [("ok", "принимает вход")] * 3
+    assert len({r.note for r in rows}) == 7
+    assert sum(len(journal.record([r], T0 + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 2
+
+
+def test_gateway_off_contract_reply_has_own_text(fake_core):                     # Ш8
+    keys = list(gw())
+    assert len(keys) == 15
+    missing = [{k: v for k, v in gw().items() if k != key} for key in keys]
+    for obj in (*missing, [gw()], "строка", 7, None, {}, gw(checked_at=12), gw(checked_at="вчера"),
+                gw(config_error=5), gw(store_ok=None), gw(store_ok=1), gw(sp_ctl=None), gw(sp_ctl=0),
+                gw(running_n=True), gw(ready_n=1.0), gw(wake_ok_1h=None), gw(wake_failed_1h="0"),
+                gw(stop_failed_1h=0.5), gw(place_auth_failed_1h=False), gw(logins_failed_1h=[]),
+                gw(origin_refused_1h={}), gw(login_busy_1h="1"), gw(cookies_duplicate_1h=None), gw(drill=None),
+                gw(refused_1h="7"), gw(streams=None), gw(stream_broken_1h=True), gw(upstream_failed_1h=1.5)):
+        r = gate_check(fake_core, obj)
+        assert (r.state, r.detail, r.note) == ("fail", GW_OFF_CONTRACT_DETAIL, ""), obj
+        with pytest.raises(ValueError):                                           # не KeyError и не TypeError
+            GatewayReply.parse(obj)
+
+
+def test_gateway_reply_d5b_keys_are_optional():                                  # ответ core :d5a во время выкладки
+    old = GatewayReply.parse(gw())
+    assert (old.refused_1h, old.streams, old.stream_broken_1h, old.upstream_failed_1h) == (None, None, None, None)
+    new = GatewayReply.parse(gw(refused_1h=7, streams=2, stream_broken_1h=1, upstream_failed_1h=0))
+    assert (new.refused_1h, new.streams, new.stream_broken_1h, new.upstream_failed_1h) == (7, 2, 1, 0)
+    assert (new.checked_at, new.store_ok, new.running_n, new.drill) == (T0 - timedelta(seconds=5), True, 1, "")
