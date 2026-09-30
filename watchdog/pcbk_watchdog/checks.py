@@ -104,6 +104,10 @@ GW_OFF_CONTRACT_DETAIL = "шлюз ответил не по договору"
 WAKE_FAILS_FAIL = 3
 # столько неверных паролей за час — предупреждение
 LOGIN_FAILS_WARN = 30
+# договор /health/gateway (задача А3 Д5а): sp_ctl — Literal["ok", "down", "unknown"];
+# drill — "" или режим DRILL_GATEWAY. Прочее — ответ не по договору
+GW_SP_CTL_STATES = frozenset({"ok", "down", "unknown"})
+GW_DRILL_MODES = frozenset({"freeze_reaper", "bad_place_pw"})
 
 
 @dataclass(frozen=True)
@@ -658,9 +662,17 @@ def check_llm(component: str, title: str, url: str, now: datetime,
     return Check(component, title, state, detail, note)
 
 
-def _count_opt(obj: dict, key: str) -> int | None:
-    """Необязательный счётчик: ключа нет — None, есть — только целое."""
-    return _count(obj, key) if key in obj else None
+def _gw_count(obj: dict, key: str, *, optional: bool = False) -> int | None:
+    """Счётчик шлюза: целое не меньше нуля; optional — ключа нет, тогда None (ключи Д5б).
+
+    Свой, а не правка общего _count: договор LlmReply (Д4а) этим не меняется.
+    """
+    if optional and key not in obj:
+        return None
+    value = _count(obj, key)
+    if value < 0:
+        raise ValueError(f"{key} — меньше нуля")
+    return value
 
 
 @dataclass(frozen=True)
@@ -692,28 +704,38 @@ class GatewayReply:
 
     @classmethod
     def parse(cls, reply) -> "GatewayReply":
-        """Ответ не по договору — только ValueError (Ш8): не объект JSON, нет ключа Д5а, тип не тот."""
+        """Ответ не по договору — только ValueError (Ш8): не объект JSON, нет ключа Д5а, тип не тот,
+        счётчик меньше нуля, sp_ctl не из GW_SP_CTL_STATES, пустая причина config_error, drill не ""
+        и не из GW_DRILL_MODES."""
         if not isinstance(reply, dict):
             raise ValueError("ответ — не объект JSON")
         try:
-            return cls(
+            r = cls(
                 checked_at=_time(reply, "checked_at"),   # не ISO — ValueError из fromisoformat
                 config_error=_text(reply, "config_error", nullable=True),
                 store_ok=_flag(reply, "store_ok"), sp_ctl=_text(reply, "sp_ctl"),
-                running_n=_count(reply, "running_n"), ready_n=_count(reply, "ready_n"),
-                wake_ok_1h=_count(reply, "wake_ok_1h"), wake_failed_1h=_count(reply, "wake_failed_1h"),
-                stop_failed_1h=_count(reply, "stop_failed_1h"),
-                place_auth_failed_1h=_count(reply, "place_auth_failed_1h"),
-                logins_failed_1h=_count(reply, "logins_failed_1h"),
-                origin_refused_1h=_count(reply, "origin_refused_1h"),
-                login_busy_1h=_count(reply, "login_busy_1h"),
-                cookies_duplicate_1h=_count(reply, "cookies_duplicate_1h"),
+                running_n=_gw_count(reply, "running_n"), ready_n=_gw_count(reply, "ready_n"),
+                wake_ok_1h=_gw_count(reply, "wake_ok_1h"), wake_failed_1h=_gw_count(reply, "wake_failed_1h"),
+                stop_failed_1h=_gw_count(reply, "stop_failed_1h"),
+                place_auth_failed_1h=_gw_count(reply, "place_auth_failed_1h"),
+                logins_failed_1h=_gw_count(reply, "logins_failed_1h"),
+                origin_refused_1h=_gw_count(reply, "origin_refused_1h"),
+                login_busy_1h=_gw_count(reply, "login_busy_1h"),
+                cookies_duplicate_1h=_gw_count(reply, "cookies_duplicate_1h"),
                 drill=_text(reply, "drill"),
-                refused_1h=_count_opt(reply, "refused_1h"), streams=_count_opt(reply, "streams"),
-                stream_broken_1h=_count_opt(reply, "stream_broken_1h"),
-                upstream_failed_1h=_count_opt(reply, "upstream_failed_1h"))
+                refused_1h=_gw_count(reply, "refused_1h", optional=True),
+                streams=_gw_count(reply, "streams", optional=True),
+                stream_broken_1h=_gw_count(reply, "stream_broken_1h", optional=True),
+                upstream_failed_1h=_gw_count(reply, "upstream_failed_1h", optional=True))
         except (KeyError, TypeError) as e:
             raise ValueError(f"ответ шлюза не по договору: {type(e).__name__} {e}") from e
+        if r.sp_ctl not in GW_SP_CTL_STATES:
+            raise ValueError("неизвестное состояние связи с sp-ctl")
+        if r.config_error is not None and not r.config_error.strip():
+            raise ValueError("ошибка настройки без причины")   # иначе строка «ошибка настройки:» без слов
+        if r.drill and r.drill not in GW_DRILL_MODES:
+            raise ValueError("неизвестный режим учений")
+        return r
 
 
 def gateway_verdict(r: GatewayReply, now: datetime, stale_s: int) -> tuple[State, str, str]:

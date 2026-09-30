@@ -7,8 +7,9 @@ import pytest
 
 from helpers import T0, gw, insp, llm_obj, now_utc
 from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD, EGRESS_STALE_S,
-                                  GW_OFF_CONTRACT_DETAIL, LLM_STALE_S, LOGIN_FAILS_WARN, REASON_CHARS,
-                                  WAKE_FAILS_FAIL, GatewayReply, check_container, check_gateway,
+                                  GW_DRILL_MODES, GW_OFF_CONTRACT_DETAIL, GW_SP_CTL_STATES, LLM_STALE_S,
+                                  LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, GatewayReply,
+                                  check_container, check_gateway,
                                   check_historian, check_http, check_llm, check_memory, check_tls, fmt_total,
                                   fmt_usd, not_installed, tls_verdict)
 from pcbk_watchdog.journal import Journal
@@ -837,6 +838,8 @@ def test_gateway_unreachable_or_garbage_is_fail(fake_core):
 def test_gateway_constants():
     assert (WAKE_FAILS_FAIL, LOGIN_FAILS_WARN, REASON_CHARS) == (3, 30, 80)
     assert GW_OFF_CONTRACT_DETAIL == "шлюз ответил не по договору"
+    assert GW_SP_CTL_STATES == {"ok", "down", "unknown"}                       # sp_ctl: Literal Д5а (А3)
+    assert GW_DRILL_MODES == {"freeze_reaper", "bad_place_pw"}                  # DRILL_GATEWAY, кроме ""
 
 
 def test_gateway_http_errors_are_down(fake_core):
@@ -925,11 +928,35 @@ def test_gateway_off_contract_reply_has_own_text(fake_core):                    
                 gw(running_n=True), gw(ready_n=1.0), gw(wake_ok_1h=None), gw(wake_failed_1h="0"),
                 gw(stop_failed_1h=0.5), gw(place_auth_failed_1h=False), gw(logins_failed_1h=[]),
                 gw(origin_refused_1h={}), gw(login_busy_1h="1"), gw(cookies_duplicate_1h=None), gw(drill=None),
-                gw(refused_1h="7"), gw(streams=None), gw(stream_broken_1h=True), gw(upstream_failed_1h=1.5)):
+                gw(refused_1h="7"), gw(streams=None), gw(stream_broken_1h=True), gw(upstream_failed_1h=1.5),
+                # доводка по ревью А1: I1 — sp_ctl вне договора; M1 — отрицательные счётчики;
+                # M2 — пустая причина настройки; M3 — неизвестный режим учений
+                gw(sp_ctl="DOWN"), gw(sp_ctl=""), gw(sp_ctl="up"), gw(sp_ctl="down "),
+                gw(wake_ok_1h=-1), gw(running_n=-1), gw(ready_n=-2), gw(wake_failed_1h=-3), gw(stop_failed_1h=-1),
+                gw(place_auth_failed_1h=-1), gw(logins_failed_1h=-30), gw(origin_refused_1h=-1),
+                gw(login_busy_1h=-1), gw(cookies_duplicate_1h=-1), gw(refused_1h=-1), gw(streams=-1),
+                gw(stream_broken_1h=-1), gw(upstream_failed_1h=-1),
+                gw(config_error=""), gw(config_error="   "), gw(config_error="\n\t"),
+                gw(drill="x"), gw(drill=" "), gw(drill="FREEZE_REAPER"), gw(drill="freeze_reaper "),
+                gw(drill="freeze_poll")):
         r = gate_check(fake_core, obj)
         assert (r.state, r.detail, r.note) == ("fail", GW_OFF_CONTRACT_DETAIL, ""), obj
         with pytest.raises(ValueError):                                           # не KeyError и не TypeError
             GatewayReply.parse(obj)
+
+
+def test_gateway_reply_accepts_whole_contract(fake_core):                       # доводка по ревью А1
+    # каждое значение из договора разбирается; sp_ctl=unknown (до первого пинга) строкой таблицы не является
+    for state in sorted(GW_SP_CTL_STATES):
+        assert GatewayReply.parse(gw(sp_ctl=state)).sp_ctl == state
+    for mode in ("", *sorted(GW_DRILL_MODES)):
+        assert GatewayReply.parse(gw(drill=mode)).drill == mode
+    zeros = gw(running_n=0, ready_n=0, wake_ok_1h=0, refused_1h=0, streams=0, stream_broken_1h=0, upstream_failed_1h=0)
+    assert GatewayReply.parse(zeros).running_n == 0
+    assert (gate_check(fake_core, gw(sp_ctl="unknown")).state, gate_check(fake_core, gw(sp_ctl="unknown")).detail) == \
+           ("ok", "принимает вход")
+    r = gate_check(fake_core, gw(config_error="x \n"))                         # не пустая — строка настройки
+    assert (r.state, r.detail) == ("fail", "ошибка настройки: x")
 
 
 def test_gateway_reply_d5b_keys_are_optional():                                  # ответ core :d5a во время выкладки
