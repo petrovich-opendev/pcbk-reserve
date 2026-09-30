@@ -47,6 +47,7 @@ import base64
 import http.cookiejar
 import logging
 import re
+import ssl
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -260,6 +261,7 @@ class Workplaces:
         self._monotonic = monotonic
         self._sleep = sleep
         self._clients: dict[int, httpx.AsyncClient] = {}
+        self._ssl: ssl.SSLContext | None = None          # один на все клиенты мест (H5), при первом клиенте
         self._locks = {n: asyncio.Lock() for n in PLACES}
         self._tasks: dict[int, asyncio.Task] = {}
         self._ready: dict[int, str | None] = {}          # место → StartedAt, при котором оно готово
@@ -281,13 +283,16 @@ class Workplaces:
     # --- клиент мест ---
 
     def _http(self, n: int) -> httpx.AsyncClient:
-        """Клиент места n — свой у каждого места (G1): свой пул соединений, своя пустая банка cookie (G3)."""
+        """Клиент места n — свой у каждого места (G1): свой пул соединений, своя пустая банка cookie (G3); контекст
+        TLS — общий (H5): места ходят по http, и набор корневых сертификатов строится один раз, а не на каждое место."""
         client = self._clients.get(n)
         if client is None:
+            if self._ssl is None:
+                self._ssl = ssl.create_default_context()
             jar = http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
             client = self._clients[n] = httpx.AsyncClient(
-                transport=self._transport, timeout=PLACE_TIMEOUT, limits=PLACE_LIMITS, cookies=jar, trust_env=False,
-                follow_redirects=False)
+                transport=self._transport, timeout=PLACE_TIMEOUT, limits=PLACE_LIMITS, cookies=jar, verify=self._ssl,
+                trust_env=False, follow_redirects=False)
         return client
 
     async def open(self) -> None:

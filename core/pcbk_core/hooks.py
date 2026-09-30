@@ -8,6 +8,13 @@
 что 413 выходит раньше звеньев ролей. Выбор — по самому длинному подходящему префиксу; путь без префикса —
 обработчик FastAPI по умолчанию и предел DEFAULT_BODY_LIMIT. Модуль не импортирует pcbk_core.data: реестр
 общий для всех ролей.
+
+Общий бюджет байтов тел на префикс (Д5б, доводка Б3, H2) — необязательный: сумма байтов тел, которые сейчас
+читаются или ждут обработки по этому префиксу, не больше бюджета. Запрос, чья объявленная длина (или уже
+прочитанное) не помещается в остаток, получает over_budget(scope) без дальнейшего чтения; байты возвращаются в
+бюджет в finally, когда приложение завершило запрос (или он оборван). budget_admits(scope) — кому бюджет вообще
+доступен: прочие получают over_budget(scope) сразу, не читая тела и не занимая бюджета (шлюз: вне pcbk-front — 404,
+иначе медленные тела из сети места держали бы бюджет всех студентов). Префикс без budget= ведёт себя как прежде.
 """
 import logging
 from collections import deque
@@ -30,6 +37,8 @@ HttpExceptionHandler = Callable[[Request, StarletteHTTPException], Awaitable[Res
 Refusal = Callable[[int], dict]
 # ответ целиком по области запроса и пределу: шлюз вне своей зоны отвечает 404, а не 413 (Д5)
 Respond = Callable[[Scope, int], Response]
+# ответ на тело сверх общего бюджета префикса — по области запроса (Д5б, H2)
+OverBudget = Callable[[Scope], Response]
 
 log = logging.getLogger("pcbk_core.hooks")
 
@@ -46,8 +55,12 @@ def safe_path(path: str) -> str:
     return ascii(path)[1:-1][:PATH_LOG_CHARS]
 
 
+def _longest_prefix(table: dict[str, object], path: str) -> str | None:
+    return max((p for p in table if path.startswith(p)), key=len, default=None)
+
+
 def _longest(table: dict[str, _T], path: str) -> _T | None:
-    prefix = max((p for p in table if path.startswith(p)), key=len, default=None)
+    prefix = _longest_prefix(table, path)
     return None if prefix is None else table[prefix]
 
 
@@ -58,13 +71,35 @@ def _check_prefix(prefix: str, table: dict, what: str) -> None:
         raise ValueError(f"{what}: префикс {prefix!r} уже занят")
 
 
+class BodyBudget:
+    """Общий бюджет байтов тел префикса (H2): take(n) — занять, если помещается (без await: решение и запись
+    атомарны в цикле событий), give(n) — вернуть. used — занято сейчас; admits(scope) — кому бюджет доступен."""
+
+    def __init__(self, total: int, over_budget: OverBudget, admits: Callable[[Scope], bool] | None = None):
+        self.total = total
+        self.over_budget = over_budget
+        self.admits = admits
+        self.used = 0
+
+    def take(self, n: int) -> bool:
+        if self.used + n > self.total:
+            return False
+        self.used += n
+        return True
+
+    def give(self, n: int) -> None:
+        self.used = max(0, self.used - n)
+
+
 class AppHooks:
-    """Реестр крючков приложения по префиксу пути: обработчики 422 и HTTPException, пределы тела с ответом 413."""
+    """Реестр крючков приложения по префиксу пути: обработчики 422 и HTTPException, пределы тела с ответом 413 и
+    необязательным общим бюджетом байтов."""
 
     def __init__(self) -> None:
         self._handlers: dict[str, ValidationHandler] = {}
         self._http_handlers: dict[str, HttpExceptionHandler] = {}
         self._limits: dict[str, tuple[int, Refusal | None, Respond | None]] = {}
+        self._budgets: dict[str, BodyBudget] = {}
 
     def validation(self, prefix: str, handler: ValidationHandler) -> None:
         """Обработчик RequestValidationError для путей с этим префиксом; повтор префикса — ValueError."""
@@ -81,15 +116,27 @@ class AppHooks:
         return _longest(self._http_handlers, path)
 
     def body_limit(self, prefix: str, max_bytes: int, *, refusal: Refusal | None = None,
-                   respond: Respond | None = None) -> None:
+                   respond: Respond | None = None, budget: int | None = None,
+                   over_budget: OverBudget | None = None,
+                   budget_admits: Callable[[Scope], bool] | None = None) -> None:
         """Предел тела для путей с этим префиксом; refusal(предел) — тело ответа 413 вместо {"detail": …};
-        respond(scope, предел) — ответ целиком (код и тело по области запроса). Оба сразу — ValueError."""
+        respond(scope, предел) — ответ целиком (код и тело по области запроса). Оба сразу — ValueError.
+        budget — общий бюджет байтов тел префикса (не меньше max_bytes), over_budget(scope) — ответ сверх него;
+        одно без другого — ValueError. budget_admits(scope) — кому бюджет доступен (только вместе с budget)."""
         _check_prefix(prefix, self._limits, "предел тела")
         if max_bytes < 1:
             raise ValueError(f"предел тела {prefix!r}: нужно не меньше 1 байта, получено {max_bytes}")
         if refusal is not None and respond is not None:
             raise ValueError(f"предел тела {prefix!r}: refusal или respond, не оба")
+        if (budget is None) != (over_budget is None):
+            raise ValueError(f"предел тела {prefix!r}: budget и over_budget — только вместе")
+        if budget_admits is not None and budget is None:
+            raise ValueError(f"предел тела {prefix!r}: budget_admits — только с budget")
+        if budget is not None and budget < max_bytes:
+            raise ValueError(f"предел тела {prefix!r}: бюджет меньше предела тела — тело предела не поместится")
         self._limits[prefix] = (max_bytes, refusal, respond)
+        if budget is not None:
+            self._budgets[prefix] = BodyBudget(budget, over_budget, budget_admits)
 
     def handler_for(self, path: str) -> ValidationHandler | None:
         return _longest(self._handlers, path)
@@ -106,6 +153,11 @@ class AppHooks:
         found = _longest(self._limits, path)
         return None if found is None else found[2]
 
+    def budget_for(self, path: str) -> BodyBudget | None:
+        """Бюджет префикса, выбранного для пути (самый длинный), или None — у префикса бюджета нет."""
+        prefix = _longest_prefix(self._limits, path)
+        return None if prefix is None else self._budgets.get(prefix)
+
 
 def hooks_of(app: FastAPI) -> AppHooks:
     """Реестр крючков приложения: его ставит create_app до роутеров ролей."""
@@ -121,6 +173,11 @@ class BodyLimit:
     на любом пути: исключение из receive FastAPI превратил бы в 400, а транспорт MCP — в 500. После
     выданного буфера receive передаёт вызовы исходному: иначе потоковый ответ не узнает об обрыве
     клиента (http.disconnect).
+
+    У префикса с бюджетом (hooks.budget_for) запрос, которому бюджет не доступен (admits), сразу получает
+    over_budget(scope); объявленная длина занимается в бюджете до чтения, тело без длины — по мере чтения; не
+    помещается — over_budget(scope) без дальнейшего чтения. Занятое возвращается в finally после приложения: и на
+    обрыве, и на отмене.
     """
 
     def __init__(self, app: ASGIApp, hooks: AppHooks | None = None, max_bytes: int = DEFAULT_BODY_LIMIT):
@@ -132,8 +189,11 @@ class BodyLimit:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = self.max_bytes if self.hooks is None else self.hooks.limit_for(scope.get("path", ""))
+        path = scope.get("path", "")
+        limit = self.max_bytes if self.hooks is None else self.hooks.limit_for(path)
+        budget = None if self.hooks is None else self.hooks.budget_for(path)
         declared = Headers(scope=scope).get("content-length")
+        size = None
         if declared is not None:
             try:
                 size = int(declared)
@@ -142,35 +202,60 @@ class BodyLimit:
             if size is not None and size > limit:
                 await self._too_large(scope, receive, send, limit)
                 return
-        body = bytearray()
-        got_request = complete = False
-        trailing: Message | None = None
-        while True:
-            message = await receive()
-            if message["type"] != "http.request":
-                trailing = message
-                break
-            got_request = True
-            chunk = message.get("body", b"")
-            if len(body) + len(chunk) > limit:
-                await self._too_large(scope, receive, send, limit)
+        held = 0                                        # занято в бюджете этим запросом
+        try:
+            if budget is not None and budget.admits is not None and not budget.admits(scope):
+                await budget.over_budget(scope)(scope, receive, send)    # бюджет не для этой зоны: тело не читается
                 return
-            body.extend(chunk)
-            if not message.get("more_body", False):
-                complete = True
-                break
-        replay: deque[Message] = deque()
-        if got_request:
-            replay.append({"type": "http.request", "body": bytes(body), "more_body": not complete})
-        if trailing is not None:
-            replay.append(trailing)
+            if budget is not None and size is not None and size > 0:
+                if not budget.take(size):
+                    await self._over_budget(budget, scope, receive, send)
+                    return
+                held = size
+            body = bytearray()
+            got_request = complete = False
+            trailing: Message | None = None
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    trailing = message
+                    break
+                got_request = True
+                chunk = message.get("body", b"")
+                if len(body) + len(chunk) > limit:
+                    await self._too_large(scope, receive, send, limit)
+                    return
+                if budget is not None and len(body) + len(chunk) > held:
+                    extra = len(body) + len(chunk) - held
+                    if not budget.take(extra):
+                        await self._over_budget(budget, scope, receive, send)
+                        return
+                    held += extra
+                body.extend(chunk)
+                if not message.get("more_body", False):
+                    complete = True
+                    break
+            replay: deque[Message] = deque()
+            if got_request:
+                replay.append({"type": "http.request", "body": bytes(body), "more_body": not complete})
+            if trailing is not None:
+                replay.append(trailing)
+            del body
 
-        async def again() -> Message:
-            if replay:
-                return replay.popleft()
-            return await receive()
+            async def again() -> Message:
+                if replay:
+                    return replay.popleft()
+                return await receive()
 
-        await self.app(scope, again, send)
+            await self.app(scope, again, send)
+        finally:
+            if budget is not None and held:
+                budget.give(held)
+
+    async def _over_budget(self, budget: BodyBudget, scope: Scope, receive: Receive, send: Send) -> None:
+        log.warning("outcome=body_budget path=%s used=%d total=%d", safe_path(scope.get("path", "")), budget.used,
+                    budget.total)
+        await budget.over_budget(scope)(scope, receive, send)
 
     async def _too_large(self, scope: Scope, receive: Receive, send: Send, limit: int) -> None:
         path = scope.get("path", "")

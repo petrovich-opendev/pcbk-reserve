@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, TypeVar
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.responses import JSONResponse
 
+from .. import zones
 from ..app import RoleBase
 from ..hooks import hooks_of
 from ..settings import GatewaySettings, Settings
@@ -237,15 +238,20 @@ class GatewayRole(RoleBase):
         """Только через реестр Д4а: отказы HTTPException и 413 под /pcbk/api/ — JSON вида OpenCode (Ш22), отказ
         front_only и 405 на /health/gateway — тоже; предел тела вне pcbk-front отвечает 404, как зона (ревью
         А4, M3), — и у /pcbk/api/oc/ с пределом GW_MAX_BODY_BYTES (Д5-R36): самый длинный префикс берёт его, и
-        без respond= сеть места получила бы 413 и узнала бы ручку; сеть мест для сверки токенов служб (Ш25)."""
+        без respond= сеть места получила бы 413 и узнала бы ручку; у него же общий бюджет тел (H2, сверх — 503
+        busy, вне pcbk-front — 404); сеть мест для сверки токенов служб (Ш25)."""
         from .api import PREFIX, http_exception_handler, too_large
-        from .proxy import OC_PREFIX
+        from .proxy import GW_BODY_BUDGET_BYTES, OC_PREFIX, body_busy
 
         hooks = hooks_of(app)
         hooks.http_exception(PREFIX + "/", http_exception_handler)
         hooks.http_exception(HEALTH_PATH, http_exception_handler)
         hooks.body_limit(PREFIX + "/", BODY_LIMIT, respond=too_large)
-        hooks.body_limit(OC_PREFIX + "/", self.gw.GW_MAX_BODY_BYTES, respond=too_large)
+        # общий бюджет тел до обработчика (H2); не меньше предела одного тела — иначе оно не поместилось бы; вне
+        # pcbk-front бюджет не доступен: 404 без чтения тела (медленные тела из сети места его не займут)
+        hooks.body_limit(OC_PREFIX + "/", self.gw.GW_MAX_BODY_BYTES, respond=too_large,
+                         budget=max(GW_BODY_BUDGET_BYTES, self.gw.GW_MAX_BODY_BYTES), over_budget=body_busy(self),
+                         budget_admits=zones.is_front)
         app.state.pcbk_stu_net = self.gw.STU_NET
 
     # --- здоровье: только память ---

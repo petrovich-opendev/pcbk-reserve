@@ -161,8 +161,8 @@ class FakePlaces:
 
     - запрос записывается в requests (Recorded);
     - raise_for[n] — это исключение; hang_for[n] — столько секунд молчания перед ответом;
-    - force_status[n] = (код, заголовки) — этот код и заголовки (Content-Type по умолчанию — JSON) на любой
-      запрос, тело {"name": "Forced"}, при content-encoding: gzip — сжатое по-настоящему;
+    - force_status[n] = (код, заголовки) — этот код и заголовки (Content-Type по умолчанию — JSON, значение None —
+      заголовка нет) на любой запрос, тело {"name": "Forced"}, при content-encoding: gzip — сжатое по-настоящему;
     - Authorization не тот (expected_basic) или wrong_pw — 401;
     - big[n] — 200 с телом из стольких байт кусками по BIG_CHUNK; big_sent[n] — сколько байт отдано;
     - GET /agent — agents[n] (по умолчанию []) начиная с вызова номер ready_after этого места (после настоящей
@@ -230,7 +230,8 @@ class FakePlaces:
             body = b'{"name":"Forced"}'
             if headers.get("content-encoding") == "gzip":                # сжатие настоящее: httpx его распакует
                 body = gzip.compress(body)
-            return httpx.Response(status, headers={"content-type": "application/json", **headers}, content=body)
+            merged = {"content-type": "application/json", **headers}
+            return httpx.Response(status, headers={k: v for k, v in merged.items() if v is not None}, content=body)
         if self.wrong_pw or request.headers.get("authorization") != expected_basic(n):
             return _json(401, {"name": "Unauthorized"})
         if n in self.big:

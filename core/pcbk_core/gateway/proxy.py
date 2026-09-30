@@ -19,8 +19,11 @@ WorkplaceNotReady. Не-GET — активность места (touch) до п�
 
 Занятость (доводка Б3, G1): к одному месту разом — не больше PROXY_PARALLEL вызовов (сверка, пересылка и отправка
 ответа браузеру — один вызов: слот отдаёт _PlaceResponse, когда ответ отправлен), ждущих — не больше PROXY_QUEUE;
-сверх очереди, не дождавшийся места до срока хода и PoolTimeout клиента места — 503 WorkplaceBusy «busy»: отказ со
-счётчиком refused, место остаётся готовым, upstream_failed не растёт. Так ответы мест в памяти прокси — не больше
+сверх очереди, не дождавшийся слота за PROXY_QUEUE_WAIT_S и PoolTimeout клиента места — 503 WorkplaceBusy «busy»:
+отказ со счётчиком refused, место остаётся готовым, upstream_failed не растёт. Ожидание слота — под своим сроком
+внутри срока хода (H1): месту после взятия слота остаётся не меньше PLACE_READ_S, и очередь не превращает
+занятость в «место не отвечает». Тела запросов /pcbk/api/oc/ до обработчика — в общем бюджете
+GW_BODY_BUDGET_BYTES (H2, hooks.body_limit budget=): сверх него — 503 busy без чтения (вне pcbk-front — 404). Так ответы мест в памяти прокси — не больше
 10 мест × PROXY_PARALLEL, а потоп одного студента не трогает соседа: у места свой клиент и свой пул соединений
 (places.PLACE_CONNECTIONS).
 
@@ -50,8 +53,9 @@ from fastapi.responses import JSONResponse, Response
 from starlette.types import Receive, Scope, Send
 
 from .accounts import Account
-from .api import GW_MESSAGES, PREFIX, configured, current_account, front_only, gw_error, same_origin
-from .places import PROXY_PARALLEL, PlaceAnswer, PlaceAnswerTooLarge
+from .. import zones
+from .api import ERROR_NAMES, GW_MESSAGES, PREFIX, configured, current_account, front_only, gw_error, same_origin
+from .places import PLACE_READ_S, PROXY_PARALLEL, PlaceAnswer, PlaceAnswerTooLarge
 from .rules import AGENT_NAME, APPROVABLE, METHODS, RULE_MESSAGES, Refused, Rule, filter_query, match
 
 if TYPE_CHECKING:
@@ -64,6 +68,10 @@ _RAW_PREFIX = OC_PREFIX.encode("ascii")
 UPSTREAM_MAX_BYTES = 4 * 1024 * 1024        # ответ места в памяти шлюза (Д5-R36)
 SEND_CHUNK = 64 * 1024                      # кусок отправки ответа места браузеру (G1)
 PROXY_DEADLINE_S = 25.0                     # весь ход вызова; edge на /pcbk/api/oc/ ждёт 45 с (Д5-R30)
+# ожидание слота места внутри срока хода: месту после слота — не меньше PLACE_READ_S (H1)
+PROXY_QUEUE_WAIT_S = PROXY_DEADLINE_S - PLACE_READ_S
+# тел /pcbk/api/oc/ в памяти до обработчика разом (H2): 32 тела по 512 КиБ
+GW_BODY_BUDGET_BYTES = 16 * 1024 * 1024
 NOT_READY_LOG_S = 60.0
 PROXY_QUEUE = 8                             # ждущих вызовов на место сверх PROXY_PARALLEL (G1)
 LOG_PATH_CHARS = 120
@@ -308,11 +316,12 @@ def _oc_line(call: _Call, rule: Rule, status: int, started: float, tail: str = "
                                         call.place, rule.name, status, ms, tail)
 
 
-def _content_type(ct: str | None) -> str | None:
-    """Content-Type браузеру (G7): нет — нет; application/json и text/plain (с параметрами, печатный ASCII до
-    CONTENT_TYPE_CHARS) — как есть; прочий — application/octet-stream: HTML или SVG места страницей не станет."""
+def _content_type(ct: str | None, body: bytes | bytearray) -> str | None:
+    """Content-Type браузеру (G7): application/json и text/plain (с параметрами, печатный ASCII до
+    CONTENT_TYPE_CHARS) — как есть; прочий — application/octet-stream: HTML или SVG места страницей не станет. Нет
+    заголовка — у пустого тела нет и у ответа, у непустого — application/octet-stream (H6)."""
     if ct is None:
-        return None
+        return OCTET_STREAM if body else None
     ok = len(ct) <= CONTENT_TYPE_CHARS and ct.isascii() and ct.isprintable()
     return ct if ok and ct.split(";", 1)[0].strip().lower() in PASSED_TYPES else OCTET_STREAM
 
@@ -320,8 +329,19 @@ def _content_type(ct: str | None) -> str | None:
 def _answer(answer: PlaceAnswer, release: Callable[[], None]) -> _PlaceResponse:
     """Ответ места браузеру: тот же код, тело как есть, из заголовков — только Content-Type (_content_type); слот
     места освобождает отправка (_PlaceResponse)."""
-    ct = _content_type(answer.content_type)
+    ct = _content_type(answer.content_type, answer.body)
     return _PlaceResponse(answer.body, answer.status, {"content-type": ct} if ct else None, release)
+
+
+def body_busy(role: GatewayRole) -> Callable[[Scope], Response]:
+    """Ответ на тело /pcbk/api/oc/ сверх общего бюджета (H2): вне pcbk-front — 404, как отказ зоны (иначе сеть места
+    узнала бы ручку); в pcbk-front — 503 WorkplaceBusy «busy» и счётчик refused."""
+    def respond(scope: Scope) -> Response:
+        if not zones.is_front(scope):
+            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
+        role.stats.event("refused")
+        return gw_error(503, "WorkplaceBusy", PROXY_MESSAGES["busy"])
+    return respond
 
 
 # --- маршрут ---
@@ -381,7 +401,8 @@ async def _proxy(role: GatewayRole, request: Request, account: Account, not_read
     try:
         try:
             async with asyncio.timeout(PROXY_DEADLINE_S):
-                release = await gate.acquire(n)
+                async with asyncio.timeout(PROXY_QUEUE_WAIT_S):     # очередь не съедает срок места (H1)
+                    release = await gate.acquire(n)
                 if rule.name == "prompt_async" and body is not None and "agent" in body:
                     await _check_agent(role, n, body["agent"])
                 elif rule.name == "permission_reply" and body is not None and body.get("reply") == "once":

@@ -5,6 +5,7 @@
 import asyncio
 import gc
 import re
+import ssl
 import time
 
 import httpx
@@ -16,8 +17,11 @@ from helpers import (ORIGIN, PW, login, make_gateway, make_places, oc_headers, s
                      wait_until_async)
 from pcbk_core.gateway import places, proxy
 from pcbk_core.gateway.api import GW_MESSAGES
-from pcbk_core.gateway.places import PLACE_CONNECTIONS, PlaceAnswer
-from pcbk_core.gateway.proxy import OCTET_STREAM, PROXY_MESSAGES, PROXY_QUEUE, UPSTREAM_MAX_BYTES
+from pcbk_core.gateway.places import PLACE_CONNECTIONS, PLACE_READ_S, PlaceAnswer
+from pcbk_core.gateway.proxy import (GW_BODY_BUDGET_BYTES, OCTET_STREAM, PROXY_MESSAGES, PROXY_QUEUE,
+                                     UPSTREAM_MAX_BYTES)
+from pcbk_core.gateway.rules import Refused
+from pcbk_core.hooks import hooks_of
 from pcbk_core.gateway.rules import EXAMPLE_IDS, RULE_MESSAGES
 from pcbk_core.settings import GW_ERROR_CHARS, GatewaySettings
 
@@ -739,3 +743,122 @@ def test_check_place_status_logged(gw, gwlog):                                  
     assert lines[0].endswith("reason=agent status=400 place_status=500")
     assert lines[1].endswith("reason=permission status=403 place_status=500")
     assert lines[2].endswith("reason=agent status=400")                                  # 200 места — без кода
+
+
+# --- доводка 2 (повторное ревью) ---
+
+def test_queue_wait_leaves_place_its_read_time():                                        # H1: соотношение сроков
+    assert proxy.PROXY_QUEUE_WAIT_S == proxy.PROXY_DEADLINE_S - PLACE_READ_S > 0
+
+
+async def test_queue_does_not_eat_place_deadline(tmp_path, monkeypatch):                # H1: проба ревью
+    app, role = make_gateway(tmp_path, ready=(3,))
+    place = role.fake_places
+    place.hang_for[3] = 0.6                                                              # место отвечает за 0,6 с
+    monkeypatch.setattr(proxy, "PROXY_DEADLINE_S", 1.0)
+    monkeypatch.setattr(proxy, "PROXY_QUEUE_WAIT_S", 0.3)                                # месту остаётся 0,7 с
+    with serve_app(app) as url:
+        wait_until(lambda: role.workplaces.ticks >= 1)
+        async with httpx.AsyncClient(base_url=url, trust_env=False, timeout=10) as client:
+            c3 = await cookie_of(client, "stu-03")
+            answers = await asyncio.gather(*(client.get(STATUS, headers=c3) for _ in range(3)))
+    assert sorted((r.status_code, r.json().get("name") if r.status_code != 200 else "")
+                  for r in answers) == [(200, ""), (200, ""), (503, "WorkplaceBusy")]
+    assert role.workplaces.is_ready(3) and role.stats.count_1h("upstream_failed") == 0
+
+
+async def test_body_budget_on_oc(tmp_path):                                             # H2
+    app, role = make_gateway(tmp_path)
+    path = f"/pcbk/api/oc/session/{SES}/prompt_async"
+    budget, size, go = hooks_of(app).budget_for(path), 524288, asyncio.Event()
+    assert budget.total == GW_BODY_BUDGET_BYTES and hooks_of(app).budget_for("/pcbk/api/auth/login") is None
+    body = b"x" * size
+
+    async def call(server=("127.0.0.1", 8000), client=("127.0.0.1", 40000)) -> tuple[int, int, dict]:
+        reads, sent = [], []
+
+        async def receive() -> dict:
+            reads.append(1)
+            await go.wait()
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+                 "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+                 "headers": [(b"host", b"core"), (b"origin", ORIGIN.encode()), (b"content-length", str(size).encode())],
+                 "server": server, "client": client}
+        await app(scope, receive, send)
+        return sent[0]["status"], len(reads), sent
+
+    calls = [asyncio.create_task(call()) for _ in range(40)]
+    await wait_until_async(lambda: sum(t.done() for t in calls) == 40 - GW_BODY_BUDGET_BYTES // size)
+    assert budget.used == GW_BODY_BUDGET_BYTES                                           # разом — не больше 32 тел
+    refused = [t.result() for t in calls if t.done()]
+    assert {(status, reads) for status, reads, _ in refused} == {(503, 0)}                # отказ — без чтения
+    assert b"WorkplaceBusy" in refused[0][2][1]["body"] and role.stats.count_1h("refused") == 8
+    status, reads, sent = await call(server=("172.31.6.2", 8000), client=("172.31.6.3", 40000))
+    assert (status, reads) == (404, 0) and b"NotFound" in sent[1]["body"]                # из сети места — 404
+    assert (await call())[:2] == (503, 0)                                                # и дальше — сразу отказ
+    go.set()
+    results = await asyncio.gather(*calls)
+    assert sorted(status for status, _, _ in results) == [401] * 32 + [503] * 8        # прочитаны — дальше вход
+    assert budget.used == 0
+    go.clear()
+    async with asyncio.timeout(2):                                                       # бюджет свободен, а из сети
+        assert (await call(server=("172.31.6.2", 8000), client=("172.31.6.3", 40000)))[:2] == (404, 0)   # места — нет
+    assert budget.used == 0
+    hanging = asyncio.create_task(call())                                                # обрыв: байты — назад
+    await wait_until_async(lambda: budget.used == size)
+    hanging.cancel()
+    await asyncio.gather(hanging, return_exceptions=True)
+    assert budget.used == 0
+
+
+async def test_queue_accepts_again_after_expired_waits():                               # H3
+    gate = proxy._PlaceGate()
+    held = [await gate.acquire(3) for _ in range(2)]                                     # слоты заняты
+    for _ in range(PROXY_QUEUE + 1):
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await gate.acquire(3)
+    waiters = [asyncio.create_task(gate.acquire(3)) for _ in range(PROXY_QUEUE)]
+    await asyncio.sleep(0.01)
+    assert not any(t.done() for t in waiters)                                            # все восемь ждут, не busy
+    with pytest.raises(Refused) as e:
+        await gate.acquire(3)
+    assert e.value.reason == "busy"
+    for release in held:
+        release()
+    await wait_until_async(lambda: sum(t.done() for t in waiters) == 2)
+    for t in waiters:
+        t.cancel()
+    await asyncio.gather(*waiters, return_exceptions=True)
+    assert gate._waiting[3] == 0
+
+
+async def test_aclose_closes_every_place_client(tmp_path):                             # H4
+    w = make_places(tmp_path)
+    for n in (1, 3, 10):
+        assert (await w.fetch(n, "GET", "/session/status", max_bytes=1024)).status == 200
+    clients = dict(w._clients)
+    assert set(clients) == {1, 3, 10}
+    await w.aclose()
+    assert w._clients == {} and all(c.is_closed for c in clients.values())
+
+
+async def test_place_clients_share_tls_context(tmp_path, monkeypatch):                 # H5
+    made, real = [], ssl.create_default_context
+    monkeypatch.setattr(ssl, "create_default_context", lambda *a, **k: made.append(1) or real(*a, **k))
+    w = make_places(tmp_path)
+    w._transport = None                                                                  # настоящие транспорты httpx
+    clients = [w._http(n) for n in range(1, 11)]
+    assert len(made) == 1 and len({id(c) for c in clients}) == 10
+    await w.aclose()
+
+
+def test_missing_content_type_on_body_is_octet_stream(gw):                             # H6
+    c, _, place = gw
+    place.force_status[3] = (200, {"content-type": None})
+    r = c.get(STATUS)
+    assert (r.status_code, r.headers["content-type"], r.content) == (200, OCTET_STREAM, b'{"name":"Forced"}')
