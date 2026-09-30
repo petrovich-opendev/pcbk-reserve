@@ -8,8 +8,10 @@ import re
 import socket
 import ssl
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -52,7 +54,9 @@ LLM_DOWN_DETAIL = "LLM-прокси не отвечает"
 LLM_OFF_CONTRACT_DETAIL = "LLM-прокси ответил не по договору"
 # опрос OpenRouter старше этого, с — «неизвестно». Опрос раз в LLM_POLL_S (60 с), в нём
 # до двух запросов по POLL_TIMEOUT_S (15 с), такт сторожа 10 с и запас 60 с на медленный
-# старт: 60 + 2 × 15 + 10 + 60 = 160 ≤ 180
+# старт: 60 + 2 × 15 + 10 + 60 = 160 ≤ 180.
+# Долг (ревью задачи 7, M6): LLM_POLL_S — настройка core (LlmSettings), а здесь число; при
+# смене опроса core поправить и эту константу, иначе строка уйдёт в «неизвестно» или опоздает.
 LLM_STALE_S = 180
 # десять кругов обновления адресов охраны выхода по 30 с (Д4а-R18): дольше без удачного
 # круга — предупреждение
@@ -68,6 +72,10 @@ UPSTREAM_FAIL_STATES = frozenset({"unreachable", "key_rejected", "money_out", "k
 UPSTREAM_STATES = UPSTREAM_FAIL_STATES | {"unknown", "ok", "errors"}
 # разность сумм меньше этого — шум сложения чисел с плавающей точкой, не деньги
 USD_NOISE = 1e-9
+# меньше этого сумма пишется «<$0.0001»: четыре знака дали бы «$0.0000» при ненулевом расходе
+USD_TINY = Decimal("0.0001")
+# что пишет core в ledger_error (задача 6 Д4а): dropped — операция журнала брошена, write — запись не идёт
+LEDGER_ERRORS = frozenset({"dropped", "write"})
 
 
 @dataclass(frozen=True)
@@ -302,11 +310,26 @@ def check_historian(component: str, title: str, url: str, now: datetime, warn_s:
     return Check(component, title, state, detail)
 
 
-def fmt_usd(x: float) -> str:
-    """Сумма для строки: $0.00; меньше доллара — четыре знака ($0.0012); иначе два ($12.35)."""
+def fmt_usd(x: float, keep: Iterable[float] = ()) -> str:
+    """Сумма для строки: $0.00; меньше $0.0001 — «<$0.0001»; меньше доллара — четыре знака ($0.0012);
+    иначе два ($12.35, -$0.50).
+
+    Округление — как у f"{x:.2f}", но не переводит сумму на другую сторону порога из keep (и доллара
+    у четырёх знаков): при бюджете $1000 расход 999.996 — «$999.99», а не «$1000.00», 500.004 при
+    полосе 50 % — «$500.01».
+    """
     if x == 0:
         return "$0.00"
-    return f"${x:.4f}" if 0 < x < 1 else f"${x:.2f}"
+    exact = Decimal(x)   # точное значение float: округление то же, что у форматирования float
+    if 0 < exact < USD_TINY:
+        return f"<${USD_TINY}"
+    small = 0 < exact < 1
+    step = USD_TINY if small else Decimal("0.01")
+    shown = exact.quantize(step, ROUND_HALF_EVEN)
+    for edge in (*map(Decimal, keep), *((Decimal(1),) if small else ())):
+        if (shown > edge, shown < edge) != (exact > edge, exact < edge):
+            shown = exact.quantize(step, ROUND_FLOOR if exact < edge else ROUND_CEILING)
+    return f"{'-' if shown < 0 else ''}${abs(shown):f}"   # -0.00 — это ноль, без минуса
 
 
 def fmt_total(x: float) -> str:
@@ -371,7 +394,9 @@ class LlmReply:
     key: str
     mgmt_key: str
     ledger_ok: bool
+    ledger_error: str | None
     ledger_reset: bool
+    drill: str
     upstream_state: str
     upstream_text: str
     spent_usd: float
@@ -389,10 +414,11 @@ class LlmReply:
     account_remaining_usd: float | None
     egress_alive: bool | None
     egress_last_ok_age_s: float | None
+    refresh_started_age_s: float | None
 
     @classmethod
     def parse(cls, reply) -> "LlmReply":
-        """Ответ не по договору — ValueError, TypeError, KeyError или OverflowError."""
+        """Ответ не по договору — ValueError, TypeError, KeyError или ArithmeticError."""
         if not isinstance(reply, dict):
             raise TypeError("ответ — не объект JSON")
         upstream, shares, egress = _part(reply, "upstream"), _part(reply, "shares"), _part(reply, "egress")
@@ -401,7 +427,8 @@ class LlmReply:
             config_error=_text(reply, "config_error", nullable=True),
             tokens_error=_text(reply, "tokens_error", nullable=True),
             key=_text(reply, "key"), mgmt_key=_text(reply, "mgmt_key"),
-            ledger_ok=_flag(reply, "ledger_ok"), ledger_reset=_flag(reply, "ledger_reset"),
+            ledger_ok=_flag(reply, "ledger_ok"), ledger_error=_text(reply, "ledger_error", nullable=True),
+            ledger_reset=_flag(reply, "ledger_reset"), drill=_text(reply, "drill"),
             upstream_state=_text(upstream, "state"), upstream_text=_text(upstream, "text"),
             spent_usd=_usd(reply, "spent_usd"), reserved_usd=_usd(reply, "reserved_usd"),
             ledger_usd=_usd(reply, "ledger_usd"), estimated_usd=_usd(reply, "estimated_usd"),
@@ -412,9 +439,16 @@ class LlmReply:
             provider_mismatch_24h=_count(reply, "provider_mismatch_24h"),
             account_remaining_usd=_usd(reply, "account_remaining_usd", nullable=True),
             egress_alive=_flag(egress, "alive", nullable=True),
-            egress_last_ok_age_s=_usd(egress, "last_ok_age_s", nullable=True))
+            egress_last_ok_age_s=_usd(egress, "last_ok_age_s", nullable=True),
+            refresh_started_age_s=_usd(reply, "refresh_started_age_s", nullable=True))
         if r.upstream_state not in UPSTREAM_STATES:
             raise ValueError("неизвестное состояние OpenRouter")
+        if not r.upstream_text.strip():
+            raise ValueError("пустой текст состояния OpenRouter")
+        if r.ledger_error is not None and r.ledger_error not in LEDGER_ERRORS:
+            raise ValueError("неизвестная причина сбоя журнала")
+        if r.egress_alive and r.egress_last_ok_age_s is None and r.refresh_started_age_s is None:
+            raise ValueError("поток адресов жив, а время его запуска неизвестно")
         if r.total_usd <= 0:
             raise ValueError("бюджет не больше нуля")
         return r
@@ -422,7 +456,9 @@ class LlmReply:
 
 def llm_note(r: LlmReply) -> str:
     """Числа строки: расход из бюджета, оценки, сверка с ключом, доли, остаток счёта."""
-    parts = [f"расход {fmt_usd(r.spent_usd)} из {fmt_total(r.total_usd)}"]
+    # округление расхода не переходит полос и бюджета: число согласно со словами строки
+    edges = (*(step * r.total_usd / 100 for step in BUDGET_STEPS), r.total_usd)
+    parts = [f"расход {fmt_usd(r.spent_usd, keep=edges)} из {fmt_total(r.total_usd)}"]
     if r.reserved_usd > 0:
         parts.append(f"идёт на оценку {fmt_usd(r.reserved_usd)}")
     unpriced = r.estimated_usd - r.reserved_usd   # вызовы без цены, кроме идущих
@@ -437,7 +473,11 @@ def llm_note(r: LlmReply) -> str:
     if r.shares_spent > 0:
         parts.append(f"доля исчерпана: {r.shares_spent}")
     if r.account_remaining_usd is not None:
-        parts.append(f"на счёте {fmt_usd(r.account_remaining_usd)}")
+        parts.append(f"на счёте {fmt_usd(r.account_remaining_usd, keep=(ACCOUNT_WARN_USD,))}")
+    elif r.mgmt_key == "error":
+        parts.append("остаток счёта не виден")   # /credits не ответил; rejected — своя строка detail
+    if r.drill:
+        parts.append(f"учения DRILL_LLM={r.drill}")
     return " · ".join(parts)
 
 
@@ -447,7 +487,7 @@ def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
 
     В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
     """
-    upstream_text = _reason(r.upstream_text) or r.upstream_state
+    upstream_text = _reason(r.upstream_text)
     if r.stopped:
         return "fail", "LLM-прокси остановлен администратором"
     if r.config_error is not None:
@@ -456,10 +496,15 @@ def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
         return "fail", "токены LLM не читаются"
     if r.key == "missing":
         return "fail", "нет ключа OpenRouter"
-    if not r.ledger_ok:
+    if not r.ledger_ok or r.ledger_error is not None:
+        if r.ledger_error == "dropped":   # брошенная строка держится до перезапуска core
+            return "fail", "строка журнала вызовов потеряна — перезапустите core"
         return "fail", "журнал вызовов не пишется"
     if r.egress_alive is False:
         return "fail", "охрана выхода: поток обновления адресов остановлен"
+    if (r.egress_alive and r.egress_last_ok_age_s is None
+            and r.refresh_started_age_s is not None and r.refresh_started_age_s > EGRESS_STALE_S):
+        return "fail", "охрана выхода: адреса OpenRouter ни разу не получены"
     # spent_usd — без резервов идущих вызовов (Д4а-R11): строка не мигает на каждом вызове
     if r.spent_usd >= r.total_usd:
         return "fail", f"бюджет {fmt_total(r.total_usd)} исчерпан — модель не отвечает"
@@ -467,6 +512,8 @@ def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
         return "fail", upstream_text
     if r.checked_at is None:
         return "unknown", "OpenRouter ещё не опрашивался"
+    if r.upstream_state == "unknown":   # опрос был, но удачи не было ни разу — «норма» была бы ложью
+        return "unknown", "OpenRouter ещё ни разу не ответил на опрос"
     if (now - r.checked_at).total_seconds() > LLM_STALE_S:
         return "unknown", "LLM-прокси давно не опрашивал OpenRouter"
     if r.upstream_state == "errors":
@@ -510,7 +557,7 @@ def check_llm(component: str, title: str, url: str, now: datetime,
         parsed = LlmReply.parse(reply)
         state, detail = llm_verdict(parsed, now)
         note = llm_note(parsed)
-    except (KeyError, TypeError, ValueError, OverflowError):
+    except (KeyError, TypeError, ValueError, ArithmeticError):   # ArithmeticError — Overflow, Decimal
         return Check(component, title, "fail", LLM_OFF_CONTRACT_DETAIL)
     return Check(component, title, state, detail, note)
 
