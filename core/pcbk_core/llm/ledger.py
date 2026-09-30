@@ -12,13 +12,16 @@ cost_est, поставленная при открытии вызова (Д4а-R
 pcbk-ledger-writer, соединение на операцию со сроком WRITE_TIMEOUT_S. Порядок операций одной
 строки держится, цикл событий SQLite не касается никогда (F9), а бюджет держится и при сбое
 диска, пока жив процесс. Сбой записи — счётчик и last_error, а не ожидание и не исключение
-вызывающему. Операция, упавшая с sqlite3.OperationalError (блокировка, ввод-вывод, диск
-полон, файл не открыть), не выбрасывается (ревью I1): писатель повторяет её во главе очереди
-через retry_pause_s, пока она не пройдёт или не придёт остановка; очередь за ней ждёт,
-consecutive_failures растёт. Поэтому каждая операция повторяема — INSERT OR REPLACE строки
-целиком по id из памяти. Любое другое исключение — операция «отравлена» и от повтора не
-пройдёт: она бросается сразу (ERROR с классом, writes_dropped_total), очередь идёт дальше
-(ревью N1). Отравить её и нечем: CallRow чистит значения на входе — строки без одиночных
+вызывающему. Операция, упавшая с ошибкой SQLite (sqlite3.Error: блокировка, ввод-вывод, диск
+полон, файл не открыть, файл испорчен), не выбрасывается (ревью I1, раунд 3): писатель
+повторяет её во главе очереди через retry_pause_s, пока она не пройдёт или не придёт
+остановка; очередь за ней ждёт, consecutive_failures растёт, flush() не успевает — задача 6
+отказывает в вызовах. Поэтому каждая операция повторяема — INSERT OR REPLACE строки целиком
+по id из памяти. Исключение не из SQLite (OverflowError, UnicodeError, ValueError, …) —
+операция «отравлена» и от повтора не пройдёт: она бросается сразу (ERROR с классом,
+writes_dropped_total), очередь идёт дальше (ревью N1), а каждый flush(), чья метка стоит
+после неё, бросает LedgerWriteLost до нового open() (R19: возврат flush() — «строка на
+диске»). Отравить её и нечем: CallRow чистит значения на входе — строки без одиночных
 суррогатов, целые в [0, 2**63 − 1], деньги по правилу _money. Файл создаёт только open();
 писатель, writable() и recent() открывают его с mode=rw и пустую базу вместо пропавшей не
 заводят.
@@ -58,6 +61,13 @@ STATUSES = ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lo
 CLOSED_STATUSES = tuple(s for s in STATUSES if s != "open")   # закрытая строка open быть не может
 COST_SOURCES = ("stream", "body", "generation", "pending", "unknown", "none")
 PRICED = ("stream", "body", "generation")   # цена пришла
+
+
+class LedgerWriteLost(TimeoutError):
+    """flush(): операция, поставленная до метки, брошена, а не записана — строки нет на диске.
+
+    Наследник TimeoutError: задача 6 одинаково отказывает и по сроку, и по потере (R19).
+    """
 
 
 def _why(exc: BaseException) -> str:
@@ -342,6 +352,8 @@ class Ledger:
         self._stop: threading.Event | None = None
         self._thread: threading.Thread | None = None     # остаётся и после close(): open() его дождётся
         self._backlog = 0
+        self._seq = 0                          # номер последней поставленной операции (с open())
+        self._lost_seq: int | None = None      # номер первой брошенной операции (с open())
         self._lock = threading.Lock()          # память и очередь; писатель его не берёт
         self._state_lock = threading.Lock()    # признаки сбоев и длина очереди
         self._open_lock = threading.Lock()
@@ -424,16 +436,18 @@ class Ledger:
             with self._lock:
                 self._mem, self._queue, self._stop, self._thread = mem, q, stop, thread
                 self.fresh = fresh
+                self._seq = 0
                 with self._state_lock:
                     self._backlog = 0
+                    self._lost_seq = None
                 self.opened = True
             return True
 
     def _drain(self, q: queue.SimpleQueue, stop: threading.Event) -> None:
-        """Поток-писатель: операции по порядку. Упавшая с OperationalError повторяется во главе
+        """Поток-писатель: операции по порядку. Упавшая с sqlite3.Error повторяется во главе
         очереди через retry_pause_s, пока не пройдёт; остановка прерывает паузу — последняя
-        попытка, и операция брошена. Другое исключение — операция брошена сразу. Сбой считается
-        и не убивает поток."""
+        попытка, и операция брошена. Исключение не из SQLite — операция брошена сразу. Сбой
+        считается и не убивает поток."""
         while True:
             item = q.get()
             if item[0] == _STOP:
@@ -441,7 +455,7 @@ class Ledger:
             if item[0] == _MARK:
                 item[1].set()
                 continue
-            _, sql, params = item
+            _, seq, sql, params = item
             outcome = self._write(sql, params)
             while outcome == _RETRY and not stop.is_set():
                 stop.wait(self.retry_pause_s)
@@ -450,18 +464,20 @@ class Ledger:
                 self._backlog -= 1
                 if outcome != _WRITTEN:
                     self.writes_dropped_total += 1
+                    if self._lost_seq is None:
+                        self._lost_seq = seq       # FIFO: первая брошенная — с наименьшим номером
             if outcome == _RETRY:
                 log.warning("журнал вызовов: при остановке запись брошена — %s", self.last_error)
 
     def _write(self, sql: str, params: tuple) -> str:
-        """Одна попытка: _WRITTEN, _RETRY (OperationalError — повторить) или _DROPPED (другое)."""
+        """Одна попытка: _WRITTEN, _RETRY (sqlite3.Error — повторить) или _DROPPED (не из SQLite)."""
         try:
             db = self._connect()
             try:
                 db.execute(sql, params)
             finally:
                 db.close()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.Error as exc:           # среда: блокировка, диск, испорченный файл — не бросать
             self._write_failed(_why(exc))
             return _RETRY
         except Exception as exc:
@@ -491,23 +507,32 @@ class Ledger:
     def _put(self, sql: str, params: tuple) -> None:
         """В очередь писателя — под self._lock, в порядке изменений памяти; не открыт — только память."""
         if self._queue is not None:
+            self._seq += 1
             with self._state_lock:
                 self._backlog += 1
-            self._queue.put((_SQL, sql, params))
+            self._queue.put((_SQL, self._seq, sql, params))
 
     def flush(self, timeout: float = 5.0) -> None:
-        """Ждёт, пока писатель выполнит всё, что поставлено до вызова; не успел — TimeoutError.
+        """Возвращается, только если всё, что поставлено до вызова, записано в файл (R19).
 
-        Пока запись не проходит, писатель её повторяет, и flush() ждёт до срока. Писатель не
-        запущен — сразу выходит. Для тестов и close(); в цикле событий не зовётся.
+        Отдаётся, как только писатель дошёл до метки. Пока запись не проходит (ошибка SQLite),
+        писатель её повторяет, и flush() ждёт до срока — TimeoutError. Операция до метки брошена
+        (исключение не из SQLite, остановка) — LedgerWriteLost; это держится до нового open():
+        в файле дыра, и «записано» сказать нельзя. Писатель не запущен — сразу выходит. В цикле
+        событий не зовётся (роль — через asyncio.to_thread).
         """
         with self._lock:
             if self._queue is None:
                 return
+            upto = self._seq
             done = threading.Event()
             self._queue.put((_MARK, done))
         if not done.wait(timeout):
             raise TimeoutError(f"журнал вызовов: писатель не успел за {timeout:g} с")
+        with self._state_lock:
+            lost = self._lost_seq
+        if lost is not None and lost <= upto:
+            raise LedgerWriteLost("журнал вызовов: операция до метки брошена — строки нет в файле")
 
     def close(self, timeout: float = 5.0) -> None:
         """flush(timeout), остановка писателя, opened = False: дальше — только память, до нового open().
@@ -524,9 +549,8 @@ class Ledger:
         """
         try:
             self.flush(timeout)
-        except TimeoutError:
-            log.warning("журнал вызовов: при остановке не записано операций: %d — последние теряются",
-                        self.queue_size)
+        except TimeoutError as exc:             # и LedgerWriteLost
+            log.warning("журнал вызовов: при остановке — %s; не записано операций: %d", exc, self.queue_size)
         with self._lock:
             q, stop, thread = self._queue, self._stop, self._thread
             self._queue = self._stop = None
@@ -562,8 +586,14 @@ class Ledger:
             self.writable_ok = ok
 
     def recent(self, limit: int = 10) -> list[CallRow]:
-        """Последние строки из файла, новые сверху; сначала flush(). Для тестов и llmrows, не для ручек."""
-        self.flush()
+        """Последние строки из файла, новые сверху; сначала flush(). Для тестов и llmrows, не для ручек.
+
+        Брошенная раньше операция чтению не мешает: читается то, что в файле.
+        """
+        try:
+            self.flush()
+        except LedgerWriteLost:
+            pass
         db = self._connect(SQLITE_TIMEOUT_S)
         try:
             rows = db.execute(f"{_SELECT} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()

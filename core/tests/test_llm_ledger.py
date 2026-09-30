@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from helpers import wait_until
-from pcbk_core.llm.ledger import STATUSES, WRITE_RETRY_S, WRITE_TIMEOUT_S, Budget, Ledger, Usage
+from pcbk_core.llm.ledger import STATUSES, WRITE_RETRY_S, WRITE_TIMEOUT_S, Budget, Ledger, LedgerWriteLost, Usage
 
 
 def lg(path):                                        # журнал, открытый как в lifespan
@@ -565,7 +565,8 @@ def test_non_operational_error_drops_the_op_and_moves_on(tmp_path, monkeypatch):
         a = opened(led)
         b = opened(led, caller="student-02")
         t = time.monotonic()
-        led.flush(timeout=2.0)
+        with pytest.raises(LedgerWriteLost):                                    # раунд 3: строки a нет на диске —
+            led.flush(timeout=2.0)                                              # flush() не говорит «записано»
         assert time.monotonic() - t < 1.0                                       # брошена сразу, без повторов
     finally:
         logger.removeHandler(handler)
@@ -591,3 +592,85 @@ def test_flush_returns_once_a_transient_lock_is_gone(tmp_path):                 
     release.join()
     assert led.write_failures_total >= 1 and led.consecutive_failures == 0
     assert led.recent(1)[0].status == "open"
+
+
+# --- доводка по ревью, раунд 3 (R19: flush() перед отправкой = строка на диске) ---
+
+def test_dropped_insert_before_flush_raises_until_reopen(tmp_path, monkeypatch):
+    led = lg(str(tmp_path / "core.db"))
+    real, fired = led._connect, []
+
+    class Poison:
+        def __init__(self, db):
+            self.db = db
+        def execute(self, sql, params=()):
+            if sql.startswith("INSERT") and not fired:
+                fired.append(1)
+                raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates not allowed")
+            return self.db.execute(sql, params)
+        def close(self):
+            self.db.close()
+
+    monkeypatch.setattr(led, "_connect", lambda *a: Poison(real(*a)))
+    opened(led)                                                                 # INSERT открытой строки брошен
+    with pytest.raises(LedgerWriteLost) as lost:
+        led.flush(timeout=2.0)
+    assert isinstance(lost.value, TimeoutError)                                 # задача 6 ловит TimeoutError
+    opened(led)                                                                 # следующая строка легла,
+    with pytest.raises(LedgerWriteLost):                                        # но дыра в файле остаётся:
+        led.flush(timeout=2.0)                                                  # отказ до нового open()
+    monkeypatch.undo()
+    led.close()
+    assert led.open() is True
+    opened(led)
+    led.flush(timeout=2.0)                                                      # после open() — с чистого листа
+    assert led.writes_dropped_total == 1
+
+
+def test_database_error_is_retried_and_flush_times_out(tmp_path, monkeypatch):  # раунд 3: вся семья DatabaseError
+    led = lg(str(tmp_path / "core.db"))
+    led.retry_pause_s = 0.01
+    real, broken = led._connect, [True]
+
+    class Corrupt:
+        def __init__(self, db):
+            self.db = db
+        def execute(self, sql, params=()):
+            if sql.startswith("INSERT") and broken:
+                raise sqlite3.DatabaseError("file is not a database")
+            return self.db.execute(sql, params)
+        def close(self):
+            self.db.close()
+
+    monkeypatch.setattr(led, "_connect", lambda *a: Corrupt(real(*a)))
+    cid = opened(led)
+    with pytest.raises(TimeoutError) as late:
+        led.flush(timeout=0.3)
+    assert not isinstance(late.value, LedgerWriteLost)                          # не брошена — повторяется
+    assert led.consecutive_failures >= 2 and led.writes_dropped_total == 0 and led.queue_size == 1
+    assert led.last_error == "DatabaseError: file is not a database"
+    broken.clear()
+    led.flush(timeout=2.0)
+    assert led.consecutive_failures == 0 and [r.id for r in led.recent()] == [cid]
+
+
+def test_overflow_is_dropped_and_flush_raises(tmp_path, monkeypatch):           # раунд 3: не-sqlite — брошена
+    led = lg(str(tmp_path / "core.db"))
+    real = led._connect
+
+    class Overflow:
+        def __init__(self, db):
+            self.db = db
+        def execute(self, sql, params=()):
+            if sql.startswith("INSERT"):
+                raise OverflowError("Python int too large to convert to SQLite INTEGER")
+            return self.db.execute(sql, params)
+        def close(self):
+            self.db.close()
+
+    monkeypatch.setattr(led, "_connect", lambda *a: Overflow(real(*a)))
+    opened(led)
+    t = time.monotonic()
+    with pytest.raises(LedgerWriteLost):
+        led.flush(timeout=2.0)
+    assert time.monotonic() - t < 1.0 and (led.writes_dropped_total, led.queue_size) == (1, 0)
