@@ -2,7 +2,8 @@
 import pytest
 
 from helpers import FakeMono
-from pcbk_core.llm.request import SUMMARY_PROMPT, SYNTHETIC_ATTACHMENT_PROMPT, TurnMark, turn_mark
+from pcbk_core.llm.models import select_models
+from pcbk_core.llm.request import SUMMARY_PROMPT, SYNTHETIC_ATTACHMENT_PROMPT, TurnMark, rebuild_body, turn_mark
 from pcbk_core.llm.turns import COMPACTION_CONTINUE, TURN_CALLS, TURN_IDLE_S, TurnLimiter, TurnLimitReached
 
 M1, M1_AGAIN_LATER = TurnMark("user", "h1", 2), TurnMark("user", "h1", 6)
@@ -182,3 +183,16 @@ def test_tool_media_steps_do_not_start_turns():
     assert [t.step("student-01", "ses_a", m) for m in marks] == list(range(1, 17))
     with pytest.raises(TurnLimitReached):
         t.step("student-01", "ses_a", turn_mark({"messages": [SYS, user("вопрос"), *steps_of(17), media]}))
+
+
+def test_attachment_only_user_counts_as_step():                                  # решение контроллера, раунд 2
+    """15 шагов, затем `user` с одним вложением (после замены — одна заглушка) — шаг 16, 17-й — отказ."""
+    policy = select_models("")["z-ai/glm-5.3"]
+    image = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}
+    mark = lambda msgs: turn_mark(rebuild_body({"messages": msgs}, policy, caller="student-01", session=None))
+    t = TurnLimiter(monotonic=FakeMono(0.0))
+    assert [t.step("student-01", "ses_a", mark([SYS, user("вопрос"), *steps_of(i)])) for i in range(1, 16)] == \
+           list(range(1, 16))
+    assert t.step("student-01", "ses_a", mark([SYS, user("вопрос"), *steps_of(15), image])) == 16
+    with pytest.raises(TurnLimitReached):
+        t.step("student-01", "ses_a", mark([SYS, user("вопрос"), *steps_of(15), image, call(16), result(16)]))

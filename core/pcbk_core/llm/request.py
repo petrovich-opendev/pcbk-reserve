@@ -291,9 +291,13 @@ def _is_user(msg: object) -> bool:
     return isinstance(msg, dict) and msg.get("role") == "user"
 
 
-def _is_tool_media(texts: list[str]) -> bool:
-    """Сообщение OpenCode с вложениями из ответа инструмента: первая часть — SYNTHETIC_ATTACHMENT_PROMPT."""
-    return bool(texts) and texts[0] == SYNTHETIC_ATTACHMENT_PROMPT
+def _only_media(texts: list[str]) -> bool:
+    """Не вопрос человека, а шаг хода: сообщение OpenCode с вложениями из ответа инструмента (первая часть —
+    SYNTHETIC_ATTACHMENT_PROMPT) или сообщение, где кроме заглушек вложений и `<system-reminder>` ничего нет
+    (решение контроллера, раунд 2): иначе инструмент с вложением на каждом шаге обнулял бы счётчик хода."""
+    if texts and texts[0] == SYNTHETIC_ATTACHMENT_PROMPT:
+        return True
+    return all(text.strip() in ("", ATTACHMENT_TEXT) for text in texts if not text.lstrip().startswith(_REMINDER))
 
 
 def _is_continue(texts: list[str]) -> bool:
@@ -305,9 +309,10 @@ def _is_continue(texts: list[str]) -> bool:
 def turn_mark(body: dict) -> TurnMark:
     """Метка хода по собранному телу (Global Constraints, «Ход и предел шагов»; доводка ревью, I1, раунд 2).
 
-    - последнее сообщение не `user` или `user` OpenCode с вложениями из ответа инструмента — `other`;
+    - последнее сообщение не `user`, или `user` с одними вложениями (сообщение OpenCode с вложениями из
+      ответа инструмента; только заглушки вложений, напоминания или пусто) — `other`;
     - последнее `user` — продолжение после сжатия: `continue` с хешем «настоящего» `user` (не
-      продолжение, не ровно SUMMARY_PROMPT, не вложения инструмента), если он стоит **прямо перед**
+      продолжение, не ровно SUMMARY_PROMPT, не одни вложения), если он стоит **прямо перед**
       продолжением, иначе `None`.
       После сжатия модели уходит `[сжатие, сводка, …хвост…, продолжение]` (session/message-v2.ts:582):
       на первом шаге нового вопроса хвост кончается этим вопросом, посреди хода — ответом модели или
@@ -322,13 +327,13 @@ def turn_mark(body: dict) -> TurnMark:
     if not messages or not _is_user(messages[-1]):
         return TurnMark("other", None, n)
     texts = _texts(messages[-1])
-    if _is_tool_media(texts):
+    if _only_media(texts):
         return TurnMark("other", None, n)
     if not _is_continue(texts):
         return TurnMark("user", _text_hash(texts), n)
     before = messages[-2] if n >= 2 else None
     if _is_user(before):
         earlier = _texts(before)
-        if not (_is_continue(earlier) or _is_tool_media(earlier) or _own_text(earlier) == SUMMARY_PROMPT):
+        if not (_is_continue(earlier) or _only_media(earlier) or _own_text(earlier) == SUMMARY_PROMPT):
             return TurnMark("continue", _text_hash(earlier), n)
     return TurnMark("continue", None, n)

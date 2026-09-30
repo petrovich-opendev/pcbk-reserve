@@ -359,3 +359,20 @@ def test_turn_mark_hash_ignores_system_reminders():                             
         msg = {"role": "user", "content": [{"type": "text", "text": "вопрос"}] +
                [{"type": "text", "text": t} for t in extra]}
         assert turn_mark({"messages": [{"role": "system", "content": "s"}, msg]}) == TurnMark("user", h("вопрос"), 2)
+
+
+def test_attachment_only_user_is_not_a_question():                               # решение контроллера, раунд 2
+    """`user` из одних заглушек вложений (и напоминаний, и пустоты) — шаг хода: `other`, а перед продолжением
+    — не «настоящий» вопрос. Текст рядом с вложением — вопрос."""
+    reminder = {"type": "text", "text": "<system-reminder>\nplan\n</system-reminder>"}
+    head = [{"role": "system", "content": "s"}, {"role": "user", "content": "вопрос"}, {"role": "assistant", "content": "a"}]
+    for content in ([ATTACHMENTS[0]], [ATTACHMENTS[0], ATTACHMENTS[1]], [ATTACHMENTS[0], reminder],
+                    [{"type": "text", "text": " "}, ATTACHMENTS[2]], "", []):
+        b = rebuild_body({**OC_BODY, "messages": [*head, {"role": "user", "content": content}]}, POLICY,
+                         caller="ops", session=None)
+        assert turn_mark(b) == TurnMark("other", None, 4), content
+        cont = [*b["messages"], {"role": "user", "content": COMPACTION_CONTINUE}]
+        assert turn_mark({"messages": cont}) == TurnMark("continue", None, 5), content
+    b = rebuild_body({**OC_BODY, "messages": [*head, {"role": "user", "content": [
+        {"type": "text", "text": "что на картинке?"}, ATTACHMENTS[0]]}]}, POLICY, caller="ops", session=None)
+    assert turn_mark(b) == TurnMark("user", h("что на картинке?\n" + ATTACHMENT_TEXT), 4)
