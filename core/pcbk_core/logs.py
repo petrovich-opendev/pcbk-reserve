@@ -10,8 +10,9 @@ import logging
 import sys
 
 LOGGER = "pcbk_core"
-# pytds на INFO пишет адрес историана и начало SQL с именами тегов
-QUIET_LOGGERS = ("pytds", "mcp")
+# pytds на INFO пишет адрес историана и начало SQL с именами тегов; httpx на INFO — адрес каждого
+# запроса к OpenRouter, httpcore на DEBUG — ход соединения (П21)
+QUIET_LOGGERS = ("pytds", "mcp", "httpx", "httpcore")
 RECORD_CHARS = 500
 EXC_TEXT_CHARS = 200             # первая строка текста исключения в записи
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
