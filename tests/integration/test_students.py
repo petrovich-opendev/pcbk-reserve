@@ -280,6 +280,15 @@ def test_env_holds_only_own_secret(stack, running):
     assert (own, foreign) == (True, False)
 
 
+def test_default_agent_is_pomoshnik(stack, running):                # Д6-R45: встроенные агенты выключены
+    agents = json.loads(stack.oc(1, "GET", "/agent", 1)[1])
+    primary = {a["name"] for a in agents if not a.get("hidden") and a.get("mode") != "subagent"}
+    assert primary == {"pomoshnik"}
+    p = next(a for a in agents if a["name"] == "pomoshnik")
+    assert (p["native"], p["mode"]) == (False, "primary")
+    assert not {"build", "plan", "general", "explore"} & {a["name"] for a in agents}
+
+
 def test_hung_workplace_row(stack, running):                       # Review Focus 3; последний в модуле
     row = lambda d: student_rows(d).get("student-01")
     stack.wait_status(lambda d: row(d) == ("ok", "работает"), timeout=60)

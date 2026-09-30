@@ -4,6 +4,13 @@
   "snapshot": false,
   "enabled_providers": ["pcbk", "pcbk-or"],
   "model": "pcbk/z-ai/glm-5.3",
+  "default_agent": "pomoshnik",
+  "agent": {
+    "build": {"disable": true},
+    "plan": {"disable": true},
+    "general": {"disable": true},
+    "explore": {"disable": true}
+  },
   "permission": {
     "external_directory": "deny",
     "task": "deny",

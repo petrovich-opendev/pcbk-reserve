@@ -11,6 +11,7 @@ from conftest import TEST_MGMT_KEY, TEST_OPENROUTER_KEY, wait_for
 
 Q = "что сейчас по тегу 20FAKE_001_PV?"
 MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
+PCBK3 = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period"}       # инструменты агента по умолчанию (Д6-R45)
 
 
 @pytest.fixture(scope="module")
@@ -24,6 +25,11 @@ def place01(stack):                          # своя фикстура: runnin
 def tool_requests(stack, session):           # заголовков клиента прокси не пересылает — сессия только в теле
     return [r for r in stack.fake_requests()
             if r["body"].get("session_id") == f"student-01:{session}" and r["body"].get("tools")]
+
+
+def tool_names(stack, session):              # имена инструментов во всех запросах к модели этой сессии
+    return {t["function"]["name"] for r in stack.fake_requests()
+            if r["body"].get("session_id") == f"student-01:{session}" for t in r["body"].get("tools", [])}
 
 
 def settled(stack, session):                 # К10: строки пишет поток-писатель, заголовок OpenCode идёт фоном
@@ -113,22 +119,28 @@ def test_openrouter_key_never_in_workplace(stack, place01):                     
 
 
 def test_conversation_without_tools_reads_no_data(stack, place01):             # задача 6, шаг 2 — тот же способ
-    def tool_names(session):
-        return {t["function"]["name"] for r in stack.fake_requests()
-                if r["body"].get("session_id") == f"student-01:{session}" for t in r["body"].get("tools", [])}
     assert "mcp=connected" in stack.health_output("pcbk-student-01")            # иначе запрет проверял бы пустоту
     control = stack.converse(1, "Ответь одним словом: да")                       # положительный контроль: без запрета
-    assert "pcbk_tag_now" in tool_names(control["session"])
+    assert "pcbk_tag_now" in tool_names(stack, control["session"])
     before = stack.data_event_count("student-01", "mcp")
     out = stack.converse(1, "Ответь одним словом: да", tools={"pcbk_*": False})
     assert out["status"] == "done" and not [t for t in out["tools"] if t["tool"].startswith("pcbk_")]
-    names = tool_names(out["session"])
-    assert "read" in names and not {n for n in names if n.startswith("pcbk_")}  # запрет снял только pcbk_*
+    names = tool_names(stack, out["session"])
+    # у агента по умолчанию других инструментов нет (Д6-R45): запрет снял все три инструмента данных
+    assert tool_names(stack, control["session"]) - {"invalid"} == PCBK3 and not names & PCBK3
     assert stack.data_event_count("student-01", "mcp") == before                # к данным не ходили
 
 
+def test_default_agent_tools_are_data_only(stack, place01):                    # Д6-R45: ни read, ни question
+    out = stack.converse(1, Q)
+    assert tool_names(stack, out["session"]) - {"invalid"} == PCBK3   # «invalid» — служебный, если OpenCode его шлёт
+    msgs = json.loads(stack.oc(1, "GET", f"/session/{out['session']}/message", 1)[1])
+    assert {m["info"].get("agent") for m in msgs if m["info"]["role"] == "assistant"} == {"pomoshnik"}
+
+
 def test_model_question_is_rejected_and_reported(stack, place01):               # раунд 2: уточняющий вопрос модели
-    out = stack.converse(1, "FAKEASK какой тег?", timeout=60)
+    # правило сессии даёт question (у агента по умолчанию его нет); converse идёт мимо шлюза
+    out = stack.converse(1, "FAKEASK какой тег?", timeout=60, tools={"question": True})
     assert out["status"] == "asked" and out["asked"] == [{"kind": "question", "tool": "question"}]
     assert stack.oc(1, "GET", "/question", 1)[1].strip() == "[]"               # висящих вопросов нет
     assert json.loads(stack.oc(1, "GET", "/session/status", 1)[1]).get(out["session"]) is None   # сессия не busy
