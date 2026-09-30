@@ -26,15 +26,15 @@
    `docker save <образ> | gzip | ssh <сервер> 'gunzip | docker load'`;
    список сторонних образов — `deploy/images.lock` (строки `# test` не
    возить, кроме `curlimages/curl` — он остаётся на сервере как инструмент
-   проверок); свои образы — `pcbk-reserve/watchdog:<день>` и
+   проверок); свои образы — `pcbk-reserve/watchdog:<день>`, `pcbk-reserve/core:<день>` (с Д3а) и
    `pcbk-reserve/student:<день>` (собирать из чистого дерева, `git archive`). Сверка: слои
    `docker image inspect -f '{{json .RootFS.Layers}}'` совпадают.
 2. `compose.yaml` и каталог `edge/` — в `/opt/pcbk-reserve` (`scp`; без
    удаления: `tls/`, `.env`, `secrets/`, `agents/` не трогаются). Права:
    `chmod -R o+rX edge` — nginx читает файлы от другого пользователя.
 3. `.env` — по `deploy/env.example`, `chmod 600`.
-4. `cd /opt/pcbk-reserve && docker compose up -d --no-build edge watchdog sp-ro sp-ctl`
-   — **с именами служб**: рабочие места (с Д2) создаются отдельно и не
+4. `cd /opt/pcbk-reserve && docker compose up -d --no-build edge watchdog sp-ro sp-ctl core`
+   (`core` — с Д3а) — **с именами служб**: рабочие места (с Д2) создаются отдельно и не
    стартуют сами.
 5. Проверка: `curl -sk https://127.0.0.1:8443/status.json` — `stale: false`.
 
@@ -103,8 +103,9 @@
 
 - Порт **8443** контейнера `edge` — Docker публикует его **в обход ufw**.
   Закрыть: `docker compose stop edge`.
-- `edge` — единственный контейнер с путём к хосту; остальные сети внутренние
-  с изолированным шлюзом.
+- `edge` — единственный контейнер с опубликованным портом. Выход наружу, кроме
+  него, есть только у `core` — через сеть `pcbk-egress` (к историану; с Д3а, охрана
+  выхода в процессе — с Д3б); остальные сети внутренние с изолированным шлюзом.
 
 ## Замена сертификата
 
