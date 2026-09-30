@@ -77,6 +77,9 @@ services:
       # временные файлы тел запросов и ответов core (Д5б) — на диске: tmpfs считался бы в mem_limit 64m, а ответ
       # core под /pcbk/api/oc/ — до 4 МиБ; каталоги proxy/ и client/ создаёт мастер nginx (proxy_temp_path)
       - {type: volume, source: pcbk-edge-temp, target: /var/lib/pcbk-edge}
+    # журнал с поворотом (итоговая доводка Д5б): отказы limit_req и limit_conn пишутся строкой на каждый запрос —
+    # поток отказов одной cookie не растит диск сервера без предела
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
     networks: [pcbk-public, pcbk-front]
     healthcheck:
       test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]

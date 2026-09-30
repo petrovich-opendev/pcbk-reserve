@@ -12,8 +12,8 @@ import pytest
 
 from helpers import PW, FakeMono, fail_connect, full_disk, store
 from pcbk_core.gateway import accounts
-from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, UNKNOWN_KEYS, AccountStore, StoreError,
-                                        hash_password, verify_password)
+from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, MAX_SESSIONS_PER_LOGIN, UNKNOWN_KEYS,
+                                        AccountStore, StoreError, hash_password, verify_password)
 from pcbk_core.gateway.accounts import main as accounts_main
 
 
@@ -124,6 +124,24 @@ def test_verify_and_sessions(tmp_path):
     tok = s.open_session("ivanov")
     s.disable("ivanov")
     assert s.session(tok) is None and s.verify("ivanov", "новый-пароль") is None
+
+
+def test_sessions_per_login_capped_oldest_closed(tmp_path, gwlog):                      # итоговая доводка Д5б, N2
+    clock = FakeMono(1000.0)
+    s = store(tmp_path, clock=clock)
+    s.add("ivanov", "student", 3, PW)
+    s.add("petrov", "student", 4, PW)
+    other = s.open_session("petrov")
+    tokens = []
+    for _ in range(MAX_SESSIONS_PER_LOGIN + 1):                                       # 4 входа, два устройства — не предел
+        tokens.append(s.open_session("ivanov"))
+        clock.advance(1)
+    assert MAX_SESSIONS_PER_LOGIN == 3
+    assert [s.session(t) is not None for t in tokens] == [False, True, True, True]     # закрыта самая старая
+    assert s.session(other).login == "petrov"                                          # чужие сессии не тронуты
+    assert "gw sessions evicted login=ivanov n=1" in gwlog.text
+    same = [s.open_session("ivanov") for _ in range(4)]                                # одно время открытия — по порядку
+    assert [s.session(t) is not None for t in tokens + same] == [False] * 5 + [True] * 3
 
 
 def test_login_lock_no_oracle_persisted_and_unlocked(tmp_path):

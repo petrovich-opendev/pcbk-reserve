@@ -19,12 +19,13 @@ map $uri $pcbk_api_csp {
     "~^/pcbk(?:/api(?:/|$)|-errors/)" "default-src 'none'";
 }
 
-# журнал доступа 8443 — без строки запроса (в ней бывает auth_token адаптера OpenCode): путь — сырой, до «?»
-map $request_uri $pcbk_log_path {
+# журнал доступа 8443 — без строки запроса (в ней бывает auth_token адаптера OpenCode): строка запроса клиента как
+# пришла — метод, сырой путь до «?» и версия; метод — из строки запроса, а не $request_method: после error_page тот — GET
+map $request $pcbk_log_request {
     default "-";
-    "~^([^?]*)" $1;
+    "~^(\S+) ([^?\s]*)\S* (\S+)$" "$1 $2 $3";
 }
-log_format pcbk '$remote_addr - $remote_user [$time_local] "$request_method $pcbk_log_path $server_protocol" '
+log_format pcbk '$remote_addr - $remote_user [$time_local] "$pcbk_log_request" '
                 '$status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_x_forwarded_for"';
 
 # /pcbk/api/oc/: одновременных запросов на cookie сессии и всего (Д5б). Ключ — значение cookie только своего вида
@@ -36,6 +37,12 @@ map $cookie_pcbk_session $pcbk_oc_session {
 }
 limit_conn_zone $pcbk_oc_session zone=pcbk_oc_session:1m;
 limit_conn_zone $server_port zone=pcbk_oc_all:1m;               # ключ один на server 8443 — общий предел
+# частота на cookie сессии (итоговая доводка Д5б, N1): вызовы — 20 в секунду с запасом 200 (одна таблица случаев —
+# 124 запроса подряд), и одна cookie не вымывает журнал core строками «gw refused». У потока — своя зона: адаптер
+# переподключается до 6 раз в секунду на вкладку (три вкладки — 18), а отказы потока core сам сворачивает в строку
+# в минуту; своя зона не даёт переподключениям съесть запас вызовов
+limit_req_zone $pcbk_oc_session zone=pcbk_oc_rate:1m rate=20r/s;
+limit_req_zone $pcbk_oc_session zone=pcbk_oc_event:1m rate=20r/s;
 
 # временные файлы тел запросов и ответов core — на томе pcbk-edge-temp (диск), не в tmpfs: tmpfs считается в
 # mem_limit 64m edge, а ответ core — до 4 МиБ (Д5-R36), тело /pcbk/api/oc/ — до 512 КиБ. Каталоги создаёт мастер
@@ -96,7 +103,7 @@ server {
     error_page 494 =400 /pcbk-errors/400.json;            # большие заголовки и cookie (cookie Dify на том же хосте)
     error_page 429 /pcbk-errors/429.json;
     error_page 502 503 504 =503 /pcbk-errors/503.json;    # «=503»: без него код остался бы 502 или 504
-    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn под /pcbk/api/oc/ (509 — только его код)
+    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn и limit_req под /pcbk/api/oc/ (509 — только их код)
 
     location = /pcbk-errors/400.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
     location = /pcbk-errors/405.json { internal; default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
@@ -208,7 +215,11 @@ server {
         limit_conn pcbk_oc_all 64;
         limit_conn_status 509;
         limit_conn_log_level warn;
+        limit_req zone=pcbk_oc_rate burst=200 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
         client_max_body_size 512k;
+        client_body_timeout 10s;                  # тело по байту в минуту не держит слот limit_conn (N2)
         proxy_request_buffering on;
         proxy_buffers 4 32k;
         proxy_max_temp_file_size 8m;
@@ -226,7 +237,11 @@ server {
         limit_conn pcbk_oc_all 64;
         limit_conn_status 509;
         limit_conn_log_level warn;
+        limit_req zone=pcbk_oc_event burst=60 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
         client_max_body_size 512k;
+        client_body_timeout 10s;
         proxy_request_buffering on;
         proxy_buffers 4 32k;
         proxy_buffering off;

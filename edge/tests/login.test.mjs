@@ -362,9 +362,11 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     "map $uri $pcbk_api_csp {",                                                        // путь после нормализации и error_page
     `"~^/pcbk(?:/api(?:/|$)|-errors/)" "default-src 'none'";`,
     "add_header Content-Security-Policy $pcbk_api_csp always;",
-    "map $request_uri $pcbk_log_path {",                                               // журнал доступа без строки запроса
-    '"~^([^?]*)" $1;',
-    `'$remote_addr - $remote_user [$time_local] "$request_method $pcbk_log_path $server_protocol" '`,
+    "map $request $pcbk_log_request {",                                                // журнал доступа без строки запроса,
+    '"~^(\\S+) ([^?\\s]*)\\S* (\\S+)$" "$1 $2 $3";',                                  // метод — исходный (Б5-m1)
+    `'$remote_addr - $remote_user [$time_local] "$pcbk_log_request" '`,
+    "limit_req_zone $pcbk_oc_session zone=pcbk_oc_rate:1m rate=20r/s;",                // N1
+    "limit_req_zone $pcbk_oc_session zone=pcbk_oc_event:1m rate=20r/s;",
     "access_log /var/log/nginx/access.log pcbk;",
     "map $cookie_pcbk_session $pcbk_oc_session {",
     '"~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;',
@@ -393,7 +395,8 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     'if ($host !~* "^[a-z0-9-]{1,63}(\\.[a-z0-9-]{1,63}){0,5}$") { rewrite ^ /pcbk-errors/host.json last; }',
   ]) assert.ok(conf.includes(line), line);
   assert.doesNotMatch(conf, /^\s*"" "";/m);                                           // запросы без cookie — не мимо предела
-  assert.doesNotMatch(conf, /\$request(?![_a-z])/);                                    // строка запроса целиком — нигде
+  assert.equal(conf.match(/\$request(?![_a-z])/g).length, 1);                           // строка запроса целиком — только
+  assert.ok(conf.includes("map $request $pcbk_log_request {"));                          // источник карты журнала
 
   for (const l of locs) {                                                              // всё это — уровень server
     assert.doesNotMatch(l.body, /error_page[^;]*pcbk-errors/, l.path);
@@ -461,10 +464,13 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     const b = loc(path).body;
     for (const line of ["proxy_pass http://$pcbk_core;", "if ($pcbk_bad_api_uri) { return 400", "client_max_body_size 512k;",
                         "limit_conn pcbk_oc_session 10;", "limit_conn pcbk_oc_all 64;", "limit_conn_status 509;",
-                        "limit_conn_log_level warn;", "proxy_request_buffering on;", "proxy_buffers 4 32k;"])
+                        "limit_conn_log_level warn;", "proxy_request_buffering on;", "proxy_buffers 4 32k;",
+                        "limit_req_status 509;", "limit_req_log_level warn;", "client_body_timeout 10s;"])
       assert.ok(b.includes(line), `${path}: ${line}`);
-    assert.doesNotMatch(b, /limit_req/, path);
+    assert.doesNotMatch(b, /zone=pcbk_login/, path);                                     // корзина входа — не здесь
   }
+  assert.ok(loc("/pcbk/api/oc/").body.includes("limit_req zone=pcbk_oc_rate burst=200 nodelay;"));   // N1: ≥ 124
+  assert.ok(loc("/pcbk/api/oc/event").body.includes("limit_req zone=pcbk_oc_event burst=60 nodelay;"));
   const call = loc("/pcbk/api/oc/").body;                                               // срок edge больше хода core (25 с)
   assert.ok(call.includes("proxy_read_timeout 45s;") && call.includes("proxy_max_temp_file_size 8m;"));
   assert.doesNotMatch(call, /proxy_buffering off|proxy_max_temp_file_size 0/);          // ответ core читается без остановки

@@ -162,8 +162,10 @@ _OCTET = r"(0|[1-9][0-9]{0,2})"
 _STU_NET = re.compile(_OCTET + r"\." + _OCTET)
 # тексты ошибок GW_* — не длиннее 60 знаков: config_error «настройки шлюза: …» со сбоем базы — до 80
 GW_ERROR_CHARS = 60
-# предел тела /pcbk/api/oc/ — не меньше предела остальных ручек шлюза (64 КиБ)
+# предел тела /pcbk/api/oc/ — не меньше предела остальных ручек шлюза (64 КиБ) и не больше 4 МиБ (итоговая доводка
+# Д5б, N8): тела держит общий бюджет 16 МиБ, и одно тело сверх 4 МиБ заняло бы его четверть
 GW_MAX_BODY_MIN = 65536
+GW_MAX_BODY_MAX = 4 * 1024 * 1024
 
 
 def _gw_float(name: str, raw: str, ok: Callable[[float], bool], rule: str) -> float:
@@ -202,9 +204,9 @@ def _stu_net(raw: str) -> str:
 
 
 def _gw_max_body(raw: str) -> int:
-    """Целое число байт в записи из цифр, не меньше GW_MAX_BODY_MIN; «1e6», «0x…», дроби — ошибка."""
-    if not (raw.isascii() and raw.isdigit()) or len(raw) > 12 or int(raw) < GW_MAX_BODY_MIN:
-        raise ValueError(f"GW_MAX_BODY_BYTES: нужно целое не меньше {GW_MAX_BODY_MIN}")
+    """Целое число байт в записи из цифр, от GW_MAX_BODY_MIN до GW_MAX_BODY_MAX; «1e6», «0x…», дроби — ошибка."""
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 12 or not GW_MAX_BODY_MIN <= int(raw) <= GW_MAX_BODY_MAX:
+        raise ValueError(f"GW_MAX_BODY_BYTES: нужно целое от {GW_MAX_BODY_MIN} до {GW_MAX_BODY_MAX}")
     return int(raw)
 
 

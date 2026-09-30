@@ -38,6 +38,7 @@ MAX_TITLE = 200
 MAX_ANSWER_LISTS = 10
 MAX_ANSWERS = 20
 MAX_ANSWER_CHARS = 2000
+MAX_ARCHIVED = 2**53 - 1                      # отметка архива — целое, точное в числе JavaScript (Б2-m1)
 APPROVABLE = frozenset({"doom_loop"})         # разрешения, которые студент одобряет сам «once» (Д5-R34)
 
 AGENT_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -125,7 +126,7 @@ def build_prompt(body: Any) -> dict:
 
 
 def build_update(body: Any) -> dict:
-    """PATCH /session/{SES}: title (1–200 знаков) и/или time.archived (целое ≥ 0 или null); пусто — 400."""
+    """PATCH /session/{SES}: title (1–200 знаков) и/или time.archived (целое от 0 до 2**53 − 1 или null); пусто — 400."""
     if not isinstance(body, dict):
         raise _bad("bad_body")
     out: dict = {}
@@ -141,7 +142,7 @@ def build_update(body: Any) -> dict:
             archived = time["archived"]
             # bool — подкласс int в Python, он не отметка времени; null — как есть (Ш13): 1.18.33 отвечает 200 и
             # не снимает архив
-            if archived is not None and not (type(archived) is int and archived >= 0):
+            if archived is not None and not (type(archived) is int and 0 <= archived <= MAX_ARCHIVED):
                 raise _bad("archived")
             out["time"] = {"archived": archived}
     if not out:

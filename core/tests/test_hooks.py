@@ -288,6 +288,49 @@ async def test_body_budget_counts_chunked_and_frees_on_abort():
 
 
 @pytest.mark.anyio
+@pytest.mark.anyio
+async def test_body_budget_freed_on_refusal_mid_body():                        # Б3-m1: отказ на втором куске
+    h = AppHooks()
+    h.body_limit("/b/", 100, budget=150, over_budget=lambda scope: JSONResponse({}, status_code=503),
+                 respond=lambda scope, limit: JSONResponse({"too": "large"}, status_code=413))
+    budget = h.budget_for("/b/")
+    reached = []
+
+    async def app(scope, receive, send):
+        reached.append(1)
+        await JSONResponse({})(scope, receive, send)
+
+    async def run(parts, used_before):
+        chunks = [{"type": "http.request", "body": b"x" * n, "more_body": i < len(parts) - 1}
+                  for i, n in enumerate(parts)]
+        sent = []
+
+        async def receive():
+            return chunks.pop(0)
+
+        async def send(message):
+            sent.append(message)
+        budget.used = used_before
+        await BodyLimit(app, hooks=h)(_post("/b/x", None), receive, send)
+        return sent[0]["status"], budget.used
+
+    assert await run([60, 35], 60) == (503, 60)                 # второй кусок не влез в бюджет — первый возвращён
+    assert await run([60, 50], 0) == (413, 0)                   # предел превышен посреди чтения — тоже
+    assert await run([60, 30], 0) == (200, 0) and reached == [1]   # положительный контроль: влезло — дошло
+
+
+def test_body_budget_over_return_is_logged(gwlog):                              # Б3-m2: двойной возврат виден
+    h = AppHooks()
+    h.body_limit("/b/", 100, budget=150, over_budget=lambda scope: JSONResponse({}, status_code=503))
+    budget = h.budget_for("/b/")
+    assert budget.take(40)
+    budget.give(40)
+    assert "body_budget_over_return" not in gwlog.text                         # честный возврат — молча
+    budget.give(40)
+    assert budget.used == 0 and "outcome=body_budget_over_return used=0 returned=40 total=150" in gwlog.text
+
+
+@pytest.mark.anyio
 async def test_body_budget_not_for_other_zones():
     h = AppHooks()
     h.body_limit("/b/", 100, budget=1000, over_budget=lambda scope: JSONResponse({}, status_code=404),

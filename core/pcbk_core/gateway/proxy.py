@@ -43,7 +43,8 @@ not_ready: без счётчика, строка журнала — одна н�
 Transfer-Encoding) — 400 bad_body до потока места: иначе тело держало бы общий бюджет тел всю жизнь потока. Затем
 поток места (Workplaces.stream): срок заголовков STREAM_OPEN_S и ошибка соединения — 503 no_answer, место неготово,
 upstream_failed; занятый пул клиента места — 503 busy, как у вызовов; 401 — 502 place_auth; иначе не 200 — 503
-no_answer; сжатый поток — как нет ответа. Слот учётки занимается только после 200 места, прямо перед
+no_answer и upstream_failed без снятия «готово», строка — одна на место за NOT_READY_LOG_S (итоговая доводка Д5б,
+N4: адаптер переподключается до 6 раз в секунду); сжатый поток — как нет ответа. Слот учётки занимается только после 200 места, прямо перед
 StreamingResponse (гонка вкладок — тот же 429); владение слотом и потоком места ответ принимает в момент return, до
 него их возвращает finally обработчика (сначала слот, затем поток места).
 
@@ -57,10 +58,12 @@ closed_by=session; STREAM_STORE_FAILURES сбоев базы подряд — cl
 поток живёт не дольше STREAM_MAX_S (closed_by=lifetime, без stream_broken; доводка Б5, L2): зависшая вкладка, которая
 поглощает пульс места, не держит слот учётки часами — send_timeout edge её не видит, адаптер переподключается сам.
 Срок жизни сверяется на каждом событии и на каждом сроке ожидания очереди.
-release() идемпотентна своим флагом: слот, отмена читателя, строка «gw event place=NN closed_by=… s=N», ожидание
+release() идемпотентна своим флагом: слот, отмена читателя, строка «gw event place=NN closed_by=… s=N» (WARNING — у
+timeout, oversize, store и у обрыва места с классом исключения, N5), ожидание
 читателя и закрытие потока места под щитом от отмены; её зовут finally генератора и BackgroundTask ответа (Starlette
 зовёт его и тогда, когда браузер ушёл до первого шага генератора), а остановка роли (lifespan) закрывает ещё открытые
-потоки и дожидается закрытия (_EventStream.shutdown). Поток место не будит и простой не продлевает (touch не
+потоки и дожидается закрытия (_EventStream.shutdown) — всех вместе не дольше STREAM_SHUTDOWN_S (Б4-m2). В реестр
+потоков роли ответ попадает, только когда принял владение (Б4-m3). Поток место не будит и простой не продлевает (touch не
 зовётся, Д5-R35).
 """
 from __future__ import annotations
@@ -100,6 +103,7 @@ log = logging.getLogger("pcbk_core.gateway.proxy")
 OC_PREFIX = PREFIX + "/oc"
 _RAW_PREFIX = OC_PREFIX.encode("ascii")
 UPSTREAM_MAX_BYTES = 4 * 1024 * 1024        # ответ места в памяти шлюза (Д5-R36)
+PLACE_LIST_MAX_BYTES = 1024 * 1024          # списки сверки /agent и /permission (итоговая доводка Д5б, N3): не история
 SEND_CHUNK = 64 * 1024                      # кусок отправки ответа места браузеру (G1)
 PROXY_DEADLINE_S = 25.0                     # весь ход вызова; edge на /pcbk/api/oc/ ждёт 45 с (Д5-R30)
 # ожидание слота места внутри срока хода: месту после слота — не меньше PLACE_READ_S (H1)
@@ -121,6 +125,7 @@ SSE_MAX_EVENT_BYTES = 512 * 1024
 # при 1 (порог ~80 МиБ); поток держит ещё кусок в send Starlette и копию в буфере uvicorn — их в формуле R36 не было
 STREAM_QUEUE_MAX = 1
 STREAM_CLOSE_S = 5.0                        # ожидание читателя и закрытие потока места в release — каждое не дольше
+STREAM_SHUTDOWN_S = 3.0                     # остановка роли ждёт закрытия всех потоков вместе не дольше (Б4-m2)
 STREAM_STORE_FAILURES = 3                   # сбоев базы подряд при перепроверке сессии — конец потока (closed_by=store)
 STREAM_MAX_S = 1800.0                       # предел жизни потока (closed_by=lifetime); читается при открытии потока
 _BROKEN = ("timeout", "oversize")           # концы потока, которые считаются stream_broken
@@ -311,8 +316,8 @@ async def _body(request: Request, rule: Rule) -> dict | None:
 
 async def _place_list(role: GatewayRole, n: int, path: str) -> tuple[list, int]:
     """GET списка своего места (/agent, /permission) и код ответа: 401 — _PlaceAuth; не 200, не JSON, не список —
-    пустой список."""
-    answer = await role.workplaces.fetch(n, "GET", path, max_bytes=UPSTREAM_MAX_BYTES)
+    пустой список. Больше PLACE_LIST_MAX_BYTES — PlaceAnswerTooLarge (502 too_big у вызова)."""
+    answer = await role.workplaces.fetch(n, "GET", path, max_bytes=PLACE_LIST_MAX_BYTES)
     if answer.status == 401:
         raise _PlaceAuth()
     if answer.status != 200:
@@ -532,7 +537,6 @@ class _EventStream:
         self._store_failures = 0
         self._started = time.monotonic()
         self._ends_at = self._started + STREAM_MAX_S    # предел жизни потока (L2)
-        role.event_streams.add(self)                # остановка роли дождётся закрытия (shutdown)
 
     async def _read(self) -> None:
         """Читатель: события filter_sse — в очередь, в конце — метка _End. Исключения места — только классом (Ш11)."""
@@ -622,7 +626,7 @@ class _EventStream:
             if closed_by in _BROKEN:
                 self.role.stats.event("stream_broken")
             tail = f" error={error}" if error else ""
-            (log.warning if closed_by in _WARN_ENDS else log.info)(
+            (log.warning if closed_by in _WARN_ENDS or error else log.info)(      # N5: обрыв места с классом
                 "gw event place=%02d closed_by=%s s=%d%s", self.n, closed_by,
                 round(time.monotonic() - self._started), tail)
             if reader is not None:
@@ -660,6 +664,7 @@ _EVENT_RULE = next(rule for rule in RULES if rule.kind == "event")
 
 async def stream_events(role: GatewayRole, account: Account, token: str, n: int, *, call: _Call | None = None,
                         not_ready: _RolledRefusals | None = None, streams: _RolledRefusals | None = None,
+                        not_stream: _RolledRefusals | None = None,
                         has_body: bool = False) -> Response:
     """Поток /event места n учётки account (сессия token): порядок проверок и владение слотом — в описании модуля.
     call — поля строк журнала; not_ready и streams — свёртки строк этих отказов прокси; has_body — у запроса есть
@@ -691,8 +696,12 @@ async def stream_events(role: GatewayRole, account: Account, token: str, n: int,
             role.stats.event("place_auth_failed")
             _oc_line(call, _EVENT_RULE, 502, started, " reason=place_auth", warn=True)
             return gw_error(502, "BadGateway", PROXY_MESSAGES["place_auth"])
-        if status != 200:
-            _oc_line(call, _EVENT_RULE, 503, started, f" reason=no_answer place_status={status}", warn=True)
+        if status != 200:                           # N4: место живо, но не отдаёт поток — счётчик, строка свёрнута
+            role.stats.event("upstream_failed")
+            rolled = not_stream.refused(n) if not_stream is not None else (1, 0)
+            if rolled is not None:
+                _oc_line(call, _EVENT_RULE, 503, started, " reason=no_answer place_status=%d n=%d since_s=%d"
+                         % (status, *rolled), warn=True)
             return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["no_answer"])
         if response.headers.get("content-encoding", "").strip().lower() not in ("", "identity"):
             role.workplaces.mark_unready(n)         # как сжатый ответ вызова (PlaceAnswerEncoded): не разобрать
@@ -705,6 +714,7 @@ async def stream_events(role: GatewayRole, account: Account, token: str, n: int,
         stream = _EventStream(role, login, token, n, opened, response)
         _oc_line(call, _EVENT_RULE, 200, started)
         owned = True                                # слот и поток места — у ответа: освободит release()
+        role.event_streams.add(stream)              # остановка роли дождётся закрытия (shutdown); после owned (Б4-m3)
         return StreamingResponse(stream.events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                                  background=BackgroundTask(stream.release))
@@ -724,11 +734,11 @@ def proxy_router(role: GatewayRole) -> APIRouter:
     вход — у обработчика; ставится до catch_all_router."""
     router = APIRouter(dependencies=[Depends(front_only), Depends(configured(role))])
     account_of = current_account(role)
-    not_ready, streams = _RolledRefusals(role.monotonic), _RolledRefusals(role.monotonic)
+    not_ready, streams, not_stream = (_RolledRefusals(role.monotonic) for _ in range(3))
     gate = _PlaceGate()
 
     async def oc(request: Request, account: Account = Depends(account_of)) -> Response:
-        return await _proxy(role, request, account, not_ready, streams, gate)
+        return await _proxy(role, request, account, not_ready, streams, gate, not_stream)
 
     for path in (OC_PREFIX + "/{rest:path}", OC_PREFIX):
         router.add_api_route(path, oc, methods=list(METHODS), include_in_schema=False)
@@ -736,7 +746,7 @@ def proxy_router(role: GatewayRole) -> APIRouter:
 
 
 async def _proxy(role: GatewayRole, request: Request, account: Account, not_ready: _RolledRefusals,
-                 streams: _RolledRefusals, gate: _PlaceGate) -> Response:
+                 streams: _RolledRefusals, gate: _PlaceGate, not_stream: _RolledRefusals | None = None) -> Response:
     method, n = request.method, account.place
     call = _Call(account.login, "-" if n is None else f"{n:02d}", method, _log_path(request.scope))
     rest = _raw_rest(request.scope)
@@ -752,7 +762,7 @@ async def _proxy(role: GatewayRole, request: Request, account: Account, not_read
 
     if rule.kind == "event":                        # поток /event: свой порядок проверок (stream_events)
         return await stream_events(role, account, session_tokens(request)[0], n, call=call, not_ready=not_ready,
-                                   streams=streams, has_body=_has_body(request))
+                                   streams=streams, not_stream=not_stream, has_body=_has_body(request))
     if not role.workplaces.is_ready(n):             # не будит: будит только страница входа
         return _not_ready(call, n, not_ready)
     if rule.kind == "summarize":                    # сжатие разговора на стенде не нужно: ответ без места

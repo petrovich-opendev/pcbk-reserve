@@ -59,6 +59,18 @@ def test_two_session_cookies_refused(tmp_path):                                 
     assert role.store.session(own) is None and role.store.session(other) is None        # обе закрыты на сервере
 
 
+def test_fourth_login_closes_oldest_session(tmp_path):                                  # итоговая доводка Д5б, N2
+    app, _ = make_gateway(tmp_path)
+    cookies = []
+    with TestClient(app, base_url=BASE) as c:
+        for _ in range(4):                                                              # четыре устройства одного студента
+            c.cookies.clear()
+            cookies.append(login(c, "stu-03").cookies["pcbk_session"])
+        c.cookies.clear()
+        codes = [c.get("/pcbk/api/auth/me", headers={"Cookie": f"pcbk_session={v}"}).status_code for v in cookies]
+    assert len(set(cookies)) == 4 and codes == [401, 200, 200, 200]                    # первая cookie — вход заново
+
+
 def rfc_paths(path):                                                                    # RFC 6265 §5.1.4
     parts = path.strip("/").split("/")
     heads = ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]

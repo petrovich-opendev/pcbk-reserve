@@ -1,6 +1,7 @@
 import itertools
 import json
 import time
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -930,14 +931,15 @@ def test_gateway_off_contract_reply_has_own_text(fake_core):                    
                 gw(running_n=True), gw(ready_n=1.0), gw(wake_ok_1h=None), gw(wake_failed_1h="0"),
                 gw(stop_failed_1h=0.5), gw(place_auth_failed_1h=False), gw(logins_failed_1h=[]),
                 gw(origin_refused_1h={}), gw(login_busy_1h="1"), gw(cookies_duplicate_1h=None), gw(drill=None),
-                gw(refused_1h="7"), gw(streams=None), gw(stream_broken_1h=True), gw(upstream_failed_1h=1.5),
+                # ключи Д5б — только полным набором (gw5): у gw() с одним ключом отказ был бы за неполноту (Б1-m1)
+                gw5(refused_1h="7"), gw5(streams=None), gw5(stream_broken_1h=True), gw5(upstream_failed_1h=1.5),
                 # доводка по ревью А1: I1 — sp_ctl вне договора; M1 — отрицательные счётчики;
                 # M2 — пустая причина настройки; M3 — неизвестный режим учений
                 gw(sp_ctl="DOWN"), gw(sp_ctl=""), gw(sp_ctl="up"), gw(sp_ctl="down "),
                 gw(wake_ok_1h=-1), gw(running_n=-1), gw(ready_n=-2), gw(wake_failed_1h=-3), gw(stop_failed_1h=-1),
                 gw(place_auth_failed_1h=-1), gw(logins_failed_1h=-30), gw(origin_refused_1h=-1),
-                gw(login_busy_1h=-1), gw(cookies_duplicate_1h=-1), gw(refused_1h=-1), gw(streams=-1),
-                gw(stream_broken_1h=-1), gw(upstream_failed_1h=-1),
+                gw(login_busy_1h=-1), gw(cookies_duplicate_1h=-1), gw5(refused_1h=-1), gw5(streams=-1),
+                gw5(stream_broken_1h=-1), gw5(upstream_failed_1h=-1),
                 gw(config_error=""), gw(config_error="   "), gw(config_error="\n\t"),
                 gw(drill="x"), gw(drill=" "), gw(drill="FREEZE_REAPER"), gw(drill="freeze_reaper "),
                 gw(drill="freeze_poll")):
@@ -953,7 +955,7 @@ def test_gateway_reply_accepts_whole_contract(fake_core):                       
         assert GatewayReply.parse(gw(sp_ctl=state)).sp_ctl == state
     for mode in ("", *sorted(GW_DRILL_MODES)):
         assert GatewayReply.parse(gw(drill=mode)).drill == mode
-    zeros = gw(running_n=0, ready_n=0, wake_ok_1h=0, refused_1h=0, streams=0, stream_broken_1h=0, upstream_failed_1h=0)
+    zeros = gw5(running_n=0, ready_n=0, wake_ok_1h=0)
     assert GatewayReply.parse(zeros).running_n == 0
     assert (gate_check(fake_core, gw(sp_ctl="unknown")).state, gate_check(fake_core, gw(sp_ctl="unknown")).detail) == \
            ("ok", "принимает вход")
@@ -994,6 +996,7 @@ def gw5(age=5, **kw):
 
 def test_gateway_d5b_keys_all_or_none(fake_core):                                # решение контроллера 1
     assert (GW_KEYS_D5A, GW_KEYS_D5B) == (set(gw()), set(D5B_KEYS))
+    assert GW_KEYS_D5A | GW_KEYS_D5B == {f.name for f in fields(GatewayReply)}      # Б1-m3: договор = поля разбора
     assert len(gw5()) == 19 and GatewayReply.parse(gw5()).streams == 0
     partial = [{k: v for k, v in gw5().items() if k not in dropped}                # 1–3 из 4 ключей
                for n in (1, 2, 3) for dropped in itertools.combinations(D5B_KEYS, n)]

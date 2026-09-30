@@ -166,7 +166,8 @@ def test_constants_pinned():
     for prefix, rx in ID_RE.items():
         assert rx.fullmatch(f"{prefix}_" + "aZ09" * 6 + "xY")
         for bad in (f"{prefix}_" + "a" * 25, f"{prefix}_" + "a" * 27, f"{prefix}_" + "a" * 25 + "-",
-                    f"{prefix}_" + "a" * 25 + "я", f"{prefix}_" + "a" * 25 + "\n", "xxx_" + "a" * 26):
+                    f"{prefix}_" + "a" * 25 + "я", f"{prefix}_" + "a" * 25 + "\n", "xxx_" + "a" * 26,
+                    f"{prefix.upper()}_" + "a" * 26, f"{prefix.capitalize()}_" + "a" * 26):   # Б2-m2: префикс строчными
             assert not rx.fullmatch(bad), (prefix, bad)
     assert ALLOWED_EVENTS == frozenset({
         "session.created", "session.updated", "session.deleted", "session.status", "session.idle",
@@ -225,10 +226,10 @@ def test_limits_at_boundary():
     assert build_answers({"answers": full}) == {"answers": full}
     assert build_answers({"answers": []}) == {"answers": []}
     assert build_answers({"answers": [[""]]}) == {"answers": [[""]]}
-    for archived in (0, 1, 1_790_000_000_000):
+    for archived in (0, 1, 1_790_000_000_000, 2**53 - 1):                              # Б2-m1: граница числа JS
         assert build_update({"time": {"archived": archived}, "title": "t"}) == \
                {"title": "t", "time": {"archived": archived}}
-    for archived in (-1, 1.5, 1.0, True, False, "1", [], {}):
+    for archived in (-1, 1.5, 1.0, True, False, "1", [], {}, 2**53, 10**30):
         with pytest.raises(Refused):
             build_update({"time": {"archived": archived}})
     for body in ({"time": {}}, {"time": None}, {"time": "x"}, {"title": None}, {"title": 5}, [], None, "x"):

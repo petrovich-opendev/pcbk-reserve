@@ -88,6 +88,10 @@ class BodyBudget:
         return True
 
     def give(self, n: int) -> None:
+        """Вернуть n байт. Вернуть больше занятого — ошибка учёта (двойной возврат): строка WARNING, а не тихая
+        обрезка (Б3-m2); занятое — не ниже нуля, иначе бюджет вырос бы сверх total."""
+        if n > self.used:
+            log.warning("outcome=body_budget_over_return used=%d returned=%d total=%d", self.used, n, self.total)
         self.used = max(0, self.used - n)
 
 

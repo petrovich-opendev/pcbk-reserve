@@ -6,6 +6,7 @@ OpenCode мест — опасные ручки и близнецы, искаж�
 места к концу, в том числе в finally фикстуры users (Ш16). Истина о состоянии места — stack.oc (из сети места, мимо
 шлюза). Пароли и cookie — только в запросах: в assert — коды, имена и индексы, не значения.
 """
+import http.client
 import json
 import re
 import secrets
@@ -28,6 +29,9 @@ OWN_PLACES = (6, 7, 8)
 # пределы edge на /pcbk/api/oc/ (edge/pcbk.conf.template): на cookie сессии и всего
 EDGE_OC_PER_SESSION = 10
 EDGE_OC_TOTAL = 64
+EDGE_OC_RATE, EDGE_OC_BURST = 20, 200                   # limit_req на cookie (итоговая доводка Д5б, N1)
+EDGE_BODY_TIMEOUT_S = 10                                # client_body_timeout у /pcbk/api/oc/ (N2)
+TEACHER_TEXT = "Просмотр разговоров студентов — в следующих выпусках стенда"
 LOG_WAIT_S = 10
 SETTLE_S = 30
 # cookie всех сессий модуля (вход, вторая сессия, преподаватель, место 08) — для проверки журнала core на секреты
@@ -273,7 +277,8 @@ def test_origin_and_teacher(stack, users):
     assert (code, body["data"]["message"]) == (403, "Запрос не с нашей страницы — отклонён")
     t = stack.gw_client(); t.login("gw-t", PW["gw-t"])
     COOKIES.append(t.cookie)
-    assert t.call("GET", "/pcbk/api/oc/session/status")[0] == 403
+    code, body, _ = t.call("GET", "/pcbk/api/oc/session/status")
+    assert (code, body["name"], body["data"]["message"]) == (403, "Forbidden", TEACHER_TEXT)   # N7: отказ — «преподаватель»
 
 
 def test_duplicate_cookies_on_long_path_through_edge(stack, users):                     # Review Focus Д5а 2; Д5-R25, Д5-R30
@@ -346,6 +351,10 @@ def test_edge_limits_oc_connections(stack, users):                              
                (503, "WorkplaceBusy", "Слишком много одновременных запросов — повторите позже")
         assert b.call("GET", "/pcbk/api/oc/session/status")[0] == 200                 # сосед не задет
         assert core_creates(stack) == created                                          # медленные тела — не в core
+        t = time.monotonic()                                                           # N2: тело, не пришедшее за 10 с,
+        wait_for(lambda: a.call("GET", "/pcbk/api/oc/session/status")[0] == 200,       # edge обрывает — слоты свободны,
+                 timeout=EDGE_BODY_TIMEOUT_S + 10)                                      # хотя клиенты соединений не закрыли
+        assert time.monotonic() - t < EDGE_BODY_TIMEOUT_S + 5
     assert 'limiting connections by zone "pcbk_oc_session"' in stack.logs("pcbk-edge")
     wait_for(lambda: a.call("GET", "/pcbk/api/oc/session/status")[0] == 200, timeout=LOG_WAIT_S)
     with slow_bodies([None] * EDGE_OC_PER_SESSION):                                   # L1: без cookie — одна корзина
@@ -364,16 +373,69 @@ def test_edge_limits_oc_connections(stack, users):                              
     assert core_creates(stack) == created
 
 
-def test_secrets_not_in_core_logs_b(stack, users):                                      # Review Focus 5
-    a, _ = users
-    line = "path=/config reason=not_whitelisted"                                        # строка запроса в журнал не идёт
-    before = stack.logs("pcbk-core").count(line)
-    a.call("GET", "/pcbk/api/oc/config?auth_token=U0VDUkVUVkFMVUU=")
-    wait_for(lambda: stack.logs("pcbk-core").count(line) > before, timeout=LOG_WAIT_S)
+def flood(cookie: str, total: int, threads: int = 4) -> list[int]:
+    """total запросов GET /pcbk/api/oc/config (отказ правил — строка «gw refused» в core) одной cookie: threads потоков,
+    у каждого своё соединение keep-alive (HTTP/1.1), иначе рукопожатия TLS растянули бы поток дольше запаса."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    codes: list[int] = []
+    lock = threading.Lock()
+
+    def worker(n: int) -> None:
+        conn = http.client.HTTPSConnection(HOST, PORT, context=ctx, timeout=20)
+        try:
+            for _ in range(n):
+                for attempt in range(2):                                               # edge закрыл keep-alive — заново
+                    try:
+                        conn.putrequest("GET", "/pcbk/api/oc/config", skip_host=True, skip_accept_encoding=True)
+                        conn.putheader("Host", STAND_HOST)
+                        conn.putheader("Cookie", f"pcbk_session={cookie}")
+                        conn.endheaders()
+                        r = conn.getresponse()
+                        r.read()
+                        break
+                    except (http.client.HTTPException, OSError):
+                        conn.close()
+                        conn = http.client.HTTPSConnection(HOST, PORT, context=ctx, timeout=20)
+                        if attempt:
+                            raise
+                with lock:
+                    codes.append(r.status)
+        finally:
+            conn.close()
+
+    workers = [threading.Thread(target=worker, args=(total // threads,)) for _ in range(threads)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    return codes
+
+
+def test_edge_limits_oc_rate(stack, users):                                             # итоговая доводка Д5б, N1
+    f = stack.gw_client(); f.login("gw-a", PW["gw-a"])                                 # своя cookie — своя корзина
+    COOKIES.append(f.cookie)
+    rules0, _ = settled(lambda: refused_counts(stack))
+    t = time.monotonic()
+    codes = flood(f.cookie, 300)
+    elapsed = time.monotonic() - t
+    rules1, _ = settled(lambda: refused_counts(stack))
+    forbidden, busy = codes.count(403), codes.count(503)
+    assert (len(codes), forbidden + busy) == (300, 300) and busy > 0                    # часть — 503 от edge
+    assert rules1 - rules0 == forbidden <= EDGE_OC_BURST + 1 + EDGE_OC_RATE * elapsed   # журнал core — не больше запаса
+    assert "limiting requests" in stack.logs("pcbk-edge")
+    print(f"поток 300 запросов за {elapsed:.1f} с: 403 — {forbidden}, 503 — {busy}")
+    f.logout()                                                                         # сессия учётки — не лишняя (N2)
+
+
+def check_no_secrets_in_core_logs(stack, a):
+    """Журнал core — без значений секретов модуля: строки запроса, cookie всех сессий, паролей учёток, паролей мест
+    (сырой, base64 и Basic), токенов LLM и данных мест. В assert — полнота списка и индексы, не значения."""
     logs = stack.logs("pcbk-core")
     read = "gw refused" in logs and "gw oc login=gw-a" in logs                          # журнал прочитан
     assert read                                                                         # без печати журнала
-    cookies = [*dict.fromkeys([*COOKIES, a.cookie])]                   # все сессии модуля (L11): в полном прогоне — 6
+    cookies = [*dict.fromkeys([*COOKIES, a.cookie])]                   # все сессии модуля (L11): в полном прогоне — 7
     forbidden = ["U0VDUkVUVkFMVUU", *cookies, *PW.values(),
                  *(f for n in OWN_PLACES for f in (*secret_forms(stack.password(n)), stack.llm_token(n),
                                                    stack.data_token(n)))]
@@ -381,6 +443,15 @@ def test_secrets_not_in_core_logs_b(stack, users):                              
         and all(forbidden)                                                               # ни одного пустого
     leaked = [i for i, s in enumerate(forbidden) if s in logs]                          # индексы, не значения
     assert (complete, leaked) == (True, [])
+
+
+def test_secrets_not_in_core_logs_b(stack, users):                                      # Review Focus 5
+    a, _ = users
+    line = "path=/config reason=not_whitelisted"                                        # строка запроса в журнал не идёт
+    before = stack.logs("pcbk-core").count(line)
+    a.call("GET", "/pcbk/api/oc/config?auth_token=U0VDUkVUVkFMVUU=")
+    wait_for(lambda: stack.logs("pcbk-core").count(line) > before, timeout=LOG_WAIT_S)
+    check_no_secrets_in_core_logs(stack, a)
 
 
 def test_hung_place_is_workplace_not_ready(stack, users):                               # Review Focus 5
@@ -408,6 +479,14 @@ def test_event_ends_when_place_stops(stack, users):
     assert events and events[0]["type"] == "server.connected"                          # поток был открыт
     assert 3 < lasted < 20                                                              # конец потока места — конец браузеру
     assert b.call("GET", "/pcbk/api/oc/session/status")[1]["name"] == "WorkplaceNotReady"
+
+
+def test_secrets_not_in_core_logs_after_failures(stack, users):                         # N6: после исключений мест
+    """Зависшее и остановленное место дают исключения httpx в прокси и потоке — журнал core сверяется ещё раз, до
+    пересоздания core последним тестом (новый контейнер — новый журнал)."""
+    a, _ = users
+    assert "error=" in stack.logs("pcbk-core")                                          # исключения мест в журнале есть
+    check_no_secrets_in_core_logs(stack, a)
 
 
 def test_event_is_not_activity(stack, users):                                           # Review Focus 4; последний

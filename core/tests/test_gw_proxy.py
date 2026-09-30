@@ -227,7 +227,8 @@ def test_oc_body_limit_from_settings(tmp_path):
 def test_gw_max_body_setting():
     assert GatewaySettings().GW_MAX_BODY_BYTES == 524288
     assert GatewaySettings.from_env({"GW_MAX_BODY_BYTES": "65536"}).GW_MAX_BODY_BYTES == 65536
-    for bad in ("65535", "abc", "1e6", "-1", "524288.5", "0x10000"):
+    assert GatewaySettings.from_env({"GW_MAX_BODY_BYTES": "4194304"}).GW_MAX_BODY_BYTES == 4194304   # N8: граница
+    for bad in ("65535", "abc", "1e6", "-1", "524288.5", "0x10000", "4194305", "999999999999"):
         with pytest.raises(ValueError) as e:
             GatewaySettings.from_env({"GW_MAX_BODY_BYTES": bad})
         text = str(e.value)
@@ -855,3 +856,20 @@ def test_missing_content_type_on_body_is_octet_stream(gw):                      
     place.force_status[3] = (200, {"content-type": None})
     r = c.get(STATUS)
     assert (r.status_code, r.headers["content-type"], r.content) == (200, OCTET_STREAM, b'{"name":"Forced"}')
+
+
+# --- итоговая доводка Д5б ---
+
+def test_check_lists_read_up_to_one_mib(gw):                                             # N3: сверка — не история
+    c, role, place = gw
+    assert proxy.PLACE_LIST_MAX_BYTES == 1024 * 1024
+    probe = {"name": "probe", "native": False, "mode": "primary"}
+    body = {"parts": [{"type": "text", "text": "x"}], "agent": "probe"}
+    url = f"/pcbk/api/oc/session/{SES}/prompt_async"
+    place.agents[3] = [probe, {"name": "pad", "description": "x" * (900 * 1024)}]       # меньше 1 МиБ — сверка проходит
+    assert c.post(url, json=body, headers=oc_headers()).status_code == 204
+    place.agents[3] = [probe, {"name": "pad", "description": "x" * (1024 * 1024)}]      # больше — 502, к месту ни шагу
+    sent = len(place.requests)
+    r = c.post(url, json=body, headers=oc_headers())
+    assert (r.status_code, r.json()["data"]["message"]) == (502, PROXY_MESSAGES["too_big"])
+    assert [x.path for x in place.requests[sent:]] == ["/agent"] and role.workplaces.is_ready(3)

@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 from fake_places import sse
 from helpers import (ORIGIN, SETTINGS, DummyRole, gateway_role, login, login_cookie, make_gateway, serve_app,
-                     wait_until)
+                     wait_until, wait_until_async)
 from pcbk_core import main
 from pcbk_core.app import create_app
 from pcbk_core.gateway import places, proxy
@@ -438,7 +438,7 @@ def test_event_open_answers_mapped(tmp_path, gwlog):                            
         r = c.get("/pcbk/api/oc/event")
         assert (r.status_code, r.json()) == (503, {"name": "WorkplaceNotReady",
                                                    "data": {"message": PROXY_MESSAGES["no_answer"]}})
-        assert role.workplaces.is_ready(3) and role.stats.count_1h("upstream_failed") == 0
+        assert role.workplaces.is_ready(3) and role.stats.count_1h("upstream_failed") == 1   # N4: счёт без снятия
         fp.force_status[3] = (200, {"content-encoding": "gzip"})                         # сжатый поток не разобрать
         assert c.get("/pcbk/api/oc/event").status_code == 503
         fp.force_status.pop(3)
@@ -459,7 +459,7 @@ def test_event_open_answers_mapped(tmp_path, gwlog):                            
     assert "rule=event status=503" in text and "place_status=500" in text and "error=RemoteProtocolError" in text
     assert "zqMARKqz" not in text
     assert role.stats.count_1h("place_auth_failed") == 1 and role.stats.streams == 0 and fp.event_open[3] == 0
-    assert role.stats.count_1h("upstream_failed") == 2                                   # сжатый поток и обрыв
+    assert role.stats.count_1h("upstream_failed") == 3                                   # 500, сжатый поток и обрыв
 
 
 def test_teacher_has_no_stream(tmp_path):
@@ -864,3 +864,76 @@ def test_stream_lifetime_checked_on_queue_wait(tmp_path, gwlog, monkeypatch):   
         wait_until(lambda: fp.event_open[3] == 0, timeout=3)
     assert lasted < 1.5 and body == EV("server.connected")                             # не ждал ни паузы, ни перепроверки
     assert "closed_by=lifetime" in gwlog.text and role.stats.streams == 0
+
+
+# --- итоговая доводка Д5б ---
+
+def test_event_not_stream_counted_and_rolled(tmp_path, gwlog):                          # N4
+    app, role = make_gateway(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.force_status[3] = (500, {})                                                       # место живо, но не отдаёт поток
+    with TestClient(app, base_url=BASE) as c:
+        login(c, "stu-03")
+        codes = [c.get("/pcbk/api/oc/event").status_code for _ in range(5)]           # цикл переподключения адаптера
+    assert codes == [503] * 5 and role.workplaces.is_ready(3)                           # «готово» не снято
+    assert role.stats.count_1h("upstream_failed") == 5                                   # сторож видит каждый
+    lines = re.findall(r"WARNING \S+ gw oc login=stu-03 place=03 rule=event status=503 ms=[0-9]+ reason=no_answer "
+                       r"place_status=500 n=([0-9]+) since_s=[0-9]+", gwlog.text)
+    assert lines == ["1"]                                                                # строка — одна на место за минуту
+
+
+def test_place_error_mid_stream_is_warning(tmp_path, gwlog):                            # N5
+    app, role = make_gateway(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = [EV("server.connected"), ("raise", httpx.ReadError("x"))]
+    with TestClient(app, base_url=BASE) as c:
+        login(c, "stu-03")
+        with c.stream("GET", "/pcbk/api/oc/event") as r:
+            b"".join(r.iter_bytes())
+        fp.events[3] = [EV("server.connected")]                                          # штатный конец места — INFO
+        with c.stream("GET", "/pcbk/api/oc/event") as r:
+            b"".join(r.iter_bytes())
+    assert re.search(r"WARNING \S+ gw event place=03 closed_by=place s=[0-9]+ error=ReadError", gwlog.text)
+    assert re.search(r"INFO \S+ gw event place=03 closed_by=place s=[0-9]+\n", gwlog.text)
+
+
+async def test_stream_registered_only_when_owned(tmp_path, monkeypatch):                 # Б4-m3
+    role = gateway_role(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = "endless"
+    real = proxy._oc_line
+
+    def failing(call, rule, status, started, tail="", *, warn=False):                   # сбой между сборкой и владением
+        if status == 200:
+            raise RuntimeError("сбой строки журнала")
+        real(call, rule, status, started, tail, warn=warn)
+
+    monkeypatch.setattr(proxy, "_oc_line", failing)
+    with pytest.raises(RuntimeError):
+        await stream_events(role, STU03, "token", 3)
+    assert not role.event_streams and role.stats.streams == 0 and fp.event_open[3] == 0
+    monkeypatch.setattr(proxy, "_oc_line", real)
+    await stream_events(role, STU03, "token", 3)                                         # положительный контроль
+    assert len(role.event_streams) == 1
+    await role._shutdown()
+    assert not role.event_streams and fp.event_open[3] == 0
+
+
+async def test_role_shutdown_bounded_for_all_streams(tmp_path, monkeypatch, gwlog):       # Б4-m2
+    monkeypatch.setattr(proxy, "STREAM_SHUTDOWN_S", 0.3)
+    monkeypatch.setattr(proxy, "STREAM_CLOSE_S", 1.0)
+    role = gateway_role(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = [EV("server.connected"), ("linger", 1.2)]                            # читатели переживут отмену
+    gens = [(await stream_events(role, STU03, "token", 3)).body_iterator for _ in range(2)]
+    for gen in gens:
+        assert await anext(gen) == EV("server.connected")
+    t = time.monotonic()
+    await role._shutdown()
+    took = time.monotonic() - t
+    assert took < 0.3 + 0.4 and "потоки /event не закрылись при остановке" in gwlog.text
+    await wait_until_async(lambda: not role.event_streams and fp.event_open[3] == 0, timeout=6)   # закрытие дошло
+    await asyncio.sleep(0.5)                                                             # читатели доживают отмену
+    for gen in gens:
+        await gen.aclose()
+    assert proxy.STREAM_SHUTDOWN_S == 0.3 and role.stats.streams == 0

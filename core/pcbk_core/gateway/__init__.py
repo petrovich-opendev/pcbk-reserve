@@ -339,8 +339,19 @@ class GatewayRole(RoleBase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await self.login_gate.drain()           # неудачные входы — в замок до выхода
-        # потоки /event — до клиентов мест: закрытие каждого (своё или начатое снятой задачей запроса) доводится здесь
-        await asyncio.gather(*(stream.shutdown() for stream in list(self.event_streams)), return_exceptions=True)
+        # потоки /event — до клиентов мест: закрытие каждого (своё или начатое снятой задачей запроса) доводится здесь,
+        # всех вместе — не дольше STREAM_SHUTDOWN_S (Б4-m2): остановка не ждёт застрявшее место по 11 с; недоведённые
+        # закрывает конец процесса
+        from . import proxy                     # лениво, как proxy_router: срок читается при остановке (тесты его меняют)
+        closing = [asyncio.ensure_future(stream.shutdown()) for stream in list(self.event_streams)]
+        if closing:
+            _, pending = await asyncio.wait(closing, timeout=proxy.STREAM_SHUTDOWN_S)
+            for task in closing:
+                if task.done() and not task.cancelled():
+                    task.exception()                # ошибка закрытия уже в журнале release(); не «never retrieved»
+            if pending:
+                log.warning("шлюз: потоки /event не закрылись при остановке за %g с: %d", proxy.STREAM_SHUTDOWN_S,
+                            len(pending))
         for name, close in (("места", self.workplaces.aclose), ("прокси сокета", self.workplaces.spctl.aclose)):
             try:
                 await close()

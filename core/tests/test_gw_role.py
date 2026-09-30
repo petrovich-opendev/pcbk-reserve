@@ -45,6 +45,8 @@ def test_gateway_settings_error_keeps_core(tmp_path):                           
     settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
     roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_ORIGIN": "https://x/path"})}   # не бросает
     assert roles["gateway"].config_error.startswith("настройки шлюза: GW_ORIGIN")
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_MAX_BODY_BYTES": "4194305"})}  # N8: сверх 4 МиБ
+    assert roles["gateway"].config_error.startswith("настройки шлюза: GW_MAX_BODY_BYTES")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root пишет и в каталог 0500")
@@ -215,12 +217,25 @@ def test_stream_slots_per_login_and_no_zero_entries():
 
 
 class _SlowDict(dict):
-    """Словарь слотов, который между чтением и записью отдаёт GIL: без замка гонка потоков неизбежна."""
+    """Словарь слотов, который после каждого чтения отдаёт GIL: без замка гонка потоков неизбежна. Медленны все пути
+    чтения (get, [], in) — тест не привязан к тому, как GatewayStats читает словарь (Б1-m2); reads — число чтений,
+    тест сверяет, что медленный путь пройден."""
 
-    def get(self, *args):
-        value = super().get(*args)
+    reads = 0
+
+    def _slow(self, value):
+        type(self).reads += 1
         time.sleep(0.01)
         return value
+
+    def get(self, *args):
+        return self._slow(super().get(*args))
+
+    def __getitem__(self, key):
+        return self._slow(super().__getitem__(key))
+
+    def __contains__(self, key):
+        return self._slow(super().__contains__(key))
 
 
 def _all_at_once(fn, n: int = 8) -> None:
@@ -242,11 +257,14 @@ def test_stream_slots_thread_safe():
     MAX_STREAMS_PER_LOGIN; восемь закрытий разом — ноль, и учётка из словаря ушла."""
     s = GatewayStats()
     s._streams = _SlowDict()
+    _SlowDict.reads = 0
     got: list[bool] = []
     _all_at_once(lambda: got.append(s.stream_opened("stu-01")))
     assert (got.count(True), s.streams_of("stu-01")) == (MAX_STREAMS_PER_LOGIN, MAX_STREAMS_PER_LOGIN)
+    opened_reads = _SlowDict.reads
     _all_at_once(lambda: s.stream_closed("stu-01"))
     assert (s.streams, dict(s._streams)) == (0, {})
+    assert opened_reads >= 8 and _SlowDict.reads >= opened_reads + 8                     # каждый вызов читал медленно
 
 
 def test_freeze_reaper_drill_stops_ticks(tmp_path):                                    # Review Focus 3
