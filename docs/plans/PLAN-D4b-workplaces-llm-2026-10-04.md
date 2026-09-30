@@ -638,7 +638,7 @@ def test_historian_load_rows(fake_core):
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_gate.py tests/test_service.py tests/test_events.py tests/test_mcp.py; cd ../watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_checks.py`. Expected: FAIL.
 - [ ] **Step 3: Implement по интерфейсам и таблице.**
-- [ ] **Step 4: Run both suites** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/)`. Expected: PASS.
+- [ ] **Step 4: Run both suites** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs)`. Expected: PASS.
 - [ ] **Step 5: Commit** — `git add core/ watchdog/ && git commit -m "Служба данных перед местами: p95 и пауза после сроков подряд, ошибки инструментов на странице, returned в событиях поиска"`.
 
 ---
@@ -879,7 +879,7 @@ def test_components_file_d4b():
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd watchdog && uv run --python 3.12 --with pytest pytest -q`. Expected: FAIL.
 - [ ] **Step 3: Implement строку, компонент и правило `sp-ro`.**
-- [ ] **Step 4: Run tests to verify they pass** — `cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/`. Expected: PASS.
+- [ ] **Step 4: Run tests to verify they pass** — `cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs`. Expected: PASS.
 - [ ] **Step 5: Commit** — `git add watchdog/ compose.yaml tests/integration/test_socket_proxy.py && git commit -m "Сторож: MCP места по выводу проверки здоровья, строка контейнера core через sp-ro"`.
 
 ---
@@ -1126,7 +1126,7 @@ def test_mcp_reconnects_after_core_restart(stack):                              
 
 - [ ] **Step 2: Run tests to verify they fail** — `uv run --python 3.12 --with pytest pytest -q tests/integration/test_conversation.py`. Expected: FAIL — `core` не в сетях мест, нет `data-token`, нет `converse`.
 - [ ] **Step 3: Implement компоновку, `converse.js`, методы `stack`, правки тестов Д2–Д4а, README.**
-- [ ] **Step 4: Run the whole local suite** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/) && uv run --python 3.12 --with pytest pytest -q tests/integration && docker network ls --filter name=pcbk- -q | wc -l`. Expected: PASS; сетей `pcbk-` после прогона — 0.
+- [ ] **Step 4: Run the whole local suite** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs) && uv run --python 3.12 --with pytest pytest -q tests/integration && docker network ls --filter name=pcbk- -q | wc -l`. Expected: PASS; сетей `pcbk-` после прогона — 0.
 - [ ] **Step 5: Commit** — `git add compose.yaml compose.test.yaml deploy/README.md tests/integration/ && git commit -m "Места подключены: core на .2 в каждой сети мест, токен данных файлом, разговор через OpenCode и MCP, отказы прокси в чате без повторов"`.
 
 ---

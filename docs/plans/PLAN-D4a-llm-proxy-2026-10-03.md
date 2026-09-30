@@ -3679,7 +3679,7 @@ test('note without detail is still shown', async () => {
 
 Подпись `ok` — «норма» из `LABELS` в `status.js` Д1.
 
-- [ ] **Step 2: Run tests to verify they fail** — `cd watchdog && uv run --python 3.12 --with pytest pytest -q; node --test tests/js/`. Expected: FAIL — нет `check_llm`, нет `note`.
+- [ ] **Step 2: Run tests to verify they fail** — `cd watchdog && uv run --python 3.12 --with pytest pytest -q; node --test tests/js/*.test.mjs`. Expected: FAIL — нет `check_llm`, нет `note`.
 - [ ] **Step 3: Implement по интерфейсам и таблице** (`http.client`, без перенаправлений и прокси, как `check_historian`).
 - [ ] **Step 4: Run all watchdog tests** — та же команда. Expected: PASS.
 - [ ] **Step 5: Commit** — `git add watchdog/ && git commit -m "Сторож: строка «LLM-прокси и бюджет» — деньги мимо учёта выше полос 50/80/95 %, расход и оценки в note" -- watchdog/`.
@@ -3894,7 +3894,7 @@ def test_openrouter_down_row(stack):                    # Review Focus 2; пос
 
 - [ ] **Step 2: Run tests to verify they fail** — `uv run --python 3.12 --with pytest pytest -q tests/integration/test_llm.py`. Expected: FAIL — нет двойника, секретов и роли в образе.
 - [ ] **Step 3: Implement правки компоновки, тестовые секреты, методы `stack`, правки старых тестов.**
-- [ ] **Step 4: Run the whole local suite** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/) && uv run --python 3.12 --with pytest pytest -q tests/integration && docker network ls --filter name=pcbk- -q | wc -l`. Expected: PASS; сетей `pcbk-` после прогона — 0.
+- [ ] **Step 4: Run the whole local suite** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs) && uv run --python 3.12 --with pytest pytest -q tests/integration && docker network ls --filter name=pcbk- -q | wc -l`. Expected: PASS; сетей `pcbk-` после прогона — 0.
 - [ ] **Step 5: Commit** — `git add compose.yaml compose.test.yaml deploy/ .gitignore tests/integration/ && git commit -m "LLM-прокси в компоновке: ключи и токены файлами, двойник OpenRouter в тестах, точный расход на странице, учения на локальном стенде" -- compose.yaml compose.test.yaml deploy/ .gitignore tests/integration/`.
 
 ---
