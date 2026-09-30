@@ -2,11 +2,30 @@
 import pytest
 
 from helpers import FakeMono
-from pcbk_core.llm.request import TurnMark
+from pcbk_core.llm.request import SUMMARY_PROMPT, TurnMark, turn_mark
 from pcbk_core.llm.turns import COMPACTION_CONTINUE, TURN_CALLS, TURN_IDLE_S, TurnLimiter, TurnLimitReached
 
 M1, M1_AGAIN_LATER = TurnMark("user", "h1", 2), TurnMark("user", "h1", 6)
 OTHER = TurnMark("other", None, 3)
+SYS = {"role": "system", "content": "s"}
+PLAN = "<system-reminder>\n# Plan Mode - System Reminder\n…\n</system-reminder>\n"   # session/prompt/plan.txt
+
+
+def user(*texts):
+    return {"role": "user", "content": [{"type": "text", "text": t} for t in texts]}
+
+
+def call(i):
+    return {"role": "assistant", "content": None,
+            "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": "pcbk_tag_now", "arguments": "{}"}}]}
+
+
+def result(i):
+    return {"role": "tool", "tool_call_id": f"c{i}", "content": "{}"}
+
+
+def steps_of(i):
+    return [m for k in range(1, i) for m in (call(k), result(k))]
 
 
 def test_turn_counts_steps_and_new_turn_on_new_mark():
@@ -20,8 +39,12 @@ def test_turn_counts_steps_and_new_turn_on_new_mark():
 def test_compaction_continue_is_not_a_new_turn():                                # Review Focus 7
     t = TurnLimiter(limit=3, monotonic=FakeMono(0.0))
     t.step("student-01", "ses_a", M1); t.step("student-01", "ses_a", OTHER); t.step("student-01", "ses_a", OTHER)
+    # сжатие посреди хода, в хвосте тот же вопрос: перед продолжением — ответ инструмента (доводка ревью I1)
+    mid = turn_mark({"messages": [user(SUMMARY_PROMPT), {"role": "assistant", "content": "сводка"}, user("вопрос"),
+                                  call(1), result(1), user(COMPACTION_CONTINUE)]})
+    assert mid == TurnMark("continue", None, 6)
     with pytest.raises(TurnLimitReached):
-        t.step("student-01", "ses_a", TurnMark("continue", "h1", 5))        # сжатие посреди хода, в хвосте тот же вопрос
+        t.step("student-01", "ses_a", mid)
     with pytest.raises(TurnLimitReached):
         t.step("student-01", "ses_a", TurnMark("continue", None, 3))        # в хвосте вопроса нет
 
@@ -107,3 +130,32 @@ def test_new_turn_after_refused_step_and_idle_keeps_active_keys():
     mono.advance(59)
     with pytest.raises(TurnLimitReached):
         t.step("ops", "ses_a", OTHER)                                          # отказ тоже трогает ход
+
+
+# --- доводка по ревью задачи 3, I1: тела, как их шлёт OpenCode 1.18.33 ---
+
+def test_mid_turn_compaction_with_plan_reminder_keeps_counting():
+    """PROMPT_PLAN дописывается к последнему `user` на каждом шаге (session/reminders.ts) и не хранится: после
+    сжатия посреди хода вопрос в хвосте — без него, напоминание — у продолжения. Счёт идёт дальше."""
+    t = TurnLimiter(monotonic=FakeMono(0.0))
+    marks = [turn_mark({"messages": [SYS, user("вопрос", PLAN), *steps_of(i)]}) for i in range(1, 16)]
+    assert [t.step("student-01", "ses_a", m) for m in marks] == list(range(1, 16))
+    squeezed = [user(SUMMARY_PROMPT), {"role": "assistant", "content": "сводка"}, user("вопрос"), call(14), result(14)]
+    cont = turn_mark({"messages": [*squeezed, user(COMPACTION_CONTINUE, PLAN)]})
+    assert t.step("student-01", "ses_a", cont) == 16
+    with pytest.raises(TurnLimitReached):
+        t.step("student-01", "ses_a", turn_mark({"messages": [*squeezed, user(COMPACTION_CONTINUE), call(16), result(16)]}))
+
+
+def test_same_short_question_with_compaction_on_first_step_is_new_turn():
+    """Ход «да» дошёл до шага 16; новый «да», и OpenCode сжимает на его первом шаге — новый ход с шага 1."""
+    t = TurnLimiter(monotonic=FakeMono(0.0))
+    marks = [turn_mark({"messages": [SYS, user("да"), *steps_of(i)]}) for i in range(1, 17)]
+    assert [t.step("student-01", "ses_a", m) for m in marks] == list(range(1, 17))
+    squeezed = [user(SUMMARY_PROMPT), {"role": "assistant", "content": "сводка"}, call(15), result(15),
+                {"role": "assistant", "content": "итог"}, user("да")]
+    first = turn_mark({"messages": [*squeezed, user(COMPACTION_CONTINUE, PLAN)]})
+    assert first.kind == "continue" and first.text_hash == marks[0].text_hash      # тот же текст, что у прошлого хода
+    assert t.step("student-01", "ses_a", first) == 1
+    assert t.step("student-01", "ses_a", turn_mark({"messages": [*squeezed, user(COMPACTION_CONTINUE), call(1),
+                                                                 result(1)]})) == 2

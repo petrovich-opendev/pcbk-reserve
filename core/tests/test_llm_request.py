@@ -1,10 +1,12 @@
 """Политика запроса LLM-прокси: белый список моделей с верхними ценами, тело из белого списка, метка хода."""
 import hashlib
 import math
+from dataclasses import replace
 
 import pytest
 
-from pcbk_core.llm.models import CANDIDATES, provider_matches, select_models
+from pcbk_core.llm.models import (BYTES_PER_TOKEN, CANDIDATES, PROVIDER_FIXED, ModelPolicy, provider_matches,
+                                  select_models)
 from pcbk_core.llm.request import (MAX_MESSAGES, SUMMARY_PROMPT, BodyRefused, TurnMark, body_bytes, rebuild_body,
                                    session_of, turn_mark)
 from pcbk_core.llm.turns import COMPACTION_CONTINUE
@@ -29,7 +31,7 @@ def test_rebuild_keeps_only_whitelist_and_sets_our_fields():                    
                       "provider", "user", "session_id"}
     assert b["provider"] == {"only": ["fireworks"], "allow_fallbacks": False, "zdr": True,
                              "data_collection": "deny", "require_parameters": True,
-                             "max_price": {"prompt": 1.40, "completion": 4.40}}           # У1
+                             "max_price": {"prompt": 1.40, "completion": 4.40, "request": 0}}   # У1; M3
     assert (b["max_tokens"], b["reasoning"], b["user"], b["session_id"]) == \
            (16000, {"effort": "high"}, "pcbk-student-01", f"student-01:{SES}")
 
@@ -114,17 +116,21 @@ def test_estimate_uses_max_variant_undiscounted_and_tier():                     
     ds, gem, luna, sol = (m["deepseek/deepseek-v4.1-flash"], m["google/gemini-3.8-flash"],
                           m["openai/gpt-6-luna"], m["openai/gpt-6-sol"])
     assert ds.estimate_usd(3000, 100) == pytest.approx(1000 * 0.45e-6 + 100 * 1.80e-6)    # fireworks/us, не 0.22/0.66
-    assert gem.estimate_usd(3000, 100) == pytest.approx(1000 * 1.50e-6 + 100 * 7.50e-6)   # без скидки 0,5
+    assert gem.estimate_usd(3000, 100) == pytest.approx(3000 * 1.50e-6 + 100 * 7.50e-6)   # без скидки 0,5; байт — токен (I3)
     below, at = 271_999 * 3, 272_000 * 3                                                    # граница длинного входа
     assert luna.estimate_usd(below, 16000) == pytest.approx(271_999 * 0.1375e-6 + 16000 * 0.55e-6)
     assert luna.estimate_usd(at, 16000) == pytest.approx(272_000 * 0.275e-6 + 16000 * 0.825e-6)
     assert sol.estimate_usd(1_048_576, 16000) == pytest.approx(349_526 * 5.50e-6 + 16000 * 16.50e-6)   # ≈ $2,19
-    assert [p.max_price() for p in (ds, gem, luna, sol, m["z-ai/glm-5.3-flash"])] == [
-        {"prompt": 0.45, "completion": 1.80}, {"prompt": 1.50, "completion": 7.50},
-        {"prompt": 0.22, "completion": 0.825}, {"prompt": 4.40, "completion": 16.50},
-        {"prompt": 0.225, "completion": 0.75}]
+    # доводка ревью I2, M3: max_price — по той же ступени, что оценка; плата за запрос — 0
+    assert [p.max_price(271_999) for p in (ds, gem, luna, sol, m["z-ai/glm-5.3-flash"])] == [
+        {"prompt": 0.45, "completion": 1.80, "request": 0}, {"prompt": 1.50, "completion": 7.50, "request": 0},
+        {"prompt": 0.11, "completion": 0.55, "request": 0}, {"prompt": 2.20, "completion": 11.00, "request": 0},
+        {"prompt": 0.225, "completion": 0.75, "request": 0}]
+    assert [p.max_price(272_000) for p in (luna, sol, ds)] == [
+        {"prompt": 0.22, "completion": 0.825, "request": 0}, {"prompt": 4.40, "completion": 16.50, "request": 0},
+        {"prompt": 0.45, "completion": 1.80, "request": 0}]
     b = rebuild_body({**OC_BODY, "model": luna.model}, luna, caller="ops", session=None)
-    assert b["provider"]["max_price"] == {"prompt": 0.22, "completion": 0.825}             # и в теле — цена длинного входа
+    assert b["provider"]["max_price"] == {"prompt": 0.11, "completion": 0.55, "request": 0}   # короткое тело — базовая
 
 
 def h(text):
@@ -138,7 +144,8 @@ def test_turn_mark():
     assert turn_mark({"messages": [*two, {"role": "tool", "tool_call_id": "c", "content": "x"}]}).kind == "other"
     for text in (COMPACTION_CONTINUE, "The previous request exceeded … files.\n\n" + COMPACTION_CONTINUE):
         assert turn_mark({"messages": [*two, {"role": "assistant", "content": "итог"}, user(text)]}) == \
-               TurnMark("continue", h("вопрос"), 4)
+               TurnMark("continue", None, 4)          # доводка ревью I1: перед продолжением ответ — посреди хода
+        assert turn_mark({"messages": [*two, user(text)]}) == TurnMark("continue", h("вопрос"), 3)
     # после сжатия: [сжатие, сводка, хвост с новым вопросом, продолжение]
     after = [user(SUMMARY_PROMPT), {"role": "assistant", "content": "сводка"}, user("вопрос 2"), user(COMPACTION_CONTINUE)]
     assert turn_mark({"messages": after}) == TurnMark("continue", h("вопрос 2"), 4)
@@ -155,16 +162,20 @@ def test_turn_mark():
 def test_table_is_seven_upper_prices():
     """Таблица дословно по брифу: вход / выход / запись, кэш Claude, ступень Azure."""
     assert SUMMARY_PROMPT == "What did we do so far?"                          # session/message-v2.ts:235
-    got = [(p.model, p.in_usd_m, p.out_usd_m, p.write_usd_m, p.auto_cache,
-            p.tier_tokens, p.tier_in_usd_m, p.tier_out_usd_m, p.tier_write_usd_m) for p in CANDIDATES]
+    got = [(p.model, p.in_usd_m, p.out_usd_m, p.write_usd_m, p.auto_cache, p.tier_tokens, p.tier_in_usd_m,
+            p.tier_out_usd_m, p.tier_write_usd_m, p.bytes_per_token) for p in CANDIDATES]
     assert got == [
-        ("z-ai/glm-5.3", 1.40, 4.40, 0, False, None, 0.0, 0.0, 0.0),
-        ("deepseek/deepseek-v4.1-flash", 0.45, 1.80, 0.45, False, None, 0.0, 0.0, 0.0),
-        ("google/gemini-3.8-flash", 1.50, 7.50, 0, False, None, 0.0, 0.0, 0.0),
-        ("openai/gpt-6-sol", 2.20, 11.00, 2.75, False, 272_000, 4.40, 16.50, 5.50),
-        ("z-ai/glm-5.3-flash", 0.225, 0.75, 0, False, None, 0.0, 0.0, 0.0),
-        ("openai/gpt-6-luna", 0.11, 0.55, 0.1375, False, 272_000, 0.22, 0.825, 0.275),
-        ("anthropic/claude-sonnet-5.5", 2.00, 10.00, 2.50, True, None, 0.0, 0.0, 0.0)]
+        ("z-ai/glm-5.3", 1.40, 4.40, 0, False, None, 0.0, 0.0, 0.0, 3),
+        ("deepseek/deepseek-v4.1-flash", 0.45, 1.80, 0.45, False, None, 0.0, 0.0, 0.0, 3),
+        ("google/gemini-3.8-flash", 1.50, 7.50, 0, False, None, 0.0, 0.0, 0.0, 1),
+        ("openai/gpt-6-sol", 2.20, 11.00, 2.75, False, 272_000, 4.40, 16.50, 5.50, 3),
+        ("z-ai/glm-5.3-flash", 0.225, 0.75, 0, False, None, 0.0, 0.0, 0.0, 3),
+        ("openai/gpt-6-luna", 0.11, 0.55, 0.1375, False, 272_000, 0.22, 0.825, 0.275, 3),
+        ("anthropic/claude-sonnet-5.5", 2.00, 10.00, 2.50, True, None, 0.0, 0.0, 0.0, 3)]
+    # доводка ревью I3: байт на токен — 1 у всего семейства Gemini, у прочих — BYTES_PER_TOKEN
+    assert BYTES_PER_TOKEN == 3
+    assert [p.model for p in CANDIDATES if p.bytes_per_token == 1] == \
+           [p.model for p in CANDIDATES if p.model.startswith("google/gemini")]
 
 
 def test_select_models_order_spaces_and_errors():
@@ -238,3 +249,89 @@ def test_rebuild_does_not_touch_raw_and_parts_lose_cache_control():
 def test_max_tokens_only_positive_json_integer(value):
     body = {k: v for k, v in OC_BODY.items() if k != "max_tokens"} | {"max_tokens": value}
     assert rebuild_body(body, POLICY, caller="ops", session=None, max_tokens_cap=400)["max_tokens"] == 400
+
+
+# --- доводка по ревью задачи 3 ---
+
+def test_max_price_follows_estimate_tier_at_boundary():                          # I2
+    """У границы 272 000 токенов max_price в теле — ступень оценки этого же тела, с обеих сторон границы."""
+    luna = select_models("")["openai/gpt-6-luna"]
+    raw = lambda k: {**OC_BODY, "model": luna.model, "messages": [{"role": "user", "content": "x" * k}]}
+    empty = body_bytes(rebuild_body(raw(0), luna, caller="ops", session=None))
+    first_tier = 3 * (luna.tier_tokens - 1) + 1 - empty          # столько «x» — и вход ровно 272 000 токенов
+    tiers = []
+    for k in range(first_tier - 2, first_tier + 2):
+        b = rebuild_body(raw(k), luna, caller="ops", session=None)
+        n = luna.input_tokens(body_bytes(b))
+        assert b["provider"]["max_price"] == luna.max_price(n)
+        tier = n >= luna.tier_tokens
+        tiers.append(tier)
+        write, out = (0.275, 0.825) if tier else (0.1375, 0.55)
+        assert luna.estimate_usd(body_bytes(b), b["max_tokens"]) == pytest.approx(n * write / 1e6 + 16000 * out / 1e6)
+    assert tiers == [False, False, True, True]
+
+
+def test_max_price_at_boundary_never_above_estimate_tier():                      # I2, запасная ветка
+    """Если цена длинного входа в JSON короче базовой, у границы ступени не сходятся: тогда в теле остаётся
+    базовая, а оценка — по длинному входу. Цена длинного входа при оценке по базовой — никогда."""
+    plain = ModelPolicy("x/y", "azure", "medium", 2.25, 11.25, 0.0)
+    raw = lambda k: {"messages": [{"role": "user", "content": "x" * k}]}
+    empty = body_bytes(rebuild_body(raw(0), plain, caller="ops", session=None))
+    tiered = replace(plain, tier_tokens=empty // 3 + 10, tier_in_usd_m=4.0, tier_out_usd_m=15.0)   # «4.0» короче «2.25»
+    first_tier = 3 * (tiered.tier_tokens - 1) + 1 - empty
+    kept_base = 0
+    for k in range(first_tier - 3, first_tier + 4):
+        b = rebuild_body(raw(k), tiered, caller="ops", session=None)
+        n, price = tiered.input_tokens(body_bytes(b)), b["provider"]["max_price"]
+        assert price in (tiered.max_price(0), tiered.max_price(n))
+        assert not (price == tiered.max_price(10**9) and n < tiered.tier_tokens)
+        kept_base += price == tiered.max_price(0) and n >= tiered.tier_tokens
+    assert kept_base                                                      # запасная ветка сработала
+
+
+def test_gemini_estimate_covers_digit_per_token():                               # I3
+    """Ответы историана — почти одни цифры, а Gemini режет числа по цифре: оценка не ниже цифр × цена."""
+    gem = select_models("")["google/gemini-3.8-flash"]
+    digits = "20.5;21.75;19.0;" * 20_000
+    b = rebuild_body({**OC_BODY, "model": gem.model, "messages": [
+        {"role": "user", "content": "q"}, {"role": "tool", "tool_call_id": "c", "content": digits}]},
+        gem, caller="ops", session=None)
+    count = sum(ch.isdigit() for ch in digits)
+    assert gem.estimate_usd(body_bytes(b), b["max_tokens"]) >= count * 1.50e-6 + b["max_tokens"] * 7.50e-6
+    assert gem.input_tokens(body_bytes(b)) == body_bytes(b)
+
+
+def test_tool_choice_only_with_tools():                                          # M1
+    server_only = [{"type": "openrouter:web_search"}]
+    for choice in ("auto", "required", {"type": "function", "function": {"name": "pcbk_tag_now"}}):
+        b = rebuild_body({**OC_BODY, "tools": server_only, "tool_choice": choice}, POLICY, caller="ops", session=None)
+        assert "tools" not in b and "tool_choice" not in b
+        assert rebuild_body({**OC_BODY, "tool_choice": choice}, POLICY, caller="ops", session=None)["tool_choice"] == choice
+
+
+def test_provider_fixed_is_read_only():                                          # M2
+    with pytest.raises(TypeError):
+        PROVIDER_FIXED["zdr"] = False
+    b = rebuild_body(OC_BODY, POLICY, caller="ops", session=None)
+    b["provider"]["zdr"] = False                                                  # тело — своя копия
+    assert PROVIDER_FIXED["zdr"] is True and rebuild_body(OC_BODY, POLICY, caller="ops", session=None)["provider"]["zdr"]
+
+
+IMAGE = [{"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}]
+
+
+@pytest.mark.parametrize("msg", [{"role": "system", "content": IMAGE}, {"role": "assistant", "content": IMAGE},
+                                 {"role": "tool", "tool_call_id": "c", "content": IMAGE},
+                                 {"role": "user", "content": [{"type": "text", "text": "q"}, *IMAGE]}])
+def test_image_parts_refused_in_every_role(msg):                                 # M4
+    with pytest.raises(BodyRefused):
+        rebuild_body({**OC_BODY, "messages": [{"role": "user", "content": "q"}, msg]}, POLICY, caller="ops", session=None)
+
+
+def test_turn_mark_hash_ignores_system_reminders():                              # I1
+    plan = "<system-reminder>\n# Plan Mode - System Reminder\n…\n</system-reminder>\n"
+    build = "<system-reminder>\nYour operational mode has changed from plan to build.\n</system-reminder>\n\nA plan…"
+    for extra in ([plan], [build], [plan, build]):
+        msg = {"role": "user", "content": [{"type": "text", "text": "вопрос"}] +
+               [{"type": "text", "text": t} for t in extra]}
+        assert turn_mark({"messages": [{"role": "system", "content": "s"}, msg]}) == TurnMark("user", h("вопрос"), 2)

@@ -34,6 +34,8 @@ _BAD_TOOL_RESULT = "у ответа инструмента нет id вызов�
 _NOT_ENCODABLE = "в запросе есть значения, которые нельзя передать модели (NaN или неверные символы)"
 
 _PLAIN_FORMATS = ("text", "json_object")
+# начало частей-напоминаний OpenCode (PROMPT_PLAN, BUILD_SWITCH, PLAN_MODE): в хеш хода не идут
+_REMINDER = "<system-reminder>"
 
 
 class BodyRefused(ValueError):
@@ -202,8 +204,8 @@ def rebuild_body(raw: object, policy: ModelPolicy, *, caller: str, session: str 
     body: dict = {"model": policy.model, "messages": _messages(raw.get("messages"))}
     if tools := _tools(raw.get("tools")):
         body["tools"] = tools
-    if (choice := _tool_choice(raw.get("tool_choice"))) is not None:
-        body["tool_choice"] = choice
+        if (choice := _tool_choice(raw.get("tool_choice"))) is not None:   # без инструментов выбирать нечего
+            body["tool_choice"] = choice
     if isinstance(raw.get("stream"), bool):
         body["stream"] = raw["stream"]
         if raw["stream"]:
@@ -211,21 +213,44 @@ def rebuild_body(raw: object, policy: ModelPolicy, *, caller: str, session: str 
     body["max_tokens"] = _max_tokens(raw, max_tokens_cap)
     body.update(_optional(raw))
     body["reasoning"] = {"effort": policy.effort}
-    body["provider"] = {"only": [policy.provider_only], **PROVIDER_FIXED, "max_price": policy.max_price()}
+    body["provider"] = {"only": [policy.provider_only], **PROVIDER_FIXED, "max_price": policy.max_price(0)}
     body["user"] = f"pcbk-{caller}"
     body["session_id"] = f"{caller}:{session or 'none'}"
     if policy.auto_cache:
         body["cache_control"] = {"type": "ephemeral"}
-    try:        # json.loads пропускает NaN и одиночные суррогаты — такое тело не отправить и не оценить
-        json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (ValueError, UnicodeEncodeError):
-        raise BodyRefused(_NOT_ENCODABLE) from None
+    _set_max_price(body, policy)
     return body
 
 
 def body_bytes(body: dict) -> int:
     """Длина тела в UTF-8, как его отправит прокси, — вход верхней оценки (Д4а-R13)."""
     return len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _checked_bytes(body: dict) -> int:
+    """`body_bytes`, но NaN и одиночные суррогаты (их пропускает json.loads) — `BodyRefused`: такое тело
+    не отправить и не оценить."""
+    try:
+        return len(json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+    except ValueError:                                  # UnicodeEncodeError — тоже ValueError
+        raise BodyRefused(_NOT_ENCODABLE) from None
+
+
+def _set_max_price(body: dict, policy: ModelPolicy) -> None:
+    """`provider.max_price` — по той же ступени, что оценка собранного тела:
+    `policy.max_price(policy.input_tokens(body_bytes(body)))`.
+
+    Цена сама меняет длину тела, поэтому после смены ступени она сверяется ещё раз. Не сошлось (цена
+    длинного входа в JSON короче базовой, тело на границе) — остаётся базовая: оценка тогда по ступени
+    длинного входа, не ниже цены точки, которую пустит OpenRouter.
+    """
+    provider = body["provider"]
+    base = provider["max_price"]
+    tiered = policy.max_price(policy.input_tokens(_checked_bytes(body)))
+    if tiered != base:
+        provider["max_price"] = tiered
+        if policy.max_price(policy.input_tokens(body_bytes(body))) != tiered:
+            provider["max_price"] = base
 
 
 @dataclass(frozen=True)
@@ -245,8 +270,14 @@ def _texts(msg: dict) -> list[str]:
     return []
 
 
+def _own_text(texts: list[str]) -> str:
+    """Текст человека: части через `\\n`, без частей `<system-reminder>` — PROMPT_PLAN / BUILD_SWITCH
+    OpenCode дописывает к последнему `user` на каждом шаге и не хранит (session/reminders.ts)."""
+    return "\n".join(text for text in texts if not text.lstrip().startswith(_REMINDER))
+
+
 def _text_hash(texts: list[str]) -> str:
-    return hashlib.sha256("\n".join(texts).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return hashlib.sha256(_own_text(texts).encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
 def _is_user(msg: object) -> bool:
@@ -260,12 +291,17 @@ def _is_continue(texts: list[str]) -> bool:
 
 
 def turn_mark(body: dict) -> TurnMark:
-    """Метка хода по собранному телу (Global Constraints, «Ход и предел шагов»).
+    """Метка хода по собранному телу (Global Constraints, «Ход и предел шагов»; доводка ревью, I1).
 
     - последнее сообщение не `user` — `other`;
-    - последнее `user` — продолжение после сжатия: `continue` с хешем последнего «настоящего» `user` до
-      него (не продолжение и не ровно SUMMARY_PROMPT) или `None`;
-    - иначе `user` с хешем его текста. Хеш — sha256 частей `text` через `\\n`, первые 16 знаков.
+    - последнее `user` — продолжение после сжатия: `continue` с хешем «настоящего» `user` (не
+      продолжение и не ровно SUMMARY_PROMPT), если он стоит **прямо перед** продолжением, иначе `None`.
+      После сжатия модели уходит `[сжатие, сводка, …хвост…, продолжение]` (session/message-v2.ts:582):
+      на первом шаге нового вопроса хвост кончается этим вопросом, посреди хода — ответом модели или
+      инструмента;
+    - иначе `user` с хешем его текста.
+
+    Хеш — sha256 частей `text` через `\\n` без частей `<system-reminder>`, первые 16 знаков.
     """
     messages = body.get("messages")
     messages = messages if isinstance(messages, list) else []
@@ -275,10 +311,9 @@ def turn_mark(body: dict) -> TurnMark:
     texts = _texts(messages[-1])
     if not _is_continue(texts):
         return TurnMark("user", _text_hash(texts), n)
-    for msg in reversed(messages[:-1]):
-        if not _is_user(msg):
-            continue
-        earlier = _texts(msg)
-        if not _is_continue(earlier) and "\n".join(earlier) != SUMMARY_PROMPT:
+    before = messages[-2] if n >= 2 else None
+    if _is_user(before):
+        earlier = _texts(before)
+        if not _is_continue(earlier) and _own_text(earlier) != SUMMARY_PROMPT:
             return TurnMark("continue", _text_hash(earlier), n)
     return TurnMark("continue", None, n)
