@@ -7,6 +7,7 @@ OpenCode мест — опасные ручки и близнецы, искаж�
 шлюза). Пароли и cookie — только в запросах: в assert — коды, имена и индексы, не значения.
 """
 import json
+import re
 import secrets
 import socket
 import ssl
@@ -18,7 +19,7 @@ import pytest
 
 from conftest import HOST, PORT, STAND_HOST, STAND_ORIGIN, secret_forms, wait_for
 from gateway_cases import (ALLOW_PERM, ALLOWED, EVENT_TYPES, FORBIDDEN, MANGLED, METHODS, MSG_FAKE, OC, SES_FAKE,
-                           check_forbidden, check_mangled)
+                           check_forbidden, check_mangled, expected_refusals)
 from gwclient import GwClient
 from test_students import PROBE_AGENT
 
@@ -28,6 +29,12 @@ OWN_PLACES = (6, 7, 8)
 EDGE_OC_PER_SESSION = 10
 EDGE_OC_TOTAL = 64
 LOG_WAIT_S = 10
+SETTLE_S = 30
+# cookie всех сессий модуля (вход, вторая сессия, преподаватель, место 08) — для проверки журнала core на секреты
+COOKIES: list[str] = []
+REFUSED_RULES = re.compile(r" gw refused .* reason=(?:not_whitelisted|bad_path) ")
+REFUSED_ORIGIN = re.compile(r" gw refused .* reason=origin ")
+PART_ONLY_TEXT = "На учебном стенде в сообщении допустим только текст"
 
 
 @pytest.fixture(scope="module")
@@ -37,6 +44,7 @@ def users(stack):
             stack.add_account(login, "teacher" if place is None else "student", place, PW[login])
         a, b = (stack.gw_client() for _ in range(2))
         a.login("gw-a", PW["gw-a"]); b.login("gw-b", PW["gw-b"])
+        COOKIES.extend((a.cookie, b.cookie))
         states = (a.wake_and_wait(90)["state"], b.wake_and_wait(90)["state"])
         assert states == ("ready", "ready")
         yield a, b
@@ -56,15 +64,29 @@ def gw_oc_lines(stack):
     return stack.logs("pcbk-core").count(" gw oc ")
 
 
-def settled_oc_lines(stack):
-    """Число строк «gw oc», когда журнал перестал расти (строка пишется до ответа, docker logs — чуть позже)."""
-    last = gw_oc_lines(stack)
+def settled(count, timeout: float = SETTLE_S):
+    """Значение count(), когда оно перестало расти (строка журнала пишется до ответа, docker logs видит её чуть
+    позже); не успокоилось за timeout — AssertionError."""
+    deadline = time.monotonic() + timeout
+    last = count()
     while True:
         time.sleep(1)
-        now = gw_oc_lines(stack)
+        now = count()
         if now == last:
             return now
+        if time.monotonic() > deadline:
+            raise AssertionError(f"журнал растёт дольше {timeout} с")
         last = now
+
+
+def settled_oc_lines(stack):
+    return settled(lambda: gw_oc_lines(stack))
+
+
+def refused_counts(stack):
+    """Строки «gw refused» журнала core: (по правилам — not_whitelisted и bad_path, по источнику — origin)."""
+    logs = stack.logs("pcbk-core")
+    return len(REFUSED_RULES.findall(logs)), len(REFUSED_ORIGIN.findall(logs))
 
 
 def test_event_types_match_core(stack):
@@ -104,9 +126,12 @@ def test_forbidden_forward_nothing(stack, users):                               
     a, _ = users
     assert a.call("POST", "/pcbk/api/oc/session")[0] == 200                           # положительный не-GET
     before = settled_oc_lines(stack)
+    rules0, origin0 = settled(lambda: refused_counts(stack))
     assert check_forbidden(a) == []
     assert check_mangled(a) == []                                                       # edge — 400
     assert settled_oc_lines(stack) == before                                            # к месту не ушло ничего
+    rules1, origin1 = settled(lambda: refused_counts(stack))
+    assert (rules1 - rules0, origin1 - origin0) == (expected_refusals(), 0)             # журнал Б7 — то же число
     cookie = {"Cookie": f"pcbk_session={a.cookie}"}
     for path in MANGLED:                                                                # мимо edge, из pcbk-front — шлюз 403
         code = stack.http_front("GET", path, headers=cookie)
@@ -126,12 +151,15 @@ def test_edge_checks_path_not_query(stack, users):                              
 
 def test_oc_responses_not_pages(stack, users):                                         # решение контроллера 3
     a, _ = users
-    cases = [a.call("GET", "/pcbk/api/oc/session/status"),                            # ответ места
-             a.call("GET", "/pcbk/api/oc/config"),                                     # отказ шлюза
-             a.call("GET", "/pcbk/api/oc//session/status")]                            # ответ самого edge
-    for code, _, headers in cases:
-        assert (headers.get_all("Content-Security-Policy"), headers.get_all("X-Content-Type-Options"),
-                headers.get_all("Cache-Control")) == (["default-src 'none'"], ["nosniff"], ["no-store"]), code
+    cases = [(200, a.call("GET", "/pcbk/api/oc/session/status")),                     # ответ места
+             (403, a.call("GET", "/pcbk/api/oc/config")),                              # отказ шлюза
+             (400, a.call("GET", "/pcbk/api/oc//session/status")),                     # ответ самого edge
+             (403, a.call("GET", "/%70cbk/api/oc/session/status")),                    # L8: путь после нормализации —
+             (400, a.call("GET", "/foo/../pcbk/api/oc/session/status")),               # CSP по $uri, не по сырому адресу
+             (413, a.call("POST", "/pcbk/api/oc/session", {"x": "x" * 600_000}))]      # переход error_page (/pcbk-errors/)
+    for expected, (code, _, headers) in cases:
+        assert (code, headers.get_all("Content-Security-Policy"), headers.get_all("X-Content-Type-Options"),
+                headers.get_all("Cache-Control")) == (expected, ["default-src 'none'"], ["nosniff"], ["no-store"])
     code, headers = stack.https_headers("/status")                                    # у страницы сторожа — только свой CSP
     csp = headers.get_all("Content-Security-Policy") or []
     assert code == 200 and len(csp) == 1 and "script-src 'self'" in csp[0]
@@ -139,20 +167,32 @@ def test_oc_responses_not_pages(stack, users):                                  
 
 def test_config_blocked_but_live_in_place(stack, users):
     a, _ = users
-    for path in ("/config", "/config/providers"):                                        # Ш14
-        assert stack.oc(6, "GET", path, 6)[0] == 200, path                              # ручка жива — отказ осмысленный
-        code, body, _ = a.call("GET", "/pcbk/api/oc" + path)
+    tokens = (stack.llm_token(6), stack.data_token(6))
+    # положительный контроль: мимо шлюза ручка жива и отдаёт подставленные {file:} — /config оба токена места,
+    # /config/providers — токен LLM (apiKey провайдера); через шлюз — 403 и ни одного. Значения — не в assert
+    for path, direct_has in (("/config", (True, True)), ("/config/providers", (True, False))):   # Ш14
+        code, direct = stack.oc(6, "GET", path, 6)
+        present = tuple(t in direct for t in tokens)
+        gw_code, body, _ = a.call("GET", "/pcbk/api/oc" + path)
         text = json.dumps(body)
-        leaked = (stack.llm_token(6) in text, stack.data_token(6) in text)            # значения — не в assert
-        assert (code, leaked) == (403, (False, False)), path
+        leaked = tuple(t in text for t in tokens)
+        assert (code, present, gw_code, leaked) == (200, direct_has, 403, (False, False)), path
 
 
-def test_archived_null_goes_to_place(stack, users):                                     # Ш13: 400 — от места, не от шлюза
+def test_archived_null_goes_to_place(stack, users):                                     # Ш13: шлюз пересылает, место решает
     a, _ = users
     sid = a.call("POST", "/pcbk/api/oc/session")[1]["id"]
+    stamp = int(time.time() * 1000)
+    assert a.call("PATCH", f"/pcbk/api/oc/session/{sid}", {"time": {"archived": stamp}})[0] == 200
+    assert direct_session(stack, 6, sid)["time"].get("archived") == stamp              # в архиве — истина мимо шлюза
+    line = "rule=session_update status="
+    before = stack.logs("pcbk-core").count(line)
     code, _, _ = a.call("PATCH", f"/pcbk/api/oc/session/{sid}", {"time": {"archived": None}})
-    wait_for(lambda: f"rule=session_update status={code}" in stack.logs("pcbk-core"), timeout=LOG_WAIT_S)   # переслано месту
-    print(f"archived=null → код места {code}")                                         # в журнал Д5б и хвост Д6
+    wait_for(lambda: stack.logs("pcbk-core").count(line) > before, timeout=LOG_WAIT_S)   # переслано месту
+    archived = direct_session(stack, 6, sid)["time"].get("archived")
+    # 1.18.33: 200 и архив не снят — тихая пустая операция; хвост Д6 — кнопку «из архива» скрыть
+    assert (code, archived) == (200, stamp)
+    print(f"archived=null → код места {code}, архив остался: {archived == stamp}")       # в журнал Д5б и хвост Д6
 
 
 def test_session_fields_stripped(stack, users):                                         # Review Focus 2
@@ -185,9 +225,11 @@ def test_prompt_fields_stripped(stack, users):                                  
     assert direct_session(stack, 6, sid).get("permission") in (None, [])                # tools не стали правилами
     for part in ({"type": "file", "url": "file:///proc/self/environ", "mime": "text/plain"},
                  {"type": "subtask", "prompt": "x", "agent": "build"}, {"type": "agent", "name": "build"}):
-        assert a.call("POST", f"/pcbk/api/oc/session/{sid}/prompt_async", {"parts": [part]})[0] == 400, part["type"]
-    assert a.call("POST", f"/pcbk/api/oc/session/{sid}/prompt_async",
-                  {"parts": [{"type": "text", "text": "x"}], "agent": "plan"})[0] == 400
+        code, body, _ = a.call("POST", f"/pcbk/api/oc/session/{sid}/prompt_async", {"parts": [part]})
+        assert (code, body["name"], body["data"]["message"]) == (400, "BadRequest", PART_ONLY_TEXT), part["type"]
+    code, body, _ = a.call("POST", f"/pcbk/api/oc/session/{sid}/prompt_async",
+                           {"parts": [{"type": "text", "text": "x"}], "agent": "plan"})    # встроенный агент — нет
+    assert (code, body["data"]["message"]) == (400, "Агент «plan» недоступен")
 
 
 def test_foreign_agent_refused(stack, users):                                           # Review Focus 3
@@ -230,6 +272,7 @@ def test_origin_and_teacher(stack, users):
     code, body, _ = evil.call("POST", "/pcbk/api/oc/session")
     assert (code, body["data"]["message"]) == (403, "Запрос не с нашей страницы — отклонён")
     t = stack.gw_client(); t.login("gw-t", PW["gw-t"])
+    COOKIES.append(t.cookie)
     assert t.call("GET", "/pcbk/api/oc/session/status")[0] == 403
 
 
@@ -237,6 +280,7 @@ def test_duplicate_cookies_on_long_path_through_edge(stack, users):             
     a, _ = users
     sid = a.call("POST", "/pcbk/api/oc/session")[1]["id"]
     extra = stack.gw_client(); extra.login("gw-a", PW["gw-a"])                        # вторая сессия того же логина
+    COOKIES.append(extra.cookie)
     both = {"Cookie": f"pcbk_session={a.cookie}; pcbk_session={extra.cookie}"}
     code, body, headers = a.call("POST", f"/pcbk/api/oc/session/{sid}/prompt_async",   # самый длинный путь: 64 знака
                                  {"parts": [{"type": "text", "text": "x"}]}, headers=both)
@@ -245,10 +289,12 @@ def test_duplicate_cookies_on_long_path_through_edge(stack, users):             
     assert len(deletes) == 12 * 3 * 2 and any("Domain=pcbk.test" in d for d in deletes)
     assert "too big header" not in stack.logs("pcbk-edge")
     a.login("gw-a", PW["gw-a"])                                                        # обе сессии закрыты — вход заново
+    COOKIES.append(a.cookie)
 
 
 def test_sleeping_place_503_no_wake(stack, users):
     c = stack.gw_client(); c.login("gw-c", PW["gw-c"])
+    COOKIES.append(c.cookie)
     code, body, _ = c.call("GET", "/pcbk/api/oc/session/status")
     assert (code, body["name"]) == (503, "WorkplaceNotReady")
     assert stack.inspect("pcbk-student-08")["State"]["Running"] is False
@@ -266,8 +312,9 @@ def test_event_stream_through_edge(stack, users):                               
 
 @contextmanager
 def slow_bodies(cookies):
-    """По соединению к edge на каждую cookie: заголовки POST /pcbk/api/oc/session с Content-Length: 64 и без тела.
-    edge ждёт тело (proxy_request_buffering on) — запрос держит слот limit_conn, а в core не уходит ничего."""
+    """По соединению к edge на каждую cookie (None — без cookie): заголовки POST /pcbk/api/oc/session с
+    Content-Length: 64 и без тела. edge ждёт тело (proxy_request_buffering on) — запрос держит слот limit_conn, а в
+    core не уходит ничего."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -276,8 +323,8 @@ def slow_bodies(cookies):
         for cookie in cookies:
             s = ctx.wrap_socket(socket.create_connection((HOST, PORT), timeout=10))
             socks.append(s)
-            s.sendall((f"POST /pcbk/api/oc/session HTTP/1.1\r\nHost: {STAND_HOST}\r\n"
-                       f"Cookie: pcbk_session={cookie}\r\nOrigin: {STAND_ORIGIN}\r\n"
+            jar = "" if cookie is None else f"Cookie: pcbk_session={cookie}\r\n"
+            s.sendall((f"POST /pcbk/api/oc/session HTTP/1.1\r\nHost: {STAND_HOST}\r\n{jar}Origin: {STAND_ORIGIN}\r\n"
                        "Content-Type: application/json\r\nContent-Length: 64\r\n\r\n").encode("ascii"))
         time.sleep(1)                                                                  # edge разобрал заголовки всех
         yield
@@ -301,6 +348,11 @@ def test_edge_limits_oc_connections(stack, users):                              
         assert core_creates(stack) == created                                          # медленные тела — не в core
     assert 'limiting connections by zone "pcbk_oc_session"' in stack.logs("pcbk-edge")
     wait_for(lambda: a.call("GET", "/pcbk/api/oc/session/status")[0] == 200, timeout=LOG_WAIT_S)
+    with slow_bodies([None] * EDGE_OC_PER_SESSION):                                   # L1: без cookie — одна корзина
+        code, body, _ = stack.gw_client().call("GET", "/pcbk/api/oc/session/status")  # 11-й без cookie
+        assert (code, body["name"]) == (503, "WorkplaceBusy")
+        assert a.call("GET", "/pcbk/api/oc/session/status")[0] == 200                 # с настоящей cookie — проходит
+    wait_for(lambda: stack.gw_client().call("GET", "/pcbk/api/oc/session/status")[0] == 401, timeout=LOG_WAIT_S)
     others = [secrets.token_urlsafe(32) for _ in range(EDGE_OC_TOTAL)]                 # свой вид, каждая — своя корзина
     with slow_bodies(others):                                                          # общий предел location
         code, body, _ = b.call("GET", "/pcbk/api/oc/session/status")
@@ -321,9 +373,12 @@ def test_secrets_not_in_core_logs_b(stack, users):                              
     logs = stack.logs("pcbk-core")
     read = "gw refused" in logs and "gw oc login=gw-a" in logs                          # журнал прочитан
     assert read                                                                         # без печати журнала
-    forbidden = ["U0VDUkVUVkFMVUU", a.cookie, *PW.values(), *secret_forms(stack.password(6)),
-                 *secret_forms(stack.password(7))]
-    complete = len(forbidden) == 2 + len(PW) + 3 * 2 and all(forbidden)                 # ни одного пустого
+    cookies = [*dict.fromkeys([*COOKIES, a.cookie])]                   # все сессии модуля (L11): в полном прогоне — 6
+    forbidden = ["U0VDUkVUVkFMVUU", *cookies, *PW.values(),
+                 *(f for n in OWN_PLACES for f in (*secret_forms(stack.password(n)), stack.llm_token(n),
+                                                   stack.data_token(n)))]
+    complete = len(cookies) >= 2 and len(forbidden) == 1 + len(cookies) + len(PW) + 5 * len(OWN_PLACES) \
+        and all(forbidden)                                                               # ни одного пустого
     leaked = [i for i, s in enumerate(forbidden) if s in logs]                          # индексы, не значения
     assert (complete, leaked) == (True, [])
 
@@ -350,7 +405,8 @@ def test_event_ends_when_place_stops(stack, users):
         events, lasted = b.events(40)
     finally:
         stopper.join()
-    assert lasted < 20                                                                  # конец потока места — конец браузеру
+    assert events and events[0]["type"] == "server.connected"                          # поток был открыт
+    assert 3 < lasted < 20                                                              # конец потока места — конец браузеру
     assert b.call("GET", "/pcbk/api/oc/session/status")[1]["name"] == "WorkplaceNotReady"
 
 

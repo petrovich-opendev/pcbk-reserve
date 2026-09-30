@@ -11,18 +11,27 @@ map $request_uri $pcbk_bad_api_uri {
 }
 limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;
 
-# ответы под /pcbk/api/ — не страница: CSP default-src 'none' (Д5б). Пустое значение nginx не отправляет — у
-# страниц сторожа и входа заголовка от этой строки нет (у входа свой CSP в его location)
-map $request_uri $pcbk_api_csp {
+# ответы под /pcbk/api/ и ошибки edge — не страница: CSP default-src 'none' (Д5б). По $uri — пути после
+# нормализации (/%70cbk/…, /x/../pcbk/…) и после перехода error_page (/pcbk-errors/…). Пустое значение nginx не
+# отправляет — у страниц сторожа и входа заголовка от этой строки нет (у входа свой CSP в его location)
+map $uri $pcbk_api_csp {
     default "";
-    "~^/pcbk/api(?:[/?]|$)" "default-src 'none'";
+    "~^/pcbk(?:/api(?:/|$)|-errors/)" "default-src 'none'";
 }
 
+# журнал доступа 8443 — без строки запроса (в ней бывает auth_token адаптера OpenCode): путь — сырой, до «?»
+map $request_uri $pcbk_log_path {
+    default "-";
+    "~^([^?]*)" $1;
+}
+log_format pcbk '$remote_addr - $remote_user [$time_local] "$request_method $pcbk_log_path $server_protocol" '
+                '$status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_x_forwarded_for"';
+
 # /pcbk/api/oc/: одновременных запросов на cookie сессии и всего (Д5б). Ключ — значение cookie только своего вида
-# (token_urlsafe(32), 43 знака); иное — общая корзина «-»; без cookie — не считается (шлюз ответит 401)
+# (token_urlsafe(32), 43 знака); без cookie и с cookie иного вида — одна общая корзина «-» (те же 10): запросы без
+# учётки не займут общий предел. Поддельные cookie своего вида — каждая своя корзина (остаточный риск, README)
 map $cookie_pcbk_session $pcbk_oc_session {
     default "-";
-    "" "";
     "~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;
 }
 limit_conn_zone $pcbk_oc_session zone=pcbk_oc_session:1m;
@@ -43,6 +52,7 @@ server {
     ssl_certificate     /etc/nginx/tls/cert.pem;
     ssl_certificate_key /etc/nginx/tls/key.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
+    access_log /var/log/nginx/access.log pcbk;          # без строки запроса (map выше)
 
     # сторож и core разрешаются в момент запроса: nginx стартует и без них
     resolver 127.0.0.11 valid=10s ipv6=off;
@@ -56,7 +66,7 @@ server {
     add_header Cache-Control "no-store" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "no-referrer" always;
-    add_header Content-Security-Policy $pcbk_api_csp always;   # только под /pcbk/api/ (map выше)
+    add_header Content-Security-Policy $pcbk_api_csp always;   # только под /pcbk/api/ и /pcbk-errors/ (map выше)
     proxy_hide_header Cache-Control;
     proxy_hide_header X-Content-Type-Options;
     proxy_hide_header Referrer-Policy;
@@ -190,30 +200,35 @@ server {
     # вызовы адаптера OpenCode (Д5б): метод, путь и тело сверяет шлюз по белому списку, edge — сырой путь, предел
     # тела, число запросов и сроки. Срок edge больше срока хода у core (25 с, Д5-R30). Тело читается целиком до
     # core: медленное тело держит edge, а не бюджет тел core (16 МиБ). Ответ core читается без остановки: сверх
-    # буферов server (32k + 8 × 32k) — во временный файл на томе (proxy_temp_path выше), ответ core — до 4 МиБ
+    # буферов (32k + 4 × 32k) — во временный файл на томе (proxy_temp_path выше), ответ core — до 4 МиБ
     location /pcbk/api/oc/ {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
         limit_conn pcbk_oc_session 10;
         limit_conn pcbk_oc_all 64;
         limit_conn_status 509;
+        limit_conn_log_level warn;
         client_max_body_size 512k;
         proxy_request_buffering on;
+        proxy_buffers 4 32k;
         proxy_max_temp_file_size 8m;
         proxy_read_timeout 45s;
         proxy_pass http://$pcbk_core;
     }
 
-    # поток событий: без буфера и сжатия; пульс места — 10 с, шлюз рвёт первым через 60 с тишины (Д5-R35);
-    # браузер, не читающий 60 с, edge отключает — очередь шлюза не копит
+    # поток событий: без буфера и сжатия; пульс места — 10 с, шлюз рвёт первым через 60 с тишины места (Д5-R35).
+    # send_timeout рвёт только поток, которому edge 60 с не может отправить ни байта (буфер сокета браузера полон);
+    # пульс мал, и зависшая вкладка поглощает его часами — такой поток закрывает core через 30 мин (STREAM_MAX_S)
     location = /pcbk/api/oc/event {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
         limit_conn pcbk_oc_session 10;
         limit_conn pcbk_oc_all 64;
         limit_conn_status 509;
+        limit_conn_log_level warn;
         client_max_body_size 512k;
         proxy_request_buffering on;
+        proxy_buffers 4 32k;
         proxy_buffering off;
         proxy_cache off;
         gzip off;

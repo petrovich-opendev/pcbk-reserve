@@ -89,7 +89,7 @@ def test_core_hardening(stack):
            ["0", "0"]
     assert hc["RestartPolicy"]["Name"] == "unless-stopped"
     assert set(hc["Tmpfs"]) == {"/tmp"}
-    assert c["Config"]["StopTimeout"] == 15             # Д5б: 2 с uvicorn + закрытие потоков /event + журнал LLM
+    assert c["Config"]["StopTimeout"] == 20             # Д5б: 2 с uvicorn + закрытие потоков /event + журнал LLM
 
 
 def test_core_secret_and_list_are_readonly_files(stack):

@@ -818,3 +818,42 @@ async def test_role_shutdown_waits_for_release_in_progress(tmp_path, monkeypatch
     await role._shutdown()
     assert fp.event_open[3] == 0 and not role.event_streams                             # остановка дождалась закрытия
     await closing
+
+
+# --- доводка Б5 (L2): предел жизни потока ---
+
+def test_stream_lifetime_constant():
+    assert proxy.STREAM_MAX_S == 1800.0                                                  # 30 мин, адаптер переподключается
+
+
+def test_stream_lifetime_ends_pulsing_stream(tmp_path, gwlog, monkeypatch):            # L2: пульс идёт, вкладка висит
+    monkeypatch.setattr(proxy, "STREAM_MAX_S", 0.5)
+    app, role = make_gateway(tmp_path, ready=(3,), stream_recheck_s=10.0)              # перепроверка сессии — позже
+    fp = role.fake_places
+    fp.events[3] = "endless"                                                             # пульс без конца: тишины нет
+    with TestClient(app, base_url=BASE) as c:
+        login(c, "stu-03")
+        t = time.monotonic()
+        with c.stream("GET", "/pcbk/api/oc/event") as r:
+            body = b"".join(r.iter_bytes())
+        lasted = time.monotonic() - t
+        wait_until(lambda: fp.event_open[3] == 0, timeout=3)                            # поток места закрыт
+    assert 0.5 <= lasted < 2 and body.count(b"server.heartbeat") >= 3
+    assert "closed_by=lifetime" in gwlog.text and "closed_by=session" not in gwlog.text
+    assert (role.stats.count_1h("stream_broken"), role.stats.streams) == (0, 0)        # не поломка, слот возвращён
+
+
+def test_stream_lifetime_checked_on_queue_wait(tmp_path, gwlog, monkeypatch):          # L2: и в тишине между событиями
+    monkeypatch.setattr(proxy, "STREAM_MAX_S", 0.3)
+    app, role = make_gateway(tmp_path, ready=(3,), stream_recheck_s=10.0)
+    fp = role.fake_places
+    fp.events[3] = [EV("server.connected"), ("pause", 5.0), EV("server.heartbeat")]
+    with TestClient(app, base_url=BASE) as c:
+        login(c, "stu-03")
+        t = time.monotonic()
+        with c.stream("GET", "/pcbk/api/oc/event") as r:
+            body = b"".join(r.iter_bytes())
+        lasted = time.monotonic() - t
+        wait_until(lambda: fp.event_open[3] == 0, timeout=3)
+    assert lasted < 1.5 and body == EV("server.connected")                             # не ждал ни паузы, ни перепроверки
+    assert "closed_by=lifetime" in gwlog.text and role.stats.streams == 0

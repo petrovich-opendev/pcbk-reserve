@@ -53,7 +53,10 @@ StreamingResponse (гонка вкладок — тот же 429); владен�
 (не на каждом событии — дельты идут десятками в секунду): сессии нет, учётка отключена или место не то — конец
 closed_by=session; STREAM_STORE_FAILURES сбоев базы подряд — closed_by=store. Конец места — конец браузеру
 (closed_by=place; обрыв httpx или OSError — с классом в журнале); событие больше SSE_MAX_EVENT_BYTES (oversize) и
-тишина места дольше places.SSE_READ_TIMEOUT_S (timeout) — конец и stream_broken; обрыв браузера — closed_by=client.
+тишина места дольше places.SSE_READ_TIMEOUT_S (timeout) — конец и stream_broken; обрыв браузера — closed_by=client;
+поток живёт не дольше STREAM_MAX_S (closed_by=lifetime, без stream_broken; доводка Б5, L2): зависшая вкладка, которая
+поглощает пульс места, не держит слот учётки часами — send_timeout edge её не видит, адаптер переподключается сам.
+Срок жизни сверяется на каждом событии и на каждом сроке ожидания очереди.
 release() идемпотентна своим флагом: слот, отмена читателя, строка «gw event place=NN closed_by=… s=N», ожидание
 читателя и закрытие потока места под щитом от отмены; её зовут finally генератора и BackgroundTask ответа (Starlette
 зовёт его и тогда, когда браузер ушёл до первого шага генератора), а остановка роли (lifespan) закрывает ещё открытые
@@ -119,6 +122,7 @@ SSE_MAX_EVENT_BYTES = 512 * 1024
 STREAM_QUEUE_MAX = 1
 STREAM_CLOSE_S = 5.0                        # ожидание читателя и закрытие потока места в release — каждое не дольше
 STREAM_STORE_FAILURES = 3                   # сбоев базы подряд при перепроверке сессии — конец потока (closed_by=store)
+STREAM_MAX_S = 1800.0                       # предел жизни потока (closed_by=lifetime); читается при открытии потока
 _BROKEN = ("timeout", "oversize")           # концы потока, которые считаются stream_broken
 _WARN_ENDS = (*_BROKEN, "store")            # концы потока со строкой WARNING
 
@@ -527,6 +531,7 @@ class _EventStream:
         self._done = asyncio.Event()                # release() довёл закрытие до конца (или сдался по сроку)
         self._store_failures = 0
         self._started = time.monotonic()
+        self._ends_at = self._started + STREAM_MAX_S    # предел жизни потока (L2)
         role.event_streams.add(self)                # остановка роли дождётся закрытия (shutdown)
 
     async def _read(self) -> None:
@@ -564,8 +569,9 @@ class _EventStream:
         return None
 
     async def events(self) -> AsyncIterator[bytes]:
-        """Генератор ответа: ждёт очередь не дольше срока до перепроверки сессии; перепроверка — раз в
-        stream_recheck_s, ни чаще (на событиях), ни реже (на сроках). Конец — release() в finally."""
+        """Генератор ответа: ждёт очередь не дольше срока до перепроверки сессии или конца жизни потока; перепроверка
+        — раз в stream_recheck_s, ни чаще (на событиях), ни реже (на сроках); жизнь потока истекла (STREAM_MAX_S) —
+        конец closed_by=lifetime, сверка на каждом событии и каждом сроке. Конец — release() в finally."""
         closed_by, error = "client", None
         try:
             if self._released:
@@ -575,12 +581,15 @@ class _EventStream:
             next_check = time.monotonic() + recheck
             while True:
                 item: bytes | _End | None = None
-                wait = next_check - time.monotonic()
+                wait = min(next_check, self._ends_at) - time.monotonic()
                 if wait > 0:
                     try:
                         item = await asyncio.wait_for(self._queue.get(), wait)   # отмена get() событие не теряет
                     except TimeoutError:
                         pass
+                if time.monotonic() >= self._ends_at:                           # L2: адаптер переподключится сам
+                    closed_by = "lifetime"
+                    break
                 if time.monotonic() >= next_check:
                     ended = await self._session_end()
                     if ended is not None:

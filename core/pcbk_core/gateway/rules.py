@@ -14,8 +14,9 @@
 Отказы — Refused с постоянным текстом без чисел и без ввода клиента (решение Д4а; Ш12): ни часть тела,
 ни путь, ни строка запроса не попадают ни в message, ни в reason. Имя агента проходит, только если оно
 целиком совпало с AGENT_NAME; сверку со списком агентов места делает прокси (Д5-R33), APPROVABLE для «once»
-— тоже прокси (Д5-R34). time.archived = null шлюз пропускает как есть (Ш13): место 1.18.33
-(ArchivedTimestamp = Schema.Finite) ответит 400 само — OpenCode шлюз не чинит.
+— тоже прокси (Д5-R34). time.archived = null шлюз пропускает как есть (Ш13): место 1.18.33 отвечает 200 и
+архив не снимает (тихая пустая операция — живой тест Б5, test_archived_null_goes_to_place); OpenCode шлюз не чинит,
+кнопку «из архива» скрывает Д6.
 
 Строки к месту — без одиночных суррогатов: httpx кодирует тело json= в UTF-8, и такой текст дал бы
 UnicodeEncodeError в прокси вместо ответа вида OpenCode.
@@ -138,7 +139,8 @@ def build_update(body: Any) -> dict:
             raise _bad("archived")
         if "archived" in time:
             archived = time["archived"]
-            # bool — подкласс int в Python, он не отметка времени; null — как есть (Ш13)
+            # bool — подкласс int в Python, он не отметка времени; null — как есть (Ш13): 1.18.33 отвечает 200 и
+            # не снимает архив
             if archived is not None and not (type(archived) is int and archived >= 0):
                 raise _bad("archived")
             out["time"] = {"archived": archived}
