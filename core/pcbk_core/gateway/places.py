@@ -13,11 +13,15 @@ Restarting или новый StartedAt, и mark_unready (Д5б: отказ со�
 Простой — по монотонным часам: от последней активности (touch), а без неё — с первого раза, когда шлюз
 увидел место работающим (такт или пробуждение). Уборщик под замком места: GET /session/status →
 перепроверка простоя → без await снять «готово» → stop. Занятое место гаснет не позже двойного срока.
+Неудавшийся stop оставляет место в running; повтор — не раньше паузы (2 такта, дальше вдвое, до
+GW_IDLE_STOP_S), паузу снимают удачная остановка, такт, увидевший место стоящим, и пробуждение.
 
 Такт снимает inspect мест параллельно, вне замков; итог места применяется, только если за это время место
 не трогали пробуждение и остановка (счётчик _gen) и замок свободен: запоздавший inspect не снимет свежий
-флаг. Первый такт с живым sp-ctl возвращает «готово» работающим местам без флага одной попыткой GET /agent,
-по местам параллельно: открытые вкладки после перезапуска core работают без пробуждения.
+флаг. Первый проход, где sp-ctl ответил хоть об одном месте, возвращает «готово» работающим местам без
+флага одной попыткой GET /agent, по местам параллельно: открытые вкладки после перезапуска core работают без
+пробуждения. Исключение шага одного места (gather с return_exceptions) — строка журнала с классом, проход
+идёт дальше: неожиданный ответ места не останавливает уборщик.
 
 Конструкторы без ввода-вывода. httpx.AsyncClient создаётся в open() или при первом запросе (как Upstream,
 П22), прокси окружения не берутся (trust_env=False). Сроки попыток держит asyncio.timeout поверх срока
@@ -157,7 +161,7 @@ class SpCtl:
             raise SpCtlError("refused", r.status_code)
         try:
             info = r.json()
-        except ValueError:
+        except (ValueError, RecursionError):              # не JSON или вложенность глубже предела разбора
             raise SpCtlError("refused", r.status_code) from None
         if not isinstance(info, dict):
             raise SpCtlError("refused", r.status_code)
@@ -232,6 +236,8 @@ class Workplaces:
         self._seen: dict[int, float] = {}                # когда шлюз увидел место работающим (monotonic)
         self._gen = dict.fromkeys(PLACES, 0)             # растёт при каждой смене места пробуждением и остановкой
         self._passwords: dict[int, str] = {}
+        self._stop_backoff: dict[int, float] = {}        # пауза до повтора неудавшейся остановки (растёт вдвое)
+        self._stop_not_before: dict[int, float] = {}     # monotonic, раньше которого уборщик место не гасит
         self._restored = False
         self.running: set[int] = set()
         self.sp_ctl: Literal["ok", "down", "unknown"] = "unknown"
@@ -338,6 +344,15 @@ class Workplaces:
     def mark_unready(self, n: int) -> None:
         self._ready.pop(_place(n), None)
 
+    def set_ready_for_tests(self, n: int, started_at: str | None = None) -> None:
+        """Только для тестов (А4 gateway_role(ready=…), Д5б): место готово без пробуждения — как после такта:
+        «готово» с этим StartedAt (None — следующий такт возьмёт его из inspect), место в running. Без
+        ввода-вывода; контейнер двойника запускает сам тест (helpers.ready_place)."""
+        n = _place(n)
+        self._ready[n] = started_at
+        self._gen[n] += 1
+        self._mark_running(n)
+
     def _unready(self, n: int) -> None:
         self._ready.pop(n, None)
         self._gen[n] += 1
@@ -348,10 +363,29 @@ class Workplaces:
             self._seen[n] = self._monotonic()
 
     def _forget(self, n: int) -> None:
-        """Место не работает (или гаснет): не в running, отсчёт «увидено» — с нового запуска."""
+        """Место не работает (или погашено): не в running, отсчёт «увидено» — с нового запуска, пауза повтора
+        остановки снята."""
         self.running.discard(n)
         self._seen.pop(n, None)
+        self._stop_retry_reset(n)
         self._gen[n] += 1
+
+    def _stop_retry_reset(self, n: int) -> None:
+        self._stop_backoff.pop(n, None)
+        self._stop_not_before.pop(n, None)
+
+    def _stop_retry_later(self, n: int) -> None:
+        """Остановка не удалась: место остаётся в running (оно работает), «увидено» не трогается, повтор — не
+        раньше паузы: 2 такта, дальше вдвое, до GW_IDLE_STOP_S. Так сбойный sp-ctl не получает stop каждый такт,
+        а stop_failed не растёт на каждом такте."""
+        backoff = self._stop_backoff.get(n)
+        backoff = 2 * self.gw.GW_REAPER_TICK_S if backoff is None else 2 * backoff
+        backoff = min(backoff, self.gw.GW_IDLE_STOP_S)
+        self._stop_backoff[n] = backoff
+        self._stop_not_before[n] = self._monotonic() + backoff
+
+    def _stop_allowed(self, n: int) -> bool:
+        return self._monotonic() >= self._stop_not_before.get(n, float("-inf"))
 
     # --- пробуждение ---
 
@@ -361,6 +395,7 @@ class Workplaces:
         self.touch(n)
         if not self._waking(n):
             self._failed.pop(n, None)                    # неудача прошлого пробуждения сбрасывается здесь
+            self._stop_retry_reset(n)                    # место снова нужно студенту
             self._tasks[n] = asyncio.create_task(self._wake(n), name=f"gw-wake-{n:02d}")
         return self.view(n)
 
@@ -482,7 +517,11 @@ class Workplaces:
         ok = await self._stop_quiet(n)
         (log.info if ok else log.warning)("gw stop place=%02d idle_s=%d busy=no result=%s", n, idle,
                                           "ok" if ok else "failed")
-        self._forget(n)
+        if ok:
+            self._forget(n)
+        else:                                            # место запущено нами и работает — уборщик повторит
+            self._mark_running(n)
+            self._stop_retry_later(n)
 
     # --- уборщик ---
 
@@ -514,9 +553,18 @@ class Workplaces:
         except SpCtlError:
             return _FAILED
 
+    @staticmethod
+    def _log_failures(step: str, places: list[int], results: list[object]) -> None:
+        """Исключения шагов прохода (gather с return_exceptions): в журнал только класс, проход идёт дальше."""
+        for n, result in zip(places, results):
+            if isinstance(result, BaseException):
+                log.warning("gw tick place=%02d step=%s error=%s", n, step, type(result).__name__)
+
     async def _pass(self) -> None:
         gens = dict(self._gen)
-        infos = await asyncio.gather(*(self._inspect_quiet(n) for n in PLACES))
+        infos = list(await asyncio.gather(*(self._inspect_quiet(n) for n in PLACES), return_exceptions=True))
+        self._log_failures("inspect", list(PLACES), infos)
+        infos = [_FAILED if isinstance(info, BaseException) else info for info in infos]
         now = self._monotonic()
         seen: dict[int, _Container] = {}
         for n, info in zip(PLACES, infos):
@@ -537,13 +585,16 @@ class Workplaces:
                     self._ready.pop(n)
                 elif flag is None:
                     self._ready[n] = container.started_at
-        if not self._restored:
-            self._restored = True
+        if not self._restored and any(info is not _FAILED for info in infos):
+            self._restored = True                         # первый проход, где sp-ctl ответил хоть об одном месте
             todo = [n for n, c in seen.items() if not c.restarting and n not in self._ready]
-            await asyncio.gather(*(self._restore(n, seen[n]) for n in todo))
+            self._log_failures("restore", todo, await asyncio.gather(
+                *(self._restore(n, seen[n]) for n in todo), return_exceptions=True))
         limit = self.gw.GW_IDLE_STOP_S
-        idle = [n for n in sorted(self.running) if not self._busy(n) and self.idle_s(n) >= limit]
-        await asyncio.gather(*(self._reap(n) for n in idle))
+        idle = [n for n in sorted(self.running)
+                if not self._busy(n) and self._stop_allowed(n) and self.idle_s(n) >= limit]
+        self._log_failures("reap", idle, await asyncio.gather(*(self._reap(n) for n in idle),
+                                                              return_exceptions=True))
 
     async def _restore(self, n: int, container: _Container) -> None:
         """Первый проход: работающее место без флага — одна попытка GET /agent; 200 — «готово»."""
@@ -568,14 +619,15 @@ class Workplaces:
             return False
         try:
             sessions = r.json()
-        except ValueError:
+        except (ValueError, RecursionError):              # не JSON или вложенность глубже предела разбора
             return False
         return isinstance(sessions, dict) and any(
-            isinstance(s, dict) and s.get("type") in BUSY_TYPES for s in sessions.values())
+            isinstance(s, dict) and isinstance(t := s.get("type"), str) and t in BUSY_TYPES
+            for s in sessions.values())
 
     async def _reap(self, n: int) -> None:
         """Остановка простаивающего места под замком: занятость → перепроверка простоя → снять «готово» → stop."""
-        if self._busy(n):
+        if self._busy(n) or not self._stop_allowed(n):
             return
         async with self._locks[n]:
             if n not in self.running:
@@ -589,4 +641,7 @@ class Workplaces:
             ok = await self._stop_quiet(n)
             (log.info if ok else log.warning)("gw stop place=%02d idle_s=%d busy=%s result=%s", n, idle,
                                               "yes" if busy else "no", "ok" if ok else "failed")
-            self._forget(n)
+            if ok:
+                self._forget(n)
+            else:
+                self._stop_retry_later(n)

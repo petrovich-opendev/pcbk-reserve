@@ -458,7 +458,14 @@ def make_places(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | Non
     gw = replace(GW_SETTINGS, **{"GW_PLACE_PW_DIR": str(pw_dir(tmp_path)), **overrides})
     mono = FakeMono(1000.0)
     stats = GatewayStats(monotonic=mono)
+    oc.stu_net = gw.STU_NET
     w = Workplaces(gw, SpCtl(gw.SP_CTL_URL, transport=httpx.MockTransport(docker)), stats=stats,
                    transport=httpx.MockTransport(oc), monotonic=mono, sleep=fast_sleep(mono))
     w.docker, w.oc, w.mono = docker, oc, mono
     return w
+
+
+def ready_place(workplaces: Workplaces, docker: FakeDocker, n: int) -> None:
+    """Место n работает в двойнике Docker и готово у шлюза без пробуждения — как после такта (А4
+    gateway_role(ready=…), Д5б): первый такт его не трогает."""
+    workplaces.set_ready_for_tests(n, docker.run(n))

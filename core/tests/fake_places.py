@@ -22,7 +22,7 @@ NEVER_STARTED = "0001-01-01T00:00:00Z"          # StartedAt контейнера
 
 _DOCKER_GET = re.compile(r"/v1\.44/(_ping|containers/pcbk-student-(0[1-9]|10)/json)")
 _DOCKER_POST = re.compile(r"/v1\.44/containers/pcbk-student-(0[1-9]|10)/(start|stop)")
-_PLACE_HOST = re.compile(r"[0-9]{1,3}\.[0-9]{1,3}\.([0-9]{1,2})\.3")
+_PLACE_TAIL = re.compile(r"([1-9]|10)\.3")         # после префикса STU_NET: N.3, номер без нуля впереди
 _stamps = itertools.count(1)
 
 
@@ -69,6 +69,13 @@ class FakeDocker:
     @property
     def stopped(self) -> list[int]:
         return list(self._stopped)
+
+    def run(self, n: int) -> str:
+        """Контейнер места n работает (как docker start мимо шлюза, в журнал вызовов не идёт); его StartedAt."""
+        c = self.containers[n]
+        if not c["running"]:
+            c.update(running=True, restarting=False, restart_count=0, started_at=_stamp())
+        return c["started_at"]
 
     def _inspect(self, n: int) -> dict:
         c = self.containers[n]
@@ -118,12 +125,14 @@ class FakeDocker:
 
 
 class FakePlaces:
-    """Серверы OpenCode мест по хосту {STU_NET}.N.3.
+    """Серверы OpenCode мест по хосту {stu_net}.N.3:4096 (stu_net — как STU_NET шлюза; чужой хост —
+    ConnectError).
 
     - Authorization не тот (expected_basic) или wrong_pw — 401 на любой запрос;
     - /agent — 200 [] начиная с вызова номер ready_after этого места (после настоящей паузы agent_delay),
       раньше и при never_ready — 503;
-    - /session/status — {} (после status_delay), у мест из busy — одна занятая сессия;
+    - /session/status — {} (после status_delay), у мест из busy — одна занятая сессия, у мест из status_raw —
+      эти байты как тело 200 (неверный ответ места);
     - прочее — 404.
     agent_calls[n] — сколько раз звали /agent места n; requests — все запросы по порядку.
     """
@@ -136,14 +145,17 @@ class FakePlaces:
         self.busy = set(busy)
         self.status_delay = status_delay
         self.agent_delay = agent_delay
+        self.stu_net = "172.31"
+        self.status_raw: dict[int, bytes] = {}
         self.agent_calls: Counter[int] = Counter()
         self.requests: list[httpx.Request] = []
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
-        m = _PLACE_HOST.fullmatch(request.url.host)
-        n = int(m[1]) if m else 0
-        if n not in PLACES or request.url.port != 4096:
+        host, prefix = request.url.host, self.stu_net + "."
+        m = _PLACE_TAIL.fullmatch(host[len(prefix):]) if host.startswith(prefix) else None
+        if m is None or request.url.port != 4096:
             raise httpx.ConnectError("нет такого места", request=request)
+        n = int(m[1])
         self.requests.append(request)
         if self.wrong_pw or request.headers.get("authorization") != expected_basic(n):
             return _json(401, {"name": "Unauthorized"})
@@ -158,5 +170,7 @@ class FakePlaces:
         if request.method == "GET" and path == "/session/status":
             if self.status_delay:
                 await asyncio.sleep(self.status_delay)
+            if n in self.status_raw:
+                return httpx.Response(200, content=self.status_raw[n], headers={"content-type": "application/json"})
             return _json(200, {"ses_" + "B" * 26: {"type": "busy"}} if n in self.busy else {})
         return _json(404, {"name": "NotFound"})

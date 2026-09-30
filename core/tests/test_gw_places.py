@@ -7,7 +7,8 @@ import httpx
 import pytest
 
 from fake_places import FakeDocker, FakePlaces
-from helpers import FakeMono, make_places
+from helpers import FakeMono, make_places, ready_place, wait_until_async
+from pcbk_core.gateway import places
 from pcbk_core.gateway.places import PLACE_TEXTS, PlaceView, SpCtl, SpCtlError
 from pcbk_core.gateway.stats import GatewayStats
 
@@ -66,7 +67,7 @@ async def test_wake_during_reaper_stop(tmp_path):                               
     await w.tick()                                                                     # место увидено работающим
     w.mono.advance(61)
     reaper = asyncio.create_task(w.tick())
-    await asyncio.sleep(0.05)                                                          # уборщик взял замок, stop идёт
+    await wait_until_async(lambda: ("stop", 3) in w.docker.calls)                      # уборщик взял замок, stop идёт
     assert not w.is_ready(3)                                                           # «готово» снято до stop
     await w.wake(3)
     await reaper
@@ -80,7 +81,7 @@ async def test_reaper_rechecks_idle_under_lock(tmp_path):                       
     await w.tick()
     w.mono.advance(61)
     reaper = asyncio.create_task(w.tick())                                             # отбор: место 5 простаивает
-    await asyncio.sleep(0.05)                                                          # уборщик ждёт /session/status
+    await wait_until_async(lambda: any(r.url.path == "/session/status" for r in w.oc.requests))   # ждёт ответа
     w.touch(5)                                                                         # действие студента в этом окне
     await reaper
     assert ("stop", 5) not in w.docker.calls and w.is_ready(5)
@@ -165,7 +166,7 @@ async def test_stale_tick_inspect_keeps_fresh_ready(tmp_path):                  
     await w.tick()
     docker.delay = 0.3
     ticking = asyncio.create_task(w.tick())                                            # inspect: «место 3 стоит»
-    await asyncio.sleep(0.05)
+    await wait_until_async(lambda: docker.calls.count(("inspect", 3)) == 2)            # второй inspect ушёл
     await w.wake(3)
     assert (await w.wait_ready(3)).state == "ready"                                    # пока такт ждёт ответа
     await ticking
@@ -227,3 +228,126 @@ def test_stats_window_and_unknown_kind():
 def test_place_view_json():
     assert PlaceView(3, "sleeping", PLACE_TEXTS["sleeping"]).to_json() == {
         "place": "03", "state": "sleeping", "detail": "Рабочее место спит"}
+
+
+# --- доводка по ревью ---
+
+async def test_bogus_session_status_does_not_break_tick(tmp_path, monkeypatch, caplog):   # M1
+    oc = FakePlaces()
+    oc.status_raw = {1: b'{"ses_x": {"type": ["busy"]}}',                           # тип — список, не строка
+                     2: b"[" * 100000 + b"]" * 100000,                                 # глубже предела разбора JSON
+                     3: b'[{"type": "busy"}]'}                                         # не объект
+    w = make_places(tmp_path, FakeDocker(running={1, 2, 3, 4}), oc, GW_IDLE_STOP_S=60.0)
+    await w.tick(); w.mono.advance(61); await w.tick()
+    assert w.ticks == 2 and w.docker.stopped == [1, 2, 3, 4]                           # неверный ответ — «не занято»
+    real = w._session_busy
+
+    async def boom(n):                                                                 # защита в глубину: gather
+        if n == 5:
+            raise RuntimeError("не должно уйти из такта")
+        return await real(n)
+    monkeypatch.setattr(w, "_session_busy", boom)
+    for n in (5, 6):
+        w.docker.run(n)
+    await w.tick(); w.mono.advance(61); await w.tick()
+    assert w.ticks == 4 and w.docker.stopped == [1, 2, 3, 4, 6]
+    assert "gw tick place=05 step=reap error=RuntimeError" in caplog.text
+    assert "не должно уйти" not in caplog.text                                         # только класс
+
+
+async def test_failed_stop_retried_with_backoff(tmp_path):                              # M2
+    docker = FakeDocker(running={6}, stop_status=500)
+    w = make_places(tmp_path, docker, GW_IDLE_STOP_S=240.0)                            # такт 30 с: паузы 60, 120, 240
+    await w.tick(); w.mono.advance(240)
+    for _ in range(20):                                                                # 600 с тактов по 30 с
+        await w.tick(); w.mono.advance(30)
+    assert [c for c in docker.calls if c == ("stop", 6)] == [("stop", 6)] * 4           # 0, +60, +180, +420 — не 20
+    assert w.stats.count_1h("stop_failed") == 4
+    assert 6 in w.running and not w.is_ready(6)                                        # работает, но не «готово»
+    docker.stop_status = 204
+    for _ in range(8):                                                                 # следующий повтор — +660 с
+        await w.tick()
+        if docker.stopped:
+            break
+        w.mono.advance(30)
+    assert docker.stopped == [6] and 6 not in w.running
+    assert w.stats.count_1h("stop_failed") == 4 and w.mono() - 1000 - 240 == 660        # ровно в разрешённый такт
+
+
+async def test_attempt_deadlines_hold(tmp_path, monkeypatch):                          # M4: двойник сроков httpx не соблюдает
+    for name in ("PING_TIMEOUT_S", "ACTION_TIMEOUT_S", "READY_ATTEMPT_S", "BUSY_CHECK_S"):
+        monkeypatch.setattr(places, name, 0.1)
+
+    async def silent(request):
+        await asyncio.sleep(5)
+        return httpx.Response(200)
+    sp = SpCtl("http://pcbk-sp-ctl:2375", transport=httpx.MockTransport(silent))
+    t = time.monotonic()
+    assert not await sp.ping()
+    for call in (sp.inspect, sp.start, sp.stop):
+        with pytest.raises(SpCtlError) as e:
+            await call(1)
+        assert e.value.kind == "down"
+    assert time.monotonic() - t < 1.5                                                   # 4 × 0,1 с, а не 4 × 5 с
+    w = make_places(tmp_path, FakeDocker(running={2}), FakePlaces(status_delay=5), GW_IDLE_STOP_S=60.0)
+    await w.tick(); w.mono.advance(61)
+    t = time.monotonic()
+    await w.tick()                                                                     # /session/status молчит
+    assert time.monotonic() - t < 1.0 and w.docker.stopped == [2]
+    w = make_places(tmp_path, oc=FakePlaces(agent_delay=5), GW_WAKE_TIMEOUT_S=1.0)
+    t = time.monotonic()
+    await w.wake(3)
+    assert (await w.wait_ready(3)).detail == PLACE_TEXTS["timeout"] and time.monotonic() - t < 1.0
+
+
+async def test_restore_waits_for_an_answered_inspect(tmp_path):                        # M5
+    class RefusedInspect(FakeDocker):                                                  # ping жив, inspect — 500
+        refuse = True
+
+        async def __call__(self, request):
+            if self.refuse and request.url.path.endswith("/json"):
+                return httpx.Response(500)
+            return await super().__call__(request)
+
+    docker = RefusedInspect(running={2})
+    w = make_places(tmp_path, docker)
+    await w.tick()
+    assert w.sp_ctl == "ok" and not w.is_ready(2)
+    docker.refuse = False
+    await w.tick()
+    assert w.is_ready(2)                                                               # проход с ответом — первый
+
+
+async def test_places_on_configured_net(tmp_path):                                      # M6
+    w = make_places(tmp_path, STU_NET="10.20")
+    await w.wake(3)
+    assert (await w.wait_ready(3)).state == "ready" and w.oc.requests[-1].url.host == "10.20.3.3"
+    w = make_places(tmp_path, STU_NET="10.20")
+    w.oc.stu_net = "172.31"                                                            # место не в той сети
+    await w.wake(3)
+    assert (await w.wait_ready(3)).state == "failed" and w.oc.requests == []
+
+
+async def test_set_ready_for_tests(tmp_path):                                           # хук тестов А4 и Д5б
+    w = make_places(tmp_path)
+    ready_place(w, w.docker, 4)
+    assert w.is_ready(4) and 4 in w.running and w.docker.containers[4]["running"]
+    w.mark_unready(4)
+    w.set_ready_for_tests(4)                                                           # без StartedAt — возьмёт такт
+    await w.tick()
+    assert w.is_ready(4) and starts(w) == [] and w.oc.agent_calls[4] == 0              # первый такт не трогает
+    w.docker.containers[4]["started_at"] = "2026-10-05T09:00:00.000000002Z"           # перезапуск извне
+    await w.tick()
+    assert not w.is_ready(4)                                                           # StartedAt взят из inspect
+
+
+async def test_failed_stop_after_failed_wake_keeps_place(tmp_path):                    # M2 в _stop_failed_wake
+    docker = FakeDocker(stop_status=500)
+    w = make_places(tmp_path, docker, FakePlaces(never_ready=True), GW_WAKE_TIMEOUT_S=10.0, GW_IDLE_STOP_S=60.0)
+    await w.wake(4)
+    assert (await w.wait_ready(4)).detail == PLACE_TEXTS["timeout"]
+    assert 4 in w.running and not w.is_ready(4) and w.stats.count_1h("stop_failed") == 1   # запущено нами — работает
+    docker.stop_status = 204
+    w.mono.advance(61)
+    await w.tick()                                                                     # простой вышел, пауза (60 с) тоже
+    assert docker.stopped == [4] and 4 not in w.running
