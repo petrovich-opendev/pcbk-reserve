@@ -217,8 +217,10 @@ server {
         try_files $uri =404;
     }
 
-    # прочее под /chat/ — не на 8443: опись build.json читает только сторож через 8080, index.html — только как /chat/
+    # прочее под /chat/ — не на 8443: опись build.json читает только сторож через 8080, index.html — только как /chat/.
+    # types {} — тип ответа не по расширению пути (иначе 404 на build.json ушёл бы как application/json)
     location ^~ /chat/ {
+        types { }
         default_type "text/plain; charset=utf-8";
         return 404 "не найдено\n";
     }

@@ -54,3 +54,12 @@ def test_login_leads_to_chat(stack, page, web_users):                           
     assets = page.requests("/chat/assets/")
     assert [r["status"] for r in assets] and all(r["status"] == 200 for r in assets), assets
     assert [r["status"] for r in page.requests("/chat/") if r["path"] == "/chat/"] == [200]
+    # положительный контроль наблюдателей (доводка 1, I1): без него тихо сломанный слушатель CSP или разбор консоли
+    # (обновление Chrome, правка cdp.py) оставил бы проверки выше зелёными навсегда. Пробы — после них
+    page.eval("fetch('https://example.invalid/').catch(() => 0), 1")               # connect-src 'self' — отказ
+    page.wait(lambda: page.csp(), 5, "отчёт CSP о пробном нарушении")
+    assert [v["effective"] for v in page.csp()] == ["connect-src"], page.csp()
+    assert page.console_errors() == []
+    page.eval("console.error('pcbk-probe'), 1")
+    page.wait(lambda: page.console_errors(), 5, "console.error пробы")
+    assert page.console_errors() == ["pcbk-probe"]

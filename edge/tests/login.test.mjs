@@ -609,7 +609,8 @@ test("шаблон edge: чат на 8443 — свой CSP, кэш и сжати
                           '    200     "public, max-age=31536000, immutable";\n' +
                           '    304     "public, max-age=31536000, immutable";\n}'));
 
-  assert.match(one(8443, "^~", "/chat/"), /return 404 /);                             // build.json и прочее — не на 8443
+  assert.match(one(8443, "^~", "/chat/"),                                              // build.json и прочее — не на 8443,
+               /types \{ \}\s*default_type "text\/plain; charset=utf-8";\s*return 404 /);  // тип — не по расширению
   assert.match(one(8443, "=", "/favicon.ico"), /return 204;/);                         // решение по А4: без 404 иконки
   assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/chat")).length, 4);
 

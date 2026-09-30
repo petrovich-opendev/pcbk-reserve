@@ -211,16 +211,22 @@ def prepare_images() -> None:
         _run(["docker", "tag", pinned, name])
 
 
-def build_test_static(static_dir: Path) -> None:
+def build_test_static(static_dir: Path, src_dir: Path) -> None:
     """Статика edge тестового стенда (Д6а): копия edge/static без сборки чата из дерева и свежая сборка веба в
-    static_dir/chat с меткой test-<12 знаков HEAD>. Общее дерево сборка не трогает — вывод в PCBK_WEB_OUT;
-    web/node_modules ставит npm ci по lock. Каталоги 0755, файлы 0644: nginx читает их не от владельца."""
-    shutil.copytree(REPO / "edge" / "static", static_dir,
-                    ignore=lambda d, names: ["chat"] if Path(d) == REPO / "edge" / "static" else [])
+    static_dir/chat с меткой test-<12 знаков HEAD>. Общее дерево сборка не трогает (Global Constraints Д6): веб
+    собирается в копии src_dir/web без node_modules — npm ci по lock там же; рядом копия edge/static, её читает
+    tsc (тест места импортирует login.js). Каталоги 0755, файлы 0644: nginx читает их не от владельца."""
+    def no_chat(d: str, names: list[str]) -> list[str]:          # сборка чата из дерева — не в копию
+        return ["chat"] if Path(d) == REPO / "edge" / "static" else []
+
+    shutil.copytree(REPO / "edge" / "static", static_dir, ignore=no_chat)
+    shutil.copytree(REPO / "edge" / "static", src_dir / "edge" / "static", ignore=no_chat)
+    shutil.copytree(REPO / "web", src_dir / "web", ignore=shutil.ignore_patterns("node_modules"))
     head = _run(["git", "rev-parse", "--short=12", "HEAD"], cwd=REPO).stdout.strip()
     env = {**os.environ, "PCBK_WEB_OUT": str(static_dir / "chat"), "PCBK_BUILD": f"test-{head}"}
-    _run(["npm", "--prefix", "web", "ci", "--ignore-scripts"], cwd=REPO, timeout=COMPOSE_TIMEOUT_S)
-    _run(["npm", "--prefix", "web", "run", "build"], cwd=REPO, env=env, timeout=COMPOSE_TIMEOUT_S)
+    web = src_dir / "web"
+    _run(["npm", "ci", "--ignore-scripts", "--prefer-offline"], cwd=web, timeout=COMPOSE_TIMEOUT_S)
+    _run(["npm", "run", "build"], cwd=web, env=env, timeout=COMPOSE_TIMEOUT_S)
     for d, _, files in os.walk(static_dir):
         Path(d).chmod(0o755)
         for f in files:
@@ -860,7 +866,7 @@ def stack(tmp_path_factory, student_image):
     make_test_places(work / "secrets", work / "agents")
     make_test_core_data(work / "secrets", work / "data")
     make_test_llm(work / "secrets")
-    build_test_static(work / "static")          # до test.env и compose: у PCBK_TEST_STATIC «:?» (preflight M15)
+    build_test_static(work / "static", work / "web-src")   # до test.env и compose: у PCBK_TEST_STATIC «:?» (M15)
     env_file = work / "test.env"
     env_file.write_text("\n".join([
         f"DOCKER_GID={docker_gid()}",
@@ -904,4 +910,6 @@ def page(browser):
         yield p
     finally:
         p.close()
+    # сбой разбора события — пропавший отчёт CSP или ошибка консоли: зелёный тест без них не считается
+    assert browser.handler_errors == [], browser.handler_errors
 

@@ -169,7 +169,8 @@ def test_edge_serves_chat_under_csp(stack):                                # Д6
     code, _, h = stack.https_full("/chat/assets/missing-00000000.js")
     assert (code, h["cache-control"]) == (404, "no-store")                 # отказ не кэшируется на год
     for path in ("/chat/build.json", "/chat/index.html"):                  # опись — только 8080; страница — только /chat/
-        assert stack.https_full(path)[0] == 404, path
+        code, _, h = stack.https_full(path)
+        assert (code, h["content-type"]) == (404, "text/plain; charset=utf-8"), path   # тип — не по расширению
     code, _, h = stack.https_full("/chat")
     assert (code, h["location"]) == (301, "/chat/")                        # относительный: туннель не уводит на 8443
     code, _, h = stack.https_full("/favicon.ico")

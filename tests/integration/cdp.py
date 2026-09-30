@@ -254,11 +254,12 @@ class Page:
         self._requests: dict[str, dict] = {}        # requestId → последняя запись (после перенаправления — новая)
         self._order: list[dict] = []                # все записи в порядке отправки
         self._extra: dict[str, dict[str, str]] = {}  # заголовки ExtraInfo, пришедшие раньше requestWillBeSent
-        self._loads = 0
+        self._loaded: set[str] = set()              # loaderId документов, дошедших до load
         self._closed = False
         conn.on(session_id, self._on_event)
         for domain in ("Page", "Runtime", "Network"):
             self._call(f"{domain}.enable")
+        self._call("Page.setLifecycleEventsEnabled", {"enabled": True})   # load — с loaderId своего документа
         self._call("Runtime.addBinding", {"name": CSP_BINDING})
         self._call("Page.addScriptToEvaluateOnNewDocument", {"source": CSP_LISTENER})
 
@@ -273,8 +274,8 @@ class Page:
                 self._errors.append((d.get("exception") or {}).get("description") or d.get("text") or "исключение")
             elif method == "Runtime.consoleAPICalled" and params.get("type") == "error":
                 self._errors.append(" ".join(_arg_text(a) for a in params.get("args") or []))
-            elif method == "Page.loadEventFired":
-                self._loads += 1
+            elif method == "Page.lifecycleEvent" and params.get("name") == "load":
+                self._loaded.add(params.get("loaderId", ""))
             elif method.startswith("Network."):
                 self._on_network(method, params)
 
@@ -310,8 +311,9 @@ class Page:
     def _call(self, method: str, params: dict | None = None, timeout: float = CALL_TIMEOUT_S) -> dict:
         return self._conn.call(method, params, session=self.session_id, timeout=timeout)
 
-    def _until(self, probe: Callable[[], object], timeout: float, what: str) -> object:
-        """Опрос probe() до истинного значения; отказ CDP во время перехода страницы — «ещё нет»."""
+    def wait(self, probe: Callable[[], object], timeout: float, what: str) -> object:
+        """Опрос probe() до истинного значения, которое и возвращается; отказ CDP во время перехода страницы — «ещё
+        нет». По сроку — AssertionError с what."""
         deadline = time.monotonic() + timeout
         last_error = ""
         while True:
@@ -337,13 +339,14 @@ class Page:
     # --- навигация и ввод ---
 
     def goto(self, url: str, timeout: float = 30) -> None:
-        """Переход и ожидание события load нового документа."""
-        with self._lock:
-            before = self._loads
+        """Переход и ожидание load именно этого документа (по loaderId перехода): запоздалый load прошлой загрузки
+        не засчитывается. Переход внутри документа (только #…) loaderId не даёт — ждать нечего."""
         r = self._call("Page.navigate", {"url": url})
         if r.get("errorText"):
             raise CDPError(f"переход на {url}: {r['errorText']}")
-        self._until(lambda: self._loads > before, timeout, f"загрузка {url}")
+        loader = r.get("loaderId")
+        if loader:
+            self.wait(lambda: loader in self._loaded, timeout, f"загрузка {url}")
 
     def url(self) -> str:
         return self.eval("location.href")
@@ -374,7 +377,7 @@ class Page:
               "(e.innerText || e.value || '').trim() === want && e.getClientRects().length && !e.disabled); "
               "if (!el) return null; el.scrollIntoView({block: 'center'}); const r = el.getBoundingClientRect(); "
               "return [r.left + r.width / 2, r.top + r.height / 2]; })()") % json.dumps(text)
-        x, y = self._until(lambda: self.eval(js), timeout, f"кнопка или ссылка «{text}»")
+        x, y = self.wait(lambda: self.eval(js), timeout, f"кнопка или ссылка «{text}»")
         for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
             self._call("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, "button": "left",
                                                      "buttons": 1 if kind == "mousePressed" else 0, "clickCount": 1})
@@ -390,24 +393,24 @@ class Page:
         def probe():
             url = self.url() or ""
             return url if url.endswith(suffix) or url.split("#")[0].split("?")[0].endswith(suffix) else None
-        return self._until(probe, timeout, f"адрес …{suffix}")
+        return self.wait(probe, timeout, f"адрес …{suffix}")
 
     def wait_selector(self, css: str, timeout: float = 10) -> None:
         """Элемент есть и виден (у скрытого hidden или display: none прямоугольников нет)."""
         js = (f"(() => {{ const e = document.querySelector({json.dumps(css)}); "
               "return !!e && e.getClientRects().length > 0; })()")
-        self._until(lambda: self.eval(js), timeout, f"видимый {css}")
+        self.wait(lambda: self.eval(js), timeout, f"видимый {css}")
 
     def _text(self) -> str:
         return self.eval("document.body ? document.body.innerText : ''") or ""
 
     def wait_text(self, pattern: str, timeout: float = 10) -> str:
         """Видимый текст страницы совпал с регулярным выражением; возвращает совпавший кусок."""
-        found = self._until(lambda: re.search(pattern, self._text()), timeout, f"текст /{pattern}/")
+        found = self.wait(lambda: re.search(pattern, self._text()), timeout, f"текст /{pattern}/")
         return found.group(0)
 
     def wait_gone(self, pattern: str, timeout: float = 10) -> None:
-        self._until(lambda: re.search(pattern, self._text()) is None, timeout, f"исчезновение /{pattern}/")
+        self.wait(lambda: re.search(pattern, self._text()) is None, timeout, f"исчезновение /{pattern}/")
 
     # --- наблюдение ---
 
@@ -524,6 +527,11 @@ class Browser:
         page = Page(self._conn, target, session, context)
         self._pages.append(page)
         return page
+
+    @property
+    def handler_errors(self) -> list[str]:
+        """Сбои разбора событий (обработчик страницы бросил): отчёт CSP или ошибка консоли могли пропасть."""
+        return list(self._conn.handler_errors) if self._conn is not None else []
 
     def close(self) -> None:
         for page in self._pages:
