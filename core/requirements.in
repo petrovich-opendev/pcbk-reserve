@@ -5,3 +5,4 @@ mcp==1.30.0  # последний 1.x: 2.x — другой API (FastMCP → MCP
 fastapi==0.142.0
 uvicorn==0.54.0
 httpx==0.28.1  # клиент OpenRouter (LLM-прокси); версию держит и mcp 1.30.0
+anyio==4.15.1  # срок запроса к OpenRouter (fail_after) — прямой импорт upstream.py

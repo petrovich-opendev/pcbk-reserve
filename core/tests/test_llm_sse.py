@@ -2,7 +2,7 @@
 import pytest
 
 from pcbk_core.llm.ledger import Usage
-from pcbk_core.llm.sse import SseObserver
+from pcbk_core.llm.sse import MAX_EVENT_BYTES, SseObserver
 from pcbk_core.logs import setup_logging
 
 STREAM = (": OPENROUTER PROCESSING\n\n"
@@ -34,3 +34,24 @@ def test_observer_odd_events_never_raise_or_leak(capfd, restore_logging):       
     assert o.bad_events >= 1 and (o.usage, o.generation_id, o.provider) == (None, None, None)
     assert Usage.from_openrouter({"cost": "SECRET-5", "prompt_tokens": "x"}).cost is None
     assert "SECRET" not in capfd.readouterr().err
+
+
+def usage_event(cost: bytes) -> bytes:
+    return b'data: {"id":"gen-1","choices":[],"usage":{"prompt_tokens":10,"cost":' + cost + b'}}\n\n'
+
+
+@pytest.mark.parametrize("feeds,cost,bad", [                                    # ловушки денег
+    ([usage_event(b"0.001"), usage_event(b"0.002")], 0.002, 0),                  # два чанка usage — последний
+    ([usage_event(b"NaN")], None, 0),
+    ([usage_event(b"-1")], None, 0),
+    ([usage_event(b'"0.5"')], None, 0),
+    ([usage_event(b"1e400")], None, 0),                                          # бесконечность
+    ([usage_event(b"1" + b"0" * 400)], None, 0),                                 # целое больше float
+    ([b"data: {" + b"x" * (MAX_EVENT_BYTES + 10), b"}\n\n", usage_event(b"0.003")], 0.003, 1),   # событие > 1 МиБ
+    ([b'data: {"choices": "x", "usage": {"cost": 0.004}}\n\n'], 0.004, 1),     # usage рядом с кривым choices
+])
+def test_observer_money_traps(feeds, cost, bad):
+    o = SseObserver()
+    for f in feeds:
+        o.feed(f)
+    assert (Usage.from_openrouter(o.usage).cost, o.bad_events) == (cost, bad)

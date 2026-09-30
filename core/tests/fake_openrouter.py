@@ -5,9 +5,10 @@ test-openrouter-key («a») и test-openrouter-key-b («b», ключ с про�
 test-mgmt-key.
 
 Чат (POST /api/v1/chat/completions) записывает {"auth_ok", "body"}; поведение выбирает слово FAKE… в
-тексте последнего сообщения user (таблица — в брифе задачи 5 Д4а). Обычный ответ — поток SSE с
-комментарием «: OPENROUTER PROCESSING», последним чанком с usage (cost 0.0012) и data: [DONE];
-заголовок X-Generation-Id: gen-<N>.
+тексте последнего сообщения user (таблица — в брифе задачи 5 Д4а; по ревью добавлены FAKEMIDSTR — событие
+ошибки с error.code строкой "server_error", и FAKEDRIP — 502 с телом ошибки по байту раз в 0,2 с).
+Обычный ответ — поток SSE с комментарием «: OPENROUTER PROCESSING», последним чанком с usage
+(cost 0.0012) и data: [DONE]; заголовок X-Generation-Id: gen-<N>.
 
 /generation по id: первые два запроса — 404, потом total_cost 0.002 (id ответа FAKEGENNEVER — всегда
 404). /key: usage ключа — сумма отданных цен (usage потока и найденные дозапросом, каждая один раз).
@@ -41,9 +42,11 @@ ASK_ARGS = {"questions": [{"question": "Какой из тегов?", "header": 
                            "options": [{"label": "20FAKE_001_PV", "description": "первый"}]}]}
 WORDS = ("FAKE402", "FAKE402INFLIGHT", "FAKE403KEY", "FAKE403REGION", "FAKE401", "FAKE500", "FAKE404",
          "FAKEMIDERR", "FAKEMID402", "FAKENOUSAGE", "FAKEGENNEVER", "FAKEFLAKY", "FAKEASK", "FAKEBREAK",
-         "FAKESLOW", "FAKESLOWSTART", "FAKEPROVIDER")
+         "FAKESLOW", "FAKESLOWSTART", "FAKEPROVIDER", "FAKEMIDSTR", "FAKEDRIP")
 _WORD = re.compile(r"\bFAKE[A-Z0-9]+\b")
-MID_ERRORS = {"FAKEMIDERR": (502, "Provider returned error"), "FAKEMID402": (402, "Insufficient credits")}
+MID_ERRORS = {"FAKEMIDERR": (502, "Provider returned error"), "FAKEMID402": (402, "Insufficient credits"),
+              "FAKEMIDSTR": ("server_error", "Provider returned error")}      # error.code строкой
+DRIP_EVERY_S = 0.2                      # FAKEDRIP: 502, тело ошибки по байту — около 14 с
 ERRORS = {   # слово → (код, текст, metadata, Retry-After)
     "FAKE402": (402, "Insufficient credits. Add more using https://openrouter.ai/settings/credits", None, None),
     "FAKE402INFLIGHT": (402, "Too many requests in flight for this key's budget, retry shortly",
@@ -283,6 +286,8 @@ class Handler(BaseHTTPRequestHandler):
         word = word_of(body)
         if word in ERRORS:
             return self._error(*ERRORS[word])
+        if word == "FAKEDRIP":
+            return self._drip()
         if word == "FAKEFLAKY":
             with st.lock:
                 st.flaky += 1
@@ -306,6 +311,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._charge(key, USAGE["cost"])
             return self._json(200, reply, (("X-Generation-Id", gen),))
         self._stream(key, gen, provider, word, message, finish, with_usage)
+
+    def _drip(self) -> None:
+        """502 с телом ошибки по байту раз в DRIP_EVERY_S: каждый кусок успевает до срока чтения."""
+        data = json.dumps({"error": {"code": 502, "message": "Provider returned error"}}).encode()
+        self.send_response(502)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        try:
+            self.end_headers()
+            for i in range(len(data)):
+                self.wfile.write(data[i:i + 1])
+                time.sleep(DRIP_EVERY_S)
+        except OSError:
+            pass                                # клиент бросил чтение по своему сроку
 
     def _charge(self, key: str, cost: float) -> None:
         with self.state.lock:
@@ -334,7 +353,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.end_headers()
             send(b": OPENROUTER PROCESSING\n\n")
-            if word in ("FAKEMIDERR", "FAKEMID402", "FAKEBREAK"):
+            if word in ("FAKEBREAK", *MID_ERRORS):
                 send(chunk({"role": "assistant", "content": "Начало ответа"}))
                 if word != "FAKEBREAK":
                     error = MID_ERRORS[word]

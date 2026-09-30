@@ -5,6 +5,8 @@ import time
 import httpx
 import pytest
 
+from pcbk_core.llm import upstream
+from pcbk_core.llm.sse import SseObserver
 from pcbk_core.llm.upstream import Upstream, UpstreamError, classify
 from pcbk_core.logs import setup_logging
 
@@ -52,6 +54,15 @@ async def test_unreachable_is_fast():
         await Upstream("http://127.0.0.1:9/api/v1", "k", None).open_chat(BODY)
     assert e.value.kind == "unreachable" and time.monotonic() - t < 2
     assert str(e.value) == "unreachable 0"                                       # П21: без текстов в str()
+    assert e.value.sent is False                                                 # соединения не было — денег нет
+
+
+async def test_read_timeout_after_body_is_sent(fake_or):                         # тело ушло, ответа нет — по оценке
+    async with httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(5, read=0.3)) as client:
+        up = Upstream(fake_or.url, "test-openrouter-key", None, client=client)
+        with pytest.raises(UpstreamError) as e:                                  # двойник молчит 1 с до заголовков
+            await up.open_chat(body_with("FAKESLOWSTART"))
+    assert (e.value.kind, e.value.sent) == ("unreachable", True)
 
 
 def test_constructor_does_no_io(monkeypatch):                                    # П22
@@ -113,3 +124,41 @@ async def test_httpx_quiet_and_no_key_in_log(fake_or, capfd, restore_logging):  
     assert "Key limit" not in str(e.value) and "Key limit" in e.value.message      # текст OpenRouter — только атрибутом
     err = capfd.readouterr().err
     assert "test-openrouter-key" not in err and "HTTP Request" not in err
+
+
+def test_key_must_be_printable_ascii():                                          # ошибка настройки, а не UnicodeError
+    for bad in ("кириллица-123", "test\x00key", "a\u200bb"):
+        for key, mgmt in ((bad, None), ("k", bad)):
+            with pytest.raises(ValueError) as e:
+                Upstream("https://openrouter.ai/api/v1", key, mgmt)
+            assert bad not in str(e.value) and len(str(e.value)) <= 60
+
+
+async def test_key_bom_stripped_and_unicode_never_escapes(fake_or):
+    up = Upstream(fake_or.url, "\ufefftest-openrouter-key\n", "\ufefftest-mgmt-key\r\n")    # BOM и перевод строки файла
+    assert "usage" in await up.key_info() and await up.credits() == 30.0
+    up._key = up._mgmt_key = "ключ"                                              # мимо проверки конструктора
+    for call in (lambda: up.open_chat(BODY), up.key_info, up.credits):
+        with pytest.raises(UpstreamError) as e:
+            await call()
+        assert (e.value.kind, e.value.status, e.value.sent) == ("key_rejected", 0, False)
+    assert await up.generation_cost("gen-1") is None and fake_or.requests == []
+    await up.aclose()
+
+
+async def test_error_body_read_has_deadline(fake_or, monkeypatch):               # тело ошибки по байту — не минутами
+    monkeypatch.setattr(upstream, "POLL_TIMEOUT_S", 0.5)
+    t = time.monotonic()
+    with pytest.raises(UpstreamError) as e:
+        await Upstream(fake_or.url, "test-openrouter-key", None).open_chat(body_with("FAKEDRIP"))
+    assert (e.value.kind, e.value.status, e.value.message) == ("server", 502, "") and time.monotonic() - t < 3
+
+
+async def test_mid_stream_string_code_is_server(fake_or):                         # error.code строкой
+    up = Upstream(fake_or.url, "test-openrouter-key", None)
+    r, o = await up.open_chat(body_with("FAKEMIDSTR")), SseObserver()
+    async for c in r.aiter_raw():
+        o.feed(c)
+    await r.aclose(); await up.aclose()
+    assert (o.error["code"], o.done, classify(o.error["code"], o.error)) == ("server_error", False, "server")
+    assert classify("402", {"message": "x"}) == "money_out"                       # код строкой цифр — как число

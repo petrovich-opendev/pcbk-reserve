@@ -141,6 +141,15 @@ async def _read_capped(response: httpx.Response, limit: int = ERROR_BODY_BYTES) 
     return b"".join(parts)[:limit]
 
 
+def _clean_key(key: str, name: str) -> str:
+    """Ключ из файла без пробелов, переводов строк и BOM по краям; только печатные знаки ASCII — иначе
+    ValueError без самого ключа (ошибка настройки роли, а не UnicodeEncodeError в заголовке)."""
+    key = key.strip().strip("\ufeff").strip()
+    if not (key.isascii() and key.isprintable()):
+        raise ValueError(f"{name} — не печатные знаки ASCII")
+    return key
+
+
 def _running_loop() -> asyncio.AbstractEventLoop | None:
     try:
         return asyncio.get_running_loop()
@@ -158,8 +167,8 @@ class Upstream:
     def __init__(self, base_url: str, key: str, mgmt_key: str | None, *, drill: str = "",
                  client: httpx.AsyncClient | None = None):
         self.base_url = base_url.rstrip("/")
-        self._key = key.strip()                     # перевод строки из файла ключа — не в заголовок
-        self._mgmt_key = (mgmt_key or "").strip() or None     # пустой файл ключа управления — ключа нет
+        self._key = _clean_key(key, "ключ OpenRouter")
+        self._mgmt_key = _clean_key(mgmt_key or "", "ключ управления OpenRouter") or None   # пустой файл — ключа нет
         self.drill = drill
         self._client = client
         self._own = client is None
@@ -202,6 +211,8 @@ class Upstream:
                        "Content-Type": "application/json"}
             request = client.build_request("POST", self.base_url + "/chat/completions", json=body, headers=headers)
             response = await client.send(request, stream=True)
+        except UnicodeError:                        # заголовок не кодируется: ключ, минуя конструктор
+            failure = UpstreamError("key_rejected", 0)
         except (httpx.HTTPError, httpx.InvalidURL) as err:
             failure = UpstreamError("unreachable", 0, sent=not isinstance(err, (*_NOT_SENT, httpx.InvalidURL)))
         if failure is not None:
@@ -209,8 +220,9 @@ class Upstream:
         if response.status_code == 200:
             return response
         try:
-            raw = await _read_capped(response)
-        except httpx.HTTPError:
+            with anyio.fail_after(POLL_TIMEOUT_S):  # тело ошибки по байту не держит вызов read=120 на кусок
+                raw = await _read_capped(response)
+        except (httpx.HTTPError, TimeoutError):
             raw = b""
         finally:
             await response.aclose()
@@ -234,6 +246,8 @@ class Upstream:
                     raw = await _read_capped(response)
                 finally:
                     await response.aclose()
+        except UnicodeError:
+            failure = UpstreamError("key_rejected", 0)
         except (httpx.HTTPError, httpx.InvalidURL, TimeoutError):
             failure = UpstreamError("unreachable", 0)
         if failure is not None:
