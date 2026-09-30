@@ -37,7 +37,9 @@ pcbk-egress-refresh (start_refresh): сразу и дальше раз в NAME_R
 прочих потоках (ворота историана, to_thread) промах, как в Д3б, разрешается
 синхронно, не чаще раза в RESOLVE_RETRY_S на имя, и найденное входит в кэш.
 Поток разрешает только имена из allowed; при установке — ни DNS, ни файлов,
-ни потоков.
+ни потоков. Живость потока, возраст последнего круга, где разрешилось каждое
+имя, и время с запуска отдают refresh_status() и refresh_started_age_s() —
+для /health/llm и сторожа («ловить молчание»).
 
 Значениям уровня Python хук не верит: семейство и тип читает из полей
 _socket.socket (подкласс со своим .family их не подменит), хост принимает
@@ -107,6 +109,9 @@ _install_lock = threading.Lock()
 _installed = False
 _refresher: Callable[[threading.Event], None] | None = None   # тело потока обновления: от установки до start_refresh
 _refreshing = False
+_last_ok: Callable[[], float | None] | None = None      # monotonic последнего удачного круга (из замыкания хука)
+_refresh_thread: threading.Thread | None = None
+_refresh_started: float | None = None                   # monotonic запуска потока обновления
 
 
 class EgressDenied(PermissionError):
@@ -114,9 +119,10 @@ class EgressDenied(PermissionError):
 
 
 def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwork, ...],
-               ) -> tuple[Callable[[str, tuple], None], Callable[[threading.Event], None]]:
-    """Хук и тело потока обновления; всё, чем они пользуются, — локальные имена этого вызова, то есть связаны
-    при установке. Кэш имён живёт только здесь."""
+               ) -> tuple[Callable[[str, tuple], None], Callable[[threading.Event], None],
+                          Callable[[], float | None]]:
+    """Хук, тело потока обновления и чтение метки последнего удачного круга; всё, чем они пользуются, —
+    локальные имена этого вызова, то есть связаны при установке. Кэш имён живёт только здесь."""
     getaddrinfo = _socket.getaddrinfo
     running_loop = asyncio._get_running_loop
     family_of = _socket.socket.family.__get__
@@ -137,6 +143,7 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
     cache: dict[tuple[str | bytes, int], tuple[float, frozenset[IPAddress]]] = {}   # имена в кортеже адреса
     seen: dict[str, dict[IPAddress, float]] = {}    # разрешённые имена: адрес → monotonic последней встречи
     tried: dict[str, float] = {}            # разрешённые имена: последнее синхронное разрешение вне цикла
+    rounds: list[float | None] = [None]     # monotonic последнего круга, где каждое имя дало хотя бы адрес
 
     def as_ip(host: str | bytes) -> IPAddress | None:
         """Адрес-литерал; IPv4 внутри IPv6 (::ffff:a.b.c.d) — как IPv4; имя — None."""
@@ -271,14 +278,19 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
         while True:
             begun = monotonic()
             try:
+                every = True
                 for name in names:
-                    learn(name, resolve(name, af_unspec))
+                    found = resolve(name, af_unspec)
+                    learn(name, found)
+                    every = every and bool(found)
             except Exception as e:          # поток не умирает; в журнал — только класс, раз за серию
                 if type(e).__name__ != failing:
                     failing = type(e).__name__
                     warn("охрана выхода: круг обновления адресов не удался (%s)", failing)
             else:
                 failing = None
+                if every:                   # «ловить молчание»: сторож видит возраст удачного круга
+                    rounds[0] = monotonic()
             first.set()
             wake.wait(refresh_s)
             wake.clear()                    # сигнал после clear даст ещё круг: этот начнётся уже после него
@@ -286,12 +298,15 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
             if rest > 0:
                 sleep(rest)
 
+    def last_ok() -> float | None:
+        return rounds[0]
+
     entries = tuple((host, want, as_ip(host)) for host, want in allowed)
     for host, _, literal in entries:
         if literal is None:
             seen.setdefault(host, {})
     names = tuple(seen)
-    return hook, refresher
+    return hook, refresher, last_ok
 
 
 def install_egress_guard(allowed: Sequence[tuple[str, int | None]],
@@ -302,7 +317,7 @@ def install_egress_guard(allowed: Sequence[tuple[str, int | None]],
     установка — RuntimeError: хук не снимается. Ни DNS, ни файлов, ни потоков при
     установке; адреса имён из allowed держит поток start_refresh (Д4а-R18).
     """
-    global _installed, _refresher
+    global _installed, _refresher, _last_ok
     allowed = tuple(allowed)                # генератор иначе пустел бы после проверки
     entries: list[tuple[str, int | None]] = []
     for entry in allowed:
@@ -313,13 +328,14 @@ def install_egress_guard(allowed: Sequence[tuple[str, int | None]],
             raise ValueError("порт направления — 1…65535 или None")
         entries.append((host, port))
     nets = tuple(ipaddress.ip_network(n) for n in tuple(allowed_nets))   # неверная сеть — ValueError до установки
-    hook, refresher = _make_hook(tuple(entries), nets)
+    hook, refresher, last_ok = _make_hook(tuple(entries), nets)
     with _install_lock:
         if _installed:
             raise RuntimeError("охрана выхода уже установлена")
         sys.addaudithook(hook)
         _installed = True
         _refresher = refresher
+        _last_ok = last_ok
 
 
 def egress_guard_installed() -> bool:
@@ -333,7 +349,7 @@ def start_refresh(first_wait_s: float = FIRST_WAIT_S) -> threading.Thread:
     Ждёт первый круг не дольше first_wait_s и отдаёт поток. Без установленной охраны и при повторном
     вызове — RuntimeError.
     """
-    global _refresher, _refreshing
+    global _refresher, _refreshing, _refresh_thread, _refresh_started
     with _install_lock:
         if _refreshing:
             raise RuntimeError("поток обновления адресов уже запущен")
@@ -348,8 +364,31 @@ def start_refresh(first_wait_s: float = FIRST_WAIT_S) -> threading.Thread:
         with _install_lock:
             _refresher, _refreshing = body, False
         raise
+    with _install_lock:
+        _refresh_thread, _refresh_started = thread, time.monotonic()
     first.wait(first_wait_s)
     return thread
+
+
+def refresh_status() -> dict:
+    """Живость потока pcbk-egress-refresh для /health/llm (Д4а-R18, «ловить молчание»), без ввода-вывода.
+
+    alive — жив ли поток (None — start_refresh не звали); last_ok_age_s — секунд с последнего круга, в
+    котором каждое имя из allowed разрешилось хотя бы в один адрес (None — такого круга не было).
+    """
+    with _install_lock:
+        thread, last_ok = _refresh_thread, _last_ok
+    at = None if last_ok is None else last_ok()
+    return {"alive": None if thread is None else thread.is_alive(),
+            "last_ok_age_s": None if at is None else round(max(0.0, time.monotonic() - at), 1)}
+
+
+def refresh_started_age_s() -> float | None:
+    """Секунд с запуска потока обновления (None — не запускался): поток жив, а удачного круга нет дольше
+    срока — адреса OpenRouter ни разу не получены (сторож Д4а). Без ввода-вывода."""
+    with _install_lock:
+        started = _refresh_started
+    return None if started is None else round(max(0.0, time.monotonic() - started), 1)
 
 
 def _directions(n: int) -> str:

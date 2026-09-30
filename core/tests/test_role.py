@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 
 from fakes import CATALOG_ROWS, CLOCK_ROWS, LIVE_ROWS, SUMMARY, WHITELIST, FakeHistorian
 from helpers import EVENT as E
-from helpers import SETTINGS, TEST_TOKENS, TOKEN, make_role, non_root, wait_until, wait_until_async, write
+from helpers import (LLM_ENV, SETTINGS, TEST_TOKENS, TOKEN, make_role, non_root, wait_until, wait_until_async,
+                     write)
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS, TOKENS_ERROR, DataRole
 from pcbk_core.data.catalog import Catalog
@@ -250,7 +251,7 @@ def test_health_historian_before_catalog():
 def test_build_roles_reads_whitelist_and_credentials(tmp_path):
     settings = replace(SETTINGS, BDRV_ENV_FILE=write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"),
                        WHITELIST_PATH=write(tmp_path, "# список\n20FAKE_001_PV\n"))
-    [role] = build_roles(settings)
+    role = {r.name: r for r in build_roles(settings, LLM_ENV)}["data"]
     assert isinstance(role, DataRole) and role.name == "data"
     assert role.gate.allowed == frozenset({"20FAKE_001_PV"}) and role.settings is settings
 
@@ -259,7 +260,7 @@ def test_build_roles_without_whitelist_file_is_empty(tmp_path, capfd, restore_lo
     setup_logging()
     settings = replace(SETTINGS, BDRV_ENV_FILE=write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"),
                        WHITELIST_PATH=str(tmp_path / "нет.txt"))
-    [role] = build_roles(settings)
+    role = {r.name: r for r in build_roles(settings, LLM_ENV)}["data"]
     assert role.gate.allowed == frozenset() and role.health() == (False, "белый список пуст или не найден")
     assert "белый список не найден" in capfd.readouterr().err
 
@@ -340,7 +341,7 @@ def test_build_roles_bad_config_is_503_without_loops(tmp_path, capfd, restore_lo
     (tmp_path / "d").mkdir()
     settings = replace(SETTINGS, BDRV_ENV_FILE=make_env(tmp_path / "d"), WHITELIST_PATH=make_list(tmp_path),
                        FRESH_POLL_S=0.05)
-    [role] = build_roles(settings)
+    role = {r.name: r for r in build_roles(settings, LLM_ENV)}["data"]
     assert role.health() == (False, reason) and len(reason) <= 80
     with TestClient(create_app(settings, [role])) as c:
         time.sleep(0.2)
@@ -625,9 +626,9 @@ def test_build_roles_unreadable_tokens_is_red_not_crash(tmp_path, capfd, restore
     setup_logging()
     settings = replace(SETTINGS, BDRV_ENV_FILE=write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"),
                        WHITELIST_PATH=write(tmp_path, "20FAKE_001_PV\n"), TOKENS_FILE=str(tmp_path / "нет"))
-    [role] = build_roles(settings)
+    role = {r.name: r for r in build_roles(settings, LLM_ENV)}["data"]
     assert role.config_error is None and role.tokens.ids == frozenset()
-    assert role.health() == (False, TOKENS_ERROR) and "токены" in capfd.readouterr().err
+    assert role.health() == (False, TOKENS_ERROR) and f"токены {settings.TOKENS_FILE}" in capfd.readouterr().err
 
 
 # --- сверх брифа ---
@@ -636,9 +637,10 @@ def test_build_roles_reads_tokens_and_bad_line_is_named_without_content(tmp_path
     setup_logging()
     base = dict(BDRV_ENV_FILE=write(tmp_path, "BDRV_HOST=h\nBDRV_USER=u\nBDRV_PW=<p>\n"),
                 WHITELIST_PATH=write(tmp_path, "20FAKE_001_PV\n"))
-    [role] = build_roles(replace(SETTINGS, **base))                       # файл сессии тестов: student-01
+    role = {r.name: r for r in build_roles(replace(SETTINGS, **base), LLM_ENV)}["data"]   # файл сессии: student-01
     assert role.tokens.caller(TOKEN) == "student-01" and role.tokens_error is None
-    [bad] = build_roles(replace(SETTINGS, **base, TOKENS_FILE=write(tmp_path, "student-01 секрет-строка\n")))
+    broken = replace(SETTINGS, **base, TOKENS_FILE=write(tmp_path, "student-01 секрет-строка\n"))
+    bad = {r.name: r for r in build_roles(broken, LLM_ENV)}["data"]
     assert bad.tokens.ids == frozenset() and bad.health() == (False, TOKENS_ERROR) and bad.config_error is None
     err = capfd.readouterr().err
     assert "строка 1" in err and "секрет" not in err

@@ -3,6 +3,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from urllib.parse import urlsplit
 
 # режимы учений свежести: "" — учений нет
 DRILL_MODES = frozenset({"", "freeze_stamps", "freeze_poll"})
@@ -58,3 +59,96 @@ class Settings:
             raise ValueError(f"DRILL_FRESHNESS: неизвестный режим {settings.DRILL_FRESHNESS!r}, "
                              "допустимо: пусто, freeze_stamps, freeze_poll")
         return settings
+
+
+# LLM-прокси (Д4а): отдельный класс — ошибка в LLM_* не роняет main() и службу данных (П8, F4 Д3б),
+# её показывает роль llm как config_error (build_roles)
+LLM_KEY_MODES = frozenset({"on", "off"})
+LLM_STATES = frozenset({"on", "stopped"})
+DRILL_LLM_MODES = frozenset({"", "402"})
+# (поле, наименьшее, наибольшее) — целые пределы
+_LLM_INT_RANGES = (("LLM_MAX_TOKENS", 1, 16000), ("LLM_TURN_CALLS", 1, None),
+                   ("LLM_MAX_BODY_BYTES", 65536, 4194304), ("LLM_CALLER_CONCURRENCY", 1, 16))
+_LLM_CHOICES = (("LLM_KEY_DEDICATED", LLM_KEY_MODES), ("LLM_STATE", LLM_STATES), ("DRILL_LLM", DRILL_LLM_MODES))
+# пути к файлам секретов роли llm: без проверок, их берёт и запасная настройка при ошибке в LLM_*
+_LLM_FILE_FIELDS = ("OPENROUTER_KEY_FILE", "OPENROUTER_MGMT_KEY_FILE", "LLM_TOKENS_FILE")
+
+
+@dataclass(frozen=True)
+class LlmSettings:
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # ключи — только файлами (Global Constraints Д4а): пустой файл — «ключа нет»
+    OPENROUTER_KEY_FILE: str = "/run/secrets/openrouter.key"
+    OPENROUTER_MGMT_KEY_FILE: str = "/run/secrets/openrouter-mgmt.key"
+    # хеши токенов LLM: строки «<id> <sha256 hex>», отдельная таблица от core-tokens
+    LLM_TOKENS_FILE: str = "/run/secrets/llm-tokens"
+    LLM_MODELS: str = ""                    # пусто — все семь кандидатов (select_models)
+    LLM_TOTAL_USD: float = 1000.0
+    LLM_SHARE_USD: float = 100.0            # больше общего бюджета — можно: тогда держит общий
+    LLM_OPS_SHARE_USD: float = 100.0
+    LLM_MAX_TOKENS: int = 16000
+    LLM_TURN_CALLS: int = 16
+    LLM_POLL_S: float = 60.0
+    LLM_MAX_BODY_BYTES: int = 1048576
+    LLM_CALLER_CONCURRENCY: int = 3
+    LLM_KEY_DEDICATED: str = "on"           # ключ только у резервного контура: сверка с /key
+    LLM_STATE: str = "on"                   # stopped — выключатель администратора
+    DRILL_LLM: str = ""                     # 402 — учение «кончились деньги» без OpenRouter
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "LlmSettings":
+        """Пустое значение — умолчание; ошибка — ValueError с именем поля. env — только он, иначе os.environ.
+
+        select_models импортируется здесь, а не в модуле: import pcbk_core.main в пробе здоровья не тянет
+        pcbk_core.llm, fastapi и httpx (П8).
+        """
+        from .llm.models import select_models
+
+        env = os.environ if env is None else env
+        values = {}
+        for f in fields(cls):
+            raw = env.get(f.name, "")
+            if raw == "":
+                continue
+            kind = type(f.default)
+            if kind is str:
+                values[f.name] = raw
+                continue
+            try:
+                value = kind(raw)
+            except ValueError:
+                raise ValueError(f"{f.name}: неверное значение {raw!r}") from None
+            if kind is float and not (math.isfinite(value) and value > 0):
+                raise ValueError(f"{f.name}: нужно число больше нуля, получено {raw!r}")
+            values[f.name] = value
+        llm = cls(**values)
+        for name, low, high in _LLM_INT_RANGES:
+            value = getattr(llm, name)
+            if value < low or (high is not None and value > high):
+                span = f"от {low}" + ("" if high is None else f" до {high}")
+                raise ValueError(f"{name}: нужно целое {span}, получено {value}")
+        for name, allowed in _LLM_CHOICES:
+            if getattr(llm, name) not in allowed:
+                raise ValueError(f"{name}: неизвестное значение {getattr(llm, name)!r}, допустимо: "
+                                 + ", ".join(repr(v) for v in sorted(allowed)))
+        _check_base_url(llm.OPENROUTER_BASE_URL)
+        select_models(llm.LLM_MODELS)       # ValueError «LLM_MODELS: …»
+        return llm
+
+    @classmethod
+    def files_from_env(cls, env: Mapping[str, str] | None = None) -> "LlmSettings":
+        """Запасная настройка при ошибке в LLM_*: умолчания, но пути к файлам секретов — из env. Так роль
+        с config_error читает свои llm-tokens и ключи, а не пути по умолчанию (тесты не читают /run/secrets)."""
+        env = os.environ if env is None else env
+        return cls(**{name: env[name] for name in _LLM_FILE_FIELDS if env.get(name, "")})
+
+
+def _check_base_url(url: str) -> None:
+    """http или https, есть хост, порт — число в пределах; иначе ValueError с именем поля."""
+    try:
+        parts = urlsplit(url)
+        parts.port                                  # порт вне 0…65535 или не число — ValueError
+    except ValueError:
+        raise ValueError("OPENROUTER_BASE_URL: адрес не разбирается") from None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("OPENROUTER_BASE_URL: нужен адрес http:// или https:// с хостом")

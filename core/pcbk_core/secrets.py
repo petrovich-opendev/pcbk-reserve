@@ -132,3 +132,44 @@ class TokenTable:
 
     def __repr__(self) -> str:
         return f"TokenTable(ids={sorted(self.ids)})"
+
+
+# ключ OpenRouter длиннее не бывает; больше — не ключ (файл перепутан), читать его целиком незачем
+KEY_FILE_MAX_BYTES = 4096
+
+
+class KeyFileError(Exception):
+    """Файл ключа есть, но не читается (права, каталог, не UTF-8): текст — имя файла и причина, без ключа."""
+
+
+def read_key_file(path: str) -> str | None:
+    """Ключ из файла: пробелы, переводы строк и BOM по краям срезаются; нет файла или пусто — None.
+
+    Прочая ошибка чтения — KeyFileError с именем файла. Ни текста ключа, ни его байтов в исключении нет:
+    исключения ввода-вывода и декодирования к нему не цепляются.
+    """
+    reason = None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(KEY_FILE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        reason = exc.strerror or "ошибка чтения"
+    else:
+        if len(raw) > KEY_FILE_MAX_BYTES:
+            reason = f"больше {KEY_FILE_MAX_BYTES} байт — это не ключ"
+        else:
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                reason = "файл не в UTF-8"
+    if reason is not None:
+        raise KeyFileError(f"{path}: {reason}")
+    key = text.strip().strip("﻿").strip()
+    return key or None
+
+
+def key_fingerprint(key: str) -> str:
+    """Первые 12 знаков sha256 ключа: точка отсчёта расхода в llm_meta и признак смены ключа (Д4а-R13)."""
+    return hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()[:12]

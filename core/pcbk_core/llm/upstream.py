@@ -177,6 +177,11 @@ class Upstream:
     def __repr__(self) -> str:                  # ключи — никогда
         return f"Upstream({self.base_url!r}, mgmt_key={'yes' if self._mgmt_key else 'no'}, drill={self.drill!r})"
 
+    @property
+    def has_mgmt_key(self) -> bool:
+        """Есть ключ управления — опрос /credits возможен (сам ключ наружу не отдаётся)."""
+        return self._mgmt_key is not None
+
     def _http(self) -> httpx.AsyncClient:
         """Свой клиент — в цикле событий, где идёт запрос. Клиент другого цикла (прошлый anyio.run) не
         годится: его соединения привязаны к тому циклу — он оставляется, берётся новый."""

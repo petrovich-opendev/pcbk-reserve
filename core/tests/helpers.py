@@ -38,8 +38,11 @@ from pcbk_core.data.historian import parse_clock
 from pcbk_core.data.service import DataService
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
 from pcbk_core.hooks import hooks_of
-from pcbk_core.secrets import TokenTable
-from pcbk_core.settings import Settings
+from pcbk_core.llm import LlmRole
+from pcbk_core.llm.ledger import Ledger
+from pcbk_core.llm.upstream import Upstream
+from pcbk_core.secrets import TokenTable, key_fingerprint
+from pcbk_core.settings import LlmSettings, Settings
 
 # каталог core/: из него подпроцессы импортируют pcbk_core
 CORE_DIR = Path(__file__).resolve().parent.parent
@@ -62,6 +65,24 @@ atexit.register(shutil.rmtree, SESSION_DIR, ignore_errors=True)
 (SESSION_DIR / "core-tokens").write_text(f"student-01 {sha(TOKEN)}\n", encoding="utf-8")
 # настройки тестов строятся напрямую: проверки from_env на них не действуют
 SETTINGS = Settings(DB_PATH=str(SESSION_DIR / "core.db"), TOKENS_FILE=str(SESSION_DIR / "core-tokens"))
+
+# роль llm в build_roles тестов Д3а/Д3б: пустые llm-tokens (пустая таблица без ошибки) и пустые ключи («нет
+# ключа») — в каталоге сессии, не в /run/secrets (F4, П6)
+LLM_ENV: dict[str, str] = {}
+for _name, _file in (("LLM_TOKENS_FILE", "llm-tokens"), ("OPENROUTER_KEY_FILE", "openrouter.key"),
+                     ("OPENROUTER_MGMT_KEY_FILE", "openrouter-mgmt.key")):
+    (SESSION_DIR / _file).write_text("", encoding="utf-8")
+    LLM_ENV[_name] = str(SESSION_DIR / _file)
+
+# тестовые токены LLM — не 48 шестнадцатеричных знаков (шаблон проверки на секреты)
+LLM_TOKEN = "test-llm-token-student-01"
+OPS_LLM_TOKEN = "test-llm-token-ops"
+LLM_TOKENS = TokenTable({"student-01": sha(LLM_TOKEN), "ops": sha(OPS_LLM_TOKEN)})
+SES = "ses_" + "A" * 26
+LLM_SETTINGS = LlmSettings()
+# один инструмент, как в OC_BODY задачи 3
+TAG_NOW_TOOL = {"type": "function", "function": {"name": "pcbk_tag_now", "description": "d",
+                                                  "parameters": {"type": "object"}}}
 
 # тесты, где права отнимает chmod: от root права каталога и файла не действуют
 non_root = pytest.mark.skipif(os.geteuid() == 0, reason="от root chmod не отнимает права")
@@ -313,3 +334,66 @@ class DummyRole(RoleBase):
 
     def mounts(self):
         return [("/dummy", dummy)] if self.installs else []
+
+
+# --- LLM-прокси (Д4а, задача 6) ---
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def chat_body(text: str = "вопрос", model: str = "z-ai/glm-5.3", stream: bool = True, steps: int = 0,
+              tools: bool = True, tail_user: str | None = None) -> dict:
+    """Тело запроса OpenCode: system, вопрос user, steps пар «assistant с вызовом — tool», при tail_user — ещё
+    одно сообщение user в конце (продолжение после сжатия); tools — один инструмент pcbk_tag_now."""
+    messages: list[dict] = [{"role": "system", "content": "sys"},
+                            {"role": "user", "content": [{"type": "text", "text": text}]}]
+    for i in range(steps):
+        messages.append({"role": "assistant", "content": None,
+                         "tool_calls": [{"id": f"call-{i}", "type": "function",
+                                         "function": {"name": "pcbk_tag_now",
+                                                      "arguments": '{"tags": ["20FAKE_001_PV"]}'}}]})
+        messages.append({"role": "tool", "tool_call_id": f"call-{i}", "content": "{\"status\": \"ok\"}"})
+    if tail_user is not None:
+        messages.append({"role": "user", "content": [{"type": "text", "text": tail_user}]})
+    body = {"model": model, "stream": stream, "messages": messages}
+    if tools:
+        body["tools"] = [TAG_NOW_TOOL]
+    return body
+
+
+def auth(token: str | None, session: str | None = None, parent: str | None = None) -> dict:
+    """Заголовки вызова: Authorization (без токена — нет), X-Session-Id, при parent — x-parent-session-id."""
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if session is not None:
+        headers["X-Session-Id"] = session
+    if parent is not None:
+        headers["x-parent-session-id"] = parent
+    return headers
+
+
+def make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key", mgmt: str | None = None,
+                  wallclock: Callable[[], datetime] | None = None, **llm_overrides) -> LlmRole:
+    """Роль llm на двойнике OpenRouter (fake — фикстура fake_or): журнал — tmp_path/core.db, открыт, как в
+    lifespan; LlmSettings — replace без проверок from_env; таблица из двух токенов; дозапрос цены — 3 × 0,01 с."""
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    if fake is not None:
+        llm_overrides = {"OPENROUTER_BASE_URL": fake.url, **llm_overrides}
+    llm = replace(LLM_SETTINGS, **llm_overrides)
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
+    clock = {} if wallclock is None else {"wallclock": wallclock}
+    upstream = Upstream(llm.OPENROUTER_BASE_URL, key, mgmt, drill=llm.DRILL_LLM) if key else None
+    role = LlmRole(settings, llm, tokens=LLM_TOKENS, upstream=upstream, ledger=Ledger(settings.DB_PATH, **clock),
+                   key_fingerprint=key_fingerprint(key) if key else None, cost_retry_delays=(0.01, 0.01, 0.01),
+                   **clock)
+    assert role.ledger.open(), role.ledger.last_error
+    return role
+
+
+def make_llm_app(tmp_path, fake=None, **kw) -> tuple[FastAPI, LlmRole]:
+    """create_app с одной ролью llm (make_llm_role); у приложения тот же core.db."""
+    role = make_llm_role(tmp_path, fake, **kw)
+    return create_app(replace(SETTINGS, DB_PATH=role.settings.DB_PATH), [role]), role

@@ -14,12 +14,12 @@ import pytest
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
-from helpers import SETTINGS, DummyRole, dummy, sha, write
+from helpers import LLM_ENV, SETTINGS, DummyRole, dummy, sha, write
 from pcbk_core.app import create_app
 from pcbk_core.logs import setup_logging
-from pcbk_core.main import healthcheck, main
-from pcbk_core.secrets import BdrvConfig, TokenTable, read_env_file
-from pcbk_core.settings import Settings
+from pcbk_core.main import build_roles, healthcheck, main
+from pcbk_core.secrets import BdrvConfig, KeyFileError, TokenTable, read_env_file, read_key_file
+from pcbk_core.settings import LlmSettings, Settings
 
 
 def test_read_env_file_strips_quotes_and_export(tmp_path):
@@ -251,7 +251,76 @@ def test_main_bad_args_or_settings_exit_1(monkeypatch, capsys):   # код 2 Doc
 
 def test_healthcheck_probe_does_not_load_server_stack():
     code = ("import sys, pcbk_core.main; "
-            "print(sorted(m for m in ('fastapi', 'starlette', 'uvicorn', 'pydantic') if m in sys.modules))")
+            "print(sorted(m for m in ('fastapi', 'starlette', 'uvicorn', 'pydantic', 'httpx') if m in sys.modules))")
     out = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent.parent,
                          capture_output=True, text=True, check=True).stdout
     assert out.strip() == "[]"
+
+
+def test_llm_settings_validation():
+    assert LlmSettings.from_env({"LLM_MODELS": "z-ai/glm-5.3", "DRILL_LLM": "402"}).DRILL_LLM == "402"
+    assert LlmSettings.from_env({}).LLM_MAX_BODY_BYTES == 1_048_576
+    assert Settings.from_env({"LLM_MODELS": "openrouter/auto"})                # Settings Д3а поля LLM не читает
+    for bad in ({"LLM_STATE": "off"}, {"DRILL_LLM": "403"}, {"LLM_MODELS": "openrouter/auto"},
+                {"LLM_MAX_TOKENS": "32000"}, {"LLM_TOTAL_USD": "0"}, {"OPENROUTER_BASE_URL": "ftp://x"},
+                {"LLM_MAX_BODY_BYTES": "8388608"}, {"LLM_CALLER_CONCURRENCY": "0"}, {"LLM_KEY_DEDICATED": "yes"}):
+        with pytest.raises(ValueError):
+            LlmSettings.from_env(bad)
+
+
+def test_llm_settings_errors_name_the_field():                                   # сверх брифа: имя поля в ошибке
+    assert LlmSettings.from_env({}) == LlmSettings()
+    for name, raw in (("LLM_TOTAL_USD", "inf"), ("LLM_SHARE_USD", "-1"), ("LLM_OPS_SHARE_USD", "x"),
+                      ("LLM_MAX_TOKENS", "0"), ("LLM_TURN_CALLS", "0"), ("LLM_POLL_S", "nan"),
+                      ("LLM_MAX_BODY_BYTES", "1000"), ("LLM_CALLER_CONCURRENCY", "17"),
+                      ("OPENROUTER_BASE_URL", "https://"), ("OPENROUTER_BASE_URL", "http://h:99999/api"),
+                      ("LLM_MAX_TOKENS", "1.5")):
+        with pytest.raises(ValueError, match=name):
+            LlmSettings.from_env({name: raw})
+    assert LlmSettings.from_env({"LLM_SHARE_USD": "2000"}).LLM_SHARE_USD == 2000.0   # больше общего — можно
+
+
+def test_read_key_file(tmp_path):
+    assert read_key_file(write(tmp_path, "  sk-test-key\n")) == "sk-test-key"
+    assert read_key_file(write(tmp_path, "\n  \n")) is None and read_key_file(str(tmp_path / "нет")) is None
+    with pytest.raises(KeyFileError) as e:
+        read_key_file(str(tmp_path))                                            # каталог вместо файла
+    assert str(tmp_path) in str(e.value)
+    p = tmp_path / "bad.key"
+    p.write_bytes(b"sk-\xffsecret-tail\n")
+    with pytest.raises(KeyFileError) as e:
+        read_key_file(str(p))
+    assert "secret" not in str(e.value) and "xff" not in str(e.value) and e.value.__cause__ is None
+
+
+@pytest.mark.parametrize("env,broken_tokens,health", [
+    ({"LLM_MODELS": "openrouter/auto"}, False, "ошибка настройки: настройки: LLM_MODELS"),
+    ({}, True, "токены LLM не читаются")])                                        # П23: не config_error
+def test_build_roles_llm_config_error_keeps_process(tmp_path, env, broken_tokens, health):   # раунд 2, П6, П25
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"), BDRV_ENV_FILE=str(tmp_path / "нет.env"),
+                       WHITELIST_PATH=write(tmp_path, "20FAKE_001_PV\n"))
+    tokens = tmp_path / "llm-tokens"
+    tokens.write_text("student-01 не-хеш\n" if broken_tokens else "")
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "LLM_TOKENS_FILE": str(tokens), **env})}   # не бросает
+    assert set(roles) == {"data", "llm"} and roles["llm"].health()[1].startswith(health)
+    assert (roles["llm"].config_error is None) is broken_tokens
+    data = roles["data"].health()[1]                                             # П25: настоящая причина роли data
+    assert data == "bdrv.env не читается (нет файла или прав)" and "LLM" not in data and "OpenRouter" not in data
+
+
+def test_build_roles_llm_key_problems_are_config_errors(tmp_path, capfd, restore_logging):   # сверх брифа
+    setup_logging()
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
+    key = tmp_path / "openrouter.key"
+    key.write_text("sk-ключ-не-ascii\n", encoding="utf-8")
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "OPENROUTER_KEY_FILE": str(key)})}
+    assert roles["llm"].upstream is None and "не печатные знаки ASCII" in roles["llm"].config_error
+    unreadable = {r.name: r for r in build_roles(settings, {**LLM_ENV, "OPENROUTER_MGMT_KEY_FILE": str(tmp_path)})}
+    assert "ключ управления OpenRouter не читается" in unreadable["llm"].config_error
+    key.write_text("test-openrouter-key\n", encoding="utf-8")
+    good = {r.name: r for r in build_roles(settings, {**LLM_ENV, "OPENROUTER_KEY_FILE": str(key)})}["llm"]
+    assert good.config_error is None and good.upstream is not None and len(good.key_fingerprint) == 12
+    bad_env = {r.name: r for r in build_roles(settings, {**LLM_ENV, "LLM_MODELS": "x/y"})}["llm"]
+    assert bad_env.tokens_error is None and bad_env.llm.LLM_TOKENS_FILE == LLM_ENV["LLM_TOKENS_FILE"]   # не /run/secrets
+    err = capfd.readouterr().err
+    assert "ключ-не-ascii" not in err and "test-openrouter-key" not in err

@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from helpers import CORE_DIR, free_port, run_python, sha, wait_http, write
+from helpers import CORE_DIR, LLM_ENV, free_port, run_python, sha, wait_http, write
 from pcbk_core.egress import egress_guard_installed
 
 
@@ -215,15 +215,16 @@ CRASH = re.compile(r"EgressDenied|PermissionError|Traceback| \| [A-Z]\w*(?:Error
 
 
 @pytest.mark.parametrize("bdrv_text, code, line", [
-    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 1 направление"),
-    (None, 503, "разрешено 0 направлений"),              # нет bdrv.env → config_error, процесс жив (I2)
+    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 2 направления"),
+    (None, 503, "разрешено 1 направление"),              # нет bdrv.env → config_error, процесс жив (I2); OpenRouter — всегда
 ])
 def test_serve_installs_guard_and_stays_up(tmp_path, bdrv_text, code, line):
     port, closed = free_port(), free_port()             # на closed никто не слушает
     env = {**os.environ, "CORE_PORT": str(port), "FRESH_POLL_S": "3600",
            "BDRV_ENV_FILE": write(tmp_path, bdrv_text.format(closed=closed)) if bdrv_text else str(tmp_path / "нет.env"),
            "WHITELIST_PATH": write(tmp_path, "20FAKE_001_PV\n"),
-           "TOKENS_FILE": write(tmp_path, f"ops {sha('tok')}\n"), "DB_PATH": str(tmp_path / "core.db")}
+           "TOKENS_FILE": write(tmp_path, f"ops {sha('tok')}\n"), "DB_PATH": str(tmp_path / "core.db"),
+           **LLM_ENV, "OPENROUTER_BASE_URL": "http://localhost:9/api/v1"}   # П3: тесты не ходят в DNS за openrouter.ai
     p = subprocess.Popen([sys.executable, "-m", "pcbk_core.main"], cwd=CORE_DIR, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
@@ -456,3 +457,40 @@ try: egress.start_refresh()
 except RuntimeError as e: print('AGAIN')
 """)
     assert out.split() == ["True", "True", "pcbk-egress-refresh", "AGAIN"]
+
+
+def test_refresh_status(listeners):                                              # ревью 2а: живость потока адресов
+    a, _ = listeners
+    out = run_python(f"""
+import _socket, time
+from pcbk_core import egress
+print(egress.refresh_status())                                              # до start_refresh
+real, fail = _socket.getaddrinfo, []
+def fake(host, *rest, **kw):
+    if fail: raise _socket.gaierror(-2, 'x')
+    return real('127.0.0.1' if host == 'or.test' else host, *rest, **kw)
+_socket.getaddrinfo = fake
+egress.NAME_REFRESH_S = 0.05
+print(egress.refresh_started_age_s())                                       # поток не запускался
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+egress.start_refresh()
+s = egress.refresh_status(); print(s['alive'], s['last_ok_age_s'] < 1)
+fail.append(1); time.sleep(0.5)                                             # круги с ошибкой — возраст растёт
+print(egress.refresh_status()['last_ok_age_s'] >= 0.4, egress.refresh_started_age_s() >= 0.5)
+""")
+    assert out.split("\n")[:4] == ["{'alive': None, 'last_ok_age_s': None}", "None", "True True", "True True"]
+
+
+def test_refresh_status_never_ok_keeps_last_ok_none(listeners):                 # имя ни разу не разрешилось
+    a, _ = listeners
+    out = run_python(f"""
+import _socket
+from pcbk_core import egress
+def fake(host, *rest, **kw): raise _socket.gaierror(-2, 'x')
+_socket.getaddrinfo = fake
+egress.NAME_REFRESH_S = 0.05
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+egress.start_refresh()
+s = egress.refresh_status(); print(s['alive'], s['last_ok_age_s'], egress.refresh_started_age_s() is not None)
+""")
+    assert out.split() == ["True", "None", "True"]
