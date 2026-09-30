@@ -72,6 +72,33 @@
   в `compose.yaml`, строка в `watchdog/components.json`, тесты границ
   диапазона, пересборка сторожа.
 
+## Служба данных (с Д3а)
+
+- **Учётка историана** — копия файла Dify, содержимое не выводить:
+  `install -m 0444 /opt/dify/scripts/.bdrv.env /opt/pcbk-reserve/secrets/bdrv.env`.
+  Сменили пароль в Dify — повторить `install` и `docker compose restart core`:
+  иначе защёлка входа держит строку «Историан БДРВ» красной, а служба больше
+  не пробует входить (учётка общая с Dify).
+- **Белый список** — правило `d3-1`: участок 20–25 по правилам 1–6 плюс имена
+  из `data/whitelist.extra` (имена без цифры в начале — группы качества,
+  общие по машине, узлы участка). Файл `data/whitelist.txt` (`0444`) строит
+  построитель тем же сетевым путём, что служба:
+  `docker run --rm --network bridge --user "$(id -u):$(id -g)" --read-only --cap-drop ALL --security-opt no-new-privileges:true -v /opt/pcbk-reserve/secrets/bdrv.env:/run/secrets/bdrv.env:ro -v /opt/pcbk-reserve/data:/data pcbk-reserve/core:d3a python -m pcbk_core.data.build_whitelist --out /data/whitelist.txt --extra /data/whitelist.extra`,
+  затем `docker compose restart core`. Вывод построителя — только числа.
+  Вариант «прежний список плюс правила 4–6» — тот же вызов с
+  `--base /data/prior.txt`. Имена других участков в список не входят (решение
+  владельца 30.09); добавить имя — строкой в `whitelist.extra` и пересборкой.
+- **Сеть выхода** `pcbk-egress` (172.31.250.80/28, мост `pcbk-egress`) — только
+  у `core`. Остаточный риск Д3а: охраны выхода в процессе до Д3б нет, и на
+  уровне сети из `core` открыт любой адрес, включая сервер через шлюз моста.
+- **Пороги свежести** — в `.env` (`HIST_WARN_S`, `HIST_FAIL_S`, `HIST_STALE_S`,
+  `CATALOG_DEADLINE_S`); по пробе 30.09 оставлены умолчания 300 / 900 / 140 /
+  60. Метки `Live` историана опережают его часы примерно на 46 с — это
+  нормально, служба считает возраст от роста метки.
+- **Откат Д3а:** `docker compose rm -sf core`; `docker network rm pcbk-egress`;
+  вернуть `compose.yaml.d2` (и `.env.d2`); `docker compose up -d --no-build watchdog`
+  (образ `:d2`).
+
 ## Что открывается наружу
 
 - Порт **8443** контейнера `edge` — Docker публикует его **в обход ufw**.
