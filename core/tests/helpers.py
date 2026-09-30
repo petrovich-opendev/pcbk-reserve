@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,7 @@ from pcbk_core.data.events import CallEvent
 from pcbk_core.data.historian import parse_clock
 from pcbk_core.data.service import DataService
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
+from pcbk_core.gateway.accounts import AccountStore
 from pcbk_core.hooks import hooks_of
 from pcbk_core.llm import LlmRole
 from pcbk_core.llm.ledger import Ledger
@@ -397,3 +399,21 @@ def make_llm_app(tmp_path, fake=None, **kw) -> tuple[FastAPI, LlmRole]:
     """create_app с одной ролью llm (make_llm_role); у приложения тот же core.db."""
     role = make_llm_role(tmp_path, fake, **kw)
     return create_app(replace(SETTINGS, DB_PATH=role.settings.DB_PATH), [role]), role
+
+
+# --- Шлюз: учётные записи (Д5а, задача А2) ---
+
+# тестовый пароль учёток: не секрет, 10 знаков — проходит PASSWORD_MIN
+PW = "пароль-123"
+
+
+def store(tmp_path, **kw) -> AccountStore:
+    """AccountStore на tmp_path/core.db с вызванным open(); kw — в конструктор (clock, ttl_s)."""
+    s = AccountStore(str(Path(tmp_path) / "core.db"), **kw)
+    assert s.open(), s.last_error
+    return s
+
+
+def fail_connect(*a, **k):
+    """Подмена sqlite3.connect: база заперта."""
+    raise sqlite3.OperationalError("database is locked")
