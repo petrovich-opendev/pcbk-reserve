@@ -831,14 +831,21 @@ def test_stream_lifetime_ends_pulsing_stream(tmp_path, gwlog, monkeypatch):     
     app, role = make_gateway(tmp_path, ready=(3,), stream_recheck_s=10.0)              # перепроверка сессии — позже
     fp = role.fake_places
     fp.events[3] = "endless"                                                             # пульс без конца: тишины нет
-    with TestClient(app, base_url=BASE) as c:
-        login(c, "stu-03")
+    with serve_app(app) as url:                                                          # настоящий uvicorn: уход клиента
+        cookie = login_cookie(url, "stu-03")                                             # виден и без конца потока
+        c, s = open_stream(url, cookie)
         t = time.monotonic()
-        with c.stream("GET", "/pcbk/api/oc/event") as r:
-            body = b"".join(r.iter_bytes())
+        body, ended = b"", True
+        with s as r:
+            for chunk in r.iter_bytes():                                                 # без предела — не висеть, а упасть
+                body += chunk
+                if time.monotonic() - t > 3:
+                    ended = False
+                    break
         lasted = time.monotonic() - t
+        c.close()
         wait_until(lambda: fp.event_open[3] == 0, timeout=3)                            # поток места закрыт
-    assert 0.5 <= lasted < 2 and body.count(b"server.heartbeat") >= 3
+    assert ended and 0.5 <= lasted < 2 and body.count(b"server.heartbeat") >= 3
     assert "closed_by=lifetime" in gwlog.text and "closed_by=session" not in gwlog.text
     assert (role.stats.count_1h("stream_broken"), role.stats.streams) == (0, 0)        # не поломка, слот возвращён
 
