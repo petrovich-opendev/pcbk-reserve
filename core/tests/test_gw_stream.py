@@ -3,15 +3,21 @@
 заголовков места, тишина и большое событие рвут поток, поток — не активность места. Места и sp-ctl — двойники
 задачи А3 (поток /event — _EventBody)."""
 import json
+import socket
 import threading
 import time
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
-from helpers import (ORIGIN, gateway_role, login, login_cookie, make_gateway, serve_app, wait_until)
+from helpers import (ORIGIN, SETTINGS, DummyRole, gateway_role, login, login_cookie, make_gateway, serve_app,
+                     wait_until)
+from pcbk_core import main
+from pcbk_core.app import create_app
 from pcbk_core.gateway import places, proxy
 from pcbk_core.gateway.accounts import Account
 from pcbk_core.gateway.proxy import (PROXY_MESSAGES, SSE_MAX_EVENT_BYTES, STREAM_QUEUE_MAX, filter_sse,
@@ -460,6 +466,99 @@ def test_teacher_has_no_stream(tmp_path):
 
 
 def test_stream_constants():
-    assert (SSE_MAX_EVENT_BYTES, STREAM_QUEUE_MAX, MAX_STREAMS_PER_LOGIN) == (512 * 1024, 4, 3)
+    assert (SSE_MAX_EVENT_BYTES, STREAM_QUEUE_MAX, MAX_STREAMS_PER_LOGIN) == (512 * 1024, 1, 3)   # очередь — решение 4
     assert (places.SSE_READ_TIMEOUT_S, places.STREAM_OPEN_S) == (60.0, 10.0)
     assert proxy.PROXY_MESSAGES["streams"] == "Открыто слишком много вкладок чата — закройте лишние"
+
+
+# --- доводка Б4 (решения контроллера по оговоркам) ---
+
+def test_streams_refusals_rolled_per_minute(tmp_path, gwlog):                           # доводка 3: как not_ready
+    app, role = make_gateway(tmp_path, ready=(3,))
+    role.fake_places.events[3] = "endless"
+    with serve_app(app) as url:
+        cookie = login_cookie(url, "stu-03")
+        opened = [open_stream(url, cookie) for _ in range(3)]
+        heads = [s.__enter__() for _, s in opened]
+
+        def extra() -> int:                                                              # поломка — не 200 без конца
+            with httpx.stream("GET", url + "/pcbk/api/oc/event", headers={"Cookie": f"pcbk_session={cookie}"},
+                              trust_env=False) as r:
+                return r.status_code
+
+        assert [extra() for _ in range(3)] == [429] * 3
+        text = gwlog.text
+        assert text.count("reason=streams") == 1
+        assert "place=03 method=GET path=/event reason=streams status=429 n=1 since_s=0" in text
+        role.mono.advance(proxy.NOT_READY_LOG_S)
+        assert extra() == 429
+        assert "reason=streams status=429 n=3 since_s=60" in gwlog.text                 # два несписанных и этот
+        assert role.stats.count_1h("refused") == 0                                       # без счётчика, как not_ready
+        for (c, s), _ in zip(opened, heads):
+            s.__exit__(None, None, None); c.close()
+
+
+def test_serve_stops_gracefully(monkeypatch, restore_logging):                          # доводка 2: параметр serve()
+    from pcbk_core import egress
+    got = {}
+    monkeypatch.setattr(egress, "install_guard", lambda targets: None)                  # охрана — не в процессе pytest
+    monkeypatch.setattr(egress, "start_refresh", lambda: None)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: got.update(kw))
+    main.serve(SETTINGS)
+    assert egress.egress_guard_installed() is False
+    assert got["timeout_graceful_shutdown"] == main.GRACEFUL_SHUTDOWN_S <= 2.0
+    assert got == main.uvicorn_options(SETTINGS)
+
+
+class _LifespanMark(DummyRole):
+    """Роль-метка: lifespan отмечает вход и выход."""
+
+    def __init__(self):
+        super().__init__("mark", (True, "ok"))
+        self.entered = self.exited = False
+
+    def lifespan(self):
+        @asynccontextmanager
+        async def span():
+            self.entered = True
+            try:
+                yield
+            finally:
+                self.exited = True
+        return span()
+
+
+def test_open_stream_does_not_hold_shutdown(tmp_path):                                  # доводка 2: uvicorn, как serve()
+    role = gateway_role(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = "endless"
+    mark = _LifespanMark()
+    app = create_app(SETTINGS, [role, mark])
+    app.state.zone_names_ok = True
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(app, lifespan="on", **main.uvicorn_options(SETTINGS)))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, name="serve-stop", daemon=True)
+    thread.start()
+    c = None
+    try:
+        wait_until(lambda: server.started, timeout=10)
+        url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        c, s = open_stream(url, login_cookie(url, "stu-03"))
+        r = s.__enter__()
+        chunks = r.iter_bytes()
+        next(chunks)
+        assert role.stats.streams == 1 and fp.event_open[3] == 1
+        t = time.monotonic()
+        server.should_exit = True                                                        # как SIGTERM (handle_exit)
+        thread.join(timeout=5)
+        stopped = time.monotonic() - t
+        assert not thread.is_alive() and stopped <= 3.0
+        assert mark.exited and role._reaper is None                                      # lifespan ролей пройден
+        assert role.stats.streams == 0 and fp.event_open[3] == 0                         # слот и поток места отданы
+    finally:
+        server.force_exit = True                                                         # поломка не вешает прогон
+        thread.join(timeout=10)
+        if c is not None:
+            c.close()
+        sock.close()

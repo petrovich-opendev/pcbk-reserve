@@ -37,16 +37,17 @@ reason, status; у сверки с не-200 места — place_status) и сч
 место за NOT_READY_LOG_S с числом и since_s (сколько секунд копились), без счётчика; вызов места — строка
 «gw oc». Ни строки запроса, ни тел, ни заголовков, ни имени агента; исключения — только классом (Ш11, Ш12).
 
-Поток /event (Д5-R35, задача Б4) — stream_events: слотов учётки уже MAX_STREAMS_PER_LOGIN — 429 streams; место не
-готово — 503 not_ready (не будит); у GET есть тело (Content-Length > 0 или Transfer-Encoding) — 400 bad_body до
+Поток /event (Д5-R35, задача Б4) — stream_events: слотов учётки уже MAX_STREAMS_PER_LOGIN — 429 streams (как
+not_ready: без счётчика, строка журнала — одна на место за NOT_READY_LOG_S с n= и since_s=; решение контроллера Б4 —
+адаптер лишней вкладки переподключается так же часто); место не готово — 503 not_ready (не будит); у GET есть тело (Content-Length > 0 или Transfer-Encoding) — 400 bad_body до
 потока места: иначе тело держало бы общий бюджет тел всю жизнь потока. Затем поток места (Workplaces.stream): срок
 заголовков STREAM_OPEN_S и ошибка соединения — 503 no_answer, место неготово, upstream_failed; занятый пул клиента
 места — 503 busy, как у вызовов; 401 — 502 place_auth; иначе не 200 — 503 no_answer; сжатый поток — как нет ответа.
-Слот учётки занимается только после 200 места, прямо перед StreamingResponse (гонка вкладок — 429); владение слотом
+Слот учётки занимается только после 200 места, прямо перед StreamingResponse (гонка вкладок — тот же 429); владение слотом
 и потоком места ответ принимает в момент return, до него их возвращает finally обработчика.
 
 Дальше — _EventStream: задача-читатель гонит filter_sse по сырым кускам места в очередь на STREAM_QUEUE_MAX
-событий; браузер не читает — читатель ждёт put, давление уходит к месту, а не в память. Генератор ответа ждёт
+событий (одно: замер памяти Б4); браузер не читает — читатель ждёт put, давление уходит к месту, а не в память. Генератор ответа ждёт
 очередь не дольше срока перепроверки и перепроверяет сессию не чаще и не реже раза в stream_recheck_s (решение
 контроллера Б4: не на каждом событии — дельты идут десятками в секунду): сессии нет, учётка отключена или место
 не то — конец closed_by=session. Конец места — конец браузеру (closed_by=place; обрыв httpx или OSError — с классом
@@ -110,7 +111,9 @@ PASSED_TYPES = ("application/json", "text/plain")
 OCTET_STREAM = "application/octet-stream"
 # поток /event (Д5-R35, Б4): событие места в памяти шлюза и очередь читателя одного потока
 SSE_MAX_EVENT_BYTES = 512 * 1024
-STREAM_QUEUE_MAX = 4
+# 1, не 4 (решение контроллера Б4): замер 30 потоков по 512 КиБ с медленным читателем — 123 МиБ RSS при 4 и 72 МиБ
+# при 1 (порог ~80 МиБ); поток держит ещё кусок в send Starlette и копию в буфере uvicorn — их в формуле R36 не было
+STREAM_QUEUE_MAX = 1
 STREAM_CLOSE_S = 5.0                        # закрытие потока места в release — не дольше (оно под щитом от отмены)
 _BROKEN = ("timeout", "oversize")           # концы потока, которые считаются stream_broken
 
@@ -213,10 +216,11 @@ class _Call(NamedTuple):
     path: str
 
 
-class _NotReadyLog:
-    """Отказы not_ready места — одна строка журнала за NOT_READY_LOG_S с числом отказов с прошлой строки (Д5-R37):
-    цикл переподключения адаптера даёт до 6 запросов в секунду на вкладку. У строки — since_s: сколько секунд
-    копились отказы (от первого не записанного до этого), чтобы старое число не выдавало себя за свежее (G8)."""
+class _RolledRefusals:
+    """Отказы одного вида по местам (not_ready — Д5-R37; streams — решение контроллера Б4) — одна строка журнала
+    за NOT_READY_LOG_S с числом отказов с прошлой строки: цикл переподключения адаптера даёт до 6 запросов в секунду
+    на вкладку. У строки — since_s: сколько секунд копились отказы (от первого не записанного до этого), чтобы старое
+    число не выдавало себя за свежее (G8)."""
 
     def __init__(self, monotonic: Callable[[], float]):
         self._monotonic = monotonic
@@ -365,13 +369,24 @@ def _answer(answer: PlaceAnswer, release: Callable[[], None]) -> _PlaceResponse:
     return _PlaceResponse(answer.body, answer.status, {"content-type": ct} if ct else None, release)
 
 
-def _not_ready(call: _Call, n: int, not_ready: _NotReadyLog | None) -> JSONResponse:
-    """503 «место спит» без счётчика; строка журнала — одна на место за NOT_READY_LOG_S (Д5-R37)."""
-    rolled = not_ready.refused(n) if not_ready is not None else None
+def _rolled(call: _Call, n: int, rolls: _RolledRefusals | None, reason: str, status: int, name: str) -> JSONResponse:
+    """Отказ без счётчика: строка журнала — одна на место за NOT_READY_LOG_S с n= и since_s= (rolls None — на каждый
+    отказ, n=1)."""
+    rolled = rolls.refused(n) if rolls is not None else (1, 0)
     if rolled is not None:
-        log.info("gw refused login=%s place=%s method=%s path=%s reason=not_ready status=503 n=%d since_s=%d",
-                 call.login, call.place, call.method, call.path, *rolled)
-    return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["not_ready"])
+        log.info("gw refused login=%s place=%s method=%s path=%s reason=%s status=%d n=%d since_s=%d",
+                 call.login, call.place, call.method, call.path, reason, status, *rolled)
+    return gw_error(status, name, PROXY_MESSAGES[reason])
+
+
+def _not_ready(call: _Call, n: int, rolls: _RolledRefusals | None) -> JSONResponse:
+    """503 «место спит» (Д5-R36, Д5-R37)."""
+    return _rolled(call, n, rolls, "not_ready", 503, "WorkplaceNotReady")
+
+
+def _too_many_streams(call: _Call, n: int, rolls: _RolledRefusals | None) -> JSONResponse:
+    """429 «слишком много вкладок» потока /event — как not_ready (решение контроллера Б4)."""
+    return _rolled(call, n, rolls, "streams", 429, "TooManyRequests")
 
 
 def body_busy(role: GatewayRole) -> Callable[[Scope], Response]:
@@ -599,10 +614,6 @@ class _EventStream:
                 log.warning("gw event place=%02d close_error=%s", self.n, type(exc).__name__)
 
 
-def _too_many_streams() -> Refused:
-    return Refused(429, "TooManyRequests", PROXY_MESSAGES["streams"], "streams")
-
-
 def _has_body(request: Request) -> bool:
     """У запроса есть тело: Transfer-Encoding (любой) или Content-Length не из одних нулей (решение контроллера Б4)."""
     if request.headers.get("transfer-encoding") is not None:
@@ -615,13 +626,15 @@ _EVENT_RULE = next(rule for rule in RULES if rule.kind == "event")
 
 
 async def stream_events(role: GatewayRole, account: Account, token: str, n: int, *, call: _Call | None = None,
-                        not_ready: _NotReadyLog | None = None, has_body: bool = False) -> Response:
+                        not_ready: _RolledRefusals | None = None, streams: _RolledRefusals | None = None,
+                        has_body: bool = False) -> Response:
     """Поток /event места n учётки account (сессия token): порядок проверок и владение слотом — в описании модуля.
-    call — поля строк журнала, not_ready — свёртка строк not_ready прокси, has_body — у запроса есть тело."""
+    call — поля строк журнала; not_ready и streams — свёртки строк этих отказов прокси; has_body — у запроса есть
+    тело."""
     login = account.login
     call = call or _Call(login, f"{n:02d}", "GET", "/event")
     if role.stats.streams_of(login) >= MAX_STREAMS_PER_LOGIN:
-        return _refused(role, call, _too_many_streams())
+        return _too_many_streams(call, n, streams)
     if not role.workplaces.is_ready(n):             # не будит: будит только страница входа
         return _not_ready(call, n, not_ready)
     if has_body:
@@ -654,7 +667,7 @@ async def stream_events(role: GatewayRole, account: Account, token: str, n: int,
             _oc_line(call, _EVENT_RULE, 503, started, " reason=no_answer error=PlaceAnswerEncoded", warn=True)
             return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["no_answer"])
         if not role.stats.stream_opened(login):     # гонка вкладок: слоты заняли, пока место отвечало
-            return _refused(role, call, _too_many_streams())
+            return _too_many_streams(call, n, streams)
         slot = True
         stream = _EventStream(role, login, token, n, opened, response)
         _oc_line(call, _EVENT_RULE, 200, started)
@@ -678,19 +691,19 @@ def proxy_router(role: GatewayRole) -> APIRouter:
     вход — у обработчика; ставится до catch_all_router."""
     router = APIRouter(dependencies=[Depends(front_only), Depends(configured(role))])
     account_of = current_account(role)
-    not_ready = _NotReadyLog(role.monotonic)
+    not_ready, streams = _RolledRefusals(role.monotonic), _RolledRefusals(role.monotonic)
     gate = _PlaceGate()
 
     async def oc(request: Request, account: Account = Depends(account_of)) -> Response:
-        return await _proxy(role, request, account, not_ready, gate)
+        return await _proxy(role, request, account, not_ready, streams, gate)
 
     for path in (OC_PREFIX + "/{rest:path}", OC_PREFIX):
         router.add_api_route(path, oc, methods=list(METHODS), include_in_schema=False)
     return router
 
 
-async def _proxy(role: GatewayRole, request: Request, account: Account, not_ready: _NotReadyLog,
-                 gate: _PlaceGate) -> Response:
+async def _proxy(role: GatewayRole, request: Request, account: Account, not_ready: _RolledRefusals,
+                 streams: _RolledRefusals, gate: _PlaceGate) -> Response:
     method, n = request.method, account.place
     call = _Call(account.login, "-" if n is None else f"{n:02d}", method, _log_path(request.scope))
     rest = _raw_rest(request.scope)
@@ -706,7 +719,7 @@ async def _proxy(role: GatewayRole, request: Request, account: Account, not_read
 
     if rule.kind == "event":                        # поток /event: свой порядок проверок (stream_events)
         return await stream_events(role, account, session_tokens(request)[0], n, call=call, not_ready=not_ready,
-                                   has_body=_has_body(request))
+                                   streams=streams, has_body=_has_body(request))
     if not role.workplaces.is_ready(n):             # не будит: будит только страница входа
         return _not_ready(call, n, not_ready)
     if rule.kind == "summarize":                    # сжатие разговора на стенде не нужно: ответ без места
