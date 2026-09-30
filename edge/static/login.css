@@ -1,0 +1,29 @@
+/* Login page styles; the page CSP allows only files from the same origin (style-src 'self'). */
+:root { color-scheme: light dark; --fg: #1f2328; --bg: #f6f8fa; --muted: #6b7280; --field: #ffffff;
+  --border: #d0d7de; --warn-fg: #5c3c00; --warn-bg: #fff4c2; --link: #0969da;
+  --ok: #1a7f37; --fail: #c62828; --accent: #0969da; --accent-fg: #ffffff; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #e6edf3; --bg: #0d1117; --muted: #8b949e; --field: #161b22; --border: #30363d;
+    --warn-fg: #f5d77a; --warn-bg: #3a2f00; --link: #58a6ff;
+    --ok: #3fb950; --fail: #ff6b6b; --accent: #1f6feb; --accent-fg: #ffffff; } }
+[hidden] { display: none !important; }
+body { margin: 0; font: 16px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+.stand { position: sticky; top: 0; padding: .75rem 1rem; text-align: center; font-weight: 600;
+  color: var(--warn-fg); background: var(--warn-bg); }
+main { max-width: 28rem; margin: 0 auto; padding: 1rem; }
+h1 { font-size: 1.4rem; margin: 1rem 0 .75rem; }
+p { margin: .5rem 0; }
+form { display: grid; gap: .35rem; margin: .5rem 0 1rem; }
+label { font-weight: 600; margin-top: .4rem; }
+input { font: inherit; padding: .45rem .6rem; color: var(--fg); background: var(--field);
+  border: 1px solid var(--border); border-radius: 6px; }
+button { font: inherit; padding: .5rem 1rem; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); color: var(--fg); background: var(--field); }
+button[type="submit"] { margin-top: .8rem; color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+button:disabled { opacity: .6; cursor: default; }
+#who { font-weight: 600; }
+#state { min-height: 1.45em; }
+#state[data-kind="ok"] { color: var(--ok); font-weight: 600; }
+#state[data-kind="fail"] { color: var(--fail); font-weight: 600; }
+.meta { color: var(--muted); }
+a { color: var(--link); }

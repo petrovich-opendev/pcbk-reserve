@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход — учебный стенд</title>
+<link rel="stylesheet" href="/login.css">
+<script type="module" src="/login.js"></script>
+</head>
+<body>
+<div class="stand" role="note">Учебный стенд: не для ведения технологического процесса — данные и выводы только для разбора и обучения.</div>
+<main>
+<h1>Вход на учебный стенд</h1>
+<form id="login-form" method="post" hidden>
+<label for="login">Логин</label>
+<input id="login" name="login" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+<label for="password">Пароль</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required>
+<button id="submit" type="submit">Войти</button>
+</form>
+<p id="who" hidden></p>
+<p id="state" role="status" aria-live="polite">Загрузка…</p>
+<noscript><p class="meta">Для входа нужен JavaScript в браузере.</p></noscript>
+<p><button id="logout" type="button" hidden>Выйти</button></p>
+<p class="meta">Что работает на стенде — на <a href="/status">странице состояния</a>.</p>
+</main>
+</body>
+</html>
