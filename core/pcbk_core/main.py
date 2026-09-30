@@ -182,27 +182,35 @@ def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> 
 
 
 def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None) -> GatewayRole:
-    """Роль gateway по образцу build_llm_role (Ш9): GW_* с ошибкой — умолчания и config_error «настройки шлюза:
-    …» (имя поля и правило, без значения); процесс жив. Ни один конструктор ничего не открывает: core.db —
-    в lifespan роли, клиенты sp-ctl и мест — при первом запросе."""
+    """Роль gateway по образцу build_llm_role (Ш9): GW_* с ошибкой — запасные настройки (gateway_settings) и
+    config_error «настройки шлюза: …» (имя поля и правило, без значения); процесс жив. Ни один конструктор
+    ничего не открывает: core.db — в lifespan роли, клиенты sp-ctl и мест — при первом запросе."""
     from .gateway import GatewayRole
     from .gateway.accounts import AccountStore
     from .gateway.places import SpCtl, Workplaces
     from .gateway.stats import GatewayStats
-    from .settings import GatewaySettings
 
-    log = logging.getLogger("pcbk_core.main")
-    problems: list[str] = []
-    try:
-        gw = GatewaySettings.from_env(env)
-    except ValueError as exc:
-        log.error("шлюз: настройки: %s", exc)
-        gw = GatewaySettings()
-        problems.append(f"настройки шлюза: {exc}")
+    gw, problem = gateway_settings(env)
+    if problem is not None:
+        logging.getLogger("pcbk_core.main").error("шлюз: настройки: %s", problem)
     stats = GatewayStats()
     return GatewayRole(settings, gw, store=AccountStore(settings.DB_PATH, ttl_s=gw.GW_SESSION_TTL_S),
                        workplaces=Workplaces(gw, SpCtl(gw.SP_CTL_URL), stats=stats), stats=stats,
-                       config_error="; ".join(problems) or None)
+                       config_error=None if problem is None else f"настройки шлюза: {problem}")
+
+
+def gateway_settings(env: Mapping[str, str] | None = None) -> tuple[GatewaySettings, str | None]:
+    """GW_* для роли gateway и охраны выхода serve(): (настройки, None) или (запасные, текст первой ошибки).
+
+    Запасные — поля, прошедшие проверку по отдельности (GatewaySettings.valid_from_env): опечатка в GW_ORIGIN
+    не сбрасывает STU_NET и SP_CTL_URL к умолчаниям — сверка токенов мест и направления охраны остаются
+    настоящими (ревью А4, I2)."""
+    from .settings import GatewaySettings
+
+    try:
+        return GatewaySettings.from_env(env), None
+    except ValueError as exc:
+        return GatewaySettings.valid_from_env(env), str(exc)
 
 
 def healthcheck(settings: Settings) -> int:
@@ -223,7 +231,7 @@ def healthcheck(settings: Settings) -> int:
 
 def serve(settings: Settings) -> None:
     """Точка входа службы: охрана выхода и поток обновления её адресов — до ролей. Плохой bdrv.env — без
-    историана, плохие LLM_* — OpenRouter по умолчанию, плохие GW_* — sp-ctl и сети мест по умолчанию; причины
+    историана, плохие LLM_* — OpenRouter по умолчанию, плохие GW_* — прошедшие проверку поля и умолчания; причины
     показывают config_error ролей, процесс живёт (Д3а, I2)."""
     # до охраны (F14): pytds/login.py импортирует ctypes, а import ctypes под хуком на 3.14 падает
     import ctypes  # noqa: F401
@@ -234,17 +242,14 @@ def serve(settings: Settings) -> None:
     from .app import create_app
     from .egress import install_guard, start_refresh
     from .logs import setup_logging
-    from .settings import GatewaySettings, LlmSettings
+    from .settings import LlmSettings
 
     log = setup_logging()
     try:
         llm = LlmSettings.from_env()
     except ValueError:
         llm = LlmSettings()                 # причину покажет роль llm (build_roles)
-    try:
-        gw = GatewaySettings.from_env()
-    except ValueError:
-        gw = GatewaySettings()              # причину покажет роль gateway (build_roles)
+    gw, _ = gateway_settings()              # запасные при ошибке; причину покажет роль gateway (build_roles)
     install_guard(egress_targets(llm, gw, read_bdrv(settings)[0]))
     start_refresh()                         # адреса OpenRouter и sp-ctl — в кэше до первого вызова (Д4а-R18)
     roles = build_roles(settings)

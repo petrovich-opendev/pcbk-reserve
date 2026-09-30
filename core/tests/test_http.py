@@ -155,8 +155,8 @@ async def test_place_token_only_from_its_network(tmp_path):
             async with from_address(app, client) as c:
                 before = len(role.events.recent(channel="http"))
                 assert (await c.post("/api/data/tag_now", json=body, headers=auth)).status_code == code, client
-                if code == 401:
-                    assert len(role.events.recent(channel="http")) == before          # как чужой токен — без события
+                # как чужой токен — без события; положительный контроль: у 200 событие есть (ревью B, M5)
+                assert len(role.events.recent(channel="http")) == before + (code == 200), client
 
 
 def from_address(app, client: tuple[str, int]) -> httpx.AsyncClient:

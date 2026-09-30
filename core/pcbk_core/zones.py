@@ -33,7 +33,8 @@ DEFAULT_STU_NET = "172.31"
 STU_NET_KEY = "pcbk_stu_net"
 PLACE_NET_PREFIX = 28
 
-_STUDENT = re.compile(r"student-([0-9]{2})")
+STUDENT_PREFIX = "student-"
+_STUDENT = re.compile(STUDENT_PREFIX + r"([0-9]{2})")
 
 log = logging.getLogger("pcbk_core.zones")
 
@@ -110,11 +111,15 @@ def stu_net(scope: Mapping[str, Any]) -> str:
 def caller_net_ok(scope: Mapping[str, Any], caller: str) -> bool:
     """Токен student-NN — только из сети своего места или из ADMIN_NETS (Ш25); прочие вызывающие — всегда.
 
-    Адрес источника не IP или его нет (клиент тестов в процессе) — сверки нет: uvicorn кладёт адрес IP.
+    id с префиксом student-, номер которого не разобрать (student-1, student-001, student-ab), — отказ из
+    любой сети: закрыто при сомнении (ревью А4, M4). Адрес источника не IP или его нет (клиент тестов в
+    процессе) — сверки нет: uvicorn кладёт адрес IP.
     """
-    m = _STUDENT.fullmatch(caller) if isinstance(caller, str) else None
-    if m is None:
+    if not isinstance(caller, str):
         return True
+    m = _STUDENT.fullmatch(caller)
+    if m is None:
+        return not caller.startswith(STUDENT_PREFIX)
     client = scope.get("client")
     addr = _ip(client[0]) if client else None
     if addr is None:

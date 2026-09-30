@@ -2,11 +2,12 @@
 приложение, разбор по префиксу пути.
 
 Роли наполняют реестр AppHooks в install(app) через hooks_of(app): обработчик ошибок разбора тела,
-обработчик HTTPException (Д5) и предел тела (с ответом 413) — на свой префикс пути. create_app после
-install всех ролей ставит один обработчик RequestValidationError, один обработчик HTTPException Starlette и
-одно звено BodyLimit — самым внешним внутри ServerErrorMiddleware, так что 413 выходит раньше звеньев ролей.
-Выбор — по самому длинному подходящему префиксу; путь без префикса — обработчик FastAPI по умолчанию и
-предел DEFAULT_BODY_LIMIT. Модуль не импортирует pcbk_core.data: реестр общий для всех ролей.
+обработчик HTTPException (Д5) и предел тела (с ответом 413 или своим ответом по области запроса) — на свой
+префикс пути. create_app после install всех ролей ставит один обработчик RequestValidationError, один
+обработчик HTTPException Starlette и одно звено BodyLimit — самым внешним внутри ServerErrorMiddleware, так
+что 413 выходит раньше звеньев ролей. Выбор — по самому длинному подходящему префиксу; путь без префикса —
+обработчик FastAPI по умолчанию и предел DEFAULT_BODY_LIMIT. Модуль не импортирует pcbk_core.data: реестр
+общий для всех ролей.
 """
 import logging
 from collections import deque
@@ -27,6 +28,8 @@ ValidationHandler = Callable[[Request, RequestValidationError], Awaitable[Respon
 HttpExceptionHandler = Callable[[Request, StarletteHTTPException], Awaitable[Response]]
 # тело ответа 413 по пределу префикса: у /llm/ — в форме OpenAI (П19)
 Refusal = Callable[[int], dict]
+# ответ целиком по области запроса и пределу: шлюз вне своей зоны отвечает 404, а не 413 (Д5)
+Respond = Callable[[Scope, int], Response]
 
 log = logging.getLogger("pcbk_core.hooks")
 
@@ -61,7 +64,7 @@ class AppHooks:
     def __init__(self) -> None:
         self._handlers: dict[str, ValidationHandler] = {}
         self._http_handlers: dict[str, HttpExceptionHandler] = {}
-        self._limits: dict[str, tuple[int, Refusal | None]] = {}
+        self._limits: dict[str, tuple[int, Refusal | None, Respond | None]] = {}
 
     def validation(self, prefix: str, handler: ValidationHandler) -> None:
         """Обработчик RequestValidationError для путей с этим префиксом; повтор префикса — ValueError."""
@@ -77,12 +80,16 @@ class AppHooks:
     def http_handler_for(self, path: str) -> HttpExceptionHandler | None:
         return _longest(self._http_handlers, path)
 
-    def body_limit(self, prefix: str, max_bytes: int, *, refusal: Refusal | None = None) -> None:
-        """Предел тела для путей с этим префиксом; refusal(предел) — тело ответа 413 вместо {"detail": …}."""
+    def body_limit(self, prefix: str, max_bytes: int, *, refusal: Refusal | None = None,
+                   respond: Respond | None = None) -> None:
+        """Предел тела для путей с этим префиксом; refusal(предел) — тело ответа 413 вместо {"detail": …};
+        respond(scope, предел) — ответ целиком (код и тело по области запроса). Оба сразу — ValueError."""
         _check_prefix(prefix, self._limits, "предел тела")
         if max_bytes < 1:
             raise ValueError(f"предел тела {prefix!r}: нужно не меньше 1 байта, получено {max_bytes}")
-        self._limits[prefix] = (max_bytes, refusal)
+        if refusal is not None and respond is not None:
+            raise ValueError(f"предел тела {prefix!r}: refusal или respond, не оба")
+        self._limits[prefix] = (max_bytes, refusal, respond)
 
     def handler_for(self, path: str) -> ValidationHandler | None:
         return _longest(self._handlers, path)
@@ -94,6 +101,10 @@ class AppHooks:
     def refusal_for(self, path: str) -> Refusal | None:
         found = _longest(self._limits, path)
         return None if found is None else found[1]
+
+    def respond_for(self, path: str) -> Respond | None:
+        found = _longest(self._limits, path)
+        return None if found is None else found[2]
 
 
 def hooks_of(app: FastAPI) -> AppHooks:
@@ -164,6 +175,10 @@ class BodyLimit:
     async def _too_large(self, scope: Scope, receive: Receive, send: Send, limit: int) -> None:
         path = scope.get("path", "")
         log.warning("outcome=too_large path=%s limit=%d", safe_path(path), limit)
+        respond = None if self.hooks is None else self.hooks.respond_for(path)
+        if respond is not None:
+            await respond(scope, limit)(scope, receive, send)
+            return
         refusal = None if self.hooks is None else self.hooks.refusal_for(path)
         body = refusal(limit) if refusal is not None else {"detail": f"тело запроса больше {size_text(limit)}"}
         await JSONResponse(body, status_code=413)(scope, receive, send)

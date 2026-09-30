@@ -12,11 +12,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
+from starlette.routing import Match
 
 from helpers import ORIGIN, PW, login, make_gateway, serve_app, wait_until
 from pcbk_core.gateway import accounts
-from pcbk_core.gateway.api import (COOKIE_HEADERS_BUDGET, COOKIE_PATH_MAX_LEN, GW_MESSAGES, MAX_SESSION_COOKIES,
-                                   clear_cookies)
+from pcbk_core.gateway.api import (COOKIE_HEADERS_BUDGET, COOKIE_PATH_MAX_LEN, GW_MESSAGES, LOGIN_PARALLEL,
+                                   MAX_SESSION_COOKIES, catch_all_router, clear_cookies)
 
 pytestmark = pytest.mark.anyio
 BASE = "https://stand.test:8443"
@@ -122,7 +123,7 @@ def test_errors_are_opencode_json_without_www_authenticate(tmp_path):
         assert r.status_code == 401 and r.json() == {"name": "Unauthorized", "data": {"message": "Нужно войти"}}
         assert "www-authenticate" not in r.headers
         assert c.get("/pcbk/api/auth/nothing").json() == {"name": "NotFound", "data": {"message": "Не найдено"}}
-        assert c.request("PROPFIND", "/pcbk/api/auth/me").json()["name"] in ("NotFound", "MethodNotAllowed")
+        assert c.request("PROPFIND", "/pcbk/api/auth/me").json()["name"] == "NotFound"   # I1 ревью: не 405
         for _ in range(5):
             assert login(c, "stu-03", pw="неверный-1").status_code == 401
         r = login(c, "stu-03")
@@ -147,6 +148,7 @@ async def test_login_scrypt_bounded(tmp_path, monkeypatch):                     
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
         rs = await asyncio.gather(*(c.post("/pcbk/api/auth/login", json={"login": f"nobody{i}", "password": "x" * 8},
                                            headers={"Origin": ORIGIN}) for i in range(20)))
+        await role.login_gate.drain()                                                  # записи неудач — до конца теста
     codes = [r.status_code for r in rs]
     assert peak <= 2 and set(codes) <= {401, 429} and codes.count(429) >= 10
     assert role.stats.count_1h("login_busy") >= 10
@@ -264,3 +266,79 @@ def test_bad_body_and_logout_without_session(tmp_path):
         assert (r.status_code, r.json()) == (200, {}) and r.headers.get_list("set-cookie")
         assert c.post("/pcbk/api/auth/logout").status_code == 403                     # запись — только со своей страницы
     assert role.stats.count_1h("login_failed") == 0
+
+
+# --- доводка, раунд 1 (task-А4-fix1.md) ---
+
+NO_ROUTE = [(m, "/pcbk/api/x") for m in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "PROPFIND", "TRACE")] + \
+    [("PROPFIND", "/pcbk/api/auth/me"), ("POST", "/health/gateway"), ("GET", "/pcbk/api/auth/login")]
+
+
+def test_no_route_is_404_without_allow_in_any_zone(tmp_path):                        # F1 (оба ревью, I1)
+    [route] = catch_all_router().routes                                                # ловит любой метод сам,
+    assert route.methods is None and route.matches({"type": "http", "method": "PROPFIND",   # без опоры на 405→404
+                                                     "path": "/pcbk/api/x"})[0] == Match.FULL
+    app, _ = make_gateway(tmp_path)
+    for base in ("http://172.31.250.34:8000", "http://172.31.6.2:8000"):             # pcbk-front и сеть места 06
+        with TestClient(app, base_url=base) as c:
+            for method, path in NO_ROUTE:
+                r = c.request(method, path)
+                assert (r.status_code, r.json()) == (404, {"name": "NotFound", "data": {"message": "Не найдено"}}), \
+                    (base, method, path)
+                assert "allow" not in r.headers, (base, method, path)
+
+
+async def test_relock_before_verify_bounds_scrypt(tmp_path, monkeypatch):             # F4 (ревью A, M1)
+    """30 одновременных неверных входов одного логина: неудача ложится в замок до того, как место очереди
+    отдано следующей попытке, и та перед сверкой видит замок — сверок не больше LOCK_FAILURES - 1 + LOGIN_PARALLEL."""
+    app, role = make_gateway(tmp_path)
+    calls, real = [], accounts.verify_password
+
+    def slow(pw, stored):
+        calls.append(1)
+        time.sleep(0.1)
+        return real(pw, stored)
+    monkeypatch.setattr(accounts, "verify_password", slow)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
+        rs = await asyncio.gather(*(c.post("/pcbk/api/auth/login", json={"login": "stu-03", "password": "неверный-1"},
+                                           headers={"Origin": ORIGIN}) for _ in range(30)))
+        await role.login_gate.drain()
+    codes = [r.status_code for r in rs]
+    assert len(calls) <= accounts.LOCK_FAILURES - 1 + LOGIN_PARALLEL, len(calls)
+    assert codes.count(401) == len(calls) and set(codes) <= {401, 429}
+    assert failures(tmp_path) == accounts.LOCK_FAILURES                                 # таблица держит не больше порога
+
+
+def test_refused_line_is_point_query(tmp_path, monkeypatch, gwlog):                      # F5 (ревью A, M2)
+    app, role = make_gateway(tmp_path)
+    monkeypatch.setattr(role.store, "list", lambda: pytest.fail("строка отказа читает все учётки"))
+    role.store.disable("stu-05")
+    with TestClient(app, base_url=BASE) as c:
+        login(c, "stu-03", pw="неверный-1"); login(c, "stu-05"); login(c, "nobody7", pw="x" * 8)
+    text = gwlog.text
+    assert "gw login refused login=stu-03 reason=password" in text
+    assert "gw login refused login=stu-05 reason=disabled" in text
+    assert "gw login refused login=<неизвестный> reason=unknown" in text
+
+
+def test_body_limit_after_zone(tmp_path):                                               # F6 (ревью A, M3)
+    app, _ = make_gateway(tmp_path)
+    big = {"content": b"x" * 70000, "headers": {"Origin": ORIGIN, "Content-Type": "application/json"}}
+    with TestClient(app, base_url="http://172.31.6.2:8000") as place:
+        r = place.post("/pcbk/api/auth/login", **big)
+        assert (r.status_code, r.json()["name"]) == (404, "NotFound")                 # вне зоны — как нет ручки
+    with TestClient(app, base_url="http://172.31.250.34:8000") as front:
+        r = front.post("/pcbk/api/auth/login", **big)
+        assert (r.status_code, r.json()["name"]) == (413, "PayloadTooLarge")
+
+
+def test_disabled_answer_equals_unknown(tmp_path):                                      # F8 (ревью A, M5)
+    app, role = make_gateway(tmp_path)
+    role.store.disable("stu-05")
+    with TestClient(app, base_url=BASE) as c:
+        disabled, unknown = login(c, "stu-05"), login(c, "nobody7")                    # у отключённой — верный пароль
+    strip = lambda r: sorted((k, v) for k, v in r.headers.multi_items() if k != "date")
+    assert (disabled.status_code, disabled.content, strip(disabled)) == (unknown.status_code, unknown.content,
+                                                                          strip(unknown))
+    assert disabled.status_code == 401

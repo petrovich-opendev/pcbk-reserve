@@ -6,7 +6,6 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontext
 from typing import Protocol
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi import HTTPException as FastApiHTTPException
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -106,19 +105,27 @@ def _route_patterns(app: FastAPI) -> list[tuple[str, re.Pattern]]:
     return patterns
 
 
+def _bypasses_http_registry(key: object) -> bool:
+    """Ключ обработчика мимо реестра HTTPException: код ответа (int — Starlette зовёт его раньше обработчика
+    по классу) или подкласс HTTPException Starlette (FastAPI HTTPException и прочие — по MRO раньше общего)."""
+    if isinstance(key, int):
+        return True
+    return isinstance(key, type) and issubclass(key, StarletteHTTPException) and key is not StarletteHTTPException
+
+
 def _install_hooks(app: FastAPI) -> None:
     """Один обработчик 422, один обработчик HTTPException и одно звено предела тела на приложение — по реестру
     ролей.
 
     Звено ставится последним: оно самое внешнее внутри ServerErrorMiddleware, и 413 выходит раньше
     звеньев ролей. Обработчик 422 или HTTPException роли мимо реестра общий молча затёр бы (Ш5) — сборка
-    отказывает. HTTPException FastAPI — подкласс Starlette: свой обработчик на него тоже обошёл бы реестр.
+    отказывает. Обработчик по коду ответа (int) или по подклассу HTTPException тоже обошёл бы реестр.
     """
     hooks = hooks_of(app)
     if app.exception_handlers.get(RequestValidationError) is not request_validation_exception_handler:
         raise ValueError("обработчик 422 ставится через реестр hooks_of(app).validation, не напрямую")
     if (app.exception_handlers.get(StarletteHTTPException) is not http_exception_handler
-            or FastApiHTTPException in app.exception_handlers):
+            or any(_bypasses_http_registry(key) for key in app.exception_handlers)):
         raise ValueError("обработчик HTTPException ставится через реестр hooks_of(app).http_exception, не напрямую")
 
     async def on_validation(request: Request, exc: RequestValidationError) -> Response:

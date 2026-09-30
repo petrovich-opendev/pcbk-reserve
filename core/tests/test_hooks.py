@@ -181,6 +181,26 @@ def test_role_own_http_exception_handler_is_refused():                          
     with pytest.raises(ValueError, match="реестр"):
         create_app(SETTINGS, [FastApiBypass("llm", (True, "ок"))])
 
+    class OwnSubclass(StarletteHTTPException):
+        pass
+
+    for key in (404, OwnSubclass):                 # F9: по коду ответа Starlette ищет раньше, чем по классу
+        class ByKey(DummyRole):
+            def install(self, app, key=key):
+                app.add_exception_handler(key, lambda request, exc: None)
+        with pytest.raises(ValueError, match="реестр"):
+            create_app(SETTINGS, [ByKey("llm", (True, "ок"))])
+
+
+def test_body_limit_respond_by_scope():                                                 # F6: ответ по зоне
+    h = AppHooks()
+    h.body_limit("/x/", 100, respond=lambda scope, n: JSONResponse({"n": n, "path": scope["path"]}, status_code=404))
+    c = TestClient(BodyLimit(_echo, hooks=h))
+    r = c.post("/x/a", content=b"x" * 101)
+    assert (r.status_code, r.json()) == (404, {"n": 100, "path": "/x/a"})
+    with pytest.raises(ValueError):
+        h.body_limit("/y/", 10, refusal=lambda n: {}, respond=lambda scope, n: JSONResponse({}))
+
 
 def test_http_exception_registry_used_by_app():
     """404 и 405 маршрутизации под префиксом роли — её обработчик; прочие пути — ответ FastAPI по умолчанию."""

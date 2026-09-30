@@ -11,10 +11,13 @@ WWW-Authenticate. Порядок проверок: зона (front_only, вне 
 (clear_cookies): строки собираются здесь, короткие, сумма байт ограничена COOKIE_HEADERS_BUDGET при любом
 Host. Номер места — только из учётки сессии.
 
-Вход: замок (store.locked) → очередь сверок (не больше LOGIN_PARALLEL scrypt разом, ждущих — не больше
-LOGIN_QUEUE, иначе 429 без scrypt) → сверка в потоке. Неудача — 401 сразу; запись неудачи в замок и строка
-журнала — фоном после ответа (BackgroundTask): время ответа не выдаёт, существует ли логин. В журнале нет ни
-паролей, ни cookie, ни заголовков; логин — только существующий, иначе «<неизвестный>».
+Вход: замок (store.locked) → очередь сверок (не больше LOGIN_PARALLEL попыток разом, ждущих — не больше
+LOGIN_QUEUE, иначе 429 без scrypt) → в одном задании потока повторная проверка замка и сверка. Неудача —
+401 сразу; запись неудачи в замок и строка журнала — в задаче попытки после итога, ответ их не ждёт (время
+ответа не выдаёт, существует ли логин), а место очереди освобождается только после записи (LoginGate).
+Нет маршрута или метода под /pcbk/api/ и на /health/gateway — 404 без Allow в любой зоне; предел тела вне
+pcbk-front — тоже 404. В журнале нет ни паролей, ни cookie, ни заголовков; логин — только существующий,
+иначе «<неизвестный>».
 """
 import asyncio
 import ipaddress
@@ -29,10 +32,12 @@ from fastapi.exception_handlers import http_exception_handler as fastapi_http_ex
 from fastapi.responses import JSONResponse, Response
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import Receive, Scope, Send
 
 from .. import zones
 from ..hooks import safe_path
-from .accounts import LOGIN_RE, Account, AccountStore, StoreError
+from . import clip
+from .accounts import Account, AccountStore, StoreError
 
 if TYPE_CHECKING:
     from . import GatewayRole
@@ -109,17 +114,28 @@ def _refusal(status: int, key: str, cookies: list[str] | None = None) -> Gateway
 
 
 async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> Response:
-    """HTTPException под /pcbk/api/ и /health/gateway: отказ шлюза — как есть; 404 и 405 маршрутизации и
+    """HTTPException под /pcbk/api/ и /health/gateway: отказ шлюза — как есть; 404 и 405 маршрутизации — 404
+    not_found без Allow (список методов не подсказывает, какие ручки есть, в любой зоне — ревью А4, I1);
     прочие — JSON вида OpenCode с тем же кодом, без WWW-Authenticate."""
     if isinstance(exc, GatewayRefusal):
         return exc.response
     status = exc.status_code
+    if status in (404, 405):
+        return _error(404, "not_found")
     if status < 400:
         return await fastapi_http_exception_handler(request, exc)
     name = ERROR_NAMES.get(status, "Unavailable" if status >= 500 else "BadRequest")
     key = {401: "need_login", 404: "not_found"}.get(status, "bad_body")
     headers = {k: v for k, v in (exc.headers or {}).items() if k.lower() != "www-authenticate"}
     return gw_error(status, name, GW_MESSAGES[key], headers=headers or None)
+
+
+def too_large(scope: Scope, limit: int) -> Response:
+    """413 под /pcbk/api/ (предел тела — до маршрутизации): вне pcbk-front — 404, как отказ зоны, иначе
+    размер тела выдавал бы ручки шлюза в сетях мест (ревью А4, M3)."""
+    if not zones.is_front(scope):
+        return _error(404, "not_found")
+    return gw_error(413, "PayloadTooLarge", "Запрос слишком большой")
 
 
 # --- источник записи (Д5-R26) ---
@@ -243,7 +259,7 @@ def configured(role: "GatewayRole") -> Callable[[], Awaitable[None]]:
     """Ошибка настройки шлюза — 503 «Шлюз не настроен: <причина>»."""
     async def dependency() -> None:
         if role.config_error:
-            reason = GW_MESSAGES["unavailable"] + role.config_error[:CONFIG_ERROR_SHOWN]
+            reason = GW_MESSAGES["unavailable"] + clip(role.config_error, CONFIG_ERROR_SHOWN)
             raise GatewayRefusal(gw_error(503, ERROR_NAMES[503], reason))
     return dependency
 
@@ -302,9 +318,21 @@ def _credentials(raw: bytes) -> tuple[str, str] | None:
     return login, password
 
 
+# итог сверки в задании потока: логин заперт — сверки не было (F4)
+LOCKED = object()
+
+
+def _check_and_verify(store: AccountStore, login: str, password: str) -> Account | object | None:
+    """Замок и сверка в одном задании потока, уже с местом в очереди: пока запрос ждал, неудачи соседних
+    попыток того же логина могли его запереть (ревью А4, M1) — тогда LOCKED без scrypt."""
+    if store.locked(login):
+        return LOCKED
+    return store.verify(login, password)
+
+
 def _refused_line(store: AccountStore, login: str, kind: str) -> None:
-    """После ответа, в потоке: неудача сверки — в замок; строка «gw login refused» — логин, только если он
-    существует. kind: password (сверка не прошла), locked, busy."""
+    """В потоке, после ответа: неудача сверки — в замок; строка «gw login refused» — логин, только если он
+    существует (точечный запрос store.status). kind: password (сверка не прошла), locked, busy."""
     if kind == "password":
         try:
             store.failure(login)
@@ -312,15 +340,24 @@ def _refused_line(store: AccountStore, login: str, kind: str) -> None:
             log.warning("шлюз: неудачный вход не записан (%s)", type(exc).__name__)
     shown, reason = "<неизвестный>", "unknown" if kind == "password" else kind
     try:
-        if kind == "password":
-            found = next((a for a in store.list() if a.login == login), None) if LOGIN_RE.fullmatch(login) else None
-            if found is not None:
-                shown, reason = login, "disabled" if found.disabled else "password"
-        elif store.exists(login):
-            shown = login
+        status = store.status(login)
     except Exception:                   # строка журнала — без логина
-        pass
+        status = None
+    if status is not None:
+        shown = login
+        if kind == "password":
+            reason = "disabled" if status == "disabled" else "password"
     log.warning("gw login refused login=%s reason=%s", shown, reason)
+
+
+def _after_verify(store: AccountStore, login: str) -> Callable[[object], None]:
+    """after попытки LoginGate: неудача сверки — в замок и в журнал, замок — в журнал; удача — ничего."""
+    def after(result: object) -> None:
+        if result is None:
+            _refused_line(store, login, "password")
+        elif result is LOCKED:
+            _refused_line(store, login, "locked")
+    return after
 
 
 def _place_nn(place: int | None) -> str:
@@ -351,13 +388,21 @@ def auth_router(role: "GatewayRole") -> APIRouter:
             role.stats.event("login_busy")
             return _error(429, "busy", background=BackgroundTask(_refused_line, store, name, "busy"))
         try:
-            account = await gate.run(store.verify, name, password)
-            token = None if account is None else await asyncio.to_thread(store.open_session, account.login)
+            # неудача пишется в замок после ответа, но до того, как место очереди отдано следующей попытке
+            account = await gate.attempt(lambda: _check_and_verify(store, name, password),
+                                         _after_verify(store, name))
+        except StoreError:
+            return _error(503, "store")
+        if account is LOCKED:
+            return _error(429, "locked")
+        if account is None:
+            role.stats.event("login_failed")
+            return _error(401, "bad_credentials")
+        try:
+            token = await asyncio.to_thread(store.open_session, account.login)
         except StoreError:
             return _error(503, "store")
         except ValueError:              # учётку отключили между сверкой и сессией — как неверный вход
-            account = token = None
-        if account is None or token is None:
             role.stats.event("login_failed")
             return _error(401, "bad_credentials", background=BackgroundTask(_refused_line, store, name, "password"))
         log.info("gw login ok login=%s role=%s place=%s", account.login, account.role, _place_nn(account.place))
@@ -402,13 +447,16 @@ def workplace_router(role: "GatewayRole") -> APIRouter:
     return router
 
 
+class _NotFound:
+    """ASGI-приложение ловящего маршрута. Экземпляр класса, а не функция: Route Starlette 1.7 функции без
+    списка методов даёт ["GET"] (прочие методы — 405 с Allow), а ASGI-приложение пускает на любой метод."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await _error(404, "not_found")(scope, receive, send)
+
+
 def catch_all_router() -> APIRouter:
-    """/pcbk/api/{rest:path} на любой метод — 404 JSON; ставится последним. Маршрут Starlette без списка
-    методов: у маршрута FastAPI список обязателен, и метод вне списка получил бы 405."""
+    """/pcbk/api/{rest:path} на любой метод — 404 JSON без Allow; ставится последним."""
     router = APIRouter()
-
-    async def not_found(request: Request) -> Response:
-        return _error(404, "not_found")
-
-    router.add_route(PREFIX + "/{rest:path}", not_found, methods=None, include_in_schema=False)
+    router.add_route(PREFIX + "/{rest:path}", _NotFound(), methods=None, include_in_schema=False)
     return router

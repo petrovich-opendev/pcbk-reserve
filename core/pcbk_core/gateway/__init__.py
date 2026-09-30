@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.responses import JSONResponse
@@ -39,7 +39,6 @@ log = logging.getLogger("pcbk_core.gateway")
 
 HEALTH_PATH = "/health/gateway"
 BODY_LIMIT = 65536                          # тела шлюза Д5а — логин и пароль
-TOO_LARGE = {"name": "PayloadTooLarge", "data": {"message": "Запрос слишком большой"}}
 CONFIG_ERROR_CHARS = 80                     # вся причина config_error, дописанная при запуске
 HEALTH_REASON_CHARS = 60                    # причина в health()
 SILENT_TICKS = 4                            # уборщик молчит дольше 4 тактов — сбой (GW_STALE_S сторожа)
@@ -47,40 +46,70 @@ SILENT_TICKS = 4                            # уборщик молчит дол
 _T = TypeVar("_T")
 
 
-class LoginGate:
-    """Сверки scrypt входа (Д5-R25): не больше parallel разом, ждущих — не больше queue.
+def clip(text: str, limit: int) -> str:
+    """Текст не длиннее limit без разрыва слова: длинный режется по последнему пробелу и кончается «…»."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit - 1]
+    cut = head.rfind(" ")
+    return (head[:cut] if cut > 0 else head).rstrip(" ;:,") + "…"
 
-    full() и run() зовутся подряд без await между ними — решение и постановка в очередь атомарны в цикле
-    событий. Место отдаётся, когда поток сверки закончил, а не когда ушёл ждущий: отменённый запрос не
-    открывает дорогу третьему scrypt, пока его поток ещё считает.
+
+class LoginGate:
+    """Сверки scrypt входа (Д5-R25): не больше parallel попыток разом, ждущих — не больше queue.
+
+    full() и attempt() зовутся подряд без await между ними — решение и постановка в очередь атомарны в цикле
+    событий. Попытка — своя задача, запрос её не отменяет: check (замок и сверка) идёт в потоке, итог
+    отдаётся запросу сразу, затем в потоке — after(итог) (запись неудачи в замок), и только после него место
+    освобождается. Так ответ не ждёт записи неудачи (время ответа не выдаёт, есть ли логин), а следующая
+    попытка того же логина уже видит её в замке (ревью А4, M1): сверок одного логина при наплыве — не больше
+    LOCK_FAILURES - 1 + parallel. Отменённый запрос не открывает дорогу лишнему scrypt и не теряет неудачу.
     """
 
     def __init__(self, parallel: int, queue: int):
         self._sem = asyncio.Semaphore(parallel)
         self._queue = queue
+        self._tasks: set[asyncio.Task] = set()
         self.waiting = 0
 
     def full(self) -> bool:
         return self._sem.locked() and self.waiting >= self._queue
 
-    async def run(self, fn: Callable[..., _T], *args: Any) -> _T:
+    async def attempt(self, check: Callable[[], _T], after: Callable[[_T], None]) -> _T:
         self.waiting += 1
         try:
             await self._sem.acquire()
         finally:
             self.waiting -= 1
+        verdict: asyncio.Future = asyncio.get_running_loop().create_future()
         try:
-            job = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+            task = asyncio.create_task(self._run(check, after, verdict), name="gw-login")
         except BaseException:
             self._sem.release()
             raise
-        job.add_done_callback(self._done)
-        return await asyncio.shield(job)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return await asyncio.shield(verdict)
 
-    def _done(self, job: asyncio.Future) -> None:
-        self._sem.release()
-        if not job.cancelled():
-            job.exception()             # забрано: исключение потока ушедшего ждущего не всплывёт предупреждением
+    async def _run(self, check: Callable[[], _T], after: Callable[[_T], None], verdict: asyncio.Future) -> None:
+        try:
+            try:
+                result = await asyncio.to_thread(check)
+            except Exception as exc:
+                verdict.set_exception(exc)
+                verdict.exception()     # забрано: ушедший запрос не оставит «исключение не получено»
+                return
+            verdict.set_result(result)
+            try:
+                await asyncio.to_thread(after, result)
+            except Exception as exc:
+                log.warning("шлюз: после сверки входа — %s", type(exc).__name__)
+        finally:
+            self._sem.release()
+
+    async def drain(self) -> None:
+        """Дождаться идущих попыток (запись неудач) — на остановке роли и в тестах."""
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
 
 class GatewayRole(RoleBase):
@@ -126,20 +155,21 @@ class GatewayRole(RoleBase):
 
     def install(self, app: FastAPI) -> None:
         """Только через реестр Д4а: отказы HTTPException и 413 под /pcbk/api/ — JSON вида OpenCode (Ш22), отказ
-        front_only на /health/gateway — тоже; сеть мест для сверки токенов служб (Ш25)."""
-        from .api import PREFIX, http_exception_handler
+        front_only и 405 на /health/gateway — тоже; предел тела вне pcbk-front отвечает 404, как зона (ревью
+        А4, M3); сеть мест для сверки токенов служб (Ш25)."""
+        from .api import PREFIX, http_exception_handler, too_large
 
         hooks = hooks_of(app)
         hooks.http_exception(PREFIX + "/", http_exception_handler)
         hooks.http_exception(HEALTH_PATH, http_exception_handler)
-        hooks.body_limit(PREFIX + "/", BODY_LIMIT, refusal=lambda n: TOO_LARGE)
+        hooks.body_limit(PREFIX + "/", BODY_LIMIT, respond=too_large)
         app.state.pcbk_stu_net = self.gw.STU_NET
 
     # --- здоровье: только память ---
 
     def health(self) -> tuple[bool, str]:
         if self.config_error:
-            return False, "ошибка настройки: " + self.config_error[:HEALTH_REASON_CHARS]
+            return False, "ошибка настройки: " + clip(self.config_error, HEALTH_REASON_CHARS)
         if self.store.probe_failures > 0 or self.store.op_failures > 0:
             return False, "учётные записи недоступны"
         if self.workplaces.sp_ctl == "down":
@@ -173,8 +203,15 @@ class GatewayRole(RoleBase):
     # --- жизненный цикл ---
 
     def _add_config_error(self, why: str) -> None:
-        text = f"{self.config_error}; {why}" if self.config_error else why
-        self.config_error = text[:CONFIG_ERROR_CHARS]
+        """Дописать причину запуска: она (сбой базы, класс ошибки) остаётся целиком, при нехватке места до
+        CONFIG_ERROR_CHARS сокращается прежняя часть — без разрыва слова (ревью А4, M2)."""
+        why = clip(why, CONFIG_ERROR_CHARS)
+        if not self.config_error:
+            self.config_error = why
+            return
+        room = CONFIG_ERROR_CHARS - len(why) - len("; ")
+        head = clip(self.config_error, room) if room > 1 else ""
+        self.config_error = f"{head}; {why}" if head else why
 
     def lifespan(self):
         return self._lifespan()
@@ -204,6 +241,7 @@ class GatewayRole(RoleBase):
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        await self.login_gate.drain()           # неудачные входы — в замок до выхода
         for name, close in (("места", self.workplaces.aclose), ("прокси сокета", self.workplaces.spctl.aclose)):
             try:
                 await close()

@@ -462,6 +462,17 @@ class AccountStore:
         with self._op() as db:
             return db.execute("SELECT 1 FROM gw_accounts WHERE login = ?", (login,)).fetchone() is not None
 
+    def status(self, login: str) -> Literal["active", "disabled"] | None:
+        """Состояние учётки одним точечным запросом: действующая, отключённая или None — учётки нет (и логин
+        не того вида, тогда без базы). Для строки журнала отказа входа."""
+        if not isinstance(login, str) or LOGIN_RE.fullmatch(login) is None:
+            return None
+        with self._op() as db:
+            row = db.execute("SELECT disabled FROM gw_accounts WHERE login = ?", (login,)).fetchone()
+        if row is None:
+            return None
+        return "disabled" if row[0] else "active"
+
     def open_session(self, login: str) -> str:
         """Новая сессия действующей учётки: токен (secrets.token_urlsafe(32)) — вызывающему, в базу — его sha256.
         Заодно удаляются истёкшие сессии. Нет учётки или она отключена — ValueError."""

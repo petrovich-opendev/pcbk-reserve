@@ -78,3 +78,14 @@ def test_caller_net_ok():                                                       
     assert caller_net_ok({"client": ("10.50.1.3", 1), "app": prod, zones.STU_NET_KEY: "10.50"}, "student-01")
     bad = SimpleNamespace(state=SimpleNamespace(pcbk_stu_net="нет"))
     assert not caller_net_ok({"client": ("172.31.1.3", 1), "app": bad}, "student-01")   # сеть не построить — закрыто
+
+
+def test_malformed_student_id_refused():                                                # F7 (ревью A, M4)
+    """id с префиксом student- без разбираемого номера — отказ из любой сети, в том числе из ADMIN_NETS и от
+    клиента тестов; прочие id и student-NN — как прежде."""
+    prod = app_with(False)
+    for caller in ("student-1", "student-001", "student-ab", "student-", "student-01x"):
+        for client in (("172.31.1.3", 1), ("127.0.0.1", 1), ("testclient", 50000), None):
+            assert not caller_net_ok({"client": client, "app": prod}, caller), (caller, client)
+    assert caller_net_ok({"client": ("127.0.0.1", 1), "app": prod}, "students-1")      # не префикс student-
+    assert caller_net_ok({"client": ("172.31.1.3", 1), "app": prod}, "student-01")

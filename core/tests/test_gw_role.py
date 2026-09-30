@@ -1,5 +1,6 @@
 """Роль gateway по договору Role (Д3а): настройки и база без падения core, lifespan не бросает, первый такт
 уборщика фоном, health() без ввода-вывода, /health/gateway — только числа, охрана выхода знает sp-ctl и места."""
+import asyncio
 import json
 import os
 import sqlite3
@@ -8,17 +9,18 @@ import sys
 import time
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from fake_places import FakeDocker, FakePlaces
-from helpers import (BDRV_CFG, CORE_DIR, LLM_ENV, LLM_SETTINGS, SETTINGS, gateway_role, login, make_app, make_gateway,
-                     wait_until)
+from helpers import (BDRV_CFG, CORE_DIR, LLM_ENV, LLM_SETTINGS, LLM_TOKEN, SETTINGS, TOKEN, chat_body, gateway_role,
+                     login, make_app, make_gateway, make_llm_role, wait_until, wait_until_async)
 from pcbk_core.app import create_app
 from pcbk_core.gateway import places
 from pcbk_core.gateway.accounts import AccountStore, StoreError
-from pcbk_core.main import PLACE_PORT, PLACES, build_roles, egress_targets
-from pcbk_core.settings import GatewaySettings, Settings
+from pcbk_core.main import PLACE_PORT, PLACES, build_roles, egress_targets, gateway_settings
+from pcbk_core.settings import GW_ERROR_CHARS, GatewaySettings, Settings
 
 BASE = "https://stand.test:8443"
 
@@ -103,16 +105,32 @@ def test_reaper_probe_keeps_row_red(tmp_path):                                  
     with TestClient(app, base_url=BASE) as c:
         db.chmod(0o444); tmp_path.chmod(0o555)                                         # том только для чтения
         try:
-            assert login(c, "stu-03").status_code == 503                               # вход пишет — сбой
-            wait_until(lambda: role.store.probe_failures >= 3, timeout=3)              # такт за тактом — красное
+            r = login(c, "stu-03")
+            assert r.status_code == 503, (r.status_code, store_state(role))            # вход пишет — сбой
+            wait_store(role, lambda s: s.probe_failures >= 3)                          # такт за тактом — красное
             assert c.get("/healthz/gateway").json() == {"ok": False, "detail": "учётные записи недоступны"}
             assert c.get("/health/gateway").json()["store_ok"] is False
         finally:
             tmp_path.chmod(0o755); db.chmod(0o644)
-        wait_until(lambda: role.store.probe_failures == 0, timeout=3)
-        assert c.get("/healthz/gateway").json()["ok"] is False                        # проба ок, сбой входа не снят
+        wait_store(role, lambda s: s.probe_failures == 0)
+        assert c.get("/healthz/gateway").json()["ok"] is False, store_state(role)     # проба ок, сбой входа не снят
         assert login(c, "stu-03").status_code == 200
         assert c.get("/healthz/gateway").json() == {"ok": True, "detail": "принимает вход"}
+
+
+def store_state(role) -> str:
+    s = role.store
+    return f"probe_failures={s.probe_failures} op_failures={s.op_failures} last_error={s.last_error} ticks=" \
+           f"{role.workplaces.ticks}"
+
+
+def wait_store(role, pred, timeout: float = 10) -> None:
+    """Ждёт состояния хранилища (такты уборщика — фоном, под нагрузкой машины медленнее); не дождался —
+    AssertionError с состоянием хранилища в тексте (ревью B, M4)."""
+    try:
+        wait_until(lambda: pred(role.store), timeout=timeout)
+    except AssertionError:
+        raise AssertionError(f"хранилище не пришло в состояние за {timeout} с: {store_state(role)}") from None
 
 
 def test_health_does_no_io(tmp_path, monkeypatch):                                     # договор Role
@@ -172,3 +190,98 @@ def test_admin_command_has_no_runpy_warning(tmp_path):
     p = subprocess.run([sys.executable, "-m", "pcbk_core.gateway.accounts", "list"], cwd=CORE_DIR,
                        env={**os.environ, "DB_PATH": str(tmp_path / "core.db")}, capture_output=True, text=True)
     assert p.returncode == 0 and p.stderr == "", p.stderr[-300:]
+
+
+# --- доводка, раунд 1 (task-А4-fix1.md) ---
+
+def test_stu_net_survives_other_gw_errors(tmp_path, fake_or):                         # F2 (оба ревью, I2)
+    """Опечатка в GW_ORIGIN не сбрасывает STU_NET: служба данных и LLM-прокси принимают токен места 01 из его
+    сети 10.50.1.3; роль шлюза — с config_error."""
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    env = {**LLM_ENV, "STU_NET": "10.50", "GW_ORIGIN": "https://x/path", "SP_CTL_URL": "http://127.0.0.1:9"}
+    gw = {r.name: r for r in build_roles(settings, env)}["gateway"]
+    assert gw.config_error.startswith("настройки шлюза: GW_ORIGIN") and gw.gw.STU_NET == "10.50"
+    assert gw.gw.SP_CTL_URL == "http://127.0.0.1:9"
+    assert gateway_settings(env)[0] == gw.gw                                          # то же берёт serve()
+    (tmp_path / "data").mkdir()
+    app, data = make_app(tmp_path / "data", extra_roles=[make_llm_role(tmp_path / "llm", fake_or), gw])
+
+    async def calls():
+        async with app.router.lifespan_context(app):
+            await wait_until_async(lambda: data.catalog.loaded)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=("10.50.1.3", 40000)),
+                                         base_url="http://testserver") as c:
+                tag = await c.post("/api/data/tag_now", json={"tags": ["20FAKE_001_PV"]},
+                                   headers={"Authorization": f"Bearer {TOKEN}"})
+                llm = await c.post("/llm/v1/chat/completions", json=chat_body(),
+                                   headers={"Authorization": f"Bearer {LLM_TOKEN}"})
+        return tag.status_code, llm.status_code
+    tag, llm = asyncio.run(calls())
+    assert tag == 200 and llm != 401
+
+
+def test_gateway_settings_fallback_keeps_valid_fields():                               # F2
+    env = {"STU_NET": "10.50", "SP_CTL_URL": "http://sp:2376", "GW_IDLE_STOP_S": "600", "GW_REAPER_TICK_S": "400",
+           "GW_ORIGIN": "https://x/path", "DRILL_GATEWAY": "freeze_reaper"}
+    gw = GatewaySettings.valid_from_env(env)
+    assert (gw.STU_NET, gw.SP_CTL_URL, gw.GW_IDLE_STOP_S, gw.DRILL_GATEWAY) == ("10.50", "http://sp:2376", 600.0,
+                                                                               "freeze_reaper")
+    assert (gw.GW_ORIGIN, gw.GW_REAPER_TICK_S) == ("", 30.0)                          # не прошедшие — умолчания
+    assert GatewaySettings.valid_from_env({"STU_NET": "300.1"}).STU_NET == "172.31"    # неверный STU_NET — умолчание
+    assert gateway_settings({"STU_NET": "300.1"})[1].startswith("STU_NET")
+
+
+@pytest.mark.parametrize("broken", ["store.open", "workplaces.spctl.open"])
+def test_lifespan_exception_becomes_config_error(tmp_path, gwlog, broken):            # F3 (ревью B, I3)
+    gw = gateway_role(tmp_path / "gw")
+    owner, name = broken.rsplit(".", 1)
+    target = gw.store if owner == "store" else gw.workplaces.spctl
+
+    def boom(*a, **k):
+        raise RuntimeError("сбой запуска")
+    setattr(target, name, boom)
+    (tmp_path / "data").mkdir()
+    app, _ = make_app(tmp_path / "data", extra_roles=[gw])                             # рядом служба данных Д3б
+    with TestClient(app, base_url=BASE) as c:                                          # lifespan не бросил
+        assert c.get("/healthz/live").status_code == 200
+        assert c.get("/healthz/data").status_code == 200
+        assert gw.config_error == "запуск шлюза: RuntimeError"
+        assert c.get("/healthz/gateway").json()["detail"] == "ошибка настройки: запуск шлюза: RuntimeError"
+        assert gw.workplaces.ticks == 0                                                 # уборщика нет
+    assert "шлюз: ошибка настройки: запуск шлюза: RuntimeError" in gwlog.text
+    assert "сбой запуска" not in gwlog.text                                            # только класс
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root пишет и в каталог 0500")
+def test_settings_errors_short_and_db_part_kept(tmp_path):                            # F10 (ревью B, M2)
+    bad = ({"GW_ORIGIN": "http://x"}, {"GW_IDLE_STOP_S": "59"}, {"GW_IDLE_STOP_S": "x"}, {"GW_REAPER_TICK_S": "0"},
+           {"GW_REAPER_TICK_S": "1000"}, {"GW_WAKE_TIMEOUT_S": "inf"}, {"GW_SESSION_TTL_S": "1"},
+           {"SP_CTL_URL": "ftp://x"}, {"SP_CTL_URL": "http://x:99999"}, {"STU_NET": "1.2.3"},
+           {"DRILL_GATEWAY": "x"})
+    for env in bad:
+        with pytest.raises(ValueError) as e:
+            GatewaySettings.from_env(env)
+        assert len(str(e.value)) <= GW_ERROR_CHARS, str(e.value)
+    ro = tmp_path / "ro"
+    ro.mkdir(mode=0o500)
+    long_error = "настройки шлюза: GW_REAPER_TICK_S: не больше GW_IDLE_STOP_S / 2"
+    gw = gateway_role(tmp_path / "gw", db_path=ro / "sub" / "core.db", accounts=False, config_error=long_error)
+    try:
+        with TestClient(create_app(SETTINGS, [gw])):
+            pass
+    finally:
+        ro.chmod(0o700)
+    db_part = "учётные записи не открываются: OperationalError"
+    assert len(gw.config_error) <= 80 and gw.config_error.endswith("; " + db_part), gw.config_error
+    kept = gw.config_error[:-len("; " + db_part)]
+    assert kept.endswith("…") and long_error.startswith(kept[:-1])                    # сокращена первая часть
+    assert long_error[len(kept) - 1] in " :;,"                                          # по границе слова
+
+
+def test_gw_origin_port_rules():                                                         # F11 (ревью B, M3)
+    for bad in ("https://stand.example:443", "https://stand.example:08443", "https://stand.example:0",
+                "https://stand.example:65536", "http://stand.example:80"):
+        with pytest.raises(ValueError, match="GW_ORIGIN"):
+            GatewaySettings.from_env({"GW_ORIGIN": bad})
+    for good in ("https://stand.example", "https://stand.example:8443", "https://127.0.0.1:28443"):
+        assert GatewaySettings.from_env({"GW_ORIGIN": good}).GW_ORIGIN == good
