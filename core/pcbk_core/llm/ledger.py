@@ -12,11 +12,16 @@ cost_est, поставленная при открытии вызова (Д4а-R
 pcbk-ledger-writer, соединение на операцию со сроком WRITE_TIMEOUT_S. Порядок операций одной
 строки держится, цикл событий SQLite не касается никогда (F9), а бюджет держится и при сбое
 диска, пока жив процесс. Сбой записи — счётчик и last_error, а не ожидание и не исключение
-вызывающему. Неудавшаяся операция не выбрасывается (ревью I1): писатель повторяет её во
-главе очереди через retry_pause_s, пока она не пройдёт или не придёт остановка; очередь за
-ней ждёт, consecutive_failures растёт. Поэтому каждая операция повторяема — INSERT OR REPLACE
-строки целиком по id из памяти. Файл создаёт только open(); писатель, writable() и recent()
-открывают его с mode=rw и пустую базу вместо пропавшей не заводят.
+вызывающему. Операция, упавшая с sqlite3.OperationalError (блокировка, ввод-вывод, диск
+полон, файл не открыть), не выбрасывается (ревью I1): писатель повторяет её во главе очереди
+через retry_pause_s, пока она не пройдёт или не придёт остановка; очередь за ней ждёт,
+consecutive_failures растёт. Поэтому каждая операция повторяема — INSERT OR REPLACE строки
+целиком по id из памяти. Любое другое исключение — операция «отравлена» и от повтора не
+пройдёт: она бросается сразу (ERROR с классом, writes_dropped_total), очередь идёт дальше
+(ревью N1). Отравить её и нечем: CallRow чистит значения на входе — строки без одиночных
+суррогатов, целые в [0, 2**63 − 1], деньги по правилу _money. Файл создаёт только open();
+писатель, writable() и recent() открывают его с mode=rw и пустую базу вместо пропавшей не
+заводят.
 
 Конструктор без ввода-вывода (F4). open() — в начале lifespan через asyncio.to_thread:
 файл, WAL, таблицы, память с нуля по файлу, поток-писатель. Суммы по вызывающим — за всё
@@ -42,13 +47,14 @@ WRITE_TIMEOUT_S = 0.5          # ожидание блокировки у зап
 SQLITE_TIMEOUT_S = 5.0         # ожидание блокировки у open, writable/check и чтения
 ERROR_CHARS = 200              # last_error: класс и начало текста
 PENDING_STUCK_S = 900          # дозапрос цены идёт около 9 минут; старше 15 минут — не идёт
-WRITE_RETRY_S = 1.0            # пауза писателя перед повтором неудавшейся записи (ревью I1)
+WRITE_RETRY_S = 0.25           # пауза писателя перед повтором записи (ревью I1): flush() задачи 6 не ждёт долго
+INT_MAX = 2**63 - 1            # предел INTEGER SQLite
 COUNTERS_WINDOW = timedelta(hours=24)
 WRITER_NAME = "pcbk-ledger-writer"
 OPS = "ops"
 
 Refusal = Literal["budget_spent", "share_spent"]
-STATUSES = ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lost")
+STATUSES = ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lost", "unknown")
 CLOSED_STATUSES = tuple(s for s in STATUSES if s != "open")   # закрытая строка open быть не может
 COST_SOURCES = ("stream", "body", "generation", "pending", "unknown", "none")
 PRICED = ("stream", "body", "generation")   # цена пришла
@@ -70,8 +76,22 @@ def _money(value: object) -> float | None:
 
 
 def _count(value: object) -> int:
-    """Неотрицательное целое (не bool); иначе 0 — поля нет."""
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+    """Неотрицательное целое (не bool), не больше INT_MAX; иначе 0 — поля нет."""
+    return min(value, INT_MAX) if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _int(value: object) -> int:
+    """Целое для столбца INTEGER: в [0, INT_MAX]; конечный float — целая часть; иначе 0."""
+    if isinstance(value, float):
+        value = int(value) if math.isfinite(value) else 0
+    if not isinstance(value, int):
+        return 0
+    return min(max(int(value), 0), INT_MAX)
+
+
+def _text(value: object) -> str:
+    """Строка, которую закодирует UTF-8: одиночный суррогат (id и провайдер из SSE) → «?»."""
+    return str(value).encode("utf-8", "replace").decode("utf-8")
 
 
 def _aware(moment: datetime) -> datetime:
@@ -133,6 +153,25 @@ class CallRow:
     cache_write_tokens: int
     reasoning_tokens: int
     duration_ms: int
+
+    def __post_init__(self) -> None:
+        """Чистка на входе (ревью N1): строка, которую писатель не запишет, встала бы в очереди."""
+        put = object.__setattr__
+        put(self, "ts", _aware(self.ts))
+        for name in ("caller", "model", "status", "code", "cost_source"):
+            put(self, name, _text(getattr(self, name)))
+        for name in ("session", "provider", "generation_id"):
+            value = getattr(self, name)
+            put(self, name, None if value is None else _text(value))
+        for name in ("id", "step", "http_status", "prompt_tokens", "completion_tokens", "cached_tokens",
+                     "cache_write_tokens", "reasoning_tokens", "duration_ms"):
+            put(self, name, _int(getattr(self, name)))
+        put(self, "provider_ok", None if self.provider_ok is None else bool(self.provider_ok))
+        put(self, "cost", _money(self.cost))
+        estimate = _money(self.cost_est)
+        if estimate is None:
+            raise ValueError("cost_est — конечное неотрицательное число")
+        put(self, "cost_est", estimate)
 
 
 def _at_estimate(row: CallRow) -> bool:
@@ -197,6 +236,7 @@ _PROBE = ("INSERT INTO llm_calls (ts, caller, model, step, status, code, http_st
 _TABLE_EXISTS = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'llm_calls'"
 
 _SQL, _MARK, _STOP = "sql", "mark", "stop"
+_WRITTEN, _RETRY, _DROPPED = "written", "retry", "dropped"
 
 
 def _values(row: CallRow) -> tuple:
@@ -390,9 +430,10 @@ class Ledger:
             return True
 
     def _drain(self, q: queue.SimpleQueue, stop: threading.Event) -> None:
-        """Поток-писатель: операции по порядку. Неудавшаяся повторяется во главе очереди через
-        retry_pause_s, пока не пройдёт; остановка прерывает паузу — последняя попытка, и операция
-        брошена. Сбой считается и не убивает поток."""
+        """Поток-писатель: операции по порядку. Упавшая с OperationalError повторяется во главе
+        очереди через retry_pause_s, пока не пройдёт; остановка прерывает паузу — последняя
+        попытка, и операция брошена. Другое исключение — операция брошена сразу. Сбой считается
+        и не убивает поток."""
         while True:
             item = q.get()
             if item[0] == _STOP:
@@ -401,38 +442,44 @@ class Ledger:
                 item[1].set()
                 continue
             _, sql, params = item
-            done = self._write(sql, params)
-            while not done and not stop.is_set():
+            outcome = self._write(sql, params)
+            while outcome == _RETRY and not stop.is_set():
                 stop.wait(self.retry_pause_s)
-                done = self._write(sql, params)
+                outcome = self._write(sql, params)
             with self._state_lock:
                 self._backlog -= 1
-                if not done:
+                if outcome != _WRITTEN:
                     self.writes_dropped_total += 1
-            if not done:
+            if outcome == _RETRY:
                 log.warning("журнал вызовов: при остановке запись брошена — %s", self.last_error)
 
-    def _write(self, sql: str, params: tuple) -> bool:
+    def _write(self, sql: str, params: tuple) -> str:
+        """Одна попытка: _WRITTEN, _RETRY (OperationalError — повторить) или _DROPPED (другое)."""
         try:
             db = self._connect()
             try:
                 db.execute(sql, params)
             finally:
                 db.close()
+        except sqlite3.OperationalError as exc:
+            self._write_failed(_why(exc))
+            return _RETRY
         except Exception as exc:
-            self._write_failed(exc)
-            return False
+            # текст исключения может нести значение строки — в журнал и last_error только класс
+            self._write_failed(type(exc).__name__, retry=False)
+            return _DROPPED
         self._write_ok()
-        return True
+        return _WRITTEN
 
-    def _write_failed(self, exc: Exception) -> None:
+    def _write_failed(self, why: str, retry: bool = True) -> None:
         with self._state_lock:
             first = self.consecutive_failures == 0
             self.consecutive_failures += 1
             self.write_failures_total += 1
-            self.last_error = _why(exc)
-            why = self.last_error
-        if first:
+            self.last_error = why
+        if not retry:
+            log.error("журнал вызовов: операция не записывается и брошена — %s", why)
+        elif first:
             log.warning("журнал вызовов: запись не удалась, писатель повторяет — %s", why)
 
     def _write_ok(self) -> None:
@@ -612,9 +659,10 @@ class Ledger:
             self._put(_REPLACE, _values(resolved))
 
     def meta_set(self, key: str, value: float) -> None:
+        key, value = _text(key), float(value)
         with self._lock:
-            self._mem.meta[key] = float(value)
-            self._put(_META_SET, (key, float(value)))
+            self._mem.meta[key] = value
+            self._put(_META_SET, (key, value))
 
     # --- чтение: только память, без ввода-вывода ---
 

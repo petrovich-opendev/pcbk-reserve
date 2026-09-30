@@ -1,4 +1,5 @@
 """Журнал вызовов LLM: память синхронно, SQLite — один поток-писатель; вызов без цены — по верхней оценке."""
+import logging
 import sqlite3
 import threading
 import time
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from helpers import wait_until
-from pcbk_core.llm.ledger import WRITE_TIMEOUT_S, Budget, Ledger, Usage
+from pcbk_core.llm.ledger import STATUSES, WRITE_RETRY_S, WRITE_TIMEOUT_S, Budget, Ledger, Usage
 
 
 def lg(path):                                        # журнал, открытый как в lifespan
@@ -194,7 +195,8 @@ def test_names_and_values_match_event_log():                                    
     from pcbk_core.llm import ledger
     assert (ledger.WRITE_TIMEOUT_S, ledger.SQLITE_TIMEOUT_S, ledger.ERROR_CHARS) == \
            (events.WRITE_TIMEOUT_S, events.SQLITE_TIMEOUT_S, events.ERROR_CHARS) == (0.5, 5.0, 200)
-    assert (ledger.LEDGER_CHECK_S, ledger.PENDING_STUCK_S) == (30.0, 900)
+    assert (ledger.LEDGER_CHECK_S, ledger.PENDING_STUCK_S, WRITE_RETRY_S) == (30.0, 900, 0.25)
+    assert STATUSES == ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lost", "unknown")  # N3
 
 
 def test_table_has_exactly_the_brief_columns(tmp_path):
@@ -510,3 +512,82 @@ def test_open_joins_previous_writer(tmp_path, monkeypatch):                     
     assert led.open() is True                                                   # сначала дождался прежнего
     assert led.spent() == pytest.approx(0.5) and led.recent(1)[0].status == "lost"
     assert sum(t.name == "pcbk-ledger-writer" and t.is_alive() for t in threading.enumerate()) >= 1
+
+
+# --- доводка по ревью, раунд 2 ---
+
+INT_MAX = 2**63 - 1
+
+
+def test_poisoned_values_land_sanitized_and_queue_moves(tmp_path):              # N1: ни одна строка не встаёт
+    led = lg(str(tmp_path / "core.db"))
+    assert Usage.from_openrouter({"prompt_tokens": 10**20}).prompt_tokens == INT_MAX
+    cid = led.open_call(ts=T, caller="student-01", session="ses_\udfff", model="m\ud800", step=10**20,
+                        estimate=0.5)
+    led.close_call(cid, status="ok", code="", http_status=200, provider="Fire\ud800works", provider_ok=True,
+                   generation_id="gen-\ud800", usage=replace(U, prompt_tokens=10**20, reasoning_tokens=-5),
+                   cost_source="stream", duration_ms=10**30)
+    nxt = opened(led, caller="student-02")
+    t = time.monotonic()
+    led.flush(timeout=2.0)
+    assert time.monotonic() - t < 1.0                                           # очередь не встала
+    assert (led.write_failures_total, led.writes_dropped_total, led.queue_size) == (0, 0, 0)
+    rows = led.recent()
+    assert [r.id for r in rows] == [nxt, cid]
+    row = rows[1]
+    assert (row.session, row.model, row.provider, row.generation_id) == ("ses_?", "m?", "Fire?works", "gen-?")
+    assert (row.step, row.prompt_tokens, row.reasoning_tokens, row.duration_ms) == (INT_MAX, INT_MAX, 0, INT_MAX)
+    assert led.spent("student-01") == pytest.approx(0.0123) and row.cost == pytest.approx(0.0123)
+
+
+def test_non_operational_error_drops_the_op_and_moves_on(tmp_path, monkeypatch):  # N1: повтор — только OperationalError
+    led = lg(str(tmp_path / "core.db"))
+    led.retry_pause_s = 0.01
+    real, fired, records = led._connect, [], []
+
+    class Poison:
+        def __init__(self, db):
+            self.db = db
+        def execute(self, sql, params=()):
+            if sql.startswith("INSERT") and not fired:
+                fired.append(1)
+                raise OverflowError("Python int too large to convert to SQLite INTEGER ses_SECRET")
+            return self.db.execute(sql, params)
+        def close(self):
+            self.db.close()
+
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("pcbk_core.llm.ledger")
+    logger.addHandler(handler)
+    try:
+        monkeypatch.setattr(led, "_connect", lambda *a: Poison(real(*a)))
+        a = opened(led)
+        b = opened(led, caller="student-02")
+        t = time.monotonic()
+        led.flush(timeout=2.0)
+        assert time.monotonic() - t < 1.0                                       # брошена сразу, без повторов
+    finally:
+        logger.removeHandler(handler)
+    assert (led.writes_dropped_total, led.write_failures_total, led.consecutive_failures) == (1, 1, 0)
+    assert [r.id for r in led.recent()] == [b] and a < b and led.spent() == pytest.approx(1.0)
+    assert led.last_error == "OverflowError"                                    # только класс
+    errors = [r for r in records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "OverflowError" in errors[0].getMessage()
+    assert not any("SECRET" in r.getMessage() for r in records)
+
+
+def test_flush_returns_once_a_transient_lock_is_gone(tmp_path):                  # к задаче 6: flush перед отправкой
+    p = tmp_path / "core.db"
+    led = lg(str(p))
+    holder = sqlite3.connect(p, isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    release = threading.Timer(0.7, lambda: (holder.execute("ROLLBACK"), holder.close()))
+    release.start()
+    t = time.monotonic()
+    opened(led)
+    led.flush(timeout=3.0)                                                      # не ждёт весь срок
+    assert time.monotonic() - t < 0.7 + WRITE_TIMEOUT_S + WRITE_RETRY_S + 0.3
+    release.join()
+    assert led.write_failures_total >= 1 and led.consecutive_failures == 0
+    assert led.recent(1)[0].status == "open"
