@@ -34,7 +34,8 @@ MCP_NOT_DOWN = frozenset({"connected", "unknown", "disabled"})
 MCP_DOWN_DETAIL = "нет связи со службой данных (MCP)"
 # столько записей Health.Log хранит Docker; все с mcp=unknown и старейшая кончилась раньше
 # MCP_UNKNOWN_S назад — «внимание». На старте (start-interval 2 с, ленивый подъём MCP под gVisor)
-# пять unknown набираются за 10 с — это норма (К30)
+# пять unknown набираются за 10 с — это норма (К30). Записи прошлого запуска (End раньше StartedAt)
+# строки MCP не считают: Docker хранит журнал и через сон места
 HEALTH_LOG_KEEP = 5
 MCP_UNKNOWN_S = 120
 MCP_UNKNOWN_DETAIL = "состояние MCP не читается"
@@ -131,8 +132,12 @@ def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Ch
 
 
 def check_container(component: str, title: str, inspect: dict | None, *,
-                    sleeping_ok: bool, now: datetime) -> Check:
-    """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1, задачи 2 Д2 и задачи 3 Д4б."""
+                    sleeping_ok: bool, now: datetime, unhealthy_detail: str = UNHEALTHY_DETAIL) -> Check:
+    """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1, задачи 2 Д2 и задачи 3 Д4б.
+
+    unhealthy_detail — текст строки при Health.Status unhealthy: по умолчанию — про OpenCode места,
+    у контейнеров с другой проверкой здоровья (core) — свой из components.json.
+    """
     def result(state: State, detail: str) -> Check:
         return Check(component, title, state, detail)
 
@@ -157,9 +162,9 @@ def check_container(component: str, title: str, inspect: dict | None, *,
             if now - max([started, *ends]) > HEALTH_SILENCE:
                 return result("fail", HEALTH_SILENT_DETAIL)
             if health.get("Status") == "unhealthy":
-                return result("fail", UNHEALTHY_DETAIL)
+                return result("fail", unhealthy_detail)
             if health.get("Status") == "healthy":
-                mcp = _mcp_detail(health.get("Log") or [], now)
+                mcp = _mcp_detail(health.get("Log") or [], started, now)
                 if mcp is not None:
                     return result("warn", mcp)
         if restarts > 0 and recent:
@@ -187,18 +192,21 @@ def _mcp_word(entry: dict) -> str | None:
     return found.group(1) if found else None
 
 
-def _mcp_detail(log: list[dict], now: datetime) -> str | None:
+def _mcp_detail(log: list[dict], started: datetime, now: datetime) -> str | None:
     """Строки MCP места (Д4б) по Health.Log, где Docker пишет новые записи последними.
 
-    Решает слово mcp= последней записи; вывода без слова (образ :d2) строки не касаются.
+    Считаются только записи этого запуска (End не раньше StartedAt): журнал прошлого запуска не даёт
+    «внимания» сразу после пробуждения. Решает слово mcp= последней из них; вывода без слова
+    (образ :d2) строки не касаются.
     """
-    words = [_mcp_word(e) for e in log[-HEALTH_LOG_KEEP:]]
+    run = [e for e in log if datetime.fromisoformat(e["End"]) >= started][-HEALTH_LOG_KEEP:]
+    words = [_mcp_word(e) for e in run]
     if not words or words[-1] is None:
         return None
     if words[-1] not in MCP_NOT_DOWN:
         return MCP_DOWN_DETAIL
     if (len(words) == HEALTH_LOG_KEEP and set(words) == {"unknown"}
-            and now - datetime.fromisoformat(log[-HEALTH_LOG_KEEP]["End"]) > timedelta(seconds=MCP_UNKNOWN_S)):
+            and now - datetime.fromisoformat(run[0]["End"]) > timedelta(seconds=MCP_UNKNOWN_S)):
         return MCP_UNKNOWN_DETAIL
     return None
 

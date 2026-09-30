@@ -15,9 +15,9 @@ SUBNETS = {"pcbk-public": "172.31.250.16/28", "pcbk-front": "172.31.250.32/28",
 def test_sp_ro_serves_watchdog_reads_only(stack):
     assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-sp-ctl/json") == 200
     assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-student-01/json") in PASSED
-    assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-core/json") in PASSED   # строка core-container, Д4б
+    assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-core/json") == 200     # строка core-container, Д4б
     for path in ("/containers/pcbk-test-foreign/json", "/containers/pcbk-watchdog/json",
-                 "/containers/pcbk-sp-ctl/logs", "/containers/json", "/events"):
+                 "/containers/pcbk-sp-ctl/logs", "/containers/pcbk-core/logs", "/containers/json", "/events"):
         assert stack.http_from_watchdog("GET", RO + path) == 403
     assert stack.http_from_watchdog("POST", RO + "/containers/pcbk-student-01/start") == 405
 

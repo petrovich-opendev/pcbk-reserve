@@ -8,7 +8,7 @@ from datetime import timedelta
 import pytest
 
 import pcbk_watchdog.main
-from helpers import (CHROME, SETTINGS, T0, chrome_dom, http_get, http_status, llm_obj, now_utc,
+from helpers import (CHROME, SETTINGS, T0, chrome_dom, http_get, http_status, insp, llm_obj, now_utc,
                      start_test_server)
 from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
@@ -267,6 +267,23 @@ def test_components_file_d4b():
     cc = comps[ids.index("core-container")]
     assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
            ("container", "pcbk-core", False, "Серверный слой — контейнер")
+    # ревью задачи 3, I1: свой текст unhealthy только у core-container, у мест — текст Д2 по умолчанию
+    assert cc["unhealthy_detail"] == "процесс core не отвечает на проверку здоровья"
+    assert len(cc["unhealthy_detail"]) <= 80
+    assert [c["id"] for c in comps if "unhealthy_detail" in c] == ["core-container"]
+
+
+def test_run_checks_passes_unhealthy_detail():                                  # ревью задачи 3, I1
+    class Docker:
+        def inspect(self, name):
+            return insp(running=True, health="unhealthy")
+    comps = [{"id": "core-container", "title": "Серверный слой — контейнер", "kind": "container",
+              "container": "pcbk-core", "sleeping_ok": False, "unhealthy_detail": "процесс core не отвечает"},
+             {"id": "student-01", "title": "Рабочее место 01", "kind": "container",
+              "container": "pcbk-student-01", "sleeping_ok": True}]
+    checks = run_checks(comps, Docker(), SETTINGS, T0)
+    assert [(c.component, c.state, c.detail) for c in checks] == [
+        ("core-container", "fail", "процесс core не отвечает"), ("student-01", "fail", "OpenCode не отвечает")]
 
 
 def test_absent_kind_stays_for_synthetic_sets():   # П17: вида absent нет в components.json, но он есть
@@ -318,7 +335,15 @@ def test_load_components_rejects_bad_config(tmp_path):
                 [{"id": "a", "title": "A", "kind": "llm"}],                            # нет url
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": ""}],
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": 1}],
-                [{"id": "a", "title": "A", "kind": "historian", "url": "http://x/", "ok_detail": "жив"}]):
+                [{"id": "a", "title": "A", "kind": "historian", "url": "http://x/", "ok_detail": "жив"}],
+                # ревью задачи 3, I1: unhealthy_detail — непустая строка до 80 знаков и только у вида container
+                [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "unhealthy_detail": "не отвечает"}],
+                [{"id": "a", "title": "A", "kind": "container", "container": "pcbk-core", "sleeping_ok": False,
+                  "unhealthy_detail": " "}],
+                [{"id": "a", "title": "A", "kind": "container", "container": "pcbk-core", "sleeping_ok": False,
+                  "unhealthy_detail": 1}],
+                [{"id": "a", "title": "A", "kind": "container", "container": "pcbk-core", "sleeping_ok": False,
+                  "unhealthy_detail": "ж" * 81}]):
         path = tmp_path / "c.json"
         path.write_text(json.dumps(bad))
         with pytest.raises(ValueError):

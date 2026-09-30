@@ -176,6 +176,29 @@ def test_mcp_details_constant_and_short(tmp_path):
     assert sum(len(journal.record([r], T0 + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 2
 
 
+# доводка по ревью задачи 3
+
+def test_unhealthy_detail_per_component():                                     # I1
+    core = check_container("core-container", "Серверный слой — контейнер", insp(running=True, health="unhealthy"),
+                           sleeping_ok=False, now=T0, unhealthy_detail="процесс core не отвечает на проверку здоровья")
+    assert (core.state, core.detail) == ("fail", "процесс core не отвечает на проверку здоровья")
+    assert stu(insp(running=True, health="unhealthy")).detail == "OpenCode не отвечает"      # по умолчанию — текст Д2
+
+
+def test_mcp_rows_ignore_log_of_previous_run():                                 # M1: журнал прошлого запуска
+    woke = T0 - timedelta(seconds=8)
+    unknown = stu(insp(running=True, health="healthy", started=woke, last_end=T0 - timedelta(seconds=2),
+                       log=["200 mcp=unknown\n"] * 5))            # четыре старые (до T0 − 122 с) и одна новая
+    failed = stu(insp(running=True, health="healthy", started=woke, last_end=T0 - timedelta(seconds=60),
+                      log=["200 mcp=failed\n"]))                   # новых записей ещё нет
+    assert [(c.state, c.detail) for c in (unknown, failed)] == [("ok", "работает")] * 2
+    mixed = stu(insp(running=True, health="healthy", started=woke, last_end=T0 - timedelta(seconds=2),
+                     log=["200 mcp=failed\n", "200 mcp=connected\n"]))   # старая failed, новая connected
+    assert mixed.detail == "работает"
+    at_start = stu(insp(running=True, health="healthy", started=woke, last_end=woke, log=["200 mcp=failed\n"]))
+    assert at_start.detail == "нет связи со службой данных (MCP)"          # End ровно в момент старта — этот запуск
+
+
 def test_paused_is_fail():
     r = check_container("sp-ctl", "Прокси сокета серверного слоя", insp(running=True, paused=True),
                         sleeping_ok=False, now=T0)
