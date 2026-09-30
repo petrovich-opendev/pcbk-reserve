@@ -44,13 +44,28 @@ def test_mcp_unknown_only_while_starting(stack, place01):                       
                                      if c["component"] == "student-01") == ("ok", "работает"), timeout=60)
 
 
+def ip_in(stack, name: str, network: str) -> str:
+    """Адрес контейнера в сети — из inspect: адреса в pcbk-ctl и pcbk-front динамические."""
+    return stack.inspect(name)["NetworkSettings"]["Networks"][network]["IPAddress"]
+
+
 def test_place_reaches_only_core(stack, place01):                              # Review Focus 3
     stu = stack.stu_net
     assert stack.probe("pcbk-stu-01", f"{stu}.1.2", 8000) == 1                   # положительный контроль
     assert stack.probe("pcbk-stu-02", f"{stu}.2.2", 8000) == 1                   # .2.2 жив — ноль ниже не пустой
     assert stack.probe("pcbk-egress", "172.31.250.82", 8000) == 1               # core в сети выхода жив
     assert stack.probe("pcbk-egress", "172.31.250.84", 8080) == 1               # двойник OpenRouter жив
-    for addr, port in ((f"{stu}.2.2", 8000), ("172.31.250.82", 8000), ("172.31.250.84", 8080)):
+    # Д5а (Ш21): прокси сокета и core в pcbk-ctl, core и edge в pcbk-front. Зона front открывает ручки шлюза
+    # всему, что пришло на адрес core в pcbk-front, и держится на том, что у места туда нет маршрута. У каждого
+    # нуля — положительный контроль тем же адресом и портом из своей сети
+    inner = [(ip_in(stack, "pcbk-sp-ctl", "pcbk-ctl"), 2375, "pcbk-ctl"),
+             (ip_in(stack, "pcbk-core", "pcbk-ctl"), 8000, "pcbk-ctl"),
+             (ip_in(stack, "pcbk-core", "pcbk-front"), 8000, "pcbk-front"),
+             (ip_in(stack, "pcbk-edge", "pcbk-front"), 8443, "pcbk-front")]
+    for addr, port, net in inner:
+        assert stack.probe(net, addr, port) == 1, (net, addr, port)              # адрес жив из своей сети
+    for addr, port in ((f"{stu}.2.2", 8000), ("172.31.250.82", 8000), ("172.31.250.84", 8080),
+                       *((a, p) for a, p, _ in inner)):
         assert stack.probe("pcbk-stu-01", addr, port) == 0, addr                 # держит отсутствие маршрута
     assert stack.inspect("pcbk-core")["HostConfig"]["Sysctls"]["net.ipv4.ip_forward"] == "0"   # второй слой
 

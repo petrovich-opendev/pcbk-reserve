@@ -30,16 +30,16 @@ def test_sp_ro_refuses_other_clients(stack):
 
 @pytest.mark.parametrize("name", ["pcbk-student-00", "pcbk-student-11", "pcbk-student-1"])
 def test_student_range_boundaries(stack, name):
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + f"/containers/{name}/start") == 403
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + f"/containers/{name}/json") == 403
+    assert stack.http_from_core("POST", CTL + f"/containers/{name}/start") == 403
+    assert stack.http_from_core("GET", CTL + f"/containers/{name}/json") == 403
     assert stack.http_from_watchdog("GET", RO + f"/containers/{name}/json") == 403
 
 
 def test_student_range_upper_bound_passes(stack):
     # положительный контроль границы: 10 — последнее место, прокси пропускает
     try:
-        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + "/containers/pcbk-student-10/start") in PASSED
-        assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/pcbk-student-10/json") in PASSED
+        assert stack.http_from_core("POST", CTL + "/containers/pcbk-student-10/start") in PASSED
+        assert stack.http_from_core("GET", CTL + "/containers/pcbk-student-10/json") in PASSED
         assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-student-10/json") in PASSED
     finally:
         stack.stop("pcbk-student-10")      # место есть — Docker его запускает, тест возвращает в сон
@@ -68,13 +68,12 @@ def test_socket_only_in_hardened_proxies(stack):
 def test_sp_ctl_passes_only_student_start_stop(stack):
     try:
         for verb in ("start", "stop"):
-            assert stack.http_as("pcbk-core", "pcbk-ctl", "POST",
-                                 CTL + f"/containers/pcbk-student-01/{verb}") in PASSED
+            assert stack.http_from_core("POST", CTL + f"/containers/pcbk-student-01/{verb}") in PASSED
     finally:
         stack.stop("pcbk-student-01")      # место будил тест — он и усыпляет, даже при сбое
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", CTL + "/containers/pcbk-sp-ro/stop") == 403
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/pcbk-test-foreign/json") == 403
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", CTL + "/containers/json") == 403
+    assert stack.http_from_core("POST", CTL + "/containers/pcbk-sp-ro/stop") == 403
+    assert stack.http_from_core("GET", CTL + "/containers/pcbk-test-foreign/json") == 403
+    assert stack.http_from_core("GET", CTL + "/containers/json") == 403
     assert stack.http_as("pcbk-intruder", "pcbk-ctl", "GET", CTL + "/_ping") == 403
 
 
@@ -90,7 +89,7 @@ def test_sp_ctl_passes_only_student_start_stop(stack):
     ("DELETE", "/containers/pcbk-student-01"),
 ])
 def test_sp_ctl_refuses_dangerous_calls(stack, method, path):
-    assert stack.http_as("pcbk-core", "pcbk-ctl", method, CTL + path) in (403, 405)
+    assert stack.http_from_core(method, CTL + path) in (403, 405)
 
 
 def test_container_networks_exact(stack):
@@ -113,6 +112,13 @@ def test_network_subnets_match_table(stack):
 
 
 def test_status_json_overall_ok(stack):
+    """Все строки, кроме историана, — норма, включая «Шлюз и вход».
+
+    Зависимость порядка (Ш4): модуль идёт после test_entry (Д5а) и test_gateway (Д5б) — по алфавиту. Их
+    последние тесты пересоздают или перезапускают core, и счётчики шлюза за час (в памяти core) сброшены;
+    иначе строка «Шлюз и вход» осталась бы «внимание» от их учений (отказ источника, подброшенная cookie,
+    неудачное пробуждение).
+    """
     # в тестовом стенде историана нет: его строка — не норма, итог страницы — тоже;
     # остальные строки — норма, включая LLM-прокси (Д4а, двойник OpenRouter)
     def all_ok(d):

@@ -96,9 +96,9 @@ def test_each_workplace_uses_own_objects(stack):                   # Review Focu
 def test_sp_ctl_really_starts_and_stops_student(stack):
     url = CTL + "/containers/pcbk-student-03"
     try:
-        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/start") == 204
-        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/start") == 304
-        assert stack.http_as("pcbk-core", "pcbk-ctl", "POST", url + "/stop") == 204
+        assert stack.http_from_core("POST", url + "/start") == 204
+        assert stack.http_from_core("POST", url + "/start") == 304
+        assert stack.http_from_core("POST", url + "/stop") == 204
         assert stack.inspect("pcbk-student-03")["State"]["Running"] is False
     finally:
         stack.stop("pcbk-student-03")                              # будил тест — он и усыпляет, даже при сбое

@@ -6,6 +6,7 @@
 метке, даже при сбое. Чужие контейнеры, сети и тома мест с нашими именами тест не
 трогает — отказывается запускаться.
 """
+import base64
 import hashlib
 import http.client
 import json
@@ -24,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from gwclient import GwClient
 from workplace import IMAGE as STUDENT_IMAGE
 from workplace import ONESHOT_LABEL
 
@@ -47,7 +49,9 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "DRILL_FREEZE_LOOP", "DATA_DIR", "FRESH_POLL_S", "CATALOG_DEADLINE_S",
                         "DRILL_FRESHNESS", "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
                         "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
-                        "LLM_TOTAL_USD"})
+                        "LLM_TOTAL_USD",
+                        # шлюз (Д5а): core и срок молчания уборщика у сторожа
+                        "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY", "GW_STALE_S"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
 # белый список стенда — одно синтетическое имя
@@ -121,6 +125,33 @@ if r.status != 200:
     sys.exit(f"HTTP {r.status}")
 sys.stdout.write(body.decode("utf-8"))
 """
+# запрос изнутри pcbk-core (Д5-R31: клиент sp-ctl — только настоящий core): argv — метод и адрес, путь как есть;
+# печатает код ответа. Срок 20 с — stop места ждёт stop_grace_period (10 с)
+CORE_REQUEST = """\
+import http.client, sys
+from urllib.parse import urlsplit
+u = urlsplit(sys.argv[2])
+conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=20)
+conn.request(sys.argv[1], u.path + ("?" + u.query if u.query else ""))
+print(conn.getresponse().status)
+"""
+# запрос изнутри pcbk-watchdog к core в pcbk-front мимо edge: argv — метод, путь как есть, заголовки JSON;
+# печатает код ответа
+FRONT_REQUEST = """\
+import http.client, json, sys
+conn = http.client.HTTPConnection("pcbk-core", 8000, timeout=20)
+conn.putrequest(sys.argv[1], sys.argv[2], skip_accept_encoding=True)
+for name, value in json.loads(sys.argv[3]).items():
+    conn.putheader(name, value)
+conn.endheaders()
+r = conn.getresponse()
+r.read()
+print(r.status)
+"""
+# публичный origin входа тестового стенда: имя из трёх меток, чтобы удаления cookie с Domain= шли через
+# настоящий edge (Д5-R25, Д5-R30); имя нигде не разрешается — клиент ходит на 127.0.0.1:18443 с этим Host
+STAND_HOST = "stand.pcbk.test:18443"
+STAND_ORIGIN = f"https://{STAND_HOST}"
 # D1: соединение есть, если curl -v его сообщил
 CONNECTED = re.compile(r"Established connection|Connected to")
 
@@ -137,6 +168,12 @@ def wait_for(pred: Callable[[], bool], timeout: float, step: float = 1.0) -> Non
         if time.monotonic() > deadline:
             raise AssertionError(f"за {timeout} с условие не выполнилось")
         time.sleep(step)
+
+
+def secret_forms(pw: str) -> list[str]:
+    """Виды пароля места, которых не должно быть в журналах: сырой, base64("opencode:"+пароль) и Basic."""
+    b64 = base64.b64encode(f"opencode:{pw}".encode("utf-8")).decode("ascii")
+    return [pw, b64, "Basic " + b64]
 
 
 def _run(cmd: list[str], *, timeout: float = 120, check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -396,13 +433,52 @@ class Stack:
         """GET изнутри pcbk-watchdog, как http_from_watchdog, но тело ответа; не 200 — исключение."""
         return self._docker("exec", "pcbk-watchdog", "python", "-c", WATCHDOG_BODY, url).stdout
 
+    def http_from_core(self, method: str, url: str) -> int:
+        """Запрос http.client изнутри pcbk-core — от имени настоящего клиента sp-ctl (Д5-R31); путь как есть."""
+        r = self._docker("exec", "pcbk-core", "python", "-c", CORE_REQUEST, method, url)
+        return int(r.stdout.strip())
+
+    def http_front(self, method: str, path: str, headers: dict | None = None) -> int:
+        """Запрос к core мимо edge: http.client изнутри pcbk-watchdog (он в pcbk-front) к pcbk-core:8000 + путь как
+        есть, с заголовками; код ответа."""
+        r = self._docker("exec", "pcbk-watchdog", "python", "-c", FRONT_REQUEST, method, path,
+                         json.dumps(headers or {}))
+        return int(r.stdout.strip())
+
+    def from_place(self, n: int, path: str) -> tuple[int, str]:
+        """Одноразовый curl в сети места n к core на {stu_net}.n.2:8000 + путь как есть, без пароля: код и тело."""
+        r = self._docker("run", "--rm", "--pull", "never", "--network", f"pcbk-stu-{n:02d}",
+                         "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
+                         "--security-opt", "no-new-privileges:true", locked_image("curlimages/curl"),
+                         "curl", "-s", "--path-as-is", "--max-time", "10", "-w", "\n%{http_code}",
+                         f"http://{self.stu_net}.{n}.2:8000{path}", check=False)
+        if r.returncode in (125, 126, 127):      # сбой docker run, а не ответ core
+            raise RuntimeError(f"запрос из сети места {n:02d}: docker run, код {r.returncode}\n{r.stderr[-1000:]}")
+        body, _, code = r.stdout.rpartition("\n")
+        return int(code or 0), body
+
+    def add_account(self, login: str, role: str, place: int | None, password: str) -> None:
+        """Учётка шлюза командой администратора в pcbk-core; пароль — в stdin, не в argv."""
+        cmd = ["docker", "exec", "-i", "pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "add",
+               "--login", login, "--role", role, *(() if place is None else ("--place", str(place)))]
+        _run(cmd, input=password + "\n")
+
+    def gw_client(self) -> GwClient:
+        """Клиент шлюза через edge с именем стенда и его Origin."""
+        return GwClient(f"https://{HOST}:{PORT}", host=STAND_HOST, origin=STAND_ORIGIN)
+
     def http_as(self, name: str, network: str, method: str, url: str) -> int:
         """Одноразовый curl, видимый в этой сети под именем name; путь — как есть, без нормализации.
 
         Имя контейнера своё (pcbk-oneshot-…), name — псевдоним в сети: иначе клиент от имени
         pcbk-core упирается в настоящий pcbk-core («name already in use»). -allowfrom прокси
         разрешает имя через DNS сети — псевдоним проходит так же, как имя контейнера.
+
+        С Д5 настоящий core сам в pcbk-ctl: псевдоним pcbk-core там — второй адрес того же имени, и
+        положительный контроль sp-ctl доказывал бы не то (Д5-R31) — только http_from_core.
         """
+        if (name, network) == ("pcbk-core", "pcbk-ctl"):
+            raise ValueError("положительный контроль sp-ctl — только из настоящего core: http_from_core")
         r = self._docker("run", "--rm", "--pull", "never", "--name", f"pcbk-oneshot-{secrets.token_hex(4)}",
                          "--network", network, "--network-alias", name,
                          "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
@@ -759,6 +835,7 @@ def stack(tmp_path_factory, student_image):
         f"DATA_DIR={work / 'data'}",
         "MEM_WARN_MIB=64",
         "MEM_FAIL_MIB=32",
+        f"GW_ORIGIN={STAND_ORIGIN}",
     ]) + "\n", encoding="utf-8")
     s = Stack(env_file)
     s.refuse_foreign()
