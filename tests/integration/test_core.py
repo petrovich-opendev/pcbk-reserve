@@ -36,7 +36,8 @@ def test_egress_network_only_core(stack):
     assert n["Internal"] is False
     assert n["Options"]["com.docker.network.bridge.name"] == "pcbk-egress"
     assert n["Options"].get("com.docker.network.bridge.enable_ip_masquerade", "true") == "true"
-    assert [c["Name"] for c in n["Containers"].values()] == ["pcbk-core"]
+    # двойник OpenRouter — только в тестовом стенде (compose.test.yaml)
+    assert sorted(c["Name"] for c in n["Containers"].values()) == ["pcbk-core", "pcbk-test-openrouter"]
     nets = stack.inspect("pcbk-core")["NetworkSettings"]["Networks"]
     assert set(nets) == {"pcbk-front", "pcbk-egress"} and nets["pcbk-egress"]["IPAddress"] == "172.31.250.82"
 
@@ -53,7 +54,7 @@ def test_core_hardening(stack):
     assert (hc["ReadonlyRootfs"], hc["CapDrop"], hc["CapAdd"], hc["Privileged"]) == (True, ["ALL"], None, False)
     assert hc["SecurityOpt"] == ["no-new-privileges:true"]
     assert c["Config"]["User"] == "10003:10003"
-    assert (hc["Memory"], hc["PidsLimit"]) == (256 * 1024 * 1024, 128)
+    assert (hc["Memory"], hc["PidsLimit"]) == (512 * 1024 * 1024, 128)
     assert hc["Sysctls"] == {"net.ipv4.tcp_fastopen": "0"}                        # Д3б-R6
     assert hc["RestartPolicy"]["Name"] == "unless-stopped"
     assert set(hc["Tmpfs"]) == {"/tmp"}
@@ -81,8 +82,9 @@ def test_tool_over_egress_answers_and_journals(stack):
 
 
 def test_core_state_volume_writable(stack):                                     # Review Focus 4
-    # в тестовом стенде bdrv.env целый — 1 направление (при config_error было бы «0 направлений», F3)
-    assert "охрана выхода: разрешено 1 направление" in stack.logs("pcbk-core")
+    # в тестовом стенде bdrv.env целый — 2 направления: историан и OpenRouter (Д4а); bdrv.env не читается —
+    # было бы «1 направление», только OpenRouter (П3)
+    assert "охрана выхода: разрешено 2 направления" in stack.logs("pcbk-core")
     # core.db создаётся в начале lifespan роли (F23) — файл есть до первого вызова инструмента
     mounts = {m["Destination"]: m for m in stack.inspect("pcbk-core")["Mounts"]}
     assert mounts["/var/lib/pcbk-core"]["Type"] == "volume"

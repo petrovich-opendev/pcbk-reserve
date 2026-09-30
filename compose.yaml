@@ -1,6 +1,6 @@
 # Стенд: прокси входа, сторож и две копии прокси сокета (Д1), десять рабочих мест (Д2,
-# профиль students), серверный слой (Д3а, инструменты — Д3б). Переменные — из .env
-# выкладки (deploy/env.example).
+# профиль students), серверный слой (Д3а, инструменты — Д3б, LLM-прокси — Д4а). Переменные — из
+# .env выкладки (deploy/env.example).
 # Сторонние образы — только по тегу из deploy/images.lock, без pull.
 # Наружу публикуется только 8443 контейнера edge; docker.sock — только у sp-ro и sp-ctl;
 # сеть выхода pcbk-egress — только у core.
@@ -83,8 +83,8 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d2 остаётся на сервере для отката
-    image: pcbk-reserve/watchdog:d3a
+    # :d3a остаётся на сервере для отката
+    image: pcbk-reserve/watchdog:d4a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -185,13 +185,14 @@ services:
     networks: [pcbk-ctl]
 
   # Серверный слой: роль «данные» (Д3а) — каталог тегов и свежесть историана, инструменты по
-  # токену и журнал событий (Д3б). Учётные данные историана и хеши токенов — только файлами-секретами,
-  # белый список — файлом только для чтения. В сеть выхода pcbk-egress — только он (Д3а-R2);
-  # сети мест и pcbk-ctl — с Д4 и Д5. Порт 8000 не публикуется.
+  # токену и журнал событий (Д3б); роль llm (Д4а) — прокси к OpenRouter с бюджетом и журналом вызовов.
+  # Учётные данные историана, ключи OpenRouter и хеши токенов — только файлами-секретами, белый
+  # список — файлом только для чтения. В сеть выхода pcbk-egress — только он (Д3а-R2); сети мест
+  # и pcbk-ctl — с Д4б и Д5. Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d3a остаётся на сервере для отката
-    image: pcbk-reserve/core:d3b
+    # :d3b остаётся на сервере для отката
+    image: pcbk-reserve/core:d4a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -199,7 +200,7 @@ services:
     tmpfs: ["/tmp"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    mem_limit: 256m
+    mem_limit: 512m                 # тела запросов к модели — до 1 МиБ, разбор JSON от десяти мест
     pids_limit: 128
     # TCP Fast Open выключен (Д3б-R6): TCP не уйдёт мимо connect, который проверяет охрана выхода в процессе
     sysctls: {net.ipv4.tcp_fastopen: "0"}
@@ -210,6 +211,14 @@ services:
       CATALOG_DEADLINE_S: ${CATALOG_DEADLINE_S:-60}
       # учения свежести: freeze_stamps — метки не растут, freeze_poll — опрос встаёт; пусто — нет
       DRILL_FRESHNESS: ${DRILL_FRESHNESS:-}
+      # LLM-прокси (Д4а): список моделей (пусто — все семь), выключатель (stopped), учения
+      # «кончились деньги» (402) без OpenRouter, доля администратора, $; ключ только у резервного
+      # контура (on — сверка расхода с /key; off — ключ общий, сверки нет)
+      LLM_MODELS: ${LLM_MODELS:-}
+      LLM_STATE: ${LLM_STATE:-on}
+      DRILL_LLM: ${DRILL_LLM:-}
+      LLM_OPS_SHARE_USD: ${LLM_OPS_SHARE_USD:-100}
+      LLM_KEY_DEDICATED: ${LLM_KEY_DEDICATED:-on}
     volumes:
       - {type: bind, source: "${DATA_DIR:?DATA_DIR не задан}/whitelist.txt", target: /app/data/whitelist.txt,
          read_only: true, bind: {create_host_path: false}}
@@ -218,6 +227,9 @@ services:
     secrets:
       - {source: bdrv-env, target: bdrv.env}
       - {source: core-tokens, target: core-tokens}
+      - {source: llm-tokens, target: llm-tokens}
+      - {source: openrouter-key, target: openrouter.key}
+      - {source: openrouter-mgmt-key, target: openrouter-mgmt.key}
     networks:
       pcbk-front: {}
       pcbk-egress: {ipv4_address: 172.31.250.82}
@@ -405,9 +417,10 @@ networks:
     ipam:
       config:
         - subnet: 172.31.250.64/28
-  # выход серверного слоя к историану (Д3а-R2): только core на .82, динамические адреса —
-  # только .88/29; маскарад включён. Охраны выхода в процессе до Д3б нет: на уровне сети
-  # отсюда открыт любой адрес, включая сервер через шлюз моста (.81) — остаточный риск Д3а
+  # выход серверного слоя к историану (Д3а-R2) и OpenRouter (Д4а): только core на .82,
+  # динамические адреса — только .88/29; маскарад включён. На уровне сети отсюда открыт любой
+  # адрес, включая сервер через шлюз моста (.81): направления держит охрана выхода в процессе
+  # (Д3б-R6) — остаточный риск до сетевого экрана (Д12)
   pcbk-egress:
     name: pcbk-egress
     driver: bridge
@@ -513,6 +526,12 @@ secrets:
   # хеши токенов вызывающих службы данных: строки «<id> <sha256>», файл 0444; сами токены
   # <id>.data-token (48 шестнадцатеричных знаков, 0400) — только на сервере
   core-tokens: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/core-tokens"}
+  # LLM-прокси (Д4а): хеши токенов LLM мест и ops (формат core-tokens, файл 0444) — отдельная таблица;
+  # ключи OpenRouter (0444, кладёт владелец): основной и управления (пустой файл — «ключа нет»).
+  # Файл 0444 не перезаписывается: rm -f, запись, docker compose up -d --no-build --force-recreate core
+  llm-tokens: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/llm-tokens"}
+  openrouter-key: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/openrouter.key"}
+  openrouter-mgmt-key: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/openrouter-mgmt.key"}
   student-01-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.pw"}
   student-01-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.llm-token"}
   student-02-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-02.pw"}

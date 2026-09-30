@@ -7,13 +7,16 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "DOCKER_TIMEOUT_S", "MEM_WARN_MIB", "MEM_FAIL_MIB", "TLS_CAFILE",
                       "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH", "DRILL_FREEZE_LOOP",
                       "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S"},
-    "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS"},
+    "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
+                  "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
+                  # только тестовый стенд (compose.test.yaml): двойник OpenRouter и частый опрос
+                  "OPENROUTER_BASE_URL", "LLM_POLL_S"},
     "pcbk-edge": set(),
     "pcbk-sp-ro": set(),
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d3a", "pcbk-core": "pcbk-reserve/core:d3b",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d4a", "pcbk-core": "pcbk-reserve/core:d4a",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d2"}
@@ -22,7 +25,7 @@ WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 
 def test_edge_serves_status_from_watchdog(stack):
     code, body = stack.https("/status")
-    assert code == 200 and "Входной прокси" in body and "ещё не установлен" in body
+    assert code == 200 and "Входной прокси" in body and "LLM-прокси и бюджет" in body
     assert stack.https("/status.js")[0] == 200
 
 
