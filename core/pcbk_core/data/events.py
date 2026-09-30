@@ -13,6 +13,10 @@
 
 Свободный текст события (requested, agent, summary) чистится на входе: одиночный суррогат
 из JSON вызывающего SQLite не закодирует, и событие-доказательство пропало бы.
+
+Столбец returned (Д4б) — имена, которые вернул catalog_search: по нему Д7 ловит tag_not_seen.
+Таблицу Д3б без него open() дополняет ALTER TABLE … ADD COLUMN один раз, строки не трогаются;
+их returned — NULL, читается как ().
 """
 import json
 import sqlite3
@@ -44,9 +48,10 @@ REQUESTED_CHARS = 128
 AGENT_CHARS = 128
 SUMMARY_CHARS = 500
 ERROR_CHARS = 200              # last_error: класс и начало текста
+RETURNED_NAMES = 50            # returned: не больше стольких имён (catalog_search отдаёт до 50)
 
 _COLUMNS = ("ts", "caller", "agent", "channel", "tool", "requested", "tags", "sent", "period_start",
-            "period_end", "outcome", "summary", "cost", "cache", "row_count", "duration_ms")
+            "period_end", "outcome", "summary", "cost", "cache", "row_count", "duration_ms", "returned")
 _SCHEMA = """CREATE TABLE IF NOT EXISTS agent_events (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
@@ -64,8 +69,11 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS agent_events (
     cost REAL NOT NULL,
     cache TEXT NOT NULL,
     row_count INTEGER NOT NULL,
-    duration_ms INTEGER NOT NULL
+    duration_ms INTEGER NOT NULL,
+    returned TEXT
 )"""
+# столбец Д4б в таблице Д3б: добавляется в конец, как ALTER TABLE … ADD COLUMN у свежей таблицы выше
+_ADD_RETURNED = "ALTER TABLE agent_events ADD COLUMN returned TEXT"
 _INSERT = f"INSERT INTO agent_events ({', '.join(_COLUMNS)}) VALUES ({', '.join('?' * len(_COLUMNS))})"
 # проба записи; откатывается
 _PROBE = ("INSERT INTO agent_events (ts, caller, channel, tool, requested, tags, sent, outcome, summary, cost,"
@@ -93,10 +101,11 @@ class CallEvent:
 
     requested — сырой ввод, не больше 16 строк по 128 знаков; tags — канонические имена со статусами
     ok, no_value, no_data (и у попадания в кэш); sent — имена, переданные драйверу: ворота возвращают
-    их и при отказе входа, когда SQL в историан не попал (F12).
+    их и при отказе входа, когда SQL в историан не попал (F12); returned — у catalog_search имена из
+    matches ответа, не больше 50, у прочих пусто.
 
     Свободный текст чистится здесь: суррогаты — в «\\udXXX», затем срез — requested 16 × 128,
-    agent 128, summary 500 знаков. tags и sent не трогаются: это имена из каталога и ворот.
+    agent 128, summary 500 знаков. tags, sent и returned не трогаются: это имена из каталога и ворот.
     """
 
     ts: datetime
@@ -115,6 +124,7 @@ class CallEvent:
     cache: CacheState
     rows: int
     duration_ms: int
+    returned: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         raw = (self.requested,) if isinstance(self.requested, str) else tuple(self.requested)[:REQUESTED_LINES]
@@ -123,6 +133,7 @@ class CallEvent:
         object.__setattr__(self, "summary", _text(self.summary, SUMMARY_CHARS))
         object.__setattr__(self, "tags", tuple(self.tags))
         object.__setattr__(self, "sent", tuple(self.sent))
+        object.__setattr__(self, "returned", tuple(self.returned)[:RETURNED_NAMES])
 
 
 def _dt(text: str | None) -> datetime | None:
@@ -131,11 +142,12 @@ def _dt(text: str | None) -> datetime | None:
 
 def _event(row: tuple) -> CallEvent:
     (ts, caller, agent, channel, tool, requested, tags, sent, start, end, outcome, summary, cost, cache,
-     rows, duration_ms) = row
+     rows, duration_ms, returned) = row
     return CallEvent(ts=datetime.fromisoformat(ts), caller=caller, agent=agent, channel=channel, tool=tool,
                      requested=tuple(json.loads(requested)), tags=tuple(json.loads(tags)),
                      sent=tuple(json.loads(sent)), start=_dt(start), end=_dt(end), outcome=outcome,
-                     summary=summary, cost=cost, cache=cache, rows=rows, duration_ms=duration_ms)
+                     summary=summary, cost=cost, cache=cache, rows=rows, duration_ms=duration_ms,
+                     returned=() if returned is None else tuple(json.loads(returned)))
 
 
 class EventLog:
@@ -166,7 +178,8 @@ class EventLog:
             db.close()
 
     def _ensure(self) -> None:
-        """Файл, WAL и таблица — один раз; сбой бросает, следующая операция пробует снова."""
+        """Файл, WAL, таблица и столбец returned — один раз (в open() в начале lifespan роли); сбой бросает,
+        следующая операция пробует снова. Готовому журналу путь write() не удлиняет."""
         if self._ready:
             return
         with self._schema_lock:
@@ -175,6 +188,9 @@ class EventLog:
             with self._db() as db:
                 db.execute("PRAGMA journal_mode=WAL")
                 db.execute(_SCHEMA)
+                # таблица Д3б без returned (К6): ALTER только при нужде — иначе схема не пишется
+                if "returned" not in {row[1] for row in db.execute("PRAGMA table_info(agent_events)")}:
+                    db.execute(_ADD_RETURNED)
             self._ready = True
 
     def open(self) -> bool:
@@ -193,7 +209,8 @@ class EventLog:
                   json.dumps(list(e.requested), ensure_ascii=False), json.dumps(list(e.tags), ensure_ascii=False),
                   json.dumps(list(e.sent), ensure_ascii=False),
                   None if e.start is None else e.start.isoformat(), None if e.end is None else e.end.isoformat(),
-                  e.outcome, e.summary, float(e.cost), e.cache, int(e.rows), int(e.duration_ms))
+                  e.outcome, e.summary, float(e.cost), e.cache, int(e.rows), int(e.duration_ms),
+                  json.dumps(list(e.returned), ensure_ascii=False))
         with self._db(WRITE_TIMEOUT_S) as db:
             db.execute(_INSERT, values)
 

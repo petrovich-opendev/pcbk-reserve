@@ -48,6 +48,13 @@ HTTP_OK_DETAIL = "отвечает"
 CATALOG_MAX_AGE_S = 172800
 CORE_DOWN_DETAIL = "служба данных не отвечает — свежесть неизвестна"
 OFF_CONTRACT_DETAIL = "служба данных ответила не по договору — свежесть неизвестна"
+# нагрузка историана и ошибки инструментов (Д4б-R22): поля gate и tools ответа службы Д4б
+SLOW_P95_MS = 5000
+TOOL_ERRORS_SHARE = 0.2
+TOOL_ERRORS_MIN_CALLS = 10
+USER_PAUSED_DETAIL = "запросы людей к историану на паузе после сроков подряд"
+SLOW_P95_DETAIL = "историан отвечает медленно: p95 больше 5 с"
+TOOL_ERRORS_DETAIL = "инструменты отвечают ошибкой"
 
 # строка «LLM-прокси и бюджет» (задача 7 Д4а)
 LLM_DOWN_DETAIL = "LLM-прокси не отвечает"
@@ -253,9 +260,42 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
+    """Строки нагрузки историана (задача 1 Д4б): пауза людей, медленный p95, ошибки инструментов.
+
+    Нет ключа tools или новых полей gate (служба :d4a) — строка не срабатывает; поле не того вида —
+    TypeError или ValueError (ответ не по договору). «k из N» — в note: detail постоянный.
+    """
+    gate = reply.get("gate")
+    if gate is not None:
+        if not isinstance(gate, dict):
+            raise TypeError("gate — не объект JSON")
+        paused = gate.get("user_paused")
+        if paused is not None and not isinstance(paused, bool):
+            raise TypeError("gate.user_paused — не логическое")
+        if paused:
+            return "warn", USER_PAUSED_DETAIL, ""
+        p95 = gate.get("p95_ms")
+        if p95 is not None and not (_is_number(p95) and math.isfinite(p95)):
+            raise TypeError("gate.p95_ms — не конечное число")
+        if p95 is not None and p95 > SLOW_P95_MS:
+            return "warn", SLOW_P95_DETAIL, ""
+    tools = reply.get("tools")
+    if tools is not None:
+        if not isinstance(tools, dict):
+            raise TypeError("tools — не объект JSON")
+        recent, errors = _count(tools, "recent"), _count(tools, "errors")
+        if not 0 <= errors <= recent:
+            raise ValueError("tools: число ошибок вне 0…recent")
+        if recent >= TOOL_ERRORS_MIN_CALLS and errors / recent >= TOOL_ERRORS_SHARE:
+            return "warn", TOOL_ERRORS_DETAIL, f"{errors} из {recent}"
+    return None
+
+
 def historian_verdict(reply, now: datetime, warn_s: int, fail_s: int,
-                      stale_s: int) -> tuple[State, str]:
-    """Вердикт по ответу /health/historian; первая подходящая строка таблицы задачи 6 Д3а.
+                      stale_s: int) -> tuple[State, str, str]:
+    """Вердикт по ответу /health/historian: (состояние, detail, note); первая подходящая строка таблицы
+    задачи 6 Д3а со строками нагрузки задачи 1 Д4б перед каталогом.
 
     Ответ не по договору — ValueError, TypeError, KeyError или OverflowError.
     """
@@ -263,31 +303,34 @@ def historian_verdict(reply, now: datetime, warn_s: int, fail_s: int,
         raise TypeError("ответ — не объект JSON")
     checked_raw = reply["checked_at"]
     if checked_raw is None:
-        return "unknown", "служба ещё не опрашивала историан"
+        return "unknown", "служба ещё не опрашивала историан", ""
     if not isinstance(checked_raw, str):
         raise TypeError("checked_at — не строка")
     checked_at = datetime.fromisoformat(checked_raw)
     if checked_at.tzinfo is None:
         checked_at = checked_at.replace(tzinfo=timezone.utc)   # договор — ISO UTC
     if (now - checked_at).total_seconds() > stale_s:
-        return "unknown", "служба давно не опрашивала историан"
+        return "unknown", "служба давно не опрашивала историан", ""
     if reply.get("error"):
         text = reply.get("error_text")
-        return "fail", _reason(text if isinstance(text, str) and text.strip() else str(reply["error"]))
+        return "fail", _reason(text if isinstance(text, str) and text.strip() else str(reply["error"])), ""
     age = reply["age_s"]
     if not _is_number(age):
         raise TypeError("age_s — не число")
     # в warn/fail текст постоянный: иначе журнал пишет событие каждый такт
     if age >= fail_s:
-        return "fail", f"последняя метка старше {fail_s} с"
+        return "fail", f"последняя метка старше {fail_s} с", ""
     if age >= warn_s:
-        return "warn", f"последняя метка старше {warn_s} с"
+        return "warn", f"последняя метка старше {warn_s} с", ""
+    load = _load_verdict(reply)
+    if load is not None:
+        return load
     catalog_age = reply.get("catalog_age_s")
     if catalog_age is not None and not _is_number(catalog_age):
         raise TypeError("catalog_age_s — не число")
     if catalog_age is not None and catalog_age > CATALOG_MAX_AGE_S:
-        return "warn", "каталог тегов старше двух суток"
-    return "ok", f"последняя метка {round(age)} с назад"
+        return "warn", "каталог тегов старше двух суток", ""
+    return "ok", f"последняя метка {round(age)} с назад", ""
 
 
 def check_historian(component: str, title: str, url: str, now: datetime, warn_s: int, fail_s: int,
@@ -304,10 +347,10 @@ def check_historian(component: str, title: str, url: str, now: datetime, warn_s:
     except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
         return Check(component, title, "unknown", CORE_DOWN_DETAIL)
     try:
-        state, detail = historian_verdict(reply, now, warn_s, fail_s, stale_s)
+        state, detail, note = historian_verdict(reply, now, warn_s, fail_s, stale_s)
     except (KeyError, TypeError, ValueError, OverflowError):   # OverflowError — age_s = -Infinity
         return Check(component, title, "unknown", OFF_CONTRACT_DETAIL)
-    return Check(component, title, state, detail)
+    return Check(component, title, state, detail, note)
 
 
 def fmt_usd(x: float, keep: Iterable[float] = ()) -> str:

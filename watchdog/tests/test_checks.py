@@ -235,6 +235,55 @@ def test_historian_core_down_or_garbage_is_unknown(fake_core):
     assert check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5).state == "unknown"
 
 
+# Д4б, задача 1: нагрузка историана и ошибки инструментов (Д4б-R22)
+
+def test_historian_load_rows(fake_core):
+    gate = {"user_paused": False, "p95_ms": 100}
+    cases = [(fresh(10, gate={**gate, "user_paused": True}),
+              ("warn", "запросы людей к историану на паузе после сроков подряд", "")),
+             (fresh(10, gate={**gate, "p95_ms": 6200}), ("warn", "историан отвечает медленно: p95 больше 5 с", "")),
+             (fresh(10, gate=gate, tools={"recent": 50, "errors": 12}), ("warn", "инструменты отвечают ошибкой", "12 из 50")),
+             (fresh(10, gate=gate, tools={"recent": 5, "errors": 5}), ("ok", "последняя метка 10 с назад", "")),
+             (fresh(10), ("ok", "последняя метка 10 с назад", ""))]             # служба :d4a — без новых полей
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want
+
+
+# сверх брифа: место в таблице, пороги, поля :d4a и ответ не по договору
+
+def test_historian_load_rows_order_and_edges(fake_core):
+    gate = {"user_paused": False, "p95_ms": None, "sent_names_total": 3}
+    tools = {"recent": 10, "errors": 2}
+    old_gate = {"sent_names_total": 0, "refused_unlisted": 0, "in_flight": {"user": 0, "background": 0},
+                "auth_latched": False}
+    cases = [(fresh(400, gate={**gate, "user_paused": True}), ("warn", "последняя метка старше 300 с", "")),
+             (fresh(10, gate={**gate, "user_paused": True, "p95_ms": 9000}, tools=tools, catalog_age_s=200000.0),
+              ("warn", "запросы людей к историану на паузе после сроков подряд", "")),
+             (fresh(10, gate={**gate, "p95_ms": 9000}, tools=tools),
+              ("warn", "историан отвечает медленно: p95 больше 5 с", "")),
+             (fresh(10, gate=gate, tools=tools, catalog_age_s=200000.0),
+              ("warn", "инструменты отвечают ошибкой", "2 из 10")),                # ровно 20 % при 10 вызовах
+             (fresh(10, gate=gate, tools={"recent": 15, "errors": 3}),
+              ("warn", "инструменты отвечают ошибкой", "3 из 15")),
+             (fresh(10, gate={**gate, "p95_ms": 5000}, tools={"recent": 10, "errors": 1}),
+              ("ok", "последняя метка 10 с назад", "")),                          # p95 ровно 5 с — ещё не медленно
+             (fresh(10, gate={**gate, "p95_ms": 5000}, tools={"recent": 9, "errors": 9}),
+              ("ok", "последняя метка 10 с назад", "")),                          # меньше 10 вызовов — не судим
+             (fresh(10, gate=old_gate, catalog_age_s=200000.0), ("warn", "каталог тегов старше двух суток", "")),
+             (fresh(10, gate=old_gate), ("ok", "последняя метка 10 с назад", ""))]
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+        assert len(r.detail) <= 80
+    for obj in (fresh(10, gate=[]), fresh(10, gate={"user_paused": "да"}), fresh(10, gate={"p95_ms": "6200"}),
+                fresh(10, gate={"p95_ms": float("nan")}), fresh(10, gate={"p95_ms": True}), fresh(10, tools=[]),
+                fresh(10, tools={"recent": 50}), fresh(10, tools={"recent": 50, "errors": 60}),
+                fresh(10, tools={"recent": 50.0, "errors": 12}), fresh(10, tools={"recent": 50, "errors": -1})):
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail) == OFF_CONTRACT, obj
+
+
 DOWN = ("unknown", "служба данных не отвечает — свежесть неизвестна")
 OFF_CONTRACT = ("unknown", "служба данных ответила не по договору — свежесть неизвестна")
 

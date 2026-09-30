@@ -9,7 +9,8 @@ import pytest
 
 from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian, RecordingConnect
 from helpers import FakeMono
-from pcbk_core.data.gate import AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
+from pcbk_core.data.gate import (AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, P95_MIN_CALLS, PAUSE_AFTER_TIMEOUTS,
+                                 STATS_WINDOW_S, USER_PAUSE_S, GateRefused, HistorianGate, SlidingWindow)
 from pcbk_core.data.historian import HistorianError, tds_query
 from pcbk_core.secrets import BdrvConfig
 from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, lit_dt, live_all_sql, live_sql, summary_sql
@@ -233,7 +234,8 @@ async def test_driver_errors_carry_sent_and_log_no_detail(capfd, restore_logging
     assert "FAKEUSER" not in err and "16FAKE" not in err
     assert "msg_no=18456" in err and "ворота: SQL вне белого списка — отказ без SQL" in err
     assert g.stats() == {"sent_names_total": 2, "refused_unlisted": 1,
-                         "in_flight": {"user": 0, "background": 0}, "auth_latched": True}
+                         "in_flight": {"user": 0, "background": 0}, "auth_latched": True,
+                         "p95_ms": None, "timeouts_5m": 0, "busy_5m": 0, "user_paused": False}
 
 
 def test_sliding_window_forgets_old_calls():
@@ -356,3 +358,84 @@ async def test_gate_refuses_summary_with_non_ascii_digits():                   #
             await g.run([bad])
         assert e.value.code == "unlisted"
     assert fake.calls == [] and g.stats()["refused_unlisted"] == 2
+
+
+# Д4б, задача 1: нагрузка историана — p95 и пауза полосы людей после сроков подряд (Д4б-R22, К8)
+
+async def test_three_timeouts_pause_user_lane_not_background():
+    mono = FakeMono(1000.0)
+    fake = FakeHistorian(fail=HistorianError("timeout", "долго"))
+    g = gate(fake, monotonic=mono)
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == sent and g.stats()["user_paused"] is True
+    fake.fail = None
+    await g.run([clock_sql()], lane="background")                              # фон на паузе не стоит
+    mono.advance(USER_PAUSE_S)
+    await g.run([Q])
+    assert g.stats()["user_paused"] is False and len(fake.calls) == sent + 2
+
+
+async def test_p95_needs_five_calls():
+    g = gate(FakeHistorian(delay_s=0.05))
+    for _ in range(4):
+        await g.run([Q])
+    assert g.stats()["p95_ms"] is None
+    await g.run([Q])
+    assert 40 <= g.stats()["p95_ms"] <= 1000
+
+
+# сверх брифа: пауза — после белого списка, счёт за окно, «подряд» и полоса, ожидание места в p95
+
+
+async def test_pause_keeps_unlisted_and_counts_in_window():                    # К8
+    mono = FakeMono(1000.0)
+    fake = FakeHistorian(fail=HistorianError("timeout", "долго"))
+    g = gate(fake, monotonic=mono)
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+    with pytest.raises(GateRefused) as e:
+        await g.run([live_sql(["16FAKE_009_PV"])])                         # вне списка — unlisted и на паузе
+    assert e.value.code == "unlisted"
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == PAUSE_AFTER_TIMEOUTS
+    s = g.stats()
+    assert (s["timeouts_5m"], s["busy_5m"], s["user_paused"]) == (3, 1, True) and s["p95_ms"] is not None
+    mono.advance(STATS_WINDOW_S)                                           # окно ушло: ни сроков, ни p95
+    s = g.stats()
+    assert (s["timeouts_5m"], s["busy_5m"], s["user_paused"], s["p95_ms"]) == (0, 0, False, None)
+
+
+async def test_timeouts_must_be_in_a_row_on_user_lane():
+    mono = FakeMono(1000.0)
+    fake = FakeHistorian(fail=HistorianError("timeout", "долго"))
+    g = gate(fake, monotonic=mono)
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        with pytest.raises(HistorianError):
+            await g.run([clock_sql()], lane="background")                  # фон паузы не знает
+    assert (g.stats()["user_paused"], g.stats()["timeouts_5m"]) == (False, 0)
+    timeout, query = fake.fail, HistorianError("query", "x")
+    for fail in (timeout, timeout, None, timeout, timeout, query, timeout, timeout):
+        fake.fail = fail                                                   # удача и ошибка обнуляют счёт
+        try:
+            await g.run([Q])
+        except HistorianError:
+            pass
+    assert g.stats()["user_paused"] is False and g.stats()["timeouts_5m"] == 6
+    fake.fail = timeout
+    with pytest.raises(HistorianError):
+        await g.run([Q])                                                   # третий подряд
+    assert g.stats()["user_paused"] is True
+
+
+async def test_p95_counts_wait_for_slot():                                     # К8: это видит студент
+    fake = FakeHistorian(delay_s=0.1)
+    g = await warmed(fake, user_slots=1)
+    await asyncio.gather(*(g.run([Q]) for _ in range(P95_MIN_CALLS)))      # по одному: последний ждал 0,4 с
+    assert g.stats()["p95_ms"] >= 450

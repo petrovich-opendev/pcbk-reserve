@@ -8,8 +8,8 @@ from typing import get_args
 
 from helpers import EVENT as E            # пример события — в helpers: его берёт и test_role.py (F16)
 from helpers import non_root
-from pcbk_core.data.events import (AGENT_CHARS, EVENTS_CHECK_S, OUTCOME_BY_CODE, SUMMARY_CHARS, WRITE_TIMEOUT_S,
-                                   CallEvent, EventLog, Outcome, outcome_for)
+from pcbk_core.data.events import (AGENT_CHARS, EVENTS_CHECK_S, OUTCOME_BY_CODE, RETURNED_NAMES, SUMMARY_CHARS,
+                                   WRITE_TIMEOUT_S, CallEvent, EventLog, Outcome, outcome_for)
 from pcbk_core.data.freshness import ERROR_TEXTS
 from pcbk_core.data.historian import ErrorCode
 
@@ -173,3 +173,45 @@ def test_locked_db_fails_write_fast(tmp_path):                                  
         holder.close()
     assert WRITE_TIMEOUT_S == 0.5 and took < WRITE_TIMEOUT_S + 1.0
     assert log.consecutive_failures == 1 and "locked" in log.last_error
+
+
+# Д4б, задача 1: returned — имена, которые вернул catalog_search (по нему Д7 ловит tag_not_seen)
+
+def test_old_table_gets_returned_column(tmp_path):
+    db = str(tmp_path / "core.db")
+    assert EventLog(db).open()                                                   # конструктор без ввода-вывода (F4)
+    con = sqlite3.connect(db)
+    con.execute("ALTER TABLE agent_events DROP COLUMN returned")                 # таблица, как у Д3б
+    con.execute("INSERT INTO agent_events (ts, caller, channel, tool, requested, tags, sent, outcome, summary,"
+                " cost, cache, row_count, duration_ms) VALUES ('2026-09-01T00:00:00+00:00', 'x', 'http',"
+                " 'tag_now', '[]', '[]', '[]', 'ok', '', 0, 'none', 0, 0)")          # строка Д3б без returned
+    con.commit(); con.close()
+    log = EventLog(db)
+    log.write(replace(E, returned=("20FAKE_001_PV",)))
+    assert log.recent()[0].returned == ("20FAKE_001_PV",)
+    assert log.recent()[1].returned == ()                                       # старая строка: NULL → ()
+
+
+# сверх брифа: до 50 имён, столбец добавляется один раз, строки Д3б не трогаются (журнал Д3б:42)
+
+def test_returned_capped_and_migration_once(tmp_path):
+    e = replace(E, returned=[f"20FAKE_{i:03d}_PV" for i in range(RETURNED_NAMES + 10)])
+    assert RETURNED_NAMES == 50 and e.returned == tuple(f"20FAKE_{i:03d}_PV" for i in range(50))
+    db = str(tmp_path / "core.db")
+    old = EventLog(db)
+    assert old.open()
+    old.write(E)
+    con = sqlite3.connect(db)
+    con.execute("ALTER TABLE agent_events DROP COLUMN returned")
+    con.commit(); con.close()
+    for _ in range(2):                                                           # второй раз столбец уже есть
+        log = EventLog(db)
+        assert log.open() is True, log.last_error
+    log.write(e)
+    con = sqlite3.connect(db)
+    try:
+        columns = [row[1] for row in con.execute("PRAGMA table_info(agent_events)")]
+        assert columns[-1] == "returned" and columns.count("returned") == 1
+    finally:
+        con.close()
+    assert [x.returned for x in log.recent()] == [e.returned, ()] and log.count() == 2

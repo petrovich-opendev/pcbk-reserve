@@ -16,6 +16,12 @@ TagName IN (…) и то, что пропускает literal_ok.
 вызова после запуска входит только один вызов за раз, остальные ждут его
 исхода; отказ входа по учётным данным закрывает ворота до перезапуска службы.
 После обрыва связи 30 с новые попытки сразу получают отказ.
+
+Нагрузка полосы людей (Д4б-R22) — в памяти, для /health/historian: p95 длительности
+вызовов за STATS_WINDOW_S, сроки и busy за то же окно. Длительность — от входа в run()
+до исхода, с ожиданием места: это видит студент. После PAUSE_AFTER_TIMEOUTS сроков
+подряд полоса людей стоит USER_PAUSE_S: новые вызовы сразу получают busy, без места и
+SQL; фон паузы не знает. Любой другой исход вызова людей обнуляет счёт.
 """
 import asyncio
 import logging
@@ -37,6 +43,10 @@ BACKGROUND_SLOTS = 1
 CALL_DEADLINE_S = 15.0
 Q_MIN_S = 5.0
 CONNECT_COOLDOWN_S = 30.0
+STATS_WINDOW_S = 300.0          # окно нагрузки полосы людей: p95, сроки, busy
+P95_MIN_CALLS = 5               # меньше вызовов в окне — p95 не считается
+PAUSE_AFTER_TIMEOUTS = 3        # сроков подряд у людей — и полоса людей на паузе
+USER_PAUSE_S = 60.0
 # 4060 («база недоступна») приходит вместе с 18456 и выглядит как отказ учётных данных
 AUTH_LATCH_TEXT = ("историан отклонил учётные данные — обновите bdrv.env или проверьте, не была ли база "
                    "историана недоступна, и перезапустите службу")
@@ -112,22 +122,38 @@ class HistorianGate:
         self._refused_unlisted = 0
         self._auth_latched = False
         self._pause_until: float | None = None
+        # исходы вызовов людей за окно: (monotonic() исхода, длительность в мс, код исхода)
+        self._user_calls: deque[tuple[float, int, str]] = deque()
+        self._timeouts_in_row = 0
+        self._user_pause_until: float | None = None
 
     def clear_pause(self) -> None:
-        """Только для тестов: снимает защёлку входа и паузу после обрыва. У людей их снимает перезапуск
-        службы."""
+        """Только для тестов: снимает защёлку входа, паузу после обрыва и паузу полосы людей. У людей их снимает
+        перезапуск службы (паузы — и время)."""
         self._auth_latched = False
         self._pause_until = None
+        self._timeouts_in_row = 0
+        self._user_pause_until = None
 
     def stats(self) -> dict:
-        """Только числа и флаги, без имён тегов."""
+        """Только числа и флаги, без имён тегов; только память — ручку здоровья зовут в цикле событий."""
+        now = self.monotonic()
+        calls = self._user_window(now)
+        took = sorted(ms for _, ms, _ in calls)
         return {"sent_names_total": self._sent_names_total,
                 "refused_unlisted": self._refused_unlisted,
                 "in_flight": dict(self._in_flight),
-                "auth_latched": self._auth_latched}
+                "auth_latched": self._auth_latched,
+                # ближайший ранг: при пяти вызовах — самый долгий
+                "p95_ms": took[math.ceil(0.95 * len(took)) - 1] if len(took) >= P95_MIN_CALLS else None,
+                "timeouts_5m": sum(1 for _, _, code in calls if code == "timeout"),
+                "busy_5m": sum(1 for _, _, code in calls if code == "busy"),
+                "user_paused": self._user_paused(now)}
 
     async def run(self, statements: Sequence[str], *, lane: Lane = "user",
                   deadline_s: float | None = None) -> GateResult:
+        loop = asyncio.get_running_loop()
+        began = loop.time()                 # длительность вызова людей — от входа, с ожиданием места (К8)
         if isinstance(statements, str):
             raise TypeError("statements — список инструкций, не строка")
         statements = tuple(statements)
@@ -138,13 +164,28 @@ class HistorianGate:
         budget = self.deadline_s if deadline_s is None else deadline_s
         if not (budget > 0 and math.isfinite(budget)):
             raise ValueError("срок вызова — положительное число секунд")
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + budget
+        if lane != "user":
+            return await self._call(statements, lane, budget, loop, began)
+        # исход вызова людей — в окно нагрузки; отмена вызывающим — не исход
+        try:
+            result = await self._call(statements, lane, budget, loop, began)
+        except Exception as exc:
+            self._note_user(exc, loop.time() - began)
+            raise
+        self._note_user(None, loop.time() - began)
+        return result
+
+    async def _call(self, statements: tuple[str, ...], lane: Lane, budget: float,
+                    loop: asyncio.AbstractEventLoop, began: float) -> GateResult:
+        deadline = began + budget
 
         # 1. белый список и форма шаблона — до всего остального, без SQL
         sent = self._check(statements, lane)
         # 2. защёлка входа и пауза после обрыва — без входа
         self._raise_if_closed()
+        # 2а. пауза полосы людей после сроков подряд — без места и SQL; unlisted остаётся unlisted (К8)
+        if lane == "user" and self._user_paused(self.monotonic()):
+            raise GateRefused("busy")
         # 3. место полосы: ждать в цикле asyncio не дольше срок − q_min
         q_min = min(self.q_min_s, budget / 3)
         slot = self._slots[lane]
@@ -218,6 +259,31 @@ class HistorianGate:
         if lane == "user" and sql != clock_sql() and not any(in_names for _, in_names in found):
             return False
         return True
+
+    def _user_window(self, now: float) -> deque[tuple[float, int, str]]:
+        """Исходы людей моложе STATS_WINDOW_S; старые уходят (граница — как у SlidingWindow)."""
+        calls = self._user_calls
+        while calls and calls[0][0] <= now - STATS_WINDOW_S:
+            calls.popleft()
+        return calls
+
+    def _user_paused(self, now: float) -> bool:
+        return self._user_pause_until is not None and now < self._user_pause_until
+
+    def _note_user(self, exc: Exception | None, took_s: float) -> None:
+        """Исход вызова людей: в окно нагрузки; срок — в счёт подряд, любой другой исход его обнуляет."""
+        code = "ok" if exc is None else exc.code if isinstance(exc, (HistorianError, GateRefused)) else "error"
+        now = self.monotonic()
+        self._user_window(now).append((now, max(0, round(took_s * 1000)), code))
+        if code != "timeout":
+            self._timeouts_in_row = 0
+            return
+        self._timeouts_in_row += 1
+        if self._timeouts_in_row >= PAUSE_AFTER_TIMEOUTS:
+            self._timeouts_in_row = 0           # следующая пауза — снова после стольких же сроков подряд
+            self._user_pause_until = now + USER_PAUSE_S
+            log.warning("ворота: сроки подряд у людей (%d) — пауза полосы людей %g с", PAUSE_AFTER_TIMEOUTS,
+                        USER_PAUSE_S)
 
     def _raise_if_closed(self) -> None:
         if self._auth_latched:

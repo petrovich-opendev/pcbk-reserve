@@ -296,3 +296,16 @@ async def test_http_and_mcp_share_caller_rate_window(core_server):
         over = (await s.call_tool("catalog_search", search)).structuredContent
     _, body = http_post(core_server.url + "/api/data/catalog_search", search, TOKEN)
     assert (over["status"], json.loads(body)["status"]) == ("rate", "rate")      # окно одно на вызывающего
+
+
+# Д4б, задача 1: у MCP службы только инструменты (Д4б-R19) — встроенные list_mcp_resources, read_mcp_resource и
+# list_mcp_resource_templates OpenCode сверяет с разрешением read, а не pcbk_*: отдавать им нечего
+
+
+@pytest.mark.anyio
+async def test_mcp_has_no_resources_or_prompts(core_server):                  # как тесты Д3б (К5)
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        assert (await s.list_resources()).resources == []
+        assert (await s.list_resource_templates()).resourceTemplates == []
+        assert (await s.list_prompts()).prompts == []
+        assert {t.name for t in (await s.list_tools()).tools} >= {"tag_now", "tag_period", "catalog_search"}

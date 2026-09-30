@@ -292,6 +292,7 @@ class DataRole(RoleBase):
                                      else round(max(0.0, mono - self.catalog_loaded_mono), 1))
             body["catalog_error"] = self.catalog_error
             body["gate"] = self.gate.stats()
+            body["tools"] = self.service.tools_stats()      # из памяти службы, не из журнала событий (К7)
             return JSONResponse(body)
 
         router.include_router(data_router(self))
