@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import ssl
 import subprocess
 import tempfile
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from cdp import Browser
 from gwclient import GwClient
 from workplace import IMAGE as STUDENT_IMAGE
 from workplace import ONESHOT_LABEL
@@ -51,7 +53,9 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
                         "LLM_TOTAL_USD",
                         # шлюз (Д5а): core и срок молчания уборщика у сторожа
-                        "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY", "GW_STALE_S"})
+                        "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY", "GW_STALE_S",
+                        # статика edge тестового стенда со сборкой чата (Д6а): compose.test.yaml, «:?»
+                        "PCBK_TEST_STATIC"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
 # белый список стенда — одно синтетическое имя
@@ -207,6 +211,22 @@ def prepare_images() -> None:
         _run(["docker", "tag", pinned, name])
 
 
+def build_test_static(static_dir: Path) -> None:
+    """Статика edge тестового стенда (Д6а): копия edge/static без сборки чата из дерева и свежая сборка веба в
+    static_dir/chat с меткой test-<12 знаков HEAD>. Общее дерево сборка не трогает — вывод в PCBK_WEB_OUT;
+    web/node_modules ставит npm ci по lock. Каталоги 0755, файлы 0644: nginx читает их не от владельца."""
+    shutil.copytree(REPO / "edge" / "static", static_dir,
+                    ignore=lambda d, names: ["chat"] if Path(d) == REPO / "edge" / "static" else [])
+    head = _run(["git", "rev-parse", "--short=12", "HEAD"], cwd=REPO).stdout.strip()
+    env = {**os.environ, "PCBK_WEB_OUT": str(static_dir / "chat"), "PCBK_BUILD": f"test-{head}"}
+    _run(["npm", "--prefix", "web", "ci", "--ignore-scripts"], cwd=REPO, timeout=COMPOSE_TIMEOUT_S)
+    _run(["npm", "--prefix", "web", "run", "build"], cwd=REPO, env=env, timeout=COMPOSE_TIMEOUT_S)
+    for d, _, files in os.walk(static_dir):
+        Path(d).chmod(0o755)
+        for f in files:
+            (Path(d) / f).chmod(0o644)
+
+
 def make_test_tls(tls_dir: Path) -> None:
     """Самоподписанный сертификат на 30 дней; каталог 0755, файлы 0644 — только у тестового ключа."""
     tls_dir.mkdir(mode=0o755)
@@ -295,6 +315,8 @@ class Stack:
         self.stu_net: str = values["STU_NET"]
         self.secrets_dir = Path(values["SECRETS_DIR"])
         self.agents_root = Path(values["AGENTS_DIR"])
+        # статика edge со сборкой чата этого прогона (build_test_static)
+        self.static_dir = Path(values["PCBK_TEST_STATIC"])
         # токен службы данных места 01 (в core-tokens — его хеш), он же файл student-01.data-token
         self.core_token: str = self.data_token(1)
         # токен LLM администратора, он же файл ops.llm-token (в llm-tokens — его хеш)
@@ -402,14 +424,16 @@ class Stack:
 
     # --- запросы к стенду ---
 
-    def _https_get(self, path: str, timeout: float) -> tuple[int, http.client.HTTPMessage, str]:
-        """GET к https://127.0.0.1:18443 без проверки сертификата, без прокси и перенаправлений."""
+    def _https_get(self, path: str, timeout: float,
+                   headers: Mapping[str, str] | None = None) -> tuple[int, http.client.HTTPMessage, str]:
+        """GET к https://127.0.0.1:18443 без проверки сертификата, без прокси и перенаправлений. Без своего
+        Accept-Encoding http.client шлёт identity — ответ несжатый."""
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         conn = http.client.HTTPSConnection(HOST, PORT, context=ctx, timeout=timeout)
         try:
-            conn.request("GET", path)
+            conn.request("GET", path, headers=dict(headers or {}))
             resp = conn.getresponse()
             return resp.status, resp.msg, resp.read().decode("utf-8", "replace")
         finally:
@@ -423,6 +447,17 @@ class Stack:
         """Код и заголовки; повторы одного заголовка — через get_all."""
         code, headers, _ = self._https_get(path, timeout)
         return code, headers
+
+    def https_full(self, path: str, headers: Mapping[str, str] | None = None,
+                   timeout: float = 20.0) -> tuple[int, str, dict[str, str]]:
+        """Код, тело и заголовки ответа; имена заголовков — в нижнем регистре, повторы одного — через «, » (два
+        одноимённых заголовка не равны одному). headers — заголовки запроса; сжатое тело не распаковывается."""
+        code, msg, body = self._https_get(path, timeout, headers)
+        out: dict[str, str] = {}
+        for name, value in msg.items():
+            key = name.lower()
+            out[key] = f"{out[key]}, {value}" if key in out else value
+        return code, body, out
 
     def http_from_watchdog(self, method: str, url: str) -> int:
         """Запрос http.client изнутри pcbk-watchdog — от имени сторожа, как его DockerReader."""
@@ -825,6 +860,7 @@ def stack(tmp_path_factory, student_image):
     make_test_places(work / "secrets", work / "agents")
     make_test_core_data(work / "secrets", work / "data")
     make_test_llm(work / "secrets")
+    build_test_static(work / "static")          # до test.env и compose: у PCBK_TEST_STATIC «:?» (preflight M15)
     env_file = work / "test.env"
     env_file.write_text("\n".join([
         f"DOCKER_GID={docker_gid()}",
@@ -837,6 +873,7 @@ def stack(tmp_path_factory, student_image):
         "MEM_WARN_MIB=64",
         "MEM_FAIL_MIB=32",
         f"GW_ORIGIN={STAND_ORIGIN}",
+        f"PCBK_TEST_STATIC={work / 'static'}",
     ]) + "\n", encoding="utf-8")
     s = Stack(env_file)
     s.refuse_foreign()
@@ -846,3 +883,25 @@ def stack(tmp_path_factory, student_image):
         yield s
     finally:
         s.down()
+
+
+@pytest.fixture(scope="module")
+def browser():
+    """Headless Chrome (cdp.py) на модуль; вкладки — фикстурой page на тест. Без Chrome — пропуск с причиной
+    (закрытие дня требует прогона без пропусков)."""
+    if shutil.which("google-chrome") is None:
+        pytest.skip("нет google-chrome")
+    with Browser() as b:
+        yield b
+
+
+@pytest.fixture
+def page(browser):
+    """Вкладка на тест, закрывается в teardown (preflight F3): шлюз держит не больше трёх потоков на логин, а вкладки
+    одного профиля делят cookie — незакрытые вкладки прошлых тестов съели бы потоки следующих."""
+    p = browser.page()
+    try:
+        yield p
+    finally:
+        p.close()
+

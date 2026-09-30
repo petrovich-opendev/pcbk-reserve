@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { viewFor, loginError, meView, GIVE_UP_S, startPage } from "../static/login.js";
+import { viewFor, loginError, meView, GIVE_UP_S, CHAT_URL, startPage } from "../static/login.js";
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
@@ -57,13 +57,14 @@ class FakeEl {
   }
 }
 
-const IDS = ["login-form", "login", "password", "submit", "who", "state", "logout"];
+const IDS = ["login-form", "login", "password", "submit", "who", "state", "logout", "to-chat"];
 
 function harness(routes) {
   const els = Object.fromEntries(IDS.map((id) => [id, new FakeEl(id)]));
   els["login-form"].hidden = true;                       // как в login.html: до ответа /me формы нет
   els.who.hidden = true;
   els.logout.hidden = true;
+  els["to-chat"].hidden = true;                          // запасная ссылка «Открыть чат» — до «готово» скрыта
   const doc = { getElementById: (id) => els[id] ?? null };
   const calls = [];
   const counts = {};
@@ -96,9 +97,10 @@ function harness(routes) {
     now = end;
     await flush();
   }
-  startPage({ doc, fetchImpl, setTimeoutImpl, clearTimeoutImpl });
+  const navigations = [];                                // переходы страницы (в Node нет location)
+  startPage({ doc, fetchImpl, setTimeoutImpl, clearTimeoutImpl, navigate: (url) => navigations.push(url) });
   const count = (key) => calls.filter((c) => c.key === key).length;
-  return { els, calls, count, advance, flush, pending: () => tasks.length };
+  return { els, calls, count, advance, flush, navigations, pending: () => tasks.length };
 }
 
 const NEED_LOGIN = [401, { name: "Unauthorized", data: { message: "Нужно войти" } }];
@@ -174,6 +176,7 @@ test("через GIVE_UP_S — «не ответило», опрос конча�
   assert.equal(h.els.state.textContent, "Готовлю рабочее место…");
   await h.advance(1);
   assert.equal(h.els.state.textContent, viewFor({ state: "gave_up" }).text);
+  assert.deepEqual(h.navigations, []);                                               // срок вышел — не в чат
   const polls = h.count("GET /pcbk/api/workplace");
   assert.ok(polls >= GIVE_UP_S - 2 && polls <= GIVE_UP_S, String(polls));           // раз в 1 с
   await h.advance(10_000);
@@ -192,6 +195,7 @@ test("отказ места и сбой опроса", async () => {
   assert.equal(failed.els.state.textContent, "Не удалось подготовить рабочее место: " + detail);
   await failed.advance(5000);
   assert.equal(failed.count("GET /pcbk/api/workplace"), 1);
+  assert.deepEqual(failed.navigations, []);                                          // отказ — не в чат
 
   const flaky = harness({                                                            // core перезапускается
     "GET /pcbk/api/auth/me": [200, STU],
@@ -203,6 +207,7 @@ test("отказ места и сбой опроса", async () => {
   assert.equal(flaky.els.state.textContent, "Серверный слой не отвечает");
   await flaky.advance(2000);
   assert.equal(flaky.els.state.textContent, "Рабочее место готово");
+  assert.deepEqual(flaky.navigations, [CHAT_URL]);                                   // сбой опроса перетерпели
 
   const expired = harness({                                                          // сессия кончилась
     "GET /pcbk/api/auth/me": [200, STU],
@@ -215,6 +220,7 @@ test("отказ места и сбой опроса", async () => {
   assert.equal(expired.els.state.textContent, "Нужно войти");
   await expired.advance(5000);
   assert.equal(expired.count("GET /pcbk/api/workplace"), 1);
+  assert.deepEqual(expired.navigations, []);
 });
 
 test("ошибка входа остаётся на форме; core лежит — форма и причина", async () => {
@@ -299,6 +305,62 @@ test("ответ, пришедший после выхода или срока, 
   assert.equal(g.pending(), 0);
 });
 
+test("ready_navigates_to_chat_once", async () => {
+  assert.equal(CHAT_URL, "/chat/");
+  const h = harness({
+    "GET /pcbk/api/auth/me": NEED_LOGIN,
+    "POST /pcbk/api/auth/login": [200, STU],
+    "POST /pcbk/api/workplace/wake": [202, place("starting")],
+    "GET /pcbk/api/workplace": (n) => [200, place(n < 2 ? "starting" : "ready")],
+    "POST /pcbk/api/auth/logout": [200, {}],
+  });
+  await h.flush();
+  h.els.login.value = "stu-03";
+  h.els.password.value = "<test-pw>";
+  h.els["login-form"].fire("submit");
+  await h.flush();
+  assert.equal(h.els.state.textContent, "Готовлю рабочее место…");
+  await h.advance(1000);                                                             // опрос: ещё «starting»
+  assert.deepEqual(h.navigations, []);
+  assert.equal(h.els["to-chat"].hidden, true);
+  await h.advance(1000);                                                             // «ready»
+  assert.equal(h.els.state.textContent, "Рабочее место готово");
+  assert.deepEqual(h.navigations, [CHAT_URL]);
+  assert.equal(h.els["to-chat"].hidden, false);                                      // запасная ссылка «Открыть чат»
+  await h.advance(GIVE_UP_S * 1000);
+  assert.deepEqual(h.navigations, [CHAT_URL]);                                       // ровно один раз за ход ожидания
+  assert.equal(h.count("GET /pcbk/api/workplace"), 2);
+  h.els.logout.fire("click");                                                         // переход не случился — «Выйти» прячет ссылку
+  await h.flush();
+  assert.equal(h.els["to-chat"].hidden, true);
+
+  const ready = harness({                                                             // место уже готово — сразу в чат
+    "GET /pcbk/api/auth/me": [200, STU],
+    "POST /pcbk/api/workplace/wake": [200, place("ready")],
+  });
+  await ready.advance(GIVE_UP_S * 1000);
+  assert.deepEqual(ready.navigations, [CHAT_URL]);
+  assert.equal(ready.els["to-chat"].hidden, false);
+  assert.equal(ready.count("GET /pcbk/api/workplace"), 0);
+});
+
+test("teacher_never_navigates", async () => {
+  const TEACH = { login: "teach", role: "teacher", place: null };
+  const signedIn = harness({ "GET /pcbk/api/auth/me": [200, TEACH] });
+  const fresh = harness({ "GET /pcbk/api/auth/me": NEED_LOGIN, "POST /pcbk/api/auth/login": [200, TEACH] });
+  await fresh.flush();
+  fresh.els.login.value = "teach";
+  fresh.els.password.value = "<test-pw>";
+  fresh.els["login-form"].fire("submit");
+  for (const h of [signedIn, fresh]) {
+    await h.advance(GIVE_UP_S * 1000);
+    assert.equal(h.els.state.textContent, "У преподавателя нет рабочего места");
+    assert.deepEqual(h.navigations, []);                                             // у преподавателя чата нет
+    assert.equal(h.els["to-chat"].hidden, true);
+    assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
+  }
+});
+
 // --- статика: CSP без встроенного, без внешних ресурсов, без хранилищ --------------------------
 
 test("login.html: форма, модуль и стили файлами, ничего встроенного и внешнего", () => {
@@ -315,6 +377,7 @@ test("login.html: форма, модуль и стили файлами, нич�
   assert.match(html, />Войти</);
   assert.match(html, />Выйти</);
   assert.match(html, /Учебный стенд/);
+  assert.match(html, /<p id="to-chat" hidden><a href="\/chat\/">Открыть чат<\/a><\/p>/);  // до «готово» скрыта
 });
 
 test("login.js и login.css: без хранилищ, cookie, innerHTML и внешних адресов", () => {
@@ -326,19 +389,27 @@ test("login.js и login.css: без хранилищ, cookie, innerHTML и вн�
   assert.match(css, /\[hidden\]/);
 });
 
-test("index.html: ссылка «Войти» на /login, предупреждение стенда на месте", () => {
+test("index.html: ссылки «Войти» на /login и «Чат» на /chat/, предупреждение стенда на месте", () => {
   const html = read("../static/index.html");
   assert.match(html, /<a href="\/login">Войти<\/a>/);
+  assert.match(html, /<a href="\/chat\/">Чат<\/a>/);
+  assert.doesNotMatch(html, /появятся здесь позже/);
   assert.match(html, /Учебный стенд: не для ведения технологического процесса/);
 });
 
 // --- шаблон edge: то, что без nginx -t видно по тексту (сам nginx -t — задача А6) --------------
 
+// location с модификатором (= или ^~) и портом своего server: server-блоки идут подряд на верхнем уровне, так что
+// location принадлежит последнему server перед ним. Регулярных location (~, ~*) в шаблоне нет — разборщик их не видит
 function locations(conf) {
+  const servers = [...conf.matchAll(/^server\s*\{/gm)].map((m) => ({
+    at: m.index, port: Number(/^\s*listen\s+(\d+)/m.exec(conf.slice(m.index))[1]),
+  }));
   const out = [];
-  const re = /location\s+(=\s+)?(\S+)\s*\{/g;
+  const re = /location\s+(=|\^~)?\s*(\S+)\s*\{/g;
   let m;
   while ((m = re.exec(conf))) {
+    const at = m.index;
     let depth = 1;
     let i = re.lastIndex;
     for (; depth > 0 && i < conf.length; i++) {
@@ -346,7 +417,8 @@ function locations(conf) {
       else if (conf[i] === "}") depth--;
       else if (conf[i] === "'") i = conf.indexOf("'", i + 1);   // тела JSON в кавычках
     }
-    out.push({ exact: Boolean(m[1]), path: m[2], body: conf.slice(re.lastIndex, i - 1) });
+    const port = servers.filter((s) => s.at < at).at(-1)?.port;
+    out.push({ exact: m[1] === "=", mod: m[1] ?? "", path: m[2], port, body: conf.slice(re.lastIndex, i - 1) });
   }
   return out;
 }
@@ -354,7 +426,7 @@ function locations(conf) {
 test("шаблон edge: ошибки JSON на уровне server, пути шлюза, страница входа", () => {
   const conf = read("../pcbk.conf.template");
   const locs = locations(conf);
-  const loc = (path) => locs.find((l) => l.path === path);
+  const loc = (path) => locs.find((l) => l.path === path && l.port === 8443);
 
   for (const line of [
     'map $request_uri $pcbk_bad_api_uri {',
@@ -497,4 +569,57 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
   for (const line of ["proxy_buffering off;", "proxy_cache off;", "gzip off;", "proxy_read_timeout 90s;", "send_timeout 60s;"])
     assert.ok(stream.includes(line), line);
   assert.ok(loc("/status").body.includes("error_page 502 503 504 /watchdog-down.html;")); // страница состояния Д1 — своя
+});
+
+const CHAT_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; " +
+                 "font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";   // Д6-R41
+
+test("шаблон edge: чат на 8443 — свой CSP, кэш и сжатие ассетов; опись — только на 8080", () => {
+  const conf = read("../pcbk.conf.template");
+  const locs = locations(conf);
+  const one = (port, mod, path) => {
+    const found = locs.filter((l) => l.port === port && l.mod === mod && l.path === path);
+    assert.equal(found.length, 1, `${port} ${mod} ${path}`);
+    return found[0].body;
+  };
+  assert.deepEqual([...new Set(locs.map((l) => l.port))], [8443, 8080]);            // разборщик видит оба server
+  assert.ok(locs.some((l) => l.mod === "^~"));                                       // и location ^~
+
+  const redirect = one(8443, "=", "/chat");
+  assert.match(redirect, /absolute_redirect off;/);                                  // Location относительный (туннель)
+  assert.match(redirect, /return 301 \/chat\/;/);
+
+  const page = one(8443, "=", "/chat/");
+  const assets = one(8443, "^~", "/chat/assets/");
+  for (const [name, b] of [["/chat/", page], ["/chat/assets/", assets]]) {
+    assert.ok(b.includes(`add_header Content-Security-Policy "${CHAT_CSP}" always;`), name);
+    assert.ok(b.includes('add_header X-Content-Type-Options "nosniff" always;'), name);   // server-заголовки не наследуются
+    assert.ok(b.includes('add_header Referrer-Policy "no-referrer" always;'), name);
+    assert.equal(b.match(/add_header Cache-Control /g)?.length, 1, name);
+    assert.doesNotMatch(b, /unsafe-|data:|blob:|proxy_pass/, name);
+  }
+  assert.ok(page.includes('add_header Cache-Control "no-store" always;'));
+  assert.match(page, /charset utf-8;/);
+  assert.match(page, /try_files \/chat\/index\.html =404;/);
+  assert.doesNotMatch(page, /gzip/);
+  for (const line of ["add_header Cache-Control $pcbk_asset_cache always;", "gzip on;",
+                      "gzip_types application/javascript text/javascript text/css;", "gzip_vary on;", "try_files $uri =404;"])
+    assert.ok(assets.includes(line), line);
+  assert.ok(conf.includes('map $status $pcbk_asset_cache {\n    default "no-store";\n' +       // год — только у файла
+                          '    200     "public, max-age=31536000, immutable";\n' +
+                          '    304     "public, max-age=31536000, immutable";\n}'));
+
+  assert.match(one(8443, "^~", "/chat/"), /return 404 /);                             // build.json и прочее — не на 8443
+  assert.match(one(8443, "=", "/favicon.ico"), /return 204;/);                         // решение по А4: без 404 иконки
+  assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/chat")).length, 4);
+
+  // карта CSP /pcbk/api/ (Д5б) /chat/ не накрывает: иначе default-src 'none' второй строкой заголовка
+  const api = new RegExp(/map \$uri \$pcbk_api_csp \{\n\s*default "";\n\s*"~([^"]+)"/.exec(conf)[1]);
+  assert.ok(api.test("/pcbk/api/oc/session") && api.test("/pcbk-errors/503.json"));   // положительный контроль
+  for (const path of ["/chat", "/chat/", "/chat/assets/index-abc.js", "/chat/build.json", "/favicon.ico"])
+    assert.equal(api.test(path), false, path);
+
+  // 8080 (А1, Д6-R46): страница и опись для сторожа — тот же корень, без TLS
+  assert.match(one(8080, "=", "/chat/"), /root \/usr\/share\/nginx\/pcbk;\s*try_files \/chat\/index\.html =404;/);
+  assert.match(one(8080, "^~", "/chat/"), /root \/usr\/share\/nginx\/pcbk;\s*try_files \$uri =404;/);
 });

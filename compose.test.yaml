@@ -9,6 +9,26 @@ services:
   edge:
     ports: !override
       - "127.0.0.1:18443:8443"
+    # статика — копия edge/static со сборкой чата во временном каталоге фикстуры (Д6а, А6): сборка тестов не пишет в
+    # общее дерево. !override заменяет список целиком — прочие привязки повторены как в compose.yaml
+    volumes: !override
+      - type: bind
+        source: ./edge/pcbk.conf.template
+        target: /etc/nginx/templates/pcbk.conf.template
+        read_only: true
+      - type: bind
+        source: ${PCBK_TEST_STATIC:?PCBK_TEST_STATIC не задан}
+        target: /usr/share/nginx/pcbk
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TLS_DIR:?TLS_DIR не задан}
+        target: /etc/nginx/tls
+        read_only: true
+        bind:
+          create_host_path: false
+      - {type: volume, source: pcbk-edge-temp, target: /var/lib/pcbk-edge}
 
   # опрос свежести и OpenRouter чаще: строки историана и LLM меняются за секунды, а не за минуты;
   # вместо OpenRouter — двойник (ключи стенда — его заглушки, настоящий ключ сюда не попадает);
