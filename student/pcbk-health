@@ -37,10 +37,11 @@ if [ "$word" = failed ]; then
   mark=/tmp/pcbk-mcp-retry
   printf -v now '%(%s)T' -1
   last=$(stat -c %Y "$mark" 2>/dev/null)
-  if ! [[ $last =~ ^[0-9]+$ ]] || (( now - last >= 50 )); then
+  # метка из будущего (часы шагнули назад) — тоже старая: иначе попыток не было бы до её срока
+  if ! [[ $last =~ ^[0-9]+$ ]] || (( now - last >= 50 )) || (( last > now )); then
     # без метки нет и попытки: иначе предел «раз в 60 с» не держится
     if touch "$mark" 2>/dev/null && { exec 3<>/dev/tcp/127.0.0.1/4096; } 2>/dev/null; then
-      # ответа не ждём: обрыв клиента connect не прерывает
+      # ответа не ждём; что обрыв клиента connect не прерывает — не проверено (К28), живьём — задача 6, шаг 3
       printf 'POST /mcp/pcbk/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' "$auth" >&3 2>/dev/null \
         && read -r -t 0.4 _ <&3 2>/dev/null
       exec 3<&-

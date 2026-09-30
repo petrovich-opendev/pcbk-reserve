@@ -15,8 +15,10 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "student" / "config"
 SEC = 10 ** 9
 # без этих правил студент одобряет чтение вне /work, и пароль из /proc/self/environ уходит в разговор;
-# "task": "deny" убирает инструмент task из запроса к модели — подагентов нет (Д4б-R20)
-PERMISSION = {"external_directory": "deny", "task": "deny",
+# "task": "deny" убирает инструмент task из запроса к модели — подагентов нет (Д4б-R20); "webfetch": "deny" —
+# интернета у стенда нет, тело каждого запроса короче (оценка — байт на токен), ручки core без токена из места
+# не читаются (до Д5)
+PERMISSION = {"external_directory": "deny", "task": "deny", "webfetch": "deny",
               "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}}
 # MCP службы данных: токен места — файлом, без OAuth (Д4б-R19)
 MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True, "oauth": False,
@@ -24,6 +26,7 @@ MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True
 # окно каждой модели: раннее сжатие разговора — защита бюджета (Д4б-R20)
 LIMIT = {"limit": {"context": 131072, "output": 16000}}
 # поддельная модель на Bun из бинарника OpenCode: первый ход — read /proc/self/environ, потом текст;
+# имена инструментов каждого запроса с инструментами — строкой «tools [...]» в свой журнал;
 # вне /llm/ — 404: иначе она отвечала бы и на /mcp, OpenCode ждал бы MCP свои 30 с (DEFAULT_TIMEOUT,
 # mcp/index.ts:38) и только потом звал модель, а срок CLIENT_JS — 20 с; с 404 MCP сразу failed
 FAKE_LLM_JS = """\
@@ -33,6 +36,7 @@ const chunk = (delta, finish) => "data: " + JSON.stringify({id: "c1", object: "c
 Bun.serve({hostname: "0.0.0.0", port: 8000, async fetch(req) {
   if (!new URL(req.url).pathname.startsWith("/llm/")) return new Response("", {status: 404})
   const body = await req.json().catch(() => ({}))
+  if ((body.tools || []).length) console.log("tools " + JSON.stringify(body.tools.map(t => t.function?.name)))
   const call = (body.tools || []).some(t => t.function?.name === "read")
     && !(body.messages || []).some(m => m.role === "tool")
   const delta = call
@@ -227,12 +231,13 @@ def test_health_reports_mcp_without_core(student_image, tmp_path):             #
         r = docker("exec", cid, "/usr/local/bin/pcbk-health")
         assert (r.returncode, r.stdout, r.stderr) == (0, "200 mcp=failed\n", "")    # ни пароля, ни ошибок bash
         assert mark() == first                                  # не чаще раза в 60 с
-        # граница — «не меньше 50 с»: 48 с — рано (запас на секунду между exec), 50 с — новая попытка
+        # граница — «не меньше 50 с»: 48 с — рано (запас на секунду между exec), 50 с — новая попытка;
+        # метка на час в будущем (часы шагнули назад) — старая, иначе попыток не было бы час
         now = int(ok(docker("exec", cid, "date", "+%s")).stdout)
-        for age, retried in ((48, False), (50, True)):
+        for age, retried in ((48, False), (50, True), (-3600, True)):
             ok(docker("exec", cid, "touch", "-d", f"@{now - age}", "/tmp/pcbk-mcp-retry"))
             assert docker("exec", cid, "/usr/local/bin/pcbk-health").stdout == "200 mcp=failed\n"
-            assert (int(mark()) >= now) is retried, age
+            assert (mark() != str(now - age)) is retried, age
     finally:
         docker("rm", "-f", cid)
 
@@ -277,6 +282,10 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
             time.sleep(1)
         r = ok(docker("exec", "-e", "BUN_BE_BUN=1", cid, "/usr/local/bin/opencode", "-e", CLIENT_JS, timeout=60))
         out = json.loads(r.stdout)
+        # инструменты в запросах к модели: запрет по правилу с шаблоном * убирает их из запроса
+        sent = [json.loads(line[len("tools "):]) for line in ok(docker("logs", cids[0])).stdout.splitlines()
+                if line.startswith("tools ")]
+        assert sent and all("read" in names for names in sent)         # журнал модели прочитан
         tools = [p for m in out["messages"] for p in m["parts"] if p["type"] == "tool"]
         assert out["prompt"] == 204 and [p["tool"] for p in tools] == ["read"]
         assert tools[0]["state"]["input"] == {"filePath": "/proc/self/environ"}
@@ -285,7 +294,9 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
             assert out["asked"] == [] and tools[0]["state"]["status"] == "error"
             assert "rule which prevents you" in tools[0]["state"]["error"]    # отказ по правилу, не сбой
             assert "probe-secret" not in json.dumps(out["messages"])
+            assert not {"task", "webfetch"} & set().union(*sent)
         else:
+            assert {"task", "webfetch"} <= set().union(*sent)                # без правил — есть: проверка видит
             assert [(a["permission"], a["metadata"]["filepath"]) for a in out["asked"]] == \
                    [("external_directory", "/proc/self/environ")]
     finally:
