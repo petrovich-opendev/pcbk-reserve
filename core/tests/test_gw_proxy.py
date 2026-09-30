@@ -2,6 +2,8 @@
 месту собирается заново, пароль места — только от шлюза, 401 места — 502, ответ места — не больше предела и только
 с Content-Type, срок хода, агенты и разрешения по списку места, журнал отказов без строки запроса. Места и sp-ctl —
 двойники задачи А3."""
+import asyncio
+import gc
 import re
 import time
 
@@ -9,10 +11,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from fake_places import BIG_CHUNK
-from helpers import ORIGIN, login, make_gateway, oc_headers, wait_until
-from pcbk_core.gateway import proxy
-from pcbk_core.gateway.proxy import PROXY_MESSAGES, UPSTREAM_MAX_BYTES
+from fake_places import BIG_CHUNK, LoopPlace
+from helpers import (ORIGIN, PW, login, make_gateway, make_places, oc_headers, serve_app, wait_until,
+                     wait_until_async)
+from pcbk_core.gateway import places, proxy
+from pcbk_core.gateway.api import GW_MESSAGES
+from pcbk_core.gateway.places import PLACE_CONNECTIONS, PlaceAnswer
+from pcbk_core.gateway.proxy import OCTET_STREAM, PROXY_MESSAGES, PROXY_QUEUE, UPSTREAM_MAX_BYTES
 from pcbk_core.gateway.rules import EXAMPLE_IDS, RULE_MESSAGES
 from pcbk_core.settings import GW_ERROR_CHARS, GatewaySettings
 
@@ -147,8 +152,14 @@ def test_teacher_origin_and_zone(gw):
     r = c.post("/pcbk/api/oc/session", content=b"x" * (524288 + 1),
                headers=oc_headers(**{"Content-Type": "application/json"}))
     assert (r.status_code, r.json()["name"]) == (413, "PayloadTooLarge")              # refusal= у body_limit
-    with TestClient(c.app, base_url="http://172.31.3.2:8000") as place_side:
-        assert place_side.get("/pcbk/api/oc/session/status").status_code == 404        # из сети места — не видно
+    # доводка G6: клиент из сети места — без with (второй lifespan той же роли не нужен), с действующей cookie
+    session = {"Cookie": f"pcbk_session={c.cookies.get('pcbk_session')}", "Origin": ORIGIN}
+    place_side = TestClient(c.app, base_url="http://172.31.3.2:8000")
+    for method, path in (("GET", "/pcbk/api/oc/session/status"), ("POST", "/pcbk/api/oc/session"),
+                         ("GET", "/pcbk/api/oc/event"), ("GET", "/pcbk/api/oc"), ("GET", "/pcbk/api/oc/config")):
+        r = place_side.request(method, path, headers=session)
+        assert (r.status_code, r.json()["name"]) == (404, "NotFound"), path            # из сети места — не видно
+    assert c.get("/pcbk/api/oc/session/status").status_code == 200                     # сессия жива
     login(c, "teach")
     assert c.get("/pcbk/api/oc/session/status").status_code == 403
 
@@ -267,6 +278,7 @@ def test_messages_shared_with_rules():                                          
         "permission": "Это разрешение даёт только преподаватель",
         "too_big": "Ответ рабочего места слишком большой",
         "streams": "Открыто слишком много вкладок чата — закройте лишние",
+        "busy": "Слишком много одновременных запросов — повторите позже",
     }
 
 
@@ -370,8 +382,13 @@ def test_not_ready_counts_nothing_and_rolls_per_minute(gw, gwlog):              
     role.mono.advance(60)
     c.get("/pcbk/api/oc/session/status")
     text = gwlog.text
-    assert text.count("reason=not_ready") == 2 and "reason=not_ready status=503 n=1" in text
-    assert "reason=not_ready status=503 n=5" in text
+    assert text.count("reason=not_ready") == 2 and "reason=not_ready status=503 n=1 since_s=0" in text
+    assert "reason=not_ready status=503 n=5 since_s=60" in text                        # G8: сколько копились
+    role.mono.advance(1)
+    c.get("/pcbk/api/oc/session/status")                                                 # свёрнут
+    role.mono.advance(3600)
+    c.get("/pcbk/api/oc/session/status")
+    assert "reason=not_ready status=503 n=2 since_s=3600" in gwlog.text                 # старое число — с давностью
     assert (role.stats.count_1h("refused"), role.stats.count_1h("upstream_failed")) == (0, 0)
 
 
@@ -435,3 +452,290 @@ def test_forward_log_line(gw, gwlog):
     text = gwlog.text
     assert re.search(r"gw oc login=stu-03 place=03 rule=session_status status=200 ms=[0-9]+", text)
     assert "U0VDUkVUVkFMVUU" not in text and "auth_token" not in text
+
+
+# --- доводка 1 (ревью A и B) ---
+
+STATUS = "/pcbk/api/oc/session/status"
+
+
+async def cookie_of(client: httpx.AsyncClient, name: str) -> dict:
+    """Вход по HTTP (serve_app): заголовок Cookie с pcbk_session. Сам клиент cookie Secure по http не шлёт."""
+    r = await client.post("/pcbk/api/auth/login", json={"login": name, "password": PW}, headers={"Origin": ORIGIN})
+    assert r.status_code == 200
+    line = next(h for h in r.headers.get_list("set-cookie") if h.startswith("pcbk_session="))
+    return {"Cookie": line.split(";", 1)[0]}
+
+
+async def loop_places(monkeypatch, hold: asyncio.Event) -> tuple[LoopPlace, LoopPlace]:
+    """Места 3 (ждёт hold) и 5 на петле: 127.0.3.3 и 127.0.5.3 на одном порту (PLACE_PORT подменён)."""
+    p3, p5 = LoopPlace(hold), LoopPlace()
+    port = await p3.start("127.0.3.3")
+    await p5.start("127.0.5.3", port)
+    monkeypatch.setattr(places, "PLACE_PORT", port)
+    return p3, p5
+
+
+async def test_flood_of_one_place_spares_neighbour(tmp_path, monkeypatch):             # G1 (проба A-P2)
+    hold = asyncio.Event()
+    p3, p5 = await loop_places(monkeypatch, hold)
+    app, role = make_gateway(tmp_path, ready=(3, 5), STU_NET="127.0")
+    role.workplaces._transport = None                                                    # настоящие сокеты
+    try:
+        with serve_app(app) as url:
+            wait_until(lambda: role.workplaces.ticks >= 1)
+            async with httpx.AsyncClient(base_url=url, trust_env=False, timeout=10) as client:
+                c3, c5 = await cookie_of(client, "stu-03"), await cookie_of(client, "stu-05")
+                flood = [asyncio.create_task(client.get(STATUS, headers=c3)) for _ in range(20)]
+                try:
+                    await wait_until_async(lambda: sum(t.done() for t in flood) >= 20 - PROXY_QUEUE - 2
+                                           and p3.active == 2)
+                    t = time.monotonic()
+                    r5 = await client.get(STATUS, headers=c5)
+                    assert r5.status_code == 200 and time.monotonic() - t < 1            # соседу потоп не мешает
+                finally:
+                    hold.set()                                                           # uvicorn не ждёт висящих
+                    answers = await asyncio.gather(*flood)
+    finally:
+        await p3.close()
+        await p5.close()
+    assert sorted(r.status_code for r in answers) == [200] * (PROXY_QUEUE + 2) + [503] * (20 - PROXY_QUEUE - 2)
+    assert {r.json()["data"]["message"] for r in answers if r.status_code == 503} == {PROXY_MESSAGES["busy"]}
+    assert {r.json()["name"] for r in answers if r.status_code == 503} == {"WorkplaceBusy"}
+    assert p3.max_active == 2 and role.workplaces.is_ready(3) and role.workplaces.is_ready(5)
+    assert (role.stats.count_1h("upstream_failed"), role.stats.count_1h("refused")) == (0, 20 - PROXY_QUEUE - 2)
+
+
+async def test_place_clients_have_own_pools(tmp_path, monkeypatch):                     # G1: пул — свой у места
+    hold = asyncio.Event()
+    p3, p5 = await loop_places(monkeypatch, hold)
+    w = make_places(tmp_path, STU_NET="127.0")
+    w._transport = None
+    stuck = [asyncio.create_task(w.fetch(3, "GET", "/session/status", max_bytes=1024)) for _ in range(120)]
+    try:
+        await wait_until_async(lambda: p3.conns >= PLACE_CONNECTIONS)
+        t = time.monotonic()
+        answer = await w.fetch(5, "GET", "/session/status", max_bytes=1024)             # общий пул в 100 был бы занят
+        assert answer.status == 200 and time.monotonic() - t < 2
+        assert p3.max_conns == PLACE_CONNECTIONS                                         # больше пул места не открывает
+    finally:
+        hold.set()
+        done = await asyncio.gather(*stuck, return_exceptions=True)
+        await w.aclose()
+        await p3.close()
+        await p5.close()
+    assert all(isinstance(d, PlaceAnswer) and d.status == 200 for d in done)
+
+
+async def test_queue_past_deadline_is_busy_not_silence(tmp_path, monkeypatch):         # G1: не дождался очереди
+    app, role = make_gateway(tmp_path, ready=(3,))
+    place = role.fake_places
+    place.hang_for[3] = 1.0
+    with serve_app(app) as url:
+        wait_until(lambda: role.workplaces.ticks >= 1)
+        async with httpx.AsyncClient(base_url=url, trust_env=False, timeout=10) as client:
+            c3 = await cookie_of(client, "stu-03")
+            first = [asyncio.create_task(client.get(STATUS, headers=c3)) for _ in range(2)]
+            await wait_until_async(lambda: place.active[3] == 2)
+            monkeypatch.setattr(proxy, "PROXY_DEADLINE_S", 0.3)                         # третьему — короткий срок
+            t = time.monotonic()
+            r = await client.get(STATUS, headers=c3)
+            waited = time.monotonic() - t
+            answers = await asyncio.gather(*first)
+    assert (r.status_code, r.json()["name"]) == (503, "WorkplaceBusy") and 0.25 < waited < 0.9
+    assert [a.status_code for a in answers] == [200, 200] and place.max_active[3] == 2
+    assert role.workplaces.is_ready(3)
+    assert (role.stats.count_1h("upstream_failed"), role.stats.count_1h("refused")) == (0, 1)
+
+
+async def test_slot_held_until_answer_sent(tmp_path, monkeypatch):                      # G1: ответ в памяти — со слотом
+    app, role = make_gateway(tmp_path, ready=(3,))
+    place, sent, got = role.fake_places, asyncio.Event(), []
+
+    async def call(send) -> None:                                                        # ASGI напрямую: отправкой правит тест
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http",
+                 "path": STATUS, "raw_path": STATUS.encode(), "query_string": b"", "root_path": "",
+                 "headers": [(b"host", b"127.0.0.1:8000"), (b"cookie", f"pcbk_session={token}".encode())],
+                 "server": ("127.0.0.1", 8000), "client": ("127.0.0.1", 40000)}
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await app(scope, receive, send)
+
+    async def slow(message: dict) -> None:                                               # браузер не забирает тело
+        if message["type"] == "http.response.body":
+            await sent.wait()
+
+    async def keep(message: dict) -> None:
+        got.append(message)
+
+    async with role.lifespan():
+        token = await asyncio.to_thread(role.store.open_session, "stu-03")
+        slow_calls = [asyncio.create_task(call(slow)) for _ in range(2)]
+        await wait_until_async(lambda: len(place.requests) == 2)                         # ответы места уже получены
+        monkeypatch.setattr(proxy, "PROXY_DEADLINE_S", 0.3)
+        await call(keep)
+        assert got[0]["status"] == 503 and b"WorkplaceBusy" in got[1]["body"] and len(place.requests) == 2
+        sent.set()
+        await asyncio.gather(*slow_calls)
+        got.clear()
+        await call(keep)
+        assert got[0]["status"] == 200                                                   # отправка вернула слоты
+
+
+async def test_place_response_always_releases_slot():                                   # G1: слот не теряется
+    released = []
+    r = proxy._PlaceResponse(b"{}", 200, None, lambda: released.append("send"))
+
+    async def gone(message: dict) -> None:
+        raise OSError("браузер ушёл")
+    with pytest.raises(OSError):
+        await r({"type": "http"}, None, gone)
+    r2 = proxy._PlaceResponse(b"{}", 200, None, lambda: released.append("gc"))
+    del r2                                                                               # не отправлялся вовсе
+    gc.collect()
+    assert released == ["send", "gc"]
+
+
+async def test_place_answer_sent_in_chunks():                                           # G1: буфер сокета не копит тело
+    body, sent, released = bytearray(b"x" * (3 * proxy.SEND_CHUNK + 1)), [], []
+    r = proxy._PlaceResponse(body, 200, {"content-type": "application/json"}, lambda: released.append(len(sent)))
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+    await r({"type": "http"}, None, send)
+    chunks = [m["body"] for m in sent[1:]]
+    assert sent[0]["status"] == 200 and (b"content-length", str(len(body)).encode()) in sent[0]["headers"]
+    assert [len(c) for c in chunks] == [proxy.SEND_CHUNK] * 3 + [1, 0] and b"".join(chunks) == body
+    assert [m["more_body"] for m in sent[1:]] == [True] * 4 + [False] and released == [len(sent)]   # слот — в конце
+
+
+def test_pool_timeout_is_busy(gw, gwlog):                                                # G1
+    c, role, place = gw
+    place.raise_for[3] = httpx.PoolTimeout("пул места занят")
+    r = c.get(STATUS)
+    assert (r.status_code, r.json()) == (503, {"name": "WorkplaceBusy", "data": {"message": PROXY_MESSAGES["busy"]}})
+    assert role.workplaces.is_ready(3) and "reason=busy status=503" in gwlog.text
+    assert (role.stats.count_1h("upstream_failed"), role.stats.count_1h("refused")) == (0, 1)
+
+
+def test_deadline_spans_check_and_forward(gw, monkeypatch):                              # G2: срок — на весь ход
+    c, role, place = gw
+    monkeypatch.setattr(proxy, "PROXY_DEADLINE_S", 0.6)
+    place.agents[3] = [{"name": "probe", "native": False, "mode": "primary"}]
+    place.hang_for[3] = 0.4                                                              # каждый шаг — меньше срока
+    r = c.post(f"/pcbk/api/oc/session/{SES}/prompt_async",
+               json={"parts": [{"type": "text", "text": "x"}], "agent": "probe"}, headers=oc_headers())
+    assert (r.status_code, r.json()["data"]["message"]) == (503, PROXY_MESSAGES["no_answer"])
+    assert [x.path for x in place.requests] == ["/agent", f"/session/{SES}/prompt_async"]
+    assert role.stats.count_1h("upstream_failed") == 1 and not role.workplaces.is_ready(3)
+
+
+def test_counters_exact_on_limit_and_auth(gw):                                          # G2: счётчики точны
+    c, role, place = gw
+    url = f"/pcbk/api/oc/session/{SES}/message"
+    place.force_status[3] = (200, {"content-length": str(UPSTREAM_MAX_BYTES)})
+    assert c.get(url).status_code == 200                                                 # ровно предел — проходит
+    place.force_status[3] = (200, {"content-length": str(UPSTREAM_MAX_BYTES + 1)})
+    r = c.get(url)
+    assert (r.status_code, r.json()["data"]["message"]) == (502, PROXY_MESSAGES["too_big"])
+    place.force_status[3] = (401, {})
+    r = c.get(url)
+    assert (r.status_code, r.json()["data"]["message"]) == (502, PROXY_MESSAGES["place_auth"])
+    assert (role.stats.count_1h("upstream_failed"), role.stats.count_1h("refused"),
+            role.stats.count_1h("place_auth_failed")) == (0, 0, 1)
+    assert role.workplaces.is_ready(3)
+
+
+def test_place_cookies_not_returned(gw):                                                 # G3
+    c, _, place = gw
+    place.force_status[3] = (200, {"set-cookie": "sid=place-secret; Path=/"})
+    r = c.get(STATUS)
+    assert r.status_code == 200 and "set-cookie" not in r.headers and "sid" not in c.cookies
+    del place.force_status[3]
+    assert c.get(STATUS).status_code == 200
+    assert "cookie" not in place.requests[-1].headers                                    # месту не вернулась
+
+
+def test_place_redirect_not_followed(gw):                                                # G4
+    c, _, place = gw
+    for target in ("http://172.31.5.3:4096/session/status",                              # чужое место
+                   "http://pcbk-sp-ctl:2375/v1.44/containers/pcbk-student-05/start"):    # прокси сокета
+        place.force_status[3] = (307, {"location": target})
+        r = c.get(STATUS, follow_redirects=False)
+        assert r.status_code == 307 and "location" not in r.headers, target
+    assert {x.url.host for x in place.requests} == {"172.31.3.3"} and len(place.requests) == 2
+
+
+def test_post_without_origin_refused(gw):                                                # G5
+    c, role, place = gw
+    r = c.post(f"/pcbk/api/oc/session/{SES}/abort")                                     # ни Origin, ни Sec-Fetch-Site
+    assert (r.status_code, r.json()) == (403, {"name": "Forbidden", "data": {"message": GW_MESSAGES["origin"]}})
+    assert role.stats.count_1h("refused") == 1 and place.requests == []
+
+
+def test_place_content_type_narrowed(gw):                                                # G7
+    c, _, place = gw
+    cases = {"application/json": "application/json",
+             "application/json; charset=utf-8": "application/json; charset=utf-8",
+             "text/plain;charset=utf-8": "text/plain;charset=utf-8", "Application/JSON": "Application/JSON",
+             "text/html; charset=utf-8": OCTET_STREAM, "image/svg+xml": OCTET_STREAM,
+             "text/event-stream": OCTET_STREAM, "application/jsonp": OCTET_STREAM,
+             "application/json-patch+json": OCTET_STREAM, "text/xml": OCTET_STREAM}
+    for given, shown in cases.items():
+        place.force_status[3] = (200, {"content-type": given})
+        r = c.get(STATUS)
+        assert (r.status_code, r.headers["content-type"], r.content) == (200, shown, b'{"name":"Forced"}'), given
+    del place.force_status[3]
+    r = c.post(f"/pcbk/api/oc/session/{SES}/prompt_async", json={"parts": [{"type": "text", "text": "x"}]},
+               headers=oc_headers())
+    assert r.status_code == 204 and "content-type" not in r.headers                      # нет — и не придумывается
+
+
+def test_not_ready_rolled_per_place(gw, gwlog):                                          # G9
+    c, role, _ = gw
+    role.workplaces.mark_unready(3)
+    c.get(STATUS)
+    login(c, "stu-05")                                                                   # место 5 не готово
+    c.get(STATUS)
+    text = gwlog.text
+    assert text.count("reason=not_ready") == 2
+    assert "place=03 method=GET path=/session/status reason=not_ready" in text
+    assert "place=05 method=GET path=/session/status reason=not_ready" in text
+
+
+def test_bad_body_is_not_activity(gw):                                                   # G9
+    c, role, place = gw
+    role.mono.advance(100)
+    r = c.post(f"/pcbk/api/oc/session/{SES}/prompt_async", content=b"{", headers=oc_headers())
+    assert r.status_code == 400 and role.workplaces.idle_s(3) >= 100 and place.requests == []
+
+
+def test_oc_lines_for_mapped_answers(gw, gwlog):                                         # G9
+    c, _, place = gw
+    assert c.post(f"/pcbk/api/oc/session/{SES}/summarize", headers=oc_headers()).status_code == 200
+    place.force_status[3] = (200, {"content-length": str(UPSTREAM_MAX_BYTES + 1)})
+    assert c.get(STATUS).status_code == 502
+    place.force_status[3] = (401, {})
+    assert c.get(STATUS).status_code == 502
+    text = gwlog.text
+    assert re.search(r"gw oc login=stu-03 place=03 rule=summarize status=200 ms=[0-9]+", text)
+    assert re.search(r"gw oc login=stu-03 place=03 rule=session_status status=502 ms=[0-9]+ reason=too_big", text)
+    assert re.search(r"gw oc login=stu-03 place=03 rule=session_status status=502 ms=[0-9]+ reason=place_auth", text)
+
+
+def test_check_place_status_logged(gw, gwlog):                                          # G10
+    c, _, place = gw
+    place.check_status[3] = 500
+    r = c.post(f"/pcbk/api/oc/session/{SES}/prompt_async",
+               json={"parts": [{"type": "text", "text": "x"}], "agent": "probe"}, headers=oc_headers())
+    assert (r.status_code, r.json()["data"]["message"]) == (400, "Агент «probe» недоступен")    # текст прежний
+    r = c.post(f"/pcbk/api/oc/permission/{PER}/reply", json={"reply": "once"}, headers=oc_headers())
+    assert (r.status_code, r.json()["data"]["message"]) == (403, PROXY_MESSAGES["permission"])
+    del place.check_status[3]
+    c.post(f"/pcbk/api/oc/session/{SES}/prompt_async",
+           json={"parts": [{"type": "text", "text": "x"}], "agent": "probe"}, headers=oc_headers())
+    lines = [line for line in gwlog.text.splitlines() if "gw refused" in line]
+    assert lines[0].endswith("reason=agent status=400 place_status=500")
+    assert lines[1].endswith("reason=permission status=403 place_status=500")
+    assert lines[2].endswith("reason=agent status=400")                                  # 200 места — без кода

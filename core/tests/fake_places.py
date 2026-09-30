@@ -170,8 +170,10 @@ class FakePlaces:
     - GET /session/status — {} (после status_delay), у мест из busy — одна занятая сессия, у мест из status_raw —
       эти байты как тело 200 (неверный ответ места);
     - GET /permission — pending[n] (по умолчанию []);
+    - check_status[n] — этот код и {"name": "Check"} на GET /agent и GET /permission (сверки прокси);
     - POST /session/{id}/prompt_async — 204; прочее — 200 {}.
-    agent_calls[n] — сколько раз звали /agent места n. /event — задача Б4.
+    agent_calls[n] — сколько раз звали /agent места n; active[n] — запросов к месту n в работе сейчас, max_active[n]
+    — наибольшее их число (от записи запроса до ответа). /event — задача Б4.
     """
 
     def __init__(self, *, ready_after: int = 1, never_ready: bool = False, wrong_pw: bool = False,
@@ -191,7 +193,10 @@ class FakePlaces:
         self.hang_for: dict[int, float] = {}
         self.big: dict[int, int] = {}
         self.big_sent: Counter[int] = Counter()
+        self.check_status: dict[int, int] = {}
         self.agent_calls: Counter[int] = Counter()
+        self.active: Counter[int] = Counter()
+        self.max_active: Counter[int] = Counter()
         self.requests: list[Recorded] = []
 
     async def _big_body(self, n: int, size: int):
@@ -208,6 +213,14 @@ class FakePlaces:
             raise httpx.ConnectError("нет такого места", request=request)
         n = int(m[1])
         self.requests.append(_record(request))
+        self.active[n] += 1
+        self.max_active[n] = max(self.max_active[n], self.active[n])
+        try:
+            return await self._answer(request, n)
+        finally:
+            self.active[n] -= 1
+
+    async def _answer(self, request: httpx.Request, n: int) -> httpx.Response:
         if n in self.raise_for:
             raise self.raise_for[n]
         if self.hang_for.get(n):
@@ -224,6 +237,8 @@ class FakePlaces:
             return httpx.Response(200, headers={"content-type": "application/json"},
                                   content=self._big_body(n, self.big[n]))
         path = request.url.path
+        if request.method == "GET" and path in ("/agent", "/permission") and n in self.check_status:
+            return _json(self.check_status[n], {"name": "Check"})
         if request.method == "GET" and path == "/agent":
             self.agent_calls[n] += 1
             if self.agent_delay:
@@ -242,3 +257,58 @@ class FakePlaces:
         if request.method == "POST" and _PROMPT_ASYNC.fullmatch(path):
             return httpx.Response(204)
         return _json(200, {})
+
+
+class LoopPlace:
+    """Место на петле (доводка Б3, G1): настоящий сервер asyncio, HTTP/1.1 от руки, пароль не сверяется. На любой
+    запрос — 200 {} после hold (если задан). conns/max_conns — открытые соединения, active/max_active — запросы в
+    работе. Пулы соединений httpx видны только на настоящих сокетах, MockTransport их не имеет."""
+
+    def __init__(self, hold: asyncio.Event | None = None):
+        self.hold = hold
+        self.conns = self.max_conns = self.active = self.max_active = self.served = 0
+        self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+
+    async def start(self, host: str, port: int = 0) -> int:
+        """Слушать host:port (0 — выберет ядро); отдаёт порт."""
+        self._server = await asyncio.start_server(self._conn, host, port)
+        return self._server.sockets[0].getsockname()[1]
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+        for writer in list(self._writers):
+            writer.close()
+        if self.hold is not None:
+            self.hold.set()
+
+    async def _conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.add(writer)
+        self.conns += 1
+        self.max_conns = max(self.max_conns, self.conns)
+        try:
+            while await reader.readline():               # строка запроса; пусто — соединение закрыто
+                length = 0
+                while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
+                    name, _, value = line.partition(b":")
+                    if name.strip().lower() == b"content-length":
+                        length = int(value)
+                if length:
+                    await reader.readexactly(length)
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    if self.hold is not None:
+                        await self.hold.wait()
+                finally:
+                    self.active -= 1
+                self.served += 1
+                writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}")
+                await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            self.conns -= 1
+            self._writers.discard(writer)
+            writer.close()

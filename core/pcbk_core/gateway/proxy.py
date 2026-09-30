@@ -17,14 +17,22 @@ Starlette ведёт маршрут по раскодированному path, 
 WorkplaceNotReady. Не-GET — активность места (touch) до пересылки. Проверка агента или разрешения и пересылка —
 под одним сроком PROXY_DEADLINE_S.
 
-Ответ места: 401 — 502 place_auth (place_auth_failed); нет ответа (любая httpx.HTTPError, OSError, срок хода) —
-503 no_answer, место неготово, upstream_failed; ответ больше UPSTREAM_MAX_BYTES — 502 too_big (читается кусками,
-дальше предела не идёт); иначе тот же код и тело, из заголовков — только Content-Type.
+Занятость (доводка Б3, G1): к одному месту разом — не больше PROXY_PARALLEL вызовов (сверка, пересылка и отправка
+ответа браузеру — один вызов: слот отдаёт _PlaceResponse, когда ответ отправлен), ждущих — не больше PROXY_QUEUE;
+сверх очереди, не дождавшийся места до срока хода и PoolTimeout клиента места — 503 WorkplaceBusy «busy»: отказ со
+счётчиком refused, место остаётся готовым, upstream_failed не растёт. Так ответы мест в памяти прокси — не больше
+10 мест × PROXY_PARALLEL, а потоп одного студента не трогает соседа: у места свой клиент и свой пул соединений
+(places.PLACE_CONNECTIONS).
+
+Ответ места: 401 — 502 place_auth (place_auth_failed); нет ответа (любая иная httpx.HTTPError, OSError, срок
+хода у места) — 503 no_answer, место неготово, upstream_failed; ответ больше UPSTREAM_MAX_BYTES — 502 too_big
+(читается кусками, дальше предела не идёт); иначе тот же код и тело, из заголовков — только Content-Type: как
+есть — application/json и text/plain (G7), прочий — application/octet-stream.
 
 Журнал (Д5-R37): отказ — строка «gw refused» (login, place, method, path до LOG_PATH_CHARS без строки запроса,
-reason, status) и счётчик refused; отказы not_ready — одна строка на место за NOT_READY_LOG_S с числом, без
-счётчика; вызов места — строка «gw oc». Ни строки запроса, ни тел, ни заголовков, ни имени агента; исключения —
-только классом (Ш11, Ш12).
+reason, status; у сверки с не-200 места — place_status) и счётчик refused; отказы not_ready — одна строка на
+место за NOT_READY_LOG_S с числом и since_s (сколько секунд копились), без счётчика; вызов места — строка
+«gw oc». Ни строки запроса, ни тел, ни заголовков, ни имени агента; исключения — только классом (Ш11, Ш12).
 """
 from __future__ import annotations
 
@@ -32,16 +40,18 @@ import asyncio
 import json
 import logging
 import time
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
+from starlette.types import Receive, Scope, Send
 
 from .accounts import Account
 from .api import GW_MESSAGES, PREFIX, configured, current_account, front_only, gw_error, same_origin
-from .places import PlaceAnswer, PlaceAnswerTooLarge
+from .places import PROXY_PARALLEL, PlaceAnswer, PlaceAnswerTooLarge
 from .rules import AGENT_NAME, APPROVABLE, METHODS, RULE_MESSAGES, Refused, Rule, filter_query, match
 
 if TYPE_CHECKING:
@@ -52,12 +62,17 @@ log = logging.getLogger("pcbk_core.gateway.proxy")
 OC_PREFIX = PREFIX + "/oc"
 _RAW_PREFIX = OC_PREFIX.encode("ascii")
 UPSTREAM_MAX_BYTES = 4 * 1024 * 1024        # ответ места в памяти шлюза (Д5-R36)
+SEND_CHUNK = 64 * 1024                      # кусок отправки ответа места браузеру (G1)
 PROXY_DEADLINE_S = 25.0                     # весь ход вызова; edge на /pcbk/api/oc/ ждёт 45 с (Д5-R30)
 NOT_READY_LOG_S = 60.0
+PROXY_QUEUE = 8                             # ждущих вызовов на место сверх PROXY_PARALLEL (G1)
 LOG_PATH_CHARS = 120
 AGENT_MODES = ("primary", "all")            # Д5-R33
 GET_SITES = ("same-origin", "none")         # Sec-Fetch-Site, с которым GET пропускается (Д5-R26, р4)
 CONTENT_TYPE_CHARS = 200
+# Content-Type ответа места как есть — только эти виды (с параметрами); прочий — OCTET_STREAM (G7)
+PASSED_TYPES = ("application/json", "text/plain")
+OCTET_STREAM = "application/octet-stream"
 
 PROXY_MESSAGES = {
     "not_whitelisted": RULE_MESSAGES["not_whitelisted"],        # тот же объект, что у правил Б2
@@ -69,6 +84,7 @@ PROXY_MESSAGES = {
     "permission": "Это разрешение даёт только преподаватель",
     "too_big": "Ответ рабочего места слишком большой",
     "streams": "Открыто слишком много вкладок чата — закройте лишние",
+    "busy": "Слишком много одновременных запросов — повторите позже",
 }
 
 _BAD_JSON = object()
@@ -76,6 +92,77 @@ _BAD_JSON = object()
 
 class _PlaceAuth(Exception):
     """Место ответило 401 на запрос шлюза: пароль места не тот."""
+
+
+class _CheckRefused(Refused):
+    """Отказ сверки агента или разрешения; place_status — код ответа места на сверке, если он не 200 (G10)."""
+
+    def __init__(self, status: int, name: str, message: str, reason: str, place_status: int) -> None:
+        super().__init__(status, name, message, reason)
+        self.place_status = place_status
+
+
+def _busy() -> Refused:
+    return Refused(503, "WorkplaceBusy", PROXY_MESSAGES["busy"], "busy")
+
+
+class _PlaceGate:
+    """Вызовы прокси к месту (G1): не больше PROXY_PARALLEL разом, ждущих — не больше PROXY_QUEUE; сверх —
+    _busy() сразу. Семафор места создаётся при первом вызове к нему."""
+
+    def __init__(self) -> None:
+        self._sems: dict[int, asyncio.Semaphore] = {}
+        self._waiting: dict[int, int] = {}
+
+    async def acquire(self, n: int) -> Callable[[], None]:
+        """Занять слот места n (отмена ожидания слот не занимает); отдаёт release — освобождение, повтор — ничего."""
+        sem = self._sems.get(n)
+        if sem is None:
+            sem = self._sems[n] = asyncio.Semaphore(PROXY_PARALLEL)
+        if sem.locked() and self._waiting.get(n, 0) >= PROXY_QUEUE:
+            raise _busy()
+        self._waiting[n] = self._waiting.get(n, 0) + 1
+        try:
+            await sem.acquire()
+        finally:
+            self._waiting[n] -= 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                sem.release()
+        return release
+
+
+class _PlaceResponse(Response):
+    """Ответ места браузеру, держащий слот места до конца отправки (G1). Тело уходит кусками по SEND_CHUNK: uvicorn
+    ждёт опустошения буфера сокета перед следующим куском, и медленный браузер задерживает отправку (и слот), а не
+    копит всё тело в буфере соединения мимо слота. Тело — как его прочитал fetch (bytearray), без копии целиком.
+    Слот освобождается в finally отправки (и при обрыве), а ответ, который так и не отправлялся, — при сборке
+    мусора (weakref.finalize): слот не теряется ни при каком исходе."""
+
+    def __init__(self, content: bytes | bytearray, status_code: int, headers: dict[str, str] | None,
+                 release: Callable[[], None]) -> None:
+        self.status_code = status_code
+        self.media_type = None
+        self.background = None
+        self.body = content                             # Response.render не принимает bytearray — без него
+        self.init_headers(headers)
+        self._release = weakref.finalize(self, release)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+            view = memoryview(self.body)
+            for i in range(0, len(view), SEND_CHUNK):
+                await send({"type": "http.response.body", "body": bytes(view[i:i + SEND_CHUNK]), "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            if self.background is not None:
+                await self.background()
+        finally:
+            self._release()
 
 
 class _Call(NamedTuple):
@@ -88,23 +175,26 @@ class _Call(NamedTuple):
 
 class _NotReadyLog:
     """Отказы not_ready места — одна строка журнала за NOT_READY_LOG_S с числом отказов с прошлой строки (Д5-R37):
-    цикл переподключения адаптера даёт до 6 запросов в секунду на вкладку."""
+    цикл переподключения адаптера даёт до 6 запросов в секунду на вкладку. У строки — since_s: сколько секунд
+    копились отказы (от первого не записанного до этого), чтобы старое число не выдавало себя за свежее (G8)."""
 
     def __init__(self, monotonic: Callable[[], float]):
         self._monotonic = monotonic
         self._last: dict[int, float] = {}
+        self._first: dict[int, float] = {}
         self._count: dict[int, int] = {}
 
-    def refused(self, n: int) -> int | None:
-        """Учесть отказ места n; число для строки журнала или None — строку не писать."""
-        self._count[n] = self._count.get(n, 0) + 1
+    def refused(self, n: int) -> tuple[int, int] | None:
+        """Учесть отказ места n; (число отказов, since_s) для строки журнала или None — строку не писать."""
         now = self._monotonic()
+        self._count[n] = self._count.get(n, 0) + 1
+        self._first.setdefault(n, now)
         last = self._last.get(n)
         if last is not None and now - last < NOT_READY_LOG_S:
             return None
         self._last[n] = now
         count, self._count[n] = self._count[n], 0
-        return count
+        return count, round(now - self._first.pop(n))
 
 
 # --- путь, источник, тело ---
@@ -166,18 +256,19 @@ async def _body(request: Request, rule: Rule) -> dict | None:
 
 # --- проверки у места ---
 
-async def _place_list(role: GatewayRole, n: int, path: str) -> list:
-    """GET списка своего места (/agent, /permission): 401 — _PlaceAuth; не 200, не JSON, не список — пустой."""
+async def _place_list(role: GatewayRole, n: int, path: str) -> tuple[list, int]:
+    """GET списка своего места (/agent, /permission) и код ответа: 401 — _PlaceAuth; не 200, не JSON, не список —
+    пустой список."""
     answer = await role.workplaces.fetch(n, "GET", path, max_bytes=UPSTREAM_MAX_BYTES)
     if answer.status == 401:
         raise _PlaceAuth()
     if answer.status != 200:
-        return []
+        return [], answer.status
     try:
         items = json.loads(answer.body)
     except (ValueError, RecursionError):
-        return []
-    return items if isinstance(items, list) else []
+        return [], answer.status
+    return (items if isinstance(items, list) else []), answer.status
 
 
 async def _check_agent(role: GatewayRole, n: int, name: str) -> None:
@@ -185,27 +276,29 @@ async def _check_agent(role: GatewayRole, n: int, name: str) -> None:
     Имя в текст отказа — только прошедшее AGENT_NAME (Ш12); в журнал оно не идёт."""
     if not isinstance(name, str) or AGENT_NAME.fullmatch(name) is None:      # сборщик уже сверил — на всякий случай
         raise Refused(400, "BadRequest", RULE_MESSAGES["agent_name"], "bad_body")
-    agents = await _place_list(role, n, "/agent")
+    agents, status = await _place_list(role, n, "/agent")
     if not any(isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"] == name
                and a.get("native") is False and isinstance(a.get("mode"), str) and a["mode"] in AGENT_MODES
                for a in agents):
-        raise Refused(400, "BadRequest", PROXY_MESSAGES["agent"].format(agent=name), "agent")
+        raise _CheckRefused(400, "BadRequest", PROXY_MESSAGES["agent"].format(agent=name), "agent", status)
 
 
 async def _check_permission(role: GatewayRole, n: int, per: str) -> None:
     """Д5-R34: once — только висящему запросу своего места с permission из APPROVABLE; иначе 403."""
-    pending = await _place_list(role, n, "/permission")
+    pending, status = await _place_list(role, n, "/permission")
     if not any(isinstance(p, dict) and p.get("id") == per and isinstance(p.get("permission"), str)
                and p["permission"] in APPROVABLE for p in pending):
-        raise Refused(403, "Forbidden", PROXY_MESSAGES["permission"], "permission")
+        raise _CheckRefused(403, "Forbidden", PROXY_MESSAGES["permission"], "permission", status)
 
 
 # --- ответы и журнал ---
 
 def _refused(role: GatewayRole, call: _Call, refusal: Refused) -> JSONResponse:
     role.stats.event("refused")
-    log.warning("gw refused login=%s place=%s method=%s path=%s reason=%s status=%d", call.login, call.place,
-                call.method, call.path, refusal.reason, refusal.status)
+    place_status = getattr(refusal, "place_status", 200)
+    tail = f" place_status={place_status}" if place_status != 200 else ""
+    log.warning("gw refused login=%s place=%s method=%s path=%s reason=%s status=%d%s", call.login, call.place,
+                call.method, call.path, refusal.reason, refusal.status, tail)
     return gw_error(refusal.status, refusal.name, refusal.message)
 
 
@@ -215,11 +308,20 @@ def _oc_line(call: _Call, rule: Rule, status: int, started: float, tail: str = "
                                         call.place, rule.name, status, ms, tail)
 
 
-def _answer(answer: PlaceAnswer) -> Response:
-    """Ответ места браузеру: тот же код, тело как есть, из заголовков — только Content-Type (печатный ASCII)."""
-    ct = answer.content_type
-    ok = ct is not None and len(ct) <= CONTENT_TYPE_CHARS and ct.isascii() and ct.isprintable()
-    return Response(answer.body, status_code=answer.status, headers={"content-type": ct} if ok else None)
+def _content_type(ct: str | None) -> str | None:
+    """Content-Type браузеру (G7): нет — нет; application/json и text/plain (с параметрами, печатный ASCII до
+    CONTENT_TYPE_CHARS) — как есть; прочий — application/octet-stream: HTML или SVG места страницей не станет."""
+    if ct is None:
+        return None
+    ok = len(ct) <= CONTENT_TYPE_CHARS and ct.isascii() and ct.isprintable()
+    return ct if ok and ct.split(";", 1)[0].strip().lower() in PASSED_TYPES else OCTET_STREAM
+
+
+def _answer(answer: PlaceAnswer, release: Callable[[], None]) -> _PlaceResponse:
+    """Ответ места браузеру: тот же код, тело как есть, из заголовков — только Content-Type (_content_type); слот
+    места освобождает отправка (_PlaceResponse)."""
+    ct = _content_type(answer.content_type)
+    return _PlaceResponse(answer.body, answer.status, {"content-type": ct} if ct else None, release)
 
 
 # --- маршрут ---
@@ -230,16 +332,18 @@ def proxy_router(role: GatewayRole) -> APIRouter:
     router = APIRouter(dependencies=[Depends(front_only), Depends(configured(role))])
     account_of = current_account(role)
     not_ready = _NotReadyLog(role.monotonic)
+    gate = _PlaceGate()
 
     async def oc(request: Request, account: Account = Depends(account_of)) -> Response:
-        return await _proxy(role, request, account, not_ready)
+        return await _proxy(role, request, account, not_ready, gate)
 
     for path in (OC_PREFIX + "/{rest:path}", OC_PREFIX):
         router.add_api_route(path, oc, methods=list(METHODS), include_in_schema=False)
     return router
 
 
-async def _proxy(role: GatewayRole, request: Request, account: Account, not_ready: _NotReadyLog) -> Response:
+async def _proxy(role: GatewayRole, request: Request, account: Account, not_ready: _NotReadyLog,
+                 gate: _PlaceGate) -> Response:
     method, n = request.method, account.place
     call = _Call(account.login, "-" if n is None else f"{n:02d}", method, _log_path(request.scope))
     rest = _raw_rest(request.scope)
@@ -256,10 +360,10 @@ async def _proxy(role: GatewayRole, request: Request, account: Account, not_read
     if rule.kind == "event":                        # поток /event — задача Б4; до неё место не трогается
         return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["no_answer"])
     if not role.workplaces.is_ready(n):             # не будит: будит только страница входа
-        count = not_ready.refused(n)
-        if count is not None:
-            log.info("gw refused login=%s place=%s method=%s path=%s reason=not_ready status=503 n=%d",
-                     call.login, call.place, call.method, call.path, count)
+        rolled = not_ready.refused(n)
+        if rolled is not None:
+            log.info("gw refused login=%s place=%s method=%s path=%s reason=not_ready status=503 n=%d since_s=%d",
+                     call.login, call.place, call.method, call.path, *rolled)
         return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["not_ready"])
     if rule.kind == "summarize":                    # сжатие разговора на стенде не нужно: ответ без места
         _oc_line(call, rule, 200, time.monotonic())
@@ -273,29 +377,41 @@ async def _proxy(role: GatewayRole, request: Request, account: Account, not_read
     if method != "GET":                             # действие студента — активность места до пересылки (Д5-R28)
         role.workplaces.touch(n)
     started = time.monotonic()
+    release: Callable[[], None] | None = None       # слот места; None до очереди и после передачи ответу
     try:
-        async with asyncio.timeout(PROXY_DEADLINE_S):
-            if rule.name == "prompt_async" and body is not None and "agent" in body:
-                await _check_agent(role, n, body["agent"])
-            elif rule.name == "permission_reply" and body is not None and body.get("reply") == "once":
-                await _check_permission(role, n, rule.pattern.fullmatch(rest)["PER"])
-            answer = await role.workplaces.fetch(n, method, upstream, params=params, json=body,
-                                                 max_bytes=UPSTREAM_MAX_BYTES)
-    except Refused as refusal:
-        return _refused(role, call, refusal)
-    except _PlaceAuth:
-        answer = PlaceAnswer(401, None, b"")
-    except PlaceAnswerTooLarge:
-        _oc_line(call, rule, 502, started, " reason=too_big", warn=True)
-        return gw_error(502, "BadGateway", PROXY_MESSAGES["too_big"])
-    except (httpx.HTTPError, OSError) as exc:       # TimeoutError срока хода — подкласс OSError (Ш11)
-        role.workplaces.mark_unready(n)
-        role.stats.event("upstream_failed")
-        _oc_line(call, rule, 503, started, f" reason=no_answer error={type(exc).__name__}", warn=True)
-        return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["no_answer"])
-    if answer.status == 401:                        # без WWW-Authenticate места
-        role.stats.event("place_auth_failed")
-        _oc_line(call, rule, 502, started, " reason=place_auth", warn=True)
-        return gw_error(502, "BadGateway", PROXY_MESSAGES["place_auth"])
-    _oc_line(call, rule, answer.status, started)
-    return _answer(answer)
+        try:
+            async with asyncio.timeout(PROXY_DEADLINE_S):
+                release = await gate.acquire(n)
+                if rule.name == "prompt_async" and body is not None and "agent" in body:
+                    await _check_agent(role, n, body["agent"])
+                elif rule.name == "permission_reply" and body is not None and body.get("reply") == "once":
+                    await _check_permission(role, n, rule.pattern.fullmatch(rest)["PER"])
+                answer = await role.workplaces.fetch(n, method, upstream, params=params, json=body,
+                                                     max_bytes=UPSTREAM_MAX_BYTES)
+        except Refused as refusal:
+            return _refused(role, call, refusal)
+        except _PlaceAuth:
+            answer = PlaceAnswer(401, None, b"")
+        except PlaceAnswerTooLarge:
+            _oc_line(call, rule, 502, started, " reason=too_big", warn=True)
+            return gw_error(502, "BadGateway", PROXY_MESSAGES["too_big"])
+        except httpx.PoolTimeout:                   # пул клиента места занят — место живо (G1)
+            return _refused(role, call, _busy())
+        except (httpx.HTTPError, OSError) as exc:   # TimeoutError срока хода — подкласс OSError (Ш11)
+            if isinstance(exc, TimeoutError) and release is None:
+                return _refused(role, call, _busy())    # не дождался очереди места до срока хода (G1)
+            role.workplaces.mark_unready(n)
+            role.stats.event("upstream_failed")
+            _oc_line(call, rule, 503, started, f" reason=no_answer error={type(exc).__name__}", warn=True)
+            return gw_error(503, "WorkplaceNotReady", PROXY_MESSAGES["no_answer"])
+        if answer.status == 401:                    # без WWW-Authenticate места
+            role.stats.event("place_auth_failed")
+            _oc_line(call, rule, 502, started, " reason=place_auth", warn=True)
+            return gw_error(502, "BadGateway", PROXY_MESSAGES["place_auth"])
+        _oc_line(call, rule, answer.status, started)
+        response = _answer(answer, release)
+        release = None                              # слот — у ответа: освободит конец отправки
+        return response
+    finally:
+        if release is not None:
+            release()
