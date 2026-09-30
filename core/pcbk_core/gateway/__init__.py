@@ -7,9 +7,10 @@ health() и health_json() читают только память; ошибка �
 первый такт не задерживает запуск других ролей (Д5-R27).
 
 Крючки — только через реестр hooks_of(app) (Д4а): обработчик HTTPException на /pcbk/api/ и /health/gateway
-(отказы вида OpenCode) и предел тела /pcbk/api/ с 413 того же вида (Ш22).
+(отказы вида OpenCode) и пределы тела /pcbk/api/ и /pcbk/api/oc/ (Д5б, GW_MAX_BODY_BYTES) с 413 того же вида
+(Ш22) — вне pcbk-front 404.
 
-Модули accounts и api (а через api — accounts) здесь импортируются только внутри методов: команда
+Модули accounts, api и proxy (а через них — accounts) здесь импортируются только внутри методов: команда
 администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
 загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
 """
@@ -216,11 +217,13 @@ class GatewayRole(RoleBase):
 
     def router(self) -> APIRouter:
         from .api import auth_router, catch_all_router, configured, front_only, workplace_router
+        from .proxy import proxy_router
 
         router = APIRouter()
         guarded = [Depends(front_only), Depends(configured(self))]
         router.include_router(auth_router(self), dependencies=guarded)
         router.include_router(workplace_router(self), dependencies=guarded)
+        router.include_router(proxy_router(self))       # front_only и configured — у самого роутера прокси
 
         @router.get(HEALTH_PATH, dependencies=[Depends(front_only)])
         async def health_gateway() -> JSONResponse:
@@ -233,13 +236,16 @@ class GatewayRole(RoleBase):
     def install(self, app: FastAPI) -> None:
         """Только через реестр Д4а: отказы HTTPException и 413 под /pcbk/api/ — JSON вида OpenCode (Ш22), отказ
         front_only и 405 на /health/gateway — тоже; предел тела вне pcbk-front отвечает 404, как зона (ревью
-        А4, M3); сеть мест для сверки токенов служб (Ш25)."""
+        А4, M3), — и у /pcbk/api/oc/ с пределом GW_MAX_BODY_BYTES (Д5-R36): самый длинный префикс берёт его, и
+        без respond= сеть места получила бы 413 и узнала бы ручку; сеть мест для сверки токенов служб (Ш25)."""
         from .api import PREFIX, http_exception_handler, too_large
+        from .proxy import OC_PREFIX
 
         hooks = hooks_of(app)
         hooks.http_exception(PREFIX + "/", http_exception_handler)
         hooks.http_exception(HEALTH_PATH, http_exception_handler)
         hooks.body_limit(PREFIX + "/", BODY_LIMIT, respond=too_large)
+        hooks.body_limit(OC_PREFIX + "/", self.gw.GW_MAX_BODY_BYTES, respond=too_large)
         app.state.pcbk_stu_net = self.gw.STU_NET
 
     # --- здоровье: только память ---

@@ -162,6 +162,8 @@ _OCTET = r"(0|[1-9][0-9]{0,2})"
 _STU_NET = re.compile(_OCTET + r"\." + _OCTET)
 # тексты ошибок GW_* — не длиннее 60 знаков: config_error «настройки шлюза: …» со сбоем базы — до 80
 GW_ERROR_CHARS = 60
+# предел тела /pcbk/api/oc/ — не меньше предела остальных ручек шлюза (64 КиБ)
+GW_MAX_BODY_MIN = 65536
 
 
 def _gw_float(name: str, raw: str, ok: Callable[[float], bool], rule: str) -> float:
@@ -199,6 +201,13 @@ def _stu_net(raw: str) -> str:
     return raw
 
 
+def _gw_max_body(raw: str) -> int:
+    """Целое число байт в записи из цифр, не меньше GW_MAX_BODY_MIN; «1e6», «0x…», дроби — ошибка."""
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 12 or int(raw) < GW_MAX_BODY_MIN:
+        raise ValueError(f"GW_MAX_BODY_BYTES: нужно целое не меньше {GW_MAX_BODY_MIN}")
+    return int(raw)
+
+
 def _drill_gateway(raw: str) -> str:
     if raw not in DRILL_GATEWAY_MODES:
         raise ValueError("DRILL_GATEWAY: пусто, freeze_reaper или bad_place_pw")
@@ -216,6 +225,7 @@ _GW_FIELD_CHECKS: dict[str, Callable[[str], object]] = {
     "SP_CTL_URL": _sp_ctl_url,
     "STU_NET": _stu_net,
     "DRILL_GATEWAY": _drill_gateway,
+    "GW_MAX_BODY_BYTES": _gw_max_body,
 }
 
 
@@ -232,6 +242,7 @@ class GatewaySettings:
     SP_CTL_URL: str = "http://pcbk-sp-ctl:2375"
     STU_NET: str = "172.31"                   # первые два октета сетей мест: место N — {STU_NET}.N.0/28
     DRILL_GATEWAY: str = ""                   # учения: freeze_reaper, bad_place_pw
+    GW_MAX_BODY_BYTES: int = 524288           # предел тела /pcbk/api/oc/ (Д5-R36; у edge — client_max_body_size 512k)
 
     @classmethod
     def _parse(cls, env: Mapping[str, str] | None) -> tuple[dict[str, object], list[str]]:

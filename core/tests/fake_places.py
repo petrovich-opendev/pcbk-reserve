@@ -6,12 +6,19 @@ pcbk-student-01…10; путь вне правил — 403, метод без п
 
 Пароли мест тестов — PLACE_PW; их пишет helpers.pw_dir. Ожидаемый Authorization двойник считает сам, а не
 берёт у Workplaces.basic: неверная сборка заголовка (и учения bad_place_pw) получает 401, как от места.
+
+Д5б (задача Б3): FakePlaces записывает запросы видом Recorded, отвечает списками агентов (agents) и висящих
+разрешений (pending), по месту умеет ответить заданным кодом и заголовками (force_status), бросить исключение
+(raise_for), помолчать (hang_for) и отдать большое тело кусками по 1 КиБ со счётом отданного (big, big_sent).
 """
 import asyncio
 import base64
+import gzip
 import itertools
+import json
 import re
 from collections import Counter
+from dataclasses import dataclass
 
 import httpx
 
@@ -23,6 +30,8 @@ NEVER_STARTED = "0001-01-01T00:00:00Z"          # StartedAt контейнера
 _DOCKER_GET = re.compile(r"/v1\.44/(_ping|containers/pcbk-student-(0[1-9]|10)/json)")
 _DOCKER_POST = re.compile(r"/v1\.44/containers/pcbk-student-(0[1-9]|10)/(start|stop)")
 _PLACE_TAIL = re.compile(r"([1-9]|10)\.3")         # после префикса STU_NET: N.3, номер без нуля впереди
+_PROMPT_ASYNC = re.compile(r"/session/[^/]+/prompt_async")
+BIG_CHUNK = 1024                                   # кусок большого тела big: предел читается с точностью до КиБ
 _stamps = itertools.count(1)
 
 
@@ -124,17 +133,45 @@ class FakeDocker:
         return httpx.Response(204)
 
 
+@dataclass(frozen=True)
+class Recorded:
+    """Запрос к месту, как его увидел двойник: имена заголовков — в нижнем регистре, json — разобранное тело
+    (нет тела — None), query — строка запроса как есть. url — прежним тестам Д5а (r.url.path, r.url.host)."""
+    method: str
+    path: str
+    query: str
+    headers: dict[str, str]
+    json: object
+    url: httpx.URL
+
+
+def _record(request: httpx.Request) -> Recorded:
+    body = request.content
+    try:
+        parsed = json.loads(body) if body else None
+    except ValueError:
+        parsed = body
+    return Recorded(request.method, request.url.path, request.url.query.decode("ascii"),
+                    {k.lower(): v for k, v in request.headers.items()}, parsed, request.url)
+
+
 class FakePlaces:
     """Серверы OpenCode мест по хосту {stu_net}.N.3:4096 (stu_net — как STU_NET шлюза; чужой хост —
-    ConnectError).
+    ConnectError). Порядок ответа места n:
 
-    - Authorization не тот (expected_basic) или wrong_pw — 401 на любой запрос;
-    - /agent — 200 [] начиная с вызова номер ready_after этого места (после настоящей паузы agent_delay),
-      раньше и при never_ready — 503;
-    - /session/status — {} (после status_delay), у мест из busy — одна занятая сессия, у мест из status_raw —
+    - запрос записывается в requests (Recorded);
+    - raise_for[n] — это исключение; hang_for[n] — столько секунд молчания перед ответом;
+    - force_status[n] = (код, заголовки) — этот код и заголовки (Content-Type по умолчанию — JSON) на любой
+      запрос, тело {"name": "Forced"}, при content-encoding: gzip — сжатое по-настоящему;
+    - Authorization не тот (expected_basic) или wrong_pw — 401;
+    - big[n] — 200 с телом из стольких байт кусками по BIG_CHUNK; big_sent[n] — сколько байт отдано;
+    - GET /agent — agents[n] (по умолчанию []) начиная с вызова номер ready_after этого места (после настоящей
+      паузы agent_delay), раньше и при never_ready — 503;
+    - GET /session/status — {} (после status_delay), у мест из busy — одна занятая сессия, у мест из status_raw —
       эти байты как тело 200 (неверный ответ места);
-    - прочее — 404.
-    agent_calls[n] — сколько раз звали /agent места n; requests — все запросы по порядку.
+    - GET /permission — pending[n] (по умолчанию []);
+    - POST /session/{id}/prompt_async — 204; прочее — 200 {}.
+    agent_calls[n] — сколько раз звали /agent места n. /event — задача Б4.
     """
 
     def __init__(self, *, ready_after: int = 1, never_ready: bool = False, wrong_pw: bool = False,
@@ -147,8 +184,22 @@ class FakePlaces:
         self.agent_delay = agent_delay
         self.stu_net = "172.31"
         self.status_raw: dict[int, bytes] = {}
+        self.agents: dict[int, list[dict]] = {}
+        self.pending: dict[int, list[dict]] = {}
+        self.force_status: dict[int, tuple[int, dict]] = {}
+        self.raise_for: dict[int, Exception] = {}
+        self.hang_for: dict[int, float] = {}
+        self.big: dict[int, int] = {}
+        self.big_sent: Counter[int] = Counter()
         self.agent_calls: Counter[int] = Counter()
-        self.requests: list[httpx.Request] = []
+        self.requests: list[Recorded] = []
+
+    async def _big_body(self, n: int, size: int):
+        while size > 0:
+            k = min(BIG_CHUNK, size)
+            self.big_sent[n] += k
+            yield b"x" * k
+            size -= k
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         host, prefix = request.url.host, self.stu_net + "."
@@ -156,9 +207,22 @@ class FakePlaces:
         if m is None or request.url.port != 4096:
             raise httpx.ConnectError("нет такого места", request=request)
         n = int(m[1])
-        self.requests.append(request)
+        self.requests.append(_record(request))
+        if n in self.raise_for:
+            raise self.raise_for[n]
+        if self.hang_for.get(n):
+            await asyncio.sleep(self.hang_for[n])
+        if n in self.force_status:
+            status, headers = self.force_status[n]
+            body = b'{"name":"Forced"}'
+            if headers.get("content-encoding") == "gzip":                # сжатие настоящее: httpx его распакует
+                body = gzip.compress(body)
+            return httpx.Response(status, headers={"content-type": "application/json", **headers}, content=body)
         if self.wrong_pw or request.headers.get("authorization") != expected_basic(n):
             return _json(401, {"name": "Unauthorized"})
+        if n in self.big:
+            return httpx.Response(200, headers={"content-type": "application/json"},
+                                  content=self._big_body(n, self.big[n]))
         path = request.url.path
         if request.method == "GET" and path == "/agent":
             self.agent_calls[n] += 1
@@ -166,11 +230,15 @@ class FakePlaces:
                 await asyncio.sleep(self.agent_delay)
             if self.never_ready or self.agent_calls[n] < self.ready_after:
                 return _json(503, {"name": "NotReady"})
-            return _json(200, [])
+            return _json(200, self.agents.get(n, []))
         if request.method == "GET" and path == "/session/status":
             if self.status_delay:
                 await asyncio.sleep(self.status_delay)
             if n in self.status_raw:
                 return httpx.Response(200, content=self.status_raw[n], headers={"content-type": "application/json"})
             return _json(200, {"ses_" + "B" * 26: {"type": "busy"}} if n in self.busy else {})
-        return _json(404, {"name": "NotFound"})
+        if request.method == "GET" and path == "/permission":
+            return _json(200, self.pending.get(n, []))
+        if request.method == "POST" and _PROMPT_ASYNC.fullmatch(path):
+            return httpx.Response(204)
+        return _json(200, {})

@@ -562,3 +562,10 @@ def login(c, name: str, pw: str = PW, **headers) -> httpx.Response:
     sent = {"Origin": ORIGIN, **headers}
     return c.post("/pcbk/api/auth/login", json={"login": name, "password": pw},
                   headers={k: v for k, v in sent.items() if v != ""})
+
+
+# --- Шлюз: прокси /pcbk/api/oc (Д5б, задача Б3) ---
+
+def oc_headers(**extra) -> dict:
+    """Заголовки вызова адаптера со своей страницы: Origin: ORIGIN и extra (места готовит make_gateway(…, ready=…))."""
+    return {"Origin": ORIGIN, **extra}

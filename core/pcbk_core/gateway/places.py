@@ -30,8 +30,12 @@ GW_IDLE_STOP_S), паузу снимают удачная остановка, т
 Конструкторы без ввода-вывода. httpx.AsyncClient создаётся в open() или при первом запросе (как Upstream,
 П22), прокси окружения не берутся (trust_env=False). Сроки попыток держит asyncio.timeout поверх срока
 httpx. Исключения httpx ловятся целиком (httpx.HTTPError, Ш11) и в журнал не пишутся: строки журнала — только
-номера мест, коды и виды. Authorization к месту ставит только request(); пароль места и Basic не попадают ни
-в журнал, ни в тексты исключений.
+номера мест, коды и виды. Authorization к месту ставит только _place_headers(), её зовут request() и fetch();
+пароль места и Basic не попадают ни в журнал, ни в тексты исключений.
+
+fetch() (Д5б, прокси Б3) читает ответ места кусками и бросает его на пределе: память шлюза не зависит от места.
+Место просят не сжимать ответ (Accept-Encoding: identity — OpenCode сжимает только по просьбе клиента), сжатый
+ответ — PlaceAnswerEncoded: размер распакованного не узнать, не распаковав.
 """
 from __future__ import annotations
 
@@ -110,6 +114,22 @@ class SpCtlError(Exception):
 class PlacePasswordError(OSError):
     """У шлюза нет пароля места: файла нет, он не читается или первая строка пуста. OSError — чтобы вызов
     места без пароля шёл тем же путём «место не отвечает», что обрыв соединения (Д5б)."""
+
+
+class PlaceAnswerTooLarge(Exception):
+    """Ответ места больше предела fetch(): тело прочитано не дальше предела и одного куска."""
+
+
+class PlaceAnswerEncoded(OSError):
+    """Место сжало ответ, хотя шлюз просил identity. OSError — как «место не отвечает» (прокси Б3)."""
+
+
+@dataclass(frozen=True)
+class PlaceAnswer:
+    """Ответ места из fetch(): код, Content-Type (None — нет) и тело целиком."""
+    status: int
+    content_type: str | None
+    body: bytes
 
 
 class SpCtl:
@@ -298,19 +318,50 @@ class Workplaces:
             pw += "-drill"
         return "Basic " + base64.b64encode(f"opencode:{pw}".encode("utf-8")).decode("ascii")
 
-    async def request(self, n: int, method: str, path: str, *, params=None, json=None,
-                      timeout: float | None = None) -> httpx.Response:
-        """Запрос к месту n — единственное место, где ставится Authorization. timeout — срок попытки целиком
-        (asyncio.timeout: TimeoutError). Ни заголовков, ни запроса в журнал."""
+    def _place_headers(self, n: int, path: str, extra: dict[str, str] | None = None) -> tuple[str, dict[str, str]]:
+        """Адрес и заголовки запроса к месту n — единственное место, где ставится Authorization."""
         if not path.startswith("/"):
             raise ValueError("путь к месту начинается с «/»")
-        headers = {"Authorization": self.basic(n)}
-        url = self.place_url(n) + path
+        return self.place_url(n) + path, {**(extra or {}), "Authorization": self.basic(n)}
+
+    async def request(self, n: int, method: str, path: str, *, params=None, json=None,
+                      timeout: float | None = None) -> httpx.Response:
+        """Запрос к месту n. timeout — срок попытки целиком (asyncio.timeout: TimeoutError). Ни заголовков, ни
+        запроса в журнал."""
+        url, headers = self._place_headers(n, path)
         if timeout is None:
             return await self._http().request(method, url, params=params, json=json, headers=headers)
         async with asyncio.timeout(timeout):
             return await self._http().request(method, url, params=params, json=json, headers=headers,
                                               timeout=timeout)
+
+    async def fetch(self, n: int, method: str, path: str, *, params=None, json=None,
+                    max_bytes: int) -> PlaceAnswer:
+        """Запрос к месту n с ответом не больше max_bytes (прокси Б3). Объявленная длина больше предела —
+        PlaceAnswerTooLarge без чтения тела; иначе тело читается кусками, и кусок, переходящий предел, —
+        PlaceAnswerTooLarge: дальше предела и одного куска не читается. Сжатый ответ — PlaceAnswerEncoded.
+        Исключения httpx и OSError (нет пароля места) — наружу; срок хода держит вызывающий."""
+        url, headers = self._place_headers(n, path, {"Accept-Encoding": "identity"})
+        client = self._http()
+        request = client.build_request(method, url, params=params, json=json, headers=headers)
+        response = await client.send(request, stream=True)
+        try:
+            encoding = response.headers.get("content-encoding", "").strip().lower()
+            if encoding not in ("", "identity"):
+                raise PlaceAnswerEncoded("ответ места сжат")
+            declared = response.headers.get("content-length", "").strip()
+            if declared.isascii() and declared.isdigit() and (len(declared) > 18 or int(declared) > max_bytes):
+                raise PlaceAnswerTooLarge()
+            body = bytearray()
+            # сжатие отсечено выше: aiter_bytes без распаковки — те же куски, что aiter_raw, и ответ, уже
+            # прочитанный транспортом (двойник MockTransport), он тоже отдаёт
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > max_bytes:
+                    raise PlaceAnswerTooLarge()
+                body += chunk
+            return PlaceAnswer(response.status_code, response.headers.get("content-type"), bytes(body))
+        finally:
+            await response.aclose()
 
     # --- состояние места ---
 
