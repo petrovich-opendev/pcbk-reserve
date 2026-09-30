@@ -336,14 +336,16 @@ def _check_and_verify(store: AccountStore, login: str, password: str,
     return store.verify(login, password)
 
 
-def _refused_line(store: AccountStore, login: str, kind: str, at: float | None = None) -> None:
+def _refused_line(store: AccountStore, login: str, kind: str, at: float | None = None) -> bool:
     """В потоке, после ответа: неудача сверки — в замок (с меткой at, если шлюз её уже учёл); строка «gw login
     refused» — логин, только если он существует (точечный запрос store.status). kind: password (сверка не
-    прошла), locked, busy."""
+    прошла), locked, busy. False — неудача не записана (LoginGate держит её метку до выхода из окна замка)."""
+    recorded = True
     if kind == "password":
         try:
             store.failure(login, at)
         except Exception as exc:
+            recorded = False
             log.warning("шлюз: неудачный вход не записан (%s)", type(exc).__name__)
     shown, reason = "<неизвестный>", "unknown" if kind == "password" else kind
     try:
@@ -355,12 +357,13 @@ def _refused_line(store: AccountStore, login: str, kind: str, at: float | None =
         if kind == "password":
             reason = "disabled" if status == "disabled" else "password"
     log.warning("gw login refused login=%s reason=%s", shown, reason)
+    return recorded
 
 
-def _after_verify(store: AccountStore, login: str) -> Callable[[object, float | None], Callable[[], None] | None]:
-    """after попытки LoginGate — задание писателю: неудача сверки — в замок с меткой шлюза и в журнал, замок — в
-    журнал; удача — ничего."""
-    def after(result: object, at: float | None) -> Callable[[], None] | None:
+def _after_verify(store: AccountStore, login: str) -> Callable[[object, float | None], Callable[[], bool] | None]:
+    """after попытки LoginGate — задание писателю: неудача сверки — в замок с меткой шлюза и в журнал (итог —
+    записана ли), замок — в журнал; удача — ничего."""
+    def after(result: object, at: float | None) -> Callable[[], bool] | None:
         if result is None:
             return lambda: _refused_line(store, login, "password", at)
         if result is LOCKED:

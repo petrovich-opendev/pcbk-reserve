@@ -14,10 +14,10 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.routing import Match
 
-from helpers import ORIGIN, PW, login, make_gateway, serve_app, wait_until, wait_until_async
+from helpers import ORIGIN, PW, FakeMono, full_disk, login, make_gateway, serve_app, wait_until, wait_until_async
 from pcbk_core.gateway import LoginGate, accounts
 from pcbk_core.gateway.api import (COOKIE_HEADERS_BUDGET, COOKIE_PATH_MAX_LEN, GW_MESSAGES, LOGIN_PARALLEL,
-                                   MAX_SESSION_COOKIES, catch_all_router, clear_cookies)
+                                   LOGIN_QUEUE, MAX_SESSION_COOKIES, catch_all_router, clear_cookies)
 
 pytestmark = pytest.mark.anyio
 BASE = "https://stand.test:8443"
@@ -446,3 +446,73 @@ def test_disabled_answer_equals_unknown(tmp_path):                              
     assert (disabled.status_code, disabled.content, strip(disabled)) == (unknown.status_code, unknown.content,
                                                                           strip(unknown))
     assert disabled.status_code == 401
+
+
+# --- остаток после повторного ревью R1–R9 ---
+
+def post_login(c, name: str, pw: str):
+    return c.post("/pcbk/api/auth/login", headers={"Origin": ORIGIN}, json={"login": name, "password": pw})
+
+
+async def test_login_backlog_busy_without_scrypt(tmp_path, monkeypatch):               # M-2: ветка LOGIN_BACKLOG
+    """Писатель неудач стоит (запись заблокирована), незаписанных заданий — предел backlog: вход «перегружен» —
+    429 busy без scrypt и +1 login_busy; когда писатель прошёл, вход снова есть."""
+    app, role = make_gateway(tmp_path)
+    role.login_gate = gate = LoginGate(LOGIN_PARALLEL, LOGIN_QUEUE, 2, clock=role.store.clock,
+                                       window=accounts.LOCK_WINDOW_S)
+    entered, release, record = threading.Event(), threading.Event(), role.store.failure
+
+    def blocked(name, *at):
+        entered.set()
+        release.wait(10)
+        record(name, *at)
+    monkeypatch.setattr(role.store, "failure", blocked)
+    calls, real = [], accounts._scrypt
+    monkeypatch.setattr(accounts, "_scrypt", lambda pw, salt: (calls.append(1), real(pw, salt))[1])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
+        try:
+            for _ in range(3):                                   # первое задание — у писателя, два — в очереди
+                assert (await asyncio.wait_for(post_login(c, "stu-03", "неверный-1"), 5)).status_code == 401
+            assert entered.is_set() and gate.full()
+            calls.clear()
+            r = await asyncio.wait_for(post_login(c, "stu-05", PW), 5)
+            assert (r.status_code, r.json()["data"]["message"], calls) == (429, GW_MESSAGES["busy"], [])
+            assert role.stats.count_1h("login_busy") == 1
+        finally:
+            release.set()
+        await gate.drain()
+        assert (await post_login(c, "stu-05", PW)).status_code == 200
+    assert failures(tmp_path) == 3
+
+
+async def test_failed_record_keeps_stamp_and_locks(tmp_path, monkeypatch):             # Л-1
+    """Запись неудачи в базу падает (диск полон): метки остаются в памяти, и после пяти неверных входов известный
+    логин заперт — 429 locked без scrypt, хотя в таблице ни строки."""
+    app, role = make_gateway(tmp_path)
+    key = accounts.login_key("stu-03")
+    calls, real = [], accounts._scrypt
+    monkeypatch.setattr(accounts, "_scrypt", lambda pw, salt: (calls.append(1), real(pw, salt))[1])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
+        with full_disk(role.store):
+            for _ in range(accounts.LOCK_FAILURES):
+                assert (await post_login(c, "stu-03", "неверный-1")).status_code == 401
+                await role.login_gate.drain()                                           # запись прошла — и упала
+            assert failures(tmp_path) == 0 and len(role.login_gate.pending_of(key)) == accounts.LOCK_FAILURES
+            calls.clear()
+            r = await post_login(c, "stu-03", PW)                                      # и с верным паролем
+            assert (r.status_code, r.json()["data"]["message"], calls) == (429, GW_MESSAGES["locked"], [])
+        r = await asyncio.gather(*(post_login(c, "stu-03", PW) for _ in range(10)))    # диск свободен — замок держит
+        assert {x.status_code for x in r} == {429} and calls == []
+
+
+async def test_unrecorded_stamp_expires_with_lock_window():                             # Л-1: память не копится
+    """Незаписанная метка живёт не дольше окна замка; записанная уходит сразу."""
+    mono = FakeMono(5000.0)
+    gate = LoginGate(1, 1, 8, clock=mono, window=900.0)
+    for recorded in (False, True):
+        await gate.attempt(b"k", lambda pending: None, lambda r: r is None,
+                           lambda r, at, recorded=recorded: lambda: recorded)
+        await gate.drain()
+    assert len(gate.pending_of(b"k")) == 1                                             # незаписанная осталась
+    mono.advance(900.0)
+    assert gate.pending_of(b"k") == () and gate.pending == {}                          # вышла из окна

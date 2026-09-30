@@ -1,15 +1,18 @@
 """Места шлюза (Д5-R27, Д5-R28): прокси сокета, замок места, пробуждение одно на место, «упало» по Restarting и
 StartedAt, готовность, уборщик простоя с перепроверкой под замком. Места и sp-ctl — двойники httpx.MockTransport."""
 import asyncio
+import importlib.util
 import logging
 import re
+import sys
 import time
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
 from fake_places import FakeDocker, FakePlaces
-from helpers import FakeMono, gateway_role, make_places, ready_place, wait_until_async
+from helpers import CORE_DIR, FakeMono, gateway_role, make_places, ready_place, wait_until_async
 from pcbk_core.gateway import places
 from pcbk_core.gateway.places import PLACE_TEXTS, PlaceView, SpCtl, SpCtlError
 from pcbk_core.gateway.stats import GatewayStats
@@ -362,10 +365,10 @@ def place_lines(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == "pcbk_core.gateway.places"]
 
 
-async def test_wake_on_fresh_ready_does_no_work(tmp_path, caplog):                     # M4, код (R5)
+async def test_wake_on_fresh_ready_does_no_work(tmp_path, caplog):                     # M4, код (R5); M-1
     """Место готово, и inspect такта подтвердил это не дольше такта назад: 20 wake подряд — ни inspect, ни строки
-    журнала, ни события, но активность (touch). Подтверждение старше такта или снятый флаг — снова сверка inspect;
-    её «готово» тоже подтверждение."""
+    журнала, но +20 wake_ok в памяти и активность (touch). Подтверждение старше такта или снятый флаг — снова
+    сверка inspect; её «готово» тоже подтверждение."""
     caplog.set_level(logging.INFO, logger="pcbk_core.gateway.places")
     w = make_places(tmp_path, FakeDocker(running={3}))
     await w.tick()                                                                     # «готово» вернул и подтвердил такт
@@ -375,14 +378,16 @@ async def test_wake_on_fresh_ready_does_no_work(tmp_path, caplog):              
     for _ in range(20):
         assert (await w.wake(3)).state == "ready"
     assert (w.docker.calls.count(("inspect", 3)), len(place_lines(caplog))) == (inspects, lines)
-    assert w.stats.count_1h("wake_ok") == 0 and w._tasks == {} and w.idle_s(3) == 0.0   # пробуждение — активность
+    assert w.stats.count_1h("wake_ok") == 20 and w._tasks == {} and w.idle_s(3) == 0.0  # пробуждение — активность
     w.mono.advance(1)                                                                  # подтверждение старше такта
     await w.wake(3)
     assert (await w.wait_ready(3)).state == "ready" and w.docker.calls.count(("inspect", 3)) == inspects + 1
-    assert w.stats.count_1h("wake_ok") == 1 and "gw wake place=03 result=ready" in "\n".join(place_lines(caplog))
+    assert w.stats.count_1h("wake_ok") == 21 and "gw wake place=03 result=ready" in "\n".join(place_lines(caplog))
+    lines = len(place_lines(caplog))
     for _ in range(19):                                                                # подтвердило само пробуждение
         await w.wake(3)
-    assert (w.docker.calls.count(("inspect", 3)), w.stats.count_1h("wake_ok")) == (inspects + 1, 1)
+    assert (w.docker.calls.count(("inspect", 3)), w.stats.count_1h("wake_ok")) == (inspects + 1, 40)
+    assert len(place_lines(caplog)) == lines
     w.mark_unready(3)                                                                  # Д5б: место не ответило
     await w.wake(3)
     assert (await w.wait_ready(3)).state == "ready" and w.docker.calls.count(("inspect", 3)) == inspects + 2
@@ -413,3 +418,51 @@ async def test_inspect_refused_while_ping_alive_is_down(tmp_path, caplog):      
     await w.tick()
     assert w.sp_ctl == "ok" and role.health() == (True, "принимает вход")
     await w.aclose(); await w.spctl.aclose()
+
+
+# --- остаток после повторного ревью R1–R9 ---
+
+def watchdog_checks():
+    """Правила сторожа (watchdog/pcbk_watchdog/checks.py, только stdlib) — из соседнего каталога репозитория,
+    как тест моделей читает student/: стык с настоящим health_json без копии правил."""
+    name = "pcbk_watchdog_checks_for_core_tests"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, CORE_DIR.parent / "watchdog" / "pcbk_watchdog" / "checks.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module                                                     # dataclass ищет свой модуль
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+async def test_long_session_ready_places_keep_row_from_fail(tmp_path):                  # M-1 (вариант «а»)
+    """Долгое занятие: место 03 поднято давно (такт вернул и подтвердил «готово»), его страница будит его — быстрый
+    путь; место 04 не создано и трижды не поднялось. Строка сторожа — warn «не поднялось по входу», а не fail
+    «рабочие места не поднимаются»: быстрый путь считает wake_ok."""
+    role = gateway_role(tmp_path, docker=FakeDocker(running={3}, missing={4}))
+    w = role.workplaces
+    await w.tick()
+    for _ in range(3):
+        assert (await w.wake(3)).state == "ready"
+        await w.wake(4)
+        assert (await w.wait_ready(4)).state == "failed"
+    assert role.fake_docker.calls.count(("start", 3)) == 0                             # 03 не будилось заново
+    checks = watchdog_checks()
+    reply = checks.GatewayReply.parse(role.health_json(role.wallclock()))
+    assert (reply.wake_ok_1h, reply.wake_failed_1h) == (3, 3)
+    verdict = checks.gateway_verdict(reply, datetime.now(timezone.utc), 120)
+    assert verdict == ("warn", "рабочее место не поднялось по входу", "3 за час"), verdict
+    await w.aclose(); await w.spctl.aclose()
+
+
+async def test_steady_tick_confirms_ready(tmp_path):                                    # M-3: подтверждение тактом
+    """Подтверждение устарело, штатный такт (не первый проход) видит место готовым и подтверждает снова: N wake
+    после него — без inspect."""
+    w = make_places(tmp_path, FakeDocker(running={3}))
+    await w.tick()                                                                     # первый проход — возврат «готово»
+    w.mono.advance(w.gw.GW_REAPER_TICK_S + 1)                                          # подтверждение устарело
+    await w.tick()                                                                     # штатный такт
+    inspects = w.docker.calls.count(("inspect", 3))
+    for _ in range(10):
+        assert (await w.wake(3)).state == "ready"
+    assert (w.docker.calls.count(("inspect", 3)), w.stats.count_1h("wake_ok")) == (inspects, 10)
+    assert w._tasks == {}

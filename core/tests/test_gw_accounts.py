@@ -258,6 +258,24 @@ def test_full_disk_write_failure_outlives_reads(tmp_path):                      
         assert db.execute("SELECT count(*) FROM gw_heartbeat").fetchone()[0] == 1      # одна строка пульса
 
 
+def test_expired_session_delete_is_a_write(tmp_path):                                   # M-4
+    """Удаление истёкшей сессии в session() — операция записи: её сбой — сбой записи, который чтение не снимает;
+    удачное удаление снимает."""
+    clock = FakeMono(5000.0)
+    s = store(tmp_path, clock=clock, ttl_s=60.0)
+    s.add("ivanov", "student", 3, PW)
+    token = s.open_session("ivanov")
+    clock.advance(61)
+    with full_disk(s):
+        with pytest.raises(StoreError):
+            s.session(token)                                                           # чтение прошло, DELETE — нет
+        assert (s.write_failures, s.read_failures) == (1, 0)
+    assert s.session("чужой") is None and s.op_failures == 1                           # чтение сбой записи не снимает
+    assert s.session(token) is None and s.op_failures == 0                             # удаление прошло
+    with closing(sqlite3.connect(tmp_path / "core.db")) as db:
+        assert db.execute("SELECT count(*) FROM gw_sessions").fetchone()[0] == 0
+
+
 def test_read_failure_cleared_by_read(tmp_path, monkeypatch):                          # R3: сбой чтения — как прежде
     s = store(tmp_path)
     with monkeypatch.context() as m:

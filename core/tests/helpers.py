@@ -429,14 +429,16 @@ def fail_connect(*a, **k):
 
 
 class FullDisk:
-    """Соединение SQLite как на переполненном диске: COMMIT падает SQLITE_FULL, чтения и запись до COMMIT идут
-    (в WAL вставка без COMMIT на диск не пишет). Подмена AccountStore._connect: full_disk(store)."""
+    """Соединение SQLite как на переполненном диске: COMMIT и запись в режиме автофиксации (сама себе COMMIT)
+    падают SQLITE_FULL; чтения и запись внутри транзакции до COMMIT идут (в WAL вставка без COMMIT на диск не
+    пишет). Подмена AccountStore._connect: full_disk(store)."""
 
     def __init__(self, db: sqlite3.Connection):
         self._db = db
 
     def execute(self, sql: str, *args):
-        if sql.strip().upper() == "COMMIT":
+        head = sql.strip().upper()
+        if head == "COMMIT" or (not self._db.in_transaction and head.startswith(("INSERT", "UPDATE", "DELETE"))):
             raise sqlite3.OperationalError("database or disk is full")
         return self._db.execute(sql, *args)
 
