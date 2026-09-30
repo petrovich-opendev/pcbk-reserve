@@ -406,7 +406,7 @@ async def test_pause_keeps_unlisted_and_counts_in_window():                    #
         await g.run([Q])
     assert e.value.code == "busy" and len(fake.calls) == PAUSE_AFTER_TIMEOUTS
     s = g.stats()
-    assert (s["timeouts_5m"], s["busy_5m"], s["user_paused"]) == (3, 1, True) and s["p95_ms"] is not None
+    assert (s["timeouts_5m"], s["busy_5m"], s["user_paused"], s["p95_ms"]) == (3, 1, True, None)  # дошли 3 из 5
     mono.advance(STATS_WINDOW_S)                                           # окно ушло: ни сроков, ни p95
     s = g.stats()
     assert (s["timeouts_5m"], s["busy_5m"], s["user_paused"], s["p95_ms"]) == (0, 0, False, None)
@@ -439,3 +439,48 @@ async def test_p95_counts_wait_for_slot():                                     #
     g = await warmed(fake, user_slots=1)
     await asyncio.gather(*(g.run([Q]) for _ in range(P95_MIN_CALLS)))      # по одному: последний ждал 0,4 с
     assert g.stats()["p95_ms"] >= 450
+
+
+# решения контроллера по вопросам задачи 1: счёт сроков и p95 — только по вызовам, дошедшим до драйвера
+
+
+async def test_busy_refusals_between_timeouts_do_not_prevent_pause():
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=1)
+    fake.delay_s, fake.fail = 0.5, HistorianError("timeout", "долго")
+    order: list[str] = []
+
+    async def holder():                                  # держит место 0,5 с и получает срок от драйвера
+        with pytest.raises(HistorianError) as e:
+            await g.run([Q])
+        order.append(e.value.code)
+
+    async def late():                                    # не дождался места: busy без SQL между сроками
+        await anyio.sleep(0.05)
+        with pytest.raises(GateRefused) as e:
+            await g.run([Q], deadline_s=0.3)
+        order.append(e.value.code)
+
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        assert g.stats()["user_paused"] is False
+        await asyncio.gather(holder(), late())
+    assert order == ["busy", "timeout"] * PAUSE_AFTER_TIMEOUTS
+    s = g.stats()
+    assert (s["user_paused"], s["timeouts_5m"], s["busy_5m"]) == (True, 3, 3)
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == sent
+
+
+async def test_p95_only_calls_that_reached_driver():
+    fake = FakeHistorian(delay_s=0.1)
+    g = gate(fake)
+    for _ in range(P95_MIN_CALLS - 1):
+        await g.run([Q])
+    for _ in range(100):                                 # мгновенные отказы без SQL
+        with pytest.raises(GateRefused):
+            await g.run([live_sql(["16FAKE_009_PV"])])
+    assert g.stats()["p95_ms"] is None                   # до драйвера дошли только четыре
+    await g.run([Q])
+    assert g.stats()["p95_ms"] >= 90                     # сто отказов по 0 мс его не тянут вниз

@@ -18,10 +18,12 @@ TagName IN (…) и то, что пропускает literal_ok.
 После обрыва связи 30 с новые попытки сразу получают отказ.
 
 Нагрузка полосы людей (Д4б-R22) — в памяти, для /health/historian: p95 длительности
-вызовов за STATS_WINDOW_S, сроки и busy за то же окно. Длительность — от входа в run()
-до исхода, с ожиданием места: это видит студент. После PAUSE_AFTER_TIMEOUTS сроков
-подряд полоса людей стоит USER_PAUSE_S: новые вызовы сразу получают busy, без места и
-SQL; фон паузы не знает. Любой другой исход вызова людей обнуляет счёт.
+вызовов за STATS_WINDOW_S, сроки и busy за то же окно. p95 — только у вызовов, дошедших
+до драйвера; длительность — от входа в run() до исхода, с ожиданием места: это видит
+студент. Отказы без SQL (busy, пауза, unlisted, rate, защёлка) p95 не разбавляют. После
+PAUSE_AFTER_TIMEOUTS сроков подряд полоса людей стоит USER_PAUSE_S: новые вызовы сразу
+получают busy, без места и SQL; фон паузы не знает. Счёт обнуляет только исход, с которым
+SQL дошёл до историана (удача, ошибка query, connect, auth); отказы без SQL его не трогают.
 """
 import asyncio
 import logging
@@ -86,6 +88,13 @@ class GateRefused(Exception):
         self.code = code
 
 
+@dataclass
+class _Attempt:
+    """Вызов людей дошёл до драйвера — отмечает _call после передачи запроса в пул ворот."""
+
+    reached: bool = False
+
+
 @dataclass(frozen=True)
 class GateResult:
     rows: list[list[Row]]
@@ -122,8 +131,8 @@ class HistorianGate:
         self._refused_unlisted = 0
         self._auth_latched = False
         self._pause_until: float | None = None
-        # исходы вызовов людей за окно: (monotonic() исхода, длительность в мс, код исхода)
-        self._user_calls: deque[tuple[float, int, str]] = deque()
+        # исходы вызовов людей за окно: (monotonic() исхода, длительность в мс, код исхода, дошёл до драйвера)
+        self._user_calls: deque[tuple[float, int, str, bool]] = deque()
         self._timeouts_in_row = 0
         self._user_pause_until: float | None = None
 
@@ -139,15 +148,15 @@ class HistorianGate:
         """Только числа и флаги, без имён тегов; только память — ручку здоровья зовут в цикле событий."""
         now = self.monotonic()
         calls = self._user_window(now)
-        took = sorted(ms for _, ms, _ in calls)
+        took = sorted(ms for _, ms, _, reached in calls if reached)     # отказы без SQL p95 не разбавляют
         return {"sent_names_total": self._sent_names_total,
                 "refused_unlisted": self._refused_unlisted,
                 "in_flight": dict(self._in_flight),
                 "auth_latched": self._auth_latched,
                 # ближайший ранг: при пяти вызовах — самый долгий
                 "p95_ms": took[math.ceil(0.95 * len(took)) - 1] if len(took) >= P95_MIN_CALLS else None,
-                "timeouts_5m": sum(1 for _, _, code in calls if code == "timeout"),
-                "busy_5m": sum(1 for _, _, code in calls if code == "busy"),
+                "timeouts_5m": sum(1 for _, _, code, _ in calls if code == "timeout"),
+                "busy_5m": sum(1 for _, _, code, _ in calls if code == "busy"),
                 "user_paused": self._user_paused(now)}
 
     async def run(self, statements: Sequence[str], *, lane: Lane = "user",
@@ -164,19 +173,20 @@ class HistorianGate:
         budget = self.deadline_s if deadline_s is None else deadline_s
         if not (budget > 0 and math.isfinite(budget)):
             raise ValueError("срок вызова — положительное число секунд")
+        attempt = _Attempt()
         if lane != "user":
-            return await self._call(statements, lane, budget, loop, began)
+            return await self._call(statements, lane, budget, loop, began, attempt)
         # исход вызова людей — в окно нагрузки; отмена вызывающим — не исход
         try:
-            result = await self._call(statements, lane, budget, loop, began)
+            result = await self._call(statements, lane, budget, loop, began, attempt)
         except Exception as exc:
-            self._note_user(exc, loop.time() - began)
+            self._note_user(exc, loop.time() - began, attempt.reached)
             raise
-        self._note_user(None, loop.time() - began)
+        self._note_user(None, loop.time() - began, attempt.reached)
         return result
 
     async def _call(self, statements: tuple[str, ...], lane: Lane, budget: float,
-                    loop: asyncio.AbstractEventLoop, began: float) -> GateResult:
+                    loop: asyncio.AbstractEventLoop, began: float, attempt: _Attempt) -> GateResult:
         deadline = began + budget
 
         # 1. белый список и форма шаблона — до всего остального, без SQL
@@ -217,6 +227,7 @@ class HistorianGate:
                 raise GateRefused("rate")
             # 5. запрос — в пул ворот; место (и замок первого входа) отпустит колбэк после возврата драйвера
             waiter = self._submit(loop, lane, probe, statements, deadline - loop.time())
+            attempt.reached = True
         except BaseException:
             if probe:
                 self._first_login.release()
@@ -260,7 +271,7 @@ class HistorianGate:
             return False
         return True
 
-    def _user_window(self, now: float) -> deque[tuple[float, int, str]]:
+    def _user_window(self, now: float) -> deque[tuple[float, int, str, bool]]:
         """Исходы людей моложе STATS_WINDOW_S; старые уходят (граница — как у SlidingWindow)."""
         calls = self._user_calls
         while calls and calls[0][0] <= now - STATS_WINDOW_S:
@@ -270,11 +281,14 @@ class HistorianGate:
     def _user_paused(self, now: float) -> bool:
         return self._user_pause_until is not None and now < self._user_pause_until
 
-    def _note_user(self, exc: Exception | None, took_s: float) -> None:
-        """Исход вызова людей: в окно нагрузки; срок — в счёт подряд, любой другой исход его обнуляет."""
+    def _note_user(self, exc: Exception | None, took_s: float, reached: bool) -> None:
+        """Исход вызова людей: в окно нагрузки. Срок — в счёт подряд; прочий исход, с которым SQL дошёл до
+        историана, счёт обнуляет; отказ без SQL (busy, пауза, unlisted, rate, защёлка) его не трогает."""
         code = "ok" if exc is None else exc.code if isinstance(exc, (HistorianError, GateRefused)) else "error"
         now = self.monotonic()
-        self._user_window(now).append((now, max(0, round(took_s * 1000)), code))
+        self._user_window(now).append((now, max(0, round(took_s * 1000)), code, reached))
+        if not reached:
+            return
         if code != "timeout":
             self._timeouts_in_row = 0
             return
