@@ -10,6 +10,8 @@ pcbk-student-01…10; путь вне правил — 403, метод без п
 Д5б (задача Б3): FakePlaces записывает запросы видом Recorded, отвечает списками агентов (agents) и висящих
 разрешений (pending), по месту умеет ответить заданным кодом и заголовками (force_status), бросить исключение
 (raise_for), помолчать (hang_for) и отдать большое тело кусками по 1 КиБ со счётом отданного (big, big_sent).
+
+Д5б (задача Б4): GET /event — поток событий места (events, event_starts, event_open, event_closed; см. FakePlaces).
 """
 import asyncio
 import base64
@@ -17,7 +19,8 @@ import gzip
 import itertools
 import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 import httpx
@@ -32,7 +35,15 @@ _DOCKER_POST = re.compile(r"/v1\.44/containers/pcbk-student-(0[1-9]|10)/(start|s
 _PLACE_TAIL = re.compile(r"([1-9]|10)\.3")         # после префикса STU_NET: N.3, номер без нуля впереди
 _PROMPT_ASYNC = re.compile(r"/session/[^/]+/prompt_async")
 BIG_CHUNK = 1024                                   # кусок большого тела big: предел читается с точностью до КиБ
+PULSE_S = 0.05                                     # пульс потока "endless"
+# "silent" молчит столько, а не вечно: поломка, при которой шлюз тишину не видит, роняет тест, а не вешает прогон
+SILENT_S = 20.0
 _stamps = itertools.count(1)
+
+
+def sse(event_type: str, **props) -> bytes:
+    """Событие потока места, как его пишет OpenCode 1.18.33: одна строка data: с JSON и пустая строка."""
+    return b"data: " + json.dumps({"id": "e", "type": event_type, "properties": props}).encode() + b"\n\n"
 
 
 def expected_basic(n: int) -> str:
@@ -145,6 +156,46 @@ class Recorded:
     url: httpx.URL
 
 
+class _EventBody(httpx.AsyncByteStream):
+    """Тело ответа /event двойника: куски по сценарию; закрытие (aclose или конец сценария) учитывается один раз.
+
+    Сценарий — список, где bytes — кусок, ("pause", s) — пауза, вызываемое — вызов без аргументов (проба теста в
+    момент чтения), ("raise", исключение) — бросить его (обрыв посреди потока); "endless" — пульс server.heartbeat
+    раз в PULSE_S без конца; "silent" — server.connected и тишина SILENT_S (для шлюза — без конца), затем конец."""
+
+    def __init__(self, places: "FakePlaces", n: int, script: object):
+        self._places, self._n, self._script = places, n, script
+        self._closed = False
+        places.event_starts[n] += 1
+        places.event_open[n] += 1
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        script = self._script
+        if script == "endless":
+            while True:
+                yield sse("server.heartbeat")
+                await asyncio.sleep(PULSE_S)
+        if script == "silent":
+            yield sse("server.connected")
+            await asyncio.sleep(SILENT_S)
+            return
+        for item in script:
+            if isinstance(item, tuple) and item[0] == "pause":
+                await asyncio.sleep(item[1])
+            elif isinstance(item, tuple) and item[0] == "raise":
+                raise item[1]
+            elif isinstance(item, Callable):
+                item()
+            else:
+                yield item
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._places.event_open[self._n] -= 1
+            self._places.event_closed[self._n] = True
+
+
 def _record(request: httpx.Request) -> Recorded:
     body = request.content
     try:
@@ -171,9 +222,12 @@ class FakePlaces:
       эти байты как тело 200 (неверный ответ места);
     - GET /permission — pending[n] (по умолчанию []);
     - check_status[n] — этот код и {"name": "Check"} на GET /agent и GET /permission (сверки прокси);
+    - GET /event — 200 text/event-stream с потоком по сценарию events[n] (_EventBody; по умолчанию —
+      server.connected и конец); event_starts[n] — сколько потоков место отдало, event_open[n] — сколько открыто
+      сейчас, event_closed[n] — закрыт ли хоть один (False, пока не закрыт ни один); пауза до заголовков — hang_for;
     - POST /session/{id}/prompt_async — 204; прочее — 200 {}.
     agent_calls[n] — сколько раз звали /agent места n; active[n] — запросов к месту n в работе сейчас, max_active[n]
-    — наибольшее их число (от записи запроса до ответа). /event — задача Б4.
+    — наибольшее их число (от записи запроса до ответа; у /event — до заголовков).
     """
 
     def __init__(self, *, ready_after: int = 1, never_ready: bool = False, wrong_pw: bool = False,
@@ -198,6 +252,10 @@ class FakePlaces:
         self.active: Counter[int] = Counter()
         self.max_active: Counter[int] = Counter()
         self.requests: list[Recorded] = []
+        self.events: dict[int, object] = {}
+        self.event_starts: Counter[int] = Counter()
+        self.event_open: Counter[int] = Counter()
+        self.event_closed: defaultdict[int, bool] = defaultdict(bool)
 
     async def _big_body(self, n: int, size: int):
         while size > 0:
@@ -238,6 +296,9 @@ class FakePlaces:
             return httpx.Response(200, headers={"content-type": "application/json"},
                                   content=self._big_body(n, self.big[n]))
         path = request.url.path
+        if request.method == "GET" and path == "/event":
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  stream=_EventBody(self, n, self.events.get(n, [sse("server.connected")])))
         if request.method == "GET" and path in ("/agent", "/permission") and n in self.check_status:
             return _json(self.check_status[n], {"name": "Check"})
         if request.method == "GET" and path == "/agent":

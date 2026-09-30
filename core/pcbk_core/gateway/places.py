@@ -39,6 +39,11 @@ httpx. Исключения httpx ловятся целиком (httpx.HTTPError
 fetch() (Д5б, прокси Б3) читает ответ места кусками и бросает его на пределе: память шлюза не зависит от места.
 Место просят не сжимать ответ (Accept-Encoding: identity — OpenCode сжимает только по просьбе клиента), сжатый
 ответ — PlaceAnswerEncoded: размер распакованного не узнать, не распаковав.
+
+stream() (Д5б, поток /event задачи Б4) — GET потока событий места клиентом этого места: Accept: text/event-stream,
+тоже identity, срок чтения httpx снят (пульс OpenCode — раз в 10 с; тишину считает шлюз, SSE_READ_TIMEOUT_S), а
+заголовки ответа ждутся не дольше STREAM_OPEN_S под asyncio.timeout: двойник MockTransport сроков httpx не знает.
+Константы читаются при вызове — тесты их подменяют.
 """
 from __future__ import annotations
 
@@ -49,7 +54,8 @@ import logging
 import re
 import ssl
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +76,8 @@ READY_ATTEMPT_S = 2.0         # попытка GET /agent: первые ~3 с п
 READY_PAUSE_S = 0.5
 BUSY_CHECK_S = 2.0
 PLACE_READ_S = 20.0           # срок чтения запроса к месту (Д5-R30)
+SSE_READ_TIMEOUT_S = 60.0     # тишина потока /event дольше — обрыв: шесть пульсов OpenCode по 10 с (Д5-R35)
+STREAM_OPEN_S = 10.0          # заголовки ответа места на /event (Д5-R35)
 PLACE_PORT = 4096
 PROXY_PARALLEL = 2            # вызовов прокси к одному месту разом (Б3, G1); потоки /event — отдельно
 # соединений клиента места: потоки учётки, вызовы прокси и один служебный (пробуждение, такт уборщика)
@@ -93,6 +101,7 @@ PLACE_TEXTS = {
 }
 
 PLACE_TIMEOUT = httpx.Timeout(connect=2, read=PLACE_READ_S, write=5, pool=5)
+STREAM_TIMEOUT = httpx.Timeout(connect=2, read=None, write=5, pool=5)     # поток /event: тишину считает шлюз
 PLACE_LIMITS = httpx.Limits(max_connections=PLACE_CONNECTIONS, max_keepalive_connections=PLACE_CONNECTIONS)
 _SP_CTL_TIMEOUT = httpx.Timeout(ACTION_TIMEOUT_S, connect=PING_TIMEOUT_S)
 # нет ответа: соединение, срок (asyncio.timeout — TimeoutError), обрыв, отказ охраны выхода (OSError)
@@ -377,6 +386,21 @@ class Workplaces:
                     raise PlaceAnswerTooLarge()
                 body += chunk
             return PlaceAnswer(response.status_code, response.headers.get("content-type"), body)
+        finally:
+            await response.aclose()
+
+    @asynccontextmanager
+    async def stream(self, n: int, path: str) -> AsyncIterator[httpx.Response]:
+        """Поток места n (Д5б, /event): GET с Accept: text/event-stream и Accept-Encoding: identity, сроки
+        STREAM_TIMEOUT; заголовки ответа — не дольше STREAM_OPEN_S (TimeoutError). Отдаёт ответ с непрочитанным
+        телом (aiter_raw), на выходе закрывает его. Исключения httpx и OSError — наружу."""
+        url, headers = self._place_headers(n, path, {"Accept": "text/event-stream", "Accept-Encoding": "identity"})
+        client = self._http(n)
+        request = client.build_request("GET", url, headers=headers, timeout=STREAM_TIMEOUT)
+        async with asyncio.timeout(STREAM_OPEN_S):
+            response = await client.send(request, stream=True)
+        try:
+            yield response
         finally:
             await response.aclose()
 

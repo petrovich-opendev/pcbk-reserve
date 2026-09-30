@@ -197,7 +197,8 @@ class GatewayRole(RoleBase):
     def __init__(self, settings: Settings, gw: GatewaySettings, *, store: AccountStore, workplaces: Workplaces,
                  stats: GatewayStats, config_error: str | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
-                 wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 stream_recheck_s: float = 10.0):
         from .accounts import LOCK_WINDOW_S
         from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
 
@@ -209,6 +210,7 @@ class GatewayRole(RoleBase):
         self.config_error = config_error
         self.monotonic = monotonic
         self.wallclock = wallclock
+        self.stream_recheck_s = stream_recheck_s    # сессия потока /event — не реже и не чаще раза за срок (Д5-R35)
         self.started_at = wallclock()           # checked_at до первого такта — время запуска роли
         self.login_gate = LoginGate(LOGIN_PARALLEL, LOGIN_QUEUE, LOGIN_BACKLOG, clock=store.clock,
                                     window=LOCK_WINDOW_S)

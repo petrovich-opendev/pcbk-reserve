@@ -302,13 +302,6 @@ def test_agent_name_in_answer_only_after_check(gw, gwlog):                      
     assert role.stats.count_1h("refused") == 5
 
 
-def test_event_answers_not_ready_until_b4(gw):                                          # решение 6: заглушка до Б4
-    c, role, place = gw
-    r = c.get("/pcbk/api/oc/event")
-    assert (r.status_code, r.json()["name"]) == (503, "WorkplaceNotReady") and place.requests == []
-    assert role.workplaces.is_ready(3) and role.stats.count_1h("upstream_failed") == 0
-
-
 def test_place_answer_cut_at_limit(gw):                                                 # решение 7
     c, role, place = gw
     place.big[3] = 3 * UPSTREAM_MAX_BYTES
