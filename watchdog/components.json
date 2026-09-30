@@ -14,6 +14,7 @@
   {"id": "student-09", "title": "Рабочее место 09", "kind": "container", "container": "pcbk-student-09", "sleeping_ok": true},
   {"id": "student-10", "title": "Рабочее место 10", "kind": "container", "container": "pcbk-student-10", "sleeping_ok": true},
   {"id": "core", "title": "Служба данных", "kind": "http", "url": "http://pcbk-core:8000/healthz/data", "ok_detail": "жива"},
+  {"id": "core-container", "title": "Серверный слой — контейнер", "kind": "container", "container": "pcbk-core", "sleeping_ok": false},
   {"id": "historian", "title": "Историан БДРВ", "kind": "historian", "url": "http://pcbk-core:8000/health/historian"},
   {"id": "llm", "title": "LLM-прокси и бюджет", "kind": "llm", "url": "http://pcbk-core:8000/health/llm"}
 ]

@@ -134,7 +134,7 @@ services:
   # с Command (у Dify там пароли), а строку запроса с фильтром прокси не проверяет.
   # :ro на сокете от записи в Docker не защищает — защищает только фильтр.
 
-  # сторожу — только чтение: ping и inspect рабочих мест и sp-ctl
+  # сторожу — только чтение: ping и inspect рабочих мест, sp-ctl и core (Д4б: строка контейнера core)
   sp-ro:
     image: wollomatic/socket-proxy:1.13.1
     pull_policy: never
@@ -149,7 +149,7 @@ services:
     command:
       - '-listenip=0.0.0.0'
       - '-allowfrom=pcbk-watchdog'
-      - '-allowGET=(/v1\.[0-9]+)?/(_ping|containers/pcbk-(student-(0[1-9]|10)|sp-ctl)/json)'
+      - '-allowGET=(/v1\.[0-9]+)?/(_ping|containers/pcbk-(student-(0[1-9]|10)|sp-ctl|core)/json)'
     volumes:
       - type: bind
         source: /var/run/docker.sock

@@ -254,11 +254,19 @@ def test_components_file_d4a():                    # было test_components_fi
            ("llm", "LLM-прокси и бюджет", "http://pcbk-core:8000/health/llm")
     assert not [c for c in comps.values() if c["kind"] == "absent"]
     assert list(comps)[:4] == ["edge", "sp-ro", "sp-ctl", "memory"]
-    assert list(comps)[-3:] == ["core", "historian", "llm"]
     students = [c for i, c in comps.items() if i.startswith("student-")]
     assert [(c["id"], c["title"], c["kind"], c["container"], c["sleeping_ok"]) for c in students] == \
            [(f"student-{n:02d}", f"Рабочее место {n:02d}", "container", f"pcbk-student-{n:02d}", True)
             for n in range(1, 11)]
+
+
+def test_components_file_d4b():
+    comps = load_components("components.json")
+    ids = [c["id"] for c in comps]
+    assert ids[-4:] == ["core", "core-container", "historian", "llm"]
+    cc = comps[ids.index("core-container")]
+    assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
+           ("container", "pcbk-core", False, "Серверный слой — контейнер")
 
 
 def test_absent_kind_stays_for_synthetic_sets():   # П17: вида absent нет в components.json, но он есть

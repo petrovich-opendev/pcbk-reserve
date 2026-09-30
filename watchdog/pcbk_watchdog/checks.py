@@ -27,6 +27,17 @@ CRASH_LOOP_DETAIL = "падает в цикле (перезапуски подр
 HEALTH_SILENCE = timedelta(minutes=2)
 HEALTH_SILENT_DETAIL = "проверка здоровья молчит"
 UNHEALTHY_DETAIL = "OpenCode не отвечает"
+# MCP места (Д4б): проверка здоровья образа :d4 печатает «200 mcp=<слово>», образ :d2 — только код
+MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
+# слова, при которых связь не потеряна: unknown — ответ /mcp не прочитан, disabled — MCP выключен
+MCP_NOT_DOWN = frozenset({"connected", "unknown", "disabled"})
+MCP_DOWN_DETAIL = "нет связи со службой данных (MCP)"
+# столько записей Health.Log хранит Docker; все с mcp=unknown и старейшая кончилась раньше
+# MCP_UNKNOWN_S назад — «внимание». На старте (start-interval 2 с, ленивый подъём MCP под gVisor)
+# пять unknown набираются за 10 с — это норма (К30)
+HEALTH_LOG_KEEP = 5
+MCP_UNKNOWN_S = 120
+MCP_UNKNOWN_DETAIL = "состояние MCP не читается"
 # пути каталога выкладки в State.Error (секреты мест) на страницу не выводим
 HOST_PATH = re.compile(r"/opt/pcbk-reserve[^\s\"':]*")
 # рабочее место спит: вышло само, SIGKILL или SIGTERM
@@ -121,7 +132,7 @@ def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Ch
 
 def check_container(component: str, title: str, inspect: dict | None, *,
                     sleeping_ok: bool, now: datetime) -> Check:
-    """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1 и задачи 2 Д2."""
+    """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1, задачи 2 Д2 и задачи 3 Д4б."""
     def result(state: State, detail: str) -> Check:
         return Check(component, title, state, detail)
 
@@ -147,6 +158,10 @@ def check_container(component: str, title: str, inspect: dict | None, *,
                 return result("fail", HEALTH_SILENT_DETAIL)
             if health.get("Status") == "unhealthy":
                 return result("fail", UNHEALTHY_DETAIL)
+            if health.get("Status") == "healthy":
+                mcp = _mcp_detail(health.get("Log") or [], now)
+                if mcp is not None:
+                    return result("warn", mcp)
         if restarts > 0 and recent:
             # время — в поясе now и с явным смещением
             at = started.astimezone(now.tzinfo).strftime("%H:%M UTC%:z")
@@ -165,6 +180,27 @@ def check_container(component: str, title: str, inspect: dict | None, *,
     if sleeping_ok and code in SLEEP_EXIT_CODES:
         return result("ok", "спит")
     return result("fail", f"остановлен, код {code}")
+
+
+def _mcp_word(entry: dict) -> str | None:
+    found = MCP_WORD.search(entry.get("Output") or "")
+    return found.group(1) if found else None
+
+
+def _mcp_detail(log: list[dict], now: datetime) -> str | None:
+    """Строки MCP места (Д4б) по Health.Log, где Docker пишет новые записи последними.
+
+    Решает слово mcp= последней записи; вывода без слова (образ :d2) строки не касаются.
+    """
+    words = [_mcp_word(e) for e in log[-HEALTH_LOG_KEEP:]]
+    if not words or words[-1] is None:
+        return None
+    if words[-1] not in MCP_NOT_DOWN:
+        return MCP_DOWN_DETAIL
+    if (len(words) == HEALTH_LOG_KEEP and set(words) == {"unknown"}
+            and now - datetime.fromisoformat(log[-HEALTH_LOG_KEEP]["End"]) > timedelta(seconds=MCP_UNKNOWN_S)):
+        return MCP_UNKNOWN_DETAIL
+    return None
 
 
 def _reason(text: str) -> str:

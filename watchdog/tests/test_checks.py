@@ -108,6 +108,74 @@ def test_health_silence_is_fail():                                            # 
     assert restarted.state == "ok"
 
 
+# Д4б, задача 3: MCP места по выводу проверки здоровья образа :d4 («200 mcp=<слово>»)
+
+def test_mcp_state_from_health_output():                                       # Review Focus 1
+    seen = {out: stu(insp(running=True, health="healthy", output=out))
+            for out in ("200 mcp=connected\n", "200 mcp=failed\n", "200\n", "200 mcp=unknown\n")}
+    assert [c.state for c in seen.values()] == ["ok", "warn", "ok", "ok"]
+    assert seen["200 mcp=failed\n"].detail == "нет связи со службой данных (MCP)"
+
+
+def test_mcp_unknown_five_in_a_row_is_warn():                                   # раунд 1: молчание MCP; К30
+    old = stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5))          # старейшая — T0 − 130 с
+    start = stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5, log_step_s=2))   # старт: T0 − 18 с
+    four = stu(insp(running=True, health="healthy", log=["200 mcp=connected\n"] + ["200 mcp=unknown\n"] * 4))
+    assert (old.state, old.detail, start.state, four.state) == ("warn", "состояние MCP не читается", "ok", "ok")
+
+
+# сверх брифа: слова, последняя запись, место строк в таблице, граница 120 с
+
+def test_mcp_words_and_last_entry_only():
+    down = ("warn", "нет связи со службой данных (MCP)")
+    cases = [(dict(output="200 mcp=disabled\n"), ("ok", "работает")),               # MCP выключен в настройке
+             (dict(output="200 mcp=needs_auth\n"), down),
+             (dict(output="200 mcp=failed"), down),                                   # без перевода строки
+             (dict(output="200 xmcp=failed\n"), ("ok", "работает")),                  # не слово mcp=
+             (dict(output="200 mcp=Failed\n"), ("ok", "работает")),                   # слово — только [a-z_]
+             (dict(output="200 mcp=\n"), ("ok", "работает")),
+             (dict(log=["200 mcp=failed\n", "200 mcp=connected\n"]), ("ok", "работает")),   # новые — последними
+             (dict(log=["200 mcp=connected\n", "200 mcp=failed\n"]), down),
+             (dict(log=["200 mcp=failed\n", "200\n"]), ("ok", "работает"))]          # последняя — образ :d2
+    for kw, want in cases:
+        r = stu(insp(running=True, health="healthy", **kw))
+        assert (r.state, r.detail) == want, kw
+
+
+def test_mcp_rows_only_for_healthy_and_after_unhealthy():
+    failed = dict(running=True, output="200 mcp=failed\n")
+    assert stu(insp(health="unhealthy", **failed)).detail == "OpenCode не отвечает"          # строка выше
+    assert stu(insp(health="starting", **failed)).detail == "работает"                        # только healthy
+    loop = stu(insp(health="healthy", restarts=3, started=T0 - timedelta(seconds=20), **failed))
+    assert loop.detail == "падает в цикле (перезапуски подряд)"
+    assert stu(insp(health="healthy", last_end=T0 - timedelta(minutes=5), **failed)).detail == \
+           "проверка здоровья молчит"
+    fresh = stu(insp(health="healthy", restarts=1, started=T0 - timedelta(minutes=3), **failed))
+    assert (fresh.state, fresh.detail) == ("warn", "нет связи со службой данных (MCP)")   # выше «перезапущен»
+    unknown = dict(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5)
+    fresh = stu(insp(restarts=1, started=T0 - timedelta(minutes=3), **unknown))
+    assert (fresh.state, fresh.detail) == ("warn", "состояние MCP не читается")
+    assert stu(insp(code=0, health="healthy", output="200 mcp=failed\n")).detail == "спит"
+
+
+def test_mcp_unknown_needs_five_and_120_s():
+    unknown = ["200 mcp=unknown\n"]
+    edge = stu(insp(running=True, health="healthy", log=unknown * 5, log_step_s=27.5))      # ровно 120 с — ещё норма
+    past = stu(insp(running=True, health="healthy", log=unknown * 5, log_step_s=27.6))      # 120,4 с
+    four = stu(insp(running=True, health="healthy", log=unknown * 4, log_step_s=60))        # четыре записи
+    bare = stu(insp(running=True, health="healthy", log=["200\n"] + unknown * 4))           # одна без слова
+    assert [(c.state, c.detail) for c in (edge, past, four, bare)] == [
+        ("ok", "работает"), ("warn", "состояние MCP не читается"), ("ok", "работает"), ("ok", "работает")]
+
+
+def test_mcp_details_constant_and_short(tmp_path):
+    rows = [stu(insp(running=True, health="healthy", output=f"200 mcp={w}\n")) for w in ("failed", "needs_auth")]
+    rows += [stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5, log_step_s=s)) for s in (30, 60)]
+    assert all(len(r.detail) <= 80 for r in rows)
+    journal = Journal(str(tmp_path / "journal.db"))
+    assert sum(len(journal.record([r], T0 + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 2
+
+
 def test_paused_is_fail():
     r = check_container("sp-ctl", "Прокси сокета серверного слоя", insp(running=True, paused=True),
                         sleeping_ok=False, now=T0)
