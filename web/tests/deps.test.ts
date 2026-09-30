@@ -18,8 +18,12 @@ test("pins_are_exact_and_single", () => {
   expect(pkg.devDependencies["@testing-library/react"]).toBe("16.3.3");
   expect(lock.packages["node_modules/@assistant-ui/react-opencode"].integrity).toBe(
     "sha512-MPP7w+MbTjFKSZX2aoNd8wK/6WXIEuU/w2qc5jy+/Vx249lQZ+mwzEZ6mPoYJbVr8VHA4x8yuXG30vZaadSx1w==");
+  expect(pkg.overrides["@opencode-ai/sdk"]).toBe("1.18.33");                             // ^1.18.31 адаптера не уведёт на 1.18.34+
+  expect(lock.packages["node_modules/@opencode-ai/sdk"].integrity).toBe(                 // сумма research/07 §1
+    "sha512-Nyurky9+AA2tvZ6my8UtO5pxPoXxrNypqjeEqMshBGiR542glOy+KE1Y+3lwWU+Z6HC/hSmrdXNbX81+qiuTzg==");
   for (const [p, v] of Object.entries<any>(lock.packages)) if (p && !v.link) {
     expect(v.resolved, p).toMatch(/^https:\/\/registry\.npmjs\.org\//);
     expect(v.integrity, p).toMatch(/^sha512-/);
+    if (v.hasInstallScript) expect(v.optional, `${p}: скрипт установки у обязательного пакета`).toBe(true);
   }
 });

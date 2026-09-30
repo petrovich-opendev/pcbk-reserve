@@ -1,12 +1,35 @@
 // Д6-R40: сборка чата под строгий CSP — base /chat/, без data: и встроенных скриптов,
 // без карт исходников; опись build.json и метка сборки — плагин pcbkBuildInfo.
+import { existsSync, readdirSync } from "node:fs";
+import { resolve } from "node:path";
 import react from "@vitejs/plugin-react";
+import type { Plugin } from "vite";
 import { defineConfig } from "vitest/config";
 import { pcbkBuildInfo } from "./build/buildInfo.ts";
 
+/**
+ * Ограда emptyOutDir: Vite стёр бы каталог вывода целиком, а PCBK_WEB_OUT с опечаткой
+ * (например, ../edge/static) унёс бы чужую статику. Чистить можно только пустой каталог или
+ * прежнюю сборку чата — ту, где лежит build.json.
+ */
+export function guardOutDir(outDir: string): void {
+  if (!existsSync(outDir)) return;
+  const entries = readdirSync(outDir);
+  if (entries.length && !entries.includes("build.json"))
+    throw new Error(`каталог вывода ${outDir} не пуст и в нём нет build.json — это не сборка чата, стирать его сборка не будет`);
+}
+
+const outDirGuard: Plugin = {
+  name: "pcbk-out-dir-guard",
+  apply: "build",
+  configResolved(config) {
+    guardOutDir(resolve(config.root, config.build.outDir));             // до renderStart, где Vite чистит каталог
+  },
+};
+
 export default defineConfig({
   base: "/chat/",
-  plugins: [react(), pcbkBuildInfo(process.env.PCBK_BUILD ?? "dev")],
+  plugins: [outDirGuard, react(), pcbkBuildInfo(process.env.PCBK_BUILD ?? "dev")],
   build: {
     outDir: process.env.PCBK_WEB_OUT ?? "../edge/static/chat",
     emptyOutDir: true,

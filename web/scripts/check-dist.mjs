@@ -12,11 +12,12 @@ import { fileURLToPath } from "node:url";
 
 export const BASE = "/chat/";
 export const WEB_MAX_FILES = 8;
-// Договор со сторожем (watchdog/pcbk_watchdog/checks.py, _web_manifest): WEB_META_RE — search,
-// WEB_FILE_RE — fullmatch и без «.»/«..» последним звеном, sha256 — 64 знака в нижнем регистре,
-// записей в описи — от 1 до WEB_MAX_FILES (preflight M1).
+// Договор со сторожем (watchdog/pcbk_watchdog/checks.py, _web_manifest и check_web): WEB_META_RE —
+// search в первых MAX_BODY_BYTES страницы, WEB_FILE_RE — fullmatch и без «.»/«..» последним звеном,
+// sha256 — 64 знака в нижнем регистре, записей в описи — от 1 до WEB_MAX_FILES (preflight M1).
 export const WEB_META_RE = /<meta name="pcbk-build" content="([A-Za-z0-9._-]{1,64})">/;
 export const WEB_FILE_RE = /^(?:assets\/[A-Za-z0-9._-]{1,100}|boot\.js)$/;
+export const MAX_BODY_BYTES = 64 * 1024;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const NOT_IN_MANIFEST = new Set(["index.html", "build.json"]);
 
@@ -24,6 +25,29 @@ const NOT_IN_MANIFEST = new Set(["index.html", "build.json"]);
 export const NEWER_API = [
   "Promise.withResolvers", ".toSorted(", ".toReversed(", ".toSpliced(",
   "Object.groupBy", "Map.groupBy", "Array.fromAsync",
+];
+const NEWER = "API новее Chrome 109";
+const EVAL = "код для eval — CSP без 'unsafe-eval' его запретит";
+const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Предупреждения по каждому *.js сборки — и assets/*, и boot.js из public/ (Д6б).
+ * @type {{ what: string, re: RegExp, kind: string }[]}
+ */
+const JS_WARNINGS = [
+  ...NEWER_API.map((api) => ({ what: api, re: new RegExp(escape(api), "g"), kind: NEWER })),
+  { what: "new Function", re: /\bnew\s+Function\b/g, kind: EVAL },
+  { what: "=Function", re: /=Function[;,)]/g, kind: EVAL },
+  { what: "eval(", re: /\beval\(/g, kind: EVAL },
+];
+
+// CSS: url( и @import со схемой (http:, https:, data:, …) или с // — CSP style-src/img-src/font-src 'self'.
+const OUTSIDE = String.raw`(?:[A-Za-z][A-Za-z0-9+.-]*:|[\\/]{2})`;
+const CSS_OUT = "CSS ведёт наружу или на схему — CSP 'self' это закроет";
+/** @type {{ what: string, re: RegExp, kind: string }[]} */
+const CSS_WARNINGS = [
+  { what: "url(", re: new RegExp(String.raw`(?<!@import\s+)url\(\s*["']?\s*${OUTSIDE}`, "gi"), kind: CSS_OUT },  // @import url(…) — строкой ниже
+  { what: "@import", re: new RegExp(String.raw`@import\s+(?:url\(\s*)?["']?\s*${OUTSIDE}`, "gi"), kind: CSS_OUT },
 ];
 
 /**
@@ -54,8 +78,9 @@ const FORBIDDEN = [
   { what: "имя хоста заказчика (pcbk.ru)", re: /pcbk\.ru/gi },
   { what: "имя хоста заказчика (ai-lab)", re: /ai-lab/gi },
   {
+    // границы — не цифра и не «точка + цифра»: адрес в конце предложения («… 10.1.2.3.») тоже ловится
     what: "адрес IPv4",
-    re: /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g,
+    re: /(?<!\d|\d\.)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?!\d|\.\d)/g,
     allow: ["127.0.0.1"],
   },
   { what: "имя тега", re: /\b\d{2}[A-Z][A-Z0-9]*_[A-Z0-9_]*(?:PV|SP|MV|LMN)\b/g },
@@ -69,7 +94,9 @@ const FORBIDDEN = [
  */
 export const KNOWN_STRINGS = [];
 
-const TAG_RE = /<([A-Za-z][\w-]*)((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*\/?>/g;
+// Тег разбирается как у браузера: между именем и атрибутами — пробелы или «/» (<script/src=…>).
+// Каждое «<буква» index.html обязано разобраться — иначе ошибка, а не молчаливый пропуск.
+const TAG_RE = /<([A-Za-z][\w-]*)((?:[\s/]+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)[\s/]*>/y;
 const ATTR_RE = /([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
 
 function attrsOf(text) {
@@ -89,12 +116,6 @@ function walk(dir, prefix, out, errors) {
   }
 }
 
-function indexesOf(text, needle) {
-  const at = [];
-  for (let i = text.indexOf(needle); i !== -1; i = text.indexOf(needle, i + 1)) at.push(i);
-  return at;
-}
-
 /** Отрезки [начало, конец) всех вхождений шаблона `fragment` в `text`. */
 function spans(text, fragment) {
   return [...text.matchAll(new RegExp(fragment.source, "g"))].map((m) => [m.index, m.index + m[0].length]);
@@ -105,32 +126,61 @@ function coveredBy(exceptions, text, index, length) {
   return exceptions.find((k) => (k.at ??= spans(text, k.fragment)).some(([a, b]) => a <= index && index + length <= b));
 }
 
+/** Адреса из значения атрибута: у srcset — первое слово каждого звена списка через запятую. */
+function urlsOf(name, value) {
+  if (name !== "srcset") return [value.trim()];
+  return value.split(",").map((part) => part.trim().split(/\s+/)[0]).filter(Boolean);
+}
+
 function checkIndexHtml(html, dir, errors) {
   for (const m of html.matchAll(/<style\b/gi)) errors.push(`index.html: встроенный <style> (смещение ${m.index})`);
-  for (const m of html.matchAll(TAG_RE)) {
+  for (const open of html.matchAll(/<[A-Za-z]/g)) {
+    TAG_RE.lastIndex = open.index;
+    const m = TAG_RE.exec(html);
+    if (!m) {
+      errors.push(`index.html: тег не разобран (смещение ${open.index})`);
+      continue;
+    }
     const tag = m[1].toLowerCase();
     const attrs = attrsOf(m[2]);
     const at = `index.html, <${tag}> (смещение ${m.index})`;
     if (tag === "script" && !attrs.has("src")) errors.push(`${at}: встроенный скрипт без src`);
     if (attrs.has("style")) errors.push(`${at}: атрибут style=`);
     for (const name of attrs.keys()) if (name.startsWith("on")) errors.push(`${at}: встроенный обработчик ${name}=`);
-    for (const name of ["src", "href"]) {
+    for (const name of ["src", "srcset", "href"]) {
       if (!attrs.has(name)) continue;
-      const value = /** @type {string} */ (attrs.get(name)).trim();
-      if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || /^[\\/]{2}/.test(value)) {
-        errors.push(`${at}: ${name} ведёт наружу или на схему (http:, https:, data:, //) — CSP 'self' это закроет`);
-        continue;
+      for (const value of urlsOf(name, /** @type {string} */ (attrs.get(name)))) {
+        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || /^[\\/]{2}/.test(value)) {
+          errors.push(`${at}: ${name} ведёт наружу или на схему (http:, https:, data:, //) — CSP 'self' это закроет`);
+          continue;
+        }
+        if (tag === "a") continue;                                        // переходы (<a href="/login">) — не файлы сборки
+        const path = value.replace(/[?#].*$/, "");
+        if (!path.startsWith(BASE)) {
+          errors.push(`${at}: ${name} вне ${BASE}`);
+          continue;
+        }
+        const rel = path.slice(BASE.length);
+        if (!rel || rel.split("/").includes("..") || !existsSync(join(dir, rel)))
+          errors.push(`${at}: ${name} ведёт на отсутствующий файл ${rel || "(пусто)"}`);
       }
-      const path = value.replace(/[?#].*$/, "");
-      if (tag === "a") continue;                                          // переходы (<a href="/login">) — не файлы сборки
-      if (!path.startsWith(BASE)) {
-        errors.push(`${at}: ${name} вне ${BASE}`);
-        continue;
-      }
-      const rel = path.slice(BASE.length);
-      if (!rel || rel.split("/").includes("..") || !existsSync(join(dir, rel)))
-        errors.push(`${at}: ${name} ведёт на отсутствующий файл ${rel || "(пусто)"}`);
     }
+  }
+}
+
+/** Предупреждения по списку шаблонов; вхождения внутри фрагментов KNOWN идут в `known`. */
+function scan(p, text, checks, warnings, known) {
+  for (const c of checks) {
+    const exceptions = KNOWN.filter((k) => k.api === c.what).map((k) => ({ ...k }));
+    /** @type {Map<string, number>} */ const bySource = new Map();
+    let rest = 0;
+    for (const m of text.matchAll(c.re)) {
+      const k = coveredBy(exceptions, text, m.index, m[0].length);
+      if (k) bySource.set(k.source, (bySource.get(k.source) ?? 0) + 1);
+      else rest++;
+    }
+    if (rest) warnings.push(`${p}: ${c.kind} — ${c.what} ×${rest}`);
+    for (const [source, n] of bySource) known.push(`${p}: ${c.what} ×${n} — известное исключение: ${source}`);
   }
 }
 
@@ -155,6 +205,8 @@ export function checkDist(dir) {
   else checkIndexHtml(html, dir, errors);
   const meta = WEB_META_RE.exec(html);
   if (htmlBuf && !meta) errors.push('index.html: нет метки сборки <meta name="pcbk-build" content="…"> в форме сторожа');
+  if (meta && Buffer.byteLength(html.slice(0, meta.index + meta[0].length)) > MAX_BODY_BYTES)
+    errors.push(`index.html: метка сборки дальше первых ${MAX_BODY_BYTES / 1024} КиБ — сторож её не дочитает`);
 
   // build.json: форма, метка, пути и число записей — как их примет сторож; суммы — с диска
   /** @type {Record<string, string> | null} */ let files = null;
@@ -196,7 +248,7 @@ export function checkDist(dir) {
   const assets = onDisk.filter((p) => p.startsWith("assets/"));
   if (assets.length > WEB_MAX_FILES) errors.push(`в assets/ больше ${WEB_MAX_FILES} файлов (${assets.length})`);
 
-  // строки заказчика — в любом файле сборки; API новее Chrome 109 — в assets/*.js
+  // строки заказчика — в любом файле сборки; предупреждения — в каждом *.js и *.css
   for (const [p, buf] of texts) {
     const text = buf.toString("latin1");                                  // смещения — байтовые
     for (const f of FORBIDDEN) {
@@ -208,19 +260,8 @@ export function checkDist(dir) {
         else errors.push(`${p}: ${f.what} (смещение ${m.index})`);
       }
     }
-    if (!/^assets\/.+\.js$/.test(p)) continue;
-    for (const api of NEWER_API) {
-      const exceptions = KNOWN.filter((k) => k.api === api).map((k) => ({ ...k }));
-      /** @type {Map<string, number>} */ const bySource = new Map();
-      let rest = 0;
-      for (const i of indexesOf(text, api)) {
-        const k = coveredBy(exceptions, text, i, api.length);
-        if (k) bySource.set(k.source, (bySource.get(k.source) ?? 0) + 1);
-        else rest++;
-      }
-      if (rest) warnings.push(`${p}: API новее Chrome 109 — ${api} ×${rest}`);
-      for (const [source, n] of bySource) known.push(`${p}: ${api} ×${n} — известное исключение: ${source}`);
-    }
+    if (p.endsWith(".js")) scan(p, text, JS_WARNINGS, warnings, known);
+    if (p.endsWith(".css")) scan(p, text, CSS_WARNINGS, warnings, known);
   }
   return { errors, warnings, known };
 }
@@ -234,7 +275,7 @@ function main(argv) {
   const { errors, warnings, known } = checkDist(resolve(dir));
   const block = (title, lines) => lines.length && console.log(`${title} (${lines.length}):\n${lines.map((l) => `  - ${l}`).join("\n")}`);
   console.log(`check-dist: ${resolve(dir)}`);
-  block("предупреждения — API новее Chrome 109", warnings);
+  block("предупреждения", warnings);
   block("известные исключения", known);
   if (errors.length) {
     console.error(`check-dist: ошибки (${errors.length}):\n${errors.map((l) => `  - ${l}`).join("\n")}`);

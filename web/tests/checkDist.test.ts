@@ -1,17 +1,20 @@
 // Проверка собранной статики под строгий CSP и опись сборки (Д6-R40, preflight M1, M6).
 // Фикстура пишет каталог сборки во временный путь; дерево репозитория не трогается.
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, expect, test } from "vitest";
 import { checkDist, KNOWN } from "../scripts/check-dist.mjs";
+import { guardOutDir } from "../vite.config.ts";
 
 type Fx = {
   html: string;
   js: string;
+  css?: string;
   build?: string;
   extraFile?: string;
+  extraBody?: string;
   listExtraInManifest?: boolean;
   badSum?: boolean;
   more?: string[];                                                      // ещё файлы, и в описи тоже
@@ -44,9 +47,9 @@ const sha256 = (body: string) => createHash("sha256").update(body).digest("hex")
 
 function fixture(f: Fx): string {
   const dir = mkdtempSync(join(root, "dist-"));
-  const files: Record<string, string> = { [JS]: f.js, [CSS]: "body{margin:0}" };
+  const files: Record<string, string> = { [JS]: f.js, [CSS]: f.css ?? "body{margin:0}" };
   for (const p of f.more ?? []) files[p] = `/* ${p} */`;
-  if (f.extraFile) files[f.extraFile] = "extra";
+  if (f.extraFile) files[f.extraFile] = f.extraBody ?? "extra";
   writeFileSync(join(dir, "index.html"), f.html);
   const manifest: Record<string, string> = {};
   for (const [p, body] of Object.entries(files)) {
@@ -67,7 +70,7 @@ test("check_dist_rejects_inline_and_external", () => {
     expect(checkDist(fixture({ ...CLEAN, html: CLEAN.html.replace("</head>", html + "</head>") })).errors.length, html).toBeGreaterThan(0);
 });
 test("check_dist_rejects_forbidden_strings", () => {
-  for (const s of ["ai-lab.pcbk.ru", "10.20.30.40", "20ABC_001_PV"])
+  for (const s of ["stand.pcbk.ru", "ai-lab.example", "10.20.30.40", "20ABC_001_PV"])      // pcbk.ru и ai-lab — порознь
     expect(checkDist(fixture({ ...CLEAN, js: `const x = "${s}";` })).errors.length, s).toBeGreaterThan(0);
   expect(checkDist(fixture({ ...CLEAN, js: 'fetch("http://127.0.0.1")' })).errors).toEqual([]);
 });
@@ -83,7 +86,88 @@ test("check_dist_manifest_from_disk", () => {                           // ра�
 test("check_dist_rejects_manifest_mismatch", () => {
   expect(checkDist(fixture({ ...CLEAN, extraFile: "assets/x.js" })).errors).toContainEqual(expect.stringMatching(/опись/));
   expect(checkDist(fixture({ ...CLEAN, badSum: true })).errors).toContainEqual(expect.stringMatching(/сумма/));
-  expect(checkDist(fixture({ ...CLEAN, extraFile: "assets/index.js.map" })).errors).toContainEqual(expect.stringMatching(/\.map/));
+  expect(checkDist(fixture({ ...CLEAN, extraFile: "assets/index.js.map", listExtraInManifest: true })).errors)
+    .toContainEqual(expect.stringMatching(/карта исходников/));                          // в описи, но всё равно ошибка
+  const gone = fixture({ ...CLEAN, more: ["assets/chunk-0.js"] });                      // файл из описи пропал с диска
+  rmSync(join(gone, "assets/chunk-0.js"));
+  expect(checkDist(gone).errors).toEqual(["опись: файла assets/chunk-0.js нет в каталоге сборки"]);
+});
+
+test("check_dist_rejects_missing_link_handlers_and_symlinks", () => {
+  const missing = fixture({ ...CLEAN, html: CLEAN.html.replace("</head>", '<link rel="icon" href="/chat/assets/icon.png"></head>') });
+  expect(checkDist(missing).errors).toEqual([expect.stringMatching(/<link>.*href ведёт на отсутствующий файл assets\/icon\.png/)]);
+  const handler = fixture({ ...CLEAN, html: CLEAN.html.replace("<body>", '<body onload="go()">') });
+  expect(checkDist(handler).errors).toEqual([expect.stringMatching(/<body>.*встроенный обработчик onload=/)]);
+  const link = fixture(CLEAN);
+  symlinkSync(join(link, JS), join(link, "assets/alias.js"));
+  expect(checkDist(link).errors).toContainEqual(expect.stringMatching(/assets\/alias\.js: не обычный файл/));
+});
+
+test("check_dist_forbidden_hosts_apart", () => {
+  const host = checkDist(fixture({ ...CLEAN, js: 'const u = "stand.pcbk.ru";' })).errors;
+  expect(host).toEqual([expect.stringMatching(/\(pcbk\.ru\)/)]);
+  const lab = checkDist(fixture({ ...CLEAN, js: 'const u = "ai-lab.example";' })).errors;
+  expect(lab).toEqual([expect.stringMatching(/\(ai-lab\)/)]);
+});
+
+test("check_dist_ipv4_at_sentence_end", () => {
+  for (const js of ['"адрес 10.20.30.40."', '"(10.20.30.40)"', '"10.20.30.40, дальше"', '"конец.10.20.30.40"'])
+    expect(checkDist(fixture({ ...CLEAN, js })).errors, js).toEqual([expect.stringMatching(/адрес IPv4/)]);
+  for (const js of ['"1.2.3.4.5"', '"v19.3.0"', '"300.20.30.40"', '"10.20.30.400"', '"см. 127.0.0.1."'])
+    expect(checkDist(fixture({ ...CLEAN, js })).errors, js).toEqual([]);
+});
+
+test("check_dist_parses_tags_like_browser", () => {
+  for (const tag of ['<script/src="https://cdn.example/x.js"></script>', "<script/src=//x/y.js></script>"])  // разобран как <script>, а не пропущен
+    expect(checkDist(fixture({ ...CLEAN, html: CLEAN.html.replace("</head>", tag + "</head>") })).errors, tag)
+      .toEqual([expect.stringMatching(/<script>.*src ведёт наружу/)]);
+  for (const tag of ['<img srcset="/chat/assets/index-A1b2c3.js 1x, https://cdn.example/a.png 2x">',
+                     '<img srcset="data:image/png;base64,AAAA 1x">',
+                     '<img srcset="/chat/assets/index-A1b2c3.js 1x, /chat/assets/nope.png 2x">'])
+    expect(checkDist(fixture({ ...CLEAN, html: CLEAN.html.replace("</head>", tag + "</head>") })).errors.length, tag).toBeGreaterThan(0);
+  const ok = '<img alt="" srcset="/chat/assets/index-A1b2c3.js 1x, /chat/assets/index-D4e5f6.css 2x">';
+  expect(checkDist(fixture({ ...CLEAN, html: CLEAN.html.replace("</head>", ok + "</head>") })).errors).toEqual([]);
+  const broken = checkDist(fixture({ ...CLEAN, html: CLEAN.html.replace("</head>", '<script src="/chat/x.js" "></head>') }));
+  expect(broken.errors).toContainEqual(expect.stringMatching(/тег не разобран/));    // неразобранный тег — ошибка, не пропуск
+});
+
+test("check_dist_warns_on_eval_and_css_outside", () => {
+  for (const [js, what] of [['var f = new Function("return 1");', "new Function"], ["var F=Function;", "=Function"],
+                            ["g(a=Function,b)", "=Function"], ['eval("1")', "eval("]]) {
+    const r = checkDist(fixture({ ...CLEAN, js }));
+    expect(r.errors, js).toEqual([]);
+    expect(r.warnings, js).toEqual([expect.stringMatching(new RegExp(`unsafe-eval.*${what.replace(/[.()]/g, "\\$&")} ×1`))]);
+  }
+  for (const js of ["retrieval(x)", "a.evaluate(b)", "class Function2{}"])
+    expect(checkDist(fixture({ ...CLEAN, js })).warnings, js).toEqual([]);
+  for (const [css, what] of [["a{background:url(https://cdn.example/a.png)}", "url("], ['a{background:url("data:image/png;base64,AA")}', "url("],
+                             ["a{background:url( //x/a.png)}", "url("], ['@import "https://cdn.example/a.css";', "@import"],
+                             ["@import url(//x/a.css);", "@import"]]) {
+    const r = checkDist(fixture({ ...CLEAN, css }));
+    expect(r.errors, css).toEqual([]);
+    expect(r.warnings, css).toEqual([expect.stringMatching(new RegExp(`${CSS}: CSS ведёт наружу.*${what.replace(/[.()]/g, "\\$&")} ×1`))]);
+  }
+  for (const css of ["a{background:url(/chat/assets/a.png)}", 'a{background:url("./a.png")}', '@import "./b.css";'])
+    expect(checkDist(fixture({ ...CLEAN, css })).warnings, css).toEqual([]);
+});
+
+test("check_dist_warns_on_boot_js", () => {                                            // Д6б: boot.js из public/ — тоже JS сборки
+  const r = checkDist(fixture({ ...CLEAN, extraFile: "boot.js", extraBody: "Promise.withResolvers();eval(s)", listExtraInManifest: true }));
+  expect(r.errors).toEqual([]);
+  expect(r.warnings).toEqual([expect.stringMatching(/^boot\.js: API новее Chrome 109 — Promise\.withResolvers ×1/),
+                              expect.stringMatching(/^boot\.js: .*unsafe-eval.*eval\( ×1/)]);
+});
+
+// Ограда emptyOutDir (vite.config.ts): сборка не стирает каталог, который не похож на прежнюю сборку чата
+test("build_refuses_foreign_out_dir", () => {
+  const out = mkdtempSync(join(root, "out-"));
+  expect(() => guardOutDir(join(out, "absent"))).not.toThrow();                          // нет каталога
+  expect(() => guardOutDir(out)).not.toThrow();                                          // пустой
+  writeFileSync(join(out, "login.html"), "<!doctype html>");
+  expect(() => guardOutDir(out)).toThrow(/не пуст и в нём нет build\.json/);            // чужая статика (edge/static)
+  writeFileSync(join(out, "build.json"), "{}");
+  expect(() => guardOutDir(out)).not.toThrow();                                          // прежняя сборка чата
+  expect(readdirSync(out).sort()).toEqual(["build.json", "login.html"]);                 // ограда сама ничего не трогает
 });
 
 // preflight M1: сборка, зелёная у check-dist, должна быть зелёной и у сторожа (WEB_META_RE, WEB_FILE_RE, WEB_MAX_FILES)
@@ -103,6 +187,8 @@ test("check_dist_matches_watchdog_contract", () => {
   const dots = fixture(CLEAN);                                                         // «assets/..» — не файл сборки
   writeFileSync(join(dots, "build.json"), JSON.stringify({ build: BUILD, files: { "assets/..": sha256("x") } }));
   expect(checkDist(dots).errors).toContainEqual(expect.stringMatching(/опись: путь "assets\/\.\."/));
+  const far = CLEAN.html.replace("<head>", `<head><!--${"x".repeat(64 * 1024)}-->`);   // сторож читает первые 64 КиБ
+  expect(checkDist(fixture({ ...CLEAN, html: far })).errors).toContainEqual(expect.stringMatching(/метка сборки дальше первых 64 КиБ/));
   const more = Array.from({ length: 6 }, (_, i) => `assets/chunk-${i}.js`);           // 2 + 6 = 8 файлов — предел
   expect(checkDist(fixture({ ...CLEAN, more })).errors).toEqual([]);
   expect(checkDist(fixture({ ...CLEAN, more, extraFile: "boot.js", listExtraInManifest: true })).errors)
