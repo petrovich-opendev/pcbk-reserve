@@ -38,24 +38,27 @@ reason, status; у сверки с не-200 места — place_status) и сч
 «gw oc». Ни строки запроса, ни тел, ни заголовков, ни имени агента; исключения — только классом (Ш11, Ш12).
 
 Поток /event (Д5-R35, задача Б4) — stream_events: слотов учётки уже MAX_STREAMS_PER_LOGIN — 429 streams (как
-not_ready: без счётчика, строка журнала — одна на место за NOT_READY_LOG_S с n= и since_s=; решение контроллера Б4 —
-адаптер лишней вкладки переподключается так же часто); место не готово — 503 not_ready (не будит); у GET есть тело (Content-Length > 0 или Transfer-Encoding) — 400 bad_body до
-потока места: иначе тело держало бы общий бюджет тел всю жизнь потока. Затем поток места (Workplaces.stream): срок
-заголовков STREAM_OPEN_S и ошибка соединения — 503 no_answer, место неготово, upstream_failed; занятый пул клиента
-места — 503 busy, как у вызовов; 401 — 502 place_auth; иначе не 200 — 503 no_answer; сжатый поток — как нет ответа.
-Слот учётки занимается только после 200 места, прямо перед StreamingResponse (гонка вкладок — тот же 429); владение слотом
-и потоком места ответ принимает в момент return, до него их возвращает finally обработчика.
+not_ready: без счётчика, строка журнала — одна на место за NOT_READY_LOG_S с n= и since_s=: адаптер лишней вкладки
+переподключается так же часто); место не готово — 503 not_ready (не будит); у GET есть тело (Content-Length > 0 или
+Transfer-Encoding) — 400 bad_body до потока места: иначе тело держало бы общий бюджет тел всю жизнь потока. Затем
+поток места (Workplaces.stream): срок заголовков STREAM_OPEN_S и ошибка соединения — 503 no_answer, место неготово,
+upstream_failed; занятый пул клиента места — 503 busy, как у вызовов; 401 — 502 place_auth; иначе не 200 — 503
+no_answer; сжатый поток — как нет ответа. Слот учётки занимается только после 200 места, прямо перед
+StreamingResponse (гонка вкладок — тот же 429); владение слотом и потоком места ответ принимает в момент return, до
+него их возвращает finally обработчика (сначала слот, затем поток места).
 
-Дальше — _EventStream: задача-читатель гонит filter_sse по сырым кускам места в очередь на STREAM_QUEUE_MAX
-событий (одно: замер памяти Б4); браузер не читает — читатель ждёт put, давление уходит к месту, а не в память. Генератор ответа ждёт
-очередь не дольше срока перепроверки и перепроверяет сессию не чаще и не реже раза в stream_recheck_s (решение
-контроллера Б4: не на каждом событии — дельты идут десятками в секунду): сессии нет, учётка отключена или место
-не то — конец closed_by=session. Конец места — конец браузеру (closed_by=place; обрыв httpx или OSError — с классом
-в журнале); событие больше SSE_MAX_EVENT_BYTES (oversize) и тишина места дольше places.SSE_READ_TIMEOUT_S
-(timeout) — конец и stream_broken; обрыв браузера — closed_by=client. release() идемпотентна своим флагом: слот,
-отмена читателя, закрытие потока места, строка «gw event place=NN closed_by=… s=N»; её зовут finally генератора и
-BackgroundTask ответа (Starlette зовёт его и тогда, когда браузер ушёл до первого шага генератора). Поток место не
-будит и простой не продлевает (touch не зовётся, Д5-R35).
+Дальше — _EventStream: задача-читатель гонит filter_sse по сырым кускам места в очередь на STREAM_QUEUE_MAX событий
+(одно: замер памяти Б4); браузер не читает — читатель ждёт put, давление уходит к месту, а не в память. Генератор
+ответа ждёт очередь не дольше срока перепроверки и перепроверяет сессию не чаще и не реже раза в stream_recheck_s
+(не на каждом событии — дельты идут десятками в секунду): сессии нет, учётка отключена или место не то — конец
+closed_by=session; STREAM_STORE_FAILURES сбоев базы подряд — closed_by=store. Конец места — конец браузеру
+(closed_by=place; обрыв httpx или OSError — с классом в журнале); событие больше SSE_MAX_EVENT_BYTES (oversize) и
+тишина места дольше places.SSE_READ_TIMEOUT_S (timeout) — конец и stream_broken; обрыв браузера — closed_by=client.
+release() идемпотентна своим флагом: слот, отмена читателя, строка «gw event place=NN closed_by=… s=N», ожидание
+читателя и закрытие потока места под щитом от отмены; её зовут finally генератора и BackgroundTask ответа (Starlette
+зовёт его и тогда, когда браузер ушёл до первого шага генератора), а остановка роли (lifespan) закрывает ещё открытые
+потоки и дожидается закрытия (_EventStream.shutdown). Поток место не будит и простой не продлевает (touch не
+зовётся, Д5-R35).
 """
 from __future__ import annotations
 
@@ -114,8 +117,10 @@ SSE_MAX_EVENT_BYTES = 512 * 1024
 # 1, не 4 (решение контроллера Б4): замер 30 потоков по 512 КиБ с медленным читателем — 123 МиБ RSS при 4 и 72 МиБ
 # при 1 (порог ~80 МиБ); поток держит ещё кусок в send Starlette и копию в буфере uvicorn — их в формуле R36 не было
 STREAM_QUEUE_MAX = 1
-STREAM_CLOSE_S = 5.0                        # закрытие потока места в release — не дольше (оно под щитом от отмены)
+STREAM_CLOSE_S = 5.0                        # ожидание читателя и закрытие потока места в release — каждое не дольше
+STREAM_STORE_FAILURES = 3                   # сбоев базы подряд при перепроверке сессии — конец потока (closed_by=store)
 _BROKEN = ("timeout", "oversize")           # концы потока, которые считаются stream_broken
+_WARN_ENDS = (*_BROKEN, "store")            # концы потока со строкой WARNING
 
 PROXY_MESSAGES = {
     "not_whitelisted": RULE_MESSAGES["not_whitelisted"],        # тот же объект, что у правил Б2
@@ -416,40 +421,18 @@ class _End(NamedTuple):
     error: str | None = None
 
 
-_EVENT_ENDS = (b"\n\n", b"\r\n\r\n")
-
-
-def _event_end(buf: bytearray, start: int) -> tuple[int, int]:
-    """Первая пустая строка (конец события) в buf не раньше start: (позиция, её длина) или (-1, 0)."""
-    best, size = -1, 0
-    for end in _EVENT_ENDS:
-        i = buf.find(end, start)
-        if i >= 0 and (best < 0 or i < best):
-            best, size = i, len(end)
-    return best, size
-
-
-def _open_tail(buf: bytearray) -> int:
-    """Сколько последних байт buf (\\r и \\n, не больше трёх) ещё могут оказаться началом пустой строки."""
-    k = 0
-    while k < 3 and k < len(buf) and buf[-1 - k] in b"\r\n":
-        k += 1
-    return k
-
-
-def _event_type(event: bytes) -> str | None:
-    """Поле type JSON-объекта из строк data: события (значения склеиваются через \\n, как у EventSource); нет
-    data:, не JSON (в том числе целое длиннее предела и вложенность глубже предела разбора), не объект, type не
-    строка — None."""
+def _event_type(lines: list[bytes]) -> str | None:
+    """Поле type JSON-объекта события из его строк (без пустой строки конца). Каждая строка обязана начинаться с
+    data: (формат OpenCode, доводка Б4 K3): id:, retry:, event:, комментарий «:» и строка data без двоеточия —
+    событие не отдаётся (иначе браузер и шлюз прочли бы кадр по-разному). Значения data: склеиваются через \\n, как
+    у SDK и EventSource. Не JSON (в том числе целое длиннее предела и вложенность глубже предела разбора), не
+    объект, type не строка — None."""
     data = []
-    for line in event.split(b"\n"):
-        if line.endswith(b"\r"):
-            line = line[:-1]
-        if line.startswith(b"data:"):
-            value = line[5:]
-            data.append(value[1:] if value.startswith(b" ") else value)
-        elif line == b"data":
-            data.append(b"")
+    for line in lines:
+        if not line.startswith(b"data:"):
+            return None
+        value = line[5:]
+        data.append(value[1:] if value.startswith(b" ") else value)
     if not data:
         return None
     try:
@@ -461,36 +444,52 @@ def _event_type(event: bytes) -> str | None:
 
 
 async def filter_sse(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
-    """События потока места, чей type — из ALLOWED_EVENTS, сырыми байтами (Д5-R35): байты события как у места и
-    пустая строка \\n\\n. Конец события — \\n\\n или \\r\\n\\r\\n; неразборчивое событие отбрасывается,
-    неоконченное к концу потока — тоже (как у EventSource). Событие больше SSE_MAX_EVENT_BYTES — SseEventTooLarge
-    (ValueError), и неоконченное тоже: копится не больше предела и одного куска. Буфер сжимается до yield:
-    читатель, ждущий места в очереди, держит отдаваемое событие и остаток куска, а не копию разобранного."""
+    """События потока места, чей type — из ALLOWED_EVENTS (Д5-R35), кадром из одних строк data: и пустой строки \\n\\n.
+
+    Концы строк — как у SDK OpenCode (serverSentEvents.gen.ts v2, :155, доводка Б4 K2): \\r\\n и одиночный \\r
+    приводятся к \\n до поиска конца события — \\r в конце куска ждёт следующего (половина \\r\\n не считается
+    лишней строкой); конец события — \\n\\n. Отдаётся событие после приведения: \\r в кадре нет, и браузер (SDK v1
+    и v2, EventSource) делит поток на события так же, как шлюз, при любой нарезке на куски — чужой тип через
+    \\n\\r\\n или \\r\\r\\n не провезти. У OpenCode (data: …\\n\\n) кадр — байты места как есть; JSON не
+    пересобирается. Пустые строки перед событием — пустые отправки, пропускаются. Неразборчивое событие
+    отбрасывается, неоконченное к концу потока — тоже (как у EventSource).
+
+    Событие больше SSE_MAX_EVENT_BYTES (после приведения, без пустой строки конца) — SseEventTooLarge (ValueError), и
+    неоконченное тоже: копится не больше предела и одного куска. События из того же куска до большого отдаются.
+    Буфер сжимается до yield: читатель, ждущий места в очереди, держит отдаваемое событие и остаток куска."""
     buf = bytearray()
     ready: deque[bytes] = deque()
+    cr = False                                      # прошлый кусок кончился на \r — возможно, половина \r\n
     async for chunk in chunks:
         if not chunk:
             continue
-        seek = max(0, len(buf) - 3)                 # раньше конца события в buf нет: его уже искали
-        buf += chunk
+        if cr:
+            chunk = b"\r" + chunk
+        cr = chunk.endswith(b"\r")
+        if cr:
+            chunk = chunk[:-1]
+        seek = max(0, len(buf) - 1)                 # раньше конца события в buf нет: его уже искали
+        buf += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         start, too_large = 0, False
         while True:
-            end, size = _event_end(buf, max(start, seek))
+            while start < len(buf) and buf[start] == 0x0A:      # пустые строки до события
+                start += 1
+            end = buf.find(b"\n\n", max(start, seek))
             if end < 0:
                 break
             if end - start > SSE_MAX_EVENT_BYTES:
                 too_large = True
                 break
-            event = bytes(buf[start:end + size]) if size == 2 else bytes(buf[start:end]) + b"\n\n"
-            start = end + size
-            if _event_type(event) in ALLOWED_EVENTS:
+            event = bytes(buf[start:end + 2])
+            start = end + 2
+            if _event_type(event.split(b"\n")[:-2]) in ALLOWED_EVENTS:
                 ready.append(event)
             event = b""                             # отброшенное событие не держится до yield
         if too_large or start == len(buf):
             buf = bytearray()                       # буфер разобран (или брошен): копившееся место не держится
         elif start:
             del buf[:start]
-        too_large = too_large or len(buf) - _open_tail(buf) > SSE_MAX_EVENT_BYTES
+        too_large = too_large or len(buf) - buf.endswith(b"\n") > SSE_MAX_EVENT_BYTES
         while ready:                                # события до большого — браузеру, затем обрыв
             yield ready.popleft()
         if too_large:
@@ -525,7 +524,10 @@ class _EventStream:
         self._queue: asyncio.Queue[bytes | _End] = asyncio.Queue(maxsize=STREAM_QUEUE_MAX)
         self._reader: asyncio.Task | None = None
         self._released = False
+        self._done = asyncio.Event()                # release() довёл закрытие до конца (или сдался по сроку)
+        self._store_failures = 0
         self._started = time.monotonic()
+        role.event_streams.add(self)                # остановка роли дождётся закрытия (shutdown)
 
     async def _read(self) -> None:
         """Читатель: события filter_sse — в очередь, в конце — метка _End. Исключения места — только классом (Ш11)."""
@@ -547,13 +549,19 @@ class _EventStream:
                 await gen.aclose()
         await self._queue.put(end)
 
-    async def _session_alive(self) -> bool:
-        """Сессия действует и ведёт к той же учётке и месту. Сбой базы поток не рвёт: проверка — через срок."""
+    async def _session_end(self) -> str | None:
+        """None — сессия действует и ведёт к той же учётке и месту; иначе вид конца: session (сессии нет, учётка
+        отключена, место другое) или store — STREAM_STORE_FAILURES сбоев базы подряд (доводка Б4 K4). Одиночный сбой
+        поток не рвёт: проверка — через срок; удачная проверка обнуляет счёт."""
         try:
             account = await asyncio.to_thread(self.role.store.session, self.token)
         except StoreError:
-            return True
-        return account is not None and account.login == self.login and account.place == self.n
+            self._store_failures += 1
+            return "store" if self._store_failures >= STREAM_STORE_FAILURES else None
+        self._store_failures = 0
+        if account is None or account.login != self.login or account.place != self.n:
+            return "session"
+        return None
 
     async def events(self) -> AsyncIterator[bytes]:
         """Генератор ответа: ждёт очередь не дольше срока до перепроверки сессии; перепроверка — раз в
@@ -574,8 +582,9 @@ class _EventStream:
                     except TimeoutError:
                         pass
                 if time.monotonic() >= next_check:
-                    if not await self._session_alive():
-                        closed_by = "session"
+                    ended = await self._session_end()
+                    if ended is not None:
+                        closed_by = ended
                         break
                     next_check = time.monotonic() + recheck
                 if item is None:
@@ -589,29 +598,44 @@ class _EventStream:
 
     async def release(self, closed_by: str = "client", error: str | None = None) -> None:
         """Освобождение ровно одно (свой флаг: stream_closed без открытых потоков молчит, повтор отнял бы слот
-        соседней вкладки). Слот — сразу, до первого await; затем отмена читателя, закрытие потока места под щитом
-        от отмены (обрыв браузера снимает генератор отменой anyio) не дольше STREAM_CLOSE_S, stream_broken для
-        timeout и oversize, строка журнала."""
+        соседней вкладки). Слот — сразу, до первого await; затем отмена читателя, stream_broken для timeout и
+        oversize, строка журнала; затем ожидание читателя и закрытие потока места — каждое под своим щитом от
+        отмены (обрыв браузера снимает генератор отменой anyio, повторной на каждом await) и своим сроком
+        STREAM_CLOSE_S: без щита поток места не закрылся бы, и пул места кончился бы за несколько обрывов (K1, K6)."""
         if self._released:
             return
         self._released = True
-        self.role.stats.stream_closed(self.login)
-        reader = self._reader
-        if reader is not None:
-            reader.cancel()
-        if closed_by in _BROKEN:
-            self.role.stats.event("stream_broken")
-        tail = f" error={error}" if error else ""
-        (log.warning if closed_by in _BROKEN else log.info)(
-            "gw event place=%02d closed_by=%s s=%d%s", self.n, closed_by, round(time.monotonic() - self._started),
-            tail)
-        with anyio.move_on_after(STREAM_CLOSE_S, shield=True):
+        try:
+            self.role.stats.stream_closed(self.login)
+            reader = self._reader
             if reader is not None:
-                await asyncio.gather(reader, return_exceptions=True)
-            try:
-                await self._opened.__aexit__(None, None, None)
-            except Exception as exc:
-                log.warning("gw event place=%02d close_error=%s", self.n, type(exc).__name__)
+                reader.cancel()
+            if closed_by in _BROKEN:
+                self.role.stats.event("stream_broken")
+            tail = f" error={error}" if error else ""
+            (log.warning if closed_by in _WARN_ENDS else log.info)(
+                "gw event place=%02d closed_by=%s s=%d%s", self.n, closed_by,
+                round(time.monotonic() - self._started), tail)
+            if reader is not None:
+                with anyio.move_on_after(STREAM_CLOSE_S, shield=True):
+                    await asyncio.gather(reader, return_exceptions=True)
+            with anyio.move_on_after(STREAM_CLOSE_S, shield=True):     # своим сроком: читатель закрытие не съест
+                try:
+                    await self._opened.__aexit__(None, None, None)
+                except Exception as exc:
+                    log.warning("gw event place=%02d close_error=%s", self.n, type(exc).__name__)
+        finally:
+            self._done.set()
+            self.role.event_streams.discard(self)
+
+    async def shutdown(self) -> None:
+        """Остановка роли: release() (если его ещё никто не звал — closed_by=shutdown) и ожидание, пока закрытие,
+        начатое кем угодно, дойдёт до конца. uvicorn по сроку мягкой остановки снимает задачи запросов и сразу идёт в
+        lifespan, не дожидаясь их; не дождись роль закрытия здесь, asyncio.run снял бы его родной отменой, от
+        которой щит anyio не спасает, — поток места остался бы открытым."""
+        await self.release("shutdown")
+        with anyio.move_on_after(2 * STREAM_CLOSE_S + 1):
+            await self._done.wait()
 
 
 def _has_body(request: Request) -> bool:
@@ -677,11 +701,11 @@ async def stream_events(role: GatewayRole, account: Account, token: str, n: int,
                                  background=BackgroundTask(stream.release))
     finally:
         if not owned:
+            if slot:
+                role.stats.stream_closed(login)     # слот — до закрытия потока места (доводка Б4 K7)
             if response is not None:
                 with anyio.move_on_after(STREAM_CLOSE_S, shield=True):
                     await opened.__aexit__(None, None, None)
-            if slot:
-                role.stats.stream_closed(login)
 
 
 # --- маршрут ---

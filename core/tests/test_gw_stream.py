@@ -2,8 +2,13 @@
 ограниченной очереди, перепроверка сессии, слот потока — только после 200 места и ровно одно освобождение, срок
 заголовков места, тишина и большое событие рвут поток, поток — не активность места. Места и sp-ctl — двойники
 задачи А3 (поток /event — _EventBody)."""
+import asyncio
+import itertools
 import json
+import random
+import re
 import socket
+import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -14,15 +19,16 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
+from fake_places import sse
 from helpers import (ORIGIN, SETTINGS, DummyRole, gateway_role, login, login_cookie, make_gateway, serve_app,
                      wait_until)
 from pcbk_core import main
 from pcbk_core.app import create_app
 from pcbk_core.gateway import places, proxy
-from pcbk_core.gateway.accounts import Account
+from pcbk_core.gateway.accounts import Account, StoreError
 from pcbk_core.gateway.proxy import (PROXY_MESSAGES, SSE_MAX_EVENT_BYTES, STREAM_QUEUE_MAX, filter_sse,
                                      stream_events)
-from pcbk_core.gateway.rules import RULE_MESSAGES
+from pcbk_core.gateway.rules import ALLOWED_EVENTS, RULE_MESSAGES
 from pcbk_core.gateway.stats import MAX_STREAMS_PER_LOGIN
 
 pytestmark = pytest.mark.anyio
@@ -562,3 +568,253 @@ def test_open_stream_does_not_hold_shutdown(tmp_path):                          
         if c is not None:
             c.close()
         sock.close()
+
+
+# --- доводка 1 (ревью A и B) ---
+
+STU03 = Account("stu-03", "student", 3, False)
+
+
+def test_disconnect_while_waiting_queue_closes_place_no_gc(tmp_path, monkeypatch):     # K1: щит release()
+    held = []
+
+    class Held(proxy._EventStream):                                                      # сборщик не закроет за шлюз
+        def events(self):
+            gen = super().events()
+            held.append((self, gen))
+            return gen
+
+    monkeypatch.setattr(proxy, "_EventStream", Held)
+    app, role = make_gateway(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = "silent"                                                              # генератор ждёт очередь
+    with serve_app(app) as url:
+        cookie = login_cookie(url, "stu-03")
+        for k in range(1, 4):
+            c, s = open_stream(url, cookie)
+            with s as r:
+                chunks = r.iter_bytes()
+                next(chunks)
+            c.close()
+            wait_until(lambda: role.stats.streams == 0 and fp.event_open[3] == 0, timeout=3)
+            assert fp.event_starts[3] == k
+    assert len(held) == 3
+
+
+def sdk_types(chunks: list[bytes], normalize: bool) -> list:
+    """Типы событий, как их прочтёт SDK OpenCode из этих кусков: v2 (normalize — serverSentEvents.gen.ts:155, \r\n и
+    \r приводятся к \n в буфере при каждом чтении) и v1 (без приведения)."""
+    buffer, types = "", []
+    for chunk in chunks:
+        buffer += chunk.decode("utf-8", "replace")
+        if normalize:
+            buffer = buffer.replace("\r\n", "\n").replace("\r", "\n")
+        parts = buffer.split("\n\n")
+        buffer = parts.pop()
+        for part in parts:
+            data = [re.sub(r"^data:\s*", "", line) for line in part.split("\n") if line.startswith("data:")]
+            if data:
+                try:
+                    parsed = json.loads("\n".join(data))
+                except ValueError:
+                    continue
+                types.append(parsed.get("type") if isinstance(parsed, dict) else None)
+    return types
+
+
+def cut(data: bytes, rnd: random.Random, parts: int) -> list[bytes]:
+    points = sorted(rnd.sample(range(1, len(data)), min(parts, len(data) - 1))) if len(data) > 1 else []
+    return [data[a:b] for a, b in zip([0, *points], [*points, len(data)])]
+
+
+async def test_filter_sse_line_ends_like_sdk():                                          # K2: \n\r\n и \r\r\n
+    a, b, c = b'data: {"type":"session.idle","x":', b'data: {"type":"catalog.updated"}', b"data: }"
+    for sep in (b"\n\r\n", b"\r\r\n", b"\r\r", b"\r\n\n", b"\n\r"):
+        stream = a + sep + b + sep + c + b"\n\n"
+        assert sdk_types([stream], normalize=True).count("catalog.updated") == 1          # проба настоящая: SDK v2 его видит
+        for k in range(1, len(stream)):                                                  # любая нарезка на куски
+            out = await collect([stream[:k], stream[k:]])
+            assert b"catalog.updated" not in b"".join(out), (sep, k)
+    crlf = EV("session.idle").replace(b"\n\n", b"\r\n\r\n")
+    assert await collect([crlf[:-1], crlf[-1:]]) == [EV("session.idle")]               # кадр — без \r
+    multi = b'data: {"type":\r\ndata: "session.idle"}\r\n\r\n'                         # \r\n на стыке — одна строка
+    for k in range(1, len(multi)):
+        assert await collect([multi[:k], multi[k:]]) == [b'data: {"type":\ndata: "session.idle"}\n\n'], k
+
+
+async def test_filter_sse_matches_sdk_on_random_streams():                              # K2: шлюз и SDK видят одно
+    rnd = random.Random(20261005)
+    pieces = [EV("session.idle"), EV("catalog.updated"), b'data: {"type":"session.idle","x":',
+              b'data: {"type":"catalog.updated"}', b"data: }", b"data:", b"data", b"\n", b"\r", b"\r\n", b"\n\n",
+              b"retry: 0", b"id: 1", b"event: x", b": c", b" "]
+    for _ in range(3000):
+        stream = b"".join(rnd.choice(pieces) for _ in range(rnd.randint(1, 12)))
+        out = b"".join(await collect(cut(stream, rnd, rnd.randint(0, 4))))
+        assert b"\r" not in out
+        again = cut(out, rnd, rnd.randint(0, 6))                                         # edge режет по-своему
+        v2, v1 = sdk_types(again, normalize=True), sdk_types(again, normalize=False)
+        assert set(v2) <= ALLOWED_EVENTS and v1 == v2 == sdk_types([out], normalize=True), (stream, out)
+
+
+async def test_filter_sse_only_data_frames():                                            # K3: только кадры data:
+    ok = EV("session.idle")
+    for extra in (b"retry: 0\n", b"id: 7\n", b"event: x\n", b": comment\n", b"data\n"):
+        assert await collect([extra + ok]) == [], extra
+        assert await collect([ok[:-1] + extra + b"\n"]) == [], extra
+    out = await collect([b"retry: 0\n\n" + ok + b"retry: 0\n\n"])
+    assert out == [ok] and b"retry" not in b"".join(out)                                # retry до браузера не доходит
+
+
+def test_store_failures_end_stream_after_three(tmp_path, gwlog, monkeypatch):           # K4
+    app, role = make_gateway(tmp_path, ready=(3,), stream_recheck_s=0.1)
+    role.fake_places.events[3] = "endless"
+    real, calls = role.store.session, itertools.count()
+    script = ["ok", "fail", "fail", "ok", "fail", "fail", "ok"]                         # 0 — вход запроса
+
+    def session(token):
+        if (script[i] if (i := next(calls)) < len(script) else "fail") == "fail":
+            raise StoreError("учётные записи: OperationalError")
+        return real(token)
+
+    monkeypatch.setattr(role.store, "session", session)
+    with serve_app(app) as url:
+        cookie = login_cookie(url, "stu-03")
+        c, s = open_stream(url, cookie)
+        with s as r:
+            t = time.monotonic()
+            for _ in r.iter_bytes():
+                assert time.monotonic() - t < 3
+        c.close()
+    assert next(calls) == len(script) + proxy.STREAM_STORE_FAILURES                     # два сбоя подряд — поток цел
+    assert re.search(r"WARNING pcbk_core\.gateway\.proxy: gw event place=03 closed_by=store s=\d+", gwlog.text)
+    assert role.stats.streams == 0 and role.fake_places.event_open[3] == 0
+
+
+def _logout(url, cookie, role):
+    httpx.post(url + "/pcbk/api/auth/logout", headers={"Cookie": f"pcbk_session={cookie}", "Origin": ORIGIN},
+               trust_env=False)
+
+
+def _other_place(url, cookie, role):                                                     # учётке сменили место
+    with sqlite3.connect(role.store.path) as db:
+        db.execute("UPDATE gw_accounts SET place = 4 WHERE login = 'stu-03'")
+
+
+def _disabled(url, cookie, role):
+    role.store.disable("stu-03")
+
+
+def _expired(url, cookie, role):
+    role.store.clock = lambda: time.time() + role.gw.GW_SESSION_TTL_S + 1
+
+
+@pytest.mark.parametrize("script, action", [
+    ("silent", _logout),                                                                 # место молчит
+    ([("repeat", sse("plugin.added"), 0.02)], _logout),                                  # шлёт только отброшенное
+    ("endless", _other_place), ("endless", _disabled), ("endless", _expired),
+], ids=["silent-logout", "dropped-logout", "other-place", "disabled", "expired"])
+def test_stream_closed_when_session_ends(tmp_path, gwlog, script, action):              # K5
+    app, role = make_gateway(tmp_path, ready=(3,), stream_recheck_s=0.2)
+    role.fake_places.events[3] = script
+    with serve_app(app) as url:
+        cookie = login_cookie(url, "stu-03")
+        c, s = open_stream(url, cookie)
+        with s as r:
+            chunks = r.iter_bytes()
+            if script != "silent" and isinstance(script, str):
+                next(chunks)
+            action(url, cookie, role)
+            t = time.monotonic()
+            for _ in chunks:
+                assert time.monotonic() - t < 2
+            waited = time.monotonic() - t
+        c.close()
+    assert waited <= 0.2 + 0.5, waited
+    assert "closed_by=session" in gwlog.text and role.stats.streams == 0 and role.fake_places.event_open[3] == 0
+
+
+async def test_busy_slots_refused_before_readiness(tmp_path):                           # K5: порядок шагов 1 и 2
+    role = gateway_role(tmp_path, ready=(3,))
+    role.fake_places.events[3] = "endless"
+    try:
+        opened = [await stream_events(role, STU03, "token", 3) for _ in range(3)]
+        role.workplaces.mark_unready(3)
+        r = await stream_events(role, STU03, "token", 3)
+        assert (r.status_code, json.loads(r.body)["data"]["message"]) == (429, PROXY_MESSAGES["streams"])
+        for o in opened:
+            await o.background()
+        r = await stream_events(role, STU03, "token", 3)
+        assert (r.status_code, json.loads(r.body)["data"]["message"]) == (503, PROXY_MESSAGES["not_ready"])
+        assert role.fake_places.event_starts[3] == 3 and role.fake_places.event_open[3] == 0
+    finally:
+        await role.workplaces.aclose()
+
+
+async def test_release_closes_place_even_if_reader_lingers(tmp_path, monkeypatch):      # K6: своя область закрытия
+    monkeypatch.setattr(proxy, "STREAM_CLOSE_S", 0.2)
+    role = gateway_role(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = [EV("server.connected"), ("linger", 1.0)]                            # отмену читатель переживёт на 1 с
+    r = await stream_events(role, STU03, "token", 3)
+    stream, gen = r.background.func.__self__, r.body_iterator
+    try:
+        assert await anext(gen) == EV("server.connected")
+        await asyncio.sleep(0.05)                                                        # читатель ждёт место
+        t = time.monotonic()
+        await r.background()
+        assert fp.event_open[3] == 0 and time.monotonic() - t < 0.8                     # не ждал читателя до конца
+        assert role.stats.streams == 0
+    finally:
+        await gen.aclose()
+        await asyncio.gather(stream._reader, return_exceptions=True)
+        await role.workplaces.aclose()
+
+
+async def test_handler_returns_slot_before_closing_place(tmp_path, monkeypatch):         # K7: порядок в finally
+    role = gateway_role(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = "endless"
+    order, real_closed = [], role.stats.stream_closed
+
+    def closed(login):
+        order.append(("slot", fp.event_open[3]))
+        real_closed(login)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("сборка ответа")
+
+    monkeypatch.setattr(role.stats, "stream_closed", closed)
+    monkeypatch.setattr(proxy, "_EventStream", broken)                                  # исключение после слота
+    try:
+        with pytest.raises(RuntimeError):
+            await stream_events(role, STU03, "token", 3)
+        assert order == [("slot", 1)] and fp.event_open[3] == 0 and role.stats.streams == 0
+    finally:
+        await role.workplaces.aclose()
+
+
+async def test_role_shutdown_closes_streams_nobody_released(tmp_path):                   # остановка: ответ не отправлен
+    role = gateway_role(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = "endless"
+    await stream_events(role, STU03, "token", 3)                                         # ни генератора, ни background
+    assert role.stats.streams == 1 and fp.event_open[3] == 1 and len(role.event_streams) == 1
+    await role._shutdown()
+    assert role.stats.streams == 0 and fp.event_open[3] == 0 and not role.event_streams
+
+
+async def test_role_shutdown_waits_for_release_in_progress(tmp_path, monkeypatch):       # остановка: закрытие начато
+    monkeypatch.setattr(proxy, "STREAM_CLOSE_S", 2.0)
+    role = gateway_role(tmp_path, ready=(3,))
+    fp = role.fake_places
+    fp.events[3] = [EV("server.connected"), ("linger", 0.5)]                            # читатель переживёт отмену на 0,5 с
+    r = await stream_events(role, STU03, "token", 3)
+    gen = r.body_iterator
+    assert await anext(gen) == EV("server.connected")
+    await asyncio.sleep(0.05)
+    closing = asyncio.create_task(gen.aclose())                                         # finally генератора: release()
+    await asyncio.sleep(0.05)
+    assert role.stats.streams == 0 and fp.event_open[3] == 1                            # слот отдан, место ещё открыто
+    await role._shutdown()
+    assert fp.event_open[3] == 0 and not role.event_streams                             # остановка дождалась закрытия
+    await closing

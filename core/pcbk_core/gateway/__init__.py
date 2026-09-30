@@ -211,6 +211,7 @@ class GatewayRole(RoleBase):
         self.monotonic = monotonic
         self.wallclock = wallclock
         self.stream_recheck_s = stream_recheck_s    # сессия потока /event — не реже и не чаще раза за срок (Д5-R35)
+        self.event_streams: set = set()             # открытые потоки /event (proxy._EventStream): закрыть при остановке
         self.started_at = wallclock()           # checked_at до первого такта — время запуска роли
         self.login_gate = LoginGate(LOGIN_PARALLEL, LOGIN_QUEUE, LOGIN_BACKLOG, clock=store.clock,
                                     window=LOCK_WINDOW_S)
@@ -338,6 +339,8 @@ class GatewayRole(RoleBase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await self.login_gate.drain()           # неудачные входы — в замок до выхода
+        # потоки /event — до клиентов мест: закрытие каждого (своё или начатое снятой задачей запроса) доводится здесь
+        await asyncio.gather(*(stream.shutdown() for stream in list(self.event_streams)), return_exceptions=True)
         for name, close in (("места", self.workplaces.aclose), ("прокси сокета", self.workplaces.spctl.aclose)):
             try:
                 await close()

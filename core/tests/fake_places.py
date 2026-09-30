@@ -160,8 +160,10 @@ class _EventBody(httpx.AsyncByteStream):
     """Тело ответа /event двойника: куски по сценарию; закрытие (aclose или конец сценария) учитывается один раз.
 
     Сценарий — список, где bytes — кусок, ("pause", s) — пауза, вызываемое — вызов без аргументов (проба теста в
-    момент чтения), ("raise", исключение) — бросить его (обрыв посреди потока); "endless" — пульс server.heartbeat
-    раз в PULSE_S без конца; "silent" — server.connected и тишина SILENT_S (для шлюза — без конца), затем конец."""
+    момент чтения), ("raise", исключение) — бросить его (обрыв посреди потока), ("repeat", кусок, s) — этот кусок раз в
+    s без конца, ("linger", s) — ждать без конца, а отмену пережить на s секунд (медленный читатель при закрытии);
+    "endless" — пульс server.heartbeat раз в PULSE_S без конца; "silent" — server.connected и тишина SILENT_S (для
+    шлюза — без конца), затем конец."""
 
     def __init__(self, places: "FakePlaces", n: int, script: object):
         self._places, self._n, self._script = places, n, script
@@ -184,13 +186,26 @@ class _EventBody(httpx.AsyncByteStream):
                 await asyncio.sleep(item[1])
             elif isinstance(item, tuple) and item[0] == "raise":
                 raise item[1]
+            elif isinstance(item, tuple) and item[0] == "repeat":
+                while True:
+                    yield item[1]
+                    await asyncio.sleep(item[2])
+            elif isinstance(item, tuple) and item[0] == "linger":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(item[1])
+                    raise
             elif isinstance(item, Callable):
                 item()
             else:
                 yield item
 
     async def aclose(self) -> None:
+        """Закрытие — точка отмены, как у сетевого транспорта: закрывающий без щита в отменённой области его не
+        доведёт (доводка Б4 K1)."""
         if not self._closed:
+            await asyncio.sleep(0)
             self._closed = True
             self._places.event_open[self._n] -= 1
             self._places.event_closed[self._n] = True
