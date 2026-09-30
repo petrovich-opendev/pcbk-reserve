@@ -1,5 +1,6 @@
 import re
 from datetime import timedelta
+from html import escape
 from zoneinfo import ZoneInfo
 
 from helpers import T0
@@ -36,7 +37,7 @@ def test_status_json_shape():
     assert data["checked_at"] == "2026-09-29T12:00:00+00:00" and data["stale_after_s"] == 30
     assert data["overall"] == "fail" and data["age_s"] == 4
     assert data["checks"] == [{"component": "edge", "title": "Входной прокси", "state": "fail",
-                               "detail": "не отвечает"}]
+                               "detail": "не отвечает", "note": ""}]
     assert status_json(None, T0, 30)["checked_at"] is None and status_json(None, T0, 30)["checks"] == []
 
 
@@ -99,3 +100,33 @@ def test_html_lists_recent_events_in_zone():
     html = render_html(s, events, T0, 30, ZoneInfo("Asia/Yekaterinburg"))
     assert "29.09.2026 17:00:00 UTC+05:00" in html
     assert "Входной прокси" in html and "сторож запущен" in html
+
+
+def test_note_in_json_and_html():
+    s = Snapshot(T0, (Check("llm", "LLM-прокси и бюджет", "ok", "OpenRouter отвечает", note="расход $1.00 из $1000"),))
+    assert status_json(s, T0, 30)["checks"][0]["note"] == "расход $1.00 из $1000"
+    assert "OpenRouter отвечает · расход $1.00 из $1000" in render_html(s, [], T0, 30, ZoneInfo("UTC"))
+
+
+def test_note_alone_when_detail_equals_label():
+    # detail совпал с подписью — не повторяется, note идёт один, без « · »
+    s = Snapshot(T0, (Check("llm", "LLM-прокси и бюджет", "ok", "норма", note="расход $0.00 из $1000"),
+                      Check("edge", "Входной прокси", "ok", "отвечает")))
+    html = render_html(s, [], T0, 30, ZoneInfo("UTC"))
+    assert '<span class="detail">расход $0.00 из $1000</span>' in html
+    assert '<span class="detail">отвечает</span>' in html                         # без note — без « · »
+
+
+def test_long_note_not_cut():                                                    # П20: note свободен от 80
+    note = ("расход $999.99 из $1000 · идёт на оценку $2.00 · по оценке $0.4900 · по ключу OpenRouter $999.99"
+            " · отбор и проверки $12.35 · доля больше 80 %: 10 · доля исчерпана: 10 · на счёте $19.99")
+    s = Snapshot(T0, (Check("llm", "LLM-прокси и бюджет", "warn", "израсходовано больше 95 % бюджета", note=note),))
+    html = render_html(s, [], T0, 30, ZoneInfo("UTC"))
+    assert status_json(s, T0, 30)["checks"][0]["note"] == note and escape(note) in html
+    assert "nowrap" not in html                                                   # строка переносится
+
+
+def test_note_is_escaped():
+    s = Snapshot(T0, (Check("x", "X", "ok", "a", note='<b>&"</b>'),))
+    html = render_html(s, [], T0, 30, ZoneInfo("UTC"))
+    assert "<b>" not in html and "a · &lt;b&gt;&amp;&quot;&lt;/b&gt;" in html

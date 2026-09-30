@@ -48,7 +48,7 @@ def status_json(snapshot: Snapshot | None, now: datetime, stale_after_s: int) ->
         "age_s": age_s(snapshot, now) if snapshot else None,
         "overall": overall(snapshot) if snapshot else "unknown",
         "checks": [{"component": c.component, "title": c.title, "state": c.state,
-                    "detail": c.detail} for c in (snapshot.checks if snapshot else ())],
+                    "detail": c.detail, "note": c.note} for c in (snapshot.checks if snapshot else ())],
     }
 
 
@@ -91,12 +91,20 @@ h2 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; }
 """
 
 
+def detail_text(detail: str, note: str, label: str) -> str:
+    """Текст строки: detail и через « · » note; detail, совпавший с подписью, не повторяется.
+
+    Тот же вид — в status.js. note не режется: предел 80 знаков — только у detail.
+    """
+    shown = "" if detail == label else detail   # «ещё не установлен» — один раз
+    return " · ".join(part for part in (shown, note) if part)
+
+
 def _check_row(c: Check) -> str:
     label = LABELS.get(c.state, c.state)
-    detail = "" if c.detail == label else c.detail   # «ещё не установлен» — один раз
     return (f'<li class="check s-{escape(c.state)}"><span class="name">{escape(c.title)}</span>'
             f'<span class="state">{escape(label)}</span>'
-            f'<span class="detail">{escape(detail)}</span></li>')
+            f'<span class="detail">{escape(detail_text(c.detail, c.note, label))}</span></li>')
 
 
 def _event_row(e: Event, titles: dict[str, str], tz: ZoneInfo) -> str:

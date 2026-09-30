@@ -1,7 +1,9 @@
-"""Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана."""
+"""Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана,
+LLM-прокси и бюджет."""
 import http.client
 import io
 import json
+import math
 import re
 import socket
 import ssl
@@ -45,6 +47,28 @@ CATALOG_MAX_AGE_S = 172800
 CORE_DOWN_DETAIL = "служба данных не отвечает — свежесть неизвестна"
 OFF_CONTRACT_DETAIL = "служба данных ответила не по договору — свежесть неизвестна"
 
+# строка «LLM-прокси и бюджет» (задача 7 Д4а)
+LLM_DOWN_DETAIL = "LLM-прокси не отвечает"
+LLM_OFF_CONTRACT_DETAIL = "LLM-прокси ответил не по договору"
+# опрос OpenRouter старше этого, с — «неизвестно». Опрос раз в LLM_POLL_S (60 с), в нём
+# до двух запросов по POLL_TIMEOUT_S (15 с), такт сторожа 10 с и запас 60 с на медленный
+# старт: 60 + 2 × 15 + 10 + 60 = 160 ≤ 180
+LLM_STALE_S = 180
+# десять кругов обновления адресов охраны выхода по 30 с (Д4а-R18): дольше без удачного
+# круга — предупреждение
+EGRESS_STALE_S = 300
+# остаток на счёте OpenRouter меньше этого — предупреждение
+ACCOUNT_WARN_USD = 20.0
+# OpenRouter насчитал по ключу больше, чем учёл прокси, на столько — предупреждение
+DRIFT_WARN_USD = 1.0
+# полосы бюджета, %: «израсходовано больше P %», первая подходящая
+BUDGET_STEPS = (95, 80, 50)
+# состояния OpenRouter по договору /health/llm (UPSTREAM_TEXTS задачи 6 Д4а)
+UPSTREAM_FAIL_STATES = frozenset({"unreachable", "key_rejected", "money_out", "key_limit", "region"})
+UPSTREAM_STATES = UPSTREAM_FAIL_STATES | {"unknown", "ok", "errors"}
+# разность сумм меньше этого — шум сложения чисел с плавающей точкой, не деньги
+USD_NOISE = 1e-9
+
 
 @dataclass(frozen=True)
 class Check:
@@ -52,6 +76,9 @@ class Check:
     title: str
     state: State
     detail: str
+    # меняющиеся числа строки (расход, остаток): в журнал не идут и перехода не делают,
+    # поэтому предел 80 знаков на них не действует
+    note: str = ""
 
 
 def not_installed(component: str, title: str) -> Check:
@@ -273,6 +300,219 @@ def check_historian(component: str, title: str, url: str, now: datetime, warn_s:
     except (KeyError, TypeError, ValueError, OverflowError):   # OverflowError — age_s = -Infinity
         return Check(component, title, "unknown", OFF_CONTRACT_DETAIL)
     return Check(component, title, state, detail)
+
+
+def fmt_usd(x: float) -> str:
+    """Сумма для строки: $0.00; меньше доллара — четыре знака ($0.0012); иначе два ($12.35)."""
+    if x == 0:
+        return "$0.00"
+    return f"${x:.4f}" if 0 < x < 1 else f"${x:.2f}"
+
+
+def fmt_total(x: float) -> str:
+    """Бюджет — целым, без дробной части ($1000)."""
+    return f"${x:.0f}"
+
+
+def _time(obj: dict, key: str) -> datetime | None:
+    raw = obj[key]
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise TypeError(f"{key} — не строка")
+    value = datetime.fromisoformat(raw)
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)   # договор — ISO UTC
+
+
+def _usd(obj: dict, key: str, *, nullable: bool = False) -> float | None:
+    value = obj[key]
+    if value is None and nullable:
+        return None
+    if not _is_number(value) or not math.isfinite(value):   # OverflowError — целое больше float
+        raise TypeError(f"{key} — не конечное число")
+    return value
+
+
+def _count(obj: dict, key: str) -> int:
+    value = obj[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{key} — не целое")
+    return value
+
+
+def _flag(obj: dict, key: str, *, nullable: bool = False) -> bool | None:
+    value = obj[key]
+    if not isinstance(value, bool) and not (value is None and nullable):
+        raise TypeError(f"{key} — не логическое")
+    return value
+
+
+def _text(obj: dict, key: str, *, nullable: bool = False) -> str | None:
+    value = obj[key]
+    if not isinstance(value, str) and not (value is None and nullable):
+        raise TypeError(f"{key} — не строка")
+    return value
+
+
+def _part(obj, key: str) -> dict:
+    value = obj[key]
+    if not isinstance(value, dict):
+        raise TypeError(f"{key} — не объект JSON")
+    return value
+
+
+@dataclass(frozen=True)
+class LlmReply:
+    """Поля ответа /health/llm, которые читает сторож; типы проверены при разборе."""
+    checked_at: datetime | None
+    stopped: bool
+    config_error: str | None
+    tokens_error: str | None
+    key: str
+    mgmt_key: str
+    ledger_ok: bool
+    ledger_reset: bool
+    upstream_state: str
+    upstream_text: str
+    spent_usd: float
+    reserved_usd: float
+    ledger_usd: float
+    estimated_usd: float
+    key_spent_usd: float | None
+    total_usd: float
+    ops_usd: float
+    over_80: int
+    shares_spent: int
+    pending_stuck: int
+    cost_unknown_24h: int
+    provider_mismatch_24h: int
+    account_remaining_usd: float | None
+    egress_alive: bool | None
+    egress_last_ok_age_s: float | None
+
+    @classmethod
+    def parse(cls, reply) -> "LlmReply":
+        """Ответ не по договору — ValueError, TypeError, KeyError или OverflowError."""
+        if not isinstance(reply, dict):
+            raise TypeError("ответ — не объект JSON")
+        upstream, shares, egress = _part(reply, "upstream"), _part(reply, "shares"), _part(reply, "egress")
+        r = cls(
+            checked_at=_time(reply, "checked_at"), stopped=_flag(reply, "stopped"),
+            config_error=_text(reply, "config_error", nullable=True),
+            tokens_error=_text(reply, "tokens_error", nullable=True),
+            key=_text(reply, "key"), mgmt_key=_text(reply, "mgmt_key"),
+            ledger_ok=_flag(reply, "ledger_ok"), ledger_reset=_flag(reply, "ledger_reset"),
+            upstream_state=_text(upstream, "state"), upstream_text=_text(upstream, "text"),
+            spent_usd=_usd(reply, "spent_usd"), reserved_usd=_usd(reply, "reserved_usd"),
+            ledger_usd=_usd(reply, "ledger_usd"), estimated_usd=_usd(reply, "estimated_usd"),
+            key_spent_usd=_usd(reply, "key_spent_usd", nullable=True), total_usd=_usd(reply, "total_usd"),
+            ops_usd=_usd(reply, "ops_usd"),
+            over_80=_count(shares, "over_80"), shares_spent=_count(shares, "spent"),
+            pending_stuck=_count(reply, "pending_stuck"), cost_unknown_24h=_count(reply, "cost_unknown_24h"),
+            provider_mismatch_24h=_count(reply, "provider_mismatch_24h"),
+            account_remaining_usd=_usd(reply, "account_remaining_usd", nullable=True),
+            egress_alive=_flag(egress, "alive", nullable=True),
+            egress_last_ok_age_s=_usd(egress, "last_ok_age_s", nullable=True))
+        if r.upstream_state not in UPSTREAM_STATES:
+            raise ValueError("неизвестное состояние OpenRouter")
+        if r.total_usd <= 0:
+            raise ValueError("бюджет не больше нуля")
+        return r
+
+
+def llm_note(r: LlmReply) -> str:
+    """Числа строки: расход из бюджета, оценки, сверка с ключом, доли, остаток счёта."""
+    parts = [f"расход {fmt_usd(r.spent_usd)} из {fmt_total(r.total_usd)}"]
+    if r.reserved_usd > 0:
+        parts.append(f"идёт на оценку {fmt_usd(r.reserved_usd)}")
+    unpriced = r.estimated_usd - r.reserved_usd   # вызовы без цены, кроме идущих
+    if unpriced > USD_NOISE:
+        parts.append(f"по оценке {fmt_usd(unpriced)}")
+    if r.key_spent_usd is not None:
+        parts.append(f"по ключу OpenRouter {fmt_usd(r.key_spent_usd)}")
+    if r.ops_usd > 0:
+        parts.append(f"отбор и проверки {fmt_usd(r.ops_usd)}")
+    if r.over_80 > 0:
+        parts.append(f"доля больше 80 %: {r.over_80}")
+    if r.shares_spent > 0:
+        parts.append(f"доля исчерпана: {r.shares_spent}")
+    if r.account_remaining_usd is not None:
+        parts.append(f"на счёте {fmt_usd(r.account_remaining_usd)}")
+    return " · ".join(parts)
+
+
+def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
+    """Первая подходящая строка таблицы задачи 7 Д4а: сбои, «неизвестно», деньги мимо учёта
+    и провайдер, полосы бюджета — последними, чтобы полоса после $500 не прятала остальное.
+
+    В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
+    """
+    upstream_text = _reason(r.upstream_text) or r.upstream_state
+    if r.stopped:
+        return "fail", "LLM-прокси остановлен администратором"
+    if r.config_error is not None:
+        return "fail", _reason("ошибка настройки: " + r.config_error)
+    if r.tokens_error is not None:
+        return "fail", "токены LLM не читаются"
+    if r.key == "missing":
+        return "fail", "нет ключа OpenRouter"
+    if not r.ledger_ok:
+        return "fail", "журнал вызовов не пишется"
+    if r.egress_alive is False:
+        return "fail", "охрана выхода: поток обновления адресов остановлен"
+    # spent_usd — без резервов идущих вызовов (Д4а-R11): строка не мигает на каждом вызове
+    if r.spent_usd >= r.total_usd:
+        return "fail", f"бюджет {fmt_total(r.total_usd)} исчерпан — модель не отвечает"
+    if r.upstream_state in UPSTREAM_FAIL_STATES:
+        return "fail", upstream_text
+    if r.checked_at is None:
+        return "unknown", "OpenRouter ещё не опрашивался"
+    if (now - r.checked_at).total_seconds() > LLM_STALE_S:
+        return "unknown", "LLM-прокси давно не опрашивал OpenRouter"
+    if r.upstream_state == "errors":
+        return "warn", upstream_text
+    if r.account_remaining_usd is not None and r.account_remaining_usd < ACCOUNT_WARN_USD:
+        return "warn", f"на счёте OpenRouter меньше {fmt_total(ACCOUNT_WARN_USD)}"
+    if r.provider_mismatch_24h > 0:
+        return "warn", "за сутки были ответы не от закреплённого провайдера"
+    if r.cost_unknown_24h > 0:
+        return "warn", "цена неизвестна у части вызовов — в расходе по верхней оценке"
+    if r.pending_stuck > 0:
+        return "warn", "цена ждёт дозапроса дольше 15 минут"
+    if r.ledger_reset:
+        return "warn", "журнал вызовов начат заново при ненулевом расходе ключа"
+    if r.egress_last_ok_age_s is not None and r.egress_last_ok_age_s > EGRESS_STALE_S:
+        return "warn", "охрана выхода: адреса OpenRouter не обновлялись больше 5 минут"
+    if r.key_spent_usd is not None and r.key_spent_usd - r.ledger_usd > DRIFT_WARN_USD:
+        return "warn", "OpenRouter насчитал больше, чем учёл прокси"
+    if r.mgmt_key == "rejected":
+        return "warn", "ключ управления OpenRouter отклонён — остаток счёта не виден"
+    for step in BUDGET_STEPS:
+        if r.spent_usd * 100 > step * r.total_usd:
+            return "warn", f"израсходовано больше {step} % бюджета"
+    return "ok", upstream_text
+
+
+def check_llm(component: str, title: str, url: str, now: datetime,
+              timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
+    """LLM-прокси и бюджет по ручке /health/llm службы; сама служба OpenRouter заново не опрашивает."""
+    try:
+        status, body = _http_get(url, timeout, lambda code: code == 200)
+    except (OSError, http.client.HTTPException):
+        return Check(component, title, "fail", LLM_DOWN_DETAIL)
+    if status != 200:
+        return Check(component, title, "fail", LLM_DOWN_DETAIL)
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
+        return Check(component, title, "fail", LLM_DOWN_DETAIL)
+    try:
+        parsed = LlmReply.parse(reply)
+        state, detail = llm_verdict(parsed, now)
+        note = llm_note(parsed)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return Check(component, title, "fail", LLM_OFF_CONTRACT_DETAIL)
+    return Check(component, title, state, detail, note)
 
 
 def tls_verdict(not_after: datetime, now: datetime, warn_days: int = 14) -> tuple[State, str]:

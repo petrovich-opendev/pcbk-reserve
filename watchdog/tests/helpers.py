@@ -38,6 +38,21 @@ def insp(running=False, oom=False, code=0, restarts=0, restarting=False, paused=
     return {"State": state, "RestartCount": restarts}
 
 
+def llm_obj(**kw):
+    """Ответ /health/llm (договор задачи 6 Д4а, 28 ключей): всё в норме, расход $12.3456."""
+    base = {"checked_at": (T0 - timedelta(seconds=10)).isoformat(), "config_error": None, "tokens_error": None,
+            "stopped": False, "key": "ok",
+            "mgmt_key": "missing", "drill": "", "ledger_ok": True,
+            "upstream": {"state": "ok", "text": "OpenRouter отвечает", "since": None},
+            "spent_usd": 12.3456, "reserved_usd": 0.0, "ledger_usd": 12.3456, "estimated_usd": 0.0, "key_spent_usd": None,
+            "key_usage_usd": 12.3, "total_usd": 1000.0, "ops_usd": 0.0, "shares": {"over_80": 0, "spent": 0},
+            "pending": 0, "pending_stuck": 0, "cost_unknown_24h": 0, "provider_mismatch_24h": 0,
+            "account_remaining_usd": None, "models": ["z-ai/glm-5.3"],
+            "ledger_queue": 0, "ledger_fresh": False, "ledger_reset": False,
+            "egress": {"alive": True, "last_ok_age_s": 12.0}}
+    return {**base, **kw}
+
+
 # /proc/meminfo для тестов: памяти с запасом; файл удаляется при выходе
 _fd, MEMINFO_FILE = tempfile.mkstemp(prefix="pcbk-meminfo-")
 with os.fdopen(_fd, "w") as _f:

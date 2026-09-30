@@ -13,6 +13,11 @@ function fmtTime(iso) {
   return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]} UTC${m[5]}` : String(iso);
 }
 
+// detail и через « · » note; detail, совпавший с подписью, не повторяется — как detail_text в page.py
+function detailText(c, label) {
+  return [c.detail === label ? '' : c.detail, c.note].filter((part) => part).join(' · ');
+}
+
 function span(doc, cls, text) {
   const el = doc.createElement('span');
   el.className = cls;
@@ -67,7 +72,7 @@ export function startPolling({ fetchImpl, doc, setIntervalImpl, staleAfterS,
       const li = doc.createElement('li');
       li.className = `check s-${c.state}`;
       li.append(span(doc, 'name', c.title), span(doc, 'state', label),
-        span(doc, 'detail', c.detail === label ? '' : c.detail));   // как в page.py
+        span(doc, 'detail', detailText(c, label)));
       return li;
     }));
   }

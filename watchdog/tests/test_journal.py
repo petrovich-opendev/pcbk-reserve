@@ -51,3 +51,11 @@ def test_probe_leaves_no_rows_and_fails_on_readonly(tmp_path):
     (tmp_path / "j.db").chmod(0o400)
     with pytest.raises(sqlite3.OperationalError):
         j.probe()
+
+
+def test_note_does_not_make_transition(tmp_path):                                # Review Focus 5
+    j = Journal(str(tmp_path / "j.db"))
+    j.record([Check("llm", "L", "warn", "израсходовано больше 50 % бюджета", note="расход $500.00 из $1000")], T0)
+    assert j.record([Check("llm", "L", "warn", "израсходовано больше 50 % бюджета", note="расход $501.00 из $1000")],
+                    T0 + timedelta(seconds=10)) == []
+    assert [e.detail for e in j.recent()] == ["израсходовано больше 50 % бюджета"]   # note в журнал не идёт

@@ -8,7 +8,7 @@ from datetime import timedelta
 import pytest
 
 import pcbk_watchdog.main
-from helpers import (CHROME, SETTINGS, T0, chrome_dom, http_get, http_status, now_utc,
+from helpers import (CHROME, SETTINGS, T0, chrome_dom, http_get, http_status, llm_obj, now_utc,
                      start_test_server)
 from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
@@ -243,21 +243,39 @@ def test_journal_unopenable_at_start_shows_on_page(tmp_path):
     assert state.snapshot.checks == ()
 
 
-def test_components_file_d3a():
+def test_components_file_d4a():                    # было test_components_file_d3a: всё прежнее, кроме строки absent
     comps = {c["id"]: c for c in load_components("components.json")}
     assert (comps["core"]["url"], comps["core"]["ok_detail"], comps["core"]["title"]) == \
            ("http://pcbk-core:8000/healthz/data", "жива", "Служба данных")
     assert comps["historian"]["kind"] == "historian"
-    assert {i for i, c in comps.items() if c["kind"] == "absent"} == {"llm"}
-    # остальное — как оставил Д2
+    assert (comps["historian"]["url"], comps["historian"]["title"]) == \
+           ("http://pcbk-core:8000/health/historian", "Историан БДРВ")      # П17: проверка Д3а сохранена
+    assert (comps["llm"]["kind"], comps["llm"]["title"], comps["llm"]["url"]) == \
+           ("llm", "LLM-прокси и бюджет", "http://pcbk-core:8000/health/llm")
+    assert not [c for c in comps.values() if c["kind"] == "absent"]
     assert list(comps)[:4] == ["edge", "sp-ro", "sp-ctl", "memory"]
     assert list(comps)[-3:] == ["core", "historian", "llm"]
-    assert (comps["historian"]["url"], comps["historian"]["title"]) == \
-           ("http://pcbk-core:8000/health/historian", "Историан БДРВ")
     students = [c for i, c in comps.items() if i.startswith("student-")]
     assert [(c["id"], c["title"], c["kind"], c["container"], c["sleeping_ok"]) for c in students] == \
            [(f"student-{n:02d}", f"Рабочее место {n:02d}", "container", f"pcbk-student-{n:02d}", True)
             for n in range(1, 11)]
+
+
+def test_absent_kind_stays_for_synthetic_sets():   # П17: вида absent нет в components.json, но он есть
+    assert pcbk_watchdog.main.KINDS["absent"] == () and pcbk_watchdog.main.LOCAL_KINDS == {"memory", "absent"}
+    assert pcbk_watchdog.main.KINDS["llm"] == ("url",)
+
+
+def test_run_checks_llm_kind(fake_core):
+    # вид llm идёт через _check_one в check_llm; note доходит до снимка
+    fake_core.set_llm(llm_obj(spent_usd=501.0, ledger_usd=501.0))
+    comps = [{"id": "llm", "title": "LLM-прокси и бюджет", "kind": "llm", "url": fake_core.base + "/health/llm"}]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert [(c.component, c.title, c.state, c.detail, c.note) for c in checks] == [
+        ("llm", "LLM-прокси и бюджет", "warn", "израсходовано больше 50 % бюджета", "расход $501.00 из $1000")]
+    comps[0]["url"] = "http://127.0.0.1:9/health/llm"
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "LLM-прокси не отвечает")
 
 
 def test_hist_settings_validation():
@@ -280,7 +298,7 @@ def test_components_file_d1_details():
            ("pcbk-edge", 8443, "Входной прокси")
     assert (comps["sp-ctl"]["container"], comps["sp-ctl"]["sleeping_ok"]) == ("pcbk-sp-ctl", False)
     assert comps["student-07"]["title"] == "Рабочее место 07"
-    assert comps["llm"]["title"] == "OpenRouter и бюджет"
+    assert comps["llm"]["title"] == "LLM-прокси и бюджет"
 
 
 def test_load_components_rejects_bad_config(tmp_path):
@@ -289,6 +307,7 @@ def test_load_components_rejects_bad_config(tmp_path):
                   "sleeping_ok": False}],
                 [{"id": "a", "title": "A", "kind": "absent"}, {"id": "a", "title": "B", "kind": "absent"}],
                 [{"id": "a", "title": "A", "kind": "historian"}],                      # нет url
+                [{"id": "a", "title": "A", "kind": "llm"}],                            # нет url
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": ""}],
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": 1}],
                 [{"id": "a", "title": "A", "kind": "historian", "url": "http://x/", "ok_detail": "жив"}]):
