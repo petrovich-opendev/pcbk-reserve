@@ -121,13 +121,14 @@ def test_openrouter_key_never_in_workplace(stack, place01):                     
 def test_conversation_without_tools_reads_no_data(stack, place01):             # задача 6, шаг 2 — тот же способ
     assert "mcp=connected" in stack.health_output("pcbk-student-01")            # иначе запрет проверял бы пустоту
     control = stack.converse(1, "Ответь одним словом: да")                       # положительный контроль: без запрета
-    assert "pcbk_tag_now" in tool_names(stack, control["session"])
+    # у агента по умолчанию других инструментов нет (Д6-R45): без запрета — ровно три инструмента данных
+    assert tool_names(stack, control["session"]) - {"invalid"} == PCBK3
     before = stack.data_event_count("student-01", "mcp")
     out = stack.converse(1, "Ответь одним словом: да", tools={"pcbk_*": False})
     assert out["status"] == "done" and not [t for t in out["tools"] if t["tool"].startswith("pcbk_")]
-    names = tool_names(stack, out["session"])
-    # у агента по умолчанию других инструментов нет (Д6-R45): запрет снял все три инструмента данных
-    assert tool_names(stack, control["session"]) - {"invalid"} == PCBK3 and not names & PCBK3
+    reqs = [r for r in stack.fake_requests() if r["body"].get("session_id") == f"student-01:{out['session']}"]
+    assert reqs                                                                  # запросы сессии дошли до двойника
+    assert not any(r["body"].get("tools") for r in reqs)                        # запрет снял все три — инструментов нет
     assert stack.data_event_count("student-01", "mcp") == before                # к данным не ходили
 
 

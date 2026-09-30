@@ -27,8 +27,9 @@ MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True
 FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 1 (Д6а); меняется только пересборкой образа\n'
          'description: "Помощник по данным: текущие значения и сводки тегов БДРВ"\nmode: primary\nsteps: 8\n'
          'permission:\n  "*": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n  pcbk_tag_period: allow\n')
-# пробный агент теста external_directory — только в копии конфигурации, не в образе: без блока permission
-# наследует правила opencode.json копии (у pomoshnik read нет вовсе, охрану проверяет он)
+# пробный агент теста external_directory — только в тесте, не в образе: без блока permission наследует правила
+# opencode.json — образа (точка монтирования агентов Д7) или копии без правил (у pomoshnik read нет вовсе,
+# охрану проверяет он)
 PROBE_READ = '---\ndescription: "probe"\nmode: primary\n---\nprobe\n'
 # окно каждой модели: раннее сжатие разговора — защита бюджета (Д4б-R20)
 LIMIT = {"limit": {"context": 131072, "output": 16000}}
@@ -107,11 +108,12 @@ def ok(r: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
     return r
 
 
-def run_place(tmp_path: Path, network: str, config: Path | None = None) -> str:
+def run_place(tmp_path: Path, network: str, config: Path | None = None, agents: Path | None = None) -> str:
     """Место с OpenCode, как в компоновке: пароль, токены LLM и данных — файлами, tmpfs; id контейнера.
 
     Без файла data-token ссылка {file:…} в заголовке MCP делает конфигурацию неверной (Д2-решение 2).
-    config — свой каталог конфигурации поверх образа (файлы 0644, каталоги 0755).
+    config — свой каталог конфигурации поверх образа (файлы 0644, каталоги 0755); agents — каталог агентов
+    в точку монтирования Д7 …/opencode/agents, конфигурация образа при этом своя.
     """
     for name, value in (("pw", "probe-secret"), ("llm", "probe-token"), ("data", "probe-data-token")):
         (tmp_path / name).write_text(value)
@@ -124,6 +126,8 @@ def run_place(tmp_path: Path, network: str, config: Path | None = None) -> str:
             "-v", f"{tmp_path / 'data'}:/run/secrets/data-token:ro"]
     if config is not None:
         args += ["-v", f"{config}:/etc/pcbk-opencode/opencode:ro"]
+    if agents is not None:
+        args += ["-v", f"{agents}:/etc/pcbk-opencode/opencode/agents:ro"]
     return ok(docker("run", "-d", *args, IMAGE)).stdout.strip()
 
 
@@ -324,16 +328,26 @@ def test_health_never_disposes():                                               
 
 @pytest.mark.parametrize("rules", [True, False])
 def test_external_read_refused_without_asking(student_image, tmp_path, rules):
-    """Модель просит read /proc/self/environ: с правилами образа — отказ без вопроса и пароля в разговоре.
+    """Модель просит read /proc/self/environ: с правилами самого образа — отказ без вопроса и пароля в разговоре.
 
     Ход ведёт пробный агент probe-read без своих прав — он наследует правила opencode.json (Д6-R45): у агента
     по умолчанию read нет, и на нём охрана external_directory проверяла бы пустоту.
-    rules=False — отрицательный контроль: конфигурация без блока permission, OpenCode спрашивает студента.
+    rules=True — конфигурация образа как есть, probe-read — в точке монтирования агентов Д7: проверяются
+    правила, зашитые в образ, а не копия дерева.
+    rules=False — отрицательный контроль: копия конфигурации без блока permission, OpenCode спрашивает студента.
     """
     (tmp_path / "llm.js").write_text(FAKE_LLM_JS)
     (tmp_path / "llm.js").chmod(0o444)
     net = f"pcbk-test-llm-{uuid.uuid4().hex[:8]}"
-    cfg = config_with_probe(tmp_path, rules)
+    cfg = agents = None
+    if rules:
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "probe-read.md").write_text(PROBE_READ)
+        agents.chmod(0o755)
+        (agents / "probe-read.md").chmod(0o644)
+    else:
+        cfg = config_with_probe(tmp_path, rules)
     cids = []
     assert docker("network", "create", "--internal", "--label", ONESHOT_LABEL, net).returncode == 0
     try:
@@ -342,7 +356,7 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
                               "--read-only", "--no-healthcheck", "--tmpfs", "/tmp:exec,mode=1777",
                               "-e", "BUN_BE_BUN=1", "-v", f"{tmp_path / 'llm.js'}:/fake/llm.js:ro",
                               "--entrypoint", "/usr/local/bin/opencode", IMAGE, "/fake/llm.js")).stdout.strip())
-        cid = run_place(tmp_path, network=net, config=cfg)
+        cid = run_place(tmp_path, network=net, config=cfg, agents=agents)
         cids.append(cid)
         deadline = time.monotonic() + 30
         while not docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.startswith("200"):
@@ -358,7 +372,7 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
         assert out["prompt"] == 204 and [p["tool"] for p in tools] == ["read"]
         assert tools[0]["state"]["input"] == {"filePath": "/proc/self/environ"}
         if rules:
-            assert out["permission"] == PERMISSION                      # правила дошли до сервера
+            assert out["permission"] == PERMISSION                      # правила образа дошли до сервера
             assert out["asked"] == [] and tools[0]["state"]["status"] == "error"
             assert "rule which prevents you" in tools[0]["state"]["error"]    # отказ по правилу, не сбой
             assert "probe-secret" not in json.dumps(out["messages"])
