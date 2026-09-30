@@ -8,7 +8,9 @@ pcbk-student-01…10, списка контейнеров нет). Имя кон
 Restarting, StartedAt, сменившийся после нашего start, или контейнер, вышедший после него; базовая метка
 StartedAt — из inspect сразу после start 204, при 304 (место уже шло) — из inspect до start. Флаг «готово»
 живёт в памяти и привязан к StartedAt: его снимают остановка (до stop), такт, увидевший Running == false,
-Restarting или новый StartedAt, и mark_unready (Д5б: отказ соединения).
+Restarting или новый StartedAt, и mark_unready (Д5б: отказ соединения). Пробуждение готового места, которое
+не дольше такта уборщика назад подтвердили inspect такта или пробуждения (и флаг с тех пор не менялся), —
+без работы: без inspect, строки журнала и события (итоговое ревью Д5а, M4).
 
 Простой — по монотонным часам: от последней активности (touch), а без неё — с первого раза, когда шлюз
 увидел место работающим (такт или пробуждение). Уборщик под замком места: GET /session/status →
@@ -18,7 +20,8 @@ GW_IDLE_STOP_S), паузу снимают удачная остановка, т
 
 Такт снимает inspect мест параллельно, вне замков; итог места применяется, только если за это время место
 не трогали пробуждение и остановка (счётчик _gen) и замок свободен: запоздавший inspect не снимет свежий
-флаг. Первый проход, где sp-ctl ответил хоть об одном месте, возвращает «готово» работающим местам без
+флаг. sp-ctl ответил на ping, но ни на один inspect такта — sp_ctl = "down", как без ping (итоговое ревью
+Д5а, M5): места не будятся, строка сторожа красная. Первый проход, где sp-ctl ответил хоть об одном месте, возвращает «готово» работающим местам без
 флага одной попыткой GET /agent, по местам параллельно: открытые вкладки после перезапуска core работают без
 пробуждения. Исключение шага одного места (gather с return_exceptions) — строка журнала с классом, проход
 идёт дальше: неожиданный ответ места не останавливает уборщик.
@@ -235,6 +238,7 @@ class Workplaces:
         self._touched: dict[int, float] = {}             # последняя активность (monotonic)
         self._seen: dict[int, float] = {}                # когда шлюз увидел место работающим (monotonic)
         self._gen = dict.fromkeys(PLACES, 0)             # растёт при каждой смене места пробуждением и остановкой
+        self._confirmed: dict[int, tuple[float, int]] = {}   # «готово» подтверждено: (monotonic, _gen) тогда
         self._passwords: dict[int, str] = {}
         self._stop_backoff: dict[int, float] = {}        # пауза до повтора неудавшейся остановки (растёт вдвое)
         self._stop_not_before: dict[int, float] = {}     # monotonic, раньше которого уборщик место не гасит
@@ -353,6 +357,16 @@ class Workplaces:
         self._gen[n] += 1
         self._mark_running(n)
 
+    def _confirm(self, n: int) -> None:
+        """Место готово — это только что подтвердил inspect (такт, пробуждение) или ответ GET /agent."""
+        self._confirmed[n] = (self._monotonic(), self._gen[n])
+
+    def _fresh_ready(self, n: int) -> bool:
+        """Готово, и подтверждено не дольше такта уборщика назад при том же флаге (_gen не менялся)."""
+        mark = self._confirmed.get(n)
+        return (n in self._ready and mark is not None and mark[1] == self._gen[n]
+                and self._monotonic() - mark[0] <= self.gw.GW_REAPER_TICK_S)
+
     def _unready(self, n: int) -> None:
         self._ready.pop(n, None)
         self._gen[n] += 1
@@ -390,13 +404,15 @@ class Workplaces:
     # --- пробуждение ---
 
     async def wake(self, n: int) -> PlaceView:
-        """touch, затем задача пробуждения — одна на место; ответ сразу, без ожидания готовности."""
+        """touch, затем задача пробуждения — одна на место; ответ сразу, без ожидания готовности. Место готово,
+        и свежее подтверждение есть (_fresh_ready) — ответ «готово» без задачи: без inspect, строки и события."""
         n = _place(n)
         self.touch(n)
         if not self._waking(n):
             self._failed.pop(n, None)                    # неудача прошлого пробуждения сбрасывается здесь
             self._stop_retry_reset(n)                    # место снова нужно студенту
-            self._tasks[n] = asyncio.create_task(self._wake(n), name=f"gw-wake-{n:02d}")
+            if not self._fresh_ready(n):
+                self._tasks[n] = asyncio.create_task(self._wake(n), name=f"gw-wake-{n:02d}")
         return self.view(n)
 
     async def wait_ready(self, n: int) -> PlaceView:
@@ -442,6 +458,7 @@ class Workplaces:
         if (before.running and not before.restarting and n in self._ready
                 and self._ready[n] == before.started_at):
             self._mark_running(n)
+            self._confirm(n)
             return None
         self._unready(n)
         try:
@@ -499,6 +516,7 @@ class Workplaces:
         self._ready[n] = base
         self._gen[n] += 1
         self._mark_running(n)
+        self._confirm(n)
         return None
 
     async def _stop_quiet(self, n: int) -> bool:
@@ -531,18 +549,23 @@ class Workplaces:
             return min(SP_CTL_DOWN_TICK_S, self.gw.GW_REAPER_TICK_S)
         return self.gw.GW_REAPER_TICK_S
 
-    def _set_sp_ctl(self, state: Literal["ok", "down"]) -> None:
+    def _set_sp_ctl(self, state: Literal["ok", "down"], step: str) -> None:
+        """Смена состояния sp-ctl — строка журнала; step — на чём он отказал (ping, inspect)."""
         if state != self.sp_ctl:
-            (log.warning if state == "down" else log.info)("gw sp-ctl %s", state)
+            if state == "down":
+                log.warning("gw sp-ctl down step=%s", step)
+            else:
+                log.info("gw sp-ctl ok")
             self.sp_ctl = state
 
     async def tick(self) -> None:
-        """Один проход уборщика (Д5-R28): ping; при живом sp-ctl — inspect мест, возврат «готово» в первом
-        удачном проходе, остановка простаивающих. В конце — checked_at, last_tick_mono, ticks."""
-        alive = await self.spctl.ping()
-        self._set_sp_ctl("ok" if alive else "down")
-        if alive:
+        """Один проход уборщика (Д5-R28): ping; при живом sp-ctl — inspect мест (ни один не удался — sp-ctl
+        «down»), возврат «готово» в первом удачном проходе, остановка простаивающих. В конце — checked_at,
+        last_tick_mono, ticks."""
+        if await self.spctl.ping():
             await self._pass()
+        else:
+            self._set_sp_ctl("down", "ping")
         self.checked_at = datetime.now(timezone.utc)
         self.last_tick_mono = self._monotonic()
         self.ticks += 1
@@ -565,6 +588,8 @@ class Workplaces:
         infos = list(await asyncio.gather(*(self._inspect_quiet(n) for n in PLACES), return_exceptions=True))
         self._log_failures("inspect", list(PLACES), infos)
         infos = [_FAILED if isinstance(info, BaseException) else info for info in infos]
+        answered = any(info is not _FAILED for info in infos)
+        self._set_sp_ctl("ok" if answered else "down", "inspect")   # ping прошёл, а места не видны — как без него
         now = self._monotonic()
         seen: dict[int, _Container] = {}
         for n, info in zip(PLACES, infos):
@@ -583,9 +608,11 @@ class Workplaces:
                 flag = self._ready[n]
                 if container.restarting or (flag is not None and flag != container.started_at):
                     self._ready.pop(n)
-                elif flag is None:
-                    self._ready[n] = container.started_at
-        if not self._restored and any(info is not _FAILED for info in infos):
+                else:
+                    if flag is None:
+                        self._ready[n] = container.started_at
+                    self._confirm(n)
+        if not self._restored and answered:
             self._restored = True                         # первый проход, где sp-ctl ответил хоть об одном месте
             todo = [n for n, c in seen.items() if not c.restarting and n not in self._ready]
             self._log_failures("restore", todo, await asyncio.gather(
@@ -608,6 +635,7 @@ class Workplaces:
             if status == 200 and n in self.running and n not in self._ready:
                 self._ready[n] = container.started_at
                 self._gen[n] += 1
+                self._confirm(n)
 
     async def _session_busy(self, n: int) -> bool:
         """Идёт ли ход на месте: GET /session/status; нет ответа или ответ не тот — не занято."""

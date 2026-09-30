@@ -1,13 +1,15 @@
 """Места шлюза (Д5-R27, Д5-R28): прокси сокета, замок места, пробуждение одно на место, «упало» по Restarting и
 StartedAt, готовность, уборщик простоя с перепроверкой под замком. Места и sp-ctl — двойники httpx.MockTransport."""
 import asyncio
+import logging
+import re
 import time
 
 import httpx
 import pytest
 
 from fake_places import FakeDocker, FakePlaces
-from helpers import FakeMono, make_places, ready_place, wait_until_async
+from helpers import FakeMono, gateway_role, make_places, ready_place, wait_until_async
 from pcbk_core.gateway import places
 from pcbk_core.gateway.places import PLACE_TEXTS, PlaceView, SpCtl, SpCtlError
 from pcbk_core.gateway.stats import GatewayStats
@@ -145,6 +147,7 @@ async def test_running_place_without_flag_woken_by_304(tmp_path):               
     await w.wake(7)
     assert (await w.wait_ready(7)).state == "ready"
     assert starts(w) == [("start", 7)] and w.docker.containers[7]["started_at"] == before
+    w.mono.advance(w.gw.GW_REAPER_TICK_S + 1)                  # подтверждение устарело — пробуждение сверяет inspect
     await w.wake(7)                                                                    # «готово» при том же StartedAt
     assert (await w.wait_ready(7)).to_json() == {"place": "07", "state": "ready", "detail": PLACE_TEXTS["ready"]}
     assert starts(w) == [("start", 7)] and w.stats.count_1h("wake_ok") == 2
@@ -312,7 +315,7 @@ async def test_restore_waits_for_an_answered_inspect(tmp_path):                 
     docker = RefusedInspect(running={2})
     w = make_places(tmp_path, docker)
     await w.tick()
-    assert w.sp_ctl == "ok" and not w.is_ready(2)
+    assert w.sp_ctl == "down" and not w.is_ready(2)             # ping жив, места не видны — «down» (R6)
     docker.refuse = False
     await w.tick()
     assert w.is_ready(2)                                                               # проход с ответом — первый
@@ -351,3 +354,62 @@ async def test_failed_stop_after_failed_wake_keeps_place(tmp_path):             
     w.mono.advance(61)
     await w.tick()                                                                     # простой вышел, пауза (60 с) тоже
     assert docker.stopped == [4] and 4 not in w.running
+
+
+# --- доводка итогового ревью Д5а (final-d5a-fix.md) ---
+
+def place_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "pcbk_core.gateway.places"]
+
+
+async def test_wake_on_fresh_ready_does_no_work(tmp_path, caplog):                     # M4, код (R5)
+    """Место готово, и inspect такта подтвердил это не дольше такта назад: 20 wake подряд — ни inspect, ни строки
+    журнала, ни события, но активность (touch). Подтверждение старше такта или снятый флаг — снова сверка inspect;
+    её «готово» тоже подтверждение."""
+    caplog.set_level(logging.INFO, logger="pcbk_core.gateway.places")
+    w = make_places(tmp_path, FakeDocker(running={3}))
+    await w.tick()                                                                     # «готово» вернул и подтвердил такт
+    assert w.is_ready(3)
+    inspects, lines = w.docker.calls.count(("inspect", 3)), len(place_lines(caplog))
+    w.mono.advance(w.gw.GW_REAPER_TICK_S)                                              # ровно такт — ещё свежее
+    for _ in range(20):
+        assert (await w.wake(3)).state == "ready"
+    assert (w.docker.calls.count(("inspect", 3)), len(place_lines(caplog))) == (inspects, lines)
+    assert w.stats.count_1h("wake_ok") == 0 and w._tasks == {} and w.idle_s(3) == 0.0   # пробуждение — активность
+    w.mono.advance(1)                                                                  # подтверждение старше такта
+    await w.wake(3)
+    assert (await w.wait_ready(3)).state == "ready" and w.docker.calls.count(("inspect", 3)) == inspects + 1
+    assert w.stats.count_1h("wake_ok") == 1 and "gw wake place=03 result=ready" in "\n".join(place_lines(caplog))
+    for _ in range(19):                                                                # подтвердило само пробуждение
+        await w.wake(3)
+    assert (w.docker.calls.count(("inspect", 3)), w.stats.count_1h("wake_ok")) == (inspects + 1, 1)
+    w.mark_unready(3)                                                                  # Д5б: место не ответило
+    await w.wake(3)
+    assert (await w.wait_ready(3)).state == "ready" and w.docker.calls.count(("inspect", 3)) == inspects + 2
+
+
+class RefusingInspect(FakeDocker):
+    """sp-ctl отвечает на ping, а inspect мест из refuse — 403 (правило прокси сломано или сменилось)."""
+    refuse = frozenset(range(1, 11))
+
+    async def __call__(self, request):
+        m = re.search(r"pcbk-student-([0-9]{2})/json$", request.url.path)
+        if m and int(m[1]) in self.refuse:
+            return httpx.Response(403, json={"message": "запрещено прокси"})
+        return await super().__call__(request)
+
+
+async def test_inspect_refused_while_ping_alive_is_down(tmp_path, caplog):               # M5 (R6)
+    """ping прошёл, а ни один inspect такта — нет: sp_ctl = "down" (строка сторожа — «нет связи с прокси сокета»,
+    fail), короткий такт; один ответ из десяти — связь есть."""
+    role = gateway_role(tmp_path, docker=RefusingInspect(running={2}))
+    w, docker = role.workplaces, role.fake_docker
+    await w.tick()
+    assert ("ping", 0) in docker.calls and w.sp_ctl == "down" and w.next_tick_s() == 5.0
+    assert role.health() == (False, "нет связи с прокси сокета — места не будятся")
+    assert role.health_json(role.wallclock())["sp_ctl"] == "down"
+    assert "gw sp-ctl down step=inspect" in caplog.text
+    docker.refuse = frozenset(range(2, 11))                                            # место 01 видно
+    await w.tick()
+    assert w.sp_ctl == "ok" and role.health() == (True, "принимает вход")
+    await w.aclose(); await w.spctl.aclose()
