@@ -1,0 +1,111 @@
+// @vitest-environment node
+// Баннер состояния (Д6-R44, решение F7): уровень и текст по /status.json и опрос по часам браузера.
+import { afterEach, expect, test, vi } from "vitest";
+import { startStatusPolling, statusView, type StatusView } from "../src/status";
+import { T_STATUS_UNKNOWN } from "../src/texts";
+
+const st = (checks: object[], extra = {}) => ({ stale: false, stale_after_s: 30, checks, ...extra });
+const c = (component: string, title: string, state: string) => ({ component, title, state, detail: "", note: "" });
+
+test("status_view_filters_and_levels", () => {
+  expect(statusView(st([c("edge", "Входной прокси", "ok")]), "03")).toEqual({ level: "ok", text: "Стенд работает" });
+  expect(statusView(st([c("student-05", "Рабочее место 05", "fail")]), "03").level).toBe("ok");      // чужое место
+  expect(statusView(st([c("student-03", "Рабочее место 03", "fail"), c("llm", "LLM-прокси и бюджет", "warn")]), "03"))
+    .toEqual({ level: "fail", text: "Сбой: Рабочее место 03" });
+  expect(statusView(st([c("a", "А", "warn"), c("b", "Б", "warn"), c("c", "В", "warn"), c("d", "Г", "warn")]), "03").text)
+    .toBe("Внимание: А, Б, В и ещё 1");
+  expect(statusView(st([c("web", "Веб-чат", "fail"), c("gateway", "Шлюз и вход", "ok")]), "03").level).toBe("ok");  // web — для владельца
+  expect(statusView(st([], { stale: true }), "03").level).toBe("unknown");
+  expect(statusView("<html>", "03").level).toBe("unknown");
+  expect(statusView(st([c("x", "X", "absent")]), "03").level).toBe("ok");
+  // F7: строка в unknown при живом стороже — названия строк, а не «сторож не отвечает»
+  expect(statusView(st([c("historian", "Историан БДРВ", "unknown"), c("llm", "LLM-прокси и бюджет", "warn")]), "03"))
+    .toEqual({ level: "unknown", text: "Состояние неизвестно: Историан БДРВ" });
+  expect(statusView(st([c("student-03", "Рабочее место 03", "unknown"), c("sp-ro", "Прокси сокета сторожа", "unknown")]), "03"))
+    .toEqual({ level: "unknown", text: "Состояние неизвестно: Рабочее место 03, Прокси сокета сторожа" });
+  expect(statusView(st([c("historian", "Историан БДРВ", "unknown"), c("edge", "Входной прокси", "fail")]), "03"))
+    .toEqual({ level: "fail", text: "Сбой: Входной прокси" });                   // fail > unknown, как в page.py
+  expect(statusView(st([], { stale: true }), "03")).toEqual({ level: "unknown", text: T_STATUS_UNKNOWN });
+  expect(statusView("<html>", "03").text).toBe("Состояние стенда неизвестно — сторож не отвечает");
+  expect(statusView({ stale: false, checks: "x" }, "03").text).toBe(T_STATUS_UNKNOWN);  // не той формы
+  expect(statusView(st([c("student-03", "Рабочее место 03", "fail")]), null).level).toBe("ok");  // без места — ни одного
+});
+
+// --- опрос: часы и таймеры — поддельные (vi.useFakeTimers), fetch — управляемый ---
+
+afterEach(() => { vi.useRealTimers(); });
+
+type Answer = { status: number; body: unknown } | "hang";
+function poller(answers: Answer[], extra: Partial<Parameters<typeof startStatusPolling>[0]> = {}) {
+  vi.useFakeTimers();
+  const views: StatusView[] = [];
+  const resolvers: ((r: Response) => void)[] = [];
+  const fetchImpl = vi.fn((url: string, _init?: RequestInit) => {
+    expect(url).toBe("/status.json");
+    const a = answers.shift() ?? "hang";
+    if (a === "hang") return new Promise<Response>((resolve) => { resolvers.push(resolve); });   // висит, сигнал не слушает
+    return Promise.resolve(new Response(typeof a.body === "string" ? a.body : JSON.stringify(a.body), { status: a.status }));
+  });
+  const stop = startStatusPolling({ onView: (v) => views.push(v), ownPlace: "03", fetchImpl, nowMs: () => Date.now(), ...extra });
+  return { views, fetchImpl, stop, resolvers };
+}
+
+test("polling_goes_unknown_by_clock", async () => {
+  const p = poller([{ status: 200, body: st([c("edge", "Входной прокси", "ok")]) }]);   // дальше fetch висит
+  await vi.advanceTimersByTimeAsync(0);
+  expect(p.views).toEqual([{ level: "ok", text: "Стенд работает" }]);             // без мигания «неизвестно» до ответа
+  await vi.advanceTimersByTimeAsync(29_000);
+  expect(p.views.at(-1)!.level).toBe("ok");
+  expect(p.fetchImpl).toHaveBeenCalledTimes(3);                                   // раз в 10 с: 0, 10, 20
+  await vi.advanceTimersByTimeAsync(2_000);                                       // 31 с по часам с последнего свежего
+  expect(p.views.at(-1)).toEqual({ level: "unknown", text: T_STATUS_UNKNOWN });
+  expect(p.views).toHaveLength(2);                                                // вид — только при смене
+  p.stop();
+  const n = p.fetchImpl.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(p.fetchImpl).toHaveBeenCalledTimes(n);                                   // после остановки — ни запроса
+  expect(p.views).toHaveLength(2);
+});
+
+test("late_answer_of_old_request_ignored", async () => {
+  const p = poller(["hang", { status: 200, body: st([c("edge", "Входной прокси", "fail")]) }], { timeoutMs: 60_000 });
+  await vi.advanceTimersByTimeAsync(10_000);                                      // второй запрос ответил первым
+  expect(p.views.at(-1)).toEqual({ level: "fail", text: "Сбой: Входной прокси" });
+  p.resolvers[0](new Response(JSON.stringify(st([c("edge", "Входной прокси", "ok")])), { status: 200 }));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(p.views.at(-1)).toEqual({ level: "fail", text: "Сбой: Входной прокси" }); // ответ №1 после №2 не применён
+  p.stop();
+});
+
+test("polling_bad_answers_are_unknown", async () => {
+  const p = poller([
+    { status: 200, body: st([c("edge", "Входной прокси", "warn")]) },
+    { status: 502, body: "<html>сторож не отвечает</html>" },                    // страница watchdog-down.html
+    { status: 200, body: st([c("edge", "Входной прокси", "warn")]) },
+    { status: 200, body: st([], { stale: true }) },
+    { status: 200, body: "не json" },
+    { status: 200, body: st([c("edge", "Входной прокси", "ok")], { stale_after_s: 60 }) },
+  ]);
+  const seen: string[] = [];
+  for (let i = 0; i < 6; i++) { await vi.advanceTimersByTimeAsync(i === 0 ? 0 : 10_000); seen.push(p.views.at(-1)!.level); }
+  expect(seen).toEqual(["warn", "unknown", "warn", "unknown", "unknown", "ok"]);
+  await vi.advanceTimersByTimeAsync(55_000);                                      // stale_after_s из ответа — 60 с
+  expect(p.views.at(-1)!.level).toBe("ok");
+  p.stop();
+});
+
+test("polling_request_timeout_aborts", async () => {
+  const signals: AbortSignal[] = [];
+  vi.useFakeTimers();
+  const views: StatusView[] = [];
+  const stop = startStatusPolling({ onView: (v) => views.push(v), ownPlace: "03", nowMs: () => Date.now(),
+    fetchImpl: (_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
+      const s = init!.signal!; signals.push(s); s.addEventListener("abort", () => reject(s.reason));
+    }) });
+  await vi.advanceTimersByTimeAsync(3_900);
+  expect(views).toEqual([]);                                                      // срок запроса 4 с ещё не вышел
+  await vi.advanceTimersByTimeAsync(200);
+  expect(signals[0].aborted).toBe(true);
+  expect(views).toEqual([{ level: "unknown", text: T_STATUS_UNKNOWN }]);          // первый же запрос повис — неизвестно
+  stop();
+});
