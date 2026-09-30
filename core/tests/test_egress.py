@@ -406,3 +406,53 @@ def test_install_guard_counts_and_logs():                                       
             "setup_logging(); print(install_guard([('h', 1), ('or.test', None)]))")
     p = subprocess.run([sys.executable, "-c", code], cwd=CORE_DIR, capture_output=True, text=True, check=True)
     assert p.stdout.split() == ["2"] and "охрана выхода: разрешено 2 направления" in p.stderr
+
+
+def test_hits_do_not_wake_refresher(listeners):      # промах одной записи при попадании другой — не промах
+    a, _ = listeners
+    out = run_python(f"""
+import _socket, asyncio, socket, threading, time
+calls, answers = [], {{'hist.test': '127.0.0.5', 'or.test': '127.0.0.2'}}
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    if host in answers:
+        calls.append(threading.current_thread().name)
+        host = answers[host]
+    return real(host, *rest, **kw)
+_socket.getaddrinfo = fake
+from pcbk_core import egress
+egress.install_egress_guard([('hist.test', None), ('or.test', {a})], allowed_nets=())   # историан по имени — первым
+egress.start_refresh()                                               # круг: по вызову на имя, очередной — через 30 с
+{ATTEMPT.format(a=a)}
+async def main():
+    print(sorted({{attempt('127.0.0.2') for _ in range(50)}}))       # OpenRouter: запись историана промахивается
+    await asyncio.sleep(1.5)                                         # внеочередной круг шёл бы через 1 с
+    print(len(calls))
+    print(attempt('127.0.0.3'))                                      # настоящий промах будит поток
+    end = time.monotonic() + 5
+    while len(calls) == 2 and time.monotonic() < end:
+        await asyncio.sleep(0.05)
+    print(len(calls) > 2)
+asyncio.run(main())
+print(calls.count('MainThread'))
+""")
+    assert out.split() == ["['PASSED']", "2", "DENIED", "True", "0"]
+
+
+def test_start_refresh_retries_after_failed_start():  # нет потоков (pids_limit) — повторный вызов возможен
+    out = run_python("""
+import threading
+from pcbk_core import egress
+egress.install_egress_guard([('127.0.0.1', None)], allowed_nets=())
+start = threading.Thread.start
+def broken(self): raise RuntimeError('нет потоков')
+threading.Thread.start = broken
+try: egress.start_refresh()
+except RuntimeError as e: print(str(e) == 'нет потоков')
+threading.Thread.start = start
+thread = egress.start_refresh()
+print(thread.is_alive(), thread.name)
+try: egress.start_refresh()
+except RuntimeError as e: print('AGAIN')
+""")
+    assert out.split() == ["True", "True", "pcbk-egress-refresh", "AGAIN"]

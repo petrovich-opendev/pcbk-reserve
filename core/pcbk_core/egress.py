@@ -132,7 +132,7 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
     keep_s, refresh_s = NAME_KEEP_S, NAME_REFRESH_S
     gap_s = min(_REFRESH_GAP_S, refresh_s)
     host_types = (str, bytes)
-    lock = threading.Lock()
+    lock = threading.RLock()                # RLock: обработчик сигнала может позвать хук, пока замок взят
     wake = threading.Event()                # промах в потоке цикла: круг обновления вне очереди
     cache: dict[tuple[str | bytes, int], tuple[float, frozenset[IPAddress]]] = {}   # имена в кортеже адреса
     seen: dict[str, dict[IPAddress, float]] = {}    # разрешённые имена: адрес → monotonic последней встречи
@@ -186,8 +186,9 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
             book = seen[name]
             for ip in found:
                 book[ip] = now
-            for ip in [ip for ip, at in book.items() if now - at > keep_s]:
-                del book[ip]
+            for ip, at in list(book.items()):   # снимок: повторный вход из обработчика сигнала не ломает обход
+                if now - at > keep_s:
+                    book.pop(ip, None)
 
     def knows(name: str, ip: IPAddress) -> bool:
         with lock:
@@ -206,7 +207,7 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
     def permits(ip: IPAddress, port: int) -> bool:
         if any(ip.version == net.version and ip in net for net in nets):
             return True
-        in_loop = running_loop() is not None
+        in_loop, missed = running_loop() is not None, False
         for host, want, literal in entries:
             if want is not None and want != port:
                 continue
@@ -217,11 +218,13 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
             if knows(host, ip):
                 return True
             if in_loop:                     # DNS в потоке цикла нет никогда: отказ, круг — в фоне вне очереди
-                wake.set()
+                missed = True
                 continue
             resolve_now(host)
             if knows(host, ip):
                 return True
+        if missed:                          # будит поток только настоящий промах, не промах одной из записей
+            wake.set()
         return False
 
     def check(family: int, address: object) -> None:
@@ -339,7 +342,12 @@ def start_refresh(first_wait_s: float = FIRST_WAIT_S) -> threading.Thread:
         body, _refresher, _refreshing = _refresher, None, True   # дальше тело держит только поток
     first = threading.Event()
     thread = threading.Thread(target=body, args=(first,), name="pcbk-egress-refresh", daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:                   # поток не поднялся — вызов можно повторить
+        with _install_lock:
+            _refresher, _refreshing = body, False
+        raise
     first.wait(first_wait_s)
     return thread
 
