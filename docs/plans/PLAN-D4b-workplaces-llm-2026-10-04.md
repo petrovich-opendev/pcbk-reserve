@@ -2,14 +2,51 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Изменения по предпроверке Д4б** (сверка с кодом `d4a/llm-proxy` @`58fba61` и
+рабочим деревом задачи 8 Д4а, исходниками OpenCode 1.18.33:
+`.superpowers/sdd/PLAN-D4b-workplaces-llm-2026-10-04/preflight.md`; решения
+К1–К30 приняты контроллером 30.09). Находка → что поменялось:
+1. [блок] К1 — Д4а не в `main` → задачи 0а и 1–4 — на `d4b/workplaces-llm` от головы `d4a/llm-proxy`; задачи 5–7 и окно — после `platform-d4a`; слияние — с перебазированием; задача 0 разделена: 0а (ветка, темп — сейчас) и 0б (хвосты Д4а — до задачи 5) (шапка, задачи 0а, 0б, 5, 8).
+2. [блок] К2 — задачи 3–4 правят те же файлы, что идущая задача 8 Д4а → задачи 3 и 4 — только после её коммита и ревью; задачи 1–2 могут идти раньше (шапка, задачи 3, 4).
+3. [блок] К3 — `$((10#$nn))` в `#!/bin/sh` (на сервере `dash`) → `converse` — `#!/bin/bash` (задача 6).
+4. [блок] К4 — склейка чужих токенов без переводов строк давала один шаблон в 432 знака → файл шаблонов — по токену в строке, контроль `grep -c '' pat` → `9` и `grep -c -F -f pat pat` → `9`; правило — в Global Constraints «Проверки секретов» (задача 6, шаг 1).
+5. К5 — `mcp_session` — не фикстура, а менеджер контекста → тест под `@pytest.mark.anyio` с `async with mcp_session(core_server.url + "/mcp", TOKEN)` (задача 1).
+6. К6 — `EventLog(db)` не создаёт таблицу → `EventLog(db).open()` перед `DROP COLUMN`; миграция `returned` — в `_ensure` под `_schema_lock`, `NULL` читается как `()` (задача 1).
+7. К7 — `tools_stats` по SQLite нарушил бы F9 → `deque(maxlen=TOOL_WINDOW)` исходов в памяти `DataService`, пополняется в `_finish` (задача 1).
+8. К8 — p95 и пауза без определения → p95 — от входа в `run()` до исхода; пауза — после белого списка и формы, до места; `busy_5m` включает отказы паузы (задача 1).
+9. К9 — `test_core_hardening` сверяет `Sysctls` равенством → ожидание с `ip_forward` (задача 4).
+10. К10 — `llm_calls` читался одним запросом → `settled(stack, session)`: `wait_for` до строк без `open`/`pending` (задача 4).
+11. К11 — `MOUNTS` правили задачи 2 и 4 → только задача 4; задача 2 — `IMAGE`, `MODELS`, `OR_MODELS` и свои запуски через `run_place` (задачи 2, 4).
+12. К12 — фрагмент `compose.yaml` ставил `core` внутрь якоря мест → `core` — отдельная служба, к полям Д4а добавляются только образ, `ip_forward` и десять сетей (задача 4).
+13. К13 — цена ошибки R18 описывала события, которых нет → POST — 401 и строка `outcome=unauthorized channel=mcp`, GET — 405 без строки, событий нет (Д4б-R18).
+14. К14 — в `/health/llm` 30 ключей, а не 28 (шапка «Изменения по предпроверке Д4а»).
+15. К15 — `x-parent-session-id` закрыт по исходникам: уходит только у дочерней сессии; подзадачи `@агент` из текста студента обходят `task: deny`, счёт в ход родителя — защита (шапка, Д4б-R20).
+16. К16 — в Global Constraints «Деньги» потолок `ops` был + $1 → + $3, настоящие траты прогона — меньше $1.
+17. К17 — цифры Д4б-R20 устарели → по Д4а-R13: при окне оценка ≈$1,1–1,5 (цена ≤ $0,49), на пределе тела у премиума ≈$2,78, самая большая ≈$6,03.
+18. К18 — основание темпа Д4а → коммиты задач 2 и 8 Д4а, 14,75 ч (14,25 + 0,5 за перенос задачи 7 Д3б) (шапка).
+19. К19 — требование R23 в плане Д5 уже есть (Д5-R31) → задача 8 сверяет его и три теста, а не вписывает заново.
+20. К20 — помощники Д2 — функции bash в `$CLAUDE_JOB_DIR/tmp/d2/h.sh`, `STU_NET` — в `.env` сервера → `scp h.sh`, в каждом шаге `. ~/pcbk-d4/h.sh; set -a; . /opt/pcbk-reserve/.env; set +a` (задача 6).
+21. К21 — `converse.js` не копировался на сервер, `-v` с пропавшим путём создаёт каталог от root → `scp converse.js`, монтирование — `--mount type=bind,…,readonly` (задача 6).
+22. К22 — `exec` отменял уборку `trap` → без `exec`, код выхода передаётся явно (задача 6).
+23. К23 — `spent_usd` включает сверку с `/key` → приращение сверяется по `ledger_usd`, `spent_usd` — справочно (задача 6, шаг 2).
+24. К24 — `direct.json` «не позже 15 с» — ложный провал на живом теге → главное правило — число против вывода `pcbk_tag_now` хода, `direct.json` — вторая сверка с возрастом (задача 6, шаг 4).
+25. К25 — прогон по сроку продолжал ход на месте `ops` → `converse.js` на сроке зовёт `POST /session/{id}/abort` и ждёт, пока сессия не пропадёт из `/session/status` (задача 4).
+26. К26 — отказы прокси (`step = 0`) попадали в служебные обращения → служебные — `step = 0` и `status != "refused"`, отказы — отдельным числом с кодами (задача 7).
+27. К27 — 503 `pcbk_ledger` — сбой стенда, а не модели → «сбой стенда» и один повтор прогона; вердикт — по прогону без кодов прокси (задача 7).
+28. К28 — обрыв клиента `connect` в проверке здоровья не проверен → принято; живьём — задача 6, шаг 3; запасной путь — `connect` фоновым подпроцессом (Д4б-R18, задача 6).
+29. К29 — доводки Д3б и Д4а правят те же файлы, что задачи 1 и 3 → сначала доводки, либо задачи 1/3 первыми и перебазирование доводок; миграция `returned` не удлиняет путь `write` (задачи 1, 3).
+30. К30 — пять `mcp=unknown` набираются за 10 с старта (`start-interval` 2 с) → «внимание» только если самая старая из пяти записей кончилась больше 120 с назад (задача 3).
+
+Часы: 11,6 → 13,4 по плановой шкале (0а 0,25; 0б 0,5 — перебазирование на `main`; задачи 1 +0,15, 3 +0,1, 4 +0,25, 6 +0,2, 7 +0,1, 8 +0,25).
+
 **Изменения по предпроверке Д4а** (решения П1–П26 плана Д4а, 29.09; что
 меняет входы Д4б):
-1. Доля кода Д4а до черты (правило «пересчитать до начала дня») — коммиты задач 2 и 8 Д4а, **14,25 ч** по шкале, а не 10,3; если задача 8 Д4а ждала задачу 7 Д3б — коммиты задач 2 и 7, 12,1 ч (задача 11 Д4а, шаг 4).
+1. Доля кода Д4а до черты (правило «пересчитать до начала дня») — коммиты задач 2 и 8 Д4а, **14,75 ч** по шкале (14,25 + 0,5 за перенос задачи 7 Д3б, К18), а не 10,3; если задача 8 Д4а ждала задачу 7 Д3б — коммиты задач 2 и 7, 12,1 ч (задача 11 Д4а, шаг 4).
 2. Строки `llm_calls` пишет поток-писатель `Ledger` (П5): строка появляется в файле с задержкой до долей секунды после ответа прокси. `stack.llm_calls` и `stack.llm_refusals` сразу после разговора читаются через `wait_for`, а не одним запросом.
-3. Нечитаемый `llm-tokens` — не `config_error`, а `tokens_error` (П23): `/llm/` всем 401, строка «токены LLM не читаются», опрос идёт; в `/health/llm` — 28 ключей, новые `tokens_error`, `ledger_queue`, `ledger_fresh`, `ledger_reset`, `egress`.
+3. Нечитаемый `llm-tokens` — не `config_error`, а `tokens_error` (П23): `/llm/` всем 401, строка «токены LLM не читаются», опрос идёт; в `/health/llm` — 30 ключей, новые `tokens_error`, `ledger_queue`, `ledger_fresh`, `ledger_reset`, `egress`, `ledger_error`, `refresh_started_age_s` (К14).
 4. 413 на `/llm/` — в форме OpenAI, `code` `pcbk_body_too_large`, текст без чисел (П19); 401 — `pcbk_unauthorized` с `WWW-Authenticate: Bearer`.
 5. Д4а вливается в `main` только после `platform-d3b` (П1); предпосылка Д4б (`platform-d4a`) не меняется.
-6. По ревью задач 2–5 Д4а: журнал расходов не пишет — прокси отвечает 503 `pcbk_ledger` без запроса в OpenRouter (Д4а-R19); отказ `rejected` — постоянный текст без чисел; поток чата обрывается после 10 минут (`pcbk_deadline`); живьём проверить, шлёт ли место `x-parent-session-id` (заметка ревью задачи 3 Д4а).
+6. По ревью задач 2–5 Д4а: журнал расходов не пишет — прокси отвечает 503 `pcbk_ledger` без запроса в OpenRouter (Д4а-R19); отказ `rejected` — постоянный текст без чисел; поток чата обрывается после 10 минут (`pcbk_deadline`); вопрос «шлёт ли место `x-parent-session-id`» закрыт по исходникам OpenCode (К15, Д4б-R20).
 7. Оценка входа Д4а — делитель 1 байт на токен у всех моделей (повторное ревью задачи 3): оценки и резервы в 3–5 раз выше цены обычного текста. Премиум на пределе тела — ≈$2,78, самый дорогой вызов — ≈$6,03 (gpt-6-sol), а не «≤ $1,03». Claude при теле около 100 КиБ — ≈$0,42, а не $0,25. Запас доли `ops` в задаче 7 (совместимость) — `ops_usd` + $3, а не + $1: резервы 2–3 идущих вызовов упёрлись бы в $1 (решение контроллера). Вложения в теле больше не отказываются, а заменяются текстом «[вложение не передаётся на учебном стенде]».
 
 **Изменения по критике, раунд 2** (три критика Opus 5.5; блокеров ноль, здесь —
@@ -148,7 +185,7 @@ major и дешёвые minor; находки о прокси правит Д4а
 (§2 — своя сеть на студента; §6 — провайдер и MCP места; §9 «Неуспех 1»,
 «Успех 6»; §10; §11 п. 4, 5); первая половина дня —
 [`PLAN-D4a-llm-proxy-2026-10-03.md`](PLAN-D4a-llm-proxy-2026-10-03.md). Её
-имена, Global Constraints и решения Д4а-R11…R17 действуют здесь. Решения этого
+имена, Global Constraints и решения Д4а-R11…R19 действуют здесь. Решения этого
 плана нумеруются дальше: Д4б-R18…R23. Предпосылки Д4 из закрытия
 [`PLAN-D3b-tag-answers-2026-10-02.md`](PLAN-D3b-tag-answers-2026-10-02.md)
 (задача 9) закрываются здесь:
@@ -170,27 +207,42 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
 здесь не делаем: студенту места не открываются, разговор идёт в обход шлюза
 только у администратора.
 
-**Предпосылка.** Д4а влит в `main` с тегом `platform-d4a`, прокси на сервере с
-ключом владельца — или хвосты закрываются в задаче 0. Ветка дня —
-`d4b/workplaces-llm`.
+**Предпосылка (ослаблена по К1, как у Д3б и Д4а).** Д4а вливается в `main`
+только после `platform-d3b`, а тот ждёт окон владельца Д3а и Д3б, поэтому
+код Д4б их не ждёт:
+- задачи 0а, 1 и 2 идут на ветке `d4b/workplaces-llm` от головы
+  `d4a/llm-proxy`. Коммиты — только по путям: `git commit -- <пути>`;
+- задачи 3 и 4 — только после коммита задачи 8 Д4а и закрытия её ревью
+  (К2): они правят `compose.yaml`, `compose.test.yaml` и
+  `tests/integration/*`, которые правит задача 8 Д4а;
+- порядок с доводками (К29): итоговые доводки Д3б и Д4а правят
+  `data/events.py`, `data/gate.py`, `watchdog/checks.py` — сначала они,
+  затем задачи 1 и 3; либо задачи 1 и 3 первыми и перебазирование доводок;
+- задача 0б (хвосты Д4а), задачи 5–7 и окно владельца Д4б — после тега
+  `platform-d4a`, прокси на сервере с ключом владельца;
+- слияние Д4б в `main` — после `platform-d4a`, с перебазированием на `main`.
+
+Цена ошибки — перебазирование, если живые проверки Д3а, Д3б или Д4а поменяют
+`core`, `compose.yaml` или `conftest.py` (около 0,5 ч — в задаче 0б).
 
 **Влезает ли в день — оценка по часам.** Задачи последовательны; в часы задач
 с кодом входят 15 минут ревью и правок; шкала — плановая.
 
 | Задача | Часы | Где |
 |---|---|---|
-| 0. Хвосты Д4а (второй раунд критика, слияние, перенесённое окно) | 0–0,5; в ветке «ключа всё ещё нет» после ключа — 1,6–2,1 (задачи 1 и 10 Д4а) | — |
-| 1. Служба данных перед подключением мест: нагрузка историана, ошибки инструментов, `returned`, у MCP нет ресурсов | 1,6 | локально |
+| 0а. Ветка от головы `d4a/llm-proxy`, темп (сейчас) | 0,25 | локально |
+| 0б. Хвосты Д4а (второй раунд критика, слияние, перенесённое окно) и перебазирование на `main` после `platform-d4a` | 0,5–1,0; в ветке «ключа всё ещё нет» после ключа — ещё 1,6–2,1 (задачи 1 и 10 Д4а) | — |
+| 1. Служба данных перед подключением мест: нагрузка историана, ошибки инструментов, `returned`, у MCP нет ресурсов | 1,75 | локально |
 | 2. Образ места `:d4` (`task` закрыт); правка тестов образа Д2 под MCP | 1,6 | локально |
-| 3. Сторож: MCP мест и контейнер `core` | 1,0 | локально |
-| 4. Компоновка: `core` в сетях мест, токены данных, сквозной разговор, вопросы модели в `converse` | 2,6 | локально |
-| 5. Выкладка | 0,75 | сервер |
-| 6. Живые проверки (шаги 1–3 — без владельца, 4–5 — окно владельца) | 1,6 | сервер |
-| 7. Проверка совместимости семи моделей | 1,1 | сервер, **окно владельца** |
-| 8. Закрытие дня | 1,35 | — |
-| **Критический путь по плановой шкале** | **11,6** (с хвостами Д4а — до 12,1; раунд 1 — 10,75; до критики — 9,75) | |
+| 3. Сторож: MCP мест и контейнер `core` (после задачи 8 Д4а) | 1,1 | локально |
+| 4. Компоновка: `core` в сетях мест, токены данных, сквозной разговор, вопросы модели и срок в `converse` (после задачи 8 Д4а) | 2,85 | локально |
+| 5. Выкладка (после `platform-d4a`) | 0,75 | сервер |
+| 6. Живые проверки (шаги 1–3 — без владельца, 4–5 — окно владельца) | 1,8 | сервер |
+| 7. Проверка совместимости семи моделей | 1,2 | сервер, **окно владельца** |
+| 8. Закрытие дня (слияние с перебазированием) | 1,6 | — |
+| **Критический путь по плановой шкале** | **13,4** при 0б = 0,5 (с хвостами Д4а — до 13,9; до предпроверки — 11,6; раунд 1 — 10,75; до критики — 9,75) | |
 
-**Окно владельца около 2 ч — вечером**, после задачи 6, шаги 1–3: задача 6,
+**Окно владельца около 2 ч — вечером**, после тега `platform-d4a` и задачи 6, шаги 1–3: задача 6,
 шаги 4–5 (разговор с числом из БДРВ, учение «`core` перезапущен» с проверкой
 вопросом), затем задача 7 (тратит деньги, меньше $1). Производственные данные
 читаются только при владельце. Строка Д4б стоит в таблице владельца дорожной
@@ -209,16 +261,18 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
    до окна. Иначе разговоры и совместимость переносятся.
 
 **Основание «один день»** — как в Д4а: живой темп Д1/Д2/Д3а по git (доля
-0,14–0,30 плановой шкалы, худшая — 0,30). По ней 11,6 ч — около 3,5 ч работы
+0,14–0,30 плановой шкалы, худшая — 0,30). По ней 13,4 ч — около 4,0 ч работы
 плюс окно. Правило пересчёта берёт долю кода Д4а до черты — первую строку
-«план / факт» задачи 11 Д4а (коммиты задач 2 и 8, 10,3 ч по шкале). Полное
+«план / факт» задачи 11 Д4а (коммиты задач 2 и 8, 14,75 ч по шкале: 14,25 и
+0,5 за перенос локальной части задачи 7 Д3б, К18). Полное
 время дня Д4а с окном и петлёй критика для этого не годится. Если доля хуже
 0,5, план пересчитывается до начала дня, владельцу — строка с числами.
 
-**Черта отсечения — конец седьмого часа** плюс время хвостов Д4а. К черте
-зелёны задачи 1–4 и сделана выкладка (задача 5): по плановой шкале 7,55 ч, по
-доле 0,30 — ≈2,3 ч. После черты порядок жёсткий: задача 6, шаги 1–3 (без
-владельца) → окно владельца → задача 8.
+**Черта отсечения — конец седьмого часа** плюс время хвостов Д4а (задача 0б)
+и ожидания задачи 8 Д4а и тега `platform-d4a`. К черте зелёны задачи 0а, 1–4
+и сделана выкладка (задача 5): по плановой шкале 8,3 ч, по доле 0,30 —
+≈2,5 ч. После черты порядок жёсткий: задача 6, шаги 1–3 (без владельца) →
+окно владельца → задача 8.
 - **Задача 4 не зелёна к черте.** Выкладки нет. Видимый результат — снимки
   локального стенда (пометка «не на сервере»), способом Д3а:
   - строка «Серверный слой — контейнер — работает»;
@@ -245,7 +299,7 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
   нет», а не «ключа нет»: критерий дня «неуспех 1» остаётся непроверенным.
   Видимый результат — снимки учения MCP (шаг 3) и строки «LLM-прокси и бюджет
   — сбой — нет ключа OpenRouter». §11 п. 4, разговоры и совместимость ждут
-  ключа, владельцу — строка тем же часом. Когда ключ появится, задача 0 берёт
+  ключа, владельцу — строка тем же часом. Когда ключ появится, задача 0б берёт
   задачи 1 и 10 Д4а (1,6–2,1 ч по шкале), затем шаги 1–2 задачи 6 заново.
 - **Модель не прошла п. 1–4 совместимости.** Это итог, а не сбой дня: в
   таблице — «не проходит», в финал Д8 идёт запасная из той же семёрки.
@@ -282,10 +336,12 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
     Жёсткого потолка здесь нет, его держит доля места ($100). Превышение
     записывается и объясняется в журнале;
   - проверка совместимости идёт от одноразового места `ops` с жёстким
-    потолком прокси `LLM_OPS_SHARE_USD` = уже учтённое `ops` + $1. Учтённое
-    включает оценки вызовов без цены (Д4а-R13), так что обрыв прогона Claude
-    или Gemini на Vertex тоже виден. Перерасход — не больше оценки одного
-    вызова;
+    потолком прокси `LLM_OPS_SHARE_USD` = уже учтённое `ops` + $3 (К16):
+    учтённое включает оценки вызовов без цены и резервы идущих (Д4а-R13,
+    делитель 1 байт на токен), и два-три идущих вызова Claude упёрлись бы в
+    $1 на оценках. Настоящие траты прогона — меньше $1 (задача 7, шаг 5).
+    Обрыв прогона Claude или Gemini на Vertex тоже виден. Перерасход — не
+    больше оценки одного вызова;
   - доли студентов на проверку не тратятся.
 - **Одноразовые контейнеры** — `converse`, место `ops`, `probe`: на сервере
   `--runtime=runsc`, пароль и токены — только файлами `:ro`, после работы
@@ -300,7 +356,11 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
 - **Проверки секретов — с положительным контролем.** Перед каждым «ключа
   нет» или «чужого токена нет» (`grep -c -F -f <файл>` → `0`):
   - `[ -s <файл> ]` — иначе вердикт «не проверено — файла нет или он пуст»;
-  - `grep -c -F -f <файл> <файл>` → `1`: шаблон рабочий;
+  - `grep -c -F -f <файл> <файл>` → `1`: шаблон рабочий. У файла шаблонов из
+    нескольких секретов — по секрету в строке (токены лежат без перевода
+    строки: `for f in …; do cat "$f"; echo; done > pat`), и контроль — число
+    строк: `grep -c '' pat` → N и `grep -c -F -f pat pat` → N (К4). Склейка
+    `cat` дала бы одну строку-шаблон, и «не найдено» было бы пустым;
   - тот же конвейер по заведомо присутствующему секрету (свой `llm-token`
     места) → не меньше `1`: источник действительно прочитан.
 
@@ -330,10 +390,15 @@ MCP `pcbk`, `returned`, О7, О10 (`dispose` и MCP — почему он зде
 ленивого подъёма MCP около 6 с, а ждём мы 1 с.
 
 Уже подключённый MCP после перезапуска `core` работает и так: сервер MCP без
-сессий (stateless, Д3б), критик раунда 1 проверил это живьём. **Цена
-ошибки:** место с неверным токеном данных будет получать `connect` раз в
-минуту. Это два запроса к `core` с отказом 401 (POST StreamableHTTP, затем
-GET SSE), оба — события журнала Д3б. Сторож показывает «внимание».
+сессий (stateless, Д3б), критик раунда 1 проверил это живьём. Что делает
+обработчик `connect` при обрыве клиента (`read -t 0.4`), по исходникам не
+проверено (К28): принимается как есть, живьём — задача 6, шаг 3, под gVisor.
+Если там `connect` не проходит, запасной путь — `connect` фоновым
+подпроцессом (`setsid … &`, свой дескриптор, `read -t 25`), проверка
+здоровья его не ждёт. **Цена ошибки:** место с неверным токеном данных будет
+получать `connect` раз в минуту: POST StreamableHTTP — 401 и строка журнала
+`outcome=unauthorized channel=mcp`, затем GET SSE — 405 до токена, без строки;
+событий журнала Д3б нет (К13). Сторож показывает «внимание».
 
 **Д4б-R19 — токен данных — свой файл места.** Токены
 `student-NN.data-token` отдельны от `llm-token` — это имена Д3б. Утёкший токен
@@ -355,14 +420,22 @@ GET SSE), оба — события журнала Д3б. Сторож пока�
 3 одновременных вызова места и в 16 шагов хода родителя, а research/09 (стр.
 103, 125, 850) исходит из закрытого `task`. Счёт подагента в ход родителя в
 прокси остаётся защитой (Д4а).
+`task` закрыт для модели, но дочернюю сессию дают и подзадачи `@агент` из
+текста студента (`session/prompt.ts:255–330`, обходят `task: deny`) и
+`POST /session` с `parentID`. Только у дочерней сессии OpenCode шлёт
+`x-parent-session-id` (`session/llm/request.ts:196–201`), и прокси считает её
+шаги в ход родителя, одновременность — 3 на место (К15). Белый список полей
+`prompt_async` — Д5 (research/07).
 У каждой модели `limit: {context: 131072, output: 16000}`. Окно 131 072, а не
 1 млн: каждый шаг пересылает весь разговор, поэтому раннее сжатие разговора —
 защита бюджета. Границей цены вызова окно не служит. OpenCode сверяет
 переполнение по токенам прошлого шага (`session/prompt.ts:1161–1167`,
 `session/overflow.ts`), и следующий запрос больше окна на выводы
 инструментов. Вход ограничивает прокси: тело `/llm/` ≤ 1 МиБ. Цена вызова в
-бюджете — верхняя оценка Д4а-R13: при окне у премиума ≈$0,49, на пределе
-тела ≤ $1,03. `small_model` не задаётся: после выбора в списке прокси
+бюджете — верхняя оценка Д4а-R13 (делитель 1 байт на токен): при окне
+настоящая цена премиума — до ≈$0,49, а оценка — ≈$1,1–1,5; на пределе тела у
+премиума ≈$2,78; самая большая оценка — ≈$6,03 (`openai/gpt-6-sol`, цены
+длинного входа) (К17). `small_model` не задаётся: после выбора в списке прокси
 останется одна модель, и заголовки разговоров идут на неё же.
 
 После выбора модели в Д8 `LLM_MODELS` сужает прокси до одного имени. Образ
@@ -494,28 +567,55 @@ docs/checks/D4b.md, docs/checks/D4b/*.png
 
 ---
 
-### Task 0: Хвосты Д4а
+### Task 0а: Ветка и темп (сейчас)
+
+- [ ] **Step 1: Ветка (К1).** `d4b/workplaces-llm` — от головы
+  `d4a/llm-proxy` (рабочее дерево Д4а чистое). Коммиты Д4б — только по
+  путям: `git commit -- <пути>`.
+  Expected: `git merge-base --is-ancestor d4a/llm-proxy d4b/workplaces-llm` →
+  код 0; в `docs/checks/D4b.md` — строка «ветка от <хеш> d4a/llm-proxy;
+  задачи 3–4 ждут коммит и ревью задачи 8 Д4а, задачи 5–7 — тег
+  `platform-d4a`».
+- [ ] **Step 2: Темп.** Помощниками `at`/`msg`/`pace` задачи 0 Д4а, шаг 1a —
+  доля кода Д4а до черты, если задача 8 Д4а уже закоммичена:
+  `pace "$(msg 'Серверный слой: один обработчик 422')" "$(msg 'LLM-прокси в компоновке')" 14.75`
+  (К18). Не закоммичена — задачи 2 и 7 Д4а, 12,1 ч. Хуже 0,5 — пересчёт
+  плана до начала дня, владельцу — строка с числами.
+- [ ] **Step 3: Commit** — `git add docs/checks/D4b.md && git commit -m "Д4б: ветка от d4a, темп кода Д4а" -- docs/checks/D4b.md`.
+
+---
+
+### Task 0б: Хвосты Д4а (до задачи 5, после `platform-d4a`)
 
 - [ ] **Step 1:** Всё, что черта Д4а перенесла сюда:
   - второй раунд критика, слияние и тег `platform-d4a`;
   - перенесённое окно владельца или ключ, которого в Д4а не было (ветка
     «ключа всё ещё нет»). Тогда первыми идут задача 1 и задачи 9–10 Д4а, их
-    шагами и коммитами.
+    шагами и коммитами;
+  - перебазирование `d4b/workplaces-llm` на `main` с влитым Д4а и полный
+    локальный прогон задачи 4, шаг 4.
 
   Expected: у каждого хвоста есть вердикт в `docs/checks/D4a.md`; прокси на
-  сервере, «LLM-прокси и бюджет» в норме; ветка Д4б — от `main` после тега.
+  сервере, «LLM-прокси и бюджет» в норме; ветка Д4б — поверх `main` после
+  тега, прогон зелёный.
 
 ---
 
 ### Task 1: Служба данных перед подключением мест
+
+Можно раньше задачи 8 Д4а: файлов с ней не делит (К2). Итоговые доводки Д3б
+(`re.ASCII` у форм; `_ensure` внутри `write` ждёт 5 с) и Д4а правят те же
+`data/events.py`, `data/gate.py`, `watchdog/checks.py`: сначала они, либо эта
+задача первой и перебазирование доводок, коммиты — по путям (К29).
 
 **Files:**
 - Modify: `core/pcbk_core/data/gate.py`, `core/pcbk_core/data/service.py`,
   `core/pcbk_core/data/events.py`, `core/pcbk_core/data/__init__.py`,
   `watchdog/pcbk_watchdog/checks.py`
 - Test: `core/tests/test_gate.py` (+2), `core/tests/test_service.py` (+2),
-  `core/tests/test_events.py` (+1), `core/tests/test_mcp.py` (+1, клиент и
-  фикстура сессии MCP Д3б), `watchdog/tests/test_checks.py` (+1)
+  `core/tests/test_events.py` (+1), `core/tests/test_mcp.py` (+1: менеджер
+  контекста `mcp_session(url, token)` Д3б и фикстура `core_server`),
+  `watchdog/tests/test_checks.py` (+1)
 
 **Interfaces:**
 - Consumes: `HistorianGate`, `GateRefused`, `HistorianError`, `FakeHistorian`,
@@ -526,23 +626,35 @@ docs/checks/D4b.md, docs/checks/D4b/*.png
     `USER_PAUSE_S = 60.0`
   - `stats()` дополнительно:
     - `p95_ms: int | None` — вызовы людей, завершённые за `STATS_WINDOW_S`,
-      при их числе не меньше `P95_MIN_CALLS`;
-    - `timeouts_5m: int`, `busy_5m: int`, `user_paused: bool`.
+      при их числе не меньше `P95_MIN_CALLS`. Длительность — от входа в
+      `run()` до исхода, с ожиданием места: это видит студент (К8);
+    - `timeouts_5m: int`, `busy_5m: int` (отказы `busy` полосы людей, в том
+      числе из-за паузы), `user_paused: bool`.
   - Пауза:
     - `HistorianError("timeout")` три раза подряд на полосе людей → до
       `monotonic() + USER_PAUSE_S` новые вызовы людей сразу получают
-      `GateRefused("busy")`, без места и SQL;
+      `GateRefused("busy")`, без места и SQL. Проверка паузы — после
+      проверки белого списка и формы (шаг 1 `run`) и до места: `unlisted`
+      остаётся `unlisted` (К8);
     - любой другой исход вызова людей обнуляет счётчик;
     - фоновая полоса паузы не знает.
 - Produces (`service.py`): `TOOL_WINDOW = 50`;
   `DataService.tools_stats(self) -> dict` — `{"recent": n, "errors": k}` по
   последним `TOOL_WINDOW` вызовам каналов `http` и `mcp`. Ошибка — исход
-  `error`, `timeout` или `unavailable`.
+  `error`, `timeout` или `unavailable`. Окно — `deque(maxlen=TOOL_WINDOW)`
+  исходов **в памяти** `DataService`, пополняется в `_finish` (цикл событий)
+  для каналов `http` и `mcp`: `/health/historian` идёт в цикле событий, и
+  SQLite (`events.recent()`) там звать нельзя (F9, К7). После перезапуска
+  окно пустое — принято.
 - Produces (`events.py`):
   - `CallEvent.returned: tuple[str, ...] = ()` — у `catalog_search` имена из
     `matches`, до 50; у прочих пусто;
   - столбец `returned` (JSON); если таблица Д3б без него, `EventLog`
-    добавляет его при открытии (`ALTER TABLE agent_events ADD COLUMN returned TEXT`).
+    добавляет его в `_ensure` под `_schema_lock` (`PRAGMA table_info`, затем
+    `ALTER TABLE agent_events ADD COLUMN returned TEXT`) — один раз при
+    открытии, путь `write` не удлиняется сверх `WRITE_TIMEOUT_S` (К6, К29).
+    `_COLUMNS`, `_INSERT`, `recent()` — с новым столбцом; `NULL` читается
+    как `()`.
 
   По этому полю Д7 ловит `tag_not_seen` (research/09 §9 п. 5).
 - `/health/historian` — плюс ключ `tools` (`tools_stats()`), `gate` — с новыми
@@ -608,19 +720,26 @@ async def test_catalog_search_event_has_returned(svc):
 # core/tests/test_events.py (+)
 def test_old_table_gets_returned_column(tmp_path):
     db = str(tmp_path / "core.db")
-    EventLog(db)
+    assert EventLog(db).open()                                                   # конструктор без ввода-вывода (F4)
     con = sqlite3.connect(db)
-    con.execute("ALTER TABLE agent_events DROP COLUMN returned"); con.commit(); con.close()   # таблица, как у Д3б
+    con.execute("ALTER TABLE agent_events DROP COLUMN returned")                 # таблица, как у Д3б
+    con.execute("INSERT INTO agent_events (ts, caller, channel, tool, requested, tags, sent, outcome, summary,"
+                " cost, cache, row_count, duration_ms) VALUES ('2026-09-01T00:00:00+00:00', 'x', 'http',"
+                " 'tag_now', '[]', '[]', '[]', 'ok', '', 0, 'none', 0, 0)")          # строка Д3б без returned
+    con.commit(); con.close()
     log = EventLog(db)
     log.write(replace(E, returned=("20FAKE_001_PV",)))
     assert log.recent()[0].returned == ("20FAKE_001_PV",)
+    assert log.recent()[1].returned == ()                                       # старая строка: NULL → ()
 
 # core/tests/test_mcp.py (+) — у MCP службы только инструменты (Д4б-R19)
-async def test_mcp_has_no_resources_or_prompts(mcp_session):                  # фикстура сессии MCP Д3б
-    assert (await mcp_session.list_resources()).resources == []
-    assert (await mcp_session.list_resource_templates()).resourceTemplates == []
-    assert (await mcp_session.list_prompts()).prompts == []
-    assert {t.name for t in (await mcp_session.list_tools()).tools} >= {"tag_now", "tag_period", "catalog_search"}
+@pytest.mark.anyio
+async def test_mcp_has_no_resources_or_prompts(core_server):                  # как тесты Д3б (К5)
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        assert (await s.list_resources()).resources == []
+        assert (await s.list_resource_templates()).resourceTemplates == []
+        assert (await s.list_prompts()).prompts == []
+        assert {t.name for t in (await s.list_tools()).tools} >= {"tag_now", "tag_period", "catalog_search"}
 
 # watchdog/tests/test_checks.py (+)
 def test_historian_load_rows(fake_core):
@@ -639,19 +758,23 @@ def test_historian_load_rows(fake_core):
 - [ ] **Step 2: Run tests to verify they fail** — `cd core && CORE_PYTEST tests/test_gate.py tests/test_service.py tests/test_events.py tests/test_mcp.py; cd ../watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_checks.py`. Expected: FAIL.
 - [ ] **Step 3: Implement по интерфейсам и таблице.**
 - [ ] **Step 4: Run both suites** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs)`. Expected: PASS.
-- [ ] **Step 5: Commit** — `git add core/ watchdog/ && git commit -m "Служба данных перед местами: p95 и пауза после сроков подряд, ошибки инструментов на странице, returned в событиях поиска"`.
+- [ ] **Step 5: Commit** — `git add core/ watchdog/ && git commit -m "Служба данных перед местами: p95 и пауза после сроков подряд, ошибки инструментов на странице, returned в событиях поиска" -- core/ watchdog/`.
 
 ---
 
 ### Task 2: Образ места `:d4`
 
 **Files:**
+Можно раньше задачи 8 Д4а: файлов с ней не делит (К2).
+
 - Modify: `student/config/opencode.json`, `student/pcbk-health`,
   `tests/integration/workplace.py` (`IMAGE = "pcbk-reserve/student:d4"`,
-  `MOUNTS` + `/run/secrets/data-token`, `MODELS`, `OR_MODELS`),
-  `tests/integration/test_student_image.py`. Правки тестов образа Д2:
+  `MODELS`, `OR_MODELS`; `MOUNTS` не трогается — его меняет задача 4 вместе
+  с `compose.yaml`, К11), `tests/integration/test_student_image.py`. Правки
+  тестов образа Д2:
   - все тесты, где стартует OpenCode, монтируют ещё и
-    `/run/secrets/data-token`: без файла конфигурация неверна;
+    `/run/secrets/data-token` — через помощник `run_place` (свой набор
+    монтирований), а не через `MOUNTS`: без файла конфигурация неверна;
   - `FAKE_LLM_JS` отвечает `404` на всё, кроме путей `/llm/…`. Иначе он
     отвечает и на `/mcp`, OpenCode ждёт MCP до своего срока 30 с
     (`DEFAULT_TIMEOUT`, `mcp/index.ts:38`), и только потом зовёт модель,
@@ -808,16 +931,23 @@ def test_workplace_config_lists_same_models():                                  
 - [ ] **Step 2: Run tests to verify they fail** — `uv run --python 3.12 --with pytest pytest -q tests/integration/test_student_image.py; (cd core && CORE_PYTEST tests/test_llm_models.py)`. Expected: FAIL — старая конфигурация, нет слова MCP в выводе.
 - [ ] **Step 3: Implement конфигурацию, `pcbk-health`, `workplace.py`, помощник `run_place` и правки тестов образа.**
 - [ ] **Step 4: Run tests to verify they pass** — та же команда. Expected: PASS, включая `test_health_survives_reset_connection`, `test_health_needs_working_instance` и `test_external_read_refused_without_asking` Д2 (с правками выше; `CLIENT_JS` укладывается в свои 20 с).
-- [ ] **Step 5: Commit** — `git add student/ tests/integration/ core/tests/test_llm_models.py && git commit -m "Образ места :d4: семь моделей через прокси, MCP pcbk с токеном файлом, проверка здоровья сообщает MCP и переподключает его через connect"`.
+- [ ] **Step 5: Commit** — `git add student/ tests/integration/workplace.py tests/integration/test_student_image.py core/tests/test_llm_models.py && git commit -m "Образ места :d4: семь моделей через прокси, MCP pcbk с токеном файлом, проверка здоровья сообщает MCP и переподключает его через connect" -- student/ tests/integration/workplace.py tests/integration/test_student_image.py core/tests/test_llm_models.py`.
 
 ---
 
 ### Task 3: Сторож — MCP мест и контейнер `core`
 
+Только после коммита задачи 8 Д4а и закрытия её ревью (К2): задача правит
+`compose.yaml` и `tests/integration/test_socket_proxy.py`, которые правит
+задача 8 Д4а. Порядок с итоговой доводкой Д4а (тексты сторожа в `checks.py`)
+— как у задачи 1 (К29).
+
 **Files:**
 - Modify: `watchdog/pcbk_watchdog/checks.py`, `watchdog/components.json`,
-  `watchdog/tests/helpers.py` (`insp(..., output="200\n", log=None)` — `log`
-  задаёт весь `Health.Log` списком выводов), `compose.yaml` (правило `sp-ro`),
+  `watchdog/tests/helpers.py` (`insp(..., output="200\n", log=None, log_step_s=30)` —
+  `log` задаёт весь `Health.Log` списком выводов, новые — последними; `End`
+  последней записи — `last_end` (по умолчанию `T0 − 10 с`), у каждой
+  предыдущей — на `log_step_s` раньше), `compose.yaml` (правило `sp-ro`),
   `tests/integration/test_socket_proxy.py`
 - Test: `watchdog/tests/test_checks.py` (+2), `watchdog/tests/test_main.py`
   (новый `test_components_file_d4b`; `test_components_file_d4a` Д4а
@@ -835,13 +965,15 @@ def test_workplace_config_lists_same_models():                                  
     `Output` последней записи `Health.Log` есть `mcp=<слово>`, и слово не
     `connected`, не `unknown`, не `disabled` (Д4б)** → `warn`
     `MCP_DOWN_DETAIL`. Вывод без слова (образ `:d2`) строку не включает.
-  - `MCP_UNKNOWN_DETAIL = "состояние MCP не читается"`; следующая строка
-    таблицы: те же условия, в `Health.Log` пять записей (столько хранит
-    Docker), и во всех пяти `mcp=unknown` → `warn` `MCP_UNKNOWN_DETAIL`.
-    Одиночный `unknown` в первые секунды после старта — норма: первый
-    `GET /mcp` ждёт ленивого подъёма MCP. Пять подряд при такте проверки
-    30 с — это больше двух минут: `GET /mcp` не отвечает, и проверка
-    здоровья его не чинит.
+  - `MCP_UNKNOWN_DETAIL = "состояние MCP не читается"`, `MCP_UNKNOWN_S = 120`;
+    следующая строка таблицы: те же условия, в `Health.Log` пять записей
+    (столько хранит Docker), во всех пяти `mcp=unknown`, **и самая старая из
+    пяти кончилась (`End`) больше `MCP_UNKNOWN_S` назад** → `warn`
+    `MCP_UNKNOWN_DETAIL`. В `start-period` 20 с Docker проверяет раз в 2 с
+    (`start-interval`, `student/Dockerfile`), и под gVisor ленивый подъём MCP
+    (около 6 с) даёт 3–5 `unknown` за 10 с старта — это норма (К30). Пять
+    `unknown` дольше двух минут: `GET /mcp` не отвечает, и проверка здоровья
+    его не чинит.
   - `components.json`: сразу после `core` встаёт
     `{"id": "core-container", "title": "Серверный слой — контейнер", "kind": "container", "container": "pcbk-core", "sleeping_ok": false}`.
     «Убит по памяти» и «падает в цикле» видны на странице, а не только
@@ -859,10 +991,11 @@ def test_mcp_state_from_health_output():                                       #
     assert [c.state for c in seen.values()] == ["ok", "warn", "ok", "ok"]
     assert seen["200 mcp=failed\n"].detail == "нет связи со службой данных (MCP)"
 
-def test_mcp_unknown_five_in_a_row_is_warn():                                   # раунд 1: молчание MCP
-    five = stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5))
+def test_mcp_unknown_five_in_a_row_is_warn():                                   # раунд 1: молчание MCP; К30
+    old = stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5))          # старейшая — T0 − 130 с
+    start = stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5, log_step_s=2))   # старт: T0 − 18 с
     four = stu(insp(running=True, health="healthy", log=["200 mcp=connected\n"] + ["200 mcp=unknown\n"] * 4))
-    assert (five.state, five.detail, four.state) == ("warn", "состояние MCP не читается", "ok")
+    assert (old.state, old.detail, start.state, four.state) == ("warn", "состояние MCP не читается", "ok", "ok")
 
 # watchdog/tests/test_main.py
 def test_components_file_d4b():
@@ -880,11 +1013,18 @@ def test_components_file_d4b():
 - [ ] **Step 2: Run tests to verify they fail** — `cd watchdog && uv run --python 3.12 --with pytest pytest -q`. Expected: FAIL.
 - [ ] **Step 3: Implement строку, компонент и правило `sp-ro`.**
 - [ ] **Step 4: Run tests to verify they pass** — `cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs`. Expected: PASS.
-- [ ] **Step 5: Commit** — `git add watchdog/ compose.yaml tests/integration/test_socket_proxy.py && git commit -m "Сторож: MCP места по выводу проверки здоровья, строка контейнера core через sp-ro"`.
+- [ ] **Step 5: Commit** — `git add watchdog/ compose.yaml tests/integration/test_socket_proxy.py && git commit -m "Сторож: MCP места по выводу проверки здоровья, строка контейнера core через sp-ro" -- watchdog/ compose.yaml tests/integration/test_socket_proxy.py`.
 
 ---
 
 ### Task 4: Компоновка — `core` в сетях мест, токены данных, сквозной разговор
+
+Только после коммита задачи 8 Д4а и закрытия её ревью (К2): те же
+`compose.yaml`, `compose.test.yaml`, `tests/integration/{conftest,test_core,test_edge}.py`,
+`deploy/README.md`. Поля `core` Д3б и Д4а в `compose.yaml` к этому моменту на
+месте: том `pcbk-core-data`, секреты `core-tokens`, `llm-tokens`,
+`openrouter-key`, `openrouter-mgmt-key`, `mem_limit: 512m`, `LLM_*`,
+`sysctls` с `tcp_fastopen`.
 
 **Files:**
 - Modify: `compose.yaml`, `compose.test.yaml`, `tests/integration/conftest.py`,
@@ -901,12 +1041,15 @@ def test_components_file_d4b():
   `llm_token`, `secrets_dir`, `stu_net`). Фикстура `running` Д2 живёт в
   `test_students.py` и держит места 01 и 02 до конца того модуля; здесь своя
   модульная `place01`.
-- Produces (`compose.yaml`):
+- Produces (`compose.yaml`). `core` — **отдельная служба**, не ключ якоря мест
+  (К12): к её полям Д3б/Д4а добавляются только образ `:d4b`, `ip_forward` в
+  `sysctls` и десять сетей мест; всё прочее остаётся как есть.
 
 ```yaml
 x-student: &student
   image: pcbk-reserve/student:d4          # остальное — как в Д2
-  core:
+services:
+  core:                                  # поля Д3б/Д4а сохраняются; меняются только строки ниже
     image: pcbk-reserve/core:d4b
     sysctls: {net.ipv4.tcp_fastopen: "0", net.ipv4.ip_forward: "0"}   # Д3б-R6, Д4б-R23
     networks:
@@ -987,6 +1130,10 @@ x-student: &student
      ответа, `tool/question.ts`; у `build` — `question: "allow"`,
      `agent/agent.ts:148`) висел бы до срока. Конец — сессии нет в статусе, а
      у последнего сообщения ассистента есть `time.completed` или `error`.
+  4а. Срок `timeout_s` истёк (К25): `POST /session/{id}/abort`, затем до 10 с
+     ждать, пока сессии не станет в `GET /session/status` — иначе ход
+     продолжался бы на месте и налезал на следующий прогон (предел 3
+     одновременных вызова, деньги). Затем печать со `status: "timeout"`.
   5. Печатает один JSON: `session`, `status` (`done` | `asked` | `timeout`;
      `asked` — ход кончился, но по пути были снятые вопросы или разрешения),
      `asked`, `final_text` (текст последнего сообщения ассистента), `error`
@@ -1009,7 +1156,9 @@ x-student: &student
 - `test_edge.py`: `IMAGES` — `core`, сторож `:d4b`, место `:d4`;
   `DECLARED_ENV["pcbk-core"]` + `LLM_TOTAL_USD` (только тестовый стенд).
 - `test_core.py`: у `pcbk-core` в `prod_config()` двенадцать сетей, в
-  `pcbk-stu-NN` — адрес `.2`. Живое условие `test_egress_network_only_core`
+  `pcbk-stu-NN` — адрес `.2`. `test_core_hardening` сверяет `Sysctls`
+  равенством — ожидание:
+  `hc["Sysctls"] == {"net.ipv4.tcp_fastopen": "0", "net.ipv4.ip_forward": "0"}` (К9). Живое условие `test_egress_network_only_core`
   — тоже двенадцать: сети `pcbk-core` — `pcbk-front`, `pcbk-egress` и десять
   `pcbk-stu-NN` (было две); в `pcbk-egress` по-прежнему `pcbk-core` и
   двойник (Д4а).
@@ -1036,6 +1185,12 @@ def tool_requests(stack, session):           # заголовков клиент
     return [r for r in stack.fake_requests()
             if r["body"].get("session_id") == f"student-01:{session}" and r["body"].get("tools")]
 
+def settled(stack, session):                 # К10: строки пишет поток-писатель, заголовок OpenCode идёт фоном
+    rows = lambda: [c for c in stack.llm_calls(50) if c["session"] == session]
+    wait_for(lambda: bool(rows()) and all(r["status"] != "open" and r["cost_source"] != "pending" for r in rows()),
+             timeout=30)
+    return rows()
+
 def test_place_reaches_only_core(stack, place01):                              # Review Focus 3
     stu = stack.stu_net
     assert stack.probe("pcbk-stu-01", f"{stu}.1.2", 8000) == 1                   # положительный контроль
@@ -1052,7 +1207,7 @@ def test_conversation_tool_via_mcp_and_cost(stack, place01):                    
     assert (out["status"], out["error"]) == ("done", None) and out["final_text"].startswith("Готово:")
     tool = next(t for t in out["tools"] if t["tool"] == "pcbk_tag_now")
     assert tool["status"] == "completed" and json.loads(tool["output"])["status"] == "unavailable"   # историана нет — словами
-    calls = [c for c in stack.llm_calls(20) if c["session"] == out["session"]]
+    calls = settled(stack, out["session"])
     assert len(calls) >= 2 and {c["caller"] for c in calls} == {"student-01"}
     assert {c["cost_source"] for c in calls} == {"stream"}
     assert stack.data_event_count("student-01", "mcp") == before + 1
@@ -1084,6 +1239,7 @@ def test_turn_limit_shown_in_chat_without_retry_storm(stack, place01):          
     assert len(tool_requests(stack, out["session"])) == 16
     assert "Предел шагов на ответ" in json.dumps(out["error"], ensure_ascii=False)
     time.sleep(15)                                                                # первый повтор OpenCode — через 2 с
+    settled(stack, out["session"])
     assert len(tool_requests(stack, out["session"])) == 16
     assert stack.llm_refusals(out["session"], "pcbk_turn_limit") == 1            # повторов нет: их видно только в журнале
 
@@ -1094,6 +1250,7 @@ def test_budget_message_in_chat(stack, place01):                                
         out = stack.converse(1, Q)
         assert "Общий бюджет стенда на модель" in json.dumps(out["error"], ensure_ascii=False)
         time.sleep(15)
+        settled(stack, out["session"])
         assert stack.llm_refusals(out["session"], "pcbk_budget_spent") <= 2       # шаг и заголовок, без повторов
     finally:
         stack.recreate("core", {})
@@ -1127,17 +1284,18 @@ def test_mcp_reconnects_after_core_restart(stack):                              
 - [ ] **Step 2: Run tests to verify they fail** — `uv run --python 3.12 --with pytest pytest -q tests/integration/test_conversation.py`. Expected: FAIL — `core` не в сетях мест, нет `data-token`, нет `converse`.
 - [ ] **Step 3: Implement компоновку, `converse.js`, методы `stack`, правки тестов Д2–Д4а, README.**
 - [ ] **Step 4: Run the whole local suite** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs) && uv run --python 3.12 --with pytest pytest -q tests/integration && docker network ls --filter name=pcbk- -q | wc -l`. Expected: PASS; сетей `pcbk-` после прогона — 0.
-- [ ] **Step 5: Commit** — `git add compose.yaml compose.test.yaml deploy/README.md tests/integration/ && git commit -m "Места подключены: core на .2 в каждой сети мест, токен данных файлом, разговор через OpenCode и MCP, отказы прокси в чате без повторов"`.
+- [ ] **Step 5: Commit** — `git add compose.yaml compose.test.yaml deploy/README.md tests/integration/ && git commit -m "Места подключены: core на .2 в каждой сети мест, токен данных файлом, разговор через OpenCode и MCP, отказы прокси в чате без повторов" -- compose.yaml compose.test.yaml deploy/README.md tests/integration/`.
 
 ---
 
 ### Task 5: Выкладка
 
 Шаги — команды и вывод, который значит «прошло». `sudo` не нужен. Итоги — в
-`docs/checks/D4b.md`.
+`docs/checks/D4b.md`. Задача идёт после тега `platform-d4a` и задачи 0б (К1):
+на сервере — `core:d4a` с прокси и ключом владельца.
 
 **Files:**
-- Create: `docs/checks/D4b.md`
+- Modify: `docs/checks/D4b.md` (создан задачей 0а)
 
 - [ ] **Step 1: Предпроверки (на сервере).**
   - `docker ps -a --filter label=pcbk.role=student --format '{{.State}}' | sort | uniq -c`
@@ -1202,9 +1360,14 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
 дня и без окна владельца (шапка, ветка «окна нет»).
 
 Помощники — в `~/pcbk-d4/` на сервере:
-- `probe`, `oc`, `ocpid` (Д2) копируются из `$JOB` в начале задачи: Д2
-  удалил свой каталог;
+- `probe`, `oc`, `ocpid` (Д2) — функции bash в
+  `$CLAUDE_JOB_DIR/tmp/d2/h.sh`, а не файлы в `$JOB` (К20). В начале задачи
+  `scp "$CLAUDE_JOB_DIR/tmp/d2/h.sh" …:~/pcbk-d4/h.sh`; каждый шаг на
+  сервере начинается с `. ~/pcbk-d4/h.sh; set -a; . /opt/pcbk-reserve/.env; set +a`
+  (`STU_NET` живёт в `.env` сервера, а не в окружении SSH);
 - `llmrows` (Д4а) уже там;
+- `converse.js` — `scp tests/integration/converse.js …:~/pcbk-d4/converse.js`,
+  затем `chmod 0444` (К21);
 - новые `converse` и `memwatch` — выписаны ниже, копируются в `~/pcbk-d4/`
   (`0700`). `converse NN REQ.json [PWFILE] [HOST]` запускает одноразовый
   `pcbk-reserve/student:d4` под `runsc` в сети места NN, как
@@ -1219,23 +1382,30 @@ Expected: `11`; `444 48`; `32` различных значения (у кажд�
 
 ```bash
 cat > ~/pcbk-d4/converse <<'EOF'
-#!/bin/sh
+#!/bin/bash
 # converse NN REQ.json [PWFILE] [HOST] — разговор через API OpenCode из сети места NN; печатает JSON converse.js
+# bash, а не sh: на сервере /bin/sh — dash, а $((10#…)) — синтаксис bash (К3)
 set -eu
 nn=$1; req=$2; pw=${3:-/opt/pcbk-reserve/secrets/student-$nn.pw}; stu=${STU_NET:?STU_NET не задан}
 host=${4:-$stu.$((10#$nn)).3}
 tmp=$(mktemp -d ~/pcbk-d4/conv.XXXXXX); trap 'rm -rf "$tmp"' EXIT
 python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); r["url"] = "http://" + sys.argv[2] + ":4096"; json.dump(r, open(sys.argv[3], "w"))' "$req" "$host" "$tmp/req.json"
 chmod 0444 "$tmp/req.json"
-exec docker run --rm --pull never --runtime=runsc --network "pcbk-stu-$nn" --label pcbk.oneshot=converse \
+# без exec: иначе trap EXIT не уберёт $tmp с вопросом (К22); --mount вместо -v: пропавший файл — отказ,
+# а не каталог от root на его месте (К21)
+rc=0
+docker run --rm --pull never --runtime=runsc --network "pcbk-stu-$nn" --label pcbk.oneshot=converse \
   --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges:true \
   --memory 512m --pids-limit 256 --tmpfs /tmp:exec,mode=1777,size=64m \
   -e BUN_BE_BUN=1 --entrypoint /usr/local/bin/opencode \
-  -v ~/pcbk-d4/converse.js:/app/converse.js:ro -v "$pw":/pw:ro -v "$tmp/req.json":/req.json:ro \
-  pcbk-reserve/student:d4 /app/converse.js
+  --mount "type=bind,src=$HOME/pcbk-d4/converse.js,dst=/app/converse.js,readonly" \
+  --mount "type=bind,src=$pw,dst=/pw,readonly" \
+  --mount "type=bind,src=$tmp/req.json,dst=/req.json,readonly" \
+  pcbk-reserve/student:d4 /app/converse.js || rc=$?
+exit $rc
 EOF
 cat > ~/pcbk-d4/memwatch <<'EOF'
-#!/bin/sh
+#!/bin/bash
 # memwatch NAME OUT — раз в секунду «unix-время memory.current pids.current» cgroup контейнера, пока не убит
 cg=/sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' "$1").scope
 while :; do echo "$(date +%s) $(cat "$cg/memory.current") $(cat "$cg/pids.current")" >> "$2"; sleep 1; done
@@ -1272,10 +1442,13 @@ chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
     3. конвейер с `-f …/student-01.llm-token` → не меньше `1` — источник
        прочитан (свой токен в `/run/secrets` есть);
     4. конвейер с `-f …/openrouter.key` → `0`.
-  - Чужих токенов данных нет: тот же конвейер с `-f` по склейке
-    `student-0[2-9].data-token student-10.data-token` (во временном файле
-    `0600` в `~/pcbk-d4/`, удаляется сразу) → `0`; положительный контроль —
-    с `-f …/student-01.data-token` → не меньше `1`.
+  - Чужих токенов данных нет. Файл шаблонов — **по токену в строке**
+    (токены лежат без перевода строки; склейка `cat` дала бы один шаблон в
+    432 знака, К4): `(umask 077; cd /opt/pcbk-reserve/secrets; for f in student-0[2-9].data-token student-10.data-token; do cat "$f"; echo; done > ~/pcbk-d4/pat)`.
+    Контроль шаблона: `grep -c '' ~/pcbk-d4/pat` → `9` и
+    `grep -c -F -f ~/pcbk-d4/pat ~/pcbk-d4/pat` → `9`. Затем тот же конвейер
+    с `-f ~/pcbk-d4/pat` → `0`; положительный контроль источника — с
+    `-f …/student-01.data-token` → не меньше `1`. `rm -f ~/pcbk-d4/pat` сразу.
 
   Expected: как указано; без положительных контролей набор не засчитывается.
 - [ ] **Step 2: Разговор без данных — §11 п. 4 через OpenCode (без
@@ -1299,9 +1472,11 @@ chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
     идёт фоном и может закончиться позже хода (`session/prompt.ts:1133–1139`):
     сверка — после того как у строк сессии нет `open` и `pending`
     (`llmrows` раз в 5 с, до 60 с);
-  - приращения, а не абсолютные числа: `spent_usd` вырос ровно на сумму
+  - приращения, а не абсолютные числа: `ledger_usd` вырос ровно на сумму
     `cost` строк сессии, `estimated_usd` не изменился (в нём могут остаться
-    `unknown` Д4а);
+    `unknown` Д4а). `spent_usd` и `key_spent_usd` — справочно, после
+    следующего опроса `/key`: `spent_usd` = `max(журнал − резервы, по ключу)`,
+    и расхождение ключа выше журнала сдвигает его (К23);
   - снимок страницы с расходом — `01-spend.png`.
 - [ ] **Step 3: Учение «место поднято без `core`» (без владельца).**
   1. `docker stop pcbk-core; docker start pcbk-student-02`.
@@ -1312,7 +1487,9 @@ chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
 
   Expected: не позже 3 минут — `mcp=connected`, строка места в норме, снимок
   `03-mcp-back.png`. Затем
-  `docker stop pcbk-student-02` → «спит».
+  `docker stop pcbk-student-02` → «спит». Не переподключилось под gVisor
+  (`connect` с `read -t 0.4` прерван обрывом клиента, К28) — вердикт, и в
+  хвосты — запасной путь Д4б-R18: `connect` фоновым подпроцессом.
 - [ ] **Step 4: Разговор с числом (при владельце).**
   1. Тег называет владелец — например, тот же, что в сверке Д3б. Каталог
      `probe-out/` закрытие Д3б удалило.
@@ -1324,12 +1501,14 @@ chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
      вопрос», один повтор с дополнением «если подходят несколько тегов —
      возьми первый, не переспрашивай».
      Сразу за ним — `tag_now` того же тега через туннель токеном `ops`:
-     `$JOB/direct.json`, не позже 15 с — срок кэша `tag_now` в Д3б.
+     `$JOB/direct.json` (вторая сверка, К24).
 
   Сверка — `python3` в `$JOB`. Правило «число совпало»: в `final_text` есть
   число (разделитель — точка или запятая), которое после округления до
   показанных знаков равно значению из ответа инструмента `pcbk_tag_now` в этом
-  же ходе и значению `direct.json`.
+  же ходе. `direct.json` — вторая сверка, не условие: кэш `tag_now` живёт 15 с
+  от вызова инструмента в середине хода, и у быстро меняющегося тега значение
+  могло смениться; в журнал — «совпало / не совпало» с его `age_s` и `asof`.
   Expected:
   - владелец видит ответ;
   - в журнал — только «совпало / не совпало», статус инструмента, число
@@ -1436,15 +1615,20 @@ chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
   6. `prompt_tokens` строки `step = 1` — в тысячах; больше 15 тыс. — пометка
      «урезать встроенные инструменты через `permission`» для Д7/Д8.
 
-  Столбец «обращений» — строки `step ≥ 1`; служебные (`step = 0`: заголовок,
-  сжатие) — отдельным числом в скобках. Столбец «вопрос» — «задала вопрос»,
-  если первый прогон вернул `asked`: это не провал п. 1, пункты 1–6 берутся по
-  повтору.
+  Столбец «обращений» — строки `step ≥ 1`; служебные (`step = 0` и
+  `status != "refused"`: заголовок, сжатие) — отдельным числом в скобках;
+  отказы прокси (`status = "refused"`, у них тоже `step = 0`) — своим числом
+  с кодами (К26). Столбец «вопрос» — «задала вопрос», если первый прогон
+  вернул `asked`: это не провал п. 1, пункты 1–6 берутся по повтору.
+
+  Прогон с отказом `pcbk_ledger` (503: сбой журнала расходов, Д4а-R19) —
+  «сбой стенда», не свойство модели: один повтор прогона. Вердикт по модели —
+  только по прогону без кодов прокси (К27).
 
   В `docs/checks/D4b.md` — таблица без имён тегов и значений:
 
-  | Модель | Провайдер OpenCode | вопрос | 1 цикл | 2 цена в потоке | 3 кэш | 4 провайдер | 5 русский и число | 6 вход, тыс. | обращений | цена прогона | вердикт |
-  |---|---|---|---|---|---|---|---|---|---|---|---|
+  | Модель | Провайдер OpenCode | вопрос | 1 цикл | 2 цена в потоке | 3 кэш | 4 провайдер | 5 русский и число | 6 вход, тыс. | обращений (служебных) | отказы прокси | цена прогона | вердикт |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
 
   Вердикт по research/08 §8: «проходит» — пункты 1–4 выполнены; «не проходит
   (п. N)»; для Gemini и Claude — какой провайдер OpenCode годится. Решение о
@@ -1486,13 +1670,16 @@ chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
   - `docs/PLAN-platform-2026-09-29.md`: строка Д4б — «готово»; строка Д8 —
     «финалисты — по таблице Д4б».
   - `README.md`: «Д4 готов (Д4а и Д4б)», дальше Д5.
-  - `docs/plans/PLAN-D5-gateway-2026-10-05.md` — требование Д4б-R23:
-    строка Global Constraints и тест шлюза. Из сети места `/pcbk/api/*` → 404
-    (отдельный порт шлюза или проверка адреса назначения); `/health/llm` из
-    сети места — без `account_remaining_usd`, `key_usage_usd` и
-    `key_spent_usd`. Без этой правки долг «до Д5» пережил бы Д5.
+  - `docs/plans/PLAN-D5-gateway-2026-10-05.md` — требование Д4б-R23 там уже
+    есть (Д5-R31, «Что Д5 берёт у прежних дней»; К19): сверить, что на месте
+    Д5-R31 и три его теста — `test_front_only_routes`,
+    `test_health_llm_redacted_off_admin`, `test_place_sees_no_gateway`. Нет —
+    вписать (из сети места `/pcbk/api/*` → 404; `/health/llm` из сети места —
+    без `account_remaining_usd`, `key_usage_usd` и `key_spent_usd`).
 - [ ] **Step 2: Критик** (Opus 5.5); петля — до нуля блокеров, число раундов владелец не ограничил (29.09, «Не лимитирую LOOP»).
-- [ ] **Step 3: Слияние.** В `main`, тег `platform-d4b`. Перед пушем:
+- [ ] **Step 3: Слияние** — после `platform-d4a` (К1): ветка уже перебазирована
+  на `main` в задаче 0б; если `main` с тех пор ушёл — перебазирование и
+  повтор прогона задачи 4, шаг 4. Затем в `main`, тег `platform-d4b`. Перед пушем:
   - проверка на секреты по ветке;
   - `git ls-files | grep -cE '(core-tokens|llm-tokens|\.(pw|llm-token|data-token)|openrouter.*\.key)$'` → `0`.
 
@@ -1503,8 +1690,11 @@ chmod 0700 ~/pcbk-d4/converse ~/pcbk-d4/memwatch
 - [ ] **Step 4: План и факт.** Две строки в `docs/checks/D4b.md`, помощники
   `msg`/`pace` задачи 0, шаг 1a Д4а:
   - темп кода до черты —
-    `pace "$(msg 'Служба данных перед местами')" "$(msg 'Выкладка Д4б')" 5.95`
-    (коммиты задач 1 и 5, между ними задачи 2–5 — 5,95 ч по шкале);
+    `pace "$(msg 'Служба данных перед местами')" "$(msg 'Места подключены')" 5.55`
+    (коммиты задач 1 и 4, между ними задачи 2–4 — 5,55 ч по шкале; выкладка
+    ждёт тега `platform-d4a` и в замер не входит). Если задачи 3–4 ждали
+    задачу 8 Д4а — замер до коммита задачи 2 (`msg 'Образ места :d4'`, 1,6 ч),
+    справочно;
   - полное время дня — от `%aI` первого коммита ветки до тега
     `platform-d4b`, справочно (окно владельца и петля критика внутри).
 - [ ] **Step 5: Владельцу** — «Д4 готов», снимки, строка «число совпало»,
