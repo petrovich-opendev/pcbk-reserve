@@ -274,10 +274,22 @@ def test_llm_settings_errors_name_the_field():                                  
                       ("LLM_MAX_TOKENS", "0"), ("LLM_TURN_CALLS", "0"), ("LLM_POLL_S", "nan"),
                       ("LLM_MAX_BODY_BYTES", "1000"), ("LLM_CALLER_CONCURRENCY", "17"),
                       ("OPENROUTER_BASE_URL", "https://"), ("OPENROUTER_BASE_URL", "http://h:99999/api"),
-                      ("LLM_MAX_TOKENS", "1.5")):
+                      ("LLM_MAX_TOKENS", "1.5"), ("LLM_TURN_CALLS", "101"), ("LLM_POLL_S", "4.9")):
         with pytest.raises(ValueError, match=name):
             LlmSettings.from_env({name: raw})
     assert LlmSettings.from_env({"LLM_SHARE_USD": "2000"}).LLM_SHARE_USD == 2000.0   # больше общего — можно
+    assert (LlmSettings.from_env({"LLM_TURN_CALLS": "100"}).LLM_TURN_CALLS,              # предел шагов — в тексте
+            LlmSettings.from_env({"LLM_POLL_S": "5"}).LLM_POLL_S) == (100, 5.0)          # отказа: не больше 100
+
+
+@pytest.mark.parametrize("name,raw", [
+    ("LLM_STATE", "zq-raw-off"), ("DRILL_LLM", "zq-raw-403"), ("LLM_KEY_DEDICATED", "zq-raw-yes"),
+    ("LLM_MODELS", "zq-raw/model"), ("LLM_MODELS", "z-ai/glm-5.3,zq-raw/model"), ("LLM_TOTAL_USD", "zq-raw-usd"),
+    ("LLM_MAX_TOKENS", "zq-raw-tok"), ("OPENROUTER_BASE_URL", "zq-raw://host"), ("LLM_POLL_S", "0.25")])
+def test_llm_settings_error_names_variable_without_value(name, raw):             # ревью B: текст идёт на страницу
+    with pytest.raises(ValueError) as e:
+        LlmSettings.from_env({name: raw})
+    assert str(e.value).startswith(name) and "zq-raw" not in str(e.value) and "0.25" not in str(e.value)
 
 
 def test_read_key_file(tmp_path):
@@ -315,12 +327,29 @@ def test_build_roles_llm_key_problems_are_config_errors(tmp_path, capfd, restore
     key.write_text("sk-ключ-не-ascii\n", encoding="utf-8")
     roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "OPENROUTER_KEY_FILE": str(key)})}
     assert roles["llm"].upstream is None and "не печатные знаки ASCII" in roles["llm"].config_error
-    unreadable = {r.name: r for r in build_roles(settings, {**LLM_ENV, "OPENROUTER_MGMT_KEY_FILE": str(tmp_path)})}
-    assert "ключ управления OpenRouter не читается" in unreadable["llm"].config_error
+    unreadable = {r.name: r for r in build_roles(settings, {**LLM_ENV, "OPENROUTER_KEY_FILE": str(tmp_path)})}
+    assert "ключ OpenRouter не читается" in unreadable["llm"].config_error
     key.write_text("test-openrouter-key\n", encoding="utf-8")
     good = {r.name: r for r in build_roles(settings, {**LLM_ENV, "OPENROUTER_KEY_FILE": str(key)})}["llm"]
     assert good.config_error is None and good.upstream is not None and len(good.key_fingerprint) == 12
+    assert (good.mgmt_key, good.upstream.has_mgmt_key) == ("missing", False)
     bad_env = {r.name: r for r in build_roles(settings, {**LLM_ENV, "LLM_MODELS": "x/y"})}["llm"]
     assert bad_env.tokens_error is None and bad_env.llm.LLM_TOKENS_FILE == LLM_ENV["LLM_TOKENS_FILE"]   # не /run/secrets
     err = capfd.readouterr().err
     assert "ключ-не-ascii" not in err and "test-openrouter-key" not in err
+
+
+def test_bad_management_key_disables_only_credits(tmp_path, capfd, restore_logging):   # ревью B, Д4а-R16
+    setup_logging()
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
+    key, mgmt = tmp_path / "openrouter.key", tmp_path / "openrouter-mgmt.key"
+    key.write_text("test-openrouter-key\n", encoding="utf-8")
+    mgmt.write_text("sk-управление-не-ascii\n", encoding="utf-8")
+    env = {**LLM_ENV, "OPENROUTER_KEY_FILE": str(key)}
+    for mgmt_file in (str(tmp_path), str(mgmt)):                                   # каталог вместо файла; не ASCII
+        llm = {r.name: r for r in build_roles(settings, {**env, "OPENROUTER_MGMT_KEY_FILE": mgmt_file})}["llm"]
+        assert llm.config_error is None and llm.upstream is not None and not llm.upstream.has_mgmt_key
+        assert llm.mgmt_key == "error" and llm.health_json(llm.wallclock())["mgmt_key"] == "error"
+    err = capfd.readouterr().err
+    assert err.count("WARNING pcbk_core.main: LLM-прокси: ключ управления OpenRouter") == 2
+    assert "управление-не-ascii" not in err

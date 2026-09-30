@@ -21,6 +21,7 @@ ERRORS_IN_ROW = 3
 DRILL_SUFFIX = " (учения)"
 _SIGNS = frozenset({"money_out", "key_limit", "key_rejected", "region"})     # вид отказа — само состояние
 _POLL_CLEARS = frozenset({"unknown", "unreachable", "key_rejected"})        # что снимает удачный опрос /key
+_MONEY = frozenset({"money_out", "key_limit"})     # неудачный опрос их не подменяет (Д4а-R14)
 
 
 class UpstreamState:
@@ -47,9 +48,13 @@ class UpstreamState:
         - удача опроса — ok, только если было unknown, unreachable или key_rejected;
         - money_out, key_limit, key_rejected, region — это же состояние;
         - server и unreachable вызова — счётчик + 1, на ERRORS_IN_ROW — errors, если не сбой из FAIL_STATES;
-        - unreachable опроса — unreachable;
-        - rate, in_flight, rejected (и server опроса) — без изменений.
+        - unreachable опроса — unreachable, но не поверх money_out и key_limit: опрос снимает только свой
+          признак, а связь с OpenRouter о деньгах ничего не говорит (Д4а-R14);
+        - rate, in_flight, rejected (и server опроса) — без изменений;
+        - при учениях опрос признак учения (money_out) не трогает вовсе — его снимает только пересоздание core.
         """
+        if source == "poll" and self.drill and self.state == "money_out":
+            return
         if kind is None:
             if source == "chat":
                 self.errors_in_row = 0
@@ -63,7 +68,7 @@ class UpstreamState:
             self.errors_in_row += 1
             if self.errors_in_row >= ERRORS_IN_ROW and self.state not in FAIL_STATES:
                 self._set("errors", now)
-        elif kind == "unreachable":
+        elif kind == "unreachable" and self.state not in _MONEY:
             self._set("unreachable", now)
 
     def clear_money(self, now: datetime, kind: Literal["money_out", "key_limit"]) -> None:

@@ -1,6 +1,7 @@
 """Настройки серверного слоя из окружения: только несекретное, секреты — файлами."""
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from urllib.parse import urlsplit
@@ -66,9 +67,12 @@ class Settings:
 LLM_KEY_MODES = frozenset({"on", "off"})
 LLM_STATES = frozenset({"on", "stopped"})
 DRILL_LLM_MODES = frozenset({"", "402"})
-# (поле, наименьшее, наибольшее) — целые пределы
-_LLM_INT_RANGES = (("LLM_MAX_TOKENS", 1, 16000), ("LLM_TURN_CALLS", 1, None),
+# (поле, наименьшее, наибольшее) — целые пределы; предел шагов стоит в тексте отказа — не больше 100
+# (OpenCode ищет в тексте 429|500|502|503|504|524)
+_LLM_INT_RANGES = (("LLM_MAX_TOKENS", 1, 16000), ("LLM_TURN_CALLS", 1, 100),
                    ("LLM_MAX_BODY_BYTES", 65536, 4194304), ("LLM_CALLER_CONCURRENCY", 1, 16))
+# наименьшее у дробных, кроме «больше нуля»: опрос OpenRouter не чаще раза в 5 с
+_LLM_FLOAT_MIN = {"LLM_POLL_S": 5.0}
 _LLM_CHOICES = (("LLM_KEY_DEDICATED", LLM_KEY_MODES), ("LLM_STATE", LLM_STATES), ("DRILL_LLM", DRILL_LLM_MODES))
 # пути к файлам секретов роли llm: без проверок, их берёт и запасная настройка при ошибке в LLM_*
 _LLM_FILE_FIELDS = ("OPENROUTER_KEY_FILE", "OPENROUTER_MGMT_KEY_FILE", "LLM_TOKENS_FILE")
@@ -97,7 +101,9 @@ class LlmSettings:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "LlmSettings":
-        """Пустое значение — умолчание; ошибка — ValueError с именем поля. env — только он, иначе os.environ.
+        """Пустое значение — умолчание; ошибка — ValueError с именем поля, но без самого значения: текст идёт
+        в config_error и на /health/llm, а в переменную по ошибке может попасть что угодно. env — только он,
+        иначе os.environ.
 
         select_models импортируется здесь, а не в модуле: import pcbk_core.main в пробе здоровья не тянет
         pcbk_core.llm, fastapi и httpx (П8).
@@ -117,22 +123,26 @@ class LlmSettings:
             try:
                 value = kind(raw)
             except ValueError:
-                raise ValueError(f"{f.name}: неверное значение {raw!r}") from None
-            if kind is float and not (math.isfinite(value) and value > 0):
-                raise ValueError(f"{f.name}: нужно число больше нуля, получено {raw!r}")
+                raise ValueError(f"{f.name}: не {'целое ' if kind is int else ''}число") from None
+            if kind is float:
+                low = _LLM_FLOAT_MIN.get(f.name)
+                if not (math.isfinite(value) and value > 0 and (low is None or value >= low)):
+                    need = "больше нуля" if low is None else f"не меньше {low:g}"
+                    raise ValueError(f"{f.name}: нужно число {need}")
             values[f.name] = value
         llm = cls(**values)
         for name, low, high in _LLM_INT_RANGES:
             value = getattr(llm, name)
             if value < low or (high is not None and value > high):
-                span = f"от {low}" + ("" if high is None else f" до {high}")
-                raise ValueError(f"{name}: нужно целое {span}, получено {value}")
+                raise ValueError(f"{name}: нужно целое от {low} до {high}")
         for name, allowed in _LLM_CHOICES:
             if getattr(llm, name) not in allowed:
-                raise ValueError(f"{name}: неизвестное значение {getattr(llm, name)!r}, допустимо: "
-                                 + ", ".join(repr(v) for v in sorted(allowed)))
+                raise ValueError(f"{name}: допустимо " + " или ".join(repr(v) for v in sorted(allowed)))
         _check_base_url(llm.OPENROUTER_BASE_URL)
-        select_models(llm.LLM_MODELS)       # ValueError «LLM_MODELS: …»
+        try:
+            select_models(llm.LLM_MODELS)
+        except ValueError as exc:           # «LLM_MODELS: неизвестная модель «имя»» — имя не повторяется
+            raise ValueError(re.sub(r"«[^»]*»", "«…»", str(exc))) from None
         return llm
 
     @classmethod

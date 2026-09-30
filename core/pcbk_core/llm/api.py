@@ -4,6 +4,7 @@
 1. токен LLM (Bearer без учёта регистра, как Д3б) — иначе 401 в форме OpenAI и строка журнала без токена;
 1а. ошибка настройки роли; 2. выключатель; 3. нет ключа OpenRouter; 4. тело — объект JSON;
 5. модель — точным ключом role.models; 6. тело собирается заново (rebuild_body);
+6а. журнал вызовов не пишется (ledger_error) — 503 pcbk_ledger сразу, без резерва и без потока;
 7. у вызывающего уже LLM_CALLER_CONCURRENCY идущих вызовов — busy; 8. доля и общий бюджет (с резервами
    идущих вызовов, Д4а-R13); 9. предел шагов хода — только у запроса с инструментами (step = 0 у прочих).
 Отказы 1а–9 пишутся ledger.refused. Шаги 7–10 — один синхронный участок: между budget.refusal() и
@@ -25,8 +26,10 @@ ledger.open_call() (begin_call) нет ни одного await, иначе дв�
 ответа 200 — pending и дозапрос /generation по X-Generation-Id (иначе id чанка), без id — сразу unknown.
 Тело ушло, а ответа нет (UpstreamError.sent) — unknown: запрос мог дойти до модели.
 
-Тексты клиенту — постоянные, без чисел и сумм, кроме предела шагов: OpenCode ищет 429|500|502|503|504|524 и в
-тексте, и в теле ответа. Текст OpenRouter клиенту не уходит; у rejected он только в строке журнала процесса.
+Тексты клиенту — постоянные, без чисел, сумм и ввода клиента (имя модели — только в строке журнала), кроме
+предела шагов (не больше 100): OpenCode ищет 429|500|502|503|504|524 и в тексте, и в теле ответа. Текст
+OpenRouter клиенту не уходит; у rejected он только в строке журнала процесса. Отказ OpenRouter 4xx: переполнение
+контекста — наш 413 pcbk_body_too_large (OpenCode сожмёт разговор), 400/404/422 — как есть, прочие — 400.
 """
 import asyncio
 import json
@@ -64,8 +67,7 @@ STREAM_SEND_GRACE_S = 5.0       # клиент не читает поток: п�
 BUSY_RETRY_AFTER = "2"
 LEDGER_RETRY_AFTER = "5"
 OR_MESSAGE_CHARS = 200          # текст OpenRouter в строке журнала
-MODEL_LABEL_CHARS = 100         # модель клиента в журнале вызовов и журнале процесса
-MODEL_SHOWN_CHARS = 80          # модель клиента в тексте отказа
+MODEL_LABEL_CHARS = 100         # модель клиента в журнале вызовов и журнале процесса (в текст отказа не идёт)
 PROVIDER_LOG_CHARS = 40
 _RETRY_AFTER = re.compile(r"[0-9]{1,6}")
 
@@ -74,7 +76,7 @@ LLM_MESSAGES = {
     "stopped": "LLM-прокси остановлен администратором — модель сейчас не отвечает.",
     "key_missing": "LLM-прокси не настроен: нет ключа OpenRouter. Сообщите преподавателю.",
     "body": "Запрос к модели отклонён: ",
-    "model": "Модель «{model}» не разрешена на учебном стенде.",
+    "model": "Эта модель не разрешена на учебном стенде.",
     "share_spent": "Ваша доля бюджета на модель израсходована — модель больше не отвечает. "
                    "Обратитесь к преподавателю.",
     "budget_spent": "Общий бюджет стенда на модель израсходован — модель не отвечает. "
@@ -125,6 +127,25 @@ UPSTREAM_REFUSALS: dict[str, str] = {"money_out": "money_out", "key_limit": "key
                                      "in_flight": "wait", "rejected": "rejected", "server": "down",
                                      "unreachable": "down"}
 MONEY_KINDS = frozenset({"money_out", "key_limit"})     # статус вызова money, а не upstream_error
+# 4xx OpenRouter, чей статус клиент получает как есть; прочие 4xx — 400 (текст всегда постоянный)
+PASS_THROUGH_4XX = frozenset({400, 404, 422})
+# переполнение контекста — образцы OpenCode 1.18.33 (packages/llm/src/provider-error.ts): на них и на 413
+# OpenCode сжимает разговор, поэтому прокси отвечает своим 413 pcbk_body_too_large
+_OVERFLOW = re.compile("|".join((
+    r"prompt is too long", r"request_too_large", r"input is too long for requested model",
+    r"exceeds the context window",
+    r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",
+    r"input token count.*exceeds the maximum", r"tokens in request more than max tokens allowed",
+    r"maximum prompt length is \d+", r"reduce the length of the messages", r"maximum context length is \d+ tokens",
+    r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?",
+    r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)",
+    r"exceeds the limit of \d+", r"exceeds the available context size", r"greater than the context length",
+    r"context window exceeds limit", r"exceeded model token limit", r"context[_ ]length[_ ]exceeded",
+    r"request entity too large", r"context length is only \d+ tokens", r"input length.*exceeds.*context length",
+    r"prompt too long; exceeded (?:max )?context length", r"too large for model with \d+ maximum context length",
+    r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?",
+    r"model_context_window_exceeded", r"too many tokens", r"token limit exceeded")), re.I)
+_NOT_OVERFLOW = re.compile(r"^(?:throttling error|service unavailable):|rate limit|too many requests", re.I)
 DEADLINE_CODE = "pcbk_deadline"
 
 log = logging.getLogger("pcbk_core.llm")
@@ -150,12 +171,26 @@ def refusal_response(role: "LlmRole", key: str, *, text: str | None = None, stat
     return JSONResponse(error_body(code, text), status_code=status or default, headers=headers)
 
 
-def upstream_refusal(role: "LlmRole", error: UpstreamError) -> JSONResponse:
-    """Отказ OpenRouter до ответа: rejected — со статусом OpenRouter, wait — с его Retry-After (только число)."""
+def is_overflow(error: UpstreamError) -> bool:
+    """4xx OpenRouter о переполнении контекста: 413 или текст по образцам OpenCode (кроме «rate limit» и пр.)."""
+    return error.status == 413 or (bool(_OVERFLOW.search(error.message)) and not _NOT_OVERFLOW.search(error.message))
+
+
+def upstream_refusal_key(error: UpstreamError) -> tuple[str, int]:
+    """(ключ REFUSALS, статус) отказа OpenRouter до ответа. rejected: переполнение контекста — наш 413
+    pcbk_body_too_large (OpenCode сожмёт разговор); 400, 404, 422 — как есть; прочие 4xx — 400."""
     key = UPSTREAM_REFUSALS.get(error.kind, "down")
-    status = headers = None
-    if key == "rejected" and 400 <= error.status < 500:
-        status = error.status
+    if key != "rejected":
+        return key, REFUSALS[key][0]
+    if is_overflow(error):
+        return "too_large", REFUSALS["too_large"][0]
+    return key, error.status if error.status in PASS_THROUGH_4XX else REFUSALS["rejected"][0]
+
+
+def upstream_refusal(role: "LlmRole", error: UpstreamError) -> JSONResponse:
+    """Отказ OpenRouter до ответа — по upstream_refusal_key; wait — с его Retry-After (только число)."""
+    key, status = upstream_refusal_key(error)
+    headers = None
     retry = (error.retry_after or "").strip()
     if key == "wait" and _RETRY_AFTER.fullmatch(retry):
         headers = {"Retry-After": retry}
@@ -173,13 +208,6 @@ def _json_object(raw: bytes) -> dict | None:
 def _model_label(value: object) -> str:
     """Модель клиента для журнала вызовов: строка, не длиннее MODEL_LABEL_CHARS; не строка — пусто."""
     return value[:MODEL_LABEL_CHARS] if isinstance(value, str) else ""
-
-
-def _model_shown(value: object) -> str:
-    """Модель клиента в тексте отказа: только печатные знаки, не длиннее MODEL_SHOWN_CHARS."""
-    if not isinstance(value, str):
-        return "не указана"
-    return "".join(ch for ch in value if ch.isprintable())[:MODEL_SHOWN_CHARS]
 
 
 def _shown(text: str | None, limit: int) -> str:
@@ -280,11 +308,13 @@ class LlmCall:
             return
         self._finished = True
         inflight = self.role.inflight
-        left = inflight.get(self.caller, 0) - 1
-        if left > 0:
-            inflight[self.caller] = left
+        held = inflight.get(self.caller, 0)
+        if held < 1:                    # место уже освобождено — ошибка учёта, а не повод уйти в минус
+            log.error("LLM-прокси: вызов id=%d: место одновременности уже свободно", self.call_id)
+        elif held == 1:
+            del inflight[self.caller]
         else:
-            inflight.pop(self.caller, None)
+            inflight[self.caller] = held - 1
         try:
             self._settle(error, ledger_refused)
         except Exception as exc:        # учёт не роняет ответ; в журнал — только класс
@@ -318,7 +348,7 @@ class LlmCall:
                 status, source = "refused", "none"
             else:
                 status = "money" if error.kind in MONEY_KINDS else "upstream_error"
-                code = REFUSALS[UPSTREAM_REFUSALS.get(error.kind, "down")][1]
+                code = REFUSALS[upstream_refusal_key(error)[0]][1]      # тот же код, что в ответе клиенту
                 http_status, record = error.status, error.kind
                 source = "unknown" if error.sent else "none"
                 or_message = error.message if error.kind == "rejected" else None
@@ -452,14 +482,16 @@ async def chat(role: "LlmRole", request: Request) -> Response:
     model = raw.get("model")
     ask.model = _model_label(model)
     policy = role.models.get(model) if isinstance(model, str) else None   # :nitro, ~…, регистр — отказ
-    if policy is None:
-        return ask.refuse("model", text=LLM_MESSAGES["model"].format(model=_model_shown(model)))
+    if policy is None:                  # имя модели — только в строке журнала (model=), не в тексте клиенту
+        return ask.refuse("model")
     try:
         body = rebuild_body(raw, policy, caller=caller, session=ask.session, max_tokens_cap=role.llm.LLM_MAX_TOKENS)
     except BodyRefused as exc:
         return ask.refuse("body", text=LLM_MESSAGES["body"] + str(exc))
     estimate = policy.estimate_usd(body_bytes(body), body["max_tokens"])
     mark = turn_mark(body) if "tools" in body else None
+    if role.ledger_error() is not None:     # журнал не пишется: сразу, без резерва и без потока (flush не нужен)
+        return ask.refuse("ledger", headers={"Retry-After": LEDGER_RETRY_AFTER})
     # --- шаги 7–10: один синхронный участок, ни одного await до begin_call ---
     if role.inflight.get(caller, 0) >= role.llm.LLM_CALLER_CONCURRENCY:
         return ask.refuse("busy", headers={"Retry-After": BUSY_RETRY_AFTER})       # до бюджета и шагов

@@ -1,5 +1,7 @@
 """Роль llm: ручка /llm/v1/chat/completions с цепочкой отказов, учёт денег через журнал вызовов (строка вызова на
 диске до OpenRouter, Д4а-R19), перекачка потока, опрос /key и /credits, выключатель и учение 402 — на двойнике."""
+import asyncio
+import logging
 import sqlite3
 import time
 from dataclasses import replace
@@ -10,16 +12,19 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import (LLM_SETTINGS, LLM_TOKEN, OPS_LLM_TOKEN, SES, TOKEN, auth, chat_body, make_llm_app,
-                     make_llm_role, now_utc, serve_app, wait_until, wait_until_async)
-from pcbk_core.llm import LLM_TOKENS_ERROR
-from pcbk_core.llm.api import LLM_MESSAGES, LlmStream
+from helpers import (LLM_SETTINGS, LLM_TOKEN, LLM_TOKENS, OPS_LLM_TOKEN, SES, SETTINGS, TOKEN, auth, chat_body,
+                     make_llm_app, make_llm_role, now_utc, serve_app, wait_until, wait_until_async)
+from pcbk_core.app import create_app
+from pcbk_core.llm import LLM_TOKENS_ERROR, LlmRole
+from pcbk_core.llm.api import LLM_MESSAGES, LlmCall, LlmStream, forward
 from pcbk_core.llm.ledger import Ledger
-from pcbk_core.llm.state import UPSTREAM_TEXTS
+from pcbk_core.llm.request import body_bytes, rebuild_body, turn_mark
+from pcbk_core.llm.state import UPSTREAM_TEXTS, UpstreamState
 from pcbk_core.llm.turns import COMPACTION_CONTINUE
+from pcbk_core.llm.upstream import Upstream, UpstreamError, classify
 from pcbk_core.logs import setup_logging
 from pcbk_core.main import egress_targets
-from pcbk_core.secrets import BdrvConfig, TokenTable
+from pcbk_core.secrets import BdrvConfig, TokenTable, key_fingerprint
 
 
 def post(c, body, token=LLM_TOKEN, session=SES, parent=None):
@@ -401,9 +406,28 @@ def test_dropped_ledger_op_keeps_health_red_and_refuses(tmp_path, fake_or, monke
         assert role.health() == (False, "строка журнала вызовов потеряна — перезапустите core")
         j = role.health_json(now_utc())
         assert (j["ledger_ok"], j["ledger_error"]) == (False, "dropped")
+        monkeypatch.setattr(role.ledger, "flush", no_flush)
         r = post(c, chat_body())
-        assert (r.status_code, r.json()["error"]["code"]) == (503, "pcbk_ledger")   # flush → LedgerWriteLost
+        assert (r.status_code, r.json()["error"]["code"]) == (503, "pcbk_ledger")   # сразу, без потока и резерва
+        monkeypatch.undo()                                                       # close() на выходе зовёт flush
     assert fake_or.requests == [] and role.inflight.get("student-01", 0) == 0
+    assert role.ledger.recent(1)[0].step == 0                                    # отказ до резерва: шаг не взят
+
+
+def no_flush(*a, **k):
+    raise AssertionError("flush при известном сбое журнала")
+
+
+def test_ledger_write_error_refuses_at_once_without_thread(tmp_path, fake_or, monkeypatch):   # ревью A, M2
+    app, role = make_llm_app(tmp_path, fake_or)
+    with TestClient(app) as c:
+        wait_until(lambda: role.ledger.writable_ok is True)                      # первая фоновая проверка прошла
+        role.ledger.writable_ok = False                                          # следующая нашла сбой
+        monkeypatch.setattr(role.ledger, "flush", no_flush)
+        r = post(c, chat_body())
+        assert (r.status_code, r.headers["retry-after"], r.json()["error"]["code"]) == (503, "5", "pcbk_ledger")
+        monkeypatch.undo()
+    assert fake_or.requests == [] and role.inflight == {}
 
 
 def test_closed_ledger_refuses_without_upstream(tmp_path, fake_or):             # после close() flush() не ждёт
@@ -583,3 +607,279 @@ def test_checks_to_reserve_have_no_await():                                     
     section = source[source.index("role.inflight.get(caller"):source.index("role.begin_call(")]
     assert "role.budget.refusal(caller)" in section and "role.turns.step(" in section
     assert "await" not in section                  # между budget.refusal() и open_call() — ни одного await
+
+
+# --- доводка по ревью задачи 6 ---
+
+@pytest.mark.anyio
+async def test_usage_without_done_is_pending_not_stream(tmp_path, fake_or):      # ревью A, I1: цена — только с [DONE]
+    role = make_llm_role(tmp_path, fake_or)
+    role.cost_retry_delays = (60.0,)                                             # дозапрос не успеет — строка pending
+    call = role.begin_call(caller="student-01", session=SES, parent=None, model="z-ai/glm-5.3", step=1, estimate=0.07)
+    call.attach(httpx.Response(200, headers={"x-generation-id": "gen-x"}))
+    call.observer.feed(b'data: {"id": "gen-x", "provider": "Fireworks", "usage": {"cost": 0.0012}}\n\n')
+    call.completed = True                                                        # поток кончился, [DONE] не пришёл
+    await call.finish()
+    row = (await anyio.to_thread.run_sync(role.ledger.recent, 1))[0]
+    assert (row.status, row.code, row.cost_source, row.generation_id) == \
+           ("upstream_error", "pcbk_upstream_down", "pending", "gen-x")
+    assert role.ledger.spent("student-01") == pytest.approx(0.07)                # по оценке, а не 0,0012
+    for task in list(role._cost_tasks):
+        task.cancel()
+
+
+def test_deadline_in_open_chat_after_send_is_unknown_and_keeps_step(tmp_path, fake_or):   # ревью A, I1
+    app, role = make_llm_app(tmp_path, fake_or)
+    role.chat_deadline_s = 0.4                                                   # FAKESLOWSTART молчит 1 с до заголовков
+    body = chat_body(text="q FAKESLOWSTART")
+    with TestClient(app) as c:
+        r = post(c, body)
+        assert (r.status_code, r.json()["error"]["code"]) == (502, "pcbk_upstream_down")
+        role.chat_deadline_s = 600.0
+        assert post(c, {**body, "stream": False}).status_code == 200            # тот же ход: метка та же
+        rows = role.ledger.recent(2)
+    assert (rows[1].status, rows[1].code, rows[1].cost_source) == ("upstream_error", "pcbk_deadline", "unknown")
+    assert rows[0].step == 2                                                     # тело ушло — шаг не возвращён
+    assert role.ledger.spent("student-01") == pytest.approx(rows[1].cost_est + 0.0012)   # не $0 за оборванный
+
+
+@pytest.mark.anyio
+async def test_cancel_in_open_chat_after_send_is_unknown(tmp_path, fake_or):     # ревью A, I1: снят обработчик
+    role = make_llm_role(tmp_path, fake_or)
+    policy = role.models["z-ai/glm-5.3"]
+    body = rebuild_body(chat_body(text="q FAKESLOWSTART"), policy, caller="student-01", session=SES)
+    assert role.turns.step("student-01", SES, turn_mark(body)) == 1
+    call = role.begin_call(caller="student-01", session=SES, parent=None, model=policy.model, step=1,
+                           estimate=policy.estimate_usd(body_bytes(body), body["max_tokens"]))
+    task = asyncio.create_task(forward(role, call, body))
+    await wait_until_async(lambda: call.sent_upstream)
+    await anyio.sleep(0.3)                                                       # запрос у двойника, заголовков нет
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    row = (await anyio.to_thread.run_sync(role.ledger.recent, 1))[0]
+    assert (row.status, row.cost_source) == ("cancelled", "unknown") and role.inflight == {}
+    assert role.turns.step("student-01", SES, turn_mark(body)) == 2              # шаг не возвращён
+
+
+def test_read_timeout_after_send_is_unknown_not_free(tmp_path, fake_or):         # ревью A, I1: UpstreamError.sent
+    app, role = make_llm_app(tmp_path, fake_or)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(5, read=0.3), trust_env=False)
+    role.upstream = Upstream(fake_or.url, "test-openrouter-key", None, client=client)
+    body = chat_body(text="q FAKESLOWSTART")
+    with TestClient(app) as c:
+        r = post(c, body)                                                        # ReadTimeout после отправки тела
+        assert (r.status_code, r.json()["error"]["code"]) == (502, "pcbk_upstream_down")
+        assert post(c, {**body, "stream": False}).status_code == 200
+        rows = role.ledger.recent(2)
+        c.portal.call(client.aclose)
+    assert (rows[1].status, rows[1].cost_source, rows[0].step) == ("upstream_error", "unknown", 2)
+    assert role.ledger.spent("student-01") == pytest.approx(rows[1].cost_est + 0.0012)
+
+
+class NonNegative(dict):
+    """inflight, который не пускает ноль и минус: ноль — удаление ключа, минус — двойное освобождение."""
+
+    def __setitem__(self, key, value):
+        assert value >= 1, (key, value)
+        super().__setitem__(key, value)
+
+
+def test_finish_settles_once_per_call_on_every_path(tmp_path, fake_or, monkeypatch, caplog):   # ревью A, I1
+    settled, begun = [], []
+    real_settle = LlmCall._settle
+
+    def counting(self, *a, **k):
+        settled.append(self.call_id)
+        return real_settle(self, *a, **k)
+
+    monkeypatch.setattr(LlmCall, "_settle", counting)
+    app, role = make_llm_app(tmp_path, fake_or)
+    real_begin = role.begin_call
+
+    def begin(**kw):
+        call = real_begin(**kw)
+        begun.append(call.call_id)
+        return call
+
+    role.begin_call, role.inflight = begin, NonNegative()
+    boom = lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error"))   # noqa: E731
+    with caplog.at_level(logging.ERROR, logger="pcbk_core.llm"), TestClient(app) as c:
+        for word in ("", "FAKE500", "FAKE402", "FAKE402INFLIGHT", "FAKEBREAK", "FAKEMIDERR", "FAKENOUSAGE",
+                     "FAKEPROVIDER"):
+            post(c, chat_body(text=f"q {word} {len(begun)}"))
+        post(c, {**chat_body(text="без потока"), "stream": False})
+        role.chat_deadline_s = 0.5
+        post(c, chat_body(text="q FAKESLOW"))                                    # срок в перекачке
+        post(c, chat_body(text="q FAKESLOWSTART"))                               # срок в open_chat
+        role.chat_deadline_s = 600.0
+        wait_until(lambda: not role._cost_tasks and role.ledger.queue_size == 0)  # дозапросы цен дописаны
+        monkeypatch.setattr(role.ledger, "_connect", boom)
+        assert post(c, chat_body(text="журнал")).status_code == 503               # R19: flush не успел
+        monkeypatch.setattr(role.ledger, "_connect", Ledger._connect.__get__(role.ledger))
+        wait_until(lambda: role.inflight == {} and role.ledger.queue_size == 0)
+    assert len(begun) == 12 and sorted(settled) == sorted(begun) and len(set(settled)) == len(settled)
+    assert "место одновременности уже свободно" not in caplog.text
+
+
+@pytest.mark.parametrize("status,message,want", [
+    (413, "Request Entity Too Large", (413, "pcbk_body_too_large")),
+    (400, "This endpoint's maximum context length is 131072 tokens. However, you requested about 200000 tokens",
+     (413, "pcbk_body_too_large")),                                              # переполнение — OpenCode сожмёт
+    (400, "Invalid request", (400, "pcbk_upstream_rejected")),
+    (404, "No endpoints found matching your max_price", (404, "pcbk_upstream_rejected")),
+    (422, "Unprocessable", (422, "pcbk_upstream_rejected")),
+    (409, "Conflict", (400, "pcbk_upstream_rejected")),
+    (403, "Forbidden by moderation", (400, "pcbk_upstream_rejected")),
+    (400, "Rate limit: too many tokens per minute", (400, "pcbk_upstream_rejected")),   # не переполнение
+])
+def test_upstream_4xx_mapping(tmp_path, fake_or, monkeypatch, status, message, want):   # ревью A, M1
+    app, role = make_llm_app(tmp_path, fake_or)
+
+    async def refuse(body):
+        raise UpstreamError(classify(status, {"message": message}), status, message)
+
+    monkeypatch.setattr(role.upstream, "open_chat", refuse)
+    with TestClient(app) as c:
+        r = post(c, chat_body())
+    text = LLM_MESSAGES["too_large" if want[1] == "pcbk_body_too_large" else "rejected"]
+    assert (r.status_code, r.json()["error"]["code"], r.json()["error"]["message"]) == (*want, text)
+    row = role.ledger.recent(1)[0]
+    assert (row.status, row.code, row.cost_source) == ("upstream_error", want[1], "none")
+
+
+def test_refusal_texts_carry_no_client_input_and_no_digits(tmp_path, fake_or, capfd, restore_logging):   # ревью A, I2
+    setup_logging()
+    app, _ = make_llm_app(tmp_path, fake_or)
+    marker = "zq-marker-429"
+    base = chat_body()
+    bodies = [chat_body(model=marker), [1], {"model": "z-ai/glm-5.3"}, {**base, "messages": [marker]},
+              {**base, "messages": [{"role": marker, "content": "x"}]},
+              {**base, "messages": [{"role": "user", "content": 429}]},
+              {**base, "messages": [{"role": "assistant", "tool_calls": [{"id": marker}]}]},
+              {**base, "messages": [{"role": "tool", "content": marker}]},
+              {**base, "messages": [{"role": "user", "content": "x"}] * 4001}]
+    with TestClient(app) as c:
+        replies = [post(c, b) for b in bodies]
+        nan = c.post("/llm/v1/chat/completions", headers={**auth(LLM_TOKEN, SES), "Content-Type": "application/json"},
+                     content=b'{"model": "z-ai/glm-5.3", "messages": [{"role": "user", "content": "x"}], '
+                             b'"tools": [{"type": "function", "function": {"name": "t", "parameters": {"x": NaN}}}]}')
+        replies.append(nan)
+    assert [r.status_code for r in replies] == [403] + [400] * 9
+    texts = [r.json()["error"]["message"] for r in replies]
+    assert texts[0] == "Эта модель не разрешена на учебном стенде."
+    assert not [t for t in texts if marker in t or any(ch.isdigit() for ch in t)], texts
+    assert f"model={marker}" in capfd.readouterr().err                          # имя — только в журнале процесса
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("share,passing,refused", [(100.0, 3, (429, "pcbk_busy")), (0.1, 2, (402, "pcbk_share_spent"))])
+async def test_concurrent_requests_hold_concurrency_and_share(tmp_path, fake_or, monkeypatch, share, passing,
+                                                              refused):      # ревью A, M3: атомарность поведением
+    app, role = make_llm_app(tmp_path, fake_or, LLM_SHARE_USD=share)             # оценка вызова ≈ $0,071
+    gate, entered = asyncio.Event(), []
+
+    async def locked(body):                                                      # OpenRouter «думает», пока не отпустят
+        entered.append(body)
+        await gate.wait()
+        raise UpstreamError("server", 500)
+
+    monkeypatch.setattr(role.upstream, "open_chat", locked)
+    n = 10
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://core") as cl:
+        tasks = [asyncio.create_task(cl.post("/llm/v1/chat/completions", json=chat_body(text=f"вопрос {i}"),
+                                             headers=auth(LLM_TOKEN, f"ses_{i:026d}"))) for i in range(n)]
+        await wait_until_async(lambda: sum(t.done() for t in tasks) == n - passing)
+        await anyio.sleep(0.1)
+        assert len(entered) == passing and len(role.inflight) == 1 and role.inflight["student-01"] == passing
+        estimate = role.models["z-ai/glm-5.3"].estimate_usd(body_bytes(entered[0]), entered[0]["max_tokens"])
+        assert role.ledger.reserved_open() - share < estimate                   # перерасход доли — меньше одной оценки
+        gate.set()
+        replies = await asyncio.gather(*tasks)
+    codes = sorted((r.status_code, r.json()["error"]["code"]) for r in replies)
+    assert codes == sorted([(502, "pcbk_upstream_down")] * passing + [refused] * (n - passing))
+    assert role.inflight == {}
+
+
+def test_poll_failure_never_replaces_money_signs():                              # ревью B, Д4а-R14
+    t = now_utc()
+    for sign in ("money_out", "key_limit"):
+        state = UpstreamState()
+        state.record(sign, t, source="chat")
+        state.record("unreachable", t, source="poll")                            # связь о деньгах ничего не говорит
+        assert state.state == sign
+    drill = UpstreamState(drill=True)
+    drill.record("money_out", t, source="chat")
+    for kind in ("unreachable", None, "key_limit", "key_rejected"):              # учение опрос не трогает
+        drill.record(kind, t, source="poll")
+    drill.clear_money(t, "money_out")
+    assert drill.to_json()["text"] == "на счёте OpenRouter кончились деньги (учения)"
+
+
+def test_drill_survives_unreachable_then_ok_polls(tmp_path, fake_or):          # ревью B: учения → недоступен → ок
+    app, role = make_llm_app(tmp_path, fake_or, mgmt="test-mgmt-key", DRILL_LLM="402")
+    working = role.upstream
+    with TestClient(app) as c:
+        wait_until(lambda: role.checked_at is not None)
+        post(c, chat_body())                                                     # учение: кончились деньги
+        role.upstream = Upstream("http://127.0.0.1:9/api/v1", "test-openrouter-key", "test-mgmt-key", drill="402")
+        c.portal.call(role.poll)                                                 # OpenRouter недоступен
+        role.upstream = working
+        c.portal.call(role.poll)                                                 # снова отвечает, остаток $30
+        j = role.health_json(now_utc())
+    assert (j["upstream"]["state"], j["upstream"]["text"]) == ("money_out", "на счёте OpenRouter кончились деньги (учения)")
+
+
+def test_unreachable_poll_keeps_money_out_until_credits(tmp_path, fake_or):      # ревью B: опрос снимает только свой
+    app, role = make_llm_app(tmp_path, fake_or, mgmt="test-mgmt-key")
+    working = role.upstream
+    with TestClient(app) as c:
+        wait_until(lambda: role.checked_at is not None)
+        post(c, chat_body(text="q FAKE402"))
+        role.upstream = Upstream("http://127.0.0.1:9/api/v1", "test-openrouter-key", "test-mgmt-key")
+        c.portal.call(role.poll)
+        assert role.health_json(now_utc())["upstream"]["state"] == "money_out"   # не «недоступен»
+        role.upstream = working
+        c.portal.call(role.poll)                                                 # /credits: остаток есть
+        assert role.health_json(now_utc())["upstream"]["state"] == "ok"
+
+
+def test_config_error_is_403_right_after_token(tmp_path, fake_or):              # ревью B: шаг 1а
+    app, role = make_llm_app(tmp_path, fake_or, LLM_STATE="stopped")
+    role.config_error = "настройки: LLM_MODELS: неизвестная модель «…»"
+    with TestClient(app) as c:
+        assert post(c, chat_body(), token=None).status_code == 401              # токен — раньше настройки
+        r = post(c, chat_body(model="openrouter/auto"))                          # и выключатель, и чужая модель — позже
+        assert (r.status_code, r.json()["error"]["code"]) == (403, "pcbk_config")
+        assert r.json()["error"]["message"] == LLM_MESSAGES["config"]
+    assert fake_or.requests == [] and role.ledger.recent(1)[0].code == "pcbk_config"
+
+
+def test_ledger_open_failure_is_config_error_without_poll(tmp_path, fake_or):   # ревью B: журнал не открылся
+    llm = replace(LLM_SETTINGS, OPENROUTER_BASE_URL=fake_or.url)
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "нет" / "core.db"))      # каталога нет — файл не создать
+    role = LlmRole(settings, llm, tokens=LLM_TOKENS, upstream=Upstream(fake_or.url, "test-openrouter-key", None),
+                   ledger=Ledger(settings.DB_PATH), key_fingerprint=key_fingerprint("test-openrouter-key"))
+    with TestClient(create_app(settings, [role])) as c:
+        time.sleep(0.3)                                                          # опрос шёл бы сразу при старте
+        r = post(c, chat_body())
+        assert (r.status_code, r.json()["error"]["code"]) == (403, "pcbk_config")
+        j = c.get("/health/llm").json()
+    assert role.checked_at is None and fake_or.requests == []                    # фоновых циклов, кроме журнала, нет
+    assert role.config_error.startswith("журнал вызовов не открылся: ")
+    assert role.health()[1].startswith("ошибка настройки: журнал вызовов не открылся")
+    assert (j["config_error"], j["ledger_error"]) == (role.config_error, "write")
+
+
+def test_health_json_egress_is_for_openrouter_host(tmp_path, fake_or, monkeypatch):   # ревью B: не имя историана
+    asked = []
+
+    def status(name=None):
+        asked.append(name)
+        return {"alive": True, "last_ok_age_s": 1.0}
+
+    monkeypatch.setattr("pcbk_core.llm.refresh_status", status)
+    role = make_llm_role(tmp_path, fake_or, OPENROUTER_BASE_URL="http://OR.Example:8080/api/v1")
+    assert role.health_json(now_utc())["egress"] == {"alive": True, "last_ok_age_s": 1.0}
+    assert asked == ["or.example"]                                               # хост так же, как в egress_targets
+    assert egress_targets(role.llm, None) == [("or.example", 8080)]

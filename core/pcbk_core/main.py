@@ -109,10 +109,12 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
 def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> LlmRole:
     """Роль llm по образцу роли «данные»: ошибка — причина на странице, процесс жив (П6, Д3а I2).
 
-    LLM_* с ошибкой — умолчания и config_error «настройки: …»; нечитаемый файл ключа или ключ не из печатных
-    знаков ASCII — ключа нет, config_error; llm-tokens не читается — пустая таблица и tokens_error, это не
-    config_error (П23). Строки журнала начинаются с «LLM-прокси: » — проверка журнала службы данных
-    «токены <файл>» их не спутает. Ledger и Upstream в конструкторах ничего не открывают.
+    LLM_* с ошибкой — умолчания (пути к файлам — свои) и config_error «настройки: …»; нечитаемый файл ключа
+    или ключ не из печатных знаков ASCII — ключа нет, config_error; llm-tokens не читается — пустая таблица и
+    tokens_error, это не config_error (П23). Ключ управления необязателен (Д4а-R16): нечитаемый или негодный —
+    опрос /credits выключен, mgmt_key «error», строка WARNING, прокси работает. Строки журнала начинаются с
+    «LLM-прокси: » — проверка журнала службы данных «токены <файл>» их не спутает. Ledger и Upstream в
+    конструкторах ничего не открывают.
     """
     from .llm import LLM_TOKENS_ERROR, LlmRole
     from .llm.ledger import Ledger
@@ -136,26 +138,38 @@ def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> 
         log.error("LLM-прокси: токены LLM %s: %s", llm.LLM_TOKENS_FILE, _why(exc))
         tokens_error = LLM_TOKENS_ERROR
 
-    keys: dict[str, str | None] = {}
-    for name, path, what in (("key", llm.OPENROUTER_KEY_FILE, "ключ OpenRouter"),
-                             ("mgmt", llm.OPENROUTER_MGMT_KEY_FILE, "ключ управления OpenRouter")):
-        try:
-            keys[name] = read_key_file(path)
-        except KeyFileError as exc:           # текст — имя файла и причина, без ключа
-            log.error("LLM-прокси: %s %s", what, exc)
-            keys[name] = None
-            problems.append(f"{what} не читается")
-    key = keys["key"]
+    key = mgmt = None
+    try:
+        key = read_key_file(llm.OPENROUTER_KEY_FILE)
+    except KeyFileError as exc:               # текст — имя файла и причина, без ключа
+        log.error("LLM-прокси: ключ OpenRouter %s", exc)
+        problems.append("ключ OpenRouter не читается")
+    mgmt_failed = False
+    try:
+        mgmt = read_key_file(llm.OPENROUTER_MGMT_KEY_FILE)
+    except KeyFileError as exc:
+        log.warning("LLM-прокси: ключ управления OpenRouter %s — остаток счёта не опрашивается", exc)
+        mgmt_failed = True
     upstream = None
     if key and not problems:
         try:
-            upstream = Upstream(llm.OPENROUTER_BASE_URL, key, keys["mgmt"], drill=llm.DRILL_LLM)
+            upstream = Upstream(llm.OPENROUTER_BASE_URL, key, None, drill=llm.DRILL_LLM)
         except ValueError as exc:             # ключ не из печатных знаков ASCII; текст без ключа
             log.error("LLM-прокси: %s", exc)
             problems.append(str(exc))
-    return LlmRole(settings, llm, tokens=tokens, upstream=upstream, ledger=Ledger(settings.DB_PATH),
+        else:
+            if mgmt:
+                try:
+                    upstream = Upstream(llm.OPENROUTER_BASE_URL, key, mgmt, drill=llm.DRILL_LLM)
+                except ValueError as exc:     # негоден только ключ управления: основной уже проверен
+                    log.warning("LLM-прокси: %s — остаток счёта не опрашивается", exc)
+                    mgmt_failed = True
+    role = LlmRole(settings, llm, tokens=tokens, upstream=upstream, ledger=Ledger(settings.DB_PATH),
                    key_fingerprint=key_fingerprint(key) if key else None,
                    config_error="; ".join(problems) or None, tokens_error=tokens_error)
+    if mgmt_failed:
+        role.mgmt_key = "error"
+    return role
 
 
 def healthcheck(settings: Settings) -> int:

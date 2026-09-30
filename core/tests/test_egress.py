@@ -494,3 +494,23 @@ egress.start_refresh()
 s = egress.refresh_status(); print(s['alive'], s['last_ok_age_s'], egress.refresh_started_age_s() is not None)
 """)
     assert out.split() == ["True", "None", "True"]
+
+
+def test_refresh_status_per_name(listeners):                                     # ревью B: историан не за OpenRouter
+    a, _ = listeners
+    out = run_python(f"""
+import _socket
+from pcbk_core import egress
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    if host == 'hist.test': raise _socket.gaierror(-2, 'x')                  # имя историана не разрешается
+    return real('127.0.0.1' if host == 'or.test' else host, *rest, **kw)
+_socket.getaddrinfo = fake
+egress.NAME_REFRESH_S = 0.05
+egress.install_egress_guard([('hist.test', 1433), ('or.test', {a}), ('10.0.0.9', 1433)], allowed_nets=())
+egress.start_refresh()
+print(egress.refresh_status('or.test')['last_ok_age_s'] < 1)                # OpenRouter разрешается
+print(egress.refresh_status('hist.test')['last_ok_age_s'], egress.refresh_status()['last_ok_age_s'])
+print(egress.refresh_status('10.0.0.9')['last_ok_age_s'] < 1, egress.refresh_status('other.test')['last_ok_age_s'])
+""")
+    assert out.split("\n")[:3] == ["True", "None None", "True None"]

@@ -109,7 +109,7 @@ _install_lock = threading.Lock()
 _installed = False
 _refresher: Callable[[threading.Event], None] | None = None   # тело потока обновления: от установки до start_refresh
 _refreshing = False
-_last_ok: Callable[[], float | None] | None = None      # monotonic последнего удачного круга (из замыкания хука)
+_last_ok: Callable[[str | None], float | None] | None = None   # последняя удача круга или имени (замыкание хука)
 _refresh_thread: threading.Thread | None = None
 _refresh_started: float | None = None                   # monotonic запуска потока обновления
 
@@ -120,9 +120,9 @@ class EgressDenied(PermissionError):
 
 def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwork, ...],
                ) -> tuple[Callable[[str, tuple], None], Callable[[threading.Event], None],
-                          Callable[[], float | None]]:
-    """Хук, тело потока обновления и чтение метки последнего удачного круга; всё, чем они пользуются, —
-    локальные имена этого вызова, то есть связаны при установке. Кэш имён живёт только здесь."""
+                          Callable[[str | None], float | None]]:
+    """Хук, тело потока обновления и чтение меток удачи (круга целиком или одного имени); всё, чем они
+    пользуются, — локальные имена этого вызова, то есть связаны при установке. Кэш имён живёт только здесь."""
     getaddrinfo = _socket.getaddrinfo
     running_loop = asyncio._get_running_loop
     family_of = _socket.socket.family.__get__
@@ -143,7 +143,8 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
     cache: dict[tuple[str | bytes, int], tuple[float, frozenset[IPAddress]]] = {}   # имена в кортеже адреса
     seen: dict[str, dict[IPAddress, float]] = {}    # разрешённые имена: адрес → monotonic последней встречи
     tried: dict[str, float] = {}            # разрешённые имена: последнее синхронное разрешение вне цикла
-    rounds: list[float | None] = [None]     # monotonic последнего круга, где каждое имя дало хотя бы адрес
+    rounds: list[float | None] = [None, None]   # monotonic: круг, где каждое имя дало адрес; любой конец круга
+    resolved: dict[str, float] = {}         # имя → monotonic последнего круга, где оно дало хотя бы адрес
 
     def as_ip(host: str | bytes) -> IPAddress | None:
         """Адрес-литерал; IPv4 внутри IPv6 (::ffff:a.b.c.d) — как IPv4; имя — None."""
@@ -282,6 +283,8 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
                 for name in names:
                     found = resolve(name, af_unspec)
                     learn(name, found)
+                    if found:
+                        resolved[name] = monotonic()
                     every = every and bool(found)
             except Exception as e:          # поток не умирает; в журнал — только класс, раз за серию
                 if type(e).__name__ != failing:
@@ -289,8 +292,9 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
                     warn("охрана выхода: круг обновления адресов не удался (%s)", failing)
             else:
                 failing = None
+                rounds[1] = monotonic()
                 if every:                   # «ловить молчание»: сторож видит возраст удачного круга
-                    rounds[0] = monotonic()
+                    rounds[0] = rounds[1]
             first.set()
             wake.wait(refresh_s)
             wake.clear()                    # сигнал после clear даст ещё круг: этот начнётся уже после него
@@ -298,8 +302,16 @@ def _make_hook(allowed: tuple[tuple[str, int | None], ...], nets: tuple[IPNetwor
             if rest > 0:
                 sleep(rest)
 
-    def last_ok() -> float | None:
-        return rounds[0]
+    def last_ok(name: str | None) -> float | None:
+        """None — круг, где разрешилось каждое имя; имя из allowed — его последняя удача; адрес-литерал —
+        конец последнего круга (разрешать нечего); прочее — None."""
+        if name is None:
+            return rounds[0]
+        if name in resolved:
+            return resolved[name]
+        if name in seen:
+            return None
+        return rounds[1] if as_ip(name) is not None else None
 
     entries = tuple((host, want, as_ip(host)) for host, want in allowed)
     for host, _, literal in entries:
@@ -370,15 +382,17 @@ def start_refresh(first_wait_s: float = FIRST_WAIT_S) -> threading.Thread:
     return thread
 
 
-def refresh_status() -> dict:
+def refresh_status(name: str | None = None) -> dict:
     """Живость потока pcbk-egress-refresh для /health/llm (Д4а-R18, «ловить молчание»), без ввода-вывода.
 
     alive — жив ли поток (None — start_refresh не звали); last_ok_age_s — секунд с последнего круга, в
-    котором каждое имя из allowed разрешилось хотя бы в один адрес (None — такого круга не было).
+    котором разрешилось имя name хотя бы в один адрес (адрес-литерал — с конца последнего круга); без name —
+    каждое имя из allowed. None — такого круга не было. Роль llm спрашивает только про хост OpenRouter:
+    неразрешимое имя историана не выдаёт себя за «адреса OpenRouter ни разу не получены».
     """
     with _install_lock:
         thread, last_ok = _refresh_thread, _last_ok
-    at = None if last_ok is None else last_ok()
+    at = None if last_ok is None else last_ok(name)
     return {"alive": None if thread is None else thread.is_alive(),
             "last_ok_age_s": None if at is None else round(max(0.0, time.monotonic() - at), 1)}
 

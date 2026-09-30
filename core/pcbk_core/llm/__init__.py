@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, FastAPI
 
@@ -82,6 +83,8 @@ class LlmRole(RoleBase):
         self.cost_retry_delays = tuple(cost_retry_delays)
         self.chat_deadline_s = chat_deadline_s
         self.models = select_models(llm.LLM_MODELS)
+        # хост OpenRouter, как его разрешает охрана выхода (egress_targets): живость адресов — только по нему
+        self.egress_name = urlsplit(llm.OPENROUTER_BASE_URL).hostname
         self.budget = Budget(ledger, total_usd=llm.LLM_TOTAL_USD, share_usd=llm.LLM_SHARE_USD,
                              ops_share_usd=llm.LLM_OPS_SHARE_USD, key_spent=self.key_spent_usd)
         self.turns = TurnLimiter(limit=llm.LLM_TURN_CALLS, monotonic=monotonic)
@@ -186,7 +189,7 @@ class LlmRole(RoleBase):
             "ledger_queue": self.ledger.queue_size,
             "ledger_fresh": self.ledger.fresh,
             "ledger_reset": self.ledger_reset(),
-            "egress": refresh_status(),
+            "egress": refresh_status(self.egress_name),
             "refresh_started_age_s": refresh_started_age_s(),
         }
 
