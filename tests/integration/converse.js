@@ -6,7 +6,7 @@
 const req = JSON.parse(await Bun.file("/req.json").text())
 const pw = (await Bun.file("/pw").text()).trim()
 const headers = {authorization: "Basic " + btoa("opencode:" + pw), "content-type": "application/json"}
-const REQUEST_TIMEOUT_MS = 10000
+const REQUEST_TIMEOUT_MS = 10000     // CONVERSE_REQUEST_S в conftest.py: по нему считается срок docker run
 
 async function api(method, path, body) {
   const r = await fetch(req.url + path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body),

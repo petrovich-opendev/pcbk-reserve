@@ -2,6 +2,7 @@
 места, токен данных файлом; отказы прокси в чате без шторма повторов; MCP переподключается после core."""
 import json
 import re
+import secrets
 import time
 
 import pytest
@@ -60,6 +61,9 @@ def test_conversation_tool_via_mcp_and_cost(stack, place01):                    
     assert (out["status"], out["error"]) == ("done", None) and out["final_text"].startswith("Готово:")
     tool = next(t for t in out["tools"] if t["tool"] == "pcbk_tag_now")
     assert tool["status"] == "completed" and json.loads(tool["output"])["status"] == "unavailable"   # историана нет — словами
+    # ответ модели построен на результате инструмента: начало вывода pcbk_tag_now (до статуса) — в тексте ответа
+    head = tool["output"][:tool["output"].index('"unavailable"') + len('"unavailable"')]
+    assert head in out["final_text"], (head, out["final_text"])
     calls = settled(stack, out["session"])
     assert len(calls) >= 2 and {c["caller"] for c in calls} == {"student-01"}
     assert {c["cost_source"] for c in calls} == {"stream"}
@@ -73,14 +77,17 @@ def test_openrouter_key_never_in_workplace(stack, place01):                     
     # положительный контроль: ключи — в секретах core, поиск их видит
     for key, path in zip(keys, ("/run/secrets/openrouter.key", "/run/secrets/openrouter-mgmt.key")):
         assert stack.exec("pcbk-core", "grep", "-c", "-F", key, path) == "1", path
+    # свой разговор через прокси: ответ прокси и метка вопроса ложатся в данные места — источник для контроля ниже
+    marker = f"pcbk-marker-{secrets.token_hex(4)}"
+    assert stack.converse(1, f"Ответь одним словом: да {marker}", tools={"pcbk_*": False})["status"] == "done"
     pid = stack.opencode_pid("pcbk-student-01")
     # всё, что место хранит и видит: окружение OpenCode, секреты, конфигурация, данные (там же разговоры), /work, /tmp
     where = f"/proc/{pid}/environ /run/secrets /etc/pcbk-opencode /var/lib/opencode /work /tmp"
     grep = lambda pattern: stack.sh("pcbk-student-01", f"grep -r -l -a -F -e '{pattern}' {where}")
-    # положительный контроль источника: свой токен LLM и строка разговора прошлого теста находятся тем же поиском;
+    # положительный контроль источника: свой токен LLM и метка разговора этого теста находятся тем же поиском;
     # найденное — списки файлов, сами токены в текст сбоя не попадают
     own_files = grep(stack.llm_token(1))[1].split()
-    talk_files = grep("Готово:")[1].split()
+    talk_files = grep(marker)[1].split()
     assert "/run/secrets/llm-token" in own_files and any(f.startswith("/var/lib/opencode/") for f in talk_files)
     for key in keys:
         code, found, _ = grep(key)
@@ -125,7 +132,9 @@ def test_turn_limit_shown_in_chat_without_retry_storm(stack, place01):          
 def test_budget_message_in_chat(stack, place01):                                # Review Focus 2
     stack.recreate("core", {"LLM_TOTAL_USD": "0.001"})                            # в бюджет упрётся первый или второй вызов хода
     try:
-        wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-01"), timeout=90)
+        # состояние MCP — из записи после старта нового core, а не из записи до пересоздания
+        core_started = stack.started_at("pcbk-core")
+        wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-01", since=core_started), timeout=90)
         out = stack.converse(1, Q)
         assert "Общий бюджет стенда на модель" in json.dumps(out["error"], ensure_ascii=False)
         time.sleep(15)
@@ -151,11 +160,13 @@ def test_mcp_reconnects_after_core_restart(stack):                              
             time.sleep(31)
             seen.add(stack.health_output("pcbk-student-02").strip())
         assert seen == {"200 mcp=failed"}                                         # не мигает: unknown не появляется
-    finally:
         stack.start("pcbk-core")
-    try:
-        wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-02"), timeout=150)
+        core_started = stack.started_at("pcbk-core")
+        wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-02", since=core_started), timeout=150)
         out = stack.converse(2, Q)
         assert any(t["tool"] == "pcbk_tag_now" and t["status"] == "completed" for t in out["tools"])
-    finally:
-        stack.stop("pcbk-student-02")
+    finally:                                                                      # один выход: место спит, core работает
+        if stack.inspect("pcbk-student-02")["State"]["Running"]:
+            stack.stop("pcbk-student-02")
+        if not stack.inspect("pcbk-core")["State"]["Running"]:
+            stack.start("pcbk-core")

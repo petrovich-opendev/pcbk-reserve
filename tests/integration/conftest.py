@@ -91,6 +91,14 @@ DATA_EVENT_COUNT_PY = ("import sqlite3, sys; "
                        "(sys.argv[1], sys.argv[2])).fetchone()[0])")
 # разговор через API OpenCode места (Bun из образа места): converse.js рядом с этим файлом
 CONVERSE_JS = REPO / "tests" / "integration" / "converse.js"
+# худший случай converse.js сверх timeout_s — из его сроков (каждый запрос — до CONVERSE_REQUEST_S = 10 с,
+# REQUEST_TIMEOUT_MS там): до цикла POST /session и prompt_async (2 запроса); такт, начатый перед сроком, —
+# шесть запросов (status, message, question, reject, permission, reply; по одному снятому вопросу и разрешению
+# за такт) и пауза 1 с; abort (1 запрос); ожидание ухода из статуса — до 10 с, плюс запрос, начатый перед его
+# концом, и пауза 0,5 с; чтение сообщений (1 запрос). Итого 11 запросов и 11,5 с; ещё 30 с — docker run,
+# запуск Bun и --rm
+CONVERSE_REQUEST_S = 10
+CONVERSE_WORST_EXTRA_S = 11 * CONVERSE_REQUEST_S + 1 + 10 + 0.5 + 30
 # запрос изнутри сторожа: argv — метод и адрес; печатает код ответа
 WATCHDOG_REQUEST = """\
 import http.client, sys
@@ -455,21 +463,28 @@ class Stack:
         """Сколько событий службы данных у вызывающего в канале (для «данные не читались»)."""
         return int(self._docker("exec", "pcbk-core", "python", "-c", DATA_EVENT_COUNT_PY, caller, channel).stdout)
 
-    def health_log(self, name: str) -> list[str]:
-        """Output записей State.Health.Log этого запуска (End не раньше StartedAt), старые первыми.
+    def health_log(self, name: str, since: datetime | None = None) -> list[str]:
+        """Output записей State.Health.Log этого запуска (End не раньше StartedAt), старые первыми; since —
+        ещё и не раньше этого момента (например, старта pcbk-core после пересоздания).
 
         Docker хранит журнал проверки здоровья (последние пять записей) и через stop/start: запись прошлого
         запуска (например, «200 mcp=connected» до остановки core) не выдаётся за нынешнее состояние.
         """
         st = self._state(name)
         started = datetime.fromisoformat(st["StartedAt"])          # RFC 3339 с наносекундами: Python 3.12 читает
+        if since is not None:
+            started = max(started, since)
         return [e["Output"] for e in (st.get("Health") or {}).get("Log") or []
                 if datetime.fromisoformat(e["End"]) >= started]
 
-    def health_output(self, name: str) -> str:
-        """Output последней записи State.Health.Log этого запуска; записей этого запуска нет — пусто."""
-        log = self.health_log(name)
+    def health_output(self, name: str, since: datetime | None = None) -> str:
+        """Output последней записи State.Health.Log этого запуска (и не раньше since); таких нет — пусто."""
+        log = self.health_log(name, since)
         return log[-1] if log else ""
+
+    def started_at(self, name: str) -> datetime:
+        """State.StartedAt контейнера — момент последнего старта."""
+        return datetime.fromisoformat(self._state(name)["StartedAt"])
 
     def converse(self, n: int, question: str, *, model: str | None = None, tools: dict[str, bool] | None = None,
                  timeout: float = 180.0, host: str | None = None, pw_file: Path | None = None) -> dict:
@@ -496,7 +511,7 @@ class Stack:
                       "--label", ONESHOT_LABEL, "--read-only", "--tmpfs", "/tmp:exec", "--no-healthcheck",
                       "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", *mounts,
                       "--entrypoint", "/usr/local/bin/opencode", "-e", "BUN_BE_BUN=1", STUDENT_IMAGE,
-                      "/app/converse.js"], timeout=timeout + 60)
+                      "/app/converse.js"], timeout=timeout + CONVERSE_WORST_EXTRA_S)
         return json.loads(r.stdout)
 
     def logs(self, name: str) -> str:
