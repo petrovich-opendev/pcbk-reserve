@@ -504,6 +504,19 @@ class Stack:
                "--login", login, "--role", role, *(() if place is None else ("--place", str(place)))]
         _run(cmd, input=password + "\n")
 
+    def passwd(self, login: str) -> str:
+        """Новый пароль учётки командой администратора (passwd закрывает все её сессии); пароль — в stdin, не в
+        argv. Возвращает новый пароль."""
+        password = secrets.token_urlsafe(12)
+        _run(["docker", "exec", "-i", "pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "passwd",
+              "--login", login], input=password + "\n")
+        return password
+
+    def gw_health(self) -> dict:
+        """/health/gateway серверного слоя изнутри pcbk-watchdog — из pcbk-front, как его читает сторож (preflight
+        M14: тело даёт body_from_watchdog, http_front — только код)."""
+        return json.loads(self.body_from_watchdog("http://pcbk-core:8000/health/gateway"))
+
     def gw_client(self) -> GwClient:
         """Клиент шлюза через edge с именем стенда и его Origin."""
         return GwClient(f"https://{HOST}:{PORT}", host=STAND_HOST, origin=STAND_ORIGIN)
@@ -901,15 +914,26 @@ def browser():
         yield b
 
 
-@pytest.fixture
-def page(browser):
-    """Вкладка на тест, закрывается в teardown (preflight F3): шлюз держит не больше трёх потоков на логин, а вкладки
-    одного профиля делят cookie — незакрытые вкладки прошлых тестов съели бы потоки следующих."""
-    p = browser.page()
+def _tab(browser, isolated: bool):
+    p = browser.page(isolated=isolated)
     try:
         yield p
     finally:
         p.close()
     # сбой разбора события — пропавший отчёт CSP или ошибка консоли: зелёный тест без них не считается
     assert browser.handler_errors == [], browser.handler_errors
+
+
+@pytest.fixture
+def page(browser):
+    """Вкладка на тест, закрывается в teardown (preflight F3): шлюз держит не больше трёх потоков на логин, а вкладки
+    одного профиля делят cookie — незакрытые вкладки прошлых тестов съели бы потоки следующих."""
+    yield from _tab(browser, isolated=False)
+
+
+@pytest.fixture
+def isolated_page(browser):
+    """Как page, но со своим контекстом браузера (свои cookie): вход другой учёткой (преподаватель) не меняет cookie
+    вкладок студента, закрывается вместе с контекстом."""
+    yield from _tab(browser, isolated=True)
 
