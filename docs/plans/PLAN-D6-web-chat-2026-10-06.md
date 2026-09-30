@@ -101,6 +101,91 @@
 
 ---
 
+## Изменения по критике, раунд 2
+
+Блокеров 0, находки раунда 1 закрыты. Третьего раунда нет — ниже итог самопроверки.
+
+**Important:**
+- **В1 (срок `check_web`).** `_http_get` сам ставит срок `now + HTTP_CHECK_SPANS × timeout`
+  (`watchdog/pcbk_watchdog/checks.py:277`), и `min(timeout, остаток)` из него выходил. Теперь
+  `_http_get(url, timeout, read_body, deadline=None)` принимает абсолютный срок и берёт меньший
+  из двух, а срок соединения — `min(timeout, остаток)`. `check_web` передаёт один свой срок
+  (`now + HTTP_CHECK_SPANS × timeout`) во все запросы, включая `/health/web` Д6б.
+
+  Параметр `deadline` от `run_checks` снят. Проверка, начатая до конца такта, по построению кончается
+  не позже «конец такта + два срока сокета», то есть в запасе `tick_budget_s`: отдельный срок
+  такта ничего не добавляет и на сервере не срабатывает. Тесты:
+  - `test_web_check_keeps_deadline` — три медленных ответа по 2,5 с дают меньше 6,5 с, а не 7,5 с;
+  - `test_web_reports_keep_check_deadline` (Б1) — медленный `/health/web` укладывается в тот же срок.
+- **В2 (баннер).** `statusView` не учитывает строку `web`: она для владельца (сборка и отчёты
+  чужих браузеров). Тест `status_view_filters_and_levels`.
+- **В3 (ложный `boot_failed` на медленной сети).** Сборка — один JS около 914 КБ, у `edge` gzip
+  выключен, на ассетах `no-store`. Теперь:
+  - `^~ /chat/assets/` — `gzip on`, `gzip_types application/javascript text/javascript text/css`,
+    `gzip_vary on` и `Cache-Control: public, max-age=31536000, immutable` (имена с хешем);
+  - `/chat/` (`index.html`) и загрузчик — `no-store`. Загрузчик переехал из `assets/` в
+    `/chat/boot.js`, у него своя `location` без кэша;
+  - таймер загрузчика стартует на `DOMContentLoaded` и длится 20 с. Модульный скрипт выполняется до
+    `DOMContentLoaded`, поэтому медленная загрузка бандла таймер не запускает. Сбой загрузки
+    самого бандла ловит слушатель `error` в фазе захвата;
+  - тест заголовков — `test_edge_serves_chat_under_csp` (А6).
+
+  Это отступление от правила Д1 «на всё, что отдаёт `edge`, — без кэша»: только для файлов с
+  хешем в имени (Д6-R41, «Отклонения»).
+- **В4 (`login.js`, `/me` не 200).** Ответ 503 `store` или сеть — текст и ссылка «Открыть чат»,
+  без `wake`. Тест `me_failure_after_login_does_not_wake` (Б2).
+- **В5 (сверка тега с выложенным).** А10 сверяет `web student watchdog edge core compose.yaml`,
+  Б7 — `web core student watchdog edge compose.yaml`.
+- **В6 (параллельная работа с Д5б).**
+  - Д6а идёт в своём worktree `/home/dev/incoming/pcbk-reserve-d6a`.
+  - Интеграционные прогоны Д6а и Д5б — строго по очереди: у них общий проект Compose `pcbk-test`,
+    порт 18443 и имена контейнеров `pcbk-*`. Перед прогоном
+    `docker ps -q --filter label=com.docker.compose.project=pcbk-test` должен быть пуст.
+  - Следствие: `core` в Д6а — тоже `:d6a`. Фикстура собирает `core` из своего дерева, и тег `:d5b`
+    в общем Docker перезаписала бы сборка Д6а. Код `core` в Д6а не меняется; на сервер уходит
+    `core:d6a` из того же закреплённого коммита (А8).
+
+**Minor:**
+1. Опись `build.json` строится с диска в `closeBundle`: `public/boot.js` в `bundle` не попадает.
+   Путь `boot.js` в описи понимает уже сторож Д6а (`WEB_FILE_RE`), так что смена статики в Д6б
+   строку не красит.
+2. `z.config({ jitless: true })` — в отдельном модуле `web/src/zodJitless.ts`, импортированном
+   первым в `main.tsx`: в ESM «первая строка» не раньше импортов. Если в сборке нет JIT-кода zod —
+   записать это в журнал, модуль остаётся.
+3. `.toSorted(` из `@radix-ui/react-collection` (её `OrderedDict`) — в известных исключениях
+   `check-dist`, с пометкой: в Chrome 109 этого API нет. Если класс на Chrome 109, заплатку
+   решает ответ о браузерах.
+4. Сбой потока — любой ответ 200 на `/event`, который прожил меньше 5 с до следующего запроса
+   `/event`, в том числе оборванный ошибкой. Счёт — по времени между запросами, без обёртки тела.
+5. Выкладка Б5: статика меняется последней, после `core:d6b`. Веб терпим к старому `core`:
+   отсутствие поля `notice` — как `null` (`== null`), 404 на `notice` и `report` не ломает чат.
+6. `accounts remove` стирает строки `gw_notices` этого логина. Тест
+   `test_remove_clears_notices`.
+7. `test_first_login_notice` ждёт поле ввода чата (`wait_selector("textarea")`), а не «Вы вошли
+   как»: шапка видна и на экране предупреждения. `login_to_chat` — тоже.
+8. Прежние тесты `login.test.mjs` передают внедрённый `navigate` (А6), а после входа отвечают
+   вторым `/me` (Б2).
+9. `test_rename_and_archive_through_gateway` ждёт самозаголовок OpenCode (заголовок перестал
+   начинаться с `New session - `) до ручного переименования. Разговор ищется по id: строки списка
+   несут `data-session-id`.
+10. Заглушка `ResizeObserver` для jsdom — в `web/tests/setup.ts` (`setupFiles`). А0, шаг 4,
+    проверяет Node ≥ 22.22.2 (требование jsdom 30.1.1).
+
+**Самопроверка (итог).**
+- **Часы Д6а — 18,5 ч:** 0,5 + 1,5 + 2,0 + 2,25 + 2,5 + 1,75 + 2,0 + 2,0 + 1,25 + 1,5 + 1,25.
+  Изменились А6 (+0,25: gzip, кэш, заголовки) и А8 (+0,25: `core:d6a`).
+  - черта: А0–А7 = 14,5 ч → конец 7,5-го часа (доля ≈0,52);
+  - темп А2–А7 = 12,5.
+- **Часы Д6б — 12,0 ч:** 0,5 + 2,25 + 2,0 + 2,0 + 2,25 + 0,5 + 1,25 + 1,25. Изменились Б2 (+0,25:
+  В4, Minor 6 и 8) и Б4 (+0,25: `location` загрузчика, Minor 7 и 9).
+  - черта: Б0–Б4 = 9,0 ч → 4,75 ч (≈0,53);
+  - темп Б2–Б4 = 6,25.
+- **Всего — 30,5 ч.**
+- **Ссылки** пересверены: `checks.py:277`, `login.js:113–119`, `test_student_image.py:291–340`,
+  `A:useOpenCodeRuntime.ts:103–105, 355–367`, `S:gen/core/serverSentEvents.gen.ts:124–131, 220–228`,
+  `O:agent/agent.ts:266–271, 328–335`, `O:session/session.ts:48` (`New session - `).
+- **Номера задач** в тексте — А0–А10 и Б0–Б7.
+
 ## Изменения по критике, раунд 1
 
 **Блокеры (3):**
@@ -127,12 +212,13 @@
    `::test_components_file_d5a` (`ids[-2] == "gateway"`): последней строкой стала `web`.
 3. `check_web` получает общий срок такта сторожа (`deadline` из `run_checks`, `tick_budget_s` =
    9 с) и не выходит за него. Запрос `/health/web` в Д6б — внутри того же срока. Строка в
-   Interfaces А1 и Б1, тесты с медленной страницей и медленным `/health/web`.
+   Interfaces А1 и Б1, тесты с медленной страницей и медленным `/health/web`. *Раунд 2, В1:
+   заменено одним абсолютным сроком проверки внутри `check_web`; `run_checks` не меняется.*
 4. Порядок тестов `test_web` Д6б: отчёт желтит строку на час, поэтому
    `test_reports_reach_row` идёт последним в модуле, после учения строки, а проверки строки
    «Веб-чат» в прочих тестах сравнивают `[:2]`.
 5. «Чат не запустился в браузере» теперь наблюдается. В Д6б (Б1) первым файлом идёт маленький
-   немодульный загрузчик `assets/boot.js` на ES5. До старта React он ловит `error` и
+   немодульный загрузчик на ES5 (с раунда 2 — `/chat/boot.js`). До старта React он ловит `error` и
    `unhandledrejection`, ставит срок «не запустился за 20 с», шлёт отчёт `boot_failed` и
    показывает текст. `build.target` — `chrome109`, `edge109`, `firefox115`: Windows 7/8.1 держит
    Chrome только до 109. `check-dist` предупреждает об API новее Chrome 109. Браузеры класса — в
@@ -183,27 +269,28 @@
 
 ## Разрез Д6 на два дня
 
-Оценка по плановой шкале Д1–Д5 одним днём — **29,5 ч**:
-- наблюдение — 3,75;
-- каркас веба и клиент шлюза — 4,25;
-- интерфейс — 4,5;
-- агент по умолчанию — 1,75;
-- предупреждение — 1,75;
-- браузер и компоновка — 5,75;
-- две выкладки, живые проверки и закрытия — 6,75;
-- утро — 1,0.
+Оценка по плановой шкале Д1–Д5 одним днём — **30,5 ч**:
+- наблюдение — 3,75 (А1 1,5 + Б1 2,25);
+- каркас веба и клиент шлюза — 4,25 (А2 2,0 + А3 2,25);
+- интерфейс — 4,5 (А4 2,5 + Б3 2,0);
+- агент по умолчанию — 1,75 (А5);
+- предупреждение — 2,0 (Б2);
+- браузер и компоновка — 6,25 (А6 2,0 + А7 2,0 + Б4 2,25);
+- две выкладки, живые проверки и закрытия — 7,0 (А8 1,25 + А9 1,5 + А10 1,25 + Б5 0,5 + Б6 1,25 +
+  Б7 1,25);
+- утро — 1,0 (А0 0,5 + Б0 0,5).
 
 Это больше порога одного дня. Поэтому, как Д3, Д4 и Д5, Д6 делится надвое. У каждой половины
 свой видимый результат и своя черта:
 
-- **Д6а «Чат в браузере» — 18,0 ч**, при темпе 0,30 около 5,4 ч. Это между Д5а (17,5 ч) и Д4а
+- **Д6а «Чат в браузере» — 18,5 ч**, при темпе 0,30 около 5,6 ч. Это между Д5а (17,5 ч) и Д4а
   (19,05 ч): оба приняты одним днём с чертой отсечения. Что видит владелец:
   - студент входит, попадает в `/chat/`, видит постоянное предупреждение «учебный стенд»,
     баннер состояния и свой логин;
   - спрашивает агента по умолчанию — **ответ числом из БДРВ** (окно владельца);
   - строка «Веб-чат» на странице состояния и её учение;
   - учение баннера «сторож остановлен → состояние неизвестно».
-- **Д6б «Предупреждение, молчание, разговоры» — 11,5 ч**, при темпе 0,30 около 3,5 ч. Что видит
+- **Д6б «Предупреждение, молчание, разговоры» — 12,0 ч**, при темпе 0,30 около 3,6 ч. Что видит
   владелец:
   - предупреждение при первом входе и его подтверждение (в `accounts list` —
     «предупреждён»);
@@ -220,7 +307,7 @@
 Строки для раздела «Отклонения» `docs/PLAN-platform-2026-09-29.md`. Правит их контролёр при
 утверждении плана.
 
-* **Веб-чат — два дня (Д6а и Д6б):** 18,0 + 11,5 ч по плановой шкале. Всего 16 дней, нумерация
+* **Веб-чат — два дня (Д6а и Д6б):** 18,5 + 12,0 ч по плановой шкале. Всего 16 дней, нумерация
   Д7–Д12 прежняя. Строка «Что видит владелец» делится: Д6а — ответ числом, баннер, предупреждение
   «учебный стенд», строка «Веб-чат»; Д6б — предупреждение при первом входе, отчёты браузеров,
   список разговоров.
@@ -235,6 +322,11 @@
   места — `:d6a`, места пересоздаются с сохранением томов.
 * **Счётчик «`same-origin`, но `Origin` ≠ `GW_ORIGIN`»** (Д5-R26, отложен в Д6) снят без кода
   (Д6-R48).
+* **Кэш у `edge` — только для файлов с хешем в имени** (`/chat/assets/*`: `immutable` на год и
+  gzip). Правило Д1 «без кэша» остаётся для всего прочего, в том числе `index.html` и загрузчика
+  (Д6-R41).
+* **`core` в Д6а — `:d6a`** при неизменном коде. Так интеграционные прогоны Д6а не перезаписывают
+  `core:d5b` Д5б в общем Docker (раунд 2, В6).
 * **Хвосты Д5б:**
   - `baseUrl` — `${location.origin}/pcbk/api/oc`;
   - логин в шапке;
@@ -288,6 +380,9 @@
   В `prompt_async` уходят только текстовые части: без `agent` и `model` (агента выбирает
   `default_agent`, Д6-R42) и без вложений. Кнопок «удалить», «изменить», «повторить», «ветка»,
   «из архива», «прикрепить» нет.
+- **Кэш и сжатие у `edge`:**
+  - `/chat/assets/*` (имена с хешем) — `Cache-Control: public, max-age=31536000, immutable` и gzip;
+  - `/chat/` (`index.html`) и `/chat/boot.js` — `no-store`, как всё прочее у `edge` (правило Д1).
 - **Веб ничего не хранит:** ни пароля, ни cookie (она `HttpOnly`), ни текста разговоров — ни в
   `localStorage`, ни в `sessionStorage`, ни в IndexedDB.
 - **Тексты ответа модели и вывода инструментов** выводятся только как текст или как markdown без
@@ -297,13 +392,21 @@
   идут**. В `docs/checks/D6a/` — снимки без производственных данных: тестовый стенд, учения,
   страница состояния, чат под `DRILL_LLM=402`.
 - **Теги образов — первой правкой дня (Ш2):**
-  - Д6а — сторож и место `:d6a`, `core` остаётся `:d5b` (Д6а его не меняет);
+  - Д6а — сторож, место и `core` `:d6a`. Код `core` Д6а не меняет, но фикстура собирает `core`
+    из своего дерева, и без своего тега прогон Д6а перезаписал бы `core:d5b` Д5б (раунд 2, В6);
   - Д6б — `core` и сторож `:d6b`.
 
   До этой правки — ни `docker compose build`, ни интеграционных прогонов, в том числе у
   ревьюеров. ID откатных образов (`watchdog:d5b`, `core:d5b`, `student:d4`, в Д6б ещё
-  `watchdog:d6a`, `student:d6a`) снимаются до и после каждого интеграционного прогона. Образы
-  выкладок прежних дней собираются из своей ветки (`git worktree`).
+  `watchdog:d6a`, `core:d6a`, `student:d6a`) снимаются до и после каждого интеграционного прогона.
+  Образы выкладок прежних дней собираются из своей ветки (`git worktree`).
+- **Своё дерево и прогоны по очереди (раунд 2, В6).**
+  - Д6а идёт в worktree `/home/dev/incoming/pcbk-reserve-d6a` (ветка `d6a/web-chat`), Д6б — в
+    нём же на `d6b/web-notice`. Основное дерево `/home/dev/incoming/pcbk-reserve` остаётся за Д5б.
+  - Интеграционные прогоны Д6 и Д5б делят проект Compose `pcbk-test`, порт 18443 и имена
+    `pcbk-*`, поэтому идут строго по очереди. Перед прогоном
+    `docker ps -q --filter label=com.docker.compose.project=pcbk-test` должен быть пуст; иначе —
+    ждать, не гасить чужой стенд.
 - **Пробные учётки живых проверок** — только `d6-probe-*`: `d6-probe-a` — место 10, `d6-probe-n`
   (Д6б) — место 09. Пароли — файлы `0600` в `~/pcbk-d6/` и `$JOB`. Закрытие каждой половины удаляет
   их разговоры по записанным id, отключает и удаляет учётки и освобождает места
@@ -336,8 +439,9 @@
 Строка «Веб-чат» на странице состояния краснеет, когда страница чата не отдаётся или сборка
 выложена не целиком.
 
-**Предпосылка (как Ш1 Д5).** Ветка дня `d6a/web-chat` — от головы `d5b/gateway-whitelist`.
-- Код А1–А7 идёт без сервера.
+**Предпосылка (как Ш1 Д5).** Ветка дня `d6a/web-chat` — от головы `d5b/gateway-whitelist`, в
+своём worktree `/home/dev/incoming/pcbk-reserve-d6a` (раунд 2, В6).
+- Код А1–А7 идёт без сервера; интеграционные прогоны — по очереди с Д5б (Global Constraints).
 - А0, шаги 2–3, и задачи А8–А10 — после `platform-d5b` и выкладки Д5б.
 - Окно владельца (А9, шаг 5) требует выложенных Д4а и Д4б (ключ OpenRouter с балансом, места с
   MCP) и Д5а, Д5б.
@@ -354,21 +458,21 @@
 | Задача | Часы | Где |
 |---|---|---|
 | А0. Теги первой правкой; хвосты Д5б; утро: предпроверки сервера и версий | 0,5 | локально, сервер |
-| А1. Сторож: строка «Веб-чат» (наблюдение раньше функции), срок такта | 1,5 | локально |
+| А1. Сторож: строка «Веб-чат» (наблюдение раньше функции), срок `_http_get` | 1,5 | локально |
 | А2. Каркас веба: версии, lock, цель сборки, опись, проверка статики | 2,0 | локально |
 | А3. Клиент шлюза: классы отказов, паузы потока, баннер, пробуждение места | 2,25 | локально |
 | А4. Интерфейс: шапка, место, разговор, ожидающие ответы агента | 2,5 | локально |
 | А5. Агент по умолчанию в образе места; правка тестов Д2 и Д4б | 1,75 | локально |
-| А6. `edge` `/chat/`, вход → чат, `cdp.py`, дымовые тесты | 1,75 | локально |
+| А6. `edge` `/chat/` (CSP, кэш, gzip), вход → чат, `cdp.py`, дымовые тесты | 2,0 | локально |
 | А7. Автотесты чата в браузере, полный прогон, снимки | 2,0 | локально |
-| А8. Выкладка | 1,0 | сервер |
+| А8. Выкладка (сторож, место и `core` `:d6a`, статика) | 1,25 | сервер |
 | А9. Живые проверки, учения, окно владельца | 1,5 (+ окно ≈45 мин) | сервер |
 | А10. Закрытие дня | 1,25 | — |
-| **Критический путь** | **18,0** | |
+| **Критический путь** | **18,5** | |
 
 **Основание «один день»** — как у Д4а и Д5а. Живой темп по git (способ Д4а, дата автора `%aI`, код
 до черты): худшая доля Д1–Д3б — 0,30; строки Д4а–Д5б — если будут к началу дня. При 0,30 Д6а —
-около 5,4 ч.
+около 5,6 ч.
 
 Если «темп кода до черты» последнего закрытого дня хуже 0,5, Д6а до начала дня делится:
 - **Д6а** — А0–А8 и шаги 1–4 А9: чат, баннер и строка на сервере, без окна;
@@ -376,9 +480,9 @@
 
 Владелец получает строку с числами.
 
-**Черта отсечения — конец 7,25-го часа** плюс превышение хвостов Д5б над 0,5 ч. К черте должны
-быть зелёны задачи А0–А7: 14,25 ч по плановой шкале, ≈4,3 ч при 0,30. Черта ловит темп хуже
-≈0,51. После каждой задачи кода — `pace` Д4а от коммита А1 до текущего; доля хуже 0,5 — строка
+**Черта отсечения — конец 7,5-го часа** плюс превышение хвостов Д5б над 0,5 ч. К черте должны
+быть зелёны задачи А0–А7: 14,5 ч по плановой шкале, ≈4,4 ч при 0,30. Черта ловит темп хуже
+≈0,52. После каждой задачи кода — `pace` Д4а от коммита А1 до текущего; доля хуже 0,5 — строка
 владельцу сразу. После черты порядок жёсткий: А8 → А9 → А10.
 - **А7 не зелёна к черте.** Выкладки нет. Видимый результат — снимки того, что прошло, с пометкой
   «не на сервере»: как минимум дымовой тест А6 (страница чата после входа). Владельцу в тот же час
@@ -419,12 +523,15 @@
   - `build.outDir: process.env.PCBK_WEB_OUT ?? '../edge/static/chat'`, `emptyOutDir: true`;
   - `build.target: ['chrome109', 'edge109', 'firefox115']`;
   - `assetsInlineLimit: 0` (без `data:`), `modulePreload: { polyfill: false }`, `sourcemap: false`.
-- `main.tsx` первой строкой зовёт `z.config({ jitless: true })` — до импорта рантайма. Так
-  zod 4 не пробует `new Function`, а CSP без `unsafe-eval` не даёт нарушения.
+- `z.config({ jitless: true })` — в отдельном модуле `src/zodJitless.ts`; `main.tsx` импортирует
+  его первым. В ESM модули исполняются в порядке импортов, так что настройка стоит раньше
+  рантайма, и zod 4 не пробует `new Function`: CSP без `unsafe-eval` не даёт нарушения. Если в
+  сборке JIT-кода zod нет вовсе — это записывается в журнал, модуль остаётся.
 - Плагин `pcbkBuildInfo(build)`:
   - вставляет в `index.html` `<meta name="pcbk-build" content="<build>">`;
-  - пишет `build.json` = `{"build": "<build>", "files": {"assets/<имя>": "<sha256 hex>", …}}` по
-    всем выпущенным файлам `assets/`.
+  - в `closeBundle` пишет `build.json` = `{"build": "<build>", "files": {"<путь>": "<sha256 hex>", …}}`.
+    Опись строится **с диска**, обходом каталога сборки: файлы `assets/*` и, с Д6б, `boot.js` из
+    `public/` (его нет в `bundle`). В описи нет самих `index.html` и `build.json`.
 - `build` — `PCBK_BUILD` из окружения, по умолчанию `dev`, шаблон `[A-Za-z0-9._-]{1,64}`.
 - `scripts/check-dist.mjs` идёт последним шагом `npm run build`. Сборка падает, если:
   - в `index.html` есть `<script>` без `src`, `<style>`, атрибут `style=`, `http:`, `https:`,
@@ -441,13 +548,25 @@
   `.toSpliced(`, `Object.groupBy`, `Map.groupBy` или `Array.fromAsync` (API новее Chrome 109),
   `check-dist` сборку не роняет, а печатает предупреждение со списком. Список — в журнал дня:
   решение по ответу владельца о браузерах.
+
+  Известные исключения — списком в `check-dist`: печатаются отдельно, с источником. Первое —
+  `.toSorted(` из `@radix-ui/react-collection` (её `OrderedDict`): в Chrome 109 этого API нет.
+  Если класс на Chrome 109, заплатку решает ответ о браузерах.
 - На сервер статика уходит в соседний каталог `chat.new`: суммы сверяются по `build.json`, потом
   каталог встаёт на место переименованием, прежний остаётся `chat.<день>` для отката (А8).
 
 **Д6-R41 — CSP и что из assistant-ui берём.**
-- CSP — строкой Global Constraints, на `/chat/` и `/chat/assets/*`. Туда же — `Cache-Control:
-  no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`: `add_header` в
+- CSP — строкой Global Constraints, на `/chat/` и `/chat/assets/*` (с Д6б и на `/chat/boot.js`).
+  Туда же — `X-Content-Type-Options: nosniff` и `Referrer-Policy: no-referrer`: `add_header` в
   `location` отменяет заголовки `server`.
+- Кэш и сжатие (раунд 2, В3):
+  - `/chat/` (`index.html`) и `/chat/boot.js` — `Cache-Control: no-store`;
+  - `^~ /chat/assets/` — `Cache-Control: public, max-age=31536000, immutable`, `gzip on`,
+    `gzip_types application/javascript text/javascript text/css`, `gzip_vary on`.
+
+  Имена ассетов несут хеш содержимого, так что новая сборка — новые имена, а старый кэш не
+  мешает. Бандл около 914 КБ без сжатия на каждой загрузке давал бы ложный `boot_failed` на
+  медленной сети.
 - `build.json` на 8443 — 404: опись читает только сторож через внутренний 8080.
 - Берём только примитивы без Radix-меню: `ThreadPrimitive` (`Root`, `Viewport`, `Messages`,
   `Empty`, `If`), `ComposerPrimitive` (`Input`, `Send`, `Cancel`), `MessagePrimitive` (`Parts`,
@@ -503,9 +622,14 @@
 - перед запросом обёртка ждёт `eventDelayMs(failures) = 0` при `failures = 0`, иначе
   `min(1000·2^(failures−1), 30000)·(0,8 + 0,4·random())`;
 - отмена сигналом запроса прерывает ожидание;
-- ответ 200 — `failures = 0`, но тело ответа обёрнуто: поток, кончившийся раньше
-  `SHORT_STREAM_S = 5`, считается сбоем (`failures + 1`) к следующему запросу. Конец по
-  `closed_by=lifetime` через 30 мин — не сбой;
+- ответ 200 запоминает время и `failures` сразу не сбрасывает; строка потока при этом гаснет
+  (`last: "ok"`). Итог решает следующий запрос `/event`:
+  - пришёл не раньше `SHORT_STREAM_S = 5` после того ответа 200 — поток был живым, `failures = 0`;
+  - пришёл раньше — поток считается сбоем (`failures + 1`), чем бы он ни кончился: концом или
+    ошибкой.
+
+  Счёт — по времени между запросами, тело не оборачивается. Конец по `closed_by=lifetime` через
+  30 мин — не сбой;
 - ответ не 200 — `failures + 1`;
 - состояние уходит в `onStream({failures, nextRetryS, last})`, веб пишет «Связь с рабочим местом
   прервалась — переподключаюсь через N с».
@@ -529,8 +653,9 @@
 - Предупреждение — `STAND_WARNING`, тот же текст, что `.stand` на `login.html`: «Учебный стенд: не
   для ведения технологического процесса — данные и выводы только для разбора и обучения.».
   Полоса закреплена сверху и видна всегда.
-- Баннер опрашивает `/status.json` раз в 10 с, срок запроса 4 с. Строки чужих мест
-  (`student-NN` ≠ своё) не считаются, `absent` не считается. Уровень — худший из оставшихся:
+- Баннер опрашивает `/status.json` раз в 10 с, срок запроса 4 с. Не считаются строки чужих мест
+  (`student-NN` ≠ своё), строка `web` (она для владельца: сборка и отчёты чужих браузеров) и
+  `absent`. Уровень — худший из оставшихся:
   `fail` > `unknown` > `warn` > `ok`, как в `page.py`.
 
   | Уровень | Текст |
@@ -573,10 +698,13 @@
 - Через внутренний 8080 `edge` — тот же корень, что 8443, но без TLS. У сторожа `_http_get`
   только `http://`; TLS и 8443 держит строка «Входной прокси».
 - Порядок: `GET /chat/` (тело ≤ `MAX_BODY_BYTES`) → `GET /chat/build.json` → `GET` каждого файла
-  описи (тело не читается).
-- Срок: вся проверка — не дольше `HTTP_CHECK_SPANS × NET_CHECK_TIMEOUT_S` (6 с) и не дольше
-  общего срока такта (`deadline` из `run_checks`, плюс запас двух сроков сокета — правило
-  `tick_budget_s`). Файлов в описи — не больше `WEB_MAX_FILES = 8`.
+  описи (тело не читается). Путь в описи — `assets/[A-Za-z0-9._-]{1,100}` или ровно `boot.js`
+  (загрузчик Д6б: сторож Д6а его уже понимает).
+- Срок: вся проверка — один срок `HTTP_CHECK_SPANS × NET_CHECK_TIMEOUT_S` (6 с) от начала,
+  переданный абсолютным временем в каждый `_http_get(…, deadline=)` (раунд 2, В1). Проверка,
+  начатая до конца такта, кончается не позже «конец такта + два срока сокета» — это ровно запас
+  правила `tick_budget_s`, так что отдельный срок от `run_checks` не нужен. Файлов в описи — не
+  больше `WEB_MAX_FILES = 8`.
 
   | Ответ | Итог | `note` |
   |---|---|---|
@@ -641,18 +769,20 @@
 ## Карта файлов Д6а
 
 ```
-watchdog/pcbk_watchdog/checks.py      + check_web(..., deadline=None), WEB_META_RE, WEB_FILE_RE, WEB_MAX_FILES
-watchdog/pcbk_watchdog/main.py        + KINDS["web"] = ("url",), вызов check_web со сроком такта
+watchdog/pcbk_watchdog/checks.py      + check_web, WEB_META_RE, WEB_FILE_RE, WEB_MAX_FILES; _http_get(..., deadline=None)
+watchdog/pcbk_watchdog/main.py        + KINDS["web"] = ("url",), вызов check_web
 watchdog/components.json              + строка web (последней)
 watchdog/tests/test_checks.py, test_main.py  (+; правка test_components_file_d4b и _d5a)
-edge/pcbk.conf.template               8443: = /chat, = /chat/, ^~ /chat/assets/, ^~ /chat/ (404); 8080: = /chat/, ^~ /chat/
+edge/pcbk.conf.template               8443: = /chat, = /chat/ (no-store), ^~ /chat/assets/ (immutable, gzip), ^~ /chat/ (404); 8080: = /chat/, ^~ /chat/
 edge/static/login.html, login.js      переход в чат после «готово», ссылка «Открыть чат»
 edge/static/index.html                ссылка на чат вместо «появятся позже»
 edge/tests/login.test.mjs             (+)
 web/package.json, package-lock.json, .npmrc, tsconfig.json, vite.config.ts, index.html
 web/build/buildInfo.ts                pcbkBuildInfo(build): метка в index.html, build.json
 web/scripts/check-dist.mjs            checkDist(dir) и запуск из npm run build
-web/src/main.tsx                      z.config({ jitless: true }); createRoot, App
+web/src/zodJitless.ts                 z.config({ jitless: true }) — импортируется первым
+web/src/main.tsx                      import "./zodJitless"; createRoot, App
+web/tests/setup.ts                    заглушка ResizeObserver для jsdom (setupFiles)
 web/src/texts.ts                      все тексты людям; STAND_WARNING, MAX_TEXT
 web/src/api.ts                        callJson, createApi (me, logout, wake, workplace)
 web/src/gateway.ts                    classify, explainError, eventDelayMs, createGatewayFetch, HaltedError
@@ -668,7 +798,7 @@ web/src/chat.css
 web/tests/deps.test.ts, checkDist.test.ts, gateway.test.ts, status.test.ts, workplace.test.ts,
           App.test.tsx, ChatView.test.tsx, texts.test.ts
 student/config/agent/pomoshnik.md, student/config/opencode.json
-compose.yaml                          сторож и место :d6a
+compose.yaml                          сторож, место и core :d6a
 compose.test.yaml                     edge: volumes !override, статика из ${PCBK_TEST_STATIC}
 tests/integration/cdp.py              Chrome по CDP: запуск, страница, ожидания, сеть, CSP, снимки (stdlib)
 tests/integration/test_web.py         чат в браузере (место 09)
@@ -681,23 +811,26 @@ deploy/README.md                      + «Статика чата»; выкла�
 docs/checks/D6a.md, docs/checks/D6a/*.png
 ```
 
-Имена: образы `pcbk-reserve/watchdog:d6a` и `pcbk-reserve/student:d6a` (`watchdog:d5b` и
-`student:d4` остаются для отката), `core:d5b` без изменений; пробная учётка `d6-probe-a` (место 10);
-тестовые учётки интеграции `web-a` (студент, место 9) и `web-t` (преподаватель).
+Имена: образы `pcbk-reserve/watchdog:d6a`, `pcbk-reserve/student:d6a` и `pcbk-reserve/core:d6a`
+(`watchdog:d5b`, `student:d4` и `core:d5b` остаются для отката; код `core` тот же); пробная учётка
+`d6-probe-a` (место 10); тестовые учётки интеграции `web-a` (студент, место 9) и `web-t`
+(преподаватель).
 
 ---
 
 ### Task А0: Теги первой правкой, хвосты Д5б и утро
 
 **Files:**
-- Modify: `compose.yaml` (образ места в якоре `x-student` и сторож), `tests/integration/test_edge.py`
-  (`IMAGES`), `tests/integration/workplace.py` (`IMAGE`)
+- Modify: `compose.yaml` (образ места в якоре `x-student`, сторож и `core`),
+  `tests/integration/test_edge.py` (`IMAGES`), `tests/integration/workplace.py` (`IMAGE`)
 - Create: `docs/checks/D6a.md`
 
+- [ ] **Step 0: Своё дерево (раунд 2, В6).** `git -C /home/dev/incoming/pcbk-reserve worktree add -b d6a/web-chat /home/dev/incoming/pcbk-reserve-d6a d5b/gateway-whitelist`.
+  Дальше все команды Д6 — в `/home/dev/incoming/pcbk-reserve-d6a`. Expected: `git -C /home/dev/incoming/pcbk-reserve-d6a branch --show-current` → `d6a/web-chat`.
 - [ ] **Step 1: Теги — первой правкой, до любой сборки (Ш2).** `watchdog:d5b` → `:d6a`,
-  `student:d4` → `:d6a` в `compose.yaml`, `IMAGES` и `workplace.IMAGE`; `core:d5b` не трогать.
-  Expected: `/usr/bin/grep -c 'image: pcbk-reserve/.*:d6a' compose.yaml` → `2`; `/usr/bin/grep -c 'core:d5b' compose.yaml` → `1`.
-  Commit: `git add compose.yaml tests/integration/test_edge.py tests/integration/workplace.py && git commit -m "Д6а: теги образов сторожа и места :d6a до первой сборки" -- compose.yaml tests/integration/test_edge.py tests/integration/workplace.py`.
+  `core:d5b` → `:d6a`, `student:d4` → `:d6a` в `compose.yaml`, `IMAGES` и `workplace.IMAGE`.
+  Expected: `/usr/bin/grep -c 'image: pcbk-reserve/.*:d6a' compose.yaml` → `3`; `/usr/bin/grep -c 'image: pcbk-reserve/.*:d5b' compose.yaml` → `0`.
+  Commit: `git add compose.yaml tests/integration/test_edge.py tests/integration/workplace.py && git commit -m "Д6а: теги образов сторожа, места и core :d6a до первой сборки" -- compose.yaml tests/integration/test_edge.py tests/integration/workplace.py`.
 - [ ] **Step 2: После `platform-d5b` (Ш1):** всё, что черта Д5б перенесла сюда (раунд критика,
   слияние, тег, чистый клон). Затем `d6a/web-chat` перебазируется на `main`.
   Expected: вердикты в `docs/checks/D5b.md`; `git merge-base --is-ancestor platform-d5b HEAD` → код `0`.
@@ -716,7 +849,7 @@ docs/checks/D6a.md, docs/checks/D6a/*.png
   Expected — как Д5б, Б0. Если место 09 или 10 уже выдано студенту, пилот начался: живые шаги А9
   откладываются, вердикт и строка владельцу — до А8.
 - [ ] **Step 4: Версии локально.**
-  - `node --version` → `v22.*`;
+  - `node --version` → `v22.*` и не ниже `v22.22.2` (требование jsdom 30.1.1);
   - `google-chrome --version` записан;
   - `npm view @assistant-ui/react-opencode@0.2.25 dist.integrity` и
     `npm view @opencode-ai/sdk@1.18.33 dist.integrity` совпадают с суммами research/07 §1;
@@ -735,21 +868,24 @@ docs/checks/D6a.md, docs/checks/D6a/*.png
 **Files:**
 - Modify: `watchdog/pcbk_watchdog/checks.py`, `watchdog/pcbk_watchdog/main.py`,
   `watchdog/components.json`, `edge/pcbk.conf.template` (server 8080)
-- Test: `watchdog/tests/test_checks.py` (+2), `watchdog/tests/test_main.py` (+1, правка
+- Test: `watchdog/tests/test_checks.py` (+3), `watchdog/tests/test_main.py` (+1, правка
   `test_components_file_d4b` и `test_components_file_d5a`)
 
 **Interfaces:**
 - Consumes: `_http_get(url, timeout, read_body)`, `Check`, `HTTP_CHECK_SPANS`,
-  `NET_CHECK_TIMEOUT_S`, `MAX_BODY_BYTES`, `run_checks` и `Settings.tick_budget_s` (Д1–Д5).
+  `NET_CHECK_TIMEOUT_S`, `MAX_BODY_BYTES` (Д1–Д5).
 - Produces:
-  - `check_web(component: str, title: str, url: str, timeout: float = NET_CHECK_TIMEOUT_S, deadline: float | None = None) -> Check`
-    — таблица Д6-R46. `deadline` — абсолютный монотонный срок от `run_checks`: конец такта плюс
-    запас двух сроков сокета (правило `tick_budget_s`). Свой срок проверки —
-    `min(time.monotonic() + HTTP_CHECK_SPANS × timeout, deadline)`;
-  - `run_checks` передаёт в `_check_one` свой `deadline`, а `_check_one` — в `check_web`;
+  - `_http_get(url, timeout, read_body, deadline: float | None = None)` — прежнее поведение при
+    `deadline=None`. С `deadline` (абсолютное `time.monotonic()`): срок чтения —
+    `min(now + HTTP_CHECK_SPANS × timeout, deadline)`, соединения — `min(timeout, deadline − now)`;
+    остаток ≤ 0 — `TimeoutError` без соединения;
+  - `check_web(component: str, title: str, url: str, timeout: float = NET_CHECK_TIMEOUT_S) -> Check`
+    — таблица Д6-R46. Один срок `start + HTTP_CHECK_SPANS × timeout` на всю проверку, в каждый
+    `_http_get(…, deadline=)`. `run_checks` не меняется: срок такта соблюдается по построению
+    (Д6-R46);
   - `WEB_MAX_FILES = 8`;
   - `WEB_META_RE = re.compile(r'<meta name="pcbk-build" content="([A-Za-z0-9._-]{1,64})">')`;
-  - `WEB_FILE_RE = re.compile(r"assets/[A-Za-z0-9._-]{1,100}")`;
+  - `WEB_FILE_RE = re.compile(r"assets/[A-Za-z0-9._-]{1,100}|boot\.js")` — `fullmatch`;
   - `KINDS["web"] = ("url",)`;
   - строка `components.json` из Д6-R46, последней;
   - `edge`, server 8080: `location = /chat/ { root /usr/share/nginx/pcbk; try_files /chat/index.html =404; }`
@@ -785,6 +921,8 @@ def test_web_verdicts(web_site):
     assert row(check_web("web", "Веб-чат", url)) == ("fail", "сборка чата неполная", "страница и опись разных сборок")
     put_build(root, files={"../x.js": b"x"})
     assert row(check_web("web", "Веб-чат", url))[1:] == ("сборка чата неполная", "опись неверна")
+    put_build(root, files={"assets/index-1.js": b"x", "boot.js": b"b"})    # загрузчик Д6б — законный путь описи
+    assert row(check_web("web", "Веб-чат", url))[0] == "ok"
     put_build(root, files={f"assets/f{i}.js": b"x" for i in range(9)})
     assert row(check_web("web", "Веб-чат", url))[2] == "опись неверна"
     put_build(root, meta="")
@@ -793,13 +931,19 @@ def test_web_verdicts(web_site):
     assert row(check_web("web", "Веб-чат", url)) == ("fail", "страница чата не отдаётся", "HTTP 404")
     assert row(check_web("web", "Веб-чат", "http://127.0.0.1:9/chat/"))[:2] == ("fail", "не отвечает")
 
-def test_web_check_keeps_deadlines(slow_site):                             # каждый ответ — через 2,5 с
+def test_web_check_keeps_deadline(slow_site):                              # раунд 2, В1: каждый ответ — через 2,5 с
+    t0 = time.monotonic()                                                   # без общего срока: 2,5 + 2,5 + 2,5 = 7,5 с
+    c = check_web("web", "Веб-чат", slow_site, timeout=3.0)
+    assert time.monotonic() - t0 < 2 * 3.0 + 0.5                           # один срок на всю проверку
+    assert (c.state, c.detail) == ("fail", "не отвечает")
+
+def test_http_get_absolute_deadline(slow_site):                             # срок соединения и чтения — не дальше deadline
     t0 = time.monotonic()
-    assert check_web("web", "Веб-чат", slow_site, timeout=3.0).state == "fail"
-    assert time.monotonic() - t0 < 2 * 3.0 + 1                             # свой срок проверки
-    t0 = time.monotonic()
-    check_web("web", "Веб-чат", slow_site, timeout=3.0, deadline=time.monotonic() + 1.0)
-    assert time.monotonic() - t0 < 1.0 + 3.0 + 0.5                         # срок такта: начатый запрос — не дольше своего срока
+    with pytest.raises((OSError, http.client.HTTPException)):
+        _http_get(slow_site, 3.0, lambda code: True, deadline=time.monotonic() + 1.0)
+    assert time.monotonic() - t0 < 1.0 + 0.5
+    with pytest.raises(TimeoutError):
+        _http_get(slow_site, 3.0, lambda code: True, deadline=time.monotonic() - 0.1)   # срок уже вышел — без соединения
 
 # watchdog/tests/test_main.py (+ и правки)
 def test_components_have_web_row():
@@ -809,9 +953,9 @@ def test_components_have_web_row():
 ```
 
 - [ ] **Step 2: Run tests to verify they fail** — `(cd watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_checks.py tests/test_main.py)`. Expected: FAIL (`check_web` не определён).
-- [ ] **Step 3: Implement по Interfaces.** Перед каждым `_http_get` остаток общего срока
-  пересчитывается: остаток ≤ 0 → `fail` «не отвечает»; `timeout` запроса — `min(timeout, остаток)`.
-  Опись разбирается `json.loads` под `except (ValueError, RecursionError)`.
+- [ ] **Step 3: Implement по Interfaces.** `check_web` считает `deadline` один раз и отдаёт его во
+  все `_http_get`; `TimeoutError`/`OSError` любого запроса статики — `fail` «не отвечает». Опись
+  разбирается `json.loads` под `except (ValueError, RecursionError)`.
 - [ ] **Step 4: Run both suites** — `(cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs)`. Expected: PASS.
 - [ ] **Step 5: Commit** — `git add watchdog/ edge/pcbk.conf.template && git commit -m "Сторож: строка «Веб-чат» — страница чата и опись сборки через edge" -- watchdog/ edge/pcbk.conf.template`.
 
@@ -822,8 +966,9 @@ def test_components_have_web_row():
 **Files:**
 - Create: `web/package.json`, `web/package-lock.json`, `web/.npmrc`, `web/tsconfig.json`,
   `web/vite.config.ts`, `web/index.html`, `web/build/buildInfo.ts`,
-  `web/scripts/check-dist.mjs`, `web/src/main.tsx` (заглушка «Чат загружается…» и
-  `z.config({ jitless: true })`)
+  `web/scripts/check-dist.mjs`, `web/src/zodJitless.ts`, `web/src/main.tsx` (первым —
+  `import "./zodJitless"`, затем заглушка «Чат загружается…»), `web/tests/setup.ts` (заглушка
+  `ResizeObserver`: в jsdom её нет, а `ThreadPrimitive.Viewport` её зовёт)
 - Modify: `.gitignore` (+ `edge/static/chat/`)
 - Test: `web/tests/deps.test.ts`, `web/tests/checkDist.test.ts`
 
@@ -835,7 +980,8 @@ def test_components_have_web_row():
   - скрипты `package.json`: `"test": "vitest run"`,
     `"build": "tsc --noEmit -p . && vite build && node scripts/check-dist.mjs ${PCBK_WEB_OUT:-../edge/static/chat}"`
     (путь можно передавать и через обёртку `scripts/build.mjs`);
-  - `vitest` в `vite.config.ts`: `environment: "jsdom"`, `include: ["tests/**/*.test.ts?(x)"]`;
+  - `vitest` в `vite.config.ts`: `environment: "jsdom"`, `include: ["tests/**/*.test.ts?(x)"]`,
+    `setupFiles: ["tests/setup.ts"]`;
   - `package.json`: `"private": true`, `"type": "module"`, `"engines": {"node": "22.x"}`,
     `"overrides": {"@opencode-ai/sdk": "1.18.33"}`.
 
@@ -880,6 +1026,11 @@ test("check_dist_warns_on_newer_api", () => {
   const r = checkDist(fixture({ ...CLEAN, js: "a.toSorted(); Promise.withResolvers()" }));
   expect(r.errors).toEqual([]); expect(r.warnings.join(" ")).toMatch(/toSorted.*withResolvers|withResolvers.*toSorted/);
 });
+test("check_dist_manifest_from_disk", () => {                           // раунд 2, Minor 1: файл из public/ тоже в описи
+  const dir = fixture({ ...CLEAN, extraFile: "boot.js", listExtraInManifest: true });
+  expect(checkDist(dir).errors).toEqual([]);
+  expect(checkDist(fixture({ ...CLEAN, extraFile: "boot.js" })).errors).toContainEqual(expect.stringMatching(/опись/));
+});
 test("check_dist_rejects_manifest_mismatch", () => {
   expect(checkDist(fixture({ ...CLEAN, extraFile: "assets/x.js" })).errors).toContainEqual(expect.stringMatching(/опись/));
   expect(checkDist(fixture({ ...CLEAN, badSum: true })).errors).toContainEqual(expect.stringMatching(/сумма/));
@@ -897,7 +1048,8 @@ test("check_dist_rejects_manifest_mismatch", () => {
   ближайшая совместимая, строка в `docs/checks/D6a.md` и решение контролёра.
 - [ ] **Step 4: Run** — `(cd web && rm -rf node_modules && npm ci --ignore-scripts && npm test && PCBK_BUILD=dev npm run build && ls ../edge/static/chat)`.
   Expected: PASS; в каталоге — `index.html`, `build.json`, `assets/`; ошибок у `check-dist` нет,
-  предупреждения об API новее Chrome 109 — списком в `docs/checks/D6a.md`.
+  предупреждения об API новее Chrome 109 и известные исключения — списком в `docs/checks/D6a.md`;
+  есть ли в сборке JIT-код zod (`new Function`), тоже записано.
   **Повторяемость сборки:** вторая сборка даёт тот же `build.json`
   (`sha256sum ../edge/static/chat/build.json` дважды совпал). Не совпало — вердикт в журнал.
   Тогда А8 сверяет суммы сервера с описью **этой** сборки, а не с пересобранной.
@@ -928,8 +1080,13 @@ test("check_dist_rejects_manifest_mismatch", () => {
   - `EVENT_PATH = "/pcbk/api/oc/event"`, `SHORT_STREAM_S = 5`; `class HaltedError extends Error`;
   - `interface StreamState { failures: number; nextRetryS: number | null; last: Outcome }`;
   - `createGatewayFetch(o: { onHalt(kind: "signed_out" | "asleep"): void; onStream(s: StreamState): void; fetchImpl?: (r: Request) => Promise<Response>; sleep?: (ms: number, signal: AbortSignal) => Promise<void>; random?: () => number; now?: () => number }): (req: Request) => Promise<Response>`.
-    Ответ 200 потока отдаётся с телом, пропущенным через `TransformStream`: его `flush` отмечает
-    конец. Поток короче `SHORT_STREAM_S` по `now()` — сбой к следующему запросу.
+    Обёртка помнит `now()` последнего ответа 200 потока и при нём `failures` не сбрасывает. На
+    следующем запросе `/event`:
+    - прошло не меньше `SHORT_STREAM_S` — `failures = 0`;
+    - меньше — `failures + 1` (раунд 2, Minor 4): неважно, кончился поток сам или оборвался
+      ошибкой.
+
+    Тело ответа не оборачивается.
 - Produces (`status.ts`):
   - `type Level = "ok" | "warn" | "fail" | "unknown"`;
   - `statusView(data: unknown, ownPlace: string | null): { level: Level; text: string }` — Д6-R44;
@@ -982,16 +1139,18 @@ test("event_backoff_grows_and_resets", async () => {
   let t = 0;
   const f = createGatewayFetch({ onHalt: vi.fn(), onStream: vi.fn(), random: () => 0.5, now: () => t,
     sleep: async (ms) => { waits.push(ms); }, fetchImpl: async () => json(codes.shift()!, "WorkplaceBusy") });
-  for (let i = 0; i < 9; i++) { const r = await f(ev()); if (r.ok) { t += 60_000; await r.text(); } }   // 200 живёт минуту
-  expect(waits).toEqual([0, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 0]);   // 200 сбросил счёт
+  for (let i = 0; i < 9; i++) { const r = await f(ev()); if (r.ok) t += 60_000; }   // 200 живёт минуту
+  expect(waits).toEqual([0, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 0]);   // долгий 200 сбросил счёт
 });
-test("short_stream_counts_as_failure", async () => {
+test("short_stream_counts_as_failure", async () => {                     // раунд 2, Minor 4
   const waits: number[] = []; let t = 0;
   const f = createGatewayFetch({ onHalt: vi.fn(), onStream: vi.fn(), random: () => 0.5, now: () => t,
     sleep: async (ms) => { waits.push(ms); }, fetchImpl: async () => new Response("data: {}\n\n", { status: 200 }) });
-  await (await f(ev())).text(); t += 1_000;                                   // поток кончился через 1 с
-  await (await f(ev())).text();
-  expect(waits).toEqual([0, 1000]);
+  await f(ev()); t += 1_000;                                                  // следующий запрос через 1 с после 200
+  await f(ev()); t += 1_500;                                                  // и ещё раз — поток снова короткий
+  await f(ev()); t += 60_000;                                                 // этот прожил минуту
+  await f(ev());
+  expect(waits).toEqual([0, 1000, 2000, 0]);                                   // конец или обрыв — всё равно сбой; долгий — сброс
 });
 test("halt_stops_stream_and_rejects_calls", async () => {
   const fetchImpl = vi.fn(async () => json(503, "WorkplaceNotReady")); const onHalt = vi.fn();
@@ -1016,6 +1175,7 @@ test("status_view_filters_and_levels", () => {
     .toEqual({ level: "fail", text: "Сбой: Рабочее место 03" });
   expect(statusView(st([c("a", "А", "warn"), c("b", "Б", "warn"), c("c", "В", "warn"), c("d", "Г", "warn")]), "03").text)
     .toBe("Внимание: А, Б, В и ещё 1");
+  expect(statusView(st([c("web", "Веб-чат", "fail"), c("gateway", "Шлюз и вход", "ok")]), "03").level).toBe("ok");  // web — для владельца
   expect(statusView(st([], { stale: true }), "03").level).toBe("unknown");
   expect(statusView("<html>", "03").level).toBe("unknown");
   expect(statusView(st([c("x", "X", "absent")]), "03").level).toBe("ok");
@@ -1162,8 +1322,8 @@ test("pending_interactions_reject_only", () => {
 ```
 
 - [ ] **Step 2: Run** — `(cd web && npm test)`. Expected: FAIL.
-- [ ] **Step 3: Implement по Interfaces.** `main.tsx`: первой строкой — `z.config({ jitless: true })`
-  (импорт `zod`), затем импорт `./chat.css` и
+- [ ] **Step 3: Implement по Interfaces.** `main.tsx`: первым импортом — `./zodJitless` (А2),
+  затем `./chat.css`, затем
   `createRoot(root).render(<App api={createApi()} navigate={(u) => location.assign(u)} />)`.
 - [ ] **Step 4: Run** — `(cd web && npm test && PCBK_BUILD=dev npm run build)`. Expected: PASS,
   ошибок у `check-dist` нет.
@@ -1311,12 +1471,17 @@ def test_default_agent_tools_are_data_only(stack, place01):
 **Interfaces:**
 - Consumes: сборка А2, строка сторожа А1, образ места А5.
 - Produces:
-  - `edge` — Д6-R39, R41. На `= /chat/` и `^~ /chat/assets/` — CSP и три заголовка `server`
-    повторены (как у `location = /login`), `charset utf-8` у `index.html`; `^~ /chat/` на 8443 —
-    `return 404`.
+  - `edge` — Д6-R39, R41:
+    - на `= /chat/` и `^~ /chat/assets/` — CSP, `nosniff` и `Referrer-Policy` повторены (как у
+      `location = /login`);
+    - `= /chat/` — `Cache-Control: no-store`, `charset utf-8`;
+    - `^~ /chat/assets/` — `Cache-Control: public, max-age=31536000, immutable`, `gzip on`,
+      `gzip_types application/javascript text/javascript text/css`, `gzip_vary on`;
+    - `^~ /chat/` на 8443 — `return 404`.
   - `login.js`: `startPage({ …, navigate = (u) => location.assign(u) })`. В `showPlace` при
     `view.ok` — показ `#to-chat` и `navigate("/chat/")` ровно один раз за ход ожидания. У
-    преподавателя перехода нет.
+    преподавателя перехода нет. Прежние тесты `login.test.mjs` передают внедрённый `navigate`
+    (раунд 2, Minor 8): в Node нет `location`.
   - Фикстура `stack` перед `compose up`:
     - копирует `edge/static` в свой временный каталог `<tmp>/static`;
     - `npm --prefix web ci --ignore-scripts`;
@@ -1333,8 +1498,8 @@ def test_default_agent_tools_are_data_only(stack, place01):
   - `Page`:
     - навигация и ввод: `goto(url)`, `url() -> str`, `type(selector, text)`,
       `press_enter(selector)`, `click_text(text)`, `eval(expr)`, `screenshot(path)`;
-    - ожидания: `wait_url(suffix, timeout)`, `wait_text(pattern, timeout) -> str`,
-      `wait_gone(pattern, timeout)`;
+    - ожидания: `wait_url(suffix, timeout)`, `wait_selector(css, timeout)`,
+      `wait_text(pattern, timeout) -> str`, `wait_gone(pattern, timeout)`;
     - наблюдение: `csp() -> list[dict]`, `console_errors() -> list[str]`,
       `requests(prefix) -> list[dict(method, path, status, protocol, headers)]`,
       `chunks(path) -> int`.
@@ -1351,8 +1516,9 @@ def test_default_agent_tools_are_data_only(stack, place01):
     - `STAND = "https://stand.pcbk.test:18443"`;
     - `STAND_WARNING` — текст `.stand` из `edge/static/login.html` (читается, не копируется);
     - `login_to_chat(page, login, password)` — вход на `/login`, затем
-      `page.wait_url("/chat/", 90)` и только потом `page.wait_text(r"Вы вошли как " + login, 30)`:
-      тот же текст есть и на странице входа.
+      `page.wait_url("/chat/", 90)` и `page.wait_selector("textarea", 90)`. «Вы вошли как» не
+      годится: этот текст есть и на странице входа, и в шапке чата на экранах места и
+      предупреждения (раунд 2, Minor 7).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1366,23 +1532,27 @@ test('teacher_never_navigates', async () => { /* role teacher → navigate не 
 # tests/integration/test_edge.py (+)
 CHAT_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "
             "font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
-def test_edge_serves_chat_under_csp(stack):
+def test_edge_serves_chat_under_csp(stack):                                # + раунд 2, В3: кэш и сжатие
     build = json.loads((stack.static_dir / "chat/build.json").read_text())
     code, body, h = stack.https_full("/chat/")
     assert (code, h["content-security-policy"], h["cache-control"], h["x-content-type-options"]) == (200, CHAT_CSP, "no-store", "nosniff")
     assert f'<meta name="pcbk-build" content="{build["build"]}">' in body
-    for path in build["files"]:
-        code, _, h = stack.https_full("/chat/" + path)
+    for path in (p for p in build["files"] if p.startswith("assets/")):
+        code, _, h = stack.https_full("/chat/" + path, headers={"Accept-Encoding": "gzip"})
         assert code == 200 and h["content-security-policy"] == CHAT_CSP
+        assert h["cache-control"] == "public, max-age=31536000, immutable", path
         assert h["content-type"].split(";")[0] in ("application/javascript", "text/javascript", "text/css"), path
+        assert (h.get("content-encoding"), h.get("vary")) == ("gzip", "Accept-Encoding"), path
+        assert stack.https_full("/chat/" + path)[2].get("content-encoding") is None      # без Accept-Encoding — как есть
     assert stack.https_full("/chat/build.json")[0] == 404                  # опись — только 8080
     code, _, h = stack.https_full("/chat")
     assert (code, h["location"]) == (301, "/chat/")
     assert stack.http_in("pcbk-front", "http://pcbk-edge:8080/chat/build.json") == 200   # одноразовый curl в сети сторожа
 ```
 
-  `https_full` — рядом с `stack.https` (код, тело, заголовки в нижнем регистре). `http_in(network,
-  url) -> int` — одноразовый `curl` в сети, по образцу `http_as`.
+  `https_full(path, headers=None)` — рядом с `stack.https` (код, тело, заголовки в нижнем
+  регистре; сжатое тело не распаковывается). `http_in(network, url) -> int` — одноразовый `curl`
+  в сети, по образцу `http_as`.
 
 ```python
 # tests/integration/test_web.py — дымовой тест А6
@@ -1531,7 +1701,9 @@ def test_web_row_and_drill(stack):                                              
 - [ ] **Step 1: Сборка из одного закреплённого коммита.**
   - `C=$(git rev-parse d6a/web-chat)`;
   - `git worktree add --detach $JOB/wt-d6a $C`;
-  - образы `pcbk-reserve/watchdog:d6a` и `pcbk-reserve/student:d6a` — из `git archive $C`;
+  - образы `pcbk-reserve/watchdog:d6a`, `pcbk-reserve/student:d6a` и `pcbk-reserve/core:d6a` — из
+    `git archive $C`. Код `core` тот же, что `core:d5b`; сверка:
+    `git diff --quiet platform-d5b $C -- core` → код `0`, иначе вердикт в журнал;
   - веб — `git archive $C web edge | tar -x -C $JOB/build-d6a`, затем
     `cd $JOB/build-d6a/web && npm ci --ignore-scripts && PCBK_BUILD=${C:0:12} npm run build`.
 
@@ -1553,12 +1725,14 @@ def test_web_row_and_drill(stack):                                              
      `curl -s http://…` изнутри `pcbk-watchdog` к `http://pcbk-edge:8080/chat/build.json` → 200.
   2. `docker compose up -d --no-build watchdog` — новый сторож знает вид `web` и сразу видит
      статику через 8080; дождаться `stale: false`.
-  3. Места — README «Пересоздание мест с сохранением томов»: сначала список `running`; если
+  3. `docker compose up -d --no-build core` → `healthy`, 13 сетей. Код тот же, меняется только
+     тег; открытые потоки чата переподключатся сами.
+  4. Места — README «Пересоздание мест с сохранением томов»: сначала список `running`; если
      место кто-то держит — ждать конца. Затем `create --force-recreate --no-build` всех десяти.
 
   Expected:
   - строки «Веб-чат» (`ok`, «сборка <build>»), «Входной прокси», «Шлюз и вход» — без новых сбоев;
-  - места спят, образ у всех `student:d6a`;
+  - `core` — `core:d6a`; места спят, образ у всех `student:d6a`;
   - `docker volume ls | /usr/bin/grep -c pcbk-student-` — как до выкладки;
   - Dify не перезапускался (время работы из снимка А0).
 - [ ] **Step 4: Commit** (после проверки на секреты) — `git add docs/checks/D6a.md deploy/README.md && git commit -m "Выкладка Д6а: чат статикой edge, строка «Веб-чат», агент по умолчанию в местах" -- docs/checks/D6a.md deploy/README.md`.
@@ -1638,8 +1812,8 @@ def test_web_row_and_drill(stack):                                              
   Петля — до нуля блокеров, число раундов владелец не ограничил.
 - [ ] **Step 3: Слияние — после `platform-d5b`.** Перебазирование на `main`, повтор А7, шаг 4 (с
   ID образов), слияние в `main`, тег `platform-d6a`. Сверка с выложенным:
-  `git diff --quiet $C platform-d6a -- web student watchdog edge` → код `0`. Иначе — пересборка и
-  повтор А8 по новому коммиту.
+  `git diff --quiet $C platform-d6a -- web student watchdog edge core compose.yaml` → код `0`.
+  Иначе — пересборка и повтор А8 по новому коммиту.
 
   Перед пушем:
   - проверка на секреты по ветке;
@@ -1649,8 +1823,8 @@ def test_web_row_and_drill(stack):                                              
   `npm run build`), `CORE_PYTEST`, сторож, `node --test edge/tests/*.test.mjs`; снимки на месте.
   На сервере удалить `~/pcbk-d6a-*.txt`.
 - [ ] **Step 4: План и факт** — две строки в `docs/checks/D6a.md`, помощники Д4а:
-  - темп кода до черты — `pace "$(msg 'Сторож: строка «Веб-чат»')" "$(msg 'Веб-чат в компоновке')" 12.25`
-    (задачи А2–А7);
+  - темп кода до черты — `pace "$(msg 'Сторож: строка «Веб-чат»')" "$(msg 'Веб-чат в компоновке')" 12.5`
+    (задачи А2–А7: 2,0 + 2,25 + 2,5 + 1,75 + 2,0 + 2,0);
   - полное время дня — справочно.
 - [ ] **Step 5: Владельцу** — «Д6а готов»:
   - «совпало» по числу;
@@ -1677,7 +1851,8 @@ def test_web_row_and_drill(stack):                                              
   Строка «Веб-чат» желтеет с числом за час.
 - **Разговоры.** В чате — список разговоров с «в архив» и «переименовать».
 
-**Предпосылка.** Ветка `d6b/web-notice` — от головы `d6a/web-chat`. Код Б1–Б4 — без сервера;
+**Предпосылка.** Ветка `d6b/web-notice` — от головы `d6a/web-chat`, в том же worktree
+`/home/dev/incoming/pcbk-reserve-d6a`; интеграционные прогоны — по очереди с Д5б. Код Б1–Б4 — без сервера;
 Б0, шаг 2, и Б5–Б7 — после `platform-d6a`. Если к коду Б1–Б4 `platform-d6a` ещё нет — видимый
 результат: снимки Б4 локального стенда и строка владельцу, Б5–Б7 — в очередь.
 
@@ -1687,16 +1862,16 @@ def test_web_row_and_drill(stack):                                              
 |---|---|---|
 | Б0. Теги первой правкой; хвосты Д6а; утро | 0,5 | локально, сервер |
 | Б1. Загрузчик, отчёты браузеров и строки сторожа (наблюдение до функций) | 2,25 | локально |
-| Б2. Предупреждение при первом входе: `core.db`, ручка, экран, `login.js` | 1,75 | локально |
+| Б2. Предупреждение при первом входе: `core.db`, ручка, экран, `login.js` | 2,0 | локально |
 | Б3. Молчание в браузере; список разговоров — архив и имя | 2,0 | локально |
-| Б4. `edge`, компоновка, автотесты в браузере и учения | 2,0 | локально |
+| Б4. `edge`, компоновка, автотесты в браузере и учения | 2,25 | локально |
 | Б5. Выкладка | 0,5 | сервер |
 | Б6. Живые проверки и учения | 1,25 | сервер |
 | Б7. Закрытие дня | 1,25 | — |
-| **Критический путь** | **11,5** | |
+| **Критический путь** | **12,0** | |
 
-**Черта отсечения — 4,5 ч от начала дня.** К черте должны быть зелёны Б0–Б4: 8,5 ч по шкале,
-≈2,6 ч при 0,30. Черта ловит темп хуже ≈0,53. После черты — Б5 → Б6 → Б7.
+**Черта отсечения — 4,75 ч от начала дня.** К черте должны быть зелёны Б0–Б4: 9,0 ч по шкале,
+≈2,7 ч при 0,30. Черта ловит темп хуже ≈0,53. После черты — Б5 → Б6 → Б7.
 
 Если Б4 не зелёна к черте — выкладки нет. Видимый результат — снимки локального стенда
 (предупреждение, строка с отчётами). Владельцу — строка о сдвиге Д7 на полдня.
@@ -1716,12 +1891,17 @@ def test_web_row_and_drill(stack):                                              
   - ответ 204, повторное подтверждение — тоже 204;
   - иной `notice` — 400 `bad_body`;
   - строка журнала `gw notice ack login=… notice=…`.
-- `accounts list` — столбец «предупреждён» (`да`/`нет`).
+- `accounts list` — столбец «предупреждён» (`да`/`нет`). `accounts remove` стирает и строки
+  `gw_notices` этого логина (раунд 2, Minor 6): учётка, заведённая заново с тем же логином (пробы
+  `dN-probe-*`), видит предупреждение снова, а не наследует чужое подтверждение.
 - Новая редакция текста — новый `NOTICE`: студент подтверждает снова.
 - Место не будится, пока `notice` не `null`:
-  - в чате — фаза `notice` перед `workplace`;
-  - на странице входа (`login.js`) — после входа и при уже открытой сессии она читает `/me`, и
-    при `notice != null` сразу ведёт в `/chat/` без `wake`.
+  - в чате — фаза `notice` перед `workplace`. Поля `notice` нет (старый `core`) — как `null`
+    (`== null`); 404 на `POST …/notice` — экран остаётся, чат не ломается (раунд 2, Minor 5);
+  - на странице входа (`login.js`) — после входа и при уже открытой сессии она читает `/me`:
+    - `notice != null` — сразу `/chat/` без `wake`;
+    - `/me` не 200 (503 `store`, сеть) — текст ошибки и ссылка «Открыть чат», **без** `wake`
+      (раунд 2, В4). Решит чат со своим экраном «Повторить».
 
 **Д6-R50 — отчёты браузеров.**
 - `POST /pcbk/api/web/report` с телом ровно `{"kind": K}`,
@@ -1757,14 +1937,19 @@ def test_web_row_and_drill(stack):                                              
   сторожа и `core` не важен.
 
 **Д6-R51 — молчание в браузере.**
-- **`boot_failed` — загрузчик `web/public/assets/boot.js`** (копируется Vite как есть в
-  `chat/assets/boot.js`, попадает в опись):
+- **`boot_failed` — загрузчик `web/public/boot.js`** (Vite копирует его как есть в `chat/boot.js`;
+  в опись он попадает, потому что `build.json` строится с диска). Имя без хеша, поэтому он
+  отдаётся с `no-store` своей `location = /chat/boot.js`, а не из кэшируемых `assets/`:
   - классический скрипт на ES5, без модулей, без стрелок и без `fetch` (`XMLHttpRequest`);
-  - подключается в `index.html` как `<script src="/chat/assets/boot.js"></script>` раньше
-    модуля;
-  - до вызова `window.__pcbkStarted()`: `error` или `unhandledrejection` на `window` — либо
-    20 с без старта — один отчёт `boot_failed` и текст в `#root`: «Чат не запустился в этом
-    браузере. Сообщите преподавателю — сбой отмечен.»;
+  - подключается в `index.html` как `<script src="/chat/boot.js"></script>` раньше модуля;
+  - до вызова `window.__pcbkStarted()` отчёт вызывают:
+    - `error` на `window` в фазе захвата (так ловится и сбой загрузки самого бандла);
+    - `unhandledrejection`;
+    - 20 с без старта, считая от `DOMContentLoaded` (раунд 2, В3). Модульный скрипт выполняется
+      до `DOMContentLoaded`, поэтому медленная загрузка бандла таймер не запускает.
+
+    Отчёт `boot_failed` — один, плюс текст в `#root`: «Чат не запустился в этом браузере.
+    Сообщите преподавателю — сбой отмечен.»;
   - `App` зовёт `window.__pcbkStarted()` после первого показа;
   - после старта загрузчик ничего не делает: сбои React ловит `ErrorBoundary`, а необработанные
     отклонения промисов работающего чата не считаются (ложные срабатывания).
@@ -1778,12 +1963,14 @@ def test_web_row_and_drill(stack):                                              
 - **`ui_crash`.** `ErrorBoundary` вокруг чата: отчёт, текст «Чат столкнулся с ошибкой. Сбой
   отмечен для администратора.» и кнопка «Перезапустить чат» (перемонтирование).
 - **`stream_down`.** Поток не открыт дольше `STREAM_DOWN_S = 120` подряд, при смонтированном
-  чате с открытым разговором. Отчёт уходит **при восстановлении** потока: пока связи нет, отчёт
-  не дойдёт. Один отчёт на эпизод.
-- Отчёт — `api.report(kind)`. Ответ отчёта не показывается, ошибка отчёта не повторяется.
+  чате с открытым разговором. Отчёт уходит **при восстановлении** потока (`onStream` с
+  `last: "ok"`): пока связи нет, отчёт не дойдёт. Один отчёт на эпизод.
+- Отчёт — `api.report(kind)`. Ответ отчёта не показывается, ошибка отчёта (в том числе 404
+  старого `core`) не повторяется.
 
 **Д6-R52 — список разговоров.**
-- Слева — `ThreadListPrimitive.Items` без архивных, «Новый разговор» и у элемента:
+- Слева — `ThreadListPrimitive.Items` без архивных и «Новый разговор». Каждая строка несёт
+  `data-session-id` (id разговора OpenCode): по нему её находят тесты. У элемента:
   - «В архив» — `ThreadListItemPrimitive.Archive`;
   - «Переименовать» — поле в строке. `ThreadListItemRuntime.rename(title)`
     (`@assistant-ui/core@0.3.21`, `runtime/api/thread-list-item-runtime.ts:110`), 1–200 знаков,
@@ -1804,7 +1991,7 @@ def test_web_row_and_drill(stack):                                              
 
    Тесты:
    - задача Б2 — `test_notice_ack_rules`, `notice_blocks_chat_until_ack`,
-     `login_does_not_wake_before_notice` (`login.test.mjs`);
+     `login_does_not_wake_before_notice`, `me_failure_after_login_does_not_wake` (`login.test.mjs`);
    - задача Б4 — `test_first_login_notice`.
 2. **Ручка отчётов как канал шума.** Произвольный `kind`, свободный текст, тело на 1 МБ,
    сотня отчётов в минуту, отчёт без сессии. Ожидание: считаются только четыре вида, не чаще раза
@@ -1822,13 +2009,13 @@ def test_web_row_and_drill(stack):                                              
    (`/health/web` 404); `core :d6b` при стороже `:d6a`. Ожидание: `core` стартует, строка не
    краснеет ложно.
    Тесты:
-   - задача Б1 — `test_web_row_without_reports`, `test_web_reports_keep_tick_deadline`;
+   - задача Б1 — `test_web_row_without_reports`, `test_web_reports_keep_check_deadline`;
    - задача Б2 — `test_store_opens_d5_db`.
 
 ## Карта файлов Д6б
 
 ```
-core/pcbk_core/gateway/accounts.py    + gw_notices, NOTICE, notice_acked, ack_notice, столбец в list
+core/pcbk_core/gateway/accounts.py    + gw_notices, NOTICE, notice_acked, ack_notice, столбец в list; remove стирает notices
 core/pcbk_core/gateway/api.py         me + "notice" (503 store при сбое); POST /pcbk/api/auth/notice
 core/pcbk_core/gateway/web.py         web_router: POST /pcbk/api/web/report, GET /health/web; WebReports
 core/pcbk_core/gateway/__init__.py    + web_router (до catch-all), reports в роли
@@ -1836,10 +2023,10 @@ core/tests/test_gw_accounts.py, test_gw_api.py, test_gw_web.py
 watchdog/pcbk_watchdog/checks.py      check_web(..., reports_url=None) — таблица Д6-R50, тот же срок
 watchdog/pcbk_watchdog/main.py        KINDS["web"] + необязательный reports_url
 watchdog/components.json              + reports_url
-edge/pcbk.conf.template               + limit_req_zone pcbk_web (по cookie); location = /pcbk/api/web/report
-edge/static/login.js                  после входа — /me; notice != null → /chat/ без wake
+edge/pcbk.conf.template               + limit_req_zone pcbk_web (по cookie); location = /pcbk/api/web/report; = /chat/boot.js (no-store, CSP)
+edge/static/login.js                  после входа — /me; notice != null → /chat/ без wake; /me не 200 → текст и ссылка, без wake
 edge/tests/login.test.mjs             (+)
-web/public/assets/boot.js             загрузчик ES5: boot_failed до старта
+web/public/boot.js                    загрузчик ES5: boot_failed до старта (в сборке — chat/boot.js, no-store)
 web/tests/boot.test.mjs               node --test загрузчика
 web/index.html, web/scripts/check-dist.mjs   классический boot.js перед модулем; check-dist пропускает только его
 web/src/api.ts                        + ackNotice, report
@@ -1848,7 +2035,7 @@ web/src/App.tsx                       + фаза notice, __pcbkStarted
 web/src/components/NoticeScreen.tsx, ErrorBoundary.tsx, ThreadSidebar.tsx; Chat.tsx (+ watch, sidebar)
 web/tests/watch.test.ts, App.test.tsx (+), Sidebar.test.tsx
 compose.yaml                          core и сторож :d6b
-tests/integration/cdp.py              + rename_first_thread, open_first_thread, has_text, close
+tests/integration/cdp.py              + rename_thread(sid, title), open_thread(sid), click_text_in, has_text, close
 tests/integration/test_web.py         (+) предупреждение, список разговоров, четвёртая вкладка, отчёты — последним
 tests/integration/test_edge.py        + /pcbk/api/web/report, IMAGES :d6b
 docs/checks/D6b.md, docs/checks/D6b/*.png
@@ -1870,7 +2057,7 @@ docs/checks/D6b.md, docs/checks/D6b/*.png
 
 **Files:**
 - Create: `core/pcbk_core/gateway/web.py`, `core/tests/test_gw_web.py`,
-  `web/public/assets/boot.js`, `web/tests/boot.test.mjs`
+  `web/public/boot.js`, `web/tests/boot.test.mjs`
 - Modify: `core/pcbk_core/gateway/__init__.py`, `watchdog/pcbk_watchdog/checks.py`,
   `watchdog/pcbk_watchdog/main.py`, `watchdog/components.json`, `web/index.html`,
   `web/scripts/check-dist.mjs`, `web/package.json` (скрипт `test` — ещё `node --test tests/*.test.mjs`)
@@ -1878,7 +2065,7 @@ docs/checks/D6b.md, docs/checks/D6b/*.png
 
 **Interfaces:**
 - Consumes: `front_only`, `configured`, `current_account`, `origin_checked`, `gw_error`
-  (`api.py`, Д5а); реестр маршрутов роли; `check_web` А1 со сроком.
+  (`api.py`, Д5а); реестр маршрутов роли; `check_web` и `_http_get(…, deadline=)` А1.
 - Produces:
   - `web.py`: `REPORT_KINDS = ("boot_failed", "ui_crash", "turn_silent", "stream_down")`,
     `WEB_REPORT_EVERY_S = 60`, `WEB_REPORT_MAX_BYTES = 256`;
@@ -1887,13 +2074,15 @@ docs/checks/D6b.md, docs/checks/D6b/*.png
     - `counts_1h(now: float) -> dict[str, int]`;
   - `web_router(role) -> APIRouter` — `POST /pcbk/api/web/report`, `GET /health/web` (Д6-R50);
     отказы — через `hooks_of(app).http_exception`;
-  - `check_web(component, title, url, timeout=…, deadline=None, reports_url: str | None = None) -> Check`
-    — запрос отчётов последним и в том же общем сроке;
+  - `check_web(component, title, url, timeout=…, reports_url: str | None = None) -> Check` — запрос
+    отчётов последним и с тем же абсолютным сроком проверки (`start + HTTP_CHECK_SPANS × timeout`);
+    срок вышел до отчётов — «отчёты браузеров недоступны»;
   - `KINDS["web"]` — прежние обязательные ключи, `reports_url` — необязательный (проверка в
     `load_components`: строка `http://…`);
   - `boot.js`: глобальная `window.__pcbkStarted()`; для тестов под Node — фабрика
-    `__pcbkBoot(win, xhrFactory, setTimeoutImpl)`, которую файл зовёт сам с настоящими
-    `window`, `XMLHttpRequest` и `setTimeout`.
+    `__pcbkBoot(win, doc, xhrFactory, setTimeoutImpl)`, которую файл зовёт сам с настоящими
+    `window`, `document`, `XMLHttpRequest` и `setTimeout`. Таймер 20 с стартует на
+    `DOMContentLoaded` документа; `error` слушается на `window` в фазе захвата.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1952,30 +2141,34 @@ def test_web_row_without_reports(web_site, fake_core):                          
     (root / "chat/index.html").unlink()                                               # статика важнее отчётов
     assert row(check_web("web", "Веб-чат", url, reports_url=u))[0] == "fail"
 
-def test_web_reports_keep_tick_deadline(web_site, fake_core):                        # Important 3
+def test_web_reports_keep_check_deadline(web_site, fake_core):                       # раунд 1 Important 3, раунд 2 В1
     root, url = web_site; put_build(root)
-    fake_core.set("/health/web", 200, {}, delay_s=5)                                  # /health/web тянет 5 с
+    fake_core.set("/health/web", 200, {}, delay_s=10)                                 # /health/web тянет 10 с
     t0 = time.monotonic()
-    r = check_web("web", "Веб-чат", url, timeout=3.0, deadline=time.monotonic() + 1.0, reports_url=fake_core.url("/health/web"))
-    assert time.monotonic() - t0 < 1.0 + 3.0 + 0.5
+    r = check_web("web", "Веб-чат", url, timeout=3.0, reports_url=fake_core.url("/health/web"))
+    assert time.monotonic() - t0 < 2 * 3.0 + 0.5                                     # статика и отчёты — в одном сроке
     assert row(r) == ("ok", "страница чата отдаётся", "сборка abc123; отчёты браузеров недоступны")
 ```
 
 ```js
 // web/tests/boot.test.mjs — node --test; окно, XMLHttpRequest и таймер подменены
-test('boot_reports_once_on_timeout', () => { /* 20 с без __pcbkStarted → один POST {"kind":"boot_failed"}, текст в #root */ });
+test('boot_reports_once_on_timeout', () => { /* DOMContentLoaded, затем 20 с без __pcbkStarted → один POST {"kind":"boot_failed"}, текст в #root */ });
+test('boot_timer_starts_at_dom_content_loaded', () => { /* 60 с до DOMContentLoaded (медленный бандл) и старт сразу после — отчёта нет */ });
+test('boot_catches_bundle_load_error', () => { /* событие error ресурса (фаза захвата) до старта → отчёт */ });
 test('boot_reports_once_on_error_before_start', () => { /* error до старта → отчёт; второй error и таймер → больше ни одного */ });
 test('boot_silent_after_start', () => { /* __pcbkStarted(); затем error, unhandledrejection и 20 с → ни одного отчёта */ });
 test('boot_is_es5', () => { /* текст файла без «=>», «let », «const », «class », «`» и import/export */ });
 ```
 
-  `checkDist.test.ts` (+): классический `<script src="/chat/assets/boot.js">` без `type` —
+  `checkDist.test.ts` (+): классический `<script src="/chat/boot.js">` без `type` —
   допустим; любой другой классический `<script src>` — ошибка.
 
   `fake_core.set(..., delay_s=)` — если у фикстуры нет задержки, добавляется.
 - [ ] **Step 2: Run** — `(cd core && CORE_PYTEST tests/test_gw_web.py); (cd watchdog && uv run --python 3.12 --with pytest pytest -q tests/test_checks.py); (cd web && npm test)`. Expected: FAIL.
 - [ ] **Step 3: Implement по Interfaces.** Маршрут ставится до ловящего `catch_all_router`. Тело
   читается не больше `WEB_REPORT_MAX_BYTES + 1` байт. `index.html` — `boot.js` перед модулем.
+  До Б4 у `edge` нет `location = /chat/boot.js`, и загрузчик отвечает 404. Это безвредно: он
+  просто не работает, чат запускается, а 404 сети в `console_errors` не считается.
 - [ ] **Step 4: Run** — `(cd core && CORE_PYTEST) && (cd watchdog && uv run --python 3.12 --with pytest pytest -q && node --test tests/js/*.test.mjs) && (cd web && npm test && PCBK_BUILD=dev npm run build)`. Expected: PASS.
 - [ ] **Step 5: Commit** — `git add core/ watchdog/ web/ && git commit -m "Шлюз: отчёты браузеров о молчании чата и строки сторожа; загрузчик чата" -- core/ watchdog/ web/`.
 
@@ -1987,8 +2180,9 @@ test('boot_is_es5', () => { /* текст файла без «=>», «let », «
 - Modify: `core/pcbk_core/gateway/accounts.py`, `core/pcbk_core/gateway/api.py`,
   `web/src/api.ts`, `web/src/App.tsx`, `web/src/texts.ts`, `edge/static/login.js`
 - Create: `web/src/components/NoticeScreen.tsx`
-- Test: `core/tests/test_gw_accounts.py` (+2), `core/tests/test_gw_api.py` (+2),
-  `web/tests/App.test.tsx` (+1), `edge/tests/login.test.mjs` (+2)
+- Test: `core/tests/test_gw_accounts.py` (+3), `core/tests/test_gw_api.py` (+2),
+  `web/tests/App.test.tsx` (+2), `edge/tests/login.test.mjs` (+3; прежние тесты входа отвечают
+  после входа вторым `/me` без `notice` — раунд 2, Minor 8)
 
 **Interfaces:**
 - Produces:
@@ -1996,13 +2190,17 @@ test('boot_is_es5', () => { /* текст файла без «=>», «let », «
     - `NOTICE = "teacher-reads-1"`;
     - `AccountStore.notice_acked(login: str, notice: str) -> bool` (сбой — `StoreError`);
     - `AccountStore.ack_notice(login: str, notice: str) -> None`;
-    - в `list` — столбец «предупреждён»;
+    - в `list` — столбец «предупреждён»; `remove` стирает строки `gw_notices` логина;
   - `api.py`: `me` → `{**account.to_json(), "notice": NOTICE | None}`, при `StoreError` — 503
     `store`; `POST /pcbk/api/auth/notice` — Д6-R49;
   - `web/src/api.ts`: `Api.ackNotice(notice: string): Promise<Reply>`;
   - `App`: фаза `notice` — `NoticeScreen({ text, onAck })` между `me` и `workplace`;
-  - `login.js`: после удачного входа и при открытой сессии — `GET /pcbk/api/auth/me`; при
-    `notice != null` — `navigate("/chat/")` без `wake`; иначе — как в Д6а.
+  - `App`: отсутствие поля `notice` — как `null` (`== null`); 404 на `ackNotice` — экран
+    остаётся с текстом ошибки (раунд 2, Minor 5);
+  - `login.js`: после удачного входа и при открытой сессии — `GET /pcbk/api/auth/me`:
+    - `notice != null` — `navigate("/chat/")` без `wake`;
+    - `/me` не 200 или сеть — текст ошибки и показ ссылки «Открыть чат», без `wake` (раунд 2, В4);
+    - иначе — как в Д6а.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2016,6 +2214,11 @@ def test_store_opens_d5_db(tmp_path):                                           
     assert store.notice_acked("stu-03", NOTICE) and not store.notice_acked("stu-03", "teacher-reads-2")
 
 def test_list_shows_notice_column(tmp_path, capsys): ...                             # «да»/«нет» у студентов
+
+def test_remove_clears_notices(tmp_path):                                            # раунд 2, Minor 6
+    store = open_store(tmp_path); store.add("d6-probe-n", "student", 9, PW); store.ack_notice("d6-probe-n", NOTICE)
+    store.disable("d6-probe-n"); store.remove("d6-probe-n")
+    assert store.notice_acked("d6-probe-n", NOTICE) is False                        # новая учётка с тем же логином спросит снова
 
 # core/tests/test_gw_api.py (+) — помощники Д5а: make_gateway, login, ORIGIN, PW; адрес FRONT
 def test_notice_ack_rules(tmp_path):                                                 # Review Focus 1
@@ -2058,12 +2261,18 @@ test("notice_blocks_chat_until_ack", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Понятно" }));
   await screen.findByTestId("fake-chat"); expect(a.ackNotice).toHaveBeenCalledWith("teacher-reads-1");
 });
+test("old_core_without_notice_field_goes_on", async () => {                      // раунд 2, Minor 5
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03" }]], workplace: [[200, { state: "ready" }]] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat"); expect(a.ackNotice).not.toHaveBeenCalled();
+});
 ```
 
 ```js
 // edge/tests/login.test.mjs (+)
 test('login_does_not_wake_before_notice', async () => { /* вход 200 → /me с notice → navigate('/chat/'), POST wake не было */ });
 test('open_session_with_notice_goes_to_chat', async () => { /* страница открыта с сессией, /me с notice → navigate('/chat/') без wake */ });
+test('me_failure_after_login_does_not_wake', async () => { /* вход 200, /me 503 store (и отдельно — сеть) → текст ошибки, #to-chat видим, wake не было */ });
 ```
 
 - [ ] **Step 2: Run** — `(cd core && CORE_PYTEST tests/test_gw_accounts.py tests/test_gw_api.py); (cd web && npm test); node --test edge/tests/*.test.mjs`. Expected: FAIL.
@@ -2086,6 +2295,8 @@ test('open_session_with_notice_goes_to_chat', async () => { /* страница 
   - `createTurnWatch(o: { now(): number; onSilent(): void; silentS?: number /* 180 */ }): { started(): void; progress(fingerprint: string): void; ended(): void; tick(): void }`.
     `tick` зовётся раз в секунду и на `visibilitychange`; отчёт — один на ход.
   - `createStreamWatch(o: { now(): number; onRecoveredAfterLongDown(): void; downS?: number /* 120 */ }): { onStream(s: StreamState): void }`.
+    Связь потеряна — `last !== "ok"`, восстановлена — `last === "ok"` (по `failures` нельзя: после
+    200 обёртка его не сбрасывает, Д6-R43).
 - `Api.report(kind: "boot_failed" | "ui_crash" | "turn_silent" | "stream_down"): Promise<void>` —
   ошибки глушатся.
 - `ThreadSidebar()` — Д6-R52; `ErrorBoundary({ onCrash, children })`.
@@ -2108,17 +2319,17 @@ test("turn_watch_progress_resets_and_end_stops", () => {
 test("turn_watch_background_tab_uses_clock", () => { /* tick не звали 200 с (фон), затем visibilitychange → tick → отчёт */ });
 test("stream_watch_reports_on_recovery_only", () => {
   let t = 0; const on = vi.fn(); const w = createStreamWatch({ now: () => t, onRecoveredAfterLongDown: on });
-  w.onStream({ failures: 1, nextRetryS: 1, last: "down" }); t = 60_000; w.onStream({ failures: 0, nextRetryS: null, last: "ok" });
+  w.onStream({ failures: 1, nextRetryS: 1, last: "down" }); t = 60_000; w.onStream({ failures: 1, nextRetryS: null, last: "ok" });
   expect(on).not.toHaveBeenCalled();                                                  // 60 с — коротко
   w.onStream({ failures: 1, nextRetryS: 1, last: "down" }); t = 190_000; w.onStream({ failures: 5, nextRetryS: 30, last: "down" });
   expect(on).not.toHaveBeenCalled();                                                  // пока нет связи — нет отчёта
-  w.onStream({ failures: 0, nextRetryS: null, last: "ok" }); expect(on).toHaveBeenCalledTimes(1);
+  w.onStream({ failures: 5, nextRetryS: null, last: "ok" }); expect(on).toHaveBeenCalledTimes(1);   // восстановление — по last, счёт сбросит только долгий поток
 });
 ```
 
 ```tsx
 // web/tests/Sidebar.test.tsx — runtime с адаптером списка из памяти
-test("sidebar_shows_active_only_and_no_unarchive_or_delete", () => { /* архивный не виден; нет «Из архива», «Удалить» */ });
+test("sidebar_shows_active_only_and_no_unarchive_or_delete", () => { /* архивный не виден; нет «Из архива», «Удалить»; у строк data-session-id */ });
 test("sidebar_rename_limits", async () => { /* "" и 201 знак — rename не зван, подсказка; 200 знаков — rename("…") */ });
 test("error_boundary_reports_crash_and_restarts", () => { /* потомок бросает → report("ui_crash") 1 раз, «Перезапустить чат» → перемонтирование */ });
 test("app_marks_started_once", () => { /* после первого показа App зовёт window.__pcbkStarted ровно один раз */ });
@@ -2147,9 +2358,12 @@ test("app_marks_started_once", () => { /* после первого показа
 - Produces:
   - `edge` — `limit_req_zone $pcbk_oc_session zone=pcbk_web:1m rate=1r/s;` и
     `location = /pcbk/api/web/report { default_type application/json; if ($pcbk_bad_api_uri) {…}; limit_req zone=pcbk_web burst=10 nodelay; limit_req_status 429; client_max_body_size 1k; proxy_read_timeout 10s; proxy_pass http://$pcbk_core; }`;
+  - `edge` — `location = /chat/boot.js` (загрузчик без хеша: `Cache-Control: no-store`, CSP,
+    `nosniff`, `Referrer-Policy`, `try_files /chat/boot.js =404`);
   - `cdp.py` (+):
-    - `Page.rename_first_thread(title)` — поле «Переименовать» первой строки списка и Enter;
-    - `Page.open_first_thread()` — щелчок по первой строке списка;
+    - `Page.rename_thread(sid, title)` — поле «Переименовать» строки `[data-session-id=sid]` и
+      Enter;
+    - `Page.open_thread(sid)` — щелчок по строке `[data-session-id=sid]`;
     - `Page.has_text(pattern, within=0) -> bool` — `True`, если текст появился за `within` с;
     - `Page.close()`;
   - помощники модуля:
@@ -2177,16 +2391,17 @@ def test_first_login_notice(stack, browser, web_users):                         
     assert [r for r in page.requests("/pcbk/api/workplace") if r["method"] == "POST"] == []   # ни вход, ни чат не будили
     assert page.requests("/pcbk/api/oc/") == []
     page.click_text("Понятно"); page.wait_gone(r"Преподаватель видит ваши разговоры", 30)
-    page.wait_text(r"Вы вошли как web-a", 60)
+    page.wait_selector("textarea", 90)                                              # поле чата, не шапка (Minor 7)
     assert "да" in stack.accounts_list_row("web-a")
 
 def test_rename_and_archive_through_gateway(stack, browser, web_users):               # Review Focus 4
     before = stack.gw_health()["refused_1h"]
     page = browser.page(); login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)
     sid = last_session(stack, 9)
-    page.rename_first_thread("Проверка Д6б")
+    wait_for(lambda: not session_of(stack, 9, sid)["title"].startswith("New session - "), timeout=60)  # самозаголовок — до ручного
+    page.rename_thread(sid, "Проверка Д6б")                                          # строка по id, не «первая» (Minor 9)
     wait_for(lambda: session_of(stack, 9, sid)["title"] == "Проверка Д6б", timeout=20)
-    page.click_text("В архив")
+    page.click_text_in(f'[data-session-id="{sid}"]', "В архив")
     wait_for(lambda: session_of(stack, 9, sid).get("time", {}).get("archived") is not None, timeout=20)
     page.wait_gone("Проверка Д6б", 10)
     assert stack.gw_health()["refused_1h"] == before
@@ -2194,9 +2409,10 @@ def test_rename_and_archive_through_gateway(stack, browser, web_users):         
 def test_fourth_tab_told_to_close(stack, browser, web_users):                        # хвост Д5б, 429 streams; Б-2
     pages = [browser.page() for _ in range(4)]
     login_to_chat(pages[0], "web-a", web_users["web-a"]); ask(pages[0], Q)          # разговор открыт — поток есть
+    sid = last_session(stack, 9)
     for p in pages[1:]:
-        p.goto(f"{STAND}/chat/"); p.wait_url("/chat/", 30); p.wait_text(r"Вы вошли как web-a", 60)
-        p.open_first_thread()                                                          # тот же разговор — свой поток у вкладки
+        p.goto(f"{STAND}/chat/"); p.wait_url("/chat/", 30); p.wait_selector(f'[data-session-id="{sid}"]', 60)
+        p.open_thread(sid)                                                             # тот же разговор — свой поток у вкладки
     pages[3].wait_text(r"Открыто слишком много вкладок чата — закройте лишние", 60)
     pages[1].close()
     pages[3].wait_gone(r"закройте лишние", 45)                                         # следующая попытка по паузе прошла
@@ -2211,12 +2427,16 @@ def test_reports_reach_row(stack, browser, web_users):                          
 ```
 
   Остальные тесты модуля перед входом зовут `ensure_notice_acked(stack, "web-a")`.
-  `test_edge.py`: `POST /pcbk/api/web/report` через `edge` без сессии — 401 JSON; тело 2 КиБ — 413
-  JSON; путь `/pcbk/api/web/other` — 404 JSON; `IMAGES` — `:d6b`.
+  `test_edge.py`:
+  - `POST /pcbk/api/web/report` через `edge` без сессии — 401 JSON; тело 2 КиБ — 413 JSON;
+  - путь `/pcbk/api/web/other` — 404 JSON;
+  - `/chat/boot.js` — 200, `Cache-Control: no-store`, CSP чата;
+  - `IMAGES` — `:d6b`.
+  `cdp.py` (+): `Page.click_text_in(css, text)` — кнопка с текстом внутри элемента.
 - [ ] **Step 2: Run** — `uv run --python 3.12 --with pytest pytest -q tests/integration/test_edge.py tests/integration/test_web.py`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Полный прогон** — как А7, шаг 4, со снимками ID
-  (`watchdog:d6a`, `student:d6a`, `core:d5b` не изменились). Expected: PASS, ноль пропусков в
+- [ ] **Step 4: Полный прогон** — как А7, шаг 4, по очереди с Д5б, со снимками ID
+  (`watchdog:d6a`, `core:d6a`, `student:d6a`, `core:d5b` не изменились). Expected: PASS, ноль пропусков в
   `test_web`.
 - [ ] **Step 5: Снимки (тестовый стенд):**
   - `01-notice.png` — предупреждение;
@@ -2234,13 +2454,14 @@ def test_reports_reach_row(stack, browser, web_users):                          
 - [ ] **Step 1:** Как А8, шаги 1–2:
   - закреплённый коммит `C` ветки `d6b/web-notice`;
   - образы `core:d6b` и `watchdog:d6b` из `git archive $C`;
-  - статика чата — в `chat.new`, сверка сумм, `mv chat chat.d6a && mv chat.new chat`;
-  - `scp edge/static/login.js`;
+  - статика чата — в `chat.new` со сверкой сумм, но **на место встаёт последней** (шаг 2);
   - копии `compose.yaml.d6a` и шаблона `edge` для отката.
-- [ ] **Step 2: Службы.**
-  1. `docker compose restart edge` — новая зона и `location` отчётов.
+- [ ] **Step 2: Службы (раунд 2, Minor 5: статика и `login.js` — после `core:d6b`).**
+  1. `scp` шаблона `edge`, `docker compose restart edge` — новая зона, `location` отчётов и
+     загрузчика. Старый `core` на отчёт отвечает 404 — терпимо.
   2. `docker compose up -d --no-build watchdog` → `stale: false`.
-  3. `docker compose up -d --no-build core` → `healthy`, 13 сетей.
+  3. `docker compose up -d --no-build core` → `healthy`, 13 сетей; `/me` отдаёт `notice`.
+  4. Статика: `mv chat chat.d6a && mv chat.new chat`, затем `scp edge/static/login.js`.
 
   Места не пересоздаются: образ места в Д6б не меняется.
   Expected: строка «Веб-чат» `ok`, «сборка <build Д6б>», без «отчёты недоступны»; «Шлюз и вход» в
@@ -2288,10 +2509,12 @@ def test_reports_reach_row(stack, browser, web_users):                          
 
   Петля — до нуля блокеров.
 - [ ] **Step 3: Слияние — после `platform-d6a`.** Перебазирование, повтор Б4, шаг 4, `main`, тег
-  `platform-d6b`, сверка тега с выложенным коммитом (как А10), проверка на секреты и
+  `platform-d6b`, сверка тега с выложенным коммитом:
+  `git diff --quiet $C platform-d6b -- web core student watchdog edge compose.yaml` → `0`
+  (раунд 2, В5); проверка на секреты и
   `git ls-files` (как А10), пуш, чистый клон.
-- [ ] **Step 4: План и факт** — `pace "$(msg 'Шлюз: отчёты браузеров')" "$(msg 'Веб-чат Д6б в компоновке')" 5.75`
-  (задачи Б2–Б4); полное время — справочно.
+- [ ] **Step 4: План и факт** — `pace "$(msg 'Шлюз: отчёты браузеров')" "$(msg 'Веб-чат Д6б в компоновке')" 6.25`
+  (задачи Б2–Б4: 2,0 + 2,0 + 2,25); полное время — справочно.
 - [ ] **Step 5: Владельцу** — «Д6 готов»: снимки `01`–`06`. Вопросы — строки 3–4 раздела ниже,
   если ответа нет.
 
