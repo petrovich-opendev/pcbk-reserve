@@ -362,19 +362,33 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     "limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;",
     "set $pcbk_core pcbk-core:8000;",
     "proxy_set_header X-Forwarded-Host $host;",
+    'proxy_set_header X-Forwarded-For "";',
+    'proxy_set_header X-Real-IP "";',
+    'proxy_set_header Forwarded "";',
     "proxy_buffer_size 32k;",
     "proxy_buffers 8 32k;",
     "proxy_busy_buffers_size 64k;",
     "error_page 400 /pcbk-errors/400.json;",
     "error_page 405 /pcbk-errors/405.json;",
     "error_page 413 /pcbk-errors/413.json;",
+    "error_page 414 /pcbk-errors/414.json;",
+    "error_page 494 =400 /pcbk-errors/400.json;",
     "error_page 429 /pcbk-errors/429.json;",
     "error_page 502 503 504 =503 /pcbk-errors/503.json;",
     'if ($host !~* "^[a-z0-9-]{1,63}(\\.[a-z0-9-]{1,63}){0,5}$") { rewrite ^ /pcbk-errors/host.json last; }',
   ]) assert.ok(conf.includes(line), line);
 
+  for (const l of locs) {                                                              // всё это — уровень server
+    assert.doesNotMatch(l.body, /error_page[^;]*pcbk-errors/, l.path);
+    assert.doesNotMatch(l.body, /proxy_set_header/, l.path);
+  }
+  for (const h of ["Connection", "X-Forwarded-Host", "X-Forwarded-For", "X-Real-IP", "Forwarded"]) {
+    assert.equal(conf.match(new RegExp(`proxy_set_header ${h} `, "g"))?.length, 1, h);  // заголовки клиента к core не доходят
+  }
+
   for (const [code, name] of [["400", "BadRequest"], ["405", "MethodNotAllowed"], ["413", "PayloadTooLarge"],
-                              ["429", "TooManyAttempts"], ["503", "Unavailable"], ["host", "BadRequest"]]) {
+                              ["414", "URITooLong"], ["429", "TooManyAttempts"], ["503", "Unavailable"],
+                              ["host", "BadRequest"]]) {
     const l = loc(`/pcbk-errors/${code}.json`);
     assert.ok(l && l.exact, code);
     assert.match(l.body, /\binternal;/, code);                                         // снаружи не видны
@@ -391,8 +405,13 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
   }
 
   const proxied = ["/pcbk/api/auth/", "/pcbk/api/workplace", "/pcbk/api/workplace/wake"];
-  assert.deepEqual(locs.filter((l) => l.body.includes("proxy_pass")).map((l) => l.path).filter((p) => p.startsWith("/pcbk")),
-                   proxied);                                                            // в core — только пути шлюза
+  const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
+  assert.equal(passes.length, conf.match(/proxy_pass\b/g).length);                     // каждый proxy_pass — внутри location
+  assert.equal(new Set(passes.map(([path]) => path)).size, passes.length);              // по одному на location
+  assert.deepEqual(Object.fromEntries(passes), {                                        // в core — только пути шлюза
+    "/status": "http://$pcbk_watchdog", "/status.js": "http://$pcbk_watchdog", "/status.json": "http://$pcbk_watchdog",
+    ...Object.fromEntries(proxied.map((path) => [path, "http://$pcbk_core"])),
+  });
   assert.equal(loc("/pcbk/api/auth/").exact, false);
   assert.equal(loc("/pcbk/api/workplace").exact, true);
   assert.equal(loc("/pcbk/api/workplace/wake").exact, true);
