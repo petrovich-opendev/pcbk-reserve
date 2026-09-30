@@ -5,6 +5,7 @@
 метке, даже при сбое. Чужие контейнеры, сети и тома мест с нашими именами тест не
 трогает — отказывается запускаться.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -47,6 +48,9 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
 # белый список стенда — одно синтетическое имя
 TEST_WHITELIST = ("20FAKE_001_PV",)
+# токен службы данных места 01: не 48 шестнадцатеричных знаков — шаблон проверки на секреты его не ловит;
+# в core-tokens — только его sha256
+TEST_CORE_TOKEN = "test-token-student-01"
 # запрос изнутри сторожа: argv — метод и адрес; печатает код ответа
 WATCHDOG_REQUEST = """\
 import http.client, sys
@@ -131,11 +135,19 @@ def make_test_places(secrets_dir: Path, agents_root: Path) -> None:
         d.chmod(0o755)
 
 
+def token_line(caller: str, token: str) -> str:
+    """Строка таблицы хешей (core-tokens, llm-tokens): «<id> <sha256 токена>»."""
+    return f"{caller} {hashlib.sha256(token.encode()).hexdigest()}"
+
+
 def make_test_core_data(secrets_dir: Path, data_dir: Path) -> None:
-    """Как на сервере: bdrv.env — в каталоге секретов (0700), белый список — в DATA_DIR (0700); файлы 0444."""
+    """Как на сервере: bdrv.env и core-tokens — в каталоге секретов (0700), белый список — в DATA_DIR (0700);
+    файлы 0444."""
     data_dir.mkdir(mode=0o700)
     data_dir.chmod(0o700)
-    for f, lines in ((secrets_dir / "bdrv.env", TEST_BDRV_ENV), (data_dir / "whitelist.txt", TEST_WHITELIST)):
+    core_tokens = (token_line("student-01", TEST_CORE_TOKEN),)
+    for f, lines in ((secrets_dir / "bdrv.env", TEST_BDRV_ENV), (data_dir / "whitelist.txt", TEST_WHITELIST),
+                     (secrets_dir / "core-tokens", core_tokens)):
         f.write_text("\n".join(lines) + "\n", encoding="utf-8")
         f.chmod(0o444)
 
@@ -165,6 +177,8 @@ class Stack:
         self.stu_net: str = values["STU_NET"]
         self.secrets_dir = Path(values["SECRETS_DIR"])
         self.agents_root = Path(values["AGENTS_DIR"])
+        # токен службы данных места 01 (в core-tokens — его хеш)
+        self.core_token: str = TEST_CORE_TOKEN
         self._prod_config: dict | None = None
         # готовность после start/restart/unpause; прочим контейнерам хватает Running,
         # местам — healthy (wait_ready); места сюда не входят, up() их не ждёт
@@ -311,13 +325,17 @@ class Stack:
                          "--max-time", "20", "-X", method, url)
         return int(r.stdout.strip())
 
-    def http_host(self, method: str, url: str, body: dict | None = None) -> tuple[int, str]:
+    def http_host(self, method: str, url: str, body: dict | None = None,
+                  token: str | None = None) -> tuple[int, str]:
         """Запрос с хоста теста (адрес серверного слоя в pcbk-egress): urllib без прокси и перенаправлений.
 
-        Код ответа и тело; ответ с ошибкой HTTP — тоже результат, а не исключение.
+        token — заголовок Authorization: Bearer. Код ответа и тело; ответ с ошибкой HTTP — тоже результат,
+        а не исключение.
         """
         data = None if body is None else json.dumps(body).encode()
         headers = {} if body is None else {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
         try:
             with opener.open(urllib.request.Request(url, data=data, headers=headers, method=method),

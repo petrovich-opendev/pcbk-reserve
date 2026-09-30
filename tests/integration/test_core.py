@@ -54,6 +54,7 @@ def test_core_hardening(stack):
     assert hc["SecurityOpt"] == ["no-new-privileges:true"]
     assert c["Config"]["User"] == "10003:10003"
     assert (hc["Memory"], hc["PidsLimit"]) == (256 * 1024 * 1024, 128)
+    assert hc["Sysctls"] == {"net.ipv4.tcp_fastopen": "0"}                        # Д3б-R6
     assert hc["RestartPolicy"]["Name"] == "unless-stopped"
     assert set(hc["Tmpfs"]) == {"/tmp"}
 
@@ -70,6 +71,26 @@ def test_core_secret_and_list_are_readonly_files(stack):
 def test_oneshot_alias_keeps_sp_ctl_controls(stack):               # настоящий pcbk-core уже работает
     assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", "http://pcbk-sp-ctl:2375/v1.44/_ping") == 200
     assert stack.http_as("pcbk-intruder", "pcbk-ctl", "GET", "http://pcbk-sp-ctl:2375/v1.44/_ping") == 403
+
+
+def test_tool_over_egress_answers_and_journals(stack):
+    code, body = stack.http_host("POST", CORE + "/api/data/tag_now", {"tags": ["20FAKE_001_PV"]}, token=stack.core_token)
+    assert code == 200 and json.loads(body)["status"] == "unavailable"          # историана нет — словами
+    assert stack.http_host("POST", CORE + "/api/data/tag_now", {"tags": ["x"]})[0] == 401
+    assert "outcome=unauthorized channel=http" in stack.logs("pcbk-core")
+
+
+def test_core_state_volume_writable(stack):                                     # Review Focus 4
+    # в тестовом стенде bdrv.env целый — 1 направление (при config_error было бы «0 направлений», F3)
+    assert "охрана выхода: разрешено 1 направление" in stack.logs("pcbk-core")
+    # core.db создаётся в начале lifespan роли (F23) — файл есть до первого вызова инструмента
+    mounts = {m["Destination"]: m for m in stack.inspect("pcbk-core")["Mounts"]}
+    assert mounts["/var/lib/pcbk-core"]["Type"] == "volume"
+    assert (mounts["/run/secrets/core-tokens"]["Type"], mounts["/run/secrets/core-tokens"]["RW"]) == ("bind", False)
+    stack.exec("pcbk-core", "test", "-w", "/var/lib/pcbk-core")               # при отказе exec бросит исключение
+    assert stack.exec("pcbk-core", "stat", "-c", "%u", "/var/lib/pcbk-core/core.db") == "10003"
+    code, body = stack.http_host("GET", CORE + "/healthz/data")
+    assert code == 200 and json.loads(body)["ok"] is True
 
 
 def test_stop_core_turns_row_red_historian_unknown(stack):

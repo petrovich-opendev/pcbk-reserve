@@ -9,10 +9,13 @@ COPY requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir --require-hashes --no-deps -r /tmp/requirements.lock \
  && rm /tmp/requirements.lock
 
-# свой uid 10003; домашнего каталога нет, корень в компоновке — только для чтения
+# свой uid 10003; домашнего каталога нет, корень в компоновке — только для чтения.
+# Каталог журнала событий (core.db) — его: новый именованный том pcbk-core-data наследует
+# владельца каталога образа, без каталога том был бы root:root 0755 и core.db не создался бы
 RUN groupadd --gid 10003 pcbk-core \
  && useradd --uid 10003 --gid 10003 --no-create-home --home-dir /nonexistent \
-      --shell /usr/sbin/nologin pcbk-core
+      --shell /usr/sbin/nologin pcbk-core \
+ && install -d -o 10003 -g 10003 -m 0750 /var/lib/pcbk-core
 
 WORKDIR /app
 COPY pcbk_core /app/pcbk_core
