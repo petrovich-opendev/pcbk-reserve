@@ -59,6 +59,7 @@ def test_place_sees_no_gateway(stack, accounts):                                
     code, body = stack.from_place(1, "/health/llm")
     assert code == 200 and not set(MONEY) & set(json.loads(body))
     assert set(MONEY) <= set(stack.llm_health())                                       # администратор (pcbk-egress) видит
+    assert stack.http_from_core("GET", "http://127.0.0.1:8000/health/gateway") == 200  # петля — своя зона и по источнику
     stack.stop("pcbk-student-01")
 
 

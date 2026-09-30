@@ -2,13 +2,16 @@
 
 core слушает один uvicorn на 0.0.0.0:8000, и его видно на .2 каждой сети мест. uvicorn кладёт в
 scope["server"] локальный адрес соединения (getsockname), в scope["client"] — адрес источника; оба —
-адреса IP. Зона назначения:
+адреса IP. Зона — по обоим адресам сразу (итоговое ревью Д5а, M3): и назначение, и источник — в сетях зоны.
+Одного назначения мало: ядро принимает пакет на любой свой адрес с любого интерфейса, и клиент из сети места,
+добравшийся до адреса core в pcbk-front, получил бы ручки шлюза.
 - FRONT_NETS — pcbk-front (edge, сторож) и петля (проба здоровья, docker exec внутри core): ручки шлюза;
 - ADMIN_NETS — ещё pcbk-egress (сам core и хост сервера — администратор): /health/llm полностью.
 
-Закрыто при сомнении: scope["server"] = None или имя вместо адреса — чужая зона. Имя бывает только у
-клиента тестов в процессе (TestClient); своим его считает лишь приложение с пометкой
-app.state.zone_names_ok = True — её ставят помощники тестов, create_app — нет.
+Закрыто при сомнении: адреса нет (scope["server"] или scope["client"] = None) или имя вместо адреса — чужая
+зона. Имя бывает только у клиента тестов в процессе (TestClient: сервер «testserver», клиент «testclient»);
+своим его считает лишь приложение с пометкой app.state.zone_names_ok = True — её ставят помощники тестов,
+create_app — нет.
 
 Токен места (student-NN) принимается только из сети своего места {STU_NET}.N.0/28 или из ADMIN_NETS
 (caller_net_ok). STU_NET — app.state.pcbk_stu_net (ставит install шлюза), без него — 172.31, как в
@@ -38,7 +41,7 @@ _STUDENT = re.compile(STUDENT_PREFIX + r"([0-9]{2})")
 
 log = logging.getLogger("pcbk_core.zones")
 
-_name_logged = False
+_names_logged: set[str] = set()
 
 Address = ipaddress.IPv4Address | ipaddress.IPv6Address
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -70,34 +73,48 @@ def _state(scope: Mapping[str, Any]) -> object:
     return getattr(scope.get("app"), "state", None)
 
 
-def _log_name_once() -> None:
-    global _name_logged
-    if not _name_logged:
-        _name_logged = True
-        log.warning("адрес назначения — не IP: считаю чужим")
+_WHAT = {"server": "адрес назначения", "client": "адрес источника"}
 
 
-def dest_in(scope: Mapping[str, Any], nets: Iterable[str]) -> bool:
-    """Пришло ли соединение на адрес из nets. server = None — нет; имя — только при zone_names_ok = True."""
-    server = scope.get("server")
-    if not server:
+def _log_name_once(key: str) -> None:
+    if key not in _names_logged:
+        _names_logged.add(key)
+        log.warning("%s — не IP: считаю чужим", _WHAT[key])
+
+
+def _addr_in(scope: Mapping[str, Any], key: str, nets: Iterable[str]) -> bool:
+    """Адрес scope[key] (server — куда пришло соединение, client — откуда) в nets. Нет адреса — нет; имя —
+    только при zone_names_ok = True."""
+    pair = scope.get(key)
+    if not pair:
         return False
-    host = server[0]                    # у uvicorn — кортеж, у TestClient Starlette — список
-    addr = _ip(host)
+    addr = _ip(pair[0])                 # у uvicorn — кортеж, у TestClient Starlette — список
     if addr is None:
         if getattr(_state(scope), "zone_names_ok", False) is True:
             return True
-        _log_name_once()
+        _log_name_once(key)
         return False
     return _in(addr, nets)
 
 
+def dest_in(scope: Mapping[str, Any], nets: Iterable[str]) -> bool:
+    """Пришло ли соединение на адрес из nets."""
+    return _addr_in(scope, "server", nets)
+
+
+def client_in(scope: Mapping[str, Any], nets: Iterable[str]) -> bool:
+    """Пришло ли соединение с адреса из nets."""
+    return _addr_in(scope, "client", nets)
+
+
 def is_front(scope: Mapping[str, Any]) -> bool:
-    return dest_in(scope, FRONT_NETS)
+    """Ручки шлюза: и назначение, и источник — в FRONT_NETS."""
+    return dest_in(scope, FRONT_NETS) and client_in(scope, FRONT_NETS)
 
 
 def is_admin(scope: Mapping[str, Any]) -> bool:
-    return dest_in(scope, ADMIN_NETS)
+    """/health/llm полностью: и назначение, и источник — в ADMIN_NETS."""
+    return dest_in(scope, ADMIN_NETS) and client_in(scope, ADMIN_NETS)
 
 
 def stu_net(scope: Mapping[str, Any]) -> str:
