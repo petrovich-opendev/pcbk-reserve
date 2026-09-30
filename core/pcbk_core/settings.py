@@ -153,6 +153,21 @@ class LlmSettings:
         return cls(**{name: env[name] for name in _LLM_FILE_FIELDS if env.get(name, "")})
 
 
+@dataclass(frozen=True)
+class GatewaySettings:
+    """Шлюз Д5: отдельный класс, как LlmSettings, — ошибка в GW_* не роняет main() и службу данных, её
+    показывает роль gateway как config_error. Проверки from_env — задача А4; тесты строят класс напрямую."""
+    GW_ORIGIN: str = ""                       # https://хост[:порт] страницы входа; пусто — ни с чем не совпадает
+    GW_IDLE_STOP_S: float = 1800.0            # простой до сна места (Д5-R28)
+    GW_REAPER_TICK_S: float = 30.0            # такт уборщика
+    GW_WAKE_TIMEOUT_S: float = 60.0           # срок готовности места после start (Д5-R27)
+    GW_SESSION_TTL_S: float = 43200.0         # срок сессии входа
+    GW_PLACE_PW_DIR: str = "/run/secrets"     # student-NN.pw — пароли мест, знает только шлюз
+    SP_CTL_URL: str = "http://pcbk-sp-ctl:2375"
+    STU_NET: str = "172.31"                   # первые два октета сетей мест: место N — {STU_NET}.N.0/28
+    DRILL_GATEWAY: str = ""                   # учения: freeze_reaper, bad_place_pw
+
+
 def _check_base_url(url: str) -> None:
     """http или https, есть хост, порт — число в пределах; иначе ValueError с именем поля."""
     try:

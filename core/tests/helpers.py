@@ -1,4 +1,5 @@
 """Общие константы и помощники тестов серверного слоя (импорт явный: from helpers import …)."""
+import asyncio
 import atexit
 import hashlib
 import itertools
@@ -30,6 +31,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel
 
+from fake_places import PLACE_PW, FakeDocker, FakePlaces
 from fakes import WHITELIST, FakeHistorian
 from pcbk_core.app import Role, RoleBase, create_app
 from pcbk_core.data import DataRole
@@ -39,12 +41,14 @@ from pcbk_core.data.historian import parse_clock
 from pcbk_core.data.service import DataService
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
 from pcbk_core.gateway.accounts import AccountStore
+from pcbk_core.gateway.places import SpCtl, Workplaces
+from pcbk_core.gateway.stats import GatewayStats
 from pcbk_core.hooks import hooks_of
 from pcbk_core.llm import LlmRole
 from pcbk_core.llm.ledger import Ledger
 from pcbk_core.llm.upstream import Upstream
 from pcbk_core.secrets import TokenTable, key_fingerprint
-from pcbk_core.settings import LlmSettings, Settings
+from pcbk_core.settings import GatewaySettings, LlmSettings, Settings
 
 # каталог core/: из него подпроцессы импортируют pcbk_core
 CORE_DIR = Path(__file__).resolve().parent.parent
@@ -417,3 +421,44 @@ def store(tmp_path, **kw) -> AccountStore:
 def fail_connect(*a, **k):
     """Подмена sqlite3.connect: база заперта."""
     raise sqlite3.OperationalError("database is locked")
+
+
+# --- Шлюз: места (Д5а, задача А3) ---
+
+# настройки шлюза тестов строятся напрямую: проверки from_env (задача А4) на них не действуют
+GW_SETTINGS = GatewaySettings()
+
+
+def pw_dir(tmp_path) -> Path:
+    """Каталог паролей мест student-01…10.pw (пароли — PLACE_PW, без перевода строки, как на сервере)."""
+    d = Path(tmp_path) / "place-secrets"
+    d.mkdir(parents=True, exist_ok=True)
+    for n, pw in PLACE_PW.items():
+        (d / f"student-{n:02d}.pw").write_text(pw, encoding="utf-8")
+    return d
+
+
+def fast_sleep(mono: FakeMono) -> Callable:
+    """Пауза для Workplaces: двигает подменные часы на s и только отдаёт управление циклу."""
+    async def sleep(s: float) -> None:
+        mono.advance(s)
+        await asyncio.sleep(0)
+    return sleep
+
+
+def make_places(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None,
+                **overrides) -> Workplaces:
+    """Workplaces на двойниках sp-ctl и мест, FakeMono(1000.0) и fast_sleep; overrides — поля GatewaySettings.
+
+    Тестам доступны .docker, .oc, .mono, .stats. Клиенты открываются при первом запросе (как Upstream, П22):
+    помощник синхронный, а open() — корутина.
+    """
+    docker = FakeDocker() if docker is None else docker
+    oc = FakePlaces() if oc is None else oc
+    gw = replace(GW_SETTINGS, **{"GW_PLACE_PW_DIR": str(pw_dir(tmp_path)), **overrides})
+    mono = FakeMono(1000.0)
+    stats = GatewayStats(monotonic=mono)
+    w = Workplaces(gw, SpCtl(gw.SP_CTL_URL, transport=httpx.MockTransport(docker)), stats=stats,
+                   transport=httpx.MockTransport(oc), monotonic=mono, sleep=fast_sleep(mono))
+    w.docker, w.oc, w.mono = docker, oc, mono
+    return w
