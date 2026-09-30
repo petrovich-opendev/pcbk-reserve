@@ -34,6 +34,7 @@ export const T_ASLEEP = "Рабочее место спит";          // экр
 export const T_WAKE = "Разбудить";
 
 // --- разговор (R42) ---
+export const T_INPUT = "Ваш вопрос агенту";           // подсказка и подпись поля ввода
 export const T_SEND = "Отправить";
 export const T_STOP = "Стоп";
 export const T_NEW_THREAD = "Новый разговор";

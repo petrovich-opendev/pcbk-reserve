@@ -16,15 +16,18 @@ import {
 } from "../texts";
 
 export const MAX_TOOL_TEXT = 2000;                    // аргументы и вывод инструмента под строкой (R42)
-const SAFE_HREF = /^(https?:|\/|#)/;
+// http(s), путь своего сайта и якорь; «//хост» и «/\хост» браузер понял бы как чужой хост без схемы
+const SAFE_HREF = /^(https?:|\/(?![\/\\])|#)/;
 
 type MdProps<T extends "a" | "img"> = ComponentPropsWithoutRef<T> & { node?: unknown };
 
 // ссылка: href — только безопасный (react-markdown уже вырезал javascript: и прочие схемы, это второй
-// рубеж и отказ от mailto:, data:, file:); всегда в новой вкладке и без Referer
+// рубеж и отказ от mailto:, data:, file: и хоста без схемы); без Referer. Якорь (сноски GFM) — на этой же
+// странице: новая вкладка открыла бы вторую копию чата и тратила бы пределы шлюза на cookie
 function Link({ href, title, children }: MdProps<"a">) {
-  const safe = typeof href === "string" && SAFE_HREF.test(href) ? { href } : {};
-  return <a {...safe} title={title} rel="noopener noreferrer" target="_blank">{children}</a>;
+  const safe = typeof href === "string" && SAFE_HREF.test(href) ? href : undefined;
+  const target = safe === undefined || safe.startsWith("#") ? undefined : "_blank";
+  return <a href={safe} title={title} rel="noopener noreferrer" target={target}>{children}</a>;
 }
 
 // картинка markdown — только текстом: браузер не идёт ни по какому адресу

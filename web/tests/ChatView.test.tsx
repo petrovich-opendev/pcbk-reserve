@@ -7,7 +7,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { Chat } from "../src/components/Chat";
 import { ChatView } from "../src/components/ChatView";
 import { PendingInteractions } from "../src/components/PendingInteractions";
-import { MAX_TEXT } from "../src/texts";
+import { MAX_TEXT, T_TOO_MANY_TABS } from "../src/texts";
 
 type Status = NonNullable<ThreadMessageLike["status"]>;
 const DONE: Status = { type: "complete", reason: "stop" };
@@ -42,6 +42,9 @@ test("chat_view_has_only_allowed_controls", () => {
     expect(screen.queryByRole("button", { name })).toBeNull();
   expect(container.querySelector('input[type="file"]')).toBeNull();
   expect(container.querySelector("textarea")!.getAttribute("maxlength")).toBe(String(MAX_TEXT));
+  const input = screen.getByRole("textbox", { name: "Ваш вопрос агенту" });   // подпись для чтения с экрана
+  expect(input.getAttribute("placeholder")).toBe("Ваш вопрос агенту");
+  expect(input.getAttribute("name")).toBe("question");
   // кнопок ровно две: «Стоп» и «Отправить» не видна, пока ход идёт
   expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Стоп"]);
 });
@@ -68,17 +71,22 @@ test("renders_model_markup_inert", () => {
 
 test("links_keep_only_safe_href", () => {
   const { container } = render(<Harness messages={[assistant(
-    "[внешняя](https://example.org/a) [страница](/status) [якорь](#x) [данные](data:text/html,x) [файл](file:///etc/passwd)")]} />);
-  const href = (name: string) => screen.getByText(name).closest("a")!.getAttribute("href");
-  expect(href("внешняя")).toBe("https://example.org/a");
-  expect(href("страница")).toBe("/status");
-  expect(href("якорь")).toBe("#x");
-  expect(href("данные")).toBeNull();
-  expect(href("файл")).toBeNull();
-  for (const a of container.querySelectorAll("a")) {
-    expect(a.getAttribute("rel")).toBe("noopener noreferrer");
-    expect(a.getAttribute("target")).toBe("_blank");
-  }
+    "[внешняя](https://example.org/a) [страница](/status) [якорь](#x) [данные](data:text/html,x) [файл](file:///etc/passwd) " +
+    "[почта](mailto:a@b.c) [без схемы](//evil.example/x) [косая](/\\evil.example/x) текст[^1]\n\n[^1]: сноска")]} />);
+  const link = (name: string) => screen.getByText(name).closest("a")!;
+  expect(link("внешняя").getAttribute("href")).toBe("https://example.org/a");
+  expect(link("страница").getAttribute("href")).toBe("/status");
+  expect(link("якорь").getAttribute("href")).toBe("#x");
+  for (const name of ["данные", "файл", "почта", "без схемы"])
+    expect(link(name).getAttribute("href"), name).toBeNull();          // чужая схема или хост без схемы
+  expect(link("косая").getAttribute("href")).toBe("/%5Cevil.example/x");  // «\» markdown кодирует — путь своего сайта
+  for (const a of container.querySelectorAll("a")) expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+  expect(link("внешняя").getAttribute("target")).toBe("_blank");
+  expect(link("страница").getAttribute("target")).toBe("_blank");
+  // якорь и сноски GFM (ссылка и возврат) — на этой же странице, без второй копии чата
+  const anchors = [...container.querySelectorAll('a[href^="#"]')];
+  expect(anchors.length).toBe(3);
+  for (const a of anchors) expect(a.getAttribute("target"), a.getAttribute("href")!).toBeNull();
 });
 
 test("tool_line_and_truncated_output", () => {
@@ -238,4 +246,113 @@ test("chat_shows_refusal_text", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Отправить" }));
   expect((await screen.findByRole("alert")).textContent).toBe("Вызов не разрешён на стенде");
   expect(onHalt).not.toHaveBeenCalled();
+});
+
+// Открытый разговор (initialSessionId): список, сессия и история отвечают, прочее решает тест.
+const SESSION = { id: SES, slug: "s", projectID: "p", directory: "/work", title: "", version: "1.18.33",
+                  time: { created: 1, updated: 1 } };
+function stubOpenSession(answer: (method: string, path: string, body: string) => Response | undefined) {
+  return stubGateway((method, path, body) => {
+    const own = answer(method, path, body);
+    if (own !== undefined) return own;
+    if (path === "/pcbk/api/oc/experimental/session") return ocJson(200, [SESSION]);
+    if (path === `/pcbk/api/oc/session/${SES}`) return ocJson(200, SESSION);
+    if (path === `/pcbk/api/oc/session/${SES}/message`) return ocJson(200, []);
+    return undefined;
+  });
+}
+// поток /event: отдаёт события и остаётся открытым (конец — отменой при размонтировании)
+function eventStream(events: object[]): Response {
+  const enc = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(c) { for (const e of events) c.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`)); },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("chat_rejects_pending_through_adapter", async () => {
+  const calls = stubOpenSession((method, path) => {
+    if (path === "/pcbk/api/oc/event") return eventStream([
+      { type: "server.connected", properties: {} },
+      { type: "permission.asked", properties: { id: "per_1", sessionID: SES, permission: "doom_loop", patterns: [], metadata: {}, always: [] } },
+      { type: "question.asked", properties: { id: "que_1", sessionID: SES, questions: [{ question: "Какой тег?", header: "Тег", options: [] }] } },
+    ]);
+    if (method === "POST" && (path.endsWith("/reply") || path.endsWith("/reject"))) return ocJson(200, true);
+    return undefined;
+  });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES} />);
+  await waitFor(() => expect(screen.getAllByRole("button", { name: "Отклонить" })).toHaveLength(2));
+  fireEvent.click(container.querySelector('li[data-permission="doom_loop"] button')!);
+  fireEvent.click(container.querySelector(".pending li:not([data-permission]) button")!);
+  await waitFor(() => expect(screen.queryAllByRole("button", { name: "Отклонить" })).toHaveLength(0));
+  const posts = calls.filter((c) => c.method === "POST").map((c) => [c.path, c.body ? JSON.parse(c.body) : null]);
+  expect(posts).toContainEqual(["/pcbk/api/oc/permission/per_1/reply", { reply: "reject" }]);   // только отклонение
+  expect(posts.some(([path]) => path === "/pcbk/api/oc/question/que_1/reject")).toBe(true);
+  expect(posts.filter(([path]) => String(path).startsWith("/pcbk/api/oc/permission/"))).toHaveLength(1);
+});
+
+test("chat_stream_line_from_gateway", async () => {
+  stubOpenSession((_method, path) => path === "/pcbk/api/oc/event"
+    ? ocJson(429, { name: "TooManyRequests", data: { message: "Открыто слишком много вкладок чата — закройте лишние" } })
+    : undefined);
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} />);
+  expect((await screen.findByRole("status")).textContent).toBe(T_TOO_MANY_TABS);
+  expect(screen.queryByRole("alert")).toBeNull();                   // поток — строкой потока, не ошибкой
+});
+
+test.each([
+  [401, "Unauthorized", "signed_out"],
+  [503, "WorkplaceNotReady", "asleep"],
+] as const)("chat_halt_is_not_an_error_line_%s", async (status, name, kind) => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  stubGateway((method, path) => {
+    if (path === "/pcbk/api/oc/experimental/session") return ocJson(200, []);
+    if (method === "POST" && path === "/pcbk/api/oc/session") return ocJson(status, { name, data: { message: "текст шлюза" } });
+    return undefined;
+  });
+  const onHalt = vi.fn();
+  render(<Chat onHalt={onHalt} />);
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "вопрос" } });
+  fireEvent.click(screen.getByRole("button", { name: "Отправить" }));
+  await waitFor(() => expect(onHalt).toHaveBeenCalledWith(kind));
+  await sleep(50);                                                  // ошибка вызова доходит до onError после остановки
+  expect(screen.queryByRole("alert")).toBeNull();                   // остановку показывает App, не строка ошибки
+});
+
+test("chat_error_line_clears_on_new_run", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  let prompts = 0;
+  stubOpenSession((_method, path) => {
+    if (path.endsWith("/prompt_async")) {
+      prompts += 1;
+      return prompts === 1 ? ocJson(403, { name: "Forbidden", data: { message: "Вызов не разрешён на стенде" } })
+        : new Response(null, { status: 204 });
+    }
+    return undefined;
+  });
+  const onThreadIdChange = vi.fn();
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} onThreadIdChange={onThreadIdChange} />);
+  await waitFor(() => expect(onThreadIdChange).toHaveBeenCalledWith(SES));   // разговор открыт — дальше id не меняется
+  const ask = async (text: string) => {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
+    const send = await screen.findByRole("button", { name: "Отправить" });
+    await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(send);
+  };
+  await ask("первый");
+  expect((await screen.findByRole("alert")).textContent).toBe("Вызов не разрешён на стенде");
+  await ask("второй");
+  await waitFor(() => expect(prompts).toBe(2));
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());      // новый ход — прежней ошибки нет
+  expect(onThreadIdChange).toHaveBeenCalledTimes(1);
+});
+
+test("chat_client_once_per_mount", async () => {
+  const calls = stubOpenSession(() => undefined);
+  const { rerender } = render(<Chat onHalt={vi.fn()} />);
+  await waitFor(() => expect(calls.filter((c) => c.path === "/pcbk/api/oc/experimental/session")).toHaveLength(1));
+  rerender(<Chat onHalt={vi.fn()} onThreadIdChange={vi.fn()} />);   // новые колбэки — тот же клиент и рантайм
+  rerender(<Chat onHalt={vi.fn()} />);
+  await sleep(100);
+  expect(calls.filter((c) => c.path === "/pcbk/api/oc/experimental/session")).toHaveLength(1);
 });

@@ -8,7 +8,7 @@ import {
   type AssistantRuntime,
 } from "@assistant-ui/react";
 import type { ReactNode } from "react";
-import { MAX_TEXT, T_SEND, T_STOP } from "../texts";
+import { MAX_TEXT, T_INPUT, T_SEND, T_STOP } from "../texts";
 import { ImagePartText, MarkdownText, PlainText, ToolLine } from "./MessageParts";
 
 export interface ChatViewProps {
@@ -64,8 +64,8 @@ export function ChatView(p: ChatViewProps) {
         {p.streamLine && <p className="stream-line" role="status">{p.streamLine}</p>}
         {p.error && <p className="error-line" role="alert">{p.error}</p>}
         <ComposerPrimitive.Root className="composer">
-          <ComposerPrimitive.Input className="composer-input" maxLength={MAX_TEXT} minRows={2} maxRows={10} autoFocus
-                                   addAttachmentOnPaste={false} />
+          <ComposerPrimitive.Input className="composer-input" name="question" aria-label={T_INPUT} placeholder={T_INPUT}
+                                   maxLength={MAX_TEXT} minRows={2} maxRows={10} autoFocus addAttachmentOnPaste={false} />
           <ThreadPrimitive.If running={false}>
             <ComposerPrimitive.Send className="send">{T_SEND}</ComposerPrimitive.Send>
           </ThreadPrimitive.If>

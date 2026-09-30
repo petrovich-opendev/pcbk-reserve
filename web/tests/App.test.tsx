@@ -200,3 +200,28 @@ test("logout_navigates_even_if_gateway_fails", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Выйти" }));
   await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
 });
+
+test("logout_while_waking_stops_polling", async () => {
+  const a = api({ me: student, workplace: [200, { state: "starting" }], wake: [202, { state: "starting" }] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} pollMs={POLL_MS} />);
+  await waitFor(() => expect(a.workplace.mock.calls.length).toBeGreaterThanOrEqual(3));   // первый вопрос и опрос wakeAndWait
+  fireEvent.click(screen.getByRole("button", { name: "Выйти" }));
+  await waitFor(() => expect(a.logout).toHaveBeenCalled());
+  const polled = a.workplace.mock.calls.length;
+  await new Promise((r) => setTimeout(r, POLL_MS * 8));
+  expect(a.workplace.mock.calls.length).toBe(polled);            // экран места снят — ожидание отменено
+});
+
+test("banner_polling_stops_on_unmount", async () => {
+  const stop = vi.fn();
+  const polling = vi.fn<typeof startStatusPolling>((o) => {
+    o.onView({ level: "ok", text: "Стенд работает" });
+    return stop;
+  });
+  const { unmount } = render(<App api={api({ me: student, workplace: [200, { state: "ready" }] })} navigate={vi.fn()}
+                                  ChatImpl={FakeChat} startPolling={polling} />);
+  await screen.findByText("Стенд работает");
+  expect(stop).not.toHaveBeenCalled();
+  unmount();
+  expect(stop).toHaveBeenCalledTimes(polling.mock.calls.length);  // каждый запуск опроса остановлен
+});
