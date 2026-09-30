@@ -200,6 +200,31 @@ def slow_site(tmp_path):
             stop.set()
 
 
+@pytest.fixture
+def full_backlog_url():
+    """Сокет слушает с очередью 0 и никого не принимает: очередь забита, новое соединение висит в connect
+    (ядро отбрасывает SYN). Положительный контроль — пробное соединение со сроком 0,2 с не устанавливается."""
+    listener = socket.create_server(("127.0.0.1", 0), backlog=0)
+    addr, fillers = listener.getsockname(), []
+    try:
+        for _ in range(8):
+            probe = socket.socket()
+            probe.settimeout(0.2)
+            try:
+                probe.connect(addr)
+            except TimeoutError:
+                probe.close()
+                break
+            fillers.append(probe)
+        else:
+            pytest.fail("очередь соединений не заполнилась — тест срока соединения ничего не проверил бы")
+        yield f"http://127.0.0.1:{addr[1]}/"
+    finally:
+        for sock in fillers:
+            sock.close()
+        listener.close()
+
+
 @contextmanager
 def serve_raw(respond):
     """Сырой TCP-двойник: читает запрос, дальше respond(conn, stop) шлёт ответ сам."""

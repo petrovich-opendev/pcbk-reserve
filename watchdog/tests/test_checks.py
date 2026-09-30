@@ -11,7 +11,7 @@ import pytest
 from helpers import T0, gw, insp, llm_obj, now_utc, put_build
 from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD, EGRESS_STALE_S,
                                   GW_DRILL_MODES, GW_KEYS_D5A, GW_KEYS_D5B, GW_OFF_CONTRACT_DETAIL,
-                                  GW_SP_CTL_STATES, LLM_STALE_S,
+                                  GW_SP_CTL_STATES, LLM_STALE_S, MAX_BODY_BYTES,
                                   LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, GatewayReply, _http_get,
                                   check_container, check_gateway,
                                   check_historian, check_http, check_llm, check_memory, check_tls, check_web,
@@ -1096,6 +1096,39 @@ def test_http_get_absolute_deadline(slow_site):                             # с
         _http_get(slow_site, 3.0, lambda code: True, deadline=time.monotonic() - 0.1)   # срок уже вышел — без соединения
     time.sleep(0.2)                                                         # опоздавшее соединение успело бы дойти
     assert accepted == 1 and len(slow_site.accepted) == accepted           # счёт живой: первый запрос учтён
+
+
+def test_http_get_connect_bounded_by_deadline(full_backlog_url):           # доводка 1: соединение — не дольше остатка
+    t0 = time.monotonic()                                                   # очередь забита: connect висит, пока не срок
+    with pytest.raises(OSError):
+        _http_get(full_backlog_url, 3.0, lambda code: True, deadline=time.monotonic() + 0.5)
+    assert time.monotonic() - t0 < 0.5 + 0.4                               # полный timeout соединения — 3 с
+
+
+def test_web_meta_only_in_contract_form(web_site):                          # доводка 1: WEB_META_RE
+    root, url = web_site
+    put_build(root)
+    for head in ('<meta name="viewport" content="width=device-width, initial-scale=1">',
+                 '<meta name="viewport" content="abc123">'):                # чужое имя с содержимым, как у метки
+        (root / "chat/index.html").write_text(f"<!doctype html><head>{head}</head>")
+        assert row(check_web("web", "Веб-чат", url)) == ("fail", "страница чата не отдаётся", "нет метки сборки"), head
+    for meta in ("abc 123", "a" * 65):                                      # содержимое вне [A-Za-z0-9._-]{1,64}
+        put_build(root, meta=meta)
+        assert row(check_web("web", "Веб-чат", url)) == ("fail", "страница чата не отдаётся", "нет метки сборки"), meta
+    put_build(root, build="a" * 64)                                         # граница: 64 знака — ещё метка
+    assert row(check_web("web", "Веб-чат", url)) == ("ok", "страница чата отдаётся", "сборка " + "a" * 64)
+
+
+def test_web_meta_beyond_body_limit(web_site):                              # доводка 1: тело страницы — до MAX_BODY_BYTES
+    root, url = web_site
+    put_build(root)
+    head, tag = "<!doctype html><head><!--", '<meta name="pcbk-build" content="abc123">'
+    fits = MAX_BODY_BYTES - len(head) - len("-->") - len(tag)              # метка кончается ровно на пределе
+    for filler, want in ((fits, ("ok", "страница чата отдаётся", "сборка abc123")),
+                         (fits + 1, ("fail", "страница чата не отдаётся", "нет метки сборки")),
+                         (MAX_BODY_BYTES, ("fail", "страница чата не отдаётся", "нет метки сборки"))):
+        (root / "chat/index.html").write_text(head + "x" * filler + "-->" + tag + "</head>")
+        assert row(check_web("web", "Веб-чат", url)) == want, filler
 
 
 def test_web_manifest_rows_and_body_stall(web_site, raw_http):             # строки таблицы Д6-R46 сверх test_web_verdicts
