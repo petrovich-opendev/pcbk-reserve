@@ -72,6 +72,7 @@ test("teacher_gets_no_chat_and_no_wake", async () => {
   expect(a.workplace).not.toHaveBeenCalled();
   expect(screen.queryByTestId("fake-chat")).toBeNull();
   expect(screen.getByText("Вы вошли как t")).toBeTruthy();
+  await waitFor(() => expect(polling).toHaveBeenCalled());       // опрос стартует в эффекте шапки
   expect(polling.mock.calls.at(-1)![0].ownPlace).toBeNull();   // баннер без мест
 });
 
@@ -85,6 +86,7 @@ test("student_wakes_place_then_chat", async () => {
   expect(a.wake).toHaveBeenCalledTimes(1);
   expect(screen.getByText("Вы вошли как s")).toBeTruthy();
   expect(screen.getByRole("note").textContent).toBe(STAND_WARNING);
+  await waitFor(() => expect(polling).toHaveBeenCalled());
   expect(polling.mock.calls.at(-1)![0].ownPlace).toBe("03");  // баннер — по своему месту
 });
 
@@ -92,6 +94,7 @@ test("banner_text_and_details_link", async () => {
   render(<App api={api({ me: student, workplace: [200, { state: "ready" }] })} navigate={vi.fn()} ChatImpl={FakeChat}
               startPolling={okPolling} />);
   await screen.findByTestId("fake-chat");
+  await screen.findByText("Стенд работает");                     // вид приходит из эффекта шапки
   const banner = screen.getByRole("status");
   expect(banner.getAttribute("data-level")).toBe("ok");
   expect(banner.textContent).toContain("Стенд работает");
@@ -150,7 +153,7 @@ test("halt_asleep_wakes_and_reopens_last_session", async () => {
                   wake: [202, { state: "starting" }] });
   render(<App api={a} navigate={vi.fn()} ChatImpl={Chat} startPolling={okPolling} pollMs={POLL_MS} />);
   await screen.findByTestId("fake-chat");
-  expect(mounts).toEqual([undefined]);
+  await waitFor(() => expect(mounts).toEqual([undefined]));    // монтирование пишется в эффекте
   fireEvent.click(screen.getByRole("button", { name: "thread" }));
   fireEvent.click(screen.getByRole("button", { name: "asleep" }));
   expect(await screen.findByText("Рабочее место спит")).toBeTruthy();
@@ -159,7 +162,7 @@ test("halt_asleep_wakes_and_reopens_last_session", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Разбудить" }));
   await screen.findByTestId("fake-chat");
   expect(a.wake).toHaveBeenCalledTimes(1);
-  expect(mounts).toEqual([undefined, "ses_0123456789abcdefghijklmnA"]);
+  await waitFor(() => expect(mounts).toEqual([undefined, "ses_0123456789abcdefghijklmnA"]));
 });
 
 test("halt_signed_out_goes_to_login", async () => {
