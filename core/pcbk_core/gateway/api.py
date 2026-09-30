@@ -2,9 +2,11 @@
 
 Все пути — под /pcbk/api/, ответы об ошибках — JSON вида OpenCode {"name", "data": {"message"}} без
 WWW-Authenticate. Порядок проверок: зона (front_only, вне pcbk-front — 404) → ошибка настройки (configured,
-503) → источник записи (Origin или Sec-Fetch-Site, 403) → сессия (current_account, 401). Зависимости
-отказывают исключением GatewayRefusal с готовым ответом; его отдаёт обработчик HTTPException роли,
-поставленный через реестр hooks_of(app).http_exception.
+503) → источник записи (Origin или Sec-Fetch-Site, 403) → сессия (current_account, 401); у пробуждения места —
+сессия раньше источника (остаток Д5б): запрос без учётки — 401 без строки журнала и счётчика origin_refused.
+Строка «gw origin refused» — одна на ручку за ORIGIN_LOG_S с n= и since_s=. Зависимости отказывают исключением
+GatewayRefusal с готовым ответом; его отдаёт обработчик HTTPException роли, поставленный через реестр
+hooks_of(app).http_exception.
 
 Сессия — cookie pcbk_session (HttpOnly; Secure; SameSite=Strict; Path=/pcbk/api/), в базе — sha256 значения.
 Две и больше pcbk_session в запросе — все предъявленные сессии закрываются, 401 и набор удалений cookie
@@ -53,6 +55,7 @@ LOGIN_PARALLEL = 2
 LOGIN_QUEUE = 8
 # незаписанных неудач входа (заданий писателя LoginGate): больше — вход «перегружен» без scrypt
 LOGIN_BACKLOG = 64
+ORIGIN_LOG_S = 60.0                     # строка «gw origin refused» — одна на ручку за столько секунд (остаток Д5б)
 
 GW_MESSAGES = {
     "need_login": "Нужно войти",
@@ -152,12 +155,42 @@ def same_origin(request: Request, origin: str) -> bool:
     return bool(origin) and request.headers.get("origin") == origin
 
 
+class _RolledLines:
+    """Строки одного вида по ключу — одна за ORIGIN_LOG_S с числом случаев с прошлой строки (n) и тем, сколько
+    секунд они копились (since_s), как отказы not_ready прокси: поток запросов не вымывает журнал (остаток Д5б)."""
+
+    def __init__(self, monotonic: Callable[[], float]):
+        self._monotonic = monotonic
+        self._last: dict[str, float] = {}
+        self._first: dict[str, float] = {}
+        self._count: dict[str, int] = {}
+
+    def hit(self, key: str) -> tuple[int, int] | None:
+        """Учесть случай; (n, since_s) для строки журнала или None — строку не писать."""
+        now = self._monotonic()
+        self._count[key] = self._count.get(key, 0) + 1
+        self._first.setdefault(key, now)
+        last = self._last.get(key)
+        if last is not None and now - last < ORIGIN_LOG_S:
+            return None
+        self._last[key] = now
+        count, self._count[key] = self._count[key], 0
+        return count, round(now - self._first.pop(key))
+
+
 def origin_checked(role: "GatewayRole") -> Callable[[Request], Awaitable[None]]:
-    """Зависимость записей шлюза: чужой источник — 403, счётчик origin_refused и строка журнала."""
+    """Проверка записей шлюза: чужой источник — 403 и счётчик origin_refused на каждый отказ; строка журнала «gw
+    origin refused» — одна на ручку за ORIGIN_LOG_S с n= и since_s=. Ручки со входом зовут её после сессии (wake):
+    запрос без учётки — 401 без строки и без счётчика, и поток таких запросов не красит строку сторожа."""
+    lines = _RolledLines(role.monotonic)
+
     async def dependency(request: Request) -> None:
         if not same_origin(request, role.gw.GW_ORIGIN):
             role.stats.event("origin_refused")
-            log.warning("gw origin refused path=%s", safe_path(request.scope["path"]))
+            path = safe_path(request.scope["path"])
+            rolled = lines.hit(path)
+            if rolled is not None:
+                log.warning("gw origin refused path=%s n=%d since_s=%d", path, *rolled)
             raise _refusal(403, "origin")
     return dependency
 
@@ -443,6 +476,7 @@ def workplace_router(role: "GatewayRole") -> APIRouter:
     Номер места — только из учётки сессии; у преподавателя места нет — 403."""
     router = APIRouter()
     account_of = current_account(role)
+    check_origin = origin_checked(role)
 
     @router.get(f"{PREFIX}/workplace")
     async def workplace(account: Account = Depends(account_of)) -> JSONResponse:
@@ -450,8 +484,9 @@ def workplace_router(role: "GatewayRole") -> APIRouter:
             return _error(403, "no_place")
         return JSONResponse(role.workplaces.view(account.place).to_json())
 
-    @router.post(f"{PREFIX}/workplace/wake", dependencies=[Depends(origin_checked(role))])
-    async def wake(account: Account = Depends(account_of)) -> JSONResponse:
+    @router.post(f"{PREFIX}/workplace/wake")
+    async def wake(request: Request, account: Account = Depends(account_of)) -> JSONResponse:
+        await check_origin(request)     # после сессии (остаток Д5б): без учётки — 401, ни строки, ни счётчика
         if account.place is None:
             return _error(403, "no_place")
         return JSONResponse((await role.workplaces.wake(account.place)).to_json(), status_code=202)

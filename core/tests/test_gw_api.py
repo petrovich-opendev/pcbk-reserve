@@ -449,6 +449,25 @@ def test_wake_needs_origin(tmp_path):                                           
     assert [call for call in role.fake_docker.calls if call[0] == "start"] == [("start", 3)]
 
 
+def test_wake_without_session_leaves_no_trace(tmp_path, gwlog):                        # остаток Д5б, 1
+    app, role = make_gateway(tmp_path)
+    with TestClient(app, base_url=BASE) as c:
+        codes = {c.post("/pcbk/api/workplace/wake").status_code for _ in range(50)}   # без cookie и без Origin
+        assert (codes, role.stats.count_1h("origin_refused")) == ({401}, 0)
+        assert "gw origin refused" not in gwlog.text                                    # журнал не вымывается
+        assert login(c, "stu-03").status_code == 200                                    # с учёткой, но без Origin
+        for _ in range(3):
+            assert c.post("/pcbk/api/workplace/wake").status_code == 403
+        assert role.stats.count_1h("origin_refused") == 3                               # счётчик — на каждый
+        lines = re.findall(r"gw origin refused path=/pcbk/api/workplace/wake n=([0-9]+) since_s=([0-9]+)", gwlog.text)
+        assert lines == [("1", "0")]                                                    # строка — одна за минуту
+        role.mono.advance(61)
+        assert c.post("/pcbk/api/workplace/wake").status_code == 403
+        lines = re.findall(r"gw origin refused path=/pcbk/api/workplace/wake n=([0-9]+) since_s=([0-9]+)", gwlog.text)
+        assert lines == [("1", "0"), ("3", "61")]                                       # 2 свёрнутых + этот, копились 61 с
+        assert role.workplaces.view(3).state == "sleeping"                              # отказ не будит
+
+
 def test_disabled_answer_equals_unknown(tmp_path):                                      # F8 (ревью A, M5)
     app, role = make_gateway(tmp_path)
     role.store.disable("stu-05")

@@ -288,7 +288,6 @@ async def test_body_budget_counts_chunked_and_frees_on_abort():
 
 
 @pytest.mark.anyio
-@pytest.mark.anyio
 async def test_body_budget_freed_on_refusal_mid_body():                        # Б3-m1: отказ на втором куске
     h = AppHooks()
     h.body_limit("/b/", 100, budget=150, over_budget=lambda scope: JSONResponse({}, status_code=503),

@@ -367,6 +367,7 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     `'$remote_addr - $remote_user [$time_local] "$pcbk_log_request" '`,
     "limit_req_zone $pcbk_oc_session zone=pcbk_oc_rate:1m rate=20r/s;",                // N1
     "limit_req_zone $pcbk_oc_session zone=pcbk_oc_event:1m rate=20r/s;",
+    "limit_req_zone $pcbk_oc_session zone=pcbk_place_rate:1m rate=5r/s;",              // ручки места (остаток Д5б)
     "access_log /var/log/nginx/access.log pcbk;",
     "map $cookie_pcbk_session $pcbk_oc_session {",
     '"~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;',
@@ -447,6 +448,12 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.equal(b.includes("limit_req zone=pcbk_login burst=20 nodelay;"), path === "/pcbk/api/auth/", path);
   }
   assert.ok(loc("/pcbk/api/auth/").body.includes("limit_req_status 429;"));
+  for (const path of ["/pcbk/api/workplace", "/pcbk/api/workplace/wake"]) {             // остаток Д5б: поток без учётки
+    const b = loc(path).body;
+    assert.ok(b.includes("limit_req zone=pcbk_place_rate burst=20 nodelay;"), path);
+    assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], path);   // busy.json, не 429 входа
+    assert.ok(b.includes("limit_req_log_level warn;"), path);
+  }
   assert.ok(loc("/pcbk/api/").body.includes("if ($pcbk_bad_api_uri) { return 400"));
   assert.match(loc("/pcbk/api/").body, /return 404 '\{"name":"NotFound"/);
   for (const [path, code] of [["/pcbk/api", 404], ["/pcbk/api/auth", 404], ["/pcbk/api/oc", 403]]) {

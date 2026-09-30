@@ -43,6 +43,9 @@ limit_conn_zone $server_port zone=pcbk_oc_all:1m;               # ключ од�
 # в минуту; своя зона не даёт переподключениям съесть запас вызовов
 limit_req_zone $pcbk_oc_session zone=pcbk_oc_rate:1m rate=20r/s;
 limit_req_zone $pcbk_oc_session zone=pcbk_oc_event:1m rate=20r/s;
+# ручки места (остаток Д5б): та же карта cookie, без cookie — корзина «-»; страница входа опрашивает состояние раз в
+# секунду, чат — реже; поток запросов без учётки не доходит до core сверх 5 в секунду
+limit_req_zone $pcbk_oc_session zone=pcbk_place_rate:1m rate=5r/s;
 
 # временные файлы тел запросов и ответов core — на томе pcbk-edge-temp (диск), не в tmpfs: tmpfs считается в
 # mem_limit 64m edge, а ответ core — до 4 МиБ (Д5-R36), тело /pcbk/api/oc/ — до 512 КиБ. Каталоги создаёт мастер
@@ -103,7 +106,7 @@ server {
     error_page 494 =400 /pcbk-errors/400.json;            # большие заголовки и cookie (cookie Dify на том же хосте)
     error_page 429 /pcbk-errors/429.json;
     error_page 502 503 504 =503 /pcbk-errors/503.json;    # «=503»: без него код остался бы 502 или 504
-    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn и limit_req под /pcbk/api/oc/ (509 — только их код)
+    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn и limit_req под /pcbk/api/oc/ и у ручек места (509 — только их код)
 
     location = /pcbk-errors/400.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
     location = /pcbk-errors/405.json { internal; default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
@@ -191,6 +194,9 @@ server {
     location = /pcbk/api/workplace {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;                     # busy.json — 503 WorkplaceBusy, как у /pcbk/api/oc/
+        limit_req_log_level warn;
         client_max_body_size 64k;
         proxy_read_timeout 30s;
         proxy_pass http://$pcbk_core;
@@ -199,6 +205,9 @@ server {
     location = /pcbk/api/workplace/wake {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
         client_max_body_size 64k;
         proxy_read_timeout 30s;
         proxy_pass http://$pcbk_core;

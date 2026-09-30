@@ -511,9 +511,9 @@ class AccountStore:
 
     def open_session(self, login: str) -> str:
         """Новая сессия действующей учётки: токен (secrets.token_urlsafe(32)) — вызывающему, в базу — его sha256.
-        Заодно удаляются истёкшие сессии, а сверх MAX_SESSIONS_PER_LOGIN живых у этой учётки — самые старые (по
-        времени открытия, при равенстве — по порядку записи), в той же транзакции. Нет учётки или она отключена —
-        ValueError."""
+        Заодно удаляются истёкшие сессии, а сверх MAX_SESSIONS_PER_LOGIN живых у этой учётки — самые старые по
+        порядку записи (rowid, а не часам: шаг часов назад не вытесняет только что открытую), в той же транзакции.
+        Нет учётки или она отключена — ValueError."""
         token = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
         now = self.clock()
         with self._op(write=True) as db:
@@ -525,7 +525,7 @@ class AccountStore:
             if added != 1:
                 raise ValueError("учётки нет или она отключена")
             evicted = db.execute("DELETE FROM gw_sessions WHERE login = ? AND rowid NOT IN (SELECT rowid FROM"
-                                 " gw_sessions WHERE login = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)",
+                                 " gw_sessions WHERE login = ? ORDER BY rowid DESC LIMIT ?)",
                                  (login, login, MAX_SESSIONS_PER_LOGIN)).rowcount
             db.execute("COMMIT")
         if evicted:

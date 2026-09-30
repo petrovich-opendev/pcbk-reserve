@@ -144,6 +144,16 @@ def test_sessions_per_login_capped_oldest_closed(tmp_path, gwlog):              
     assert [s.session(t) is not None for t in tokens + same] == [False] * 5 + [True] * 3
 
 
+def test_session_eviction_by_insert_order_not_clock(tmp_path):                         # остаток Д5б, 2
+    clock = FakeMono(5000.0)
+    s = store(tmp_path, clock=clock)
+    s.add("ivanov", "student", 3, PW)
+    old = [s.open_session("ivanov") for _ in range(MAX_SESSIONS_PER_LOGIN)]
+    clock.advance(-600)                                                                # часы шагнули назад (NTP)
+    new = s.open_session("ivanov")                                                     # открыта последней — живёт
+    assert (s.session(new) is not None, [s.session(t) is not None for t in old]) == (True, [False, True, True])
+
+
 def test_login_lock_no_oracle_persisted_and_unlocked(tmp_path):
     clock = FakeMono(0.0)
     s = store(tmp_path, clock=clock)
