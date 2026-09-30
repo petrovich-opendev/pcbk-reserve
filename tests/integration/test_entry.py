@@ -14,6 +14,7 @@ import pytest
 from conftest import STAND_ORIGIN, secret_forms
 from gwclient import GwClient
 
+# пароли — только в запросах: в assert сверяются коды и индексы, иначе при падении pytest напечатал бы значения
 PW = {"stu-01": secrets.token_urlsafe(12), "stu-03": secrets.token_urlsafe(12), "stu-04": secrets.token_urlsafe(12),
       "stu-05": secrets.token_urlsafe(12), "teach": secrets.token_urlsafe(12)}
 MONEY = ("account_remaining_usd", "key_usage_usd", "key_spent_usd")
@@ -126,7 +127,11 @@ def test_place_from_account_only(stack, accounts):
     code, body, _ = c.call("POST", "/pcbk/api/workplace/wake?place=04", headers={"X-Pcbk-Place": "04"})
     assert code == 202 and body["place"] == "03"
     assert stack.inspect("pcbk-student-04")["State"]["Running"] is False
-    c.wake_and_wait(90); stack.stop("pcbk-student-03")
+    try:
+        assert c.wake_and_wait(90)["state"] == "ready"                                 # пробуждение фоном: ждём исход
+        assert stack.inspect("pcbk-student-04")["State"]["Running"] is False            # и после него 04 не запущено
+    finally:
+        stack.stop("pcbk-student-03")
 
 
 def test_teacher_and_lockout(stack, accounts):
@@ -136,16 +141,20 @@ def test_teacher_and_lockout(stack, accounts):
     bad = stack.gw_client()
     for _ in range(5):
         assert bad.call("POST", "/pcbk/api/auth/login", {"login": "stu-05", "password": "неверный-1"})[0] == 401
-    assert bad.call("POST", "/pcbk/api/auth/login", {"login": "stu-05", "password": PW["stu-05"]})[0] == 429
+    code = bad.call("POST", "/pcbk/api/auth/login", {"login": "stu-05", "password": PW["stu-05"]})[0]
+    assert code == 429
     stack._docker("exec", "pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "unlock", "--login", "stu-05")
-    assert bad.call("POST", "/pcbk/api/auth/login", {"login": "stu-05", "password": PW["stu-05"]})[0] == 200
+    code = bad.call("POST", "/pcbk/api/auth/login", {"login": "stu-05", "password": PW["stu-05"]})[0]
+    assert code == 200
 
 
 def test_origin_required_and_counted(stack, accounts):
     raw = GwClient("https://127.0.0.1:18443")                                         # без Origin и Sec-Fetch-Site
-    assert raw.call("POST", "/pcbk/api/auth/login", {"login": "stu-01", "password": PW["stu-01"]})[0] == 403
+    code = raw.call("POST", "/pcbk/api/auth/login", {"login": "stu-01", "password": PW["stu-01"]})[0]
+    assert code == 403
     evil = GwClient("https://127.0.0.1:18443", host="stand.pcbk.test:18443", origin="https://stand.pcbk.test")   # хост без порта — Dify
-    assert evil.call("POST", "/pcbk/api/auth/login", {"login": "stu-01", "password": PW["stu-01"]})[0] == 403
+    code = evil.call("POST", "/pcbk/api/auth/login", {"login": "stu-01", "password": PW["stu-01"]})[0]
+    assert code == 403
     stack.wait_status(lambda d: row(d, "gateway")[:2] ==
                       ("warn", "вход отклоняется проверкой источника — проверьте GW_ORIGIN"), timeout=60)
 
@@ -153,9 +162,13 @@ def test_origin_required_and_counted(stack, accounts):
 def test_secrets_not_in_core_logs(stack, accounts):                                    # Review Focus 5
     c = as_user(stack, "stu-01")
     logs = stack.logs("pcbk-core")
-    assert "gw login ok login=stu-01" in logs                                          # журнал прочитан
-    forbidden = [*PW.values(), c.cookie, *secret_forms(stack.password(1))]
-    assert [s for s in forbidden if s in logs] == []
+    read = "gw login ok login=stu-01" in logs                                          # журнал прочитан
+    assert read                                                                        # без печати журнала
+    # пароли всех мест модуля — во всех видах (сырой, base64 и Basic): шлюз знает их все, будил 01 и 03
+    forbidden = [*PW.values(), c.cookie, *(f for n in OWN_PLACES for f in secret_forms(stack.password(n)))]
+    complete = len(forbidden) == len(PW) + 1 + 3 * len(OWN_PLACES) and all(forbidden)   # ни одного пустого
+    leaked = [i for i, s in enumerate(forbidden) if s in logs]                          # индексы, не значения
+    assert (complete, leaked) == (True, [])
 
 
 def test_duplicate_cookies_through_edge(stack, accounts):                              # Review Focus 2; Д5-R25, Д5-R30
