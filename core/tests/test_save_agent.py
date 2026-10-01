@@ -564,3 +564,40 @@ async def test_cancel_before_write_is_error_event(tmp_path, caplog):      # m3: 
     ev = _events(role.settings.DB_PATH)(tool="save_agent")
     assert sorted((e["agent"], e["outcome"], e["summary"]) for e in ev) == [
         ("drugoy", "error", "error: cancelled"), ("proverka", "ok", "saved")]
+
+
+@pytest.mark.anyio
+async def test_check_sees_save_failure_during_probe(tmp_path, monkeypatch, caplog):  # I-1: «было» — после потока
+    caplog.set_level(logging.INFO, logger="pcbk_core.data")
+    role, _ = direct(tmp_path)
+    real = role.agents.open
+
+    def open_while_save_fails() -> bool:
+        ok = real()
+        role.agent_stats.store_failed("учёт агентов: OperationalError SQLITE_BUSY")   # save_agent упал за время проверки
+        return ok
+
+    monkeypatch.setattr(role.agents, "open", open_while_save_fails)
+    await role.check_agents()
+    assert role.agent_stats.store_error is None
+    assert _store_lines(caplog) == ["учёт агентов: запись снова проходит"]          # смена не потерялась
+
+
+@non_root
+@pytest.mark.anyio
+async def test_check_sees_readonly_store(tmp_path, caplog):                # I-1: open() на файле только для чтения проходит
+    caplog.set_level(logging.INFO, logger="pcbk_core.data")
+    role, _ = direct(tmp_path)
+    db = tmp_path / "core.db"
+    db.chmod(0o444)
+    try:
+        assert role.agents.open()                                           # одного open() мало — нужна проба записи
+        await role.check_agents()
+        assert role.agent_stats.store_error == "OperationalError SQLITE_READONLY"
+    finally:                                    # -wal и -shm, созданные при 0444, — тоже 0444: SQLite берёт права файла базы
+        for f in tmp_path.glob("core.db*"):
+            f.chmod(0o644)
+    await role.check_agents()
+    assert role.agent_stats.store_error is None
+    assert _store_lines(caplog) == ["учёт агентов: запись не проходит (OperationalError SQLITE_READONLY)",
+                                    "учёт агентов: запись снова проходит"]

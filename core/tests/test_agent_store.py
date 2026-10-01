@@ -408,3 +408,20 @@ def test_archive_dir_vanished_keeps_files(store, draft, monkeypatch):       # к
         store.archive(3, None, NOW)
     assert sorted(p.name for p in store.place_dir(3).iterdir()) == ["manual.md", "sushka-bdm2.md"]
     assert store.list_place(3)[0].state == "saved" and list((store.root / "archive").iterdir()) == []
+
+
+@non_root
+def test_probe_write_sees_readonly_file(store):                           # I-1: проба записи учёта, без следа
+    store.probe_write()
+    assert store.pending() == {}                                            # проба откатывается
+    db = store.db_path
+    os.chmod(db, 0o444)
+    try:
+        assert store.open()                                                 # BEGIN IMMEDIATE на файле 0444 проходит
+        with pytest.raises(StoreError, match="SQLITE_READONLY"):
+            store.probe_write()
+    finally:                                    # -wal и -shm, созданные при 0444, — тоже 0444
+        for f in (db, db + "-wal", db + "-shm"):
+            if os.path.exists(f):
+                os.chmod(f, 0o644)
+    store.probe_write()

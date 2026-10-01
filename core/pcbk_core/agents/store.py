@@ -293,6 +293,15 @@ class AgentStore:
         self.last_error = None
         return True
 
+    def probe_write(self) -> None:
+        """Проба записи учёта: BEGIN IMMEDIATE, вставка в agent_reloads (место 0 — вне 1…10) и ROLLBACK. Одного open()
+        мало: на файле только для чтения BEGIN IMMEDIATE и CREATE … IF NOT EXISTS проходят (итоговая доводка Д7а,
+        I-1). Сбой — StoreError без пути и значений."""
+        with self._op() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT INTO agent_reloads (place, since, seq) VALUES (0, '', 0)")
+            db.execute("ROLLBACK")
+
     def _live_rows(self, place: int) -> list[tuple[str, str, str]]:
         """(имя, digest, состояние) неархивных строк места."""
         with self._op() as db:

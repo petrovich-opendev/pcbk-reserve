@@ -11,8 +11,8 @@ EVENTS_CHECK_S. Состояние роли меняется только в ц�
 
 Учёт агентов студентов (AgentStore, Д7-R56) открывается в lifespan сразу после журнала событий. Его сбой —
 agent_stats.store_failed (строка сторожа «Агенты студентов»), а не config_error: /healthz/data от агентов не
-зависит (П13). Дальше учёт открывается заново раз в EVENTS_CHECK_S вместе с проверкой журнала (итоговое ревью Д7а,
-I-1): флаг сбоя после одного SQLITE_BUSY у save_agent снимается сам, без перезапуска core.
+зависит (П13). Дальше учёт открывается заново и пробуется на запись раз в EVENTS_CHECK_S вместе с проверкой журнала
+(итоговое ревью Д7а, I-1): флаг сбоя после одного SQLITE_BUSY у save_agent снимается сам, без перезапуска core.
 """
 import asyncio
 import logging
@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp
 
 from ..agents.stats import AgentStats
-from ..agents.store import AgentStore
+from ..agents.store import AgentStore, StoreError
 from ..app import RoleBase
 from ..hooks import hooks_of
 from ..secrets import TokenTable
@@ -55,6 +55,7 @@ CONFIG_ERRORS = {
 TOKENS_ERROR = "токены не читаются — все вызовы получают 401"
 EVENTS_ERROR = "журнал событий не пишется: "
 EVENTS_ERROR_CHARS = 53                 # 27 + 53 ≤ 80 (F10)
+STORE_PREFIX = "учёт агентов: "        # начало текста StoreError — в строке журнала проверки не повторяется
 
 log = logging.getLogger("pcbk_core.data")
 
@@ -280,15 +281,27 @@ class DataRole(RoleBase):
         """Проверка записи журнала — в потоке (F9); health() читает только её итог."""
         await asyncio.to_thread(self.events.check)
 
-    async def check_agents(self) -> None:
-        """Учёт агентов — снова open() в потоке (схема идемпотентна, BEGIN IMMEDIATE проверяет и запись): удача —
-        store_ok, сбой — store_failed (I-1). В журнал службы — только смена «пишется / не пишется»."""
-        was = self.agent_stats.store_error
+    def _agents_writable(self) -> str | None:
+        """В потоке: open() (схема идемпотентна) и проба записи с откатом — на файле только для чтения open() проходит.
+        None — учёт пишется, иначе причина без пути и значений."""
+        if not self.agents.open():
+            return self.agents.last_error or "Error"
         try:
-            ok = await asyncio.to_thread(self.agents.open)
-            error = self.agents.last_error or "Error"
-        except Exception as exc:            # open() не бросает; страховка — только класс
-            ok, error = False, type(exc).__name__
+            self.agents.probe_write()
+        except StoreError as exc:
+            return str(exc).removeprefix(STORE_PREFIX)
+        return None
+
+    async def check_agents(self) -> None:
+        """Учёт агентов — снова open() и проба записи в потоке: удача — store_ok, сбой — store_failed (I-1). В журнал
+        службы — только смена «пишется / не пишется». Прежнее состояние читается после потока: сбой save_agent, пришедший
+        за время проверки, — тоже смена, и её строка журнала не теряется."""
+        try:
+            error = await asyncio.to_thread(self._agents_writable)
+        except Exception as exc:            # страховка — только класс
+            error = type(exc).__name__
+        ok = error is None
+        was = self.agent_stats.store_error
         if ok:
             self.agent_stats.store_ok()
             if was is not None:
