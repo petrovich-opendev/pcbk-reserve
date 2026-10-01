@@ -20,7 +20,7 @@ import pytest
 from helpers import (AGENT_DRAFT, ORIGIN, PW, SETTINGS, agent_text, gateway_role, non_root, oc_headers,
                      wait_until_async)
 from pcbk_core.app import create_app
-from pcbk_core.agents.store import NameTaken
+from pcbk_core.agents.store import NameTaken, StoreError
 from pcbk_core.gateway.places import PLACE_TEXTS
 from pcbk_core.gateway.reload import (IDLE_SETTLE_S, PLACE_AGENTS_DIR, QUARANTINE_MAX_PER_H, RELOAD_RETRY_S,
                                       RELOAD_TICK_S, AgentReloads, agents_rel_path, config_error_path)
@@ -406,3 +406,62 @@ async def test_worker_skips_restarting_place(env):            # П5 г: пере
     assert len([r for r in env.oc.requests if r.url.host == "172.31.3.3"]) == asked and env.oc.dispose_calls[3] == 0
     hold.set()
     assert (await w.wait_ready(3)).state == "ready"
+
+
+# --- доводка р1 (ревью 7aaced4/743fde1) ---
+
+@pytest.mark.anyio
+async def test_store_error_after_move_is_quarantined(env, monkeypatch, caplog):   # Ruling 3: файл уже в карантине
+    caplog.set_level(logging.INFO, logger="pcbk_core.gateway.reload")
+    with monkeypatch.context() as m:                         # учёт падает на транзакции после переноса файла
+        m.setattr(env.store, "_op", lambda: (_ for _ in ()).throw(StoreError("disk")))
+        assert await env.reloads.repair(3, body()) == "quarantined"
+    assert not (env.root / "student-03" / "proverka.md").exists()
+    assert len(list((env.root / "quarantine" / "student-03").iterdir())) == 1
+    assert env.stats.count_1h("image_config") == 0 and env.stats.count_1h("quarantined") == 1
+    assert env.stats.worker_store_error == "StoreError" and env.stats.store_error is None   # флаг воркера, не роли
+    assert "gw agents quarantine place=03 result=moved error=StoreError" in caplog.text
+    for i in range(QUARANTINE_MAX_PER_H - 1):                # метка предела осталась: ещё два — и предел
+        (env.root / "student-03" / f"b{i}.md").write_text("x")
+        assert await env.reloads.repair(3, body(PLACE_AGENTS_DIR + f"/b{i}.md")) == "quarantined"
+    (env.root / "student-03" / "b9.md").write_text("x")
+    assert await env.reloads.repair(3, body(PLACE_AGENTS_DIR + "/b9.md")) == "capped"
+
+
+@pytest.mark.anyio
+async def test_wake_capped_is_config_once(env_asleep):       # R8: предел на пробуждении — config сразу, один счёт
+    e = env_asleep
+    for i in range(QUARANTINE_MAX_PER_H):
+        (e.root / "student-05" / f"b{i}.md").write_text("x")
+        assert await e.reloads.repair(5, body(PLACE_AGENTS_DIR + f"/b{i}.md")) == "quarantined"
+    bad = e.root / "student-05" / "bad.md"; bad.write_text("x")
+    e.oc.bad_files[5] = (PLACE_AGENTS_DIR + "/bad.md", bad)
+    await e.role.workplaces.wake(5); view = await e.role.workplaces.wait_ready(5)
+    assert (view.state, view.detail) == ("failed", CONFIG_TEXT)
+    assert e.stats.count_1h("image_config") == 1 and bad.exists()
+    assert place_calls(e, 5) == ["start", "stop"]
+
+
+@pytest.mark.anyio
+async def test_image_md_path_outside_agents_not_moved(env):  # R1: .md вне каталога агентов места — файл образа
+    for path in ("/etc/pcbk-opencode/opencode/agent/proverka.md", PLACE_AGENTS_DIR + "x/proverka.md"):
+        assert await env.reloads.repair(3, body(path)) == "image", path
+    assert (env.root / "student-03" / "proverka.md").exists() and env.store.list_place(3)[0].state == "saved"
+    assert list((env.root / "quarantine").iterdir()) == [] and env.stats.count_1h("quarantined") == 0
+
+
+@pytest.mark.anyio
+async def test_worker_other_400_after_dispose_keeps_place(env, monkeypatch):   # R9: 400 не про конфигурацию
+    real = env.oc._answer
+
+    async def answer(request, n):
+        if request.url.path == "/agent" and env.oc.dispose_calls[n]:
+            return httpx.Response(400, json={"name": "BadRequestError", "data": {"path": BAD}})
+        return await real(request, n)
+    monkeypatch.setattr(env.oc, "_answer", answer)
+    env.mono.advance(10); await settle(env)
+    assert env.oc.dispose_calls[3] == 1 and env.stats.count_1h("reload_failed") == 1
+    assert env.role.workplaces.is_ready(3) and not env.role.workplaces.is_waking(3)
+    assert place_calls(env, 3) == [] and env.docker.containers[3]["running"]
+    assert (env.root / "student-03" / "proverka.md").exists() and env.stats.count_1h("quarantined") == 0
+    assert env.stats.count_1h("image_config") == 0 and env.store.list_place(3)[0].state == "saved"

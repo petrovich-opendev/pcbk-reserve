@@ -221,7 +221,7 @@ def test_agents_row_ok(stack, users):                                  # m13: st
             shot(page, "01-agents-row-ok.png")
 
 
-def test_bad_file_quarantined_on_wake(stack, users, browser):          # Review Focus Д7б 5, учение строки; последним
+def test_bad_file_quarantined_on_wake(stack, users):                   # Review Focus Д7б 5, учение строки; последним
     a, _ = users
     stack.compose("stop", "student-10")
     wait_for(lambda: a.call("GET", "/pcbk/api/workplace")[1]["state"] == "sleeping", 70)   # шлюз увидел остановку
@@ -231,15 +231,14 @@ def test_bad_file_quarantined_on_wake(stack, users, browser):          # Review 
     assert stack.sh("pcbk-core", "ls /srv/agents/quarantine/student-10")[1].startswith("drill-bad.md.")   # П6
     row = row_of(stack.wait_status(lambda d: row_of(d, "agents")["state"] == "warn", 60), "agents")
     assert row["detail"] == "файл агента сломал рабочее место — в карантине, место перезапущено"
-    page = browser.page(isolated=True)                                   # m8: снимок строки — до пересоздания core
-    try:
-        page.goto(f"{STAND_ORIGIN}/status")
-        page.wait_text(r"Агенты студентов", 20); page.wait_text(r"файл агента сломал рабочее место", 20)
-        page.eval(AGENTS_ROW_INTO_VIEW_JS)
-        shot(page, "01-agents-row-quarantine.png")
-    finally:
-        page.close()
-    assert browser.handler_errors == [], browser.handler_errors
+    if os.environ.get("PCBK_SHOTS"):                                    # m8: снимок строки — до пересоздания core;
+        with cdp.Browser() as browser:                                   # без PCBK_SHOTS тест от Chrome не зависит (m-4)
+            page = browser.page(isolated=True)
+            page.goto(f"{STAND_ORIGIN}/status")
+            page.wait_text(r"Агенты студентов", 20); page.wait_text(r"файл агента сломал рабочее место", 20)
+            page.eval(AGENTS_ROW_INTO_VIEW_JS)
+            shot(page, "01-agents-row-quarantine.png")
+            assert browser.handler_errors == [], browser.handler_errors
     stack.recreate("core", {})                                           # I-н3: счётчики часа — в памяти core
     row = row_of(stack.wait_status(lambda d: row_of(d, "agents")["state"] == "ok", 60), "agents")
     assert row["detail"] == "агенты сохраняются"

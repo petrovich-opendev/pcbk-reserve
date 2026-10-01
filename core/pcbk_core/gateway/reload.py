@@ -34,8 +34,9 @@ DRILL_AGENTS=freeze_reload — после первого прохода ворк
 воркера (шаг в, после dispose) и пробуждения (Workplaces.repair): путь в каталоге агентов места (agents_rel_path) —
 файл в карантин (AgentStore.quarantine в потоке, строка агента — quarantined), не больше QUARANTINE_MAX_PER_H за час на
 место (метки — deque времён monotonic, окно QUARANTINE_WINDOW_S); путь вне каталога — файл образа, ничего не двигается
-(image); предел — capped; сбой переноса (DirUnavailable, StoreError) — тоже image (предпроверка Д7б, m6). image и capped
-— счётчик image_config. Воркер после любого Config…Error отпускает замок места и до конца ворот зовёт
+(image); предел — capped; файл не перенесён (DirUnavailable) — тоже image (предпроверка Д7б, m6). Сбой учёта после
+переноса (StoreError: файл уже в карантине, строка агента не обновлена) — quarantined и флаг сбоя учёта воркера
+(доводка р1, Ruling 3): место перезапускается и поднимается. image и capped — счётчик image_config. Воркер после любого Config…Error отпускает замок места и до конца ворот зовёт
 Workplaces.restart (П5 в): после карантина — перезапуск места, при image и capped — место гаснет с текстом config. Так
 сломанное место не получает dispose раз в RELOAD_RETRY_S. reload_done при этом не зовётся (раунд 1, m1): метка остаётся,
 и место, снова готовое, перезагружается и сверяет оставшиеся saved — не раньше RELOAD_RETRY_S после неудачи (_failed_at;
@@ -47,7 +48,7 @@ reload_failed считается и при карантине, m4).
 - … result=failed step=<шаг> error=<Класс или status_NNN или config_<итог repair>>;
 - … result=delayed wait_s=S;
 - gw agents quarantine place=NN result=moved|missing|image|capped [error=<Класс>] — без имени файла (missing — файла
-  уже нет: перезапуск нужен всё равно, кэш экземпляра сломан).
+  уже нет: перезапуск нужен всё равно, кэш экземпляра сломан; moved error=StoreError — файл перенесён, учёт не записал).
 
 Только память и учёт: модуль не импортирует accounts (команда администратора шлюза, runpy).
 """
@@ -292,11 +293,13 @@ class AgentReloads:
         - путь вне каталога агентов места (файл образа, «..», имя вне правил) — image: ничего не двигается;
         - у места уже QUARANTINE_MAX_PER_H карантинов за окно — capped: файл остаётся, нужен человек;
         - иначе файл — в карантин (AgentStore.quarantine в потоке), строка агента — quarantined; файла уже нет — тоже
-          quarantined: экземпляр места всё равно сломан, перезапуск нужен. Сбой переноса (DirUnavailable, StoreError) —
-          image с классом ошибки в журнале, а не исключение и срок пробуждения (m6).
+          quarantined: экземпляр места всё равно сломан, перезапуск нужен. Файл не перенесён (DirUnavailable) — image с
+          классом ошибки в журнале, а не исключение и срок пробуждения (m6). StoreError бывает только после переноса
+          (AgentStore.quarantine пишет строку агента после os.replace): файл уже в карантине — quarantined, флаг сбоя
+          учёта воркера (worker_store_failed) и строка журнала result=moved error=StoreError (доводка р1, Ruling 3).
         image и capped — счётчик image_config, quarantined — quarantined. Метка окна ставится до переноса (без await
-        между проверкой предела и меткой) и снимается, если перенос не удался. Зовут под замком места (шаг в воркера,
-        пробуждение), так что у одного места repair не идут разом."""
+        между проверкой предела и меткой) и снимается, только если файл не перенесён. Зовут под замком места (шаг в
+        воркера, пробуждение), так что у одного места repair не идут разом."""
         path = config_error_path(body)
         if path is None:
             return "not_config"
@@ -312,9 +315,14 @@ class AgentReloads:
         marks.append(now)
         try:
             moved = await asyncio.to_thread(self.store.quarantine, n, rel, self._wallclock())
-        except (DirUnavailable, StoreError) as exc:
+        except DirUnavailable as exc:                   # файл не перенесён
             marks.remove(now)
             return self._not_moved(n, "image", type(exc).__name__)
+        except StoreError as exc:                       # файл перенесён, строка агента не обновлена
+            self.stats.worker_store_failed(type(exc).__name__)
+            self.stats.event("quarantined")
+            log.warning("gw agents quarantine place=%02d result=moved error=%s", n, type(exc).__name__)
+            return "quarantined"
         self.stats.event("quarantined")
         log.warning("gw agents quarantine place=%02d result=%s", n, "missing" if moved is None else "moved")
         return "quarantined"
@@ -449,7 +457,7 @@ class AgentReloads:
             if seen is None:
                 self._failed(n, "agent", failure)
                 if failure.startswith("config_"):       # Д7-R59, П5 в: без await после release и до end_reload (m4, m7)
-                    w.restart(n, broken=failure != "config_quarantined")
+                    w.restart(n, broken=failure in ("config_image", "config_capped"))
                 return
             step[0] = "mark"                            # г)
             now_wall = self._wallclock()
