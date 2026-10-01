@@ -338,6 +338,12 @@ def test_first_login_notice(stack, isolated_page, web_users):                   
     page.click_text("Понятно"); page.wait_gone(NOTICE_RE, 30)
     page.wait_selector("textarea", 90)                                                    # поле чата, не шапка (Minor 7)
     assert [(r["method"], r["status"]) for r in page.requests("/pcbk/api/auth/notice")] == [("POST", 204)]
+    page.wait(lambda: page.requests(OC + "/"), 10, "запросы чата к месту")               # список разговоров — после поля
+    seq = page.requests("/pcbk/api/")                                                     # все записи вкладки по порядку
+    ack = next(i for i, r in enumerate(seq) if r["path"] == "/pcbk/api/auth/notice")
+    wake = [i for i, r in enumerate(seq) if r["method"] == "POST" and r["path"].startswith("/pcbk/api/workplace")]
+    oc = [i for i, r in enumerate(seq) if r["path"].startswith(OC + "/")]
+    assert oc and all(i > ack for i in wake + oc), (ack, wake, oc)                        # место и чат — после «Понятно»
     assert noticed(stack, "web-a") == "да"
     assert page.csp() == [] and page.console_errors() == []
 
@@ -413,7 +419,11 @@ def test_place_asleep_shows_wake_and_goes_quiet(stack, page, web_users):        
     assert [r["path"] for r in page.requests("/pcbk/api/")[n:]] == []                      # остановлен до действия студента
     assert 1 <= len(refusals(page)) <= RECONNECT_ROUND, refusals(page)                     # один круг, не шторм
     page.click_text("Разбудить"); page.wait_gone(r"Рабочее место спит", 90)
-    assert "Готово:" in page.wait_text(ANSWER, 30)                                         # тот же разговор (initialSessionId)
+    # тот же разговор (initialSessionId): его ответ — среди сообщений агента, а не где угодно на странице — в списке
+    # слева самозаголовок двойника «Готово: нет инструмента» тоже совпадает с ANSWER (доводка Б4, I1)
+    page.wait(lambda: any(re.search(ANSWER, t) for t in page.eval(ASSISTANT_TEXTS_JS)), 30,
+              "ответ восстановленного разговора")
+    assert len(page.eval(ASSISTANT_TEXTS_JS)) == 1                                         # история загружена до вопроса
     ask(page, Q)
     assert page_sessions(page) == [sid, sid] and last_session(stack, PLACE) == sid
     # консоль не сверяется: на отказ списка разговоров (сон, 401) адаптер пишет console.error сам — это не ошибка чата
@@ -485,6 +495,7 @@ def test_model_retries_recorded(stack, page, web_users, record_property):       
         n = attempts()
         return (n >= 3 and any(t == "retry" for t, _, _ in seen)) or (n >= 1 and not running())
 
+    reports = web_reports(stack)
     started = time.monotonic()
     page.type("textarea", "FAKE500 что сейчас?"); page.press_enter("textarea")
     wait_for(retried_enough, timeout=150, step=0.5)
@@ -500,7 +511,7 @@ def test_model_retries_recorded(stack, page, web_users, record_property):       
     assert facts["attempts"] >= 3 and stopped, facts                                     # повторы были, ход шёл
     assert [t for t, _, _ in seen if t == "retry"], facts                                # повтор виден статусом
     assert all(n == 0 for _, _, n in seen) and "retry" not in facts["part_types"], facts  # частей на попытку нет
-    assert web_reports(stack) == NO_REPORTS                                                # повторы — не «ответа нет»
+    assert web_reports(stack) == reports                                                   # повторы — не «ответа нет»
     assert page.csp() == []
 
 
@@ -522,7 +533,8 @@ def test_rename_and_archive_through_gateway(stack, page, web_users):            
     login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)
     sid = last_session(stack, PLACE)
     row_css = cdp.Page.thread_row(sid)
-    wait_for(lambda: not session_of(stack, PLACE, sid)["title"].startswith(DEFAULT_TITLE), timeout=60)  # самозаголовок — до ручного
+    # самозаголовок — до ручного
+    wait_for(lambda: not session_of(stack, PLACE, sid)["title"].startswith(DEFAULT_TITLE), timeout=60)
     page.wait_text(re.escape(session_of(stack, PLACE, sid)["title"]), 30, css=row_css)   # Ф13: имя OpenCode в строке
     page.rename_thread(sid, "Проверка Д6б")
     wait_for(lambda: session_of(stack, PLACE, sid)["title"] == "Проверка Д6б", timeout=20)
@@ -548,15 +560,17 @@ def test_fourth_tab_told_to_close(stack, browser, page, web_users):             
         sid = last_session(stack, PLACE)
         for i, p in enumerate(pages[1:], 1):
             p.goto(f"{STAND}/chat/"); p.wait_url("/chat/", 30); p.wait_selector(cdp.Page.thread_row(sid), 60)
-            p.open_thread(sid)                                                          # тот же разговор — свой поток у вкладки
+            p.open_thread(sid)                                              # тот же разговор — свой поток у вкладки
             if i < 3:                               # поток второй и третьей — до следующей: четвёртая по счёту — pages[3]
                 p.wait(lambda p=p: any(r["status"] == 200 for r in p.requests(EVENT)), 30, f"поток вкладки {i + 1}")
         pages[3].wait_text(TOO_MANY_TABS, 60)
         assert [p.has_text(r"закройте лишние") for p in pages[:3]] == [False] * 3        # сказано только лишней
         shot(pages[3], "04-fourth-tab.png")
+        n = len(pages[3].requests(EVENT))
+        assert n and all(r["status"] != 200 for r in pages[3].requests(EVENT)), pages[3].requests(EVENT)  # потока не было
         pages[1].close()
         pages[3].wait_gone(r"закройте лишние", 45)                                     # следующая попытка по паузе прошла
-        assert any(r["status"] == 200 for r in pages[3].requests(EVENT))
+        assert any(r["status"] == 200 for r in pages[3].requests(EVENT)[n:])            # поток — после закрытия второй
         # 509/503 WorkplaceBusy на вспомогательных GET при открытии четырёх вкладок допустимы: у edge 10 на cookie
         assert all(p.csp() == [] for p in pages)
     finally:

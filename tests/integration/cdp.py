@@ -1,8 +1,9 @@
 """Headless Chrome по протоколу DevTools (CDP), только stdlib: запуск, вкладки, ввод, ожидания, сеть, CSP, снимки.
 
 Для браузерных тестов веб-чата (Д6а; список разговоров — rename_thread, open_thread, click_text_in — Д6б): фикстуры
-browser (на модуль) и page (на тест, вкладка закрывается) — в conftest.py. Все вкладки — сессии одного соединения с браузером (Target.attachToTarget, flatten). Клиент WebSocket —
-свой, по RFC 6455 в том объёме, что нужен CDP: только ws://127.0.0.1, текстовые кадры, длина до 64 бит.
+browser (на модуль) и page (на тест, вкладка закрывается) — в conftest.py. Все вкладки — сессии одного соединения с
+браузером (Target.attachToTarget, flatten). Клиент WebSocket — свой, по RFC 6455 в том объёме, что нужен CDP: только
+ws://127.0.0.1, текстовые кадры, длина до 64 бит.
 
 Что видит страница:
 - нарушения CSP — слушатель securitypolicyviolation, вставленный в каждый новый документ
@@ -487,12 +488,21 @@ class Page:
 
     def has_text(self, pattern: str, within: float = 0, css: str | None = None) -> bool:
         """True, если текст страницы (или первого элемента css) совпал с выражением за within с; within=0 — одна
-        проверка сейчас. В отличие от wait_text, срок — не сбой: для «этого текста здесь нет»."""
-        try:
-            self.wait(lambda: re.search(pattern, self._text(css)), within, f"текст /{pattern}/")
-        except AssertionError:
-            return False
-        return True
+        проверка сейчас. В отличие от wait_text, срок — не сбой: для «этого текста здесь нет». Отказ CDP на последней
+        пробе — исключение, а не False: «текста нет» не выводится из того, что текст не прочитан (доводка Б4, m2)."""
+        deadline = time.monotonic() + within
+        while True:
+            failed: CDPError | None = None
+            try:
+                if re.search(pattern, self._text(css)):
+                    return True
+            except CDPError as e:                   # переход страницы — ещё нет, пока срок не вышел
+                failed = e
+            if time.monotonic() >= deadline:
+                if failed is not None:
+                    raise failed
+                return False
+            time.sleep(POLL_S)
 
     def wait_gone(self, pattern: str, timeout: float = 10) -> None:
         self.wait(lambda: re.search(pattern, self._text()) is None, timeout, f"исчезновение /{pattern}/")
