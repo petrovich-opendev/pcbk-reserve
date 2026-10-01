@@ -91,7 +91,7 @@ services:
   watchdog:
     build: ./watchdog
     # :d5b остаётся на сервере для отката Д6а
-    image: pcbk-reserve/watchdog:d6a
+    image: pcbk-reserve/watchdog:d6b
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -204,7 +204,7 @@ services:
   core:
     build: ./core
     # :d5b остаётся на сервере для отката Д6а
-    image: pcbk-reserve/core:d6a
+    image: pcbk-reserve/core:d6b
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
