@@ -8,6 +8,7 @@ lifespan; env_sync — под TestClient, воркер припаркован (h
 import asyncio
 import logging
 import sqlite3
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -447,7 +448,7 @@ async def test_store_error_on_step_g_no_redispose(env, monkeypatch):       # I-�
 async def test_no_dispose_while_place_lock_held(env):                      # m-н12
     env.mono.advance(10); await env.reloads.tick(); env.mono.advance(IDLE_SETTLE_S + 0.1)
     async with env.role.workplaces.lock(3):                                 # идёт пробуждение или остановка
-        await env.reloads.tick()
+        await asyncio.wait_for(env.reloads.tick(), 2)                       # m4: ждать замок такт не должен
     assert env.oc.dispose_calls[3] == 0
 
 
@@ -556,7 +557,7 @@ async def test_busy_under_gate_aborts_reload(env, monkeypatch):            # ш�
                 env.oc.busy.add(3)
         return await real(request, n)
     monkeypatch.setattr(env.oc, "_answer", answer)
-    await env.reloads.tick()
+    await asyncio.wait_for(env.reloads.tick(), 2)                           # m4
     assert len(statuses) == 2 and env.oc.dispose_calls[3] == 0
     assert env.reloads.gates.try_reload(3) and not env.role.workplaces.lock(3).locked()    # ворота и замок отпущены
     env.reloads.gates.end_reload(3)
@@ -748,3 +749,136 @@ def test_agents_open_failure_is_worker_flag_not_config_error(tmp_path):    # П1
         assert role.config_error is None and role.health() == (True, "принимает вход")
         assert role.agent_stats.worker_store_error is not None and c.get("/health/agents").json()["store_ok"] is False
         assert role._reload_task is not None                                # воркер идёт: строка «учёт недоступен»
+
+
+# --- доводка р1 (ревью 4c1ed44) ---
+
+@pytest.mark.anyio
+async def test_turn_during_rows_read(env, client_a, monkeypatch):          # К1: ход целиком прошёл ворота, пока
+    client, sid = client_a                                                  # воркер читал строки места
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10)
+    await env.reloads.tick()                                                # пустая карта замечена
+    env.mono.advance(IDLE_SETTLE_S + 0.1)                                   # успокоение прошло, отсрочки нет
+    real = env.store.list_place
+    started, release = threading.Event(), threading.Event()
+
+    def slow(n):
+        started.set(); release.wait(5); return real(n)
+    monkeypatch.setattr(env.store, "list_place", slow)
+    tick = asyncio.create_task(env.reloads.tick())
+    await wait_until_async(started.is_set)
+    r = await prompt_of(client, sid)()                                      # короткий ход: 204, busy у места ещё нет
+    assert r.status_code == 204
+    release.set()
+    await asyncio.wait_for(tick, 2)
+    assert env.oc.dispose_calls[3] == 0, "dispose через миллисекунды после 204 — оборванный ход"
+    assert env.reloads.gates.try_reload(3) and not env.role.workplaces.lock(3).locked()    # ворота отпущены
+    env.reloads.gates.end_reload(3)
+    env.mono.advance(TURN_START_GRACE_S + 0.1); await settle(env)            # после отсрочки — как обычно
+    assert env.oc.dispose_calls[3] == 1
+
+
+@pytest.mark.anyio
+async def test_place_ready_during_rows_read(env, monkeypatch):            # К1: место заново готово за время чтения —
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10)          # успокоение заново
+    await env.reloads.tick(); env.mono.advance(IDLE_SETTLE_S + 0.1)
+    real = env.store.list_place
+    started, release = threading.Event(), threading.Event()
+
+    def slow(n):
+        started.set(); release.wait(5); return real(n)
+    monkeypatch.setattr(env.store, "list_place", slow)
+    tick = asyncio.create_task(env.reloads.tick())
+    await wait_until_async(started.is_set)
+    env.role.workplaces.on_ready(3)                                         # крючок готовности (перезапуск места)
+    release.set()
+    await asyncio.wait_for(tick, 2)
+    assert env.oc.dispose_calls[3] == 0
+    monkeypatch.setattr(env.store, "list_place", real)
+    await settle(env)
+    assert env.oc.dispose_calls[3] == 1
+
+
+@pytest.mark.anyio
+async def test_prompt_waits_for_worker_reload(env, client_a, monkeypatch):  # В2: воркер держит ворота на dispose
+    client, sid = client_a
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10)
+    await env.reloads.tick(); env.mono.advance(IDLE_SETTLE_S + 0.1)
+    real = env.oc._answer
+    in_dispose, release = asyncio.Event(), asyncio.Event()
+
+    async def answer(request, n):
+        if request.url.path == "/instance/dispose":
+            in_dispose.set(); await release.wait()
+        return await real(request, n)
+    monkeypatch.setattr(env.oc, "_answer", answer)
+    tick = asyncio.create_task(env.reloads.tick())
+    await asyncio.wait_for(in_dispose.wait(), 2)
+    prompt = asyncio.create_task(prompt_of(client, sid)())
+    await asyncio.sleep(0.2)
+    assert not [r for r in place_requests(env.oc, 3) if r.url.path.endswith("/prompt_async")]
+    assert env.reloads.gates.waiting(3) == 1                                 # ждёт у ворот, а не у места
+    release.set(); await asyncio.wait_for(tick, 2)
+    assert (await prompt).status_code == 204 and env.oc.dispose_calls[3] == 1
+
+
+@pytest.mark.anyio
+async def test_no_reload_while_prompt_in_flight(env, client_a):           # В2: active > 0 — воркер не входит
+    client, sid = client_a
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10)
+    await env.reloads.tick(); env.mono.advance(IDLE_SETTLE_S + 0.1)
+    env.oc.hang_for[3] = 0.5                                                # prompt_async висит у места
+    prompt = asyncio.create_task(prompt_of(client, sid)())
+    await wait_until_async(lambda: env.reloads.gates.active(3) == 1)
+    env.oc.hang_for[3] = 0
+    await asyncio.wait_for(env.reloads.tick(), 2)
+    assert env.oc.dispose_calls[3] == 0
+    assert (await prompt).status_code == 204
+
+
+@pytest.mark.parametrize("trouble", ["status_500", "no_answer"])
+@pytest.mark.anyio
+async def test_status_error_is_not_idle(env, monkeypatch, trouble):        # В3: «не знаю» — не «пусто»
+    real = env.oc._answer
+
+    async def answer(request, n):
+        if request.url.path == "/session/status":
+            if trouble == "no_answer":
+                raise httpx.ConnectError("нет ответа", request=request)
+            return httpx.Response(500, json={"name": "Boom"})
+        return await real(request, n)
+    monkeypatch.setattr(env.oc, "_answer", answer)
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10)
+    await settle(env); await settle(env)
+    assert len([r for r in place_requests(env.oc, 3) if r.url.path == "/session/status"]) == 4   # проверка шла
+    assert not [r for r in place_requests(env.oc, 3) if r.url.path == "/instance/dispose"]
+    monkeypatch.setattr(env.oc, "_answer", real)                            # положительный контроль: место ответило
+    await settle(env)
+    assert env.oc.dispose_calls[3] == 1
+
+
+@pytest.mark.anyio
+async def test_waking_place_skipped(env, monkeypatch):                     # m1: is_waking на входе и на шаге а
+    w, never = env.role.workplaces, asyncio.Event()
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10)
+    await env.reloads.tick(); env.mono.advance(IDLE_SETTLE_S + 0.1)
+    w._tasks[3] = asyncio.create_task(never.wait())                         # задача пробуждения создана, замок не взят
+    asked = len(place_requests(env.oc, 3))
+    await asyncio.wait_for(env.reloads.tick(), 2)
+    assert len(place_requests(env.oc, 3)) == asked                          # вход: место не спрашивали вовсе
+    never.set(); await w._tasks[3]
+    assert w.is_ready(3) and not w.is_waking(3) and not w.lock(3).locked()
+    real, statuses = env.oc._answer, []
+
+    async def answer(request, n):                                           # шаг а: пробуждение — под воротами
+        if request.url.path == "/session/status":
+            statuses.append(n)
+            if len(statuses) == 3:                                          # 1 — такт; 2, 3 — до ворот и под ними
+                w._tasks[3] = asyncio.create_task(never.wait())
+        return await real(request, n)
+    never.clear(); monkeypatch.setattr(env.oc, "_answer", answer)
+    await env.reloads.tick()                                                # пустая карта — заново (вход её снял)
+    env.mono.advance(IDLE_SETTLE_S + 0.1)
+    await asyncio.wait_for(env.reloads.tick(), 2)
+    assert len(statuses) == 3 and env.oc.dispose_calls[3] == 0 and not w.lock(3).locked()
+    never.set(); await w._tasks[3]

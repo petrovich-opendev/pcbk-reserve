@@ -111,7 +111,10 @@ def test_reaper_probe_keeps_row_red(tmp_path):                                  
     app, role = make_gateway(tmp_path, GW_REAPER_TICK_S=0.05)
     db = tmp_path / "core.db"
     with TestClient(app, base_url=BASE) as c:
-        db.chmod(0o444); tmp_path.chmod(0o555)                                         # том только для чтения
+        # том только для чтения: каталог закрывается первым и открывается последним — иначе SQLite соседнего
+        # соединения (воркер перезагрузки агентов Д7а читает тот же core.db) успел бы создать core.db-shm с правами
+        # файла 0444 в ещё пишущемся каталоге, и база не ожила бы после возврата прав (доводка А5 р1, В1)
+        tmp_path.chmod(0o555); db.chmod(0o444)
         try:
             r = login(c, "stu-03")
             assert r.status_code == 503, (r.status_code, store_state(role))            # вход пишет — сбой
@@ -119,7 +122,7 @@ def test_reaper_probe_keeps_row_red(tmp_path):                                  
             assert c.get("/healthz/gateway").json() == {"ok": False, "detail": "учётные записи недоступны"}
             assert c.get("/health/gateway").json()["store_ok"] is False
         finally:
-            tmp_path.chmod(0o755); db.chmod(0o644)
+            db.chmod(0o644); tmp_path.chmod(0o755)
         wait_store(role, lambda s: s.probe_failures == 0)
         assert c.get("/healthz/gateway").json()["ok"] is False, store_state(role)     # проба ок, сбой входа не снят
         assert login(c, "stu-03").status_code == 200
