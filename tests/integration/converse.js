@@ -1,5 +1,5 @@
 // tests/integration/converse.js — разговор через API OpenCode места (1.18.33); Bun из бинарника OpenCode
-// (BUN_BE_BUN=1), без импортов. Вход — /req.json {url, question, model, tools, timeout_s}, пароль места — /pw.
+// (BUN_BE_BUN=1), без импортов. Вход — /req.json {url, question, model, tools, agent, timeout_s}, пароль места — /pw.
 // Печатает один JSON: session, status (done | asked | timeout), asked, final_text, error, tools,
 // assistant_messages. Вопросы модели и запросы разрешений своей сессии снимаются (reject): иначе ход с
 // вопросом висел бы до срока. На сроке — abort и ожидание, пока сессия не уйдёт из /session/status (К25).
@@ -20,6 +20,7 @@ const session = (await api("POST", "/session", {})).id
 const prompt = {parts: [{type: "text", text: req.question}]}
 if (req.model) prompt.model = req.model
 if (req.tools) prompt.tools = req.tools
+if (req.agent) prompt.agent = req.agent      // агент хода (Д7а); без поля — агент по умолчанию места
 await api("POST", `/session/${session}/prompt_async`, prompt)
 
 const asked = []

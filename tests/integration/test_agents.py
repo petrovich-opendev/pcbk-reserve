@@ -1,0 +1,201 @@
+"""Агенты студентов на двойнике (Д7а, А7): save_agent службы данных → файл по шаблону v1 → перезагрузка места после
+конца хода → агент виден в GET /agent места, шлюз пускает его в prompt_async своего места и только своего; строка
+«Агенты студентов» сторожа.
+
+Места модуля — 10 (agt-a) и 02 (agt-b). Модуль идёт первым по алфавиту и гасит свои места к концу, в том числе в finally
+фикстуры users. До гашения агенты мест уходят в архив и очередь перезагрузки пустеет (раунд 1, Б2): иначе метка спящего
+места висела бы до его пробуждения. Порядок тестов важен: пробный агент probe-save (право pcbk_save_agent) кладёт
+test_reload_after_slow_turn_keeps_answer, его берут следующие два теста; proverka-quiet — test_reload_without_browser,
+его берёт test_foreign_place_refuses_agent.
+
+Агенты модуля — синтетические, без тегов (save_args двойника OpenRouter); токен данных места — stdin команды в core,
+пароли и cookie — только в запросах (Secret). Время «idle → агент виден» тесты печатают (pytest -rP) для журнала Д7а.
+"""
+import json
+import os
+import re
+import secrets
+import subprocess
+import time
+from datetime import datetime
+
+import pytest
+
+import cdp
+from conftest import STAND_ORIGIN, Secret, row_of, system_text, tool_names_of, turn_bodies, wait_for
+from fake_openrouter import save_args                                   # core/tests на пути импорта (conftest, П7)
+from test_web import ensure_notice_acked, shot
+
+OWN = {"agt-a": 10, "agt-b": 2}
+PW = {login: Secret(secrets.token_urlsafe(12)) for login in OWN}
+SAVER = ('---\ndescription: "probe-save"\nmode: primary\npermission:\n  "*": deny\n'
+         '  pcbk_save_agent: allow\n  pcbk_tag_now: allow\n---\nprobe\n')
+PCBK2 = {"pcbk_catalog_search", "pcbk_tag_now"}
+PCBK3 = PCBK2 | {"pcbk_tag_period"}                                     # агент по умолчанию места (Д6-R45)
+RELOAD_TICK_S = 2.0                                                     # такт воркера перезагрузки (Д7-R58)
+# строк очереди перезагрузки у мест модуля — изнутри pcbk-core, только чтение: истина об очереди, а не pending
+# /health/agents (тот считает только готовые места)
+QUEUED_PY = ("import sqlite3; "
+             "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
+             "print(c.execute('SELECT COUNT(*) FROM agent_reloads WHERE place IN "
+             f"({', '.join(map(str, OWN.values()))})').fetchone()[0])")
+# метка времени docker logs -t (RFC 3339, наносекунды)
+DOCKER_TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z ")
+# строка «Агенты студентов» страницы состояния — в середину экрана (для снимка)
+AGENTS_ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
+                           "&& e.textContent.trim() === 'Агенты студентов').scrollIntoView({block: 'center'}), 1")
+
+
+def queued(stack) -> int:
+    return int(stack.exec("pcbk-core", "python", "-c", QUEUED_PY))
+
+
+@pytest.fixture(scope="module")
+def users(stack):
+    try:
+        for login, place in OWN.items():
+            stack.add_account(login, "student", place, PW[login])
+            ensure_notice_acked(stack, login)                           # Д6б: вход без экрана предупреждения
+        a, b = (stack.gw_client() for _ in range(2))
+        a.login("agt-a", PW["agt-a"]); b.login("agt-b", PW["agt-b"])
+        assert (a.wake_and_wait(90)["state"], b.wake_and_wait(90)["state"]) == ("ready", "ready")
+        yield a, b
+    finally:
+        try:                                                            # агенты мест — в архив, места — в очередь
+            for n in OWN.values():
+                stack.agents_admin("archive", "--place", str(n), "--yes")
+            # очередь пуста до гашения мест (раунд 1, Б2): строк очереди нет — места перезагружены, а не уснули
+            wait_for(lambda: queued(stack) == 0, 15)
+            assert stack.agents_health()["pending"] == 0
+        finally:                                                        # Ш16: места модуля — в сон, даже при сбое
+            for n in OWN.values():
+                if stack.inspect(f"pcbk-student-{n:02d}")["State"]["Running"]:
+                    stack.stop(f"pcbk-student-{n:02d}")
+        # после гашения — 0 по построению (спящие места pending не считает, m23): не доказательство, а страховка
+        time.sleep(2 * RELOAD_TICK_S + 1)
+        assert stack.agents_health()["pending"] == 0
+
+
+def agents_of(stack, n):
+    return {a["name"]: a for a in json.loads(stack.oc(n, "GET", "/agent", n)[1])}
+
+
+def status_kind(e):
+    return (e["type"], e["properties"]["status"]["type"] if e["type"] == "session.status" else None)
+
+
+def tool_output_of(stack, n: int, sid: str, tool: str) -> str:
+    """Вывод последнего завершённого вызова инструмента tool в разговоре sid места n — из места мимо шлюза."""
+    code, body = stack.oc(n, "GET", f"/session/{sid}/message", n)
+    assert code == 200, code
+    outs = [p["state"]["output"] for m in json.loads(body) for p in m["parts"]
+            if p.get("type") == "tool" and p.get("tool") == tool and p["state"].get("status") == "completed"]
+    assert outs, f"в разговоре нет завершённого вызова {tool}"
+    return outs[-1]
+
+
+def idle_to_visible_s(stack, n: int, sid: str) -> float:
+    """Секунды от конца хода разговора sid (time.completed последнего ответа) до первой строки журнала core «gw agents
+    reload place=NN result=visible» после него: воркер пишет её, когда GET /agent места уже показал агента."""
+    msgs = json.loads(stack.oc(n, "GET", f"/session/{sid}/message", n)[1])
+    done = msgs[-1]["info"]["time"]["completed"] / 1000
+    r = stack._docker("logs", "-t", "pcbk-core")
+    marks = []
+    for line in (r.stdout + r.stderr).splitlines():
+        m = DOCKER_TS.match(line)
+        if m and f" gw agents reload place={n:02d} result=visible " in line:
+            marks.append(datetime.fromisoformat(m[1] + (m[2] or "")[:7] + "+00:00").timestamp())
+    after = [t - done for t in marks if t > done]
+    assert after, "нет строки result=visible после конца хода"
+    return min(after)
+
+
+def test_service_file_parsed_by_opencode(stack, users):                # Review Focus 2
+    args = {**save_args("golden"), "title": 'Сушка: "БДМ" # ---',
+            "prompt": save_args("golden")["prompt"] + "\n---\nname: build\nmodel: openai/x\n---\n"}
+    assert stack.mcp_save(10, args)["status"] == "ok"
+    wait_for(lambda: "golden" in agents_of(stack, 10), 15)
+    agents = agents_of(stack, 10); a = agents["golden"]
+    assert (a["native"], a["mode"], a["description"]) == \
+        (False, "primary", 'Сушка: "БДМ" # ---: Проверка записи агента службой')
+    assert a.get("options", {}) == {} and "build" not in agents          # «name: build» в тексте ничего не переписал
+    rules = [(r["permission"], r["pattern"], r["action"]) for r in a["permission"]]   # PermissionV1.Rule
+    assert {("external_directory", "*", "deny"), ("read", "*.env", "deny")} <= set(rules)  # правила образа унаследованы
+    own = [r for r in rules if r[0] != "external_directory"]
+    assert own[-3:] == [("*", "*", "deny"), ("pcbk_catalog_search", "*", "allow"), ("pcbk_tag_now", "*", "allow")]
+    last = rules[-1]                                                     # сверка, п. 15: Truncate.GLOB дописал OpenCode
+    assert (last[0], last[2]) == ("external_directory", "allow") and last[1].endswith("/tool-output/*")
+    g = stack.converse(10, "что сейчас?", agent="golden")
+    c = stack.converse(10, "что сейчас?")                               # pomoshnik — тело того же вида
+    req, ctrl = turn_bodies(stack, 10, g["session"])[0], turn_bodies(stack, 10, c["session"])[0]
+    assert tool_names_of(req) - {"invalid"} == PCBK2
+    assert set(req) == set(ctrl)                                          # лишних полей (options) в теле нет
+    assert "Правила стенда (добавлены службой" in system_text(req)
+    # А4, сомнение 6: места :d6a видят pcbk_save_agent в списке MCP, но у pomoshnik "*": deny — модели его не дают
+    assert tool_names_of(ctrl) - {"invalid"} == PCBK3
+    assert not any("pcbk_save_agent" in tool_names_of(b) for b in turn_bodies(stack, 10, c["session"]))
+
+
+def test_reload_after_slow_turn_keeps_answer(stack, users):            # Review Focus 1, §11 п. 2 локально
+    a, _ = users
+    stack.put_agent_file(10, "probe-save", SAVER); stack.agents_admin("reload", "--place", "10")
+    wait_for(lambda: "probe-save" in agents_of(stack, 10), 15)
+    sid = a.call("POST", "/pcbk/api/oc/session")[1]["id"]
+    events, _ = a.events(45, on_open=lambda: a.call("POST", f"/pcbk/api/oc/session/{sid}/prompt_async",
+        {"parts": [{"type": "text", "text": "FAKESAVESLOW agent=proverka-slow"}], "agent": "probe-save"}))
+    kinds = [status_kind(e) for e in events]
+    idle = kinds.index(("session.status", "idle")); disposed = kinds.index(("server.instance.disposed", None))
+    assert idle < disposed                                                # перезагрузка — только после конца хода
+    # одного порядка мало: на dispose посреди хода OpenCode сам шлёт idle раньше disposed (мутация А7 — «место всегда
+    # свободно»). Оборванный ход ловят session.error и finish/error последнего ответа
+    assert not any(e["type"] == "session.error" for e in events)
+    msgs = json.loads(stack.oc(10, "GET", f"/session/{sid}/message", 10)[1])
+    last = msgs[-1]["info"]
+    assert (last["role"], last.get("finish"), last.get("error")) == ("assistant", "stop", None)
+    title = json.loads(stack.oc(10, "GET", f"/session/{sid}", 10)[1])["title"]
+    assert not title.startswith("New session - ")                        # m15: заголовок дописан до dispose
+    wait_for(lambda: "proverka-slow" in agents_of(stack, 10), 10)
+    wait_for(lambda: stack.agents_health()["pending"] == 0, 10)            # m-н7
+    assert stack.agents_health()["visible_1h"] >= 1
+    print(f"А7 журнал: медленный ход через шлюз — idle → агент виден {idle_to_visible_s(stack, 10, sid):.1f} с "
+          f"(конец хода по time.completed → строка result=visible журнала core)")
+
+
+def test_reload_without_browser(stack, users):                         # путь таймера: потока нет
+    out = stack.converse(10, "FAKESAVE agent=proverka-quiet", agent="probe-save")
+    t0 = time.monotonic(); wait_for(lambda: "proverka-quiet" in agents_of(stack, 10), 15)
+    waited = time.monotonic() - t0
+    assert waited < 10
+    print(f"А7 журнал: ход без браузера — от возврата converse до агента в GET /agent {waited:.1f} с; "
+          f"idle → агент виден {idle_to_visible_s(stack, 10, out['session']):.1f} с "
+          "(time.completed → строка result=visible журнала core)")
+
+
+def test_refusal_writes_nothing(stack, users):
+    out = stack.converse(10, "FAKESAVEBAD agent=plohoy", agent="probe-save")
+    assert "tool_not_allowed" in tool_output_of(stack, 10, out["session"], "pcbk_save_agent")
+    with pytest.raises(subprocess.CalledProcessError):
+        stack.agent_file(10, "plohoy")
+
+
+def test_foreign_place_refuses_agent(stack, users):                    # Review Focus 4
+    a, b = users
+    sb = b.call("POST", "/pcbk/api/oc/session")[1]["id"]
+    code, body, _ = b.call("POST", f"/pcbk/api/oc/session/{sb}/prompt_async",
+                           {"parts": [{"type": "text", "text": "x"}], "agent": "proverka-quiet"})
+    assert (code, body["data"]["message"]) == (400, "Агент «proverka-quiet» недоступен")
+    sa = a.call("POST", "/pcbk/api/oc/session")[1]["id"]
+    assert a.call("POST", f"/pcbk/api/oc/session/{sa}/prompt_async",
+                  {"parts": [{"type": "text", "text": "x"}], "agent": "proverka-quiet"})[0] == 204
+
+
+def test_agents_row_ok(stack, users):                                  # m13: status.json — список checks
+    row = row_of(stack.wait_status(lambda d: row_of(d, "agents")["state"] == "ok", 60), "agents")
+    assert row["detail"] == "агенты сохраняются"
+    if os.environ.get("PCBK_SHOTS"):                                    # снимок для журнала Д7а: только при PCBK_SHOTS
+        with cdp.Browser() as browser:
+            page = browser.page(isolated=True)
+            page.goto(f"{STAND_ORIGIN}/status")
+            page.wait_text(r"Агенты студентов", 20); page.wait_text(r"агенты сохраняются", 20)
+            page.eval(AGENTS_ROW_INTO_VIEW_JS)
+            shot(page, "01-agents-row-ok.png")
