@@ -34,6 +34,24 @@ test("status_view_filters_and_levels", () => {
     .toEqual({ level: "unknown", text: "Состояние неизвестно: Служба данных" });
   expect(statusView({ stale_after_s: 30, checks: [c("edge", "Входной прокси", "ok")] }, "03"))
     .toEqual({ level: "unknown", text: T_STATUS_UNKNOWN });
+  // итоговое ревью Д6а, P1: warn общих строк владельца студенту не показывается, их fail и unknown — показываются
+  const owners = [c("gateway", "Шлюз и вход", "warn"), c("edge", "Входной прокси", "warn"), c("memory", "Память сервера", "warn"),
+    c("llm", "LLM-прокси и бюджет", "warn")];
+  expect(statusView(st(owners), "03")).toEqual({ level: "ok", text: "Стенд работает" });
+  for (const row of owners) expect(statusView(st([row]), "03").level).toBe("ok");          // каждая по отдельности
+  expect(statusView(st([...owners, c("gateway", "Шлюз и вход", "fail")]), "03"))
+    .toEqual({ level: "fail", text: "Сбой: Шлюз и вход" });
+  expect(statusView(st([c("gateway", "Шлюз и вход", "fail")]), "03")).toEqual({ level: "fail", text: "Сбой: Шлюз и вход" });
+  expect(statusView(st([c("edge", "Входной прокси", "fail")]), "03")).toEqual({ level: "fail", text: "Сбой: Входной прокси" });
+  expect(statusView(st([c("llm", "LLM-прокси и бюджет", "fail")]), "03").level).toBe("fail");
+  expect(statusView(st([c("memory", "Память сервера", "unknown")]), "03"))
+    .toEqual({ level: "unknown", text: "Состояние неизвестно: Память сервера" });
+  // warn своего места, историана и контейнера core студенту по-прежнему виден
+  expect(statusView(st([...owners, c("historian", "Историан БДРВ", "warn")]), "03"))
+    .toEqual({ level: "warn", text: "Внимание: Историан БДРВ" });
+  expect(statusView(st([...owners, c("student-03", "Рабочее место 03", "warn")]), "03"))
+    .toEqual({ level: "warn", text: "Внимание: Рабочее место 03" });
+  expect(statusView(st([c("core-container", "Серверный слой — контейнер", "warn")]), "03").level).toBe("warn");
 });
 
 // --- опрос: часы и таймеры — поддельные (vi.useFakeTimers), fetch — управляемый ---
@@ -84,9 +102,9 @@ test("late_answer_of_old_request_ignored", async () => {
 
 test("polling_bad_answers_are_unknown", async () => {
   const p = poller([
-    { status: 200, body: st([c("edge", "Входной прокси", "warn")]) },
+    { status: 200, body: st([c("historian", "Историан БДРВ", "warn")]) },         // warn, который студенту виден
     { status: 502, body: "<html>сторож не отвечает</html>" },                    // страница watchdog-down.html
-    { status: 200, body: st([c("edge", "Входной прокси", "warn")]) },
+    { status: 200, body: st([c("historian", "Историан БДРВ", "warn")]) },
     { status: 200, body: st([], { stale: true }) },
     { status: 200, body: "не json" },
     { status: 200, body: { stale_after_s: 30, checks: [c("edge", "Входной прокси", "ok")] } },   // без stale

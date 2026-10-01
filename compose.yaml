@@ -12,7 +12,7 @@ name: pcbk-reserve
 # Профиль students: команды выкладки без имён служб места не поднимают — их создают
 # create и будит серверный слой (с Д5) или администратор.
 # Секции build нет: образ один на десять мест, собирается локально и едет docker save/load;
-# :d2 остаётся на сервере для отката.
+# :d4 остаётся на сервере для отката Д6а.
 # healthcheck не задаётся: работает проверка образа (GET /agent и слово MCP: «200 mcp=connected»).
 x-student: &student
   image: pcbk-reserve/student:d6a
@@ -90,7 +90,7 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d5a остаётся на сервере для отката
+    # :d5b остаётся на сервере для отката Д6а
     image: pcbk-reserve/watchdog:d6a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
@@ -203,7 +203,7 @@ services:
   # на адресе core в pcbk-front (Д5-R31). Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d5a остаётся на сервере для отката
+    # :d5b остаётся на сервере для отката Д6а
     image: pcbk-reserve/core:d6a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core

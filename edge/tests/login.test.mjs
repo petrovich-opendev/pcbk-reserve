@@ -591,14 +591,17 @@ test("шаблон edge: чат на 8443 — свой CSP, кэш и сжати
 
   const page = one(8443, "=", "/chat/");
   const assets = one(8443, "^~", "/chat/assets/");
-  for (const [name, b] of [["/chat/", page], ["/chat/assets/", assets]]) {
+  const other = one(8443, "^~", "/chat/");                                              // 404 прочего под /chat/
+  // CSP R41 и заголовки server — у всех ответов /chat*: и у перенаправления, и у 404 (итоговое ревью Д6а, P3)
+  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["/chat/assets/", assets], ["^~ /chat/", other]]) {
     assert.ok(b.includes(`add_header Content-Security-Policy "${CHAT_CSP}" always;`), name);
     assert.ok(b.includes('add_header X-Content-Type-Options "nosniff" always;'), name);   // server-заголовки не наследуются
     assert.ok(b.includes('add_header Referrer-Policy "no-referrer" always;'), name);
     assert.equal(b.match(/add_header Cache-Control /g)?.length, 1, name);
     assert.doesNotMatch(b, /unsafe-|data:|blob:|proxy_pass/, name);
   }
-  assert.ok(page.includes('add_header Cache-Control "no-store" always;'));
+  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["^~ /chat/", other]])
+    assert.ok(b.includes('add_header Cache-Control "no-store" always;'), name);
   assert.match(page, /charset utf-8;/);
   assert.match(page, /try_files \/chat\/index\.html =404;/);
   assert.doesNotMatch(page, /gzip/);

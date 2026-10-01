@@ -21,10 +21,30 @@ export const MAX_BODY_BYTES = 64 * 1024;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const NOT_IN_MANIFEST = new Set(["index.html", "build.json"]);
 
-// API новее Chrome 109: предупреждение, решение — по ответу владельца о браузерах класса.
+// API новее Chrome 109: предупреждение, решение — по ответу владельца о браузерах класса. В скобках — с какой версии
+// Chrome (итоговое ревью Д6а, P4). findLast и findLastIndex (Chrome 97) не новее 109 — их в списке нет: в нашей
+// сборке findLast есть, и предупреждение было бы ложным.
+// Подстрокой — имена, которые не путаются со старыми API:
 export const NEWER_API = [
-  "Promise.withResolvers", ".toSorted(", ".toReversed(", ".toSpliced(",
-  "Object.groupBy", "Map.groupBy", "Array.fromAsync",
+  "Promise.withResolvers",                                                // 119
+  ".toSorted(", ".toReversed(", ".toSpliced(", ".with(",                  // 110: Array.prototype
+  "Object.groupBy", "Map.groupBy",                                        // 117
+  "Array.fromAsync",                                                      // 121
+  ".union(", ".intersection(", ".difference(", ".symmetricDifference(",   // 122: Set.prototype
+  ".isSubsetOf(", ".isSupersetOf(", ".isDisjointFrom(",
+  ".isWellFormed(", ".toWellFormed(",                                     // 111: String.prototype
+  "Iterator.from(",                                                       // 122: помощники итераторов
+];
+// Шаблоном — то, что подстрокой давало бы ложные срабатывания. .take( и .drop( бывают у чего угодно, а помощник
+// итератора — это вызов прямо на итераторе .values()/.keys()/.entries() (Object.values(o).map — массив, не он).
+// Флаг регулярки v (112) — у литерала после знака, с которого в JS начинается выражение (деление a/b/v не литерал),
+// и у new RegExp(…, "…v…").
+export const NEWER_API_PATTERNS = [
+  { what: "помощники итераторов",                                          // .values().map( и т. п.
+    re: /\.(?:values|keys|entries)\(\)\.(?:map|filter|take|drop|flatMap|reduce|toArray|forEach|some|every|find)\(/g },
+  { what: "флаг регулярки v",
+    re: /(?<=[(,=:[!&|?{};]|^)\s*\/(?![*/])(?:[^/\\\n[]|\\.|\[(?:[^\]\\\n]|\\.)*\])+\/[dgimsuy]*v[dgimsuy]*(?![\w$])/g },
+  { what: "флаг регулярки v (new RegExp)", re: /\bRegExp\(\s*[^,()]*,\s*(["'`])[dgimsuy]*v[dgimsuy]*\1\s*\)/g },
 ];
 const NEWER = "API новее Chrome 109";
 const EVAL = "код для eval — CSP без 'unsafe-eval' его запретит";
@@ -36,6 +56,7 @@ const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  */
 const JS_WARNINGS = [
   ...NEWER_API.map((api) => ({ what: api, re: new RegExp(escape(api), "g"), kind: NEWER })),
+  ...NEWER_API_PATTERNS.map(({ what, re }) => ({ what, re, kind: NEWER })),
   { what: "new Function", re: /\bnew\s+Function\b/g, kind: EVAL },
   { what: "=Function", re: /=Function[;,)]/g, kind: EVAL },
   { what: "eval(", re: /\beval\(/g, kind: EVAL },

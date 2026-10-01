@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, expect, test } from "vitest";
-import { checkDist, KNOWN } from "../scripts/check-dist.mjs";
+import { checkDist, KNOWN, NEWER_API, NEWER_API_PATTERNS } from "../scripts/check-dist.mjs";
 import { guardOutDir } from "../vite.config.ts";
 
 type Fx = {
@@ -77,6 +77,38 @@ test("check_dist_rejects_forbidden_strings", () => {
 test("check_dist_warns_on_newer_api", () => {
   const r = checkDist(fixture({ ...CLEAN, js: "a.toSorted(); Promise.withResolvers()" }));
   expect(r.errors).toEqual([]); expect(r.warnings.join(" ")).toMatch(/toSorted.*withResolvers|withResolvers.*toSorted/);
+});
+// итоговое ревью Д6а, P4: каждое API новее Chrome 109 — предупреждение (не ошибка), и без ложных срабатываний
+test("check_dist_warns_on_each_newer_api", () => {
+  const cases: [string, string][] = [
+    ["Promise.withResolvers", "const {promise:p}=Promise.withResolvers();"],
+    [".toSorted(", "a.toSorted((x,y)=>x-y);"], [".toReversed(", "a.toReversed();"], [".toSpliced(", "a.toSpliced(0,1);"],
+    [".with(", "a.with(0,1);"], ["Object.groupBy", "Object.groupBy(a,f);"], ["Map.groupBy", "Map.groupBy(a,f);"],
+    ["Array.fromAsync", "await Array.fromAsync(g);"],
+    [".union(", "s.union(t);"], [".intersection(", "s.intersection(t);"], [".difference(", "s.difference(t);"],
+    [".symmetricDifference(", "s.symmetricDifference(t);"], [".isSubsetOf(", "s.isSubsetOf(t);"],
+    [".isSupersetOf(", "s.isSupersetOf(t);"], [".isDisjointFrom(", "s.isDisjointFrom(t);"],
+    [".isWellFormed(", "x.isWellFormed();"], [".toWellFormed(", "x.toWellFormed();"], ["Iterator.from(", "Iterator.from(g);"],
+    ["помощники итераторов", "m.values().map(f);"], ["помощники итераторов", "m.keys().take(3);"],
+    ["помощники итераторов", "s.entries().drop(1).toArray();"],
+    ["флаг регулярки v", "const r=/[\\p{L}--[a-z]]/v;"], ["флаг регулярки v", "x.match(/a/gv)"],
+    ["флаг регулярки v (new RegExp)", 'new RegExp("[a]","v")'],
+  ];
+  for (const [what, js] of cases) {
+    const r = checkDist(fixture({ ...CLEAN, js }));
+    expect(r.errors, js).toEqual([]);
+    expect(r.warnings.length, js).toBe(1);
+    expect(r.warnings[0], js).toContain(`API новее Chrome 109 — ${what}`);
+  }
+  // каждое имя списка и каждый шаблон проверены хоть одним случаем
+  for (const api of NEWER_API) expect(cases.some(([w]) => w === api), api).toBe(true);
+  for (const { what } of NEWER_API_PATTERNS) expect(cases.some(([w]) => w === what), what).toBe(true);
+  // без ложных срабатываний: старые API, массив из Object.values, деление, обычные флаги, take/drop не на итераторе
+  for (const js of ["a.findLast(f);a.findLastIndex(f);a.at(-1);", "Object.values(o).map(f);Object.entries(o).filter(f);",
+                    "[...m.values()].map(f);", "x=a/b/v;y=(c)/d/v;", "x.replace(/a/g,'');/b/giu.test(y);",
+                    "new RegExp(s,'gu');", "q.take(3);q.drop(1);", "lodash.take(a,2);"]) {
+    expect(checkDist(fixture({ ...CLEAN, js })).warnings, js).toEqual([]);
+  }
 });
 test("check_dist_manifest_from_disk", () => {                           // раунд 2, Minor 1: файл из public/ тоже в описи
   const dir = fixture({ ...CLEAN, extraFile: "boot.js", listExtraInManifest: true });

@@ -173,6 +173,12 @@ def test_edge_serves_chat_under_csp(stack):                                # Д6
         assert (code, h["content-type"]) == (404, "text/plain; charset=utf-8"), path   # тип — не по расширению
     code, _, h = stack.https_full("/chat")
     assert (code, h["location"]) == (301, "/chat/")                        # относительный: туннель не уводит на 8443
+    # CSP R41 и заголовки — у всех ответов /chat*, и у перенаправления и 404 (итоговое ревью Д6а, P3)
+    for path, want in (("/chat", 301), ("/chat/build.json", 404), ("/chat/index.html", 404),
+                       ("/chat/assets/missing-00000000.js", 404)):
+        code, _, h = stack.https_full(path)
+        assert (code, h.get("content-security-policy"), h.get("cache-control"), h.get("x-content-type-options"),
+                h.get("referrer-policy")) == (want, CHAT_CSP, "no-store", "nosniff", "no-referrer"), path
     code, _, h = stack.https_full("/favicon.ico")
     assert (code, h["cache-control"]) == (204, "no-store")                 # решение по А4: иконки нет — не 404
     assert stack.http_from_watchdog("GET", "http://pcbk-edge:8080/chat/build.json") == 200   # из сети сторожа (M13)
