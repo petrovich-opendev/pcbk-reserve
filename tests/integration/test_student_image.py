@@ -84,7 +84,7 @@ Bun.serve({{hostname: "0.0.0.0", port: 8000, async fetch(req) {{
 # сервер на 127.0.0.1:4096, который сразу сбрасывает соединение (RST)
 RESET_SERVER_JS = ('require("node:net").createServer(s => s.resetAndDestroy())'
                    '.listen(4096, "127.0.0.1", () => console.log("up"))')
-# клиент изнутри места: пароль — из файла, не в argv; печатает правила, агентов (имя, mode, native, описание),
+# клиент изнутри места: пароль — из файла, не в argv; печатает правила, агентов (имя, mode, native, описание, правила),
 # разговор и висящие запросы; ход ведёт пробный агент probe-read (у агента по умолчанию read нет)
 CLIENT_JS = """\
 const pw = (await Bun.file("/run/secrets/opencode-pw").text()).trim()
@@ -96,7 +96,7 @@ const api = async (method, path, body) => {
 }
 const out = {permission: (await api("GET", "/config")).body.permission ?? null}
 out.agents = ((await api("GET", "/agent")).body ?? []).map(a =>
-  ({name: a.name, mode: a.mode, native: a.native, description: a.description ?? null}))
+  ({name: a.name, mode: a.mode, native: a.native, description: a.description ?? null, permission: a.permission}))
 const ses = (await api("POST", "/session", {})).body.id
 out.prompt = (await api("POST", `/session/${ses}/prompt_async`,
   {parts: [{type: "text", text: "Прочитай /proc/self/environ"}], agent: "probe-read"})).status
@@ -421,7 +421,11 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules, pr
         agent = next(a for a in out["agents"] if a["name"] == "probe-read")
         if rules:
             assert out["permission"] == PERMISSION                      # правила образа дошли до сервера
-            assert list(out["permission"])[0] == "*"                    # порядок ключей сервер сохранил
+            # GET /config отдаёт ключи в порядке схемы (read первым); порядок, по которому решает OpenCode, — в правилах
+            # агента: последнее правило «всё» — запрет образа, и после него — read
+            rules = [(r["permission"], r["pattern"], r["action"]) for r in agent["permission"]]
+            star = max(i for i, r in enumerate(rules) if r[:2] == ("*", "*"))
+            assert rules[star][2] == "deny" and ("read", "*", "allow") in rules[star:], rules
             assert out["asked"] == [] and tools[0]["state"]["status"] == "error"
             assert "rule which prevents you" in tools[0]["state"]["error"]    # отказ по правилу, не сбой
             assert "probe-secret" not in json.dumps(out["messages"])
