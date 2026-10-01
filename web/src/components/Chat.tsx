@@ -21,6 +21,11 @@
 // isDisabled не смотрит, и кнопка с текстом в поле ушла бы выбранному агенту). Список агентов читает опрос
 // createAgentsPoll (agents.ts): при монтировании, через 1 с после конца хода, пока есть pending — раз в 3 с до 60 с;
 // остановка — при снятии чата и остановке обёртки.
+// С панелью агентов после перезагрузки или «Разбудить» (initialSessionId) отправка закрыта и до решения, открывать ли
+// прежний разговор (доводка р1, m1): иначе ход ушёл бы выбранному агенту (помощнику) в новый разговор мимо прежнего
+// разговора Конструктора. Решение — прежний открыт или его нет в списке; ещё открывают отправку сбой списка (решать
+// нечего, студент пишет в новый разговор) и выбор агента в панели (m15). Без панели (тесты Д6) — поведение Д6б: студент
+// может начать новый разговор сразу, и прежний поверх него не откроется.
 import {
   createOpencodeClient, useOpenCodePermissions, useOpenCodeQuestions, useOpenCodeRuntime,
   useOpenCodeRuntimeExtras, type OpenCodePermissionRequest, type OpenCodeQuestionRequest,
@@ -29,7 +34,7 @@ import { useEffect, useRef, useState } from "react";
 import { DEFAULT_AGENT, createAgentsPoll, parseAgents, sendAgent, type AgentItem, type AgentsPoll } from "../agents";
 import type { Reply } from "../api";
 import { createGatewayFetch, explainError, streamLine } from "../gateway";
-import { T_AGENT_LINE, T_TURN_SILENT } from "../texts";
+import { BUILTIN_AGENT_TITLES, T_AGENT_LINE, T_TURN_SILENT } from "../texts";
 import { TICK_MS, createStreamWatch, useTurnWatch } from "../watch";
 import { AgentPanel } from "./AgentPanel";
 import { ChatView } from "./ChatView";
@@ -92,6 +97,8 @@ export function Chat(p: ChatProps) {
   const [newAgent, setNewAgent] = useState(DEFAULT_AGENT);            // агент нового разговора — выбор в панели
   const [seen, setSeen] = useState<ThreadAgentSeen>({ state: "none" });   // агент открытого разговора
   const picked = useRef(false);            // студент выбрал агента — прежний разговор поверх выбора не открывается (m15)
+  const [awaitingOpen, setAwaitingOpen] =   // решение по прежнему разговору ещё не принято (m1 доводки р1)
+    useState(() => p.loadAgents !== undefined && p.initialSessionId !== undefined);
   const poll = useRef<AgentsPoll | null>(null);
 
   // Ошибка действия → строка над полем ввода. Остановку (signed_out, asleep) показывает App, своя отмена
@@ -174,7 +181,7 @@ export function Chat(p: ChatProps) {
   }, []);
 
   // агент хода: открытого разговора — из истории, нового — выбранный; пока агент разговора неизвестен — не отправлять
-  const locked = seen.state === "loading";
+  const locked = seen.state === "loading" || awaitingOpen;
   const agent = seen.state === "agent" ? seen.name : newAgent;
   const runtime = useOpenCodeRuntime({
     client,
@@ -206,16 +213,19 @@ export function Chat(p: ChatProps) {
       if (done) return;
       if (halted.current || !mounted.current) return;
       const list = runtime.threads.getState();
+      if (list.loadError !== undefined) setAwaitingOpen(false);   // список упал — решать нечего, отправка открыта
       if (list.isLoading || list.loadError !== undefined) return;
       done = true;
       unsubscribe();
-      if (list.mainThreadId !== list.newThreadId) return;  // студент уже начал новый разговор — не уводим
-      if (picked.current) return;                          // или выбрал агента — новый разговор с ним (m15)
-      if (!list.threadIds.includes(want)) {                // в архиве или удалён — новый разговор
-        props.current.onThreadIdChange?.(undefined);
+      if (list.mainThreadId !== list.newThreadId || picked.current || !list.threadIds.includes(want)) {
+        setAwaitingOpen(false);
+        if (list.mainThreadId !== list.newThreadId) return;  // студент уже начал новый разговор — не уводим
+        if (picked.current) return;                          // или выбрал агента — новый разговор с ним (m15)
+        props.current.onThreadIdChange?.(undefined);         // в архиве или удалён — новый разговор
         return;
       }
-      runtime.threads.switchToThread(want, { unarchive: false }).catch(onError);
+      // отправка откроется, когда разговор уже открыт: дальше её держит агент разговора (история ещё грузится)
+      runtime.threads.switchToThread(want, { unarchive: false }).catch(onError).finally(() => setAwaitingOpen(false));
     };
     unsubscribe = runtime.threads.subscribe(() => queueMicrotask(tryOpen));   // не внутри уведомления библиотеки
     tryOpen();
@@ -240,6 +250,7 @@ export function Chat(p: ChatProps) {
   const pick = (name: string): void => {
     if (halted.current) return;
     picked.current = true;
+    setAwaitingOpen(false);                // студент выбрал сам — прежний разговор не ждём
     setNewAgent(name);
     runtime.threads.switchToNewThread().catch(onError);
   };
@@ -249,9 +260,11 @@ export function Chat(p: ChatProps) {
 
   // строка «Агент: …» и подсветка в панели — агент, которому уйдёт ход; пока он неизвестен — ни строки, ни подсветки
   const shown = locked ? undefined : agent;
-  const title = shown === undefined ? undefined : agents.known.find((a) => a.name === shown)?.title ?? shown;
+  // название — из списка, у встроенных без списка — запасное (m3), прочих нет в списке — имя (m14)
+  const title = shown === undefined ? undefined
+    : agents.known.find((a) => a.name === shown)?.title ?? BUILTIN_AGENT_TITLES.get(shown) ?? shown;
   const threads = <ThreadSidebar runtime={runtime} onError={onError} />;
-  const watch = <ThreadAgentWatch onAgent={onAgent} />;    // внутри провайдера, ничего не рисует
+  const watch = <ThreadAgentWatch onAgent={onAgent} onError={onError} />;   // внутри провайдера, ничего не рисует
   return (
     <ChatView
       runtime={runtime}

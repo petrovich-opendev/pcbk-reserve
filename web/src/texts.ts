@@ -78,6 +78,12 @@ export const T_AGENT_PENDING = "появится после ответа Кон�
 export const T_AGENT_BROKEN = "не загрузился — сообщите преподавателю";   // state broken — кнопка неактивна
 export const T_AGENTS_DOWN = "Список агентов недоступен — чат работает с помощником по данным";   // ответ не 200
 export const T_AGENT_LINE = (title: string): string => `Агент: ${title}`;  // над полем ввода
+// названия встроенных агентов места — для строки «Агент: …», когда списка нет (404 старого core, сбой) или агента в нём
+// нет (доводка р1, m3); источник правды — ответ ручки (IMAGE_AGENTS шлюза, Д7-R64), эти — запасные и с ним совпадают
+export const BUILTIN_AGENT_TITLES: ReadonlyMap<string, string> = new Map([
+  ["pomoshnik", "Помощник по данным"],
+  ["konstruktor", "Конструктор агентов"],
+]);
 
 // --- молчание в браузере (R51): строка хода и сбой интерфейса; отчёт уходит администратору ---
 export const T_TURN_SILENT =

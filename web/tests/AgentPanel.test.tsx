@@ -10,7 +10,7 @@ import { AgentPanel } from "../src/components/AgentPanel";
 import { Chat } from "../src/components/Chat";
 import { seenAgent } from "../src/components/ThreadAgentWatch";
 import {
-  T_AGENT_BROKEN, T_AGENT_LINE, T_AGENT_PENDING, T_AGENTS, T_AGENTS_DOWN, T_AGENTS_EMPTY, T_MY_AGENTS,
+  T_AGENT_BROKEN, T_AGENT_LINE, T_AGENT_PENDING, T_AGENTS, T_AGENTS_DOWN, T_AGENTS_EMPTY, T_MY_AGENTS, T_UNKNOWN,
 } from "../src/texts";
 
 const POMOSHNIK: AgentItem = { name: "pomoshnik", title: "Помощник по данным", purpose: "текущие значения и сводки тегов БДРВ",
@@ -142,9 +142,9 @@ type Answer = Response | Promise<Response> | undefined;
 
 // Двойник шлюза: список разговоров, сессии, история (можно придержать), prompt_async, поток /event и GET
 // /pcbk/api/agents (agentCalls — число вызовов). Новый разговор — POST /session с id ses_newN.
-// hold(sid, n) — придержать n-ю (с 1) загрузку истории разговора sid до release(sid)
+// hold(sid, n) — придержать n-ю (с 1) загрузку истории разговора sid до release(sid); fail(sid, n) — ответить на неё 500
 function chatGateway(o: { agents?: () => Answer; list?: () => Answer; hold?: (sid: string, n: number) => boolean;
-                          prompt?: (sid: string) => Answer }) {
+                          fail?: (sid: string, n: number) => boolean; prompt?: (sid: string) => Answer }) {
   const enc = new TextEncoder();
   let ctl: ReadableStreamDefaultController<Uint8Array> | null = null;
   const held = new Map<string, (r: Response) => void>();
@@ -159,6 +159,7 @@ function chatGateway(o: { agents?: () => Answer; list?: () => Answer; hold?: (si
     push(...events: object[]): void { for (const e of events) ctl?.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`)); },
     release(sid: string): void { held.get(sid)?.(ocJson(200, HISTORY[sid] ?? [])); held.delete(sid); },
     asked: (path: string): boolean => gw.calls.some((c) => c.path === path),
+    loads: (sid: string): number => gw.calls.filter((c) => c.path === `/pcbk/api/oc/session/${sid}/message`).length,
   };
   const answer = (method: string, path: string, body: string): Answer => {
     if (path === "/pcbk/api/agents") {
@@ -186,6 +187,7 @@ function chatGateway(o: { agents?: () => Answer; list?: () => Answer; hold?: (si
       const n = (loads.get(sid!) ?? 0) + 1;
       loads.set(sid!, n);
       if (o.hold?.(sid!, n)) return new Promise<Response>((resolve) => { held.set(sid!, resolve); });
+      if (o.fail?.(sid!, n)) return ocJson(500, { name: "UnknownError", data: { message: "История разговора не загрузилась" } });
       return ocJson(200, HISTORY[sid!] ?? []);
     }
     if (rest === "/summarize") return ocJson(200, true);                         // самозаголовок разговора
@@ -451,4 +453,112 @@ test("background_history_reload_keeps_composer", async () => {
   gw.release(SES_K);
   const next = await send(gw, "дальше");
   expect(next.body).toMatchObject({ agent: "konstruktor" });
+}, CHAT_TIMEOUT_MS);
+
+// --- доводка р1 ---
+
+test("history_first_load_error_reopen_reloads", async () => {
+  // I1: первая загрузка истории упала — агент разговора неизвестен, отправка закрыта. Экземпляр разговора и контроллер
+  // адаптер держит до снятия чата и load() сам не повторяет; каждое повторное открытие перечитывает историю (одна
+  // загрузка на открытие, без таймеров). Ошибка снова видна строкой — не пустой разговор без текста
+  vi.spyOn(console, "error").mockImplementation(() => {});                       // адаптер пишет сбой загрузки
+  const gw = chatGateway({ fail: (sid, n) => sid === SES_K && n <= 2 });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents} />);
+  await waitFor(() => expect(gw.loads(SES_K)).toBe(1));
+  expect((await screen.findByRole("alert")).textContent).toBe(T_UNKNOWN);    // 500 — общий текст Д6
+  await sleep(300);
+  expect(gw.loads(SES_K)).toBe(1);                                               // сам не повторяет — тупик без правки
+  expect(box().disabled).toBe(true);
+  expect(agentLine(container)).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Новый разговор" }));
+  await waitFor(() => expect(box().disabled).toBe(false));                       // новый разговор — пиши
+  openThread(container, SES_K);                                                  // снова открыт — вторая загрузка, 500
+  await waitFor(() => expect(gw.loads(SES_K)).toBe(2));
+  expect((await screen.findByRole("alert")).textContent).toBe(T_UNKNOWN);    // 500 — общий текст Д6
+  await sleep(1_000);
+  expect(gw.loads(SES_K)).toBe(2);                                               // без петли: одна загрузка на открытие
+  expect(box().disabled).toBe(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "Новый разговор" }));
+  await waitFor(() => expect(box().disabled).toBe(false));
+  openThread(container, SES_K);                                                  // третья загрузка — 200
+  await screen.findByText("Какой узел и какие теги?");
+  expect(gw.loads(SES_K)).toBe(3);
+  await waitFor(() => expect(agentLine(container)).toBe("Агент: Конструктор агентов"));
+  const next = await send(gw, "дальше");
+  expect(next).toMatchObject({ session: SES_K, body: { agent: "konstruktor" } });
+  expect(gw.loads(SES_K)).toBe(3);
+}, CHAT_TIMEOUT_MS);
+
+test("history_reopen_after_success_does_not_reload", async () => {
+  // перечитывание — только после сбоя первой загрузки: открытие загруженного разговора истории не перечитывает
+  const gw = chatGateway({});
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents} />);
+  await screen.findByText("Какой узел и какие теги?");
+  fireEvent.click(screen.getByRole("button", { name: "Новый разговор" }));
+  await waitFor(() => expect(box().disabled).toBe(false));
+  openThread(container, SES_K);
+  await waitFor(() => expect(agentLine(container)).toBe("Агент: Конструктор агентов"));
+  await sleep(300);
+  expect(gw.loads(SES_K)).toBe(1);
+}, CHAT_TIMEOUT_MS);
+
+test("send_before_list_loaded_after_reload", async () => {
+  // m1: перезагрузка или «Разбудить» — пока не решено, открывать ли прежний разговор (список в пути), отправка закрыта:
+  // иначе ход ушёл бы помощнику в новый разговор мимо прежнего разговора Конструктора
+  let releaseList: (r: Response) => void = () => {};
+  const gw = chatGateway({ list: () => new Promise<Response>((resolve) => { releaseList = resolve; }) });
+  const onThreadIdChange = vi.fn();
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents}
+                                     onThreadIdChange={onThreadIdChange} />);
+  await waitFor(() => expect(gw.agentCalls).toBe(1));
+  await screen.findByRole("button", { name: /Конструктор агентов/ });           // панель уже есть, список разговоров — нет
+  expect(box().disabled).toBe(true);
+  expect(agentLine(container)).toBeNull();
+  fireEvent.change(box(), { target: { value: "продолжим" } });
+  fireEvent.click(screen.getByRole("button", { name: "Отправить" }));
+  fireEvent.keyDown(box(), { key: "Enter" });
+  await sleep(150);
+  expect(gw.prompts).toEqual([]);
+  expect(gw.created).toBe(0);
+  releaseList(ocJson(200, [session(SES_K, "Агент по узлу 3")]));
+  await screen.findByText("Какой узел и какие теги?");                           // открыт прежний разговор
+  const next = await send(gw, "узел 3");
+  expect(next).toMatchObject({ session: SES_K, body: { agent: "konstruktor" } });
+  expect(onThreadIdChange.mock.calls).toEqual([[SES_K]]);
+}, CHAT_TIMEOUT_MS);
+
+test("send_after_list_failure_on_reload", async () => {
+  // m1, «и нет loadError»: список разговоров упал — решать нечего, отправка открыта (новый разговор, помощник)
+  vi.spyOn(console, "error").mockImplementation(() => {});                       // библиотека пишет сбой списка
+  const gw = chatGateway({ list: () => ocJson(500, { name: "UnknownError", data: { message: "сбой" } }) });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents} />);
+  const first = await send(gw, "что сейчас");
+  expect(first.session).not.toBe(SES_K);
+  expect(first.body).not.toHaveProperty("agent");
+  expect(agentLine(container)).toBe("Агент: Помощник по данным");
+  expect(gw.loads(SES_K)).toBe(0);
+}, CHAT_TIMEOUT_MS);
+
+test("send_after_previous_not_listed_on_reload", async () => {
+  // m1: прежнего разговора в списке нет (архив) — решение принято, отправка открыта, App забывает прежний
+  const gw = chatGateway({ list: () => ocJson(200, [session(SES_P, "Значение T1")]) });
+  const onThreadIdChange = vi.fn();
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents} onThreadIdChange={onThreadIdChange} />);
+  const first = await send(gw, "что сейчас");
+  expect(first.session).not.toBe(SES_K);
+  expect(onThreadIdChange.mock.calls[0]).toEqual([undefined]);
+}, CHAT_TIMEOUT_MS);
+
+test("agent_line_builtin_titles_without_list", async () => {
+  // m3: список агентов недоступен (404) — у встроенных агентов в строке название, а не системное имя
+  const gw = chatGateway({ agents: () => ocJson(404, { name: "NotFound", data: { message: "нет" } }) });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents} />);
+  await screen.findByText(T_AGENTS_DOWN);
+  await screen.findByText("Какой узел и какие теги?");
+  await waitFor(() => expect(agentLine(container)).toBe("Агент: Конструктор агентов"));
+  fireEvent.click(screen.getByRole("button", { name: "Новый разговор" }));
+  await waitFor(() => expect(agentLine(container)).toBe("Агент: Помощник по данным"));
+  void gw;
 }, CHAT_TIMEOUT_MS);
