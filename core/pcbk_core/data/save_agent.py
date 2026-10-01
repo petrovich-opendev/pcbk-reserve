@@ -18,7 +18,8 @@
 
 Отмена вызова (клиент MCP ушёл; итоговое ревью Д7а, m3): поток записи под asyncio.shield дописывает, замок места
 держится до его конца, событие, строка журнала и счётчик — всё равно (finally), с итогом записи; затем отмена идёт
-дальше. Отменённый до записи (ждал замок места) — событие error: cancelled.
+дальше. Отменённый до записи (ждал замок места) — событие error: cancelled без счётчика и строка журнала WARNING:
+отмена клиентом — не сбой службы.
 """
 from __future__ import annotations
 
@@ -88,8 +89,9 @@ _LEVELS = {"ok": logging.INFO, "refused": logging.INFO, "rate": logging.INFO, "u
            "error": logging.ERROR}
 # счётчик AgentStats по исходу (у ok — только без already; у rate счётчика нет, Д7-R57). error считается как unavailable
 # (итоговое ревью Д7а, I-2, отступление от Д7-R57): иначе при сплошных сбоях строка сторожа — ok «агенты сохраняются»;
-# договор /health/agents (15 ключей) прежний
+# договор /health/agents (15 ключей) прежний. Отменённый клиентом до записи (codes == ("cancelled",)) — без счётчика
 _COUNTERS = {"refused": "refused", "unavailable": "unavailable", "error": "unavailable"}
+_CANCELLED = ("cancelled",)
 CALLER_LOG_CHARS = 64
 
 log = logging.getLogger("pcbk_core.data.save_agent")
@@ -175,7 +177,7 @@ class SaveAgent:
         began = self.role.monotonic()
         caller = str(caller)
         late: list[_Result] = []
-        result = _Result("error", ("cancelled",), SAVE_MESSAGES["error"])     # отменён до записи (ждал замок места)
+        result = _Result("error", _CANCELLED, SAVE_MESSAGES["error"])     # отменён до записи (ждал замок места)
         try:
             result = await self._call(caller, raw, late)
         except asyncio.CancelledError:
@@ -249,7 +251,9 @@ class SaveAgent:
     async def _finish(self, caller: str, raw: Mapping[str, object], result: _Result, began: float) -> None:
         """Счётчик → событие (запись в потоке; сбой записи ответ не ломает) → строка журнала."""
         role = self.role
-        kind = "saved" if result.status == "ok" and not result.already else _COUNTERS.get(result.status)
+        cancelled = result.codes == _CANCELLED                     # отмена клиентом — не сбой службы: без счётчика
+        kind = ("saved" if result.status == "ok" and not result.already
+                else None if cancelled else _COUNTERS.get(result.status))
         if kind is not None:
             role.agent_stats.event(kind)
         ms = max(0, round((role.monotonic() - began) * 1000))
@@ -266,5 +270,6 @@ class SaveAgent:
             log.error("журнал событий: событие %s не собрано (%s)", TOOL, type(exc).__name__)
         else:
             await role._write_event(event)
-        log.log(_LEVELS.get(result.status, logging.WARNING), "tool=%s caller=%s channel=mcp outcome=%s codes=%s ms=%d",
+        level = logging.WARNING if cancelled else _LEVELS.get(result.status, logging.WARNING)
+        log.log(level, "tool=%s caller=%s channel=mcp outcome=%s codes=%s ms=%d",
                 TOOL, ascii(caller)[1:-1][:CALLER_LOG_CHARS], result.status, result.log_codes(), ms)

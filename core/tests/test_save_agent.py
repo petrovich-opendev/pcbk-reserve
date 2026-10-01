@@ -564,6 +564,9 @@ async def test_cancel_before_write_is_error_event(tmp_path, caplog):      # m3: 
     ev = _events(role.settings.DB_PATH)(tool="save_agent")
     assert sorted((e["agent"], e["outcome"], e["summary"]) for e in ev) == [
         ("drugoy", "error", "error: cancelled"), ("proverka", "ok", "saved")]
+    assert role.agent_stats.count_1h("unavailable") == 0               # отмена клиентом — не сбой службы
+    line = next(r for r in caplog.records if "codes=cancelled" in r.getMessage())
+    assert line.levelno == logging.WARNING
 
 
 @pytest.mark.anyio
