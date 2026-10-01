@@ -29,7 +29,8 @@ from pcbk_core.gateway.rules import EXAMPLE_IDS
 NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
 BAD = PLACE_AGENTS_DIR + "/proverka.md"
 CONFIG_TEXT = "Настройка рабочего места сломана — сообщите администратору."
-AGENT = {"name": "proverka", "native": False, "mode": "primary"}
+# агент шаблона службы в GET /agent места: primary и описание (итоговая доводка Д7б, I-1: без них — не видим)
+AGENT = {"name": "proverka", "native": False, "mode": "primary", "description": "Проверка: сводка узла"}
 BASE = "https://stand.test:8443"
 SES = EXAMPLE_IDS["ses"]
 

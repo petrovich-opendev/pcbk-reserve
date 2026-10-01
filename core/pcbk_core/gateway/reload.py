@@ -36,11 +36,12 @@ DRILL_AGENTS=freeze_reload — после первого прохода ворк
 место (метки — deque времён monotonic, окно QUARANTINE_WINDOW_S); путь вне каталога — файл образа, ничего не двигается
 (image); предел — capped; файл не перенесён (DirUnavailable) — тоже image (предпроверка Д7б, m6). Сбой учёта после
 переноса (StoreError: файл уже в карантине, строка агента не обновлена) — quarantined и флаг сбоя учёта воркера
-(доводка р1, Ruling 3): место перезапускается и поднимается. image и capped — счётчик image_config. Воркер после любого Config…Error отпускает замок места и до конца ворот зовёт
-Workplaces.restart (П5 в): после карантина — перезапуск места, при image и capped — место гаснет с текстом config. Так
-сломанное место не получает dispose раз в RELOAD_RETRY_S. reload_done при этом не зовётся (раунд 1, m1): метка остаётся,
-и место, снова готовое, перезагружается и сверяет оставшиеся saved — не раньше RELOAD_RETRY_S после неудачи (_failed_at;
-reload_failed считается и при карантине, m4).
+(доводка р1, Ruling 3): место перезапускается и поднимается. image и capped — счётчик image_config. Воркер после
+любого Config…Error отпускает замок места и до конца ворот зовёт Workplaces.restart (П5 в): после карантина —
+перезапуск места, при image и capped — место гаснет с текстом config. Так сломанное место не получает dispose раз
+в RELOAD_RETRY_S. reload_done при этом не зовётся (раунд 1, m1): метка остаётся, и место, снова готовое,
+перезагружается и сверяет оставшиеся saved — не раньше RELOAD_RETRY_S после неудачи (_failed_at; reload_failed
+считается и при карантине, m4).
 
 Строки журнала — без имён агентов, только номер места, итог и числа:
 - gw agents reload place=NN result=visible n=K wait_s=S;
@@ -49,6 +50,11 @@ reload_failed считается и при карантине, m4).
 - … result=delayed wait_s=S;
 - gw agents quarantine place=NN result=moved|missing|image|capped [error=<Класс>] — без имени файла (missing — файла
   уже нет: перезапуск нужен всё равно, кэш экземпляра сломан; moved error=StoreError — файл перенесён, учёт не записал).
+
+Видим — агент, которого место загрузило со своим frontmatter (итоговая доводка Д7б, I-1, второй слой): в ответе
+GET /agent mode primary и непустое описание (own_agent_loaded). Файл с битым YAML OpenCode грузит агентом mode all
+без описания и своих правил — его строка остаётся not_visible (в панели «не загрузился»), шлюз такого агента в ход
+не пускает (proxy.AGENT_MODES).
 
 Только память и учёт: модуль не импортирует accounts (команда администратора шлюза, runpy).
 """
@@ -99,6 +105,14 @@ _REL_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")   # путь файла аген
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def own_agent_loaded(item: dict) -> bool:
+    """Агент ответа GET /agent загружен со своим frontmatter (итоговая доводка Д7б, I-1, второй слой): mode primary и
+    непустое описание — так пишет шаблон службы (А2). Файл без frontmatter или с битым YAML (gray-matter отдаёт из кэша
+    пустой frontmatter) OpenCode грузит агентом mode all без описания и с правилами стенда вместо своих — не видим."""
+    description = item.get("description")
+    return item.get("mode") == "primary" and isinstance(description, str) and description.strip() != ""
 
 
 def config_error_path(body: bytes) -> str | None:
@@ -516,11 +530,12 @@ class AgentReloads:
             return type(exc).__name__
         return None if r.status_code == 200 else f"status_{r.status_code}"
 
-    async def _visible(self, n: int, expected: set[str]) -> tuple[set[str] | None, str]:
+    async def _visible(self, n: int, expected: set[str]) -> tuple[dict[str, dict] | None, str]:
         """GET /agent до VISIBLE_TRIES раз (попытка — places.READY_ATTEMPT_S, пауза VISIBLE_PAUSE_S), пока место не
-        увидит всех expected. (имена последнего ответа 200, "") или (None, причина): ни одного 200, или 400 с
-        ошибкой конфигурации (config_error_path) — тогда repair и без повторов, причина config_<итог repair>."""
-        seen: set[str] | None = None
+        увидит всех expected. (агенты последнего ответа 200 по имени, "") или (None, причина): ни одного 200, или 400 с
+        ошибкой конфигурации (config_error_path) — тогда repair и без повторов, причина config_<итог repair>. Агент с
+        битым YAML тоже «увиден» — повторы его не починят; видимость решает шаг г (own_agent_loaded)."""
+        seen: dict[str, dict] | None = None
         why = "no_answer"
         for attempt in range(VISIBLE_TRIES):
             if attempt:
@@ -543,21 +558,25 @@ class AgentReloads:
             if not isinstance(items, list):
                 why = "not_list"
                 continue
-            seen = {a["name"] for a in items if isinstance(a, dict) and isinstance(a.get("name"), str)}
-            if expected <= seen:
+            seen = {a["name"]: a for a in items if isinstance(a, dict) and isinstance(a.get("name"), str)}
+            if expected <= seen.keys():
                 break
         return seen, why
 
-    def _settle_rows(self, n: int, rows: list[AgentRow], seen: set[str], now: datetime) -> tuple[int, int, int]:
+    def _settle_rows(self, n: int, rows: list[AgentRow], seen: dict[str, dict],
+                     now: datetime) -> tuple[int, int, int]:
         """Шаг г в потоке. Состояния строк — перечитанные сейчас (итоговое ревью Д7а, m1): за время перезагрузки агента
         могли унести в архив или карантин. Ожидаемые (saved, visible) и прежде невидимые (not_visible) строки, которые
-        место видит, — visible. Невидимые — только те, что ждали этой перезагрузки (ожидаемые в rows до dispose) и
-        ожидаемые до сих пор: ушедший в архив агент — не not_visible, а сохранённый после чтения rows дождётся своей
-        перезагрузки (его метка пришла позже). Ответ — (стало видно, видно всего, не видно)."""
+        место видит, — visible. Видит — агент есть в GET /agent и загружен со своим frontmatter (own_agent_loaded):
+        mode primary и описание; агент mode all (битый YAML) — не видим (итоговая доводка Д7б, I-1). Невидимые — только
+        те, что ждали этой перезагрузки (ожидаемые в rows до dispose) и ожидаемые до сих пор: ушедший в архив агент — не
+        not_visible, а сохранённый после чтения rows дождётся своей перезагрузки (его метка пришла позже). Ответ —
+        (стало видно, видно всего, не видно)."""
+        loaded = {name for name, item in seen.items() if own_agent_loaded(item)}
         waited = {row.name for row in rows if row.state in _EXPECTED}
         current = self.store.list_place(n)
-        visible = [row for row in current if row.state in (*_EXPECTED, "not_visible") and row.name in seen]
-        invisible = [row for row in current if row.state in _EXPECTED and row.name in waited and row.name not in seen]
+        visible = [row for row in current if row.state in (*_EXPECTED, "not_visible") and row.name in loaded]
+        invisible = [row for row in current if row.state in _EXPECTED and row.name in waited and row.name not in loaded]
         if visible:
             self.store.mark_visible(n, [row.name for row in visible], now)
         for row in invisible:

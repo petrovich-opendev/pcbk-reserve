@@ -30,7 +30,8 @@ from pcbk_core.gateway.reload import (DIR_CHECK_S, IDLE_SETTLE_S, RELOAD_DELAYED
 from pcbk_core.gateway.rules import EXAMPLE_IDS
 from pcbk_core.gateway.stats import MAX_STREAMS_PER_LOGIN
 
-AGENT = {"name": "proverka", "native": False, "mode": "primary"}
+# агент шаблона службы в GET /agent места: primary и описание (итоговая доводка Д7б, I-1: без них — не видим)
+AGENT = {"name": "proverka", "native": False, "mode": "primary", "description": "Проверка: сводка узла"}
 NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
 FRONT = ("172.31.250.35", 40000)            # edge в pcbk-front (как в test_gw_agents_health)
 BASE = "https://stand.test:8443"            # ORIGIN шлюза тестов: cookie Secure клиент шлёт
@@ -489,31 +490,39 @@ def test_health_reports_pending(env_sync):                                 # Tes
     assert (body["pending"], body["pending_oldest_s"] is not None) == (1, True)
 
 
+async def _freeze_holds(e) -> None:
+    """Учения freeze_reload (А5): первый проход — ожидание по условию (ревью А6, m-a), не фиксированная пауза; после
+    него фиксированное окно 0,3 с — только отрицательная проверка: шесть тактов по 0,05 с без прохода."""
+    task = asyncio.create_task(e.reloads.run())
+    try:
+        await wait_until_async(lambda: e.reloads.checked_at is not None)
+        first = e.reloads.checked_at
+        await asyncio.sleep(0.3)
+        assert e.reloads.checked_at == first
+        assert len(e.pending_calls) == 1                                   # m25: после первого прохода — ни одного
+    finally:
+        task.cancel(); await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.anyio
 async def test_freeze_drill(env_freeze):
-    task = asyncio.create_task(env_freeze.reloads.run()); await asyncio.sleep(0.3)
-    first = env_freeze.reloads.checked_at; await asyncio.sleep(0.3)
-    assert first is not None and env_freeze.reloads.checked_at == first
-    assert len(env_freeze.pending_calls) == 1                              # m25: после первого прохода — ни одного
-    task.cancel(); await asyncio.gather(task, return_exceptions=True)
+    await _freeze_holds(env_freeze)
 
 
 @pytest.mark.anyio
 async def test_freeze_drill_empty_queue(env_freeze_empty):                 # Б-н1: учения и без очереди
-    task = asyncio.create_task(env_freeze_empty.reloads.run()); await asyncio.sleep(0.3)
-    first = env_freeze_empty.reloads.checked_at; await asyncio.sleep(0.3)
-    assert first is not None and env_freeze_empty.reloads.checked_at == first
-    assert len(env_freeze_empty.pending_calls) == 1                        # m25
-    task.cancel(); await asyncio.gather(task, return_exceptions=True)
+    await _freeze_holds(env_freeze_empty)
 
 
 # --- сверх брифа ---
 
 @pytest.mark.anyio
 async def test_run_ticks_without_drill(env_ticking):                       # отрицательный контроль учений (m25)
-    task = asyncio.create_task(env_ticking.reloads.run()); await asyncio.sleep(0.3)
-    task.cancel(); await asyncio.gather(task, return_exceptions=True)
-    assert len(env_ticking.pending_calls) >= 2                             # без учений проходы идут дальше первого
+    task = asyncio.create_task(env_ticking.reloads.run())
+    try:                                                                   # без учений проходы идут дальше первого
+        await wait_until_async(lambda: len(env_ticking.pending_calls) >= 2)   # ожидание по условию (ревью А6, m-a)
+    finally:
+        task.cancel(); await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.anyio
@@ -639,6 +648,35 @@ async def test_not_visible_rechecked_on_next_reload(env):                  # not
     assert env.store.list_place(3)[0].state == "visible" and env.stats.count_1h("visible") == 1
     env.store.mark_reload(3, NOW); env.mono.advance(IDLE_SETTLE_S + 0.1); await settle(env)
     assert env.oc.dispose_calls[3] == 3 and env.stats.count_1h("visible") == 1    # уже видимый — не считается снова
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("loose", [{"mode": "all", "description": None}, {"mode": "all"}, {"mode": "subagent"},
+                                   {"description": None}, {"description": " "}],
+                         ids=["broken-yaml", "all", "subagent", "no-description", "blank-description"])
+async def test_agent_without_own_frontmatter_not_visible(env, loose):     # итоговая доводка Д7б, I-1: второй слой
+    # битый YAML: место грузит файл агентом mode all без описания и своих правил — строка not_visible, в панели
+    # «не загрузился»; повторов GET /agent нет (агент по имени есть — повторы его не починят); агенты образа рядом
+    item = {**AGENT, **loose}
+    image = [{"name": "pomoshnik", "native": False, "mode": "primary", "description": "Помощник по данным: сводки"}]
+    env.oc.agents_after_dispose[3] = [*image, item]; env.mono.advance(10)
+    await settle(env)
+    assert env.store.list_place(3)[0].state == "not_visible" and env.store.pending() == {}
+    assert env.stats.count_1h("not_visible") == 1 and env.stats.count_1h("visible") == 0
+    assert [r.path for r in place_requests(env.oc, 3)].count("/agent") == 1
+
+
+@pytest.mark.anyio
+async def test_visible_agent_broken_later_not_visible(env):                 # I-1: файл испорчен мимо службы
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10); await settle(env)
+    assert env.store.list_place(3)[0].state == "visible"                   # положительный контроль: AGENT видим
+    env.store.mark_reload(3, NOW)                                           # reload администратора после правки файла
+    env.oc.agents_after_dispose[3] = [{**AGENT, "mode": "all", "description": None}]
+    env.mono.advance(IDLE_SETTLE_S + 0.1); await settle(env)
+    assert env.oc.dispose_calls[3] == 2 and env.store.list_place(3)[0].state == "not_visible"
+    env.store.mark_reload(3, NOW); env.oc.agents_after_dispose[3] = [AGENT]  # файл исправлен — снова видим
+    env.mono.advance(IDLE_SETTLE_S + 0.1); await settle(env)
+    assert env.store.list_place(3)[0].state == "visible"
 
 
 @pytest.mark.anyio

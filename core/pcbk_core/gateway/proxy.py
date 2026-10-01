@@ -123,7 +123,10 @@ GW_BODY_BUDGET_BYTES = 16 * 1024 * 1024
 NOT_READY_LOG_S = 60.0
 PROXY_QUEUE = 8                             # ждущих вызовов на место сверх PROXY_PARALLEL (G1)
 LOG_PATH_CHARS = 120
-AGENT_MODES = ("primary", "all")            # Д5-R33
+# Д5-R33 с поправкой итоговой доводки Д7б (I-1, второй слой): только primary. mode all — агент без своих правил
+# (файл без frontmatter или с битым YAML); служба пишет агентов только mode: primary (шаблон А2), агенты образа —
+# тоже primary
+AGENT_MODES = ("primary",)
 GET_SITES = ("same-origin", "none")         # Sec-Fetch-Site, с которым GET пропускается (Д5-R26, р4)
 CONTENT_TYPE_CHARS = 200
 # Content-Type ответа места как есть — только эти виды (с параметрами); прочий — OCTET_STREAM (G7)
@@ -341,7 +344,7 @@ async def _place_list(role: GatewayRole, n: int, path: str) -> tuple[list, int]:
 
 
 async def _check_agent(role: GatewayRole, n: int, name: str) -> None:
-    """Д5-R33: агент есть в GET /agent своего места, native строго false, mode — primary или all; иначе 400.
+    """Д5-R33: агент есть в GET /agent своего места, native строго false, mode — из AGENT_MODES; иначе 400.
     Имя в текст отказа — только прошедшее AGENT_NAME (Ш12); в журнал оно не идёт."""
     if not isinstance(name, str) or AGENT_NAME.fullmatch(name) is None:      # сборщик уже сверил — на всякий случай
         raise Refused(400, "BadRequest", RULE_MESSAGES["agent_name"], "bad_body")
