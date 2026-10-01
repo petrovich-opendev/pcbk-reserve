@@ -41,6 +41,7 @@ RESERVED_PREFIX = "pcbk"
 TEXT_LIMITS = {"title": (3, 60), "node": (2, 100), "purpose": (10, 200), "student_reply": (1, 200)}
 PROMPT_MIN = 200
 PROMPT_MAX = 4000
+PROMPT_MAX_BYTES = 8000         # и в байтах UTF-8: 4 000 эмодзи иначе прошли бы проверку, а файл — нет (доводка 1, m1)
 MAX_TAGS = 16
 AGENT_STEPS = 8
 MAX_FILE_BYTES = 16384
@@ -50,41 +51,43 @@ VALUE_MAX = 60                  # введённое значение в зам�
 FIELDS = ("name", "title", "node", "purpose", "tools", "tags", "prompt", "student_reply")
 _FORBIDDEN_FIELDS = frozenset({"title", "node", "purpose", "prompt"})
 
-# research/09 §4.2; порт историана — только как порт (раунд 1, m7)
+# research/09 §4.2; порт историана — только как порт (раунд 1, m7). Хвосты слов — не длиннее 30 знаков, а ищется
+# только в пределах поля (срез в check_draft): без этого «портпорт…» давал квадратичный поиск, и один вызов
+# save_agent на сотнях тысяч знаков вставал на секунды для всех ролей core (доводка 1, I1)
 _FORBIDDEN_SOURCES = (
     # технические метки
     r"\{file:", r"\{env:", r"!`", r"http://", r"https://", r"/run/secrets", r"/etc/", r"opencode\.json",
-    r"\.opencode", r"OPENCODE_", r"docker", r"(?:порт\w*\W{1,3}|:)1433\b", r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
+    r"\.opencode", r"OPENCODE_", r"docker", r"(?:порт\w{0,30}\W{1,3}|:)1433\b", r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
     r"<system", r"</system", r"mcp_instructions", r"пароль", r"password",
     # SQL
     r"\bselect\b[\s\S]{0,200}?\bfrom\b", r"\binsert\s+into\b", r"\bupdate\s+\w+\s+set\b", r"\bdelete\s+from\b",
     r"\bxp_cmdshell\b", r"\bopenquery\b", r"\binsql\b",
     # обход
-    r"игнорир\w*\s+(?:\S+\s+){0,2}(?:правил|инструкц|огранич|запрет)",
+    r"игнорир\w{0,30}\s+(?:\S+\s+){0,2}(?:правил|инструкц|огранич|запрет)",
     r"ignore\s+(?:all|any|previous|the)\b",
     r"в\s+обход\s+(?:\S+\s+)?(?:служб|правил|огранич|белого|бюджет)",
     r"обо(?:йти|йди)\s+(?:\S+\s+){0,2}(?:служб|правил|огранич|запрет|белый|бюджет)",
     r"(?:забудь|отмени|не\s+соблюдай|не\s+следуй)\s+(?:\S+\s+)?(?:правил|инструкц|огранич)",
     r"напрямую\s+(?:к|в|из)\s+(?:историан|бдрв|баз|sql)",
-    r"системн\w+\s+(?:промпт|подсказк|инструкц)",
+    r"системн\w{1,30}\s+(?:промпт|подсказк|инструкц)",
     r"system\s+prompt",
 )
 FORBIDDEN: tuple[re.Pattern, ...] = tuple(re.compile(s, re.IGNORECASE) for s in _FORBIDDEN_SOURCES)
 
-# признак нормы в инструкции (раунд 1, I6): число не дальше 40 знаков от слова на норм|допуск|порог|предел|должн,
-# в любую сторону, без перехода через . ! ? и перевод строки. Не отказ — только Draft.flags
-_LIMIT_WORD = r"\b(?:норм|допуск|порог|предел|должн)"
-NUMERIC_LIMIT = re.compile(rf"{_LIMIT_WORD}[^\W\d_]*[^.!?\n]{{0,40}}\d|\d[^.!?\n]{{0,40}}{_LIMIT_WORD}",
+# признак нормы в инструкции (раунд 1, I6): число не дальше 40 знаков от слова на норм|допуск|порог|предел|должн
+# или «должен» (доводка 1, m6), в любую сторону, без перехода через . ! ? и перевод строки. Не отказ — только Draft.flags
+_LIMIT_WORD = r"\b(?:норм|допуск|порог|предел|долж(?:н|ен))"
+NUMERIC_LIMIT = re.compile(rf"{_LIMIT_WORD}[^\W\d_]{{0,30}}[^.!?\n]{{0,40}}\d|\d[^.!?\n]{{0,40}}{_LIMIT_WORD}",
                            re.IGNORECASE)
 NUMERIC_LIMIT_FLAG = "prompt_numeric_limit"
 
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 # однострочное поле: C0, DEL, C1, U+2028/2029, U+FEFF, U+FFFE/FFFF и одиночные суррогаты (раунд 2, m-н5)
-_ONE_LINE_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f  ﻿￾￿\ud800-\udfff]")
+_ONE_LINE_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff\ufffe\uffff\ud800-\udfff]")
 # инструкция: из управляющих — только \t и \n (после CRLF → LF)
 _PROMPT_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
 # описание и единица тега из каталога (Д7-R55, раунд 1, m6): эти знаки → пробел, обратные кавычки убираются
-_TAG_TEXT_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f  ﻿]")
+_TAG_TEXT_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff]")
 _SPACES = re.compile(r"\s+")
 # копии pcbk_core.data.sql.SAFE_NAME и pcbk_core.secrets.TOKEN_ID (сверяет test_patterns_match_neighbours)
 TAG_NAME = re.compile(r"[A-Za-z0-9_]{1,128}")
@@ -238,15 +241,16 @@ def check_draft(raw: Mapping[str, object], lookup: Callable[[str], Lookup] | Non
         if not low <= len(text) <= high or _ONE_LINE_BAD.search(text):
             add(Problem.make(field, "text_field", text))
         if field in _FORBIDDEN_FIELDS:
-            for p in _forbidden(field, text):
+            for p in _forbidden(field, text[:high]):        # сверх предела — уже text_field (I1)
                 add(p)
 
     prompt = None
     if "prompt" in values:
         prompt = values["prompt"].replace("\r\n", "\n").strip()
-        if not PROMPT_MIN <= len(prompt) <= PROMPT_MAX or _PROMPT_BAD.search(prompt):
+        if (not PROMPT_MIN <= len(prompt) <= PROMPT_MAX or len(prompt.encode("utf-8")) > PROMPT_MAX_BYTES
+                or _PROMPT_BAD.search(prompt)):
             add(Problem.make("prompt", "prompt_length"))
-        for p in _forbidden("prompt", prompt):
+        for p in _forbidden("prompt", prompt[:PROMPT_MAX]):    # сверх предела — уже prompt_length (I1)
             add(p)
 
     tags: list[str] | None = None
