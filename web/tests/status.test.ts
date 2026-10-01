@@ -52,6 +52,15 @@ test("status_view_filters_and_levels", () => {
   expect(statusView(st([...owners, c("student-03", "Рабочее место 03", "warn")]), "03"))
     .toEqual({ level: "warn", text: "Внимание: Рабочее место 03" });
   expect(statusView(st([c("core-container", "Серверный слой — контейнер", "warn")]), "03").level).toBe("warn");
+  // Д7а: «Агенты студентов» — общая строка владельца (счётчики по всем местам): warn студенту не показывается,
+  // fail и unknown — показываются, как у прочих строк владельца
+  expect(statusView(st([c("agents", "Агенты студентов", "warn")]), "03")).toEqual({ level: "ok", text: "Стенд работает" });
+  expect(statusView(st([c("agents", "Агенты студентов", "fail")]), "03"))
+    .toEqual({ level: "fail", text: "Сбой: Агенты студентов" });
+  expect(statusView(st([c("agents", "Агенты студентов", "unknown")]), "03"))
+    .toEqual({ level: "unknown", text: "Состояние неизвестно: Агенты студентов" });
+  expect(statusView(st([c("agents", "Агенты студентов", "warn"), c("student-03", "Рабочее место 03", "warn")]), "03"))
+    .toEqual({ level: "warn", text: "Внимание: Рабочее место 03" });
 });
 
 // --- опрос: часы и таймеры — поддельные (vi.useFakeTimers), fetch — управляемый ---

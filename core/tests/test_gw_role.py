@@ -32,9 +32,13 @@ def test_settings_gateway_validation():
     assert (s.GW_IDLE_STOP_S, s.STU_NET) == (60.0, "172.31")
     for bad in ({"GW_ORIGIN": "http://x"}, {"GW_ORIGIN": "https://x/path"}, {"STU_NET": "172.31.0"},
                 {"STU_NET": "300.1"}, {"GW_IDLE_STOP_S": "59"}, {"GW_REAPER_TICK_S": "1000"},
-                {"GW_WAKE_TIMEOUT_S": "5"}, {"DRILL_GATEWAY": "x"}, {"SP_CTL_URL": "ftp://x"}):
+                {"GW_WAKE_TIMEOUT_S": "5"}, {"DRILL_GATEWAY": "x"}, {"SP_CTL_URL": "ftp://x"},
+                {"DRILL_AGENTS": "x"}, {"DRILL_AGENTS": "freeze_reaper"}, {"DRILL_AGENTS": "FREEZE_RELOAD"}):   # Д7а (m18)
         with pytest.raises(ValueError):
             GatewaySettings.from_env(bad)
+    assert (GatewaySettings().DRILL_AGENTS, GatewaySettings.from_env({"DRILL_AGENTS": "freeze_reload"}).DRILL_AGENTS) == \
+           ("", "freeze_reload")
+    assert Settings().AGENTS_ROOT == "/srv/agents" and Settings.from_env({"AGENTS_ROOT": "/x"}).AGENTS_ROOT == "/x"
     assert Settings.from_env({"GW_ORIGIN": "http://x"})                                # Settings поля шлюза не знает
     with pytest.raises(ValueError) as e:
         GatewaySettings.from_env({"GW_ORIGIN": "https://x/tok-SECRET"})
@@ -366,7 +370,7 @@ def test_settings_errors_short_and_db_part_kept(tmp_path):                      
     bad = ({"GW_ORIGIN": "http://x"}, {"GW_IDLE_STOP_S": "59"}, {"GW_IDLE_STOP_S": "x"}, {"GW_REAPER_TICK_S": "0"},
            {"GW_REAPER_TICK_S": "1000"}, {"GW_WAKE_TIMEOUT_S": "inf"}, {"GW_SESSION_TTL_S": "1"},
            {"SP_CTL_URL": "ftp://x"}, {"SP_CTL_URL": "http://x:99999"}, {"STU_NET": "1.2.3"},
-           {"DRILL_GATEWAY": "x"})
+           {"DRILL_GATEWAY": "x"}, {"DRILL_AGENTS": "x"})
     for env in bad:
         with pytest.raises(ValueError) as e:
             GatewaySettings.from_env(env)

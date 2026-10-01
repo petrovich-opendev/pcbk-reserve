@@ -57,6 +57,7 @@ def test_hostname_fails_closed_without_opt_in(tmp_path):                        
         assert c.get("/pcbk/api/auth/me").status_code == 404
         assert c.get("/health/gateway").status_code == 404
         assert c.get("/health/web").status_code == 404
+        assert c.get("/health/agents").status_code == 404                             # Д7а (m17)
 
 
 def test_uvicorn_scope_server_is_ip():                                                  # решение контролёра р2; Ш6, Ш25
@@ -125,7 +126,7 @@ def test_gateway_needs_front_client_too(tmp_path):                              
     app, _ = make_gateway(tmp_path)
     big = {"content": b"x" * 70000, "headers": {"Origin": ORIGIN, "Content-Type": "application/json"}}
     with TestClient(app, base_url="http://172.31.250.34:8000", client=("172.31.6.3", 40000)) as place:
-        for path in ("/pcbk/api/auth/me", "/pcbk/api/workplace", "/health/gateway", "/health/web"):
+        for path in ("/pcbk/api/auth/me", "/pcbk/api/workplace", "/health/gateway", "/health/web", "/health/agents"):
             r = place.get(path)
             assert (r.status_code, r.json()["name"]) == (404, "NotFound"), path
         r = place.post("/pcbk/api/auth/login", json={"login": "stu-03", "password": PW}, headers={"Origin": ORIGIN})
@@ -140,6 +141,7 @@ def test_gateway_needs_front_client_too(tmp_path):                              
             assert front.get("/pcbk/api/auth/me").status_code == 401, client
             assert front.get("/health/gateway").status_code == 200, client
             assert front.get("/health/web").status_code == 200, client
+            assert front.get("/health/agents").status_code == 200, client             # Д7а (m17): сторож ходит отсюда
             assert front.post("/pcbk/api/web/report", json={"kind": "ui_crash"}).status_code == 401, client
             assert front.post("/pcbk/api/auth/notice", json={"notice": "teacher-reads-1"},
                               headers={"Origin": ORIGIN}).status_code == 401, client
@@ -147,9 +149,11 @@ def test_gateway_needs_front_client_too(tmp_path):                              
     with TestClient(app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 40000)) as loop:   # петля
         assert loop.get("/health/gateway").status_code == 200
         assert loop.get("/health/web").status_code == 200
+        assert loop.get("/health/agents").status_code == 200
     with TestClient(app, base_url="http://172.31.250.82:8000", client=("172.31.250.81", 40000)) as host:
         assert host.get("/health/gateway").status_code == 404                          # pcbk-egress — не front
         assert host.get("/health/web").status_code == 404
+        assert host.get("/health/agents").status_code == 404
         assert host.post("/pcbk/api/web/report", json={"kind": "ui_crash"}).status_code == 404
         assert host.post("/pcbk/api/auth/notice", json={"notice": "teacher-reads-1"},
                          headers={"Origin": ORIGIN}).status_code == 404

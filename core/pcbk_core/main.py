@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from .settings import Settings
 
 if TYPE_CHECKING:
+    from .agents.stats import AgentStats
     from .app import Role
     from .gateway import GatewayRole
     from .llm import LlmRole
@@ -76,7 +77,11 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
     входов в историан; процесс живёт, и сторож видит причину. Учётные данные —
     только файлом. core-tokens не читается — это не ошибка настройки (F4): пустая
     таблица (всем 401), причина TOKENS_ERROR на странице, фоновые циклы идут.
+
+    Счётчики агентов студентов (Д7-R53) — один AgentStats на процесс у обеих ролей: «данные» пишет итоги save_agent,
+    шлюз отдаёт их на /health/agents.
     """
+    from .agents.stats import AgentStats
     from .data import CONFIG_ERRORS, TOKENS_ERROR, DataRole
     from .data.historian import HistorianError, QueryFn, tds_query
     from .data.names import load_names
@@ -113,9 +118,10 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
         log.error("токены %s: %s", settings.TOKENS_FILE, _why(exc))
         tokens_error = TOKENS_ERROR
 
+    agent_stats = AgentStats()
     data = DataRole(settings, query, whitelist, config_error="; ".join(problems) or None,
-                    tokens=tokens, tokens_error=tokens_error)
-    return [data, build_llm_role(settings, env), build_gateway_role(settings, env)]
+                    tokens=tokens, tokens_error=tokens_error, agent_stats=agent_stats)
+    return [data, build_llm_role(settings, env), build_gateway_role(settings, env, agent_stats=agent_stats)]
 
 
 def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> LlmRole:
@@ -184,10 +190,12 @@ def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> 
     return role
 
 
-def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None) -> GatewayRole:
+def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None, *,
+                       agent_stats: AgentStats | None = None) -> GatewayRole:
     """Роль gateway по образцу build_llm_role (Ш9): GW_* с ошибкой — запасные настройки (gateway_settings) и
     config_error «настройки шлюза: …» (имя поля и правило, без значения); процесс жив. Ни один конструктор
-    ничего не открывает: core.db — в lifespan роли, клиенты sp-ctl и мест — при первом запросе."""
+    ничего не открывает: core.db — в lifespan роли, клиенты sp-ctl и мест — при первом запросе. agent_stats —
+    общие с ролью «данные» счётчики агентов (build_roles); None — роль создаёт свои."""
     from .gateway import GatewayRole
     from .gateway.accounts import AccountStore
     from .gateway.places import SpCtl, Workplaces
@@ -199,7 +207,8 @@ def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None)
     stats = GatewayStats()
     return GatewayRole(settings, gw, store=AccountStore(settings.DB_PATH, ttl_s=gw.GW_SESSION_TTL_S),
                        workplaces=Workplaces(gw, SpCtl(gw.SP_CTL_URL), stats=stats), stats=stats,
-                       config_error=None if problem is None else f"настройки шлюза: {problem}")
+                       config_error=None if problem is None else f"настройки шлюза: {problem}",
+                       agent_stats=agent_stats)
 
 
 def gateway_settings(env: Mapping[str, str] | None = None) -> tuple[GatewaySettings, str | None]:

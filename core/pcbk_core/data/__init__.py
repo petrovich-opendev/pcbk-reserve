@@ -20,6 +20,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp
 
+from ..agents.stats import AgentStats
 from ..app import RoleBase
 from ..hooks import hooks_of
 from ..secrets import TokenTable
@@ -59,6 +60,9 @@ class DataRole(RoleBase):
     core-tokens не прочитан. Конструктор без ввода-вывода (F4): журнал событий только запоминает путь,
     служба (service) — кэш, single-flight и окно частоты в памяти, MCP (mcp, mcp_app) строится один
     раз — его session_manager.run() SDK даёт однажды, и его запускает lifespan.
+
+    agent_stats — счётчики агентов студентов (Д7-R53, Д7-R60): один объект на процесс, его создаёт
+    main.build_roles и отдаёт и шлюзу (/health/agents); не передан — свой (тесты).
     """
 
     name = "data"
@@ -67,7 +71,8 @@ class DataRole(RoleBase):
                  monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  config_error: str | None = None,
-                 tokens: TokenTable | None = None, tokens_error: str | None = None):
+                 tokens: TokenTable | None = None, tokens_error: str | None = None,
+                 agent_stats: AgentStats | None = None):
         self.settings = settings
         self.config_error = config_error
         self.tokens = TokenTable.empty() if tokens is None else tokens
@@ -76,6 +81,7 @@ class DataRole(RoleBase):
         self.whitelist = whitelist
         self.monotonic = monotonic
         self.wallclock = wallclock
+        self.agent_stats = AgentStats(monotonic=monotonic) if agent_stats is None else agent_stats
         # вне TagName IN (…) ворота пускают только даты сводки и закрытый набор ww-значений
         self.gate = HistorianGate(query, allowed=whitelist, literal_ok=allowed_literal, monotonic=monotonic)
         self.catalog = Catalog.empty()

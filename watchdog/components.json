@@ -18,5 +18,6 @@
   {"id": "historian", "title": "Историан БДРВ", "kind": "historian", "url": "http://pcbk-core:8000/health/historian"},
   {"id": "llm", "title": "LLM-прокси и бюджет", "kind": "llm", "url": "http://pcbk-core:8000/health/llm"},
   {"id": "gateway", "title": "Шлюз и вход", "kind": "gateway", "url": "http://pcbk-core:8000/health/gateway"},
-  {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/", "reports_url": "http://pcbk-core:8000/health/web"}
+  {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/", "reports_url": "http://pcbk-core:8000/health/web"},
+  {"id": "agents", "title": "Агенты студентов", "kind": "agents", "url": "http://pcbk-core:8000/health/agents"}
 ]

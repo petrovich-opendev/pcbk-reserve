@@ -331,6 +331,29 @@ def fake_core():
 
 
 @pytest.fixture
+def json_site():
+    """json_site(code, obj) → адрес http://127.0.0.1:N/health/agents двойника, который на любой путь отвечает кодом code и
+    телом obj в JSON (как FastAPI: UTF-8, не \\u); двойники гасятся при выходе из теста (задача А1 Д7а, предпроверка m3)."""
+    with ExitStack() as stack:
+        def site(code: int, obj) -> str:
+            body = json.dumps(obj, ensure_ascii=False).encode()
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    pass
+
+            return stack.enter_context(serve_http(Handler)) + "/health/agents"
+        yield site
+
+
+@pytest.fixture
 def silent_proxy_url():
     """Сокет принимает соединения и молчит — повисший прокси."""
     listener = socket.create_server(("127.0.0.1", 0))

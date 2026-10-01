@@ -12,7 +12,8 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "DOCKER_TIMEOUT_S", "MEM_WARN_MIB", "MEM_FAIL_MIB", "TLS_CAFILE",
                       "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH", "DRILL_FREEZE_LOOP",
                       "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
-                      "GW_STALE_S"},                                   # строка «Шлюз и вход» (Д5а)
+                      "GW_STALE_S",                                    # строка «Шлюз и вход» (Д5а)
+                      "AGENTS_STALE_S"},                               # строка «Агенты студентов» (Д7а, П10)
     "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
                   "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
                   # шлюз (Д5а): сети мест для сверки токенов и адресов мест, origin входа, простой, такт, учения

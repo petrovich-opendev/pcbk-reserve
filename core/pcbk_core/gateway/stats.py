@@ -1,22 +1,17 @@
 """Счётчики шлюза за час (Д5-R29): строка «Шлюз и вход» показывает «k за час» по видам.
 
-Окно — 3600 с по монотонным часам. Память ограничена при любом потоке событий: события одного вида в
-пределах секунды лежат одной записью «первое, последнее, число», записей на вид — не больше ~3600. Запись
-уходит из окна, когда из него вышло её последнее событие: счёт завышается не больше чем на секунду событий.
-Неизвестный вид — ValueError: опечатка в имени не проходит молча нулём.
+Окно часа — pcbk_core.hourly (Д7а, П1: общее со счётчиками агентов студентов, только stdlib); WINDOW_S оттуда же —
+его берёт и web.py.
 
 Д5б (Б1): слоты потоков событий /event по учёткам — не больше MAX_STREAMS_PER_LOGIN на логин; под тем же
 замком, что и счётчики. Учётка без открытых потоков в словаре не лежит.
 """
 from __future__ import annotations
 
-import threading
 import time
-from collections import deque
 from collections.abc import Callable
 
-WINDOW_S = 3600.0
-_BUCKET_S = 1.0
+from ..hourly import WINDOW_S, HourlyCounts  # noqa: F401 — реэкспорт WINDOW_S: его берёт web.py
 
 MAX_STREAMS_PER_LOGIN = 3                   # потоков /event одной учётки разом (Б1, Б4)
 
@@ -25,45 +20,15 @@ KINDS = frozenset({"wake_ok", "wake_failed", "stop_failed", "place_auth_failed",
                    "origin_refused", "cookies_duplicate", "refused", "stream_broken", "upstream_failed"})
 
 
-class GatewayStats:
+class GatewayStats(HourlyCounts):
     """event(kind) — событие сейчас; count_1h(kind) — число событий за последние 3600 с; stream_opened(login) и
-    stream_closed(login) — слоты потоков учётки, streams_of(login) и streams — открытые. Потокобезопасно."""
+    stream_closed(login) — слоты потоков учётки, streams_of(login) и streams — открытые. Потокобезопасно.
+    kinds — виды счётчиков (по умолчанию KINDS шлюза, Д7а: параметр — для окна часа других счётчиков)."""
 
-    def __init__(self, monotonic: Callable[[], float] = time.monotonic):
-        self._monotonic = monotonic
-        self._lock = threading.Lock()
-        # вид → записи [первое, последнее, число] по возрастанию времени
-        self._events: dict[str, deque[list]] = {kind: deque() for kind in KINDS}
+    def __init__(self, monotonic: Callable[[], float] = time.monotonic, kinds: frozenset[str] = KINDS):
+        super().__init__(kinds, monotonic, what="шлюза")
         # логин → открытых потоков (> 0); ноль — ключа нет
         self._streams: dict[str, int] = {}
-
-    def _queue(self, kind: str) -> deque[list]:
-        try:
-            return self._events[kind]
-        except KeyError:
-            raise ValueError(f"неизвестный вид события шлюза: {kind!r}") from None
-
-    @staticmethod
-    def _trim(queue: deque[list], now: float) -> None:
-        while queue and now - queue[0][1] >= WINDOW_S:
-            queue.popleft()
-
-    def event(self, kind: str) -> None:
-        queue = self._queue(kind)
-        with self._lock:
-            now = self._monotonic()
-            self._trim(queue, now)
-            if queue and now - queue[-1][0] < _BUCKET_S:
-                queue[-1][1] = now
-                queue[-1][2] += 1
-            else:
-                queue.append([now, now, 1])
-
-    def count_1h(self, kind: str) -> int:
-        queue = self._queue(kind)
-        with self._lock:
-            self._trim(queue, self._monotonic())
-            return sum(entry[2] for entry in queue)
 
     def streams_of(self, login: str) -> int:
         with self._lock:

@@ -9,10 +9,11 @@ from pathlib import Path
 import pytest
 
 from helpers import T0, gw, insp, llm_obj, now_utc, put_build
-from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD, EGRESS_STALE_S,
+from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_KEYS, BUDGET_STEPS, DRIFT_WARN_USD,
+                                  EGRESS_STALE_S, AgentsReply, agents_verdict, check_agents,
                                   GW_DRILL_MODES, GW_KEYS_D5A, GW_KEYS_D5B, GW_OFF_CONTRACT_DETAIL,
                                   GW_SP_CTL_STATES, LLM_STALE_S, MAX_BODY_BYTES,
-                                  LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, GatewayReply, _http_get,
+                                  LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, Check, GatewayReply, _http_get,
                                   check_container, check_gateway,
                                   check_historian, check_http, check_llm, check_memory, check_tls, check_web,
                                   fmt_total, fmt_usd, not_installed, tls_verdict)
@@ -1214,3 +1215,169 @@ def test_web_reports_share_static_deadline(web_site, fake_core, monkeypatch):   
     monkeypatch.setattr(checks_module, "_http_get", slow_page)
     r, took = timed(check_web, "web", "Веб-чат", url, timeout=1.0, reports_url=fake_core.base + "/health/web")
     assert row(r) == NO_REPORTS and took < 2 * 1.0 + 0.4
+
+
+# --- строка «Агенты студентов» (задача А1 Д7а, Д7-R60): ответ /health/agents core ---------------------------------
+
+NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
+BASE = {"checked_at": NOW.isoformat(), "store_ok": True, "dir_error": None, "pending": 0, "pending_oldest_s": None,
+        "saved_1h": 2, "refused_1h": 1, "unavailable_1h": 0, "visible_1h": 2, "not_visible_1h": 0, "quarantined_1h": 0,
+        "reload_failed_1h": 0, "reload_delayed_1h": 0, "image_config_1h": 0, "drill": ""}
+
+@pytest.mark.parametrize("patch,want", [
+    ({}, ("ok", "агенты сохраняются", "сохранено за час: 2; ждут перезагрузки: 0")),
+    ({"image_config_1h": 1}, ("fail", "настройка рабочего места сломана — место не поднимается", "1 за час")),
+    ({"dir_error": "каталог агентов не пишется"}, ("fail", "каталог агентов недоступен — агенты не сохраняются", "каталог агентов не пишется")),
+    ({"store_ok": False}, ("fail", "учёт агентов недоступен", "")),
+    ({"checked_at": None}, ("unknown", "перезагрузка агентов ещё не проходила", "")),
+    ({"checked_at": (NOW - timedelta(seconds=61)).isoformat()}, ("fail", "перезагрузка агентов молчит", "")),
+    ({"quarantined_1h": 1}, ("warn", "файл агента сломал рабочее место — в карантине, место перезапущено", "1 за час")),
+    ({"not_visible_1h": 2}, ("warn", "сохранённый агент не появился в рабочем месте", "2 за час")),
+    ({"reload_failed_1h": 1}, ("warn", "перезагрузка рабочего места не удалась", "1 за час")),
+    ({"pending": 1, "pending_oldest_s": 900}, ("warn", "агент ждёт перезагрузки места дольше 15 минут", "мест: 1")),
+    ({"unavailable_1h": 2}, ("warn", "save_agent отвечает «недоступно» — агенты не сохраняются", "2 за час")),
+    ({"saved_1h": 0, "refused_1h": 6}, ("warn", "save_agent отказывает — агенты не сохраняются", "6 за час")),
+    ({"reload_delayed_1h": 1}, ("ok", "агенты сохраняются", "сохранено за час: 2; ждут перезагрузки: 0; ждали дольше 15 мин: 1")),
+])
+def test_agents_verdicts(patch, want):
+    assert agents_verdict(AgentsReply.parse({**BASE, **patch}), NOW, 60) == want
+
+@pytest.mark.parametrize("bad", [{**BASE, "extra": 1}, {k: v for k, v in BASE.items() if k != "drill"},
+                                 {**BASE, "saved_1h": -1}, {**BASE, "drill": "other"}, [], {**BASE, "dir_error": ""}])
+def test_agents_off_contract(bad):
+    with pytest.raises(ValueError):
+        AgentsReply.parse(bad)
+
+def test_check_agents_codes(json_site):
+    c = check_agents("agents", "Агенты студентов", json_site(404, {"name": "NotFound"}), NOW, 60)
+    assert (c.state, c.detail) == ("unknown", "служба агентов ещё не выложена")
+    c = check_agents("agents", "Агенты студентов", json_site(200, {**BASE, "drill": "freeze_reload"}), NOW, 60)
+    assert c.note.startswith("учения: freeze_reload")
+    c = check_agents("agents", "Агенты студентов", "http://127.0.0.1:9/x", NOW, 60)
+    assert (c.state, c.detail) == ("fail", "служба агентов не отвечает")
+
+
+# --- сверх брифа ---
+
+AGENTS_DOWN = ("fail", "служба агентов не отвечает", "")
+AGENTS_OFF = ("fail", "служба агентов ответила не по договору", "")
+
+
+def agents_row(json_site, obj, code=200, stale_s=60):
+    return row(check_agents("agents", "Агенты студентов", json_site(code, obj), NOW, stale_s, timeout=0.5))
+
+
+def test_agents_contract_constants():
+    assert AGENTS_KEYS == set(BASE) and len(AGENTS_KEYS) == 15
+    assert AGENTS_KEYS == {f.name for f in fields(AgentsReply)}                    # договор = поля разбора
+    assert AGENTS_DRILL_MODES == {"freeze_reload"}                                 # DRILL_AGENTS, кроме ""
+    r = AgentsReply.parse({**BASE, "pending": 3, "pending_oldest_s": 12.5, "dir_error": None})
+    assert (r.checked_at, r.pending, r.pending_oldest_s, r.store_ok) == (NOW, 3, 12.5, True)
+
+
+def test_agents_verdict_order_and_bounds():                                    # первая подходящая строка таблицы Д7-R60
+    every = {"image_config_1h": 1, "dir_error": "нет каталога агентов", "store_ok": False, "checked_at": None,
+             "quarantined_1h": 1, "not_visible_1h": 1, "reload_failed_1h": 1, "pending": 2, "pending_oldest_s": 950,
+             "unavailable_1h": 1, "saved_1h": 0, "refused_1h": 9}
+    order = [("image_config_1h", "настройка рабочего места сломана — место не поднимается"),
+             ("dir_error", "каталог агентов недоступен — агенты не сохраняются"),
+             ("store_ok", "учёт агентов недоступен"),
+             ("checked_at", "перезагрузка агентов ещё не проходила"),
+             ("quarantined_1h", "файл агента сломал рабочее место — в карантине, место перезапущено"),
+             ("not_visible_1h", "сохранённый агент не появился в рабочем месте"),
+             ("reload_failed_1h", "перезагрузка рабочего места не удалась"),
+             ("pending_oldest_s", "агент ждёт перезагрузки места дольше 15 минут"),
+             ("unavailable_1h", "save_agent отвечает «недоступно» — агенты не сохраняются"),
+             ("refused_1h", "save_agent отказывает — агенты не сохраняются")]
+    obj = {**BASE, **every}
+    for key, detail in order:                                                      # снимаем по одной сверху вниз
+        assert agents_verdict(AgentsReply.parse(obj), NOW, 60)[1] == detail, key
+        obj[key] = BASE[key]
+    assert agents_verdict(AgentsReply.parse(obj), NOW, 60)[:2] == ("ok", "агенты сохраняются")
+    stale = {**BASE, "checked_at": (NOW - timedelta(seconds=61)).isoformat(), "quarantined_1h": 3}
+    assert agents_verdict(AgentsReply.parse(stale), NOW, 60)[1] == "перезагрузка агентов молчит"   # молчание выше warn
+    assert agents_verdict(AgentsReply.parse({**stale, "store_ok": False}), NOW, 60)[1] == "учёт агентов недоступен"
+    for patch, state in (({"checked_at": (NOW - timedelta(seconds=60)).isoformat()}, "ok"),   # ровно порог — ещё не молчит
+                         ({"checked_at": (NOW - timedelta(seconds=61)).isoformat()}, "fail"),
+                         ({"pending": 1, "pending_oldest_s": 899.9}, "ok"),
+                         ({"pending": 4, "pending_oldest_s": 900.0}, "warn"),
+                         ({"saved_1h": 0, "refused_1h": 5}, "ok"),
+                         ({"saved_1h": 1, "refused_1h": 40}, "ok"),            # хоть одно сохранение — служба жива
+                         ({"saved_1h": 0, "refused_1h": 6}, "warn")):
+        assert agents_verdict(AgentsReply.parse({**BASE, **patch}), NOW, 60)[0] == state, patch
+    assert agents_verdict(AgentsReply.parse({**BASE, "checked_at": (NOW - timedelta(seconds=61)).isoformat()}),
+                          NOW, 120)[0] == "ok"                                     # порог — из AGENTS_STALE_S
+    assert agents_verdict(AgentsReply.parse({**BASE, "pending": 4, "pending_oldest_s": 1200}), NOW, 60)[2] == "мест: 4"
+
+
+def test_agents_details_fit_80_chars_and_numbers_only_in_note(tmp_path):        # правило журнала Д1
+    objs = [{**BASE, **p} for p in ({"image_config_1h": 1}, {"dir_error": "нет каталога агентов"}, {"store_ok": False},
+                                     {"checked_at": None}, {"checked_at": "2026-10-07T08:00:00+00:00"},
+                                     {"quarantined_1h": 1}, {"not_visible_1h": 1}, {"reload_failed_1h": 1},
+                                     {"pending": 1, "pending_oldest_s": 900}, {"unavailable_1h": 1},
+                                     {"saved_1h": 0, "refused_1h": 6}, {})]
+    details = [agents_verdict(AgentsReply.parse(o), NOW, 60)[1] for o in objs]
+    details += ["служба агентов не отвечает", "служба агентов ещё не выложена", "служба агентов ответила не по договору"]
+    assert all(len(d) <= REASON_CHARS for d in details), [d for d in details if len(d) > REASON_CHARS]
+    assert not [d for d in details if any(ch.isdigit() for ch in d) and "15 минут" not in d]   # кроме порога в тексте
+    journal = Journal(str(tmp_path / "j.db"))
+    rows = [Check("agents", "Агенты студентов", *agents_verdict(AgentsReply.parse({**BASE, "not_visible_1h": k}), NOW, 60))
+            for k in (1, 2, 7)]
+    rows += [Check("agents", "Агенты студентов", *agents_verdict(AgentsReply.parse({**BASE, "saved_1h": k}), NOW, 60))
+             for k in (0, 3, 9)]
+    assert len({r.note for r in rows}) == 6
+    assert sum(len(journal.record([r], NOW + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 2
+
+
+def test_agents_dir_error_note_is_safe(json_site):                                # note — без путей и не длиннее 80
+    assert agents_row(json_site, {**BASE, "dir_error": "каталог места отсутствует или не пишется"}) == \
+           ("fail", "каталог агентов недоступен — агенты не сохраняются", "каталог места отсутствует или не пишется")
+    r = agents_row(json_site, {**BASE, "dir_error": "сбой /opt/pcbk-reserve/agents/student-03 " + "х" * 100})
+    assert r[2].startswith("сбой … ") and len(r[2]) <= REASON_CHARS and "student-03" not in r[2]
+
+
+def test_agents_off_contract_reply_has_own_text(json_site):                     # Ш8: как у строки шлюза
+    missing = [{k: v for k, v in BASE.items() if k != key} for key in BASE]
+    for obj in (*missing, "строка", 7, None, {}, [BASE], {**BASE, "extra": 0}, {**BASE, "streams": 0},
+                {**BASE, "checked_at": 12}, {**BASE, "checked_at": "вчера"}, {**BASE, "store_ok": None},
+                {**BASE, "store_ok": 1}, {**BASE, "dir_error": 5}, {**BASE, "dir_error": "   "},
+                {**BASE, "dir_error": "\n\t"}, {**BASE, "pending": True}, {**BASE, "pending": 1.0},
+                {**BASE, "pending": -1}, {**BASE, "pending": None}, {**BASE, "pending_oldest_s": "900"},
+                {**BASE, "pending_oldest_s": -1}, {**BASE, "pending_oldest_s": True}, {**BASE, "pending_oldest_s": []},
+                {**BASE, "pending_oldest_s": 10 ** 400},                         # целое больше float — не падение проверки
+                *({**BASE, k: v} for k in BASE if k.endswith("_1h") for v in (-1, True, 1.5, "1", None)),
+                {**BASE, "drill": None}, {**BASE, "drill": "FREEZE_RELOAD"}, {**BASE, "drill": "freeze_reaper"},
+                {**BASE, "drill": "freeze_reload "}, {**BASE, "drill": " "}):
+        assert agents_row(json_site, obj) == AGENTS_OFF, obj
+        with pytest.raises(ValueError):                                            # не KeyError и не TypeError
+            AgentsReply.parse(obj)
+    assert len(missing) == 15
+    for bad in (float("nan"), float("inf")):                                       # json.dumps пишет NaN/Infinity
+        with pytest.raises(ValueError):
+            AgentsReply.parse({**BASE, "pending_oldest_s": bad})
+
+
+def test_agents_http_errors_are_down(json_site, raw_http):
+    for code in (500, 503, 401, 302):                                              # 404 — своя строка
+        assert agents_row(json_site, BASE, code=code) == AGENTS_DOWN, code
+
+    def text_reply(conn, stop):
+        body = "не json".encode()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+    r = check_agents("agents", "Агенты студентов", raw_http(text_reply) + "/health/agents", NOW, 60, timeout=0.5)
+    assert row(r) == AGENTS_DOWN
+    r, took = timed(check_agents, "agents", "Агенты студентов", raw_http(headers_then_stall) + "/health/agents", NOW, 60,
+                    timeout=SOCK_S)
+    assert row(r) == AGENTS_DOWN and took < BOUND_S                                # тело оборвал общий срок
+    assert agents_row(json_site, {"detail": "Not Found"}, code=404) == \
+           ("unknown", "служба агентов ещё не выложена", "")                         # core :d6b — 404 FastAPI
+
+
+def test_agents_drill_goes_first_in_note(json_site):
+    drill = {**BASE, "drill": "freeze_reload"}
+    assert agents_row(json_site, drill) == \
+           ("ok", "агенты сохраняются", "учения: freeze_reload; сохранено за час: 2; ждут перезагрузки: 0")
+    assert agents_row(json_site, {**drill, "checked_at": (NOW - timedelta(seconds=90)).isoformat()}) == \
+           ("fail", "перезагрузка агентов молчит", "учения: freeze_reload")       # учение молчания — с пометкой
+    assert agents_row(json_site, {**drill, "not_visible_1h": 3}) == \
+           ("warn", "сохранённый агент не появился в рабочем месте", "учения: freeze_reload; 3 за час")

@@ -1,5 +1,5 @@
 """Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана,
-LLM-прокси и бюджет, шлюз и вход, веб-чат."""
+LLM-прокси и бюджет, шлюз и вход, веб-чат, агенты студентов."""
 import http.client
 import io
 import json
@@ -135,6 +135,20 @@ WEB_REPORT_ROWS = (("boot_failed_1h", "чат не запускается в б�
                    ("turn_silent_1h", "ответ модели не пришёл вовремя"),
                    ("stream_down_1h", "браузеры теряют связь с сервером"))
 WEB_NO_REPORTS = "отчёты браузеров недоступны"
+
+# строка «Агенты студентов» (задача А1 Д7а, Д7-R60): ответ /health/agents core — ровно эти 15 ключей; drill — "" или
+# режим DRILL_AGENTS. Отдельная ручка, а не ключи /health/gateway: его договор строгий (лишний ключ — не по договору)
+AGENTS_KEYS = frozenset({"checked_at", "store_ok", "dir_error", "pending", "pending_oldest_s", "saved_1h", "refused_1h",
+                         "unavailable_1h", "visible_1h", "not_visible_1h", "quarantined_1h", "reload_failed_1h",
+                         "reload_delayed_1h", "image_config_1h", "drill"})
+AGENTS_DRILL_MODES = frozenset({"freeze_reload"})
+AGENTS_DOWN_DETAIL = "служба агентов не отвечает"
+AGENTS_NOT_DEPLOYED_DETAIL = "служба агентов ещё не выложена"       # 404: core старше сторожа (выкладка)
+AGENTS_OFF_CONTRACT_DETAIL = "служба агентов ответила не по договору"
+# агент ждёт перезагрузки места дольше стольких секунд — «внимание» (RELOAD_DELAYED_S core, Д7-R58)
+AGENTS_DELAYED_S = 900
+# столько отказов save_agent за час без единого сохранения — «внимание»
+AGENTS_REFUSED_WARN = 6
 
 
 @dataclass(frozen=True)
@@ -836,6 +850,114 @@ def check_gateway(component: str, title: str, url: str, now: datetime, stale_s: 
     except ValueError:
         return Check(component, title, "fail", GW_OFF_CONTRACT_DETAIL)
     state, detail, note = gateway_verdict(parsed, now, stale_s)
+    if parsed.drill:
+        note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
+    return Check(component, title, state, detail, note)
+
+
+@dataclass(frozen=True)
+class AgentsReply:
+    """Ответ /health/agents (Д7-R60): все 15 ключей, типы проверены при разборе."""
+    checked_at: datetime | None
+    store_ok: bool
+    dir_error: str | None
+    pending: int
+    pending_oldest_s: float | None
+    saved_1h: int
+    refused_1h: int
+    unavailable_1h: int
+    visible_1h: int
+    not_visible_1h: int
+    quarantined_1h: int
+    reload_failed_1h: int
+    reload_delayed_1h: int
+    image_config_1h: int
+    drill: str
+
+    @classmethod
+    def parse(cls, reply) -> "AgentsReply":
+        """Ответ не по договору — только ValueError (Ш8), как у GatewayReply: не объект JSON, лишний или недостающий
+        ключ, тип не тот, счётчик или pending_oldest_s меньше нуля (или не конечное число), пустая причина dir_error,
+        drill не "" и не из AGENTS_DRILL_MODES."""
+        if not isinstance(reply, dict):
+            raise ValueError("ответ — не объект JSON")
+        if set(reply) != AGENTS_KEYS:
+            raise ValueError("в ответе службы агентов лишний или недостающий ключ")
+        try:
+            oldest = _usd(reply, "pending_oldest_s", nullable=True)    # число или null; bool и не конечное — TypeError
+            r = cls(checked_at=_time(reply, "checked_at"),           # не ISO — ValueError из fromisoformat
+                    store_ok=_flag(reply, "store_ok"), dir_error=_text(reply, "dir_error", nullable=True),
+                    pending=_gw_count(reply, "pending"), pending_oldest_s=oldest,
+                    **{key: _gw_count(reply, key) for key in sorted(AGENTS_KEYS) if key.endswith("_1h")},
+                    drill=_text(reply, "drill"))
+        except (KeyError, TypeError, ArithmeticError) as e:     # ArithmeticError — целое больше float в isfinite
+            raise ValueError(f"ответ службы агентов не по договору: {type(e).__name__} {e}") from e
+        if r.pending_oldest_s is not None and r.pending_oldest_s < 0:
+            raise ValueError("pending_oldest_s — меньше нуля")
+        if r.dir_error is not None and not r.dir_error.strip():
+            raise ValueError("сбой каталога без причины")       # иначе строка «каталог недоступен» без слов
+        if r.drill and r.drill not in AGENTS_DRILL_MODES:
+            raise ValueError("неизвестный режим учений")
+        return r
+
+
+def agents_verdict(r: AgentsReply, now: datetime, stale_s: int) -> tuple[State, str, str]:
+    """Первая подходящая строка таблицы Д7-R60: (состояние, detail, note без учений).
+
+    В warn/fail текст постоянный — числа идут в note (правило журнала Д1); dir_error — тоже в note (без путей, до 80).
+    """
+    if r.image_config_1h > 0:
+        return "fail", "настройка рабочего места сломана — место не поднимается", f"{r.image_config_1h} за час"
+    if r.dir_error is not None:
+        return "fail", "каталог агентов недоступен — агенты не сохраняются", _reason(r.dir_error)
+    if not r.store_ok:
+        return "fail", "учёт агентов недоступен", ""
+    if r.checked_at is None:
+        return "unknown", "перезагрузка агентов ещё не проходила", ""
+    if (now - r.checked_at).total_seconds() > stale_s:
+        return "fail", "перезагрузка агентов молчит", ""
+    for count, detail in ((r.quarantined_1h, "файл агента сломал рабочее место — в карантине, место перезапущено"),
+                          (r.not_visible_1h, "сохранённый агент не появился в рабочем месте"),
+                          (r.reload_failed_1h, "перезагрузка рабочего места не удалась")):
+        if count > 0:
+            return "warn", detail, f"{count} за час"
+    if r.pending_oldest_s is not None and r.pending_oldest_s >= AGENTS_DELAYED_S:
+        return "warn", "агент ждёт перезагрузки места дольше 15 минут", f"мест: {r.pending}"
+    if r.unavailable_1h > 0:
+        return "warn", "save_agent отвечает «недоступно» — агенты не сохраняются", f"{r.unavailable_1h} за час"
+    if r.refused_1h >= AGENTS_REFUSED_WARN and r.saved_1h == 0:
+        return "warn", "save_agent отказывает — агенты не сохраняются", f"{r.refused_1h} за час"
+    note = f"сохранено за час: {r.saved_1h}; ждут перезагрузки: {r.pending}"
+    if r.reload_delayed_1h > 0:
+        note += f"; ждали дольше 15 мин: {r.reload_delayed_1h}"
+    return "ok", "агенты сохраняются", note
+
+
+def check_agents(component: str, title: str, url: str, now: datetime, stale_s: int,
+                 timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
+    """Агенты студентов по ручке /health/agents службы (только числа и тексты, без имён агентов и номеров мест).
+
+    Нет ответа, срок, не JSON, код не 200 и не 404 — «служба агентов не отвечает»; 404 (core старше сторожа во время
+    выкладки) — «неизвестно»; JSON не по договору — свой текст (Ш8). При учениях к note любой строки таблицы первым
+    добавляется «учения: <режим>».
+    """
+    try:
+        status, body = _http_get(url, timeout, lambda code: code == 200)
+    except (OSError, http.client.HTTPException):
+        return Check(component, title, "fail", AGENTS_DOWN_DETAIL)
+    if status == 404:
+        return Check(component, title, "unknown", AGENTS_NOT_DEPLOYED_DETAIL)
+    if status != 200:
+        return Check(component, title, "fail", AGENTS_DOWN_DETAIL)
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
+        return Check(component, title, "fail", AGENTS_DOWN_DETAIL)
+    try:
+        parsed = AgentsReply.parse(reply)
+    except ValueError:
+        return Check(component, title, "fail", AGENTS_OFF_CONTRACT_DETAIL)
+    state, detail, note = agents_verdict(parsed, now, stale_s)
     if parsed.drill:
         note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
     return Check(component, title, state, detail, note)

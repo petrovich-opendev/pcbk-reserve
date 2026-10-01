@@ -55,6 +55,8 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "LLM_TOTAL_USD",
                         # шлюз (Д5а): core и срок молчания уборщика у сторожа
                         "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY", "GW_STALE_S",
+                        # срок молчания воркера перезагрузки агентов у сторожа (Д7а)
+                        "AGENTS_STALE_S",
                         # статика edge тестового стенда со сборкой чата (Д6а): compose.test.yaml, «:?»
                         "PCBK_TEST_STATIC"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
