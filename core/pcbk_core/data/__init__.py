@@ -11,7 +11,8 @@ EVENTS_CHECK_S. Состояние роли меняется только в ц�
 
 Учёт агентов студентов (AgentStore, Д7-R56) открывается в lifespan сразу после журнала событий. Его сбой —
 agent_stats.store_failed (строка сторожа «Агенты студентов»), а не config_error: /healthz/data от агентов не
-зависит (П13).
+зависит (П13). Дальше учёт открывается заново раз в EVENTS_CHECK_S вместе с проверкой журнала (итоговое ревью Д7а,
+I-1): флаг сбоя после одного SQLITE_BUSY у save_agent снимается сам, без перезапуска core.
 """
 import asyncio
 import logging
@@ -279,6 +280,24 @@ class DataRole(RoleBase):
         """Проверка записи журнала — в потоке (F9); health() читает только её итог."""
         await asyncio.to_thread(self.events.check)
 
+    async def check_agents(self) -> None:
+        """Учёт агентов — снова open() в потоке (схема идемпотентна, BEGIN IMMEDIATE проверяет и запись): удача —
+        store_ok, сбой — store_failed (I-1). В журнал службы — только смена «пишется / не пишется»."""
+        was = self.agent_stats.store_error
+        try:
+            ok = await asyncio.to_thread(self.agents.open)
+            error = self.agents.last_error or "Error"
+        except Exception as exc:            # open() не бросает; страховка — только класс
+            ok, error = False, type(exc).__name__
+        if ok:
+            self.agent_stats.store_ok()
+            if was is not None:
+                log.info("учёт агентов: запись снова проходит")
+        else:
+            self.agent_stats.store_failed(error)
+            if was is None:
+                log.error("учёт агентов: запись не проходит (%s)", error)
+
     # --- протокол роли ---
 
     def health(self) -> tuple[bool, str]:
@@ -391,7 +410,8 @@ class DataRole(RoleBase):
             await asyncio.sleep(self.settings.FRESH_POLL_S)
 
     async def _events_loop(self) -> None:
-        """Проверка записи журнала сразу и дальше раз в EVENTS_CHECK_S; в журнал службы — только смена."""
+        """Проверка записи журнала и учёта агентов (I-1) сразу и дальше раз в EVENTS_CHECK_S; в журнал службы — только
+        смена."""
         while True:
             was = self.events.writable_ok
             try:
@@ -403,6 +423,7 @@ class DataRole(RoleBase):
                 log.error("журнал событий: запись не проходит (%s)", self.events.last_error)
             elif now and was is False:
                 log.info("журнал событий: запись снова проходит")
+            await self.check_agents()
             await asyncio.sleep(EVENTS_CHECK_S)
 
 

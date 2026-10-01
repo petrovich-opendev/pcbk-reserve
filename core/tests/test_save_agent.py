@@ -7,18 +7,22 @@
 import asyncio
 import json
 import logging
+import re
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from dataclasses import replace
 from types import SimpleNamespace
 
+import anyio
 import pytest
 
+import pcbk_core.data as data_module
 from fakes import WHITELIST, FakeHistorian
 from helpers import (SETTINGS, TOKEN, FakeMono, agent_catalog, make_agents_root, make_role, mcp_session, non_root,
-                     serve_role, sha, wait_http, wait_until)
-from pcbk_core.agents.store import MAX_AGENTS, AgentStore, StoreError
+                     serve_role, sha, wait_http, wait_until, wait_until_async)
+from pcbk_core.agents.store import MAX_AGENTS, AgentStore, DirUnavailable, StoreError
 from pcbk_core.data import DataRole
 from pcbk_core.data import save_agent as save_agent_module
 from pcbk_core.data.catalog import Catalog
@@ -207,10 +211,13 @@ async def test_dir_unavailable(served):
 def test_log_line_has_no_name(served, caplog):           # строка журнала без имени агента и полей
     caplog.set_level(logging.INFO, logger="pcbk_core.data")     # П4: строка ok — INFO, корень тестов — WARNING
     asyncio.run(save(served.url, TOKEN3))
-    line = next(r.getMessage() for r in caplog.records if "tool=save_agent" in r.getMessage())
+    record = next(r for r in caplog.records if "tool=save_agent" in r.getMessage())
+    line = record.getMessage()
     assert "proverka" not in line and "Проверка" not in line and "outcome=ok" in line
     assert "20FAKE" not in line and "помощник" not in line and "student-03/" not in line
-    assert line.startswith("tool=save_agent caller=student-03 channel=mcp outcome=ok codes=saved ms=")
+    # доводка Д7а (А4, m1): строка целиком — формат Д7-R57 без лишних частей, уровень INFO
+    assert re.fullmatch(r"tool=save_agent caller=student-03 channel=mcp outcome=ok codes=saved ms=\d+", line), line
+    assert record.levelno == logging.INFO
 
 
 # --- сверх брифа: ответ и событие ---
@@ -325,7 +332,9 @@ async def test_render_failure_is_error_without_file(tmp_path, monkeypatch):
     assert (out["status"], set(out)) == ("error", OTHER_KEYS) and files_of(root, 1) == []
     ev = _events(role.settings.DB_PATH)(tool="save_agent")[-1]
     assert (ev["outcome"], ev["summary"]) == ("error", "error: render_failed")
-    assert sum(role.agent_stats.count_1h(k) for k in ("saved", "refused", "unavailable")) == 0
+    # итоговое ревью Д7а, I-2: error считается как unavailable — строка сторожа не ok при сплошных сбоях
+    assert (role.agent_stats.count_1h("unavailable"), role.agent_stats.count_1h("saved"),
+            role.agent_stats.count_1h("refused")) == (1, 0, 0)
 
 
 @pytest.mark.anyio
@@ -355,6 +364,7 @@ async def test_unexpected_failure_is_error_answer(tmp_path, monkeypatch):
     assert (out["status"], out["message"]) == ("error", SAVE_MESSAGES["error"])
     ev = _events(role.settings.DB_PATH)(tool="save_agent")[-1]
     assert (ev["outcome"], ev["summary"]) == ("error", "error: RuntimeError")
+    assert role.agent_stats.count_1h("unavailable") == 1                      # I-2
 
 
 # --- сверх брифа: роль ---
@@ -384,3 +394,173 @@ async def test_mcp_call_outside_http_request_is_refused_without_event(tmp_path):
     _, sc = await role.mcp.call_tool("save_agent", ARGS)
     assert (sc["status"], sc["message"]) == ("refused", "нужен токен") and set(sc) == OTHER_KEYS
     assert _events(role.settings.DB_PATH)(tool="save_agent") == [] and files_of(root, 1) == []
+
+
+# --- итоговая доводка Д7а ---
+
+def _store_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("учёт агентов: запись")]
+
+
+def test_store_flag_clears_without_restart(tmp_path, monkeypatch, caplog):  # I-1: один SQLITE_BUSY — не до перезапуска
+    monkeypatch.setattr(data_module, "EVENTS_CHECK_S", 0.05)
+    caplog.set_level(logging.INFO, logger="pcbk_core.data")
+    role, root = _role(tmp_path, FakeHistorian(fail=HistorianError("query", "каталог не читается")))
+
+    def busy(*a, **k):
+        raise StoreError("учёт агентов: OperationalError SQLITE_BUSY")
+
+    with serve_role(role, wait_catalog=False) as url:
+        with monkeypatch.context() as m:
+            m.setattr(role.agents, "save", busy)
+            _, out = asyncio.run(save(url, TOKEN, {**ARGS, "tags": []}))
+        assert (out["status"], out["message"]) == ("unavailable", SAVE_MESSAGES["store"])
+        # больше ни одного вызова save_agent: флаг снимает фоновая проверка учёта за период
+        wait_until(lambda: role.agent_stats.store_error is None, 5)
+        time.sleep(0.3)                                                     # ещё несколько проверок — без строк
+    assert _store_lines(caplog) == ["учёт агентов: запись снова проходит"]
+    assert files_of(root, 1) == []
+
+
+def test_periodic_check_flags_broken_store(tmp_path, monkeypatch, caplog):  # I-1: проверка ставит и снимает флаг
+    monkeypatch.setattr(data_module, "EVENTS_CHECK_S", 0.05)
+    caplog.set_level(logging.INFO, logger="pcbk_core.data")
+    role, _ = _role(tmp_path, FakeHistorian(fail=HistorianError("query", "каталог не читается")))
+
+    def broken() -> bool:
+        role.agents.last_error = "OperationalError"
+        return False
+
+    with serve_role(role, wait_catalog=False):
+        assert role.agent_stats.store_error is None                         # lifespan открыл учёт — флага нет
+        with monkeypatch.context() as m:
+            m.setattr(role.agents, "open", broken)
+            wait_until(lambda: role.agent_stats.store_error == "OperationalError", 5)
+            time.sleep(0.3)
+        wait_until(lambda: role.agent_stats.store_error is None, 5)
+        time.sleep(0.3)
+    assert _store_lines(caplog) == ["учёт агентов: запись не проходит (OperationalError)",
+                                    "учёт агентов: запись снова проходит"]          # только смена
+
+
+@pytest.mark.anyio
+async def test_store_answer_clears_flag(tmp_path, monkeypatch):            # I-1: учёт ответил — флаг снят
+    role, root = direct(tmp_path)
+    stats = role.agent_stats
+    assert (await role.save_agent.call("student-01", ARGS))["status"] == "ok"
+    stats.store_failed("учёт агентов: OperationalError SQLITE_BUSY")
+    out = await role.save_agent.call("student-01", ARGS)
+    assert (out["status"], out["already"], stats.store_error) == ("ok", True, None)        # already — только чтение
+    stats.store_failed("учёт агентов: OperationalError SQLITE_BUSY")
+    out = await role.save_agent.call("student-01", {**ARGS, "title": "Другое"})
+    assert (out["problems"][0]["code"], stats.store_error) == ("name_taken", None)
+    stats.store_failed("учёт агентов: OperationalError SQLITE_BUSY")
+    with monkeypatch.context() as m:                                         # каталог места не читается — не учёт
+        m.setattr(role.agents, "_scan", lambda place: (_ for _ in ()).throw(DirUnavailable("каталог места")))
+        out = await role.save_agent.call("student-01", {**ARGS, "name": "drugoy"})
+    assert (out["status"], out["message"], stats.store_error) == ("unavailable", SAVE_MESSAGES["dir"], None)
+
+
+@pytest.mark.anyio
+async def test_save_does_not_block_event_loop(tmp_path):                   # А4 m3: запись — в потоке
+    role, root = direct(tmp_path)
+    started, release, waited = threading.Event(), threading.Event(), []
+    write_new = role.agents._write_new
+
+    def slow(*a, **k):
+        started.set()
+        waited.append(release.wait(2))              # release ставит корутина теста: цикл событий стоит — не дождаться
+        return write_new(*a, **k)
+
+    role.agents._write_new = slow
+    task = asyncio.create_task(role.save_agent.call("student-01", ARGS))
+    await wait_until_async(started.is_set)
+    release.set()
+    assert (await task)["status"] == "ok" and waited == [True]
+
+
+def _slow_first_write(role) -> tuple[threading.Event, threading.Event]:
+    """Первая запись файла агента ждёт release (до 5 с), последующие — сразу; started — первая запись началась."""
+    started, release, calls = threading.Event(), threading.Event(), []
+    write_new = role.agents._write_new
+
+    def slow(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            started.set()
+            release.wait(5)
+        return write_new(*a, **k)
+
+    role.agents._write_new = slow
+    return started, release
+
+
+def _tool_lines(caplog) -> list[str]:
+    return [r.getMessage().split(" ms=")[0] for r in caplog.records if r.getMessage().startswith("tool=save_agent")]
+
+
+@pytest.mark.anyio
+async def test_cancel_mid_write_keeps_lock_and_event(tmp_path, caplog):   # m3: отмена посреди записи
+    caplog.set_level(logging.INFO, logger="pcbk_core.data")
+    role, root = direct(tmp_path)
+    started, release = _slow_first_write(role)
+    task = asyncio.create_task(role.save_agent.call("student-01", ARGS))
+    await wait_until_async(started.is_set)
+    task.cancel(); await asyncio.sleep(0.05)
+    second = asyncio.create_task(role.save_agent.call("student-01", ARGS))
+    await asyncio.sleep(0.2)
+    assert not task.done() and not second.done()        # поток пишет — замок места держится, второй вызов ждёт
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    out = await second
+    assert (out["status"], out["already"]) == ("ok", True) and files_of(root, 1) == ["proverka.md"]
+    ev = _events(role.settings.DB_PATH)(tool="save_agent")
+    assert sorted((e["outcome"], e["summary"]) for e in ev) == [("ok", "already"), ("ok", "saved")]
+    assert role.agent_stats.count_1h("saved") == 1 and role.agent_stats.count_1h("unavailable") == 0
+    assert sorted(_tool_lines(caplog)) == ["tool=save_agent caller=student-01 channel=mcp outcome=ok codes=already",
+                                           "tool=save_agent caller=student-01 channel=mcp outcome=ok codes=saved"]
+
+
+@pytest.mark.anyio
+async def test_cancel_scope_mid_write_still_finishes(tmp_path, caplog):    # m3: отмена anyio, как у SDK MCP
+    caplog.set_level(logging.INFO, logger="pcbk_core.data")
+    role, root = direct(tmp_path)
+    started, release = _slow_first_write(role)
+    scopes, caught = [], []
+
+    async def run():
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await role.save_agent.call("student-01", ARGS)
+        caught.append(scope.cancelled_caught)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run)
+        await wait_until_async(started.is_set)
+        scopes[0].cancel()                              # anyio повторяет отмену на каждом ожидании задачи
+        await anyio.sleep(0.05)
+        release.set()
+    assert caught == [True] and files_of(root, 1) == ["proverka.md"]
+    ev = _events(role.settings.DB_PATH)(tool="save_agent")
+    assert [(e["outcome"], e["summary"]) for e in ev] == [("ok", "saved")]
+    assert _tool_lines(caplog) == ["tool=save_agent caller=student-01 channel=mcp outcome=ok codes=saved"]
+
+
+@pytest.mark.anyio
+async def test_cancel_before_write_is_error_event(tmp_path, caplog):      # m3: отменён, пока ждал замок места
+    caplog.set_level(logging.INFO, logger="pcbk_core.data")
+    role, root = direct(tmp_path)
+    started, release = _slow_first_write(role)
+    first = asyncio.create_task(role.save_agent.call("student-01", ARGS))
+    await wait_until_async(started.is_set)
+    waiting = asyncio.create_task(role.save_agent.call("student-01", {**ARGS, "name": "drugoy"}))
+    await asyncio.sleep(0.05)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    release.set()
+    assert (await first)["status"] == "ok" and files_of(root, 1) == ["proverka.md"]
+    ev = _events(role.settings.DB_PATH)(tool="save_agent")
+    assert sorted((e["agent"], e["outcome"], e["summary"]) for e in ev) == [
+        ("drugoy", "error", "error: cancelled"), ("proverka", "ok", "saved")]

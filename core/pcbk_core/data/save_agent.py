@@ -9,11 +9,16 @@
 3. check_draft (все замечания сразу); теги при незагруженном каталоге — unavailable;
 4. файл по шаблону — вне замка; замок места (asyncio.Lock, создаётся при первом вызове места);
 5. AgentStore.save в потоке под замком: повтор того же черновика — already, другое имя занято — name_taken.
+   Учёт ответил (любой исход, кроме StoreError) — флаг сбоя учёта роли снят (итоговое ревью Д7а, I-1).
 
 Место — только из вызывающего (токен, Ш25): в аргументах места нет, лишние ключи FastMCP отбрасывает до функции.
 Отказ — обычный результат, не isError (research/09 §4.3). Каждый вызов — событие agent_events и строка журнала
 «tool=save_agent caller=… channel=mcp outcome=… codes=… ms=N»: без имени агента, тегов, текста полей и путей —
 имя агента хранится только в SQLite (agents, agent_events.agent).
+
+Отмена вызова (клиент MCP ушёл; итоговое ревью Д7а, m3): поток записи под asyncio.shield дописывает, замок места
+держится до его конца, событие, строка журнала и счётчик — всё равно (finally), с итогом записи; затем отмена идёт
+дальше. Отменённый до записи (ждал замок места) — событие error: cancelled.
 """
 from __future__ import annotations
 
@@ -22,6 +27,8 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+import anyio
 
 from ..agents.draft import (AGENT_TOOLS, MAX_TAGS, NAME_MAX, NAME_MIN, PROMPT_MAX, PROMPT_MIN, TEXT_LIMITS, Draft,
                             Problem, check_draft, render_agent_file)
@@ -79,8 +86,10 @@ SAVE_MESSAGES = {
 # уровень строки журнала: ответ дан или отказ по правилам — INFO, недоступность — WARNING, сбой — ERROR (как служба)
 _LEVELS = {"ok": logging.INFO, "refused": logging.INFO, "rate": logging.INFO, "unavailable": logging.WARNING,
            "error": logging.ERROR}
-# счётчик AgentStats по исходу (у ok — только без already; у rate и error счётчика нет, Д7-R57)
-_COUNTERS = {"refused": "refused", "unavailable": "unavailable"}
+# счётчик AgentStats по исходу (у ok — только без already; у rate счётчика нет, Д7-R57). error считается как unavailable
+# (итоговое ревью Д7а, I-2, отступление от Д7-R57): иначе при сплошных сбоях строка сторожа — ok «агенты сохраняются»;
+# договор /health/agents (15 ключей) прежний
+_COUNTERS = {"refused": "refused", "unavailable": "unavailable", "error": "unavailable"}
 CALLER_LOG_CHARS = 64
 
 log = logging.getLogger("pcbk_core.data.save_agent")
@@ -132,6 +141,17 @@ class _Result:
         return ",".join((*codes, *flags)) or "-"
 
 
+async def _wait_out(work: asyncio.Future[str]) -> None:
+    """Дождаться потока записи после отмены вызова (m3). Щит anyio — SDK MCP повторяет отмену на каждом ожидании;
+    повторная отмена asyncio ожидание тоже не обрывает: отмена и так идёт дальше, как только поток кончится."""
+    with anyio.CancelScope(shield=True):
+        while not work.done():
+            try:
+                await asyncio.wait((work,))
+            except asyncio.CancelledError:
+                continue
+
+
 def _refused(problems: list[Problem], draft: Draft | None = None) -> _Result:
     codes = tuple(dict.fromkeys(p.code for p in problems))
     return _Result("refused", codes, refused_message(len(problems)), problems, draft)
@@ -147,16 +167,29 @@ class SaveAgent:
         self._locks: dict[int, asyncio.Lock] = {}
 
     async def call(self, caller: str, raw: Mapping[str, object]) -> dict[str, object]:
-        """Д7-R57: ответ research/09 §4.3; отказ и сбой — тоже ответ, событие и строка журнала."""
+        """Д7-R57: ответ research/09 §4.3; отказ и сбой — тоже ответ, событие и строка журнала.
+
+        Событие, строка журнала и счётчик — при любом выходе, и при отмене (m3): finally под щитом anyio — SDK MCP
+        повторяет отмену на каждом ожидании, иначе событие оборвалось бы. Итог записи, дописанной после отмены, —
+        в late (его кладёт шаг 5)."""
         began = self.role.monotonic()
+        caller = str(caller)
+        late: list[_Result] = []
+        result = _Result("error", ("cancelled",), SAVE_MESSAGES["error"])     # отменён до записи (ждал замок места)
         try:
-            result = await self._call(str(caller), raw)
+            result = await self._call(caller, raw, late)
+        except asyncio.CancelledError:
+            if late:
+                result = late[0]
+            raise
         except Exception as exc:            # текст исключения может нести имя агента или тега — только класс
             result = _Result("error", (type(exc).__name__,), SAVE_MESSAGES["error"])
-        await self._finish(str(caller), raw, result, began)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self._finish(caller, raw, result, began)
         return result.answer()
 
-    async def _call(self, caller: str, raw: Mapping[str, object]) -> _Result:
+    async def _call(self, caller: str, raw: Mapping[str, object], late: list[_Result]) -> _Result:
         role = self.role
         if role.config_error:                                           # 1. F5
             return _Result("unavailable", ("config",), role.config_error)
@@ -179,21 +212,39 @@ class SaveAgent:
         except ValueError:                                  # больше MAX_FILE_BYTES и т. п. — не запись (Д7-R55)
             return _Result("error", ("render_failed",), SAVE_MESSAGES["error"], draft=draft)
         lock = self._locks.setdefault(place, asyncio.Lock())
-        try:
-            async with lock:                                            # 5. учёт и файл — в потоке под замком места
-                done = await asyncio.to_thread(role.agents.save, place, draft, text, now)
-        except NameTaken as exc:
-            return _refused([Problem.make("name", "name_taken", draft.name, existing=exc.existing)], draft)
-        except TooManyAgents:
-            return _refused([Problem.make("name", "too_many_agents")], draft)
-        except DirUnavailable:
-            return _Result("unavailable", ("dir_unavailable",), SAVE_MESSAGES["dir"], draft=draft)
-        except StoreError as exc:
-            role.agent_stats.store_failed(str(exc))                     # текст StoreError — без пути и значений
+        async with lock:                                                # 5. учёт и файл — в потоке под замком места
+            work = asyncio.ensure_future(asyncio.to_thread(role.agents.save, place, draft, text, now))
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # m3: поток всё равно дописывает — замок места держится до его конца (следующий вызов места иначе
+                # прочёл бы учёт посреди записи), итог записи — событию вызова; затем отмена идёт дальше
+                await _wait_out(work)
+                late.append(self._stored(work, draft))
+                raise
+            except Exception:                       # отказ учёта или сбой записи — исход разбирает _stored
+                pass
+        return self._stored(work, draft)
+
+    def _stored(self, work: asyncio.Future[str], draft: Draft) -> _Result:
+        """Итог AgentStore.save (поток уже кончился); не бросает. Учёт ответил — любой исход, кроме StoreError, — флаг
+        сбоя учёта роли снят (I-1): already, NameTaken и TooManyAgents идут после чтения строк учёта, DirUnavailable —
+        тоже (save читает строки раньше каталога), это сбой каталога, а не учёта."""
+        stats = self.role.agent_stats
+        exc = work.exception()
+        if isinstance(exc, StoreError):
+            stats.store_failed(str(exc))                                # текст StoreError — без пути и значений
             return _Result("unavailable", ("store_error",), SAVE_MESSAGES["store"], draft=draft)
-        if done == "saved":
-            role.agent_stats.store_ok()
-        return _Result("ok", (), SAVE_MESSAGES["ok"], draft=draft, already=done == "already")
+        if exc is not None and not isinstance(exc, (NameTaken, TooManyAgents, DirUnavailable)):
+            return _Result("error", (type(exc).__name__,), SAVE_MESSAGES["error"], draft=draft)   # только класс
+        stats.store_ok()
+        if isinstance(exc, NameTaken):
+            return _refused([Problem.make("name", "name_taken", draft.name, existing=exc.existing)], draft)
+        if isinstance(exc, TooManyAgents):
+            return _refused([Problem.make("name", "too_many_agents")], draft)
+        if isinstance(exc, DirUnavailable):
+            return _Result("unavailable", ("dir_unavailable",), SAVE_MESSAGES["dir"], draft=draft)
+        return _Result("ok", (), SAVE_MESSAGES["ok"], draft=draft, already=work.result() == "already")
 
     async def _finish(self, caller: str, raw: Mapping[str, object], result: _Result, began: float) -> None:
         """Счётчик → событие (запись в потоке; сбой записи ответ не ломает) → строка журнала."""
