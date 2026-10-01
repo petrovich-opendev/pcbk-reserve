@@ -8,6 +8,9 @@
 // /me — экран места или предупреждения дольше 20 с не дают ложного boot_failed (preflight Ф9); без загрузчика (edge
 // до Д6б, откат) App работает. Чат — внутри ErrorBoundary: сбой отрисовки — отчёт ui_crash и «Перезапустить чат» —
 // новое монтирование с последним открытым разговором (lastSession), а не с тем, что был при прошлом монтировании.
+// Сбой чата, смонтированного перезапуском, — второй подряд: разговор мог ронять чат своим содержимым, и заход с ним
+// снова дал бы петлю ui_crash, поэтому следующий перезапуск открывает новый разговор, а прежний App забывает
+// (итоговая доводка Д6б, Б3-m6). Сбой вне границы (шапка, фазы до чата) ловит корень — mount.tsx.
 // Отчёты чата (turn_silent, stream_down) уходят через api.report — только от нынешнего чата и не при уходе на вход.
 import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
@@ -36,7 +39,7 @@ type Phase =
   | { kind: "notice"; notice: string; text: string }   // предупреждение при первом входе (R49)
   | { kind: "workplace" }
   | { kind: "asleep" }
-  | { kind: "chat"; mount: number; sessionId: string | undefined }
+  | { kind: "chat"; mount: number; sessionId: string | undefined; restarted: boolean }   // restarted — «Перезапустить чат»
   | { kind: "leaving" };                                 // уход на /login: чат снят, поток закрыт
 
 // notice — как пришло: номер редакции, null — подтверждено, undefined — поля нет (core Д5)
@@ -97,7 +100,14 @@ export function App(p: AppProps) {
 
   const openChat = useCallback((): void => {
     mounts.current += 1;
-    setPhase({ kind: "chat", mount: mounts.current, sessionId: lastSession.current });
+    setPhase({ kind: "chat", mount: mounts.current, sessionId: lastSession.current, restarted: false });
+  }, []);
+
+  // «Перезапустить чат»: с последним открытым разговором; упал чат прошлого перезапуска — с новым (Б3-m6)
+  const restartChat = useCallback((crashedWasRestart: boolean): void => {
+    if (crashedWasRestart) lastSession.current = undefined;
+    mounts.current += 1;
+    setPhase({ kind: "chat", mount: mounts.current, sessionId: lastSession.current, restarted: true });
   }, []);
 
   // место студента: готово — чат, иначе экран места (он и будит); stale — ответ уже никому не нужен
@@ -195,9 +205,9 @@ export function App(p: AppProps) {
       );
       break;
     case "chat": {
-      const mount = phase.mount;
+      const { mount, restarted } = phase;
       body = (
-        <ErrorBoundary key={mount} onCrash={() => report("ui_crash")} onRestart={openChat}>
+        <ErrorBoundary key={mount} onCrash={() => report("ui_crash")} onRestart={() => restartChat(restarted)}>
           <ChatImpl
             initialSessionId={phase.sessionId}
             onThreadIdChange={(id) => { if (mount === mounts.current) lastSession.current = id; }}

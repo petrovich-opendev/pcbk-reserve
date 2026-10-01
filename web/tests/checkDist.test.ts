@@ -192,8 +192,9 @@ test("check_dist_warns_on_boot_js", () => {                                     
                               expect.stringMatching(/^boot\.js: .*unsafe-eval.*eval\( ×1/)]);
 });
 
-// Д6б (Д6-R51, preflight Ф15): загрузчик /chat/boot.js — ровно один классический <script src> без type, async
-// и defer; любой другой <script src> не модулем — ошибка. Без загрузчика отчёт boot_failed пропал бы молча
+// Д6б (Д6-R51, preflight Ф15): загрузчик /chat/boot.js — ровно один классический <script src> без type, async,
+// defer и nomodule (итоговая доводка Д6б, Б1-m3: nomodule браузер класса не исполняет); любой другой <script src> не
+// модулем — ошибка. Без загрузчика отчёт boot_failed пропал бы молча
 test("check_dist_requires_one_classic_boot", () => {
   const real = readFileSync("public/boot.js", "utf8");                                 // настоящий загрузчик
   const r = checkDist(fixture({ ...CLEAN, extraFile: "boot.js", extraBody: real, listExtraInManifest: true }));
@@ -202,6 +203,7 @@ test("check_dist_requires_one_classic_boot", () => {
   for (const tag of ["", BOOT + BOOT, '<script type="module" src="/chat/boot.js"></script>',
                      '<script type="text/javascript" src="/chat/boot.js"></script>',
                      '<script src="/chat/boot.js" defer></script>', '<script async src="/chat/boot.js"></script>',
+                     '<script nomodule src="/chat/boot.js"></script>', '<script src="/chat/boot.js" NOMODULE></script>',
                      '<script type="Module" src="/chat/boot.js"></script>' + BOOT])  // модуль с тем же файлом — лишний
     expect(checkDist(fixture({ ...CLEAN, html: html(tag) })).errors, tag)
       .toEqual([expect.stringMatching(/загрузчик \/chat\/boot\.js/)]);

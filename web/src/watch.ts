@@ -3,18 +3,28 @@
 //   вкладка троттлит таймеры, и тики лишь проверяют часы (раз в секунду и на visibilitychange). Любой прирост
 //   последнего ответа ассистента (текст, рассуждение, вызов инструмента) отсчёт сбрасывает, конец хода снимает.
 //   Отчёт — один на ход.
-// - Сон машины (preflight Н15): вкладка видна, а между тиками больше TICK_GAP_S — ноутбук спал. Ход мог кончиться,
-//   пока поток стоял, поэтому отсчёт начинается заново, а не даёт ложный отчёт на первом тике. Скрытую вкладку
-//   браузер троттлит законно — там разрыв тиков не сон. Известное ограничение: если вкладка была скрыта и ноутбук
-//   уснул, первый тик после возврата отчёт даст.
+// - Сон машины (preflight Н15; итоговая доводка Д6б, m4): между тиками больше TICK_GAP_S — ноутбук спал или браузер
+//   троттлил фоновую вкладку (до раза в минуту), отличить одно от другого по таймерам нельзя. Пока машина спала,
+//   поток стоял: ход мог кончиться, а ответ — прийти. Поэтому при любой видимости вкладки отчёт хода после разрыва
+//   тиков ждёт RESYNC_S: адаптер за это время переподключает поток и перечитывает историю и статус разговора
+//   (handleStreamReconnect @assistant-ui/react-opencode), и ход, кончившийся во сне, снимается концом хода, а не
+//   отчётом. Отсрочка взводится один раз и снимается только обычным тиком после её срока: у троттлинга каждый тик —
+//   разрыв, и отсрочка, взводимая каждым тиком, не дала бы отчёта никогда. Вернувшаяся фоновая вкладка поэтому даёт
+//   отчёт на RESYNC_S позже первого тика после возврата. Известное ограничение: сон машины после того, как отсрочка
+//   взведена троттлингом и не снята (вкладка скрыта дольше 5 минут), даёт отчёт на первом тике после сна.
 // - Пока поток не "ok", отсчёт хода стоит на паузе (доводка 1, m4): без потока прироста ответа не видно, и при
-//   лежащей связи владелец увидел бы «ответ модели не пришёл» вместо «браузеры теряют связь».
+//   лежащей связи владелец увидел бы «ответ модели не пришёл» вместо «браузеры теряют связь». "too_many_tabs" для
+//   хода — тоже пауза (поток не открыт, прироста не видно).
 // - Сторож потока (stream_down): связь потеряна — last !== "ok", восстановлена — last === "ok" (по failures нельзя:
 //   после 200 обёртка его не сбрасывает, Д6-R43). "too_many_tabs" — не потеря связи (доводка 1): шлюз ответил, а
 //   забытая четвёртая вкладка не должна красить строку; эпизод она закрывает, как "ok". Отчёт — при восстановлении
-//   после потери дольше STREAM_DOWN_S (пока связи нет, отчёт не дойдёт), один на эпизод. Известное ограничение
-//   (preflight Н16): петлю коротких потоков (200 и сразу конец) сторож не видит — last остаётся "ok", хотя строка
-//   «переподключаюсь» видна.
+//   после потери дольше STREAM_DOWN_S (пока связи нет, отчёт не дойдёт), один на эпизод. Сон машины — то же правило,
+//   что у хода: свои тики видят разрыв, и эпизод, начатый до разрыва, связь которого вернулась в первые RESYNC_S
+//   после него, закрывается без отчёта — потеря связи была сном. Эпизод, долгий уже до разрыва, отчёт даёт.
+//   Известное ограничение (preflight Н16): петлю коротких потоков (200 и сразу конец) сторож не видит — last
+//   остаётся "ok", хотя строка «переподключаюсь» видна. У троттлинга каждый тик — разрыв, и восстановление в первые
+//   RESYNC_S после тика (примерно каждый четвёртый эпизод) скрытой дольше 5 минут вкладки отчёта не даёт, если к
+//   прошлому тику потеря ещё не была долгой.
 // createTurnWatch и createStreamWatch — чистые функции от часов; useTurnWatch связывает сторож хода с рантаймом.
 import type { AssistantRuntime, ThreadMessage } from "@assistant-ui/react";
 import { useEffect, useRef, useState } from "react";
@@ -22,7 +32,8 @@ import type { StreamState } from "./gateway";
 
 export const TURN_SILENT_S = 180;         // «Ответа нет уже 3 минуты»
 export const STREAM_DOWN_S = 120;
-export const TICK_GAP_S = 30;             // разрыв тиков видимой вкладки длиннее — машина спала (Н15)
+export const TICK_GAP_S = 30;             // разрыв тиков длиннее — машина могла спать (Н15) или вкладку троттлили
+export const RESYNC_S = 15;               // после разрыва тиков отчёт ждёт пересинхронизации адаптера (m4)
 export const TICK_MS = 1000;
 
 export interface TurnWatch {
@@ -38,19 +49,18 @@ export function createTurnWatch(o: {
   now(): number;
   onSilent(): void;
   silentS?: number;
-  isVisible?(): boolean;                  // без него разрыв тиков сном не считается
 }): TurnWatch {
   const silentMs = (o.silentS ?? TURN_SILENT_S) * 1000;
   const gapMs = TICK_GAP_S * 1000;
+  const resyncMs = RESYNC_S * 1000;
   let running = false;
   let since = 0;                          // начало хода или последний прирост ответа
   let fingerprint: string | null = null;
   let reported = false;
   let lastTick = 0;
-  let lastVisible = false;
   let pausedAt: number | null = null;     // начало паузы (поток не "ok")
-
-  const visible = (): boolean => o.isVisible?.() ?? false;
+  let holdUntil = -Infinity;              // раньше — отчёта нет: после разрыва тиков адаптер пересинхронизируется
+  let holding = false;                    // отсрочка взведена и ещё не снята обычным тиком после её срока
 
   return {
     started() {
@@ -59,7 +69,8 @@ export function createTurnWatch(o: {
       fingerprint = null;
       since = o.now();
       lastTick = since;
-      lastVisible = visible();
+      holdUntil = -Infinity;
+      holding = false;
     },
     progress(next) {
       if (!running || next === fingerprint) return;          // тот же отпечаток — не прогресс
@@ -72,9 +83,8 @@ export function createTurnWatch(o: {
     resume() {
       if (pausedAt === null) return;
       const t = o.now();
-      since += t - Math.max(pausedAt, since);                 // время без потока не в счёт
+      since += t - Math.max(pausedAt, since);                 // время без потока не в счёт; пауза до хода — тоже
       pausedAt = null;
-      lastTick = t;                                           // разрыв тиков на паузе — не сон
     },
     ended() {
       running = false;
@@ -83,11 +93,16 @@ export function createTurnWatch(o: {
     tick() {
       if (!running) return;
       const t = o.now();
-      const shown = visible();
-      if (o.isVisible !== undefined && shown && lastVisible && t - lastTick > gapMs) since = t;   // сон — отсчёт заново
+      if (t - lastTick > gapMs) {                             // разрыв: сон машины или троттлинг фоновой вкладки
+        if (!holding) {
+          holdUntil = t + resyncMs;
+          holding = true;
+        }
+      } else if (holding && t >= holdUntil) {
+        holding = false;                                      // обычный тик после срока — следующий разрыв взведёт снова
+      }
       lastTick = t;
-      lastVisible = shown;
-      if (pausedAt !== null || reported || t - since < silentMs) return;
+      if (pausedAt !== null || reported || t - since < silentMs || t < holdUntil) return;
       reported = true;
       o.onSilent();
     },
@@ -98,16 +113,34 @@ export function createStreamWatch(o: {
   now(): number;
   onRecoveredAfterLongDown(): void;
   downS?: number;
-}): { onStream(s: StreamState): void } {
+}): { onStream(s: StreamState): void; tick(): void } {
   const downMs = (o.downS ?? STREAM_DOWN_S) * 1000;
+  const gapMs = TICK_GAP_S * 1000;
+  const resyncMs = RESYNC_S * 1000;
   let downSince: number | null = null;    // первая потеря связи в эпизоде
+  let lastTick: number | null = null;
+  let gapFrom = -Infinity;                // последний разрыв тиков: тик до него
+  let gapTo = -Infinity;                  // … и первый тик после
   return {
+    tick() {
+      const t = o.now();
+      if (lastTick !== null && t - lastTick > gapMs) {
+        gapFrom = lastTick;
+        gapTo = t;
+      }
+      lastTick = t;
+    },
     onStream(s) {
       if (s.last !== "ok" && s.last !== "too_many_tabs") {
         downSince ??= o.now();
         return;
       }
-      if (downSince !== null && o.now() - downSince > downMs) o.onRecoveredAfterLongDown();
+      if (downSince !== null) {
+        const t = o.now();
+        // сон (m4): эпизод начался до разрыва тиков и к нему ещё не был долгим, а связь вернулась в первые RESYNC_S
+        const slept = downSince < gapTo && gapFrom - downSince <= downMs && t < gapTo + resyncMs;
+        if (t - downSince > downMs && !slept) o.onRecoveredAfterLongDown();
+      }
       downSince = null;
     },
   };
@@ -116,10 +149,12 @@ export function createStreamWatch(o: {
 type Part = ThreadMessage["content"][number];
 
 // последняя часть ответа: у текста и рассуждения — длина, у вызова инструмента — имя и состояние (Н14: у части-вызова
-// длина не растёт, растёт состояние «идёт» → «готово»). Прочие части — по типу; новая часть меняет их число. Так
-// часть retry OpenCode (адаптер даёт её частью data opencode-retry) считается приростом: повторы модели сбрасывают
-// отсчёт, и ход, который только повторяет запрос к модели, turn_silent не даст. Так ли ведёт себя живое место
-// (пишет ли 1.18.33 часть retry на каждую попытку) — живая проверка Б4/Б6 (m3 ревью Б3), здесь не правится.
+// длина не растёт, растёт состояние «идёт» → «готово»). Прочие части — по типу; новая часть меняет их число.
+// Повторы запроса к модели место 1.18.33 частями ответа не пишет — ни retry, ни других (проверено живьём в Б4,
+// test_model_retries_recorded): повтор виден только статусом разговора (session/status retry), а isRunning адаптера
+// во время повторов остаётся true. Отпечаток во время повторов поэтому стоит, и ход из одних повторов дольше
+// TURN_SILENT_S даёт turn_silent — молчание модели не маскируется. Если место начнёт писать части retry, их прирост
+// сбросит отсчёт; тест test_model_retries_recorded такое место уронит.
 function partMark(part: Part | undefined): string {
   if (part === undefined) return "-";
   switch (part.type) {
@@ -145,8 +180,9 @@ export function turnFingerprint(messages: readonly ThreadMessage[]): string {
 
 // Сторож хода на рантайме чата (preflight Ф11): onNew адаптер наружу не отдаёт, поэтому начало хода — переход
 // isRunning false → true в подписке runtime.thread, конец — true → false (isRunning адаптера включает busy и retry
-// места). Прирост — смена отпечатка. Тик — раз в tickMs и на visibilitychange. Возвращает: показывать ли строку
-// «Ответа нет уже 3 минуты» (снимается приростом ответа, концом и началом хода).
+// места). Прирост — смена отпечатка. Тик — раз в tickMs и на visibilitychange (вернувшаяся вкладка сразу видит разрыв
+// тиков). Возвращает: показывать ли строку «Ответа нет уже 3 минуты» (снимается приростом ответа, концом и началом
+// хода).
 export function useTurnWatch(runtime: AssistantRuntime, o: {
   onSilent(): void;
   now?(): number;
@@ -166,7 +202,6 @@ export function useTurnWatch(runtime: AssistantRuntime, o: {
         setSilent(true);
         opts.current.onSilent();
       },
-      isVisible: () => document.visibilityState !== "hidden",
     });
     if (opts.current.streamOk === false) watch.pause();
     current.current = watch;

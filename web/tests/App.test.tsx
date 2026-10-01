@@ -311,3 +311,28 @@ test("logout_from_notice_does_not_open_chat", async () => {                     
   await new Promise((r) => setTimeout(r, 50));
   expect(a.workplace).not.toHaveBeenCalled(); expect(screen.queryByTestId("fake-chat")).toBeNull();
 });
+
+test("notice_ack_button_disabled_while_in_flight", async () => {                  // итоговая доводка Д6б, Б2-m1
+  // пока подтверждение в пути, «Понятно» выключена: второе нажатие не уходит; отказ — кнопка снова доступна
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }]],
+                  workplace: [[200, { state: "ready" }]] });
+  const answers: ((r: Reply) => void)[] = [];
+  a.ackNotice.mockImplementation(() => new Promise<Reply>((resolve) => { answers.push(resolve); }));
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText(NOTICE_TEXT);
+  const button = screen.getByRole("button", { name: "Понятно" }) as HTMLButtonElement;
+  expect(button.disabled).toBe(false);
+  fireEvent.click(button);
+  await waitFor(() => expect(button.disabled).toBe(true));
+  fireEvent.click(button);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(a.ackNotice).toHaveBeenCalledTimes(1);                                  // второе не ушло
+  answers[0]!({ status: 503, body: { name: "Unavailable", data: { message: "Учётные записи недоступны — повторите позже" } } });
+  expect(await screen.findByText("Учётные записи недоступны — повторите позже")).toBeTruthy();
+  expect(button.disabled).toBe(false);                                            // отказ — можно нажать снова
+  fireEvent.click(button);
+  await waitFor(() => expect(a.ackNotice).toHaveBeenCalledTimes(2));
+  expect(button.disabled).toBe(true);
+  answers[1]!({ status: 204, body: "" });
+  expect(await screen.findByTestId("fake-chat")).toBeTruthy();
+});

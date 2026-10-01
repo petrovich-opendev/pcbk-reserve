@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import vm from "node:vm";
+import ts from "typescript";
 
 const SRC = readFileSync(new URL("../public/boot.js", import.meta.url), "utf8");
 // текст сбоя — точной строкой (preflight Н20): импортов у загрузчика нет, сверить с texts.ts нечем
@@ -121,9 +122,111 @@ test("boot_silent_after_start", () => {
   assert.equal(s.root.textContent, "");
 });
 
+// ES5 — по дереву разбора TypeScript (devDependencies), а не подстроками (итоговая доводка Д6б, Б1-m1): белый список
+// видов узлов ES5, у бинарного выражения — белый список операторов, плюс флаги и тексты, которых видом узла не видно
+// (let/const, параметры по умолчанию, catch без переменной, флаги регулярки, 0b/0o/«_» в числах, \u{…}, запятая
+// после последнего аргумента). Токены, которые обходит forEachChild (?. , ..., *, async), в белом списке нет.
+// Возвращает нарушения «вид (строка N)».
+const S = ts.SyntaxKind;
+const ES5_NODES = new Set([
+  S.SourceFile, S.EndOfFileToken, S.FunctionDeclaration, S.FunctionExpression, S.Parameter, S.Block,
+  S.VariableStatement, S.VariableDeclarationList, S.VariableDeclaration, S.ExpressionStatement, S.IfStatement,
+  S.ReturnStatement, S.TryStatement, S.CatchClause, S.ThrowStatement, S.ForStatement, S.ForInStatement,
+  S.WhileStatement, S.DoStatement, S.BreakStatement, S.ContinueStatement, S.SwitchStatement, S.CaseBlock,
+  S.CaseClause, S.DefaultClause, S.LabeledStatement, S.EmptyStatement, S.DebuggerStatement,
+  S.Identifier, S.StringLiteral, S.NumericLiteral, S.RegularExpressionLiteral,
+  S.TrueKeyword, S.FalseKeyword, S.NullKeyword, S.ThisKeyword,
+  S.CallExpression, S.NewExpression, S.PropertyAccessExpression, S.ElementAccessExpression, S.BinaryExpression,
+  S.PrefixUnaryExpression, S.PostfixUnaryExpression, S.ConditionalExpression, S.QuestionToken, S.ColonToken,
+  S.ParenthesizedExpression, S.TypeOfExpression, S.DeleteExpression, S.VoidExpression,
+  S.ObjectLiteralExpression, S.PropertyAssignment, S.GetAccessor, S.SetAccessor, S.ArrayLiteralExpression,
+  S.OmittedExpression,
+]);
+const ES5_OPERATORS = new Set([
+  S.PlusToken, S.MinusToken, S.AsteriskToken, S.SlashToken, S.PercentToken, S.LessThanLessThanToken,
+  S.GreaterThanGreaterThanToken, S.GreaterThanGreaterThanGreaterThanToken, S.LessThanToken, S.GreaterThanToken,
+  S.LessThanEqualsToken, S.GreaterThanEqualsToken, S.EqualsEqualsToken, S.ExclamationEqualsToken,
+  S.EqualsEqualsEqualsToken, S.ExclamationEqualsEqualsToken, S.AmpersandToken, S.BarToken, S.CaretToken,
+  S.AmpersandAmpersandToken, S.BarBarToken, S.EqualsToken, S.PlusEqualsToken, S.MinusEqualsToken,
+  S.AsteriskEqualsToken, S.SlashEqualsToken, S.PercentEqualsToken, S.LessThanLessThanEqualsToken,
+  S.GreaterThanGreaterThanEqualsToken, S.GreaterThanGreaterThanGreaterThanEqualsToken, S.AmpersandEqualsToken,
+  S.BarEqualsToken, S.CaretEqualsToken, S.CommaToken, S.InKeyword, S.InstanceOfKeyword,
+]);
+const BLOCK_SCOPED = ts.NodeFlags.Let | ts.NodeFlags.Const | (ts.NodeFlags.Using ?? 0);
+
+function es5Violations(source) {
+  const sf = ts.createSourceFile("boot.js", source, ts.ScriptTarget.ES5, true, ts.ScriptKind.JS);
+  const out = [];
+  const bad = (node, what) =>
+    out.push(`${what ?? S[node.kind]} (строка ${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1})`);
+  for (const d of sf.parseDiagnostics ?? []) out.push(`разбор: ${ts.flattenDiagnosticMessageText(d.messageText, " ")}`);
+  const visit = (node) => {
+    if (!ES5_NODES.has(node.kind)) {
+      bad(node);
+      return;
+    }
+    const text = node.getText(sf);
+    switch (node.kind) {
+      case S.BinaryExpression:
+        if (!ES5_OPERATORS.has(node.operatorToken.kind)) bad(node.operatorToken);
+        visit(node.left);
+        visit(node.right);
+        return;
+      case S.VariableDeclarationList:
+        if (node.flags & BLOCK_SCOPED) bad(node, "let/const");
+        break;
+      case S.Parameter:
+        if (node.initializer) bad(node, "параметр по умолчанию");
+        break;
+      case S.CatchClause:
+        if (!node.variableDeclaration) bad(node, "catch без переменной");
+        break;
+      case S.RegularExpressionLiteral:
+        if (!/^[gim]*$/.test(text.slice(text.lastIndexOf("/") + 1))) bad(node, "флаг регулярки новее ES5");
+        break;
+      case S.NumericLiteral:
+        if (/^0[bBoO]|_/.test(text)) bad(node, "число 0b/0o/с «_»");
+        break;
+      case S.StringLiteral:
+        if (/\\u\{/.test(text)) bad(node, "\\u{…}");
+        break;
+      case S.CallExpression:
+      case S.NewExpression:
+        if (node.arguments?.hasTrailingComma) bad(node, "запятая после последнего аргумента");
+        break;
+      case S.FunctionDeclaration:
+      case S.FunctionExpression:
+        if (node.parameters.hasTrailingComma) bad(node, "запятая после последнего параметра");
+        break;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
 test("boot_is_es5", () => {
-  for (const bad of ["=>", "let ", "const ", "class ", "`", "fetch(", "async ", "await "])
-    assert.ok(!SRC.includes(bad), bad);
-  assert.doesNotMatch(SRC, /^\s*(?:import|export)\b/m);
+  assert.deepEqual(es5Violations(SRC), []);
+  assert.doesNotMatch(SRC, /\bfetch\(/);                                // XMLHttpRequest: fetch нет в Chrome без него
   assert.doesNotThrow(() => new vm.Script(SRC, { filename: "boot.js" }));  // классический скрипт разбирается
+});
+
+test("es5_check_catches_newer_syntax", () => {
+  // положительный контроль разбора: каждая конструкция новее ES5 — нарушение, а ES5 рядом с ней — нет
+  for (const bad of ["let a = 1;", "const a = 1;", "var f = () => 1;", "class A {}", "var s = `x`;", "var s = `${a}`;",
+                     "a?.b;", "a?.[0];", "f?.();", "f(...a);", "var o = {...a};", "var c = a ?? b;", "var p = a ** 2;",
+                     "a **= 2;", "a ||= b;", "a ??= b;", "for (var x of y) {}", "async function f() {}",
+                     "function* g() {}", "function f(a = 1) {}", "function f(...a) {}", "var {a} = o;", "var [a] = o;",
+                     "try {} catch {}", "var o = {a};", "var o = {[k]: 1};", "var o = {m() {}};", "var r = /x/u;",
+                     "var r = /x/y;", "var r = /x/s;", "var n = 0b1;", "var n = 0o7;", "var n = 1_000;", "var n = 1n;",
+                     "var s = '\\u{1F600}';", "f(a, b,);", "function f(a, b,) {}", "import('x');", "tag`x`;",
+                     "export var a = 1;", "import a from 'a';", "label: for (let i = 0; ; ) {}"])
+    assert.notDeepEqual(es5Violations(bad), [], bad);
+  for (const good of ["var a = 1, b;", "function f(a, b) { 'use strict'; return a ? b : !a; }",
+                      "var o = {a: 1, 'b': 2, 3: 4, get x() { return 1; }, set x(v) {}};", "var r = /x[/]y/gim;",
+                      "try { f(); } catch (e) { g(e); } finally { h(); }", "for (var k in o) { if (k) continue; }",
+                      "var x = typeof a === 'string' && a instanceof B || 'k' in o;", "a = [1, , 2,];",
+                      "var n = 0x1F + 1e3 + .5;", "switch (a) { case 1: break; default: }", "do { i++; } while (--i);",
+                      "var s = '\\u0041';", "new X;", "delete o.a; void 0;", "out: for (;;) { break out; }"])
+    assert.deepEqual(es5Violations(good), [], good);
 });

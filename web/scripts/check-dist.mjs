@@ -12,8 +12,9 @@ import { fileURLToPath } from "node:url";
 
 export const BASE = "/chat/";
 export const WEB_MAX_FILES = 8;
-// Загрузчик Д6б (Д6-R51, preflight Ф15): ровно один классический <script src="/chat/boot.js"> без type, async и
-// defer — иначе отчёт boot_failed молча пропал бы или пришёл бы после бандла. Прочие <script src> — только модули.
+// Загрузчик Д6б (Д6-R51, preflight Ф15): ровно один классический <script src="/chat/boot.js"> без type, async, defer
+// и nomodule — иначе отчёт boot_failed молча пропал бы или пришёл бы после бандла (nomodule браузер с модулями — все
+// браузеры класса — не исполняет вовсе; итоговая доводка Д6б, Б1-m3). Прочие <script src> — только модули.
 export const BOOT_SRC = BASE + "boot.js";
 // Договор со сторожем (watchdog/pcbk_watchdog/checks.py, _web_manifest и check_web): WEB_META_RE —
 // search в первых MAX_BODY_BYTES страницы, WEB_FILE_RE — fullmatch и без «.»/«..» последним звеном,
@@ -158,7 +159,7 @@ function urlsOf(name, value) {
 
 function checkIndexHtml(html, dir, errors) {
   let boots = 0;                                                          // <script> с src загрузчика
-  let classicBoots = 0;                                                   // … классических, без async и defer
+  let classicBoots = 0;                                                   // … классических, без async, defer и nomodule
   for (const m of html.matchAll(/<style\b/gi)) errors.push(`index.html: встроенный <style> (смещение ${m.index})`);
   for (const open of html.matchAll(/<[A-Za-z]/g)) {
     TAG_RE.lastIndex = open.index;
@@ -186,7 +187,7 @@ function checkIndexHtml(html, dir, errors) {
           const type = attrs.get("type");
           if (path === BOOT_SRC) {
             boots++;
-            if (type === undefined && !attrs.has("async") && !attrs.has("defer")) classicBoots++;
+            if (type === undefined && !["async", "defer", "nomodule"].some((a) => attrs.has(a))) classicBoots++;
           } else if (type?.trim().toLowerCase() !== "module")
             errors.push(`${at}: скрипт не модуль (классический — только загрузчик ${BOOT_SRC})`);
         }
@@ -201,8 +202,8 @@ function checkIndexHtml(html, dir, errors) {
     }
   }
   if (boots !== 1 || classicBoots !== 1)
-    errors.push(`index.html: загрузчик ${BOOT_SRC} — нужен ровно один классический <script src> без type, async и `
-      + `defer (тегов с ним: ${boots}) — без него отчёт boot_failed пропадёт молча`);
+    errors.push(`index.html: загрузчик ${BOOT_SRC} — нужен ровно один классический <script src> без type, async, `
+      + `defer и nomodule (тегов с ним: ${boots}) — без него отчёт boot_failed пропадёт молча`);
 }
 
 /** Предупреждения по списку шаблонов; вхождения внутри фрагментов KNOWN идут в `known`. */

@@ -8,11 +8,12 @@ import {
 } from "@assistant-ui/react";
 import { StrictMode, useEffect, useLayoutEffect, useState } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import { App } from "../src/App";
+import { App, type AppProps } from "../src/App";
 import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import { ErrorBoundary } from "../src/components/ErrorBoundary";
 import { ThreadSidebar, useTitleFollowsSession } from "../src/components/ThreadSidebar";
+import { mountChat } from "../src/mount";
 import type { startStatusPolling } from "../src/status";
 import { MAX_TITLE, T_UI_CRASH } from "../src/texts";
 
@@ -269,6 +270,83 @@ test("restart_opens_last_session", async () => {
   await screen.findByTestId("fake-chat");
   await waitFor(() => expect(mounts).toEqual([undefined, "ses_B"]));              // B, а не разговор прошлого монтирования
   expect(a.report.mock.calls).toEqual([["ui_crash"]]);
+});
+
+test("second_crash_after_restart_opens_new", async () => {
+  // итоговая доводка Д6б, Б3-m6: чат, смонтированный «Перезапустить чат», упал снова — разговор мог ронять чат своим
+  // содержимым: следующий перезапуск — с новым разговором, а не петля ui_crash на прежнем
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const { Chat, mounts } = crashableChat();
+  const a = fakeApi({ me: STUDENT, workplace: READY });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={Chat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "B" }));
+  const crashAndRestart = async () => {
+    fireEvent.click(screen.getByRole("button", { name: "crash" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Перезапустить чат" }));
+    await screen.findByTestId("fake-chat");
+  };
+  await crashAndRestart();                                                         // первый сбой — с B
+  await waitFor(() => expect(mounts).toEqual([undefined, "ses_B"]));
+  await crashAndRestart();                                                         // второй подряд — новый разговор
+  await waitFor(() => expect(mounts).toEqual([undefined, "ses_B", undefined]));
+  fireEvent.click(screen.getByRole("button", { name: "B" }));                     // студент сам открыл B — и снова сбой
+  await crashAndRestart();
+  await waitFor(() => expect(mounts).toEqual([undefined, "ses_B", undefined, undefined]));
+  expect(a.report.mock.calls).toEqual([["ui_crash"], ["ui_crash"], ["ui_crash"]]);   // отчёт — на каждый сбой
+});
+
+test("crash_outside_boundary_reports_once", async () => {
+  // итоговая доводка Д6б, m3: сбой вне ErrorBoundary (здесь — эффект шапки) корень React 19 снимает целиком; обработчик
+  // корня — отчёт ui_crash один раз, текст T_UI_CRASH в #root, отметка старта загрузчику (второго отчёта boot_failed нет)
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const started = vi.fn();
+  window.__pcbkStarted = started;
+  const container = document.createElement("div");
+  document.body.append(container);
+  try {
+    const a = fakeApi({ me: STUDENT, workplace: READY });
+    const broken: typeof startStatusPolling = () => { throw new Error("сбой шапки"); };
+    const root = mountChat(container, { api: a, navigate: vi.fn(), startPolling: broken,
+                                        ChatImpl: (_p: ChatProps) => <div data-testid="fake-chat" /> });
+    await waitFor(() => expect(a.report).toHaveBeenCalled());
+    expect(a.report.mock.calls).toEqual([["ui_crash"]]);
+    expect(container.textContent).toBe(T_UI_CRASH);
+    expect(container.querySelector('[role="alert"][data-kind="fail"]')?.textContent).toBe(T_UI_CRASH);
+    expect(started).toHaveBeenCalled();
+    expect(logged.mock.calls.some(([first]) => String(first).includes("сбой оболочки"))).toBe(true);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(a.report).toHaveBeenCalledTimes(1);
+    root.unmount();
+  } finally {
+    container.remove();
+    delete window.__pcbkStarted;
+  }
+});
+
+test("crash_in_first_render_marks_started_and_reports_once", async () => {
+  // m3: сбой первой отрисовки — до эффектов App, старт загрузчику ещё не отмечен: обработчик корня отмечает его сам
+  // (иначе через 20 с boot.js дал бы второй отчёт boot_failed и сменил бы текст). Два сбоя одной фиксации — один отчёт
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const started = vi.fn();
+  window.__pcbkStarted = started;
+  const container = document.createElement("div");
+  document.body.append(container);
+  try {
+    const a = fakeApi({ me: STUDENT, workplace: READY });
+    const Broken = () => { useEffect(() => { throw new Error("сбой эффекта"); }, []); return <p>часть</p>; };
+    const Shell = (_p: AppProps) => <><Broken /><Broken /></>;
+    const root = mountChat(container, { api: a, navigate: vi.fn() }, Shell);
+    await waitFor(() => expect(a.report).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(a.report.mock.calls).toEqual([["ui_crash"]]);
+    expect(started).toHaveBeenCalledTimes(1);                                      // Shell старт не отмечает — отметил корень
+    expect(container.textContent).toBe(T_UI_CRASH);
+    root.unmount();
+  } finally {
+    container.remove();
+    delete window.__pcbkStarted;
+  }
 });
 
 test("restart_after_archive_opens_new", async () => {

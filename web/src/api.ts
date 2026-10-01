@@ -51,7 +51,8 @@ export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
     wake: () => callJson("POST", "/pcbk/api/workplace/wake", undefined, fetchImpl),
     workplace: () => callJson("GET", "/pcbk/api/workplace", undefined, fetchImpl),
     ackNotice: (notice) => callJson("POST", "/pcbk/api/auth/notice", { notice }, fetchImpl),
-    // отчёт не повторяется (в том числе 404 старого core и 429 предела): потерянный отчёт дешевле шторма
+    // отчёт не повторяется (в том числе 404 старого core и 503 WorkplaceBusy предела edge — 509 → busy.json): потерянный
+    // отчёт дешевле шторма
     report: async (kind) => {
       try {
         await callJson("POST", "/pcbk/api/web/report", { kind }, fetchImpl);
