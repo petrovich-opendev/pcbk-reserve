@@ -1,18 +1,18 @@
 // Список разговоров слева (Д6-R52, Review Focus 4 Д6б), сбой интерфейса (ErrorBoundary → ui_crash) и отметка
 // старта для загрузчика (window.__pcbkStarted, preflight Ф9).
 // Список — useRemoteThreadListRuntime с адаптером из памяти: видно, что ушло в адаптер (= в шлюз у OpenCode).
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import {
-  AssistantRuntimeProvider, useExternalStoreRuntime, useRemoteThreadListRuntime, type RemoteThreadListAdapter,
-  type ThreadMessageLike,
+  AssistantRuntimeProvider, useExternalStoreRuntime, useRemoteThreadListRuntime, type AssistantRuntime,
+  type RemoteThreadListAdapter, type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { StrictMode, useEffect, useLayoutEffect } from "react";
+import { StrictMode, useEffect, useLayoutEffect, useState } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import { App } from "../src/App";
 import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import { ErrorBoundary } from "../src/components/ErrorBoundary";
-import { ThreadSidebar } from "../src/components/ThreadSidebar";
+import { ThreadSidebar, useTitleFollowsSession } from "../src/components/ThreadSidebar";
 import type { startStatusPolling } from "../src/status";
 import { MAX_TITLE, T_UI_CRASH } from "../src/texts";
 
@@ -235,4 +235,88 @@ test("app_passes_reports_of_chat", async () => {
   fireEvent.click(screen.getByRole("button", { name: "silent" }));
   fireEvent.click(screen.getByRole("button", { name: "down" }));
   expect(a.report.mock.calls).toEqual([["turn_silent"], ["stream_down"]]);
+});
+
+// --- доводка 1, I1: «Перезапустить чат» — новое монтирование с последним открытым разговором ---
+
+// чат, которым управляет тест: пишет initialSessionId каждого монтирования, по кнопкам — разговор и сбой
+function crashableChat() {
+  const mounts: (string | undefined)[] = [];
+  const Chat = (p: ChatProps) => {
+    const [broken, setBroken] = useState(false);
+    useEffect(() => { mounts.push(p.initialSessionId); }, []);
+    if (broken) throw new Error("сбой отрисовки");
+    return (
+      <div data-testid="fake-chat">
+        <button type="button" onClick={() => p.onThreadIdChange?.("ses_B")}>B</button>
+        <button type="button" onClick={() => p.onThreadIdChange?.(undefined)}>archived</button>
+        <button type="button" onClick={() => setBroken(true)}>crash</button>
+      </div>
+    );
+  };
+  return { Chat, mounts };
+}
+
+test("restart_opens_last_session", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const { Chat, mounts } = crashableChat();
+  const a = fakeApi({ me: STUDENT, workplace: READY });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={Chat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "B" }));                     // работа в B
+  fireEvent.click(screen.getByRole("button", { name: "crash" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Перезапустить чат" }));
+  await screen.findByTestId("fake-chat");
+  await waitFor(() => expect(mounts).toEqual([undefined, "ses_B"]));              // B, а не разговор прошлого монтирования
+  expect(a.report.mock.calls).toEqual([["ui_crash"]]);
+});
+
+test("restart_after_archive_opens_new", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const { Chat, mounts } = crashableChat();
+  render(<App api={fakeApi({ me: STUDENT, workplace: READY })} navigate={vi.fn()} ChatImpl={Chat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "B" }));
+  fireEvent.click(screen.getByRole("button", { name: "archived" }));              // открытый ушёл в архив — чат на новом
+  fireEvent.click(screen.getByRole("button", { name: "crash" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Перезапустить чат" }));
+  await screen.findByTestId("fake-chat");
+  await waitFor(() => expect(mounts).toEqual([undefined, undefined]));
+});
+
+// --- доводка 1, m2: сверка имени — только для того разговора, что открыт, когда пришёл ответ списка ---
+
+function fakeTitleRuntime(main: { id: string; title: string }) {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const state = { ...main };
+  const runtime = {
+    threads: {
+      getLoadThreadsPromise: vi.fn(() => held),
+      reload: vi.fn(async () => {}),
+      mainItem: { getState: () => ({ id: state.id, remoteId: state.id, externalId: state.id, title: state.title }) },
+    },
+  } as unknown as AssistantRuntime;
+  return { runtime, state, release, reload: (runtime.threads.reload as ReturnType<typeof vi.fn>) };
+}
+
+test("title_follow_skips_when_other_thread_opened", async () => {
+  const f = fakeTitleRuntime({ id: "ses_1", title: "Старое" });
+  renderHook(() => useTitleFollowsSession(f.runtime, { id: "ses_1", title: "Новое" }));
+  Object.assign(f.state, { id: "ses_2", title: "Другой" });                       // пока список в пути, открыли другой
+  await act(async () => { f.release(); });
+  expect(f.reload).not.toHaveBeenCalled();                                         // имя ses_1 к ses_2 не относится
+  const g = fakeTitleRuntime({ id: "ses_1", title: "Старое" });                    // положительный контроль
+  renderHook(() => useTitleFollowsSession(g.runtime, { id: "ses_1", title: "Новое" }));
+  await act(async () => { g.release(); });
+  expect(g.reload).toHaveBeenCalledTimes(1);
+});
+
+test("title_follow_waits_for_list_in_flight", async () => {
+  // m1 на хуке: имя в списке уже совпадает, но в пути ответ списка, запрошенный раньше, — сверка после него
+  const f = fakeTitleRuntime({ id: "ses_1", title: "Новое" });
+  renderHook(() => useTitleFollowsSession(f.runtime, { id: "ses_1", title: "Новое" }));
+  f.state.title = "Старое";                                                        // ответ списка затёр имя
+  await act(async () => { f.release(); });
+  expect(f.reload).toHaveBeenCalledTimes(1);
 });

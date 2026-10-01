@@ -33,11 +33,12 @@ interface RowContext {
 
 const Row = createContext<RowContext | null>(null);
 
-// Имя открытого разговора от OpenCode → список, если там другое (Ф13). Сверка — после загрузки списка, что уже в
-// пути: иначе ответ списка, запрошенный до смены имени, затёр бы имя уже после сверки. Своё переименование список
-// не перечитывает: имя в строке уже новое, а session.updated приносит то же имя.
-function useTitleFollowsSession(runtime: AssistantRuntime): void {
-  const session = useOpenCodeSession();
+// Имя открытого разговора от OpenCode (session — useOpenCodeSession()) → список, если там другое (Ф13). Сверка — после
+// загрузки списка, что уже в пути: иначе ответ списка, запрошенный до смены имени, затёр бы имя уже после сверки, а
+// пока прежний ответ в пути, нового запроса нет. Ответ пришёл, когда открыт уже другой разговор, — не перечитывать.
+// Своё переименование список не перечитывает: имя в строке уже новое, а session.updated приносит то же имя.
+export function useTitleFollowsSession(runtime: AssistantRuntime,
+                                       session: { id: string; title: string } | null | undefined): void {
   const sessionId = session?.id;
   const title = session?.title;
   useEffect(() => {
@@ -134,7 +135,7 @@ export function ThreadSidebar(p: ThreadSidebarProps) {
     runtime: p.runtime,
     onError: (error) => onError.current?.(error),
   }), [p.runtime]);
-  useTitleFollowsSession(p.runtime);
+  useTitleFollowsSession(p.runtime, useOpenCodeSession());
   return (
     <nav className="threads" aria-label={T_THREADS}>
       <ThreadListPrimitive.New className="new-thread">{T_NEW_THREAD}</ThreadListPrimitive.New>

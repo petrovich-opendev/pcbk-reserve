@@ -85,6 +85,33 @@ test("stream_watch_one_report_per_episode", () => {
   t += 1_000; w.onStream({ failures: 0, nextRetryS: null, last: "ok" }); expect(on).toHaveBeenCalledTimes(1);   // эпизод закрыт
 });
 
+test("stream_watch_too_many_tabs_is_not_loss", () => {
+  // доводка 1: «закройте лишние вкладки» — шлюз ответил; забытая четвёртая вкладка stream_down не даёт
+  let t = 0; const on = vi.fn(); const w = createStreamWatch({ now: () => t, onRecoveredAfterLongDown: on });
+  for (let i = 1; i <= 120; i += 1) { t += 30_000; w.onStream({ failures: i, nextRetryS: 30, last: "too_many_tabs" }); }   // час
+  w.onStream({ failures: 120, nextRetryS: null, last: "ok" });                           // закрыли лишнюю — место есть
+  expect(on).not.toHaveBeenCalled();
+  w.onStream({ failures: 1, nextRetryS: 1, last: "offline" }); t += 130_000;            // а настоящая потеря связи
+  w.onStream({ failures: 6, nextRetryS: 30, last: "too_many_tabs" });                   // кончается ответом шлюза
+  expect(on).toHaveBeenCalledTimes(1);
+  t += 3_600_000; w.onStream({ failures: 7, nextRetryS: 30, last: "too_many_tabs" }); w.onStream({ failures: 7, nextRetryS: null, last: "ok" });
+  expect(on).toHaveBeenCalledTimes(1);                                                   // эпизод уже закрыт
+});
+
+test("turn_watch_pauses_while_stream_down", () => {
+  // доводка 1, m4: пока поток не "ok", молчание хода не копится — связь лежит, а не модель молчит
+  let t = 0; const onSilent = vi.fn(); const w = createTurnWatch({ now: () => t, onSilent });
+  w.started(); t = 100_000; w.pause();
+  t = 1_000_000; w.tick(); expect(onSilent).not.toHaveBeenCalled();                     // 15 мин без потока — не отчёт
+  w.resume();
+  t = 1_079_000; w.tick(); expect(onSilent).not.toHaveBeenCalled();                     // 100 + 79 с — рано
+  t = 1_081_000; w.tick(); expect(onSilent).toHaveBeenCalledTimes(1);                   // 181 с молчания при потоке
+  w.ended(); w.pause(); w.started(); t = 1_500_000; w.tick();                            // ход начался без потока
+  expect(onSilent).toHaveBeenCalledTimes(1);
+  w.resume(); t = 1_679_000; w.tick(); expect(onSilent).toHaveBeenCalledTimes(1);
+  t = 1_681_000; w.tick(); expect(onSilent).toHaveBeenCalledTimes(2);
+});
+
 // --- отпечаток прогресса: messageId последнего ответа ассистента, число частей, последняя часть ---
 
 const msg = (m: ThreadMessageLike): ThreadMessage => m as unknown as ThreadMessage;
@@ -112,7 +139,7 @@ test("turn_fingerprint_marks_growth", () => {
 
 // --- useTurnWatch: рантайм из внешнего хранилища, часы — Date.now под vi.useFakeTimers ---
 
-type Props = { running: boolean; messages: ThreadMessageLike[] };
+type Props = { running: boolean; messages: ThreadMessageLike[]; streamOk?: boolean };
 const USER: ThreadMessageLike = { id: "u1", role: "user", content: [{ type: "text", text: "вопрос" }] };
 const answer = (text: string): ThreadMessageLike =>
   ({ id: "a1", role: "assistant", content: [{ type: "text", text }], status: { type: "running" } });
@@ -123,8 +150,8 @@ function watchHook(onSilent: () => void) {
     const runtime = useExternalStoreRuntime<ThreadMessageLike>({
       messages: p.messages, isRunning: p.running, onNew: async () => {}, convertMessage: (m) => m,
     });
-    return useTurnWatch(runtime, { onSilent });
-  }, { initialProps: { running: false, messages: [USER] } });
+    return useTurnWatch(runtime, { onSilent, streamOk: p.streamOk });
+  }, { initialProps: { running: false, messages: [USER] } as Props });
 }
 
 test("use_turn_watch_start_progress_end", async () => {
@@ -149,6 +176,13 @@ test("use_turn_watch_start_progress_end", async () => {
   expect(onSilent).toHaveBeenCalledTimes(2);
   h.rerender({ running: false, messages: [USER, answer("Число")] });
   expect(h.result.current).toBe(false);                                                   // конец хода снимает строку
+  await act(async () => { vi.advanceTimersByTime(400_000); });
+  expect(onSilent).toHaveBeenCalledTimes(2);
+  h.rerender({ running: true, messages: [USER, answer("Число")] });                       // доводка 1, I2: ход кончился
+  await act(async () => { vi.advanceTimersByTime(100_000); });                            // раньше срока — сторож снят
+  h.rerender({ running: false, messages: [USER, answer("Число")] });
+  await act(async () => { vi.advanceTimersByTime(400_000); });
+  expect(onSilent).toHaveBeenCalledTimes(2);
   h.unmount();
 });
 
@@ -187,6 +221,22 @@ test("use_turn_watch_sleep_does_not_report", async () => {
   await act(async () => { vi.advanceTimersByTime(1_000); });
   expect(onSilent).not.toHaveBeenCalled();
   await act(async () => { vi.advanceTimersByTime(181_000); });                            // а молчание и после сна — отчёт
+  expect(onSilent).toHaveBeenCalledTimes(1);
+  h.unmount();
+});
+
+test("use_turn_watch_pauses_on_stream_down", async () => {
+  const onSilent = vi.fn();
+  const h = watchHook(onSilent);
+  h.rerender({ running: true, messages: [USER] });
+  await act(async () => { vi.advanceTimersByTime(60_000); });
+  h.rerender({ running: true, messages: [USER], streamOk: false });                      // поток лёг
+  await act(async () => { vi.advanceTimersByTime(600_000); });
+  expect(onSilent).not.toHaveBeenCalled();
+  h.rerender({ running: true, messages: [USER], streamOk: true });                       // вернулся — отсчёт с 60 с
+  await act(async () => { vi.advanceTimersByTime(119_000); });
+  expect(onSilent).not.toHaveBeenCalled();
+  await act(async () => { vi.advanceTimersByTime(2_000); });
   expect(onSilent).toHaveBeenCalledTimes(1);
   h.unmount();
 });

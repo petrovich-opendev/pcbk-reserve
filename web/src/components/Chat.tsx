@@ -5,6 +5,11 @@
 // Д6б: список разговоров слева (R52) и сторожа молчания (R51): ход без прироста ответа 3 мин — строка и отчёт
 // turn_silent (один на ход), связь с потоком потеряна дольше 2 мин — отчёт stream_down при восстановлении (один на
 // эпизод). Отчёт уходит через onReport, пока чат смонтирован и обёртка не остановлена (после 401 и «спит» — нет).
+// Пока поток не "ok", отсчёт хода на паузе (доводка 1, m4).
+// initialSessionId не уходит в рантайм (доводка 1, I1): switchToThread библиотеки по умолчанию снимает архив
+// (PATCH time.archived = null — против R52), а разговор мог уйти в архив в другой вкладке или до перезапуска. Чат
+// открывает его сам — после загрузки списка, только если он есть среди неархивных и студент ещё не начал новый
+// разговор, и с unarchive: false. Иначе — новый разговор, а App забывает прежний (onThreadIdChange(undefined)).
 import {
   createOpencodeClient, useOpenCodePermissions, useOpenCodeQuestions, useOpenCodeRuntime,
   useOpenCodeRuntimeExtras, type OpenCodePermissionRequest, type OpenCodeQuestionRequest,
@@ -53,6 +58,7 @@ function PendingWithReject(p: {
 
 export function Chat(p: ChatProps) {
   const [stream, setStream] = useState<string | null>(null);
+  const [streamOk, setStreamOk] = useState(true);       // поток "ok" — молчание хода копится
   const [error, setError] = useState("");
   const props = useRef(p);
   props.current = p;
@@ -83,6 +89,7 @@ export function Chat(p: ChatProps) {
       },
       onStream: (s) => {
         setStream(streamLine(s));
+        setStreamOk(s.last === "ok");
         streamWatch.onStream(s);
       },
     });
@@ -98,7 +105,6 @@ export function Chat(p: ChatProps) {
 
   const runtime = useOpenCodeRuntime({
     client,
-    initialSessionId: p.initialSessionId,
     onError,
     onThreadIdChange: (id) => {
       if (halted.current || !mounted.current) return;    // остановленный или снятый чат молчит
@@ -106,6 +112,25 @@ export function Chat(p: ChatProps) {
       props.current.onThreadIdChange?.(id);
     },
   });
+
+  // прежний разговор (I1): открыть, только если он в неархивном списке; список не загрузился — не открывать
+  useEffect(() => {
+    const want = props.current.initialSessionId;           // разговор на момент монтирования
+    if (want === undefined) return;
+    let cancelled = false;
+    void runtime.threads.getLoadThreadsPromise().catch(() => undefined).then(() => {
+      if (cancelled || halted.current || !mounted.current) return;
+      const list = runtime.threads.getState();
+      if (list.loadError !== undefined) return;            // неизвестно, в архиве ли он: App помнит, откроет позже
+      if (list.mainThreadId !== list.newThreadId) return;  // студент уже начал новый разговор — не уводим
+      if (!list.threadIds.includes(want)) {                // в архиве или удалён — новый разговор
+        props.current.onThreadIdChange?.(undefined);
+        return;
+      }
+      runtime.threads.switchToThread(want, { unarchive: false }).catch(onError);
+    });
+    return () => { cancelled = true; };
+  }, [runtime, onError]);
 
   // новый ход пошёл — ошибка прошлого действия больше не нужна
   useEffect(() => {
@@ -118,7 +143,7 @@ export function Chat(p: ChatProps) {
   }, [runtime]);
 
   // ход без прироста ответа: строка над полем ввода и отчёт (Ф11 — начало хода по isRunning, не по onNew)
-  const silent = useTurnWatch(runtime, { onSilent: () => report("turn_silent") });
+  const silent = useTurnWatch(runtime, { onSilent: () => report("turn_silent"), streamOk });
 
   return (
     <ChatView

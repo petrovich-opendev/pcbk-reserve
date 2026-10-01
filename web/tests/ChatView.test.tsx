@@ -1,7 +1,7 @@
 // Отображение разговора (Д6-R41, R42): только разрешённые кнопки, разметка модели инертна, строка вызова
 // инструмента, ошибка сообщения, висящие разрешения и вопросы — только «Отклонить».
 // runtime — useExternalStoreRuntime({ messages, isRunning, onNew, convertMessage }), без OpenCode и сети.
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { Chat } from "../src/components/Chat";
@@ -177,7 +177,9 @@ const SES = "ses_0123456789abcdefghijklmnop";
 const ocJson = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-function stubGateway(answer: (method: string, path: string, body: string) => Response | undefined) {
+type Answer = Response | Promise<Response> | undefined;      // ответ можно придержать промисом
+
+function stubGateway(answer: (method: string, path: string, body: string) => Answer) {
   const calls: { method: string; path: string; body: string }[] = [];
   vi.stubGlobal("fetch", vi.fn(async (r: Request) => {
     const path = new URL(r.url).pathname;
@@ -251,7 +253,7 @@ test("chat_shows_refusal_text", async () => {
 // Открытый разговор (initialSessionId): список, сессия и история отвечают, прочее решает тест.
 const SESSION = { id: SES, slug: "s", projectID: "p", directory: "/work", title: "", version: "1.18.33",
                   time: { created: 1, updated: 1 } };
-function stubOpenSession(answer: (method: string, path: string, body: string) => Response | undefined) {
+function stubOpenSession(answer: (method: string, path: string, body: string) => Answer) {
   return stubGateway((method, path, body) => {
     const own = answer(method, path, body);
     if (own !== undefined) return own;
@@ -479,3 +481,125 @@ test("chat_no_reports_after_halt", async () => {
     delete (document as { visibilityState?: unknown }).visibilityState;
   }
 });
+
+// --- доводка 1 ---
+
+test.each([
+  ["archived", [{ ...SESSION, time: { created: 1, updated: 1, archived: 1_700_000_000_000 } }]],
+  ["gone", []],
+] as const)("chat_initial_session_not_listed_opens_new_%s", async (_name, listed) => {
+  // I1: switchToThread библиотеки снял бы архив (PATCH time.archived = null, против R52). Разговор не в неархивном
+  // списке — новый разговор, ни одного PATCH, App забывает прежний
+  const archivedSession = { ...SESSION, time: { created: 1, updated: 1, archived: 1_700_000_000_000 } };
+  const calls = stubOpenSession((_method, path) => {
+    if (path === "/pcbk/api/oc/experimental/session") return ocJson(200, listed);
+    if (path === `/pcbk/api/oc/session/${SES}`) return ocJson(200, archivedSession);
+    return undefined;
+  });
+  const onThreadIdChange = vi.fn();
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES} onThreadIdChange={onThreadIdChange} />);
+  await waitFor(() => expect(onThreadIdChange).toHaveBeenCalledWith(undefined));
+  await sleep(150);
+  expect(calls.filter((c) => c.method === "PATCH")).toEqual([]);
+  expect(calls.some((c) => c.body.includes('"archived":null'))).toBe(false);
+  expect(calls.filter((c) => c.path.startsWith(`/pcbk/api/oc/session/${SES}`))).toEqual([]);   // и не открыт
+  expect(onThreadIdChange.mock.calls).toEqual([[undefined]]);
+  expect(container.querySelector(`[data-session-id="${SES}"]`)).toBeNull();
+  expect(screen.getByRole("button", { name: "Новый разговор" }).getAttribute("aria-current")).toBe("true");
+});
+
+test("chat_initial_session_waits_for_list", async () => {
+  // список не загрузился — неизвестно, в архиве ли разговор: не открывать и не забывать
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const calls = stubOpenSession((_method, path) =>
+    path === "/pcbk/api/oc/experimental/session" ? ocJson(500, { name: "UnknownError", data: { message: "сбой" } }) : undefined);
+  const onThreadIdChange = vi.fn();
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} onThreadIdChange={onThreadIdChange} />);
+  await waitFor(() => expect(calls.some((c) => c.path === "/pcbk/api/oc/experimental/session")).toBe(true));
+  await sleep(150);
+  expect(onThreadIdChange).not.toHaveBeenCalled();
+  expect(calls.filter((c) => c.path.startsWith(`/pcbk/api/oc/session/${SES}`) || c.method === "PATCH")).toEqual([]);
+});
+
+test("chat_archive_open_thread_forgets_it", async () => {
+  // I1: архив открытого разговора — чат на новом, App получает undefined (перезапуск откроет новый)
+  const calls = stubOpenSession((method, path) =>
+    method === "PATCH" && path === `/pcbk/api/oc/session/${SES}` ? ocJson(200, { ...SESSION, time: { created: 1, updated: 2, archived: 2 } }) : undefined);
+  const onThreadIdChange = vi.fn();
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES} onThreadIdChange={onThreadIdChange} />);
+  await waitFor(() => expect(onThreadIdChange).toHaveBeenCalledWith(SES));
+  const row = container.querySelector<HTMLElement>(`[data-session-id="${SES}"]`)!;
+  fireEvent.click(within(row).getByRole("button", { name: "В архив" }));
+  await waitFor(() => expect(onThreadIdChange.mock.calls.at(-1)).toEqual([undefined]));
+  await waitFor(() => expect(container.querySelector(`[data-session-id="${SES}"]`)).toBeNull());
+  const patches = calls.filter((c) => c.method === "PATCH").map((c) => JSON.parse(c.body));
+  expect(patches).toHaveLength(1);
+  expect(typeof patches[0].time.archived).toBe("number");                      // в архив, а не «из архива»
+});
+
+test("chat_title_race_waits_for_list_in_flight", async () => {
+  // m1: ответ списка придержан, приходит новое имя — новый запрос списка не уходит, пока прежний в пути; прежний
+  // отдаёт старое имя — тогда перечитывание, и в строке новое имя
+  let lists = 0;
+  let release: (r: Response) => void = () => {};
+  const named = (title: string, updated = 1) => ({ ...SESSION, title, time: { created: 1, updated } });
+  const events = controlledEvents();
+  stubOpenSession((_method, path) => {
+    if (path === "/pcbk/api/oc/experimental/session") {
+      lists += 1;
+      if (lists === 1) return ocJson(200, [named("Имя A")]);
+      if (lists === 2) return new Promise<Response>((resolve) => { release = resolve; });   // придержан
+      return ocJson(200, [named("Имя C")]);
+    }
+    if (path === `/pcbk/api/oc/session/${SES}`) return ocJson(200, named("Имя A"));
+    if (path === "/pcbk/api/oc/event") return events.response();
+    return undefined;
+  });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES} />);
+  const row = () => container.querySelector(`[data-session-id="${SES}"]`)?.textContent ?? "";
+  await waitFor(() => expect(row()).toContain("Имя A"));
+  await sleep(50);
+  events.push({ type: "session.updated", properties: { info: named("Имя B", 2) } });   // перечитывание №2 — в пути
+  await waitFor(() => expect(lists).toBe(2));
+  events.push({ type: "session.updated", properties: { info: named("Имя C", 3) } });   // имя сменилось ещё раз
+  await sleep(150);
+  expect(lists).toBe(2);                                                    // пока прежний ответ в пути — нового нет
+  release(ocJson(200, [named("Имя B", 2)]));                               // прежний ответ — со старым именем
+  await waitFor(() => expect(row()).toContain("Имя C"));
+  expect(lists).toBe(3);
+});
+
+test("chat_no_turn_silent_while_stream_down", async () => {
+  // m4: поток лёг посреди хода — отсчёт хода на паузе: при лежащей связи отчёт не «ответ модели не пришёл»
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  let events = 0;
+  const enc = new TextEncoder();
+  stubOpenSession((_method, path) => {
+    if (path !== "/pcbk/api/oc/event") return undefined;
+    events += 1;
+    if (events === 1) return new Response(new ReadableStream<Uint8Array>({   // ход пошёл, и поток оборвался
+      start(c) {
+        for (const e of [{ type: "server.connected", properties: {} },
+                         { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } }])
+          c.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+        c.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    return ocJson(503, { name: "Unavailable", data: { message: "Серверный слой не отвечает" } });
+  });
+  const onReport = vi.fn();
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
+  await screen.findByRole("button", { name: "Стоп" });                     // ход идёт
+  await waitFor(() => expect(events).toBeGreaterThanOrEqual(2), { timeout: 8_000 });   // переподключение — 503
+  await sleep(100);
+  try {
+    setVisibility("hidden");                                                // фон: тики по часам, без правила сна
+    now += 181_000;
+    await sleep(1_500);
+    expect(onReport).not.toHaveBeenCalled();
+    expect(screen.queryByText(T_TURN_SILENT)).toBeNull();
+  } finally {
+    delete (document as { visibilityState?: unknown }).visibilityState;
+  }
+}, 15_000);

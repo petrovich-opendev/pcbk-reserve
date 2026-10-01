@@ -6,7 +6,8 @@
 // открытый разговор (onThreadIdChange) и после «Разбудить» монтирует чат с ним.
 // Молчание в браузере (R51): старт отмечается загрузчику (window.__pcbkStarted) при монтировании App, ещё до ответа
 // /me — экран места или предупреждения дольше 20 с не дают ложного boot_failed (preflight Ф9); без загрузчика (edge
-// до Д6б, откат) App работает. Чат — внутри ErrorBoundary: сбой отрисовки — отчёт ui_crash и «Перезапустить чат».
+// до Д6б, откат) App работает. Чат — внутри ErrorBoundary: сбой отрисовки — отчёт ui_crash и «Перезапустить чат» —
+// новое монтирование с последним открытым разговором (lastSession), а не с тем, что был при прошлом монтировании.
 // Отчёты чата (turn_silent, stream_down) уходят через api.report — только от нынешнего чата и не при уходе на вход.
 import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
@@ -196,7 +197,7 @@ export function App(p: AppProps) {
     case "chat": {
       const mount = phase.mount;
       body = (
-        <ErrorBoundary key={mount} onCrash={() => report("ui_crash")}>
+        <ErrorBoundary key={mount} onCrash={() => report("ui_crash")} onRestart={openChat}>
           <ChatImpl
             initialSessionId={phase.sessionId}
             onThreadIdChange={(id) => { if (mount === mounts.current) lastSession.current = id; }}

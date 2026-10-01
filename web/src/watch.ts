@@ -7,10 +7,14 @@
 //   пока поток стоял, поэтому отсчёт начинается заново, а не даёт ложный отчёт на первом тике. Скрытую вкладку
 //   браузер троттлит законно — там разрыв тиков не сон. Известное ограничение: если вкладка была скрыта и ноутбук
 //   уснул, первый тик после возврата отчёт даст.
+// - Пока поток не "ok", отсчёт хода стоит на паузе (доводка 1, m4): без потока прироста ответа не видно, и при
+//   лежащей связи владелец увидел бы «ответ модели не пришёл» вместо «браузеры теряют связь».
 // - Сторож потока (stream_down): связь потеряна — last !== "ok", восстановлена — last === "ok" (по failures нельзя:
-//   после 200 обёртка его не сбрасывает, Д6-R43). Отчёт — при восстановлении после потери дольше STREAM_DOWN_S
-//   (пока связи нет, отчёт не дойдёт), один на эпизод. Известное ограничение (preflight Н16): петлю коротких потоков
-//   (200 и сразу конец) сторож не видит — last остаётся "ok", хотя строка «переподключаюсь» видна.
+//   после 200 обёртка его не сбрасывает, Д6-R43). "too_many_tabs" — не потеря связи (доводка 1): шлюз ответил, а
+//   забытая четвёртая вкладка не должна красить строку; эпизод она закрывает, как "ok". Отчёт — при восстановлении
+//   после потери дольше STREAM_DOWN_S (пока связи нет, отчёт не дойдёт), один на эпизод. Известное ограничение
+//   (preflight Н16): петлю коротких потоков (200 и сразу конец) сторож не видит — last остаётся "ok", хотя строка
+//   «переподключаюсь» видна.
 // createTurnWatch и createStreamWatch — чистые функции от часов; useTurnWatch связывает сторож хода с рантаймом.
 import type { AssistantRuntime, ThreadMessage } from "@assistant-ui/react";
 import { useEffect, useRef, useState } from "react";
@@ -26,6 +30,8 @@ export interface TurnWatch {
   progress(fingerprint: string): void;
   ended(): void;
   tick(): void;
+  pause(): void;                          // поток не "ok": молчание не копится
+  resume(): void;                         // поток снова "ok": отсчёт идёт с того же места
 }
 
 export function createTurnWatch(o: {
@@ -42,6 +48,7 @@ export function createTurnWatch(o: {
   let reported = false;
   let lastTick = 0;
   let lastVisible = false;
+  let pausedAt: number | null = null;     // начало паузы (поток не "ok")
 
   const visible = (): boolean => o.isVisible?.() ?? false;
 
@@ -59,6 +66,16 @@ export function createTurnWatch(o: {
       fingerprint = next;
       since = o.now();
     },
+    pause() {
+      pausedAt ??= o.now();
+    },
+    resume() {
+      if (pausedAt === null) return;
+      const t = o.now();
+      since += t - Math.max(pausedAt, since);                 // время без потока не в счёт
+      pausedAt = null;
+      lastTick = t;                                           // разрыв тиков на паузе — не сон
+    },
     ended() {
       running = false;
       fingerprint = null;
@@ -70,7 +87,7 @@ export function createTurnWatch(o: {
       if (o.isVisible !== undefined && shown && lastVisible && t - lastTick > gapMs) since = t;   // сон — отсчёт заново
       lastTick = t;
       lastVisible = shown;
-      if (reported || t - since < silentMs) return;
+      if (pausedAt !== null || reported || t - since < silentMs) return;
       reported = true;
       o.onSilent();
     },
@@ -86,7 +103,7 @@ export function createStreamWatch(o: {
   let downSince: number | null = null;    // первая потеря связи в эпизоде
   return {
     onStream(s) {
-      if (s.last !== "ok") {
+      if (s.last !== "ok" && s.last !== "too_many_tabs") {
         downSince ??= o.now();
         return;
       }
@@ -99,7 +116,10 @@ export function createStreamWatch(o: {
 type Part = ThreadMessage["content"][number];
 
 // последняя часть ответа: у текста и рассуждения — длина, у вызова инструмента — имя и состояние (Н14: у части-вызова
-// длина не растёт, растёт состояние «идёт» → «готово»)
+// длина не растёт, растёт состояние «идёт» → «готово»). Прочие части — по типу; новая часть меняет их число. Так
+// часть retry OpenCode (адаптер даёт её частью data opencode-retry) считается приростом: повторы модели сбрасывают
+// отсчёт, и ход, который только повторяет запрос к модели, turn_silent не даст. Так ли ведёт себя живое место
+// (пишет ли 1.18.33 часть retry на каждую попытку) — живая проверка Б4/Б6 (m3 ревью Б3), здесь не правится.
 function partMark(part: Part | undefined): string {
   if (part === undefined) return "-";
   switch (part.type) {
@@ -131,10 +151,13 @@ export function useTurnWatch(runtime: AssistantRuntime, o: {
   onSilent(): void;
   now?(): number;
   tickMs?: number;
+  streamOk?: boolean;                     // поток "ok" (по умолчанию да); нет — отсчёт на паузе (m4)
 }): boolean {
   const [silent, setSilent] = useState(false);
   const opts = useRef(o);
   opts.current = o;
+  const current = useRef<TurnWatch | null>(null);
+  const streamOk = o.streamOk ?? true;
 
   useEffect(() => {
     const watch = createTurnWatch({
@@ -145,6 +168,8 @@ export function useTurnWatch(runtime: AssistantRuntime, o: {
       },
       isVisible: () => document.visibilityState !== "hidden",
     });
+    if (opts.current.streamOk === false) watch.pause();
+    current.current = watch;
     let running = false;
     let fingerprint = "";
     const check = (): void => {
@@ -167,11 +192,17 @@ export function useTurnWatch(runtime: AssistantRuntime, o: {
     const onVisibility = (): void => watch.tick();
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
+      current.current = null;
       unsubscribe();
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [runtime]);
+
+  useEffect(() => {
+    if (streamOk) current.current?.resume();
+    else current.current?.pause();
+  }, [streamOk]);
 
   return silent;
 }
