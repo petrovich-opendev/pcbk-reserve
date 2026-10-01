@@ -192,7 +192,7 @@ def test_konstruktor_file():                                                    
                  "«konstruktor» и не с «pcbk» в начале",                             # m1: name_reserved службы
                  "Сохранённого агента поменять нельзя"):                             # m2: name_taken — только новый
         assert rule in flat, rule
-    assert "через минуту" not in flat                                  # при сбое — преподаватель, не повтор (р1)
+    assert "через минуту" not in flat                                  # при сбое — пересказ message службы (р1)
     stand = (CONFIG / "AGENTS.md").read_text()                       # правила стенда в системном тексте всех агентов
     assert stand.startswith("# Правила учебного стенда ПЦБК (для всех агентов)")
     for rule in ("Норматива в данных стенда нет", "общие знания, не норматив ПЦБК", "Шкала прибора"):

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from conftest import wait_for
+from secret import Secret
 from workplace import IMAGE, MOUNTS, STUB_PREFIX, WORKPLACE_ENV
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -287,8 +288,9 @@ def test_default_agent_is_pomoshnik(stack, running):                # Д6-R45: �
     k = next(a for a in agents if a["name"] == "konstruktor")
     assert (k["native"], k["mode"], k["steps"], k.get("model")) == (False, "primary", 12, None)   # модель стенда
     assert not {"build", "plan", "general", "explore"} & {a["name"] for a in agents}
-    code, body = stack.oc(1, "GET", "/config", 1)                    # в теле /config — токен места: в traceback
-    try:                                                               # (аргументы json.loads) оно не попадает
+    code, body = stack.oc(1, "GET", "/config", 1)                    # в теле /config — токен места: ни в traceback
+    body = Secret(body)                                                # (аргументы json.loads), ни в --showlocals
+    try:                                                               # его нет
         default = json.loads(body)["default_agent"]
     except ValueError:
         default = None
