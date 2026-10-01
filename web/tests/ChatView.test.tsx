@@ -459,24 +459,34 @@ test("chat_reports_turn_silent_once", async () => {
   expect(onReport).toHaveBeenCalledTimes(1);                                  // один на ход
 });
 
-test("chat_reports_stream_down_after_long_outage", async () => {
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+test.each([
+  ["", false],
+  ["_interval_ticks", true],
+] as const)("chat_reports_stream_down_after_long_outage%s", async (_name, interval) => {
+  // связи нет 130 с при живой машине (тики идут) — отчёт при восстановлении, один. Вариант interval: часы идут шагами по
+  // 26 с, а тикает только таймер раз в секунду — без него lastTick устарел бы, и onStream принял бы потерю за сон
+  const c = chatClock();
   let events = 0;
+  let release: (r: Response) => void = () => {};
   stubOpenSession((_method, path) => {
     if (path !== "/pcbk/api/oc/event") return undefined;
     events += 1;
     if (events === 1) return ocJson(503, { name: "Unavailable", data: { message: "Серверный слой не отвечает" } });
-    now += 130_000;                                                           // связи не было 130 с
+    if (events === 2) return new Promise<Response>((resolve) => { release = resolve; });   // переподключение в пути
     return eventStream([{ type: "server.connected", properties: {} }]);
   });
   const onReport = vi.fn();
   render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
-  await waitFor(() => expect(onReport).toHaveBeenCalledWith("stream_down"), { timeout: 4000 });   // при восстановлении
+  await waitFor(() => expect(events).toBe(2), { timeout: 4_000 });
+  if (interval) {
+    for (let k = 0; k < 5; k += 1) { c.now += 26_000; await sleep(1_100); }    // 130 с, тик таймера на каждом шаге
+  } else c.pass(130_000);                                                     // связи не было 130 с
+  expect(onReport).not.toHaveBeenCalled();                                    // пока нет связи — нет отчёта
+  release(eventStream([{ type: "server.connected", properties: {} }]));
+  await waitFor(() => expect(onReport).toHaveBeenCalledWith("stream_down"), { timeout: 2_000 });   // при восстановлении
   await sleep(100);
   expect(onReport).toHaveBeenCalledTimes(1);
-  expect(events).toBe(2);
-});
+}, 15_000);
 
 test("chat_no_reports_after_halt", async () => {
   // без сессии отчёты не шлются: место уснуло посреди хода (503 WorkplaceNotReady на «Стоп») — чат остановлен,
@@ -652,6 +662,7 @@ test("chat_too_many_tabs_pauses_turn", async () => {
 test.each([
   ["back_within_down_s", false, false],
   ["back_within_down_s_interval_tick", false, true],
+  ["back_before_first_tick", false, null],
   ["down_long_after_wake", true, false],
 ] as const)("chat_stream_sleep_%s", async (_name, late, intervalTick) => {
   // m4 и поправка контролёра: связь пропала, машина проспала час; первый тик сторожа потока после сна видит разрыв, и
@@ -671,7 +682,9 @@ test.each([
   const onReport = vi.fn();
   render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
   await waitFor(() => expect(events).toBe(2), { timeout: 4_000 });
-  if (intervalTick) {
+  if (intervalTick === null) {
+    c.now += 3_600_000;                                                       // сон; поток вернётся раньше первого тика
+  } else if (intervalTick) {                                                  // (остаток m1: разрыв видит и onStream)
     c.now += 3_600_000;                                                       // сон
     await sleep(1_200);                                                       // первый тик после него — только по таймеру
   } else {

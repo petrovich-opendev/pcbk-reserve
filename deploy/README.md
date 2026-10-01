@@ -230,10 +230,13 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
   своими настоящими сессиями занимает не больше 3 × 10 = 30 мест из 64;
   поддельные cookie правильного вида (43 знака) дают каждая свою корзину на
   10, и их хватит, чтобы занять все 64 (тела без учётки в core не уходят, но
-  чат класса получит 503). Тело, у которого байт приходит чаще раза в 10 с,
-  срок между чтениями не обрывает: такое соединение держит слот сколько
-  угодно. Окончательно — предел по адресу клиента после замера
-  `$remote_addr` на сервере (Б7).
+  чат класса получит 503). Тот же класс — у «кто я» и подтверждения
+  предупреждения (`/pcbk/api/auth/me`, `…/notice`, Д6б) и у ручек места: каждая
+  поддельная cookie правильного вида — своя корзина, предел на неё обходится
+  перебором cookie (запросы без учётки core отклоняет сразу, 401). Тело, у
+  которого байт приходит чаще раза в 10 с, срок между чтениями не обрывает:
+  такое соединение держит слот сколько угодно. Окончательно — предел по адресу
+  клиента после замера `$remote_addr` на сервере (Б7).
 
 ## Замена сертификата
 
@@ -270,13 +273,15 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
      — места на `:d2`, тома сохраняются, места спят;
   5. токены данных `student-NN.data-token` и `core-tokens` не удаляются.
 - Д6б — назад к Д6а (места не трогаются: образ места в Д6б тот же, `student:d6a`):
-  1. вернуть `compose.yaml.d6a` и шаблон `edge` Д6а (копии перед выкладкой Д6б),
+  1. вернуть `compose.yaml.d6a` и шаблон `edge` Д6а — копии перед выкладкой Д6б
+     или из git: `git show <тег platform-d6a>:edge/pcbk.conf.template`;
      `docker compose restart edge`;
   2. `docker compose up -d --no-build core watchdog` — `core` и сторож на `:d6a`
      (образы `:d6a` остаются на сервере); `core.db` с таблицей `gw_notices` Д6б
      `core:d6a` открывает как есть — лишняя таблица ему не мешает;
   3. статика чата — `chat.d6a` на место (раздел «Статика чата», откат) и
-     `edge/static/login.js` Д6а.
+     `edge/static/login.js` Д6а — копия перед выкладкой Д6б или из git:
+     `git show <тег platform-d6a>:edge/static/login.js`, как шаблон в шаге 1.
 
   Откат только статики и `login.js` при `core:d6b` снимает предупреждение при
   первом входе: чат Д6а поле `notice` не знает, страница входа Д6а будит место
@@ -291,12 +296,15 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
   после возврата на `core:d6b` стереть подтверждения этого логина:
   ```bash
   docker exec pcbk-core python -c 'import sqlite3, sys
+  from pathlib import Path
   from pcbk_core.settings import Settings
-  db = sqlite3.connect(Settings.from_env().DB_PATH, timeout=5)
+  uri = Path(Settings.from_env().DB_PATH).absolute().as_uri() + "?mode=rw"
+  db = sqlite3.connect(uri, uri=True, timeout=5)
   with db: n = db.execute("DELETE FROM gw_notices WHERE login = ?", (sys.argv[1],)).rowcount
   print("стёрто подтверждений:", n)' <логин>
   ```
-  (`accounts list` после этого — «нет» в последнем столбце).
+  `mode=rw`, как у `accounts.py`: при неверном пути — ошибка, а не новый пустой
+  файл. `accounts list` после этого — «нет» в последнем столбце.
 - Тома мест, `secrets/` и `agents/` удаляются только до первого входа
   студента и только по именам: после — там разговоры и агенты студентов.
 - `rm -rf /opt/pcbk-reserve` (с `sudo`) — только до первого входа. После —

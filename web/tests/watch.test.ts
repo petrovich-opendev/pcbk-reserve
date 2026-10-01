@@ -144,6 +144,24 @@ test("stream_watch_sleep_is_not_loss", () => {
   w.onStream(ok); expect(on).toHaveBeenCalledTimes(3);
 });
 
+test("stream_watch_recovery_before_first_tick_after_sleep", () => {
+  // итоговая доводка Д6б, остаток m1: связь лежала до сна, после пробуждения поток вернулся раньше первого тика —
+  // разрыв по lastTick видит и onStream: это сон, stream_down нет; потом тик — тоже без отчёта
+  const c = clock(); const on = vi.fn(); const w = createStreamWatch({ now: c.now, onRecoveredAfterLongDown: on });
+  w.tick(); c.ticksTo(w, 10_000); w.onStream({ failures: 1, nextRetryS: 1, last: "offline" });
+  c.t += 3_600_000; w.onStream({ failures: 2, nextRetryS: null, last: "ok" });         // раньше первого тика
+  w.tick(); c.ticksTo(w, c.t + 300_000);
+  expect(on).not.toHaveBeenCalled();
+  // потеря после пробуждения тоже открывается ответом потока раньше тика — отсчёт с него, обычное правило
+  c.t += 3_600_000; w.onStream({ failures: 1, nextRetryS: 1, last: "offline" });
+  c.ticksTo(w, c.t + STREAM_DOWN_S * 1000 + 1_000); w.onStream({ failures: 6, nextRetryS: null, last: "ok" });
+  expect(on).toHaveBeenCalledTimes(1);
+  // эпизод, долгий уже к последнему тику перед сном, остаётся настоящим
+  w.onStream({ failures: 1, nextRetryS: 1, last: "down" }); c.ticksTo(w, c.t + 130_000);
+  c.t += 3_600_000; w.onStream({ failures: 9, nextRetryS: null, last: "ok" });
+  expect(on).toHaveBeenCalledTimes(2);
+});
+
 test("stream_watch_throttled_tab_waits_for_visible", () => {
   // вкладка скрыта дольше 5 минут: тик раз в минуту — каждый тик разрыв, потеря считается заново с каждого тика, и
   // stream_down нет (цена правила, запись в D6b.md); вкладку открыли — тики раз в секунду, обычное правило

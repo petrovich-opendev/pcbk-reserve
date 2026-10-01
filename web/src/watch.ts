@@ -19,7 +19,8 @@
 //   забытая четвёртая вкладка не должна красить строку; эпизод она закрывает, как "ok". Отчёт — при восстановлении
 //   после потери дольше STREAM_DOWN_S (пока связи нет, отчёт не дойдёт), один на эпизод. Сон машины — тот же приём,
 //   что у хода: свои тики видят разрыв, и потеря связи, начатая до разрыва, считается с пробуждения (downSince
-//   переносится на тик после разрыва) — время сна в эпизод не входит. Эпизод, долгий уже к тику перед разрывом,
+//   переносится на тик после разрыва, а если поток вернулся раньше первого тика — на этот ответ потока: разрыв
+//   по lastTick проверяет и onStream) — время сна в эпизод не входит. Эпизод, долгий уже к тику перед разрывом,
 //   не переносится: он настоящий и отчёт даст. Цена: у вкладки, скрытой дольше 5 минут, каждый тик — разрыв, и
 //   потеря связи там stream_down не даёт. Известное ограничение (preflight Н16): петлю коротких потоков (200 и
 //   сразу конец) сторож не видит — last остаётся "ok", хотя строка «переподключаюсь» видна.
@@ -103,20 +104,28 @@ export function createStreamWatch(o: {
   const gapMs = TICK_GAP_S * 1000;
   let downSince: number | null = null;    // первая потеря связи в эпизоде (после сна — пробуждение)
   let lastTick: number | null = null;
+  // разрыв тиков к моменту t: потеря, начатая до него и к нему ещё не долгая, считается с пробуждения; замеченный
+  // разрыв закрыт — следующий тик его не видит снова
+  const wake = (t: number): void => {
+    if (lastTick === null || t - lastTick <= gapMs) return;
+    if (downSince !== null && lastTick - downSince <= downMs) downSince = t;
+    lastTick = t;
+  };
   return {
     tick() {
       const t = o.now();
-      // разрыв тиков: потеря, начатая до него и к нему ещё не долгая, считается с пробуждения
-      if (lastTick !== null && t - lastTick > gapMs && downSince !== null && lastTick - downSince <= downMs)
-        downSince = t;
+      wake(t);
       lastTick = t;
     },
     onStream(s) {
+      const t = o.now();
+      // поток мог вернуться после сна раньше первого тика (итоговая доводка Д6б, остаток m1): разрыв — и здесь
+      wake(t);
       if (s.last !== "ok" && s.last !== "too_many_tabs") {
-        downSince ??= o.now();
+        downSince ??= t;
         return;
       }
-      if (downSince !== null && o.now() - downSince > downMs) o.onRecoveredAfterLongDown();
+      if (downSince !== null && t - downSince > downMs) o.onRecoveredAfterLongDown();
       downSince = null;
     },
   };
