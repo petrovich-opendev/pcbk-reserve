@@ -3,6 +3,10 @@
 Соединение — по адресу из base (127.0.0.1:18443), заголовок Host — свой (host), так имя стенда нигде не
 разрешается. TLS без проверки сертификата: сертификат тестовый, на сервере — туннель. Путь уходит как есть
 (putrequest), без нормализации. Каждый вызов — своё соединение HTTP/1.1.
+
+Пароль и cookie в трассировке pytest не печатаются (итоговое ревью Д6а, P7): тело запроса — SecretBytes (его несут
+кадры http.client: endheaders, _send_output, send), cookie сессии и заголовок Cookie — Secret. Пароль вызывающий
+передаёт строкой Secret: аргумент login и тело call — его кадры.
 """
 from __future__ import annotations
 
@@ -13,6 +17,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
+
+from secret import Secret, SecretBytes
 
 COOKIE = "pcbk_session"
 WAKE_POLL_S = 1.0
@@ -48,13 +54,13 @@ class GwClient:
         """
         extra = dict(headers or {})
         names = {k.lower() for k in extra}
-        data = b"" if body is None else json.dumps(body).encode("utf-8")
+        data = SecretBytes(b"" if body is None else json.dumps(body).encode("utf-8"))   # в теле бывает пароль
         conn = http.client.HTTPSConnection(self.addr, self.port, context=self._ctx, timeout=self.timeout)
         try:
             conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
             conn.putheader("Host", self.host)
             if "cookie" not in names and self.cookie is not None:
-                conn.putheader("Cookie", f"{COOKIE}={self.cookie}")
+                conn.putheader("Cookie", Secret(f"{COOKIE}={self.cookie}"))
             if method.upper() not in ("GET", "HEAD"):
                 if self.origin is not None and "origin" not in names:
                     conn.putheader("Origin", self.origin)
@@ -82,7 +88,7 @@ class GwClient:
             name, _, rest = line.partition("=")
             value = rest.split(";", 1)[0]
             if name.strip() == COOKIE and value:
-                self.cookie = value
+                self.cookie = Secret(value)
         if self.cookie is None:
             raise AssertionError(f"вход {login}: нет cookie сессии")
         self.place = body.get("place")
@@ -107,7 +113,7 @@ class GwClient:
             conn.putrequest("GET", EVENT_PATH, skip_host=True, skip_accept_encoding=True)
             conn.putheader("Host", self.host)
             if self.cookie is not None:
-                conn.putheader("Cookie", f"{COOKIE}={self.cookie}")
+                conn.putheader("Cookie", Secret(f"{COOKIE}={self.cookie}"))
             conn.putheader("Accept", "text/event-stream")
             conn.endheaders()
             sock = conn.sock                            # getresponse может отдать сокет ответу и обнулить conn.sock

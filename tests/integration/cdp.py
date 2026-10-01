@@ -64,6 +64,17 @@ class _WireBytes(bytes):
         return f"<кадр WebSocket: {len(self)} байт>"
 
 
+class _Hidden(str):
+    """Значение заголовка с секретом (cookie, authorization) в requests(headers=True): сравнивается как строка, в
+    трассировке pytest — «<скрыт>» (итоговое ревью Д6а, P6)."""
+
+    def __repr__(self) -> str:
+        return "<скрыт>"
+
+
+_SECRET_HEADERS = frozenset({"cookie", "authorization"})
+
+
 class CDPError(RuntimeError):
     """Отказ CDP (ответ с error), срок ответа или обрыв соединения с браузером."""
 
@@ -441,12 +452,18 @@ class Page:
         with self._lock:
             return list(self._errors)
 
-    def requests(self, prefix: str) -> list[dict]:
-        """Запросы вкладки, чей путь (без ?…) начинается с prefix: method, path, status, protocol, headers
-        (настоящие, имена в нижнем регистре), url. status None — ответа не было."""
+    def requests(self, prefix: str, headers: bool = False) -> list[dict]:
+        """Запросы вкладки, чей путь (без ?…) начинается с prefix: method, path, status, protocol, url; status None —
+        ответа не было. Заголовки (настоящие, имена в нижнем регистре) — только при headers=True, и cookie и
+        authorization в них — строкой с безопасным repr: записи попадают в аргументы и переменные кадров, а pytest
+        печатает их при сбое (итоговое ревью Д6а, P6)."""
+        def view(r: dict) -> dict:
+            out = {k: v for k, v in r.items() if k not in ("chunks", "headers")}
+            if headers:
+                out["headers"] = {k: (_Hidden(v) if k in _SECRET_HEADERS else v) for k, v in r["headers"].items()}
+            return out
         with self._lock:
-            return [{k: (dict(v) if k == "headers" else v) for k, v in r.items() if k != "chunks"}
-                    for r in self._order if r["path"].startswith(prefix)]
+            return [view(r) for r in self._order if r["path"].startswith(prefix)]
 
     def chunks(self, path: str) -> int:
         """Сколько порций тела (Network.dataReceived) пришло на запросы с ровно этим путём."""

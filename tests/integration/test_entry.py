@@ -11,12 +11,12 @@ import time
 
 import pytest
 
-from conftest import STAND_ORIGIN, secret_forms
+from conftest import STAND_ORIGIN, Secret, secret_forms
 from gwclient import GwClient
 
 # пароли — только в запросах: в assert сверяются коды и индексы, иначе при падении pytest напечатал бы значения
-PW = {"stu-01": secrets.token_urlsafe(12), "stu-03": secrets.token_urlsafe(12), "stu-04": secrets.token_urlsafe(12),
-      "stu-05": secrets.token_urlsafe(12), "teach": secrets.token_urlsafe(12)}
+# пароли — Secret: в трассировке pytest «<скрыт>» (итоговое ревью Д6а, P7)
+PW = {n: Secret(secrets.token_urlsafe(12)) for n in ("stu-01", "stu-03", "stu-04", "stu-05", "teach")}
 MONEY = ("account_remaining_usd", "key_usage_usd", "key_spent_usd")
 OWN_PLACES = (1, 3, 4, 5)
 
@@ -31,6 +31,10 @@ def accounts(stack):
         for n in OWN_PLACES:
             if stack.inspect(f"pcbk-student-{n:02d}")["State"]["Running"]:
                 stack.stop(f"pcbk-student-{n:02d}")
+
+
+def test_passwords_are_secret():                                                         # без стенда: итоговое ревью Д6а, P7
+    assert {type(v) for v in PW.values()} == {Secret}
 
 
 def row(data, cid):

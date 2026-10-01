@@ -28,6 +28,7 @@ import pytest
 
 from cdp import Browser
 from gwclient import GwClient
+from secret import Secret, SecretBytes  # noqa: F401 — Secret берут тесты через conftest (ревью А7)
 from workplace import IMAGE as STUDENT_IMAGE
 from workplace import ONESHOT_LABEL
 
@@ -160,13 +161,27 @@ STAND_ORIGIN = f"https://{STAND_HOST}"
 CONNECTED = re.compile(r"Established connection|Connected to")
 
 
-class Secret(str):
-    """Пароль: значение — как у строки, repr — «<скрыт>». pytest печатает аргументы кадров трассировки (первого и
-    последнего, при --tb=long — всех) и локальные переменные при --showlocals через repr. Склейка (secret + "\\n")
-    даёт обычную str — оборачивать после неё."""
+def failure(fn, *args, **kw) -> BaseException:
+    """Исключение вызова fn; его трассировка начинается с этого кадра — без кадра теста и его переменных."""
+    try:
+        fn(*args, **kw)
+    except Exception as e:                      # noqa: BLE001 — нужно любое
+        return e
+    raise AssertionError("ждали отказ вызова")
 
-    def __repr__(self) -> str:
-        return "<скрыт>"
+
+def leaks(exc: BaseException, secret: str) -> bool:
+    """Значение secret есть в трассировке exc так, как её печатал бы pytest при --tb=long --showlocals: аргументы и
+    локальные переменные каждого кадра, с цепочкой причин, — строже вывода по умолчанию. Два вида: с обрезкой
+    значений, как по умолчанию, и без неё. Без обрезки длинное значение pprint режет на куски по строкам ('…'\n 'b…'),
+    и они склеиваются обратно; подсветка исходника (ANSI) снимается."""
+    info = pytest.ExceptionInfo.from_exception(exc)
+    for cut in (True, False):
+        text = re.sub(r"\x1b\[[0-9;]*m", "", str(info.getrepr(style="long", showlocals=True, truncate_locals=cut,
+                                                               truncate_args=cut, chain=True)))
+        if str(secret) in text or str(secret) in re.sub(r"""['"]\s*\n\s*b?['"]""", "", text):
+            return True
+    return False
 
 
 def wait_for(pred: Callable[[], bool], timeout: float, step: float = 1.0) -> None:
@@ -183,10 +198,10 @@ def wait_for(pred: Callable[[], bool], timeout: float, step: float = 1.0) -> Non
         time.sleep(step)
 
 
-def secret_forms(pw: str) -> list[str]:
+def secret_forms(pw: str) -> list[Secret]:
     """Виды пароля места, которых не должно быть в журналах: сырой, base64("opencode:"+пароль) и Basic."""
     b64 = base64.b64encode(f"opencode:{pw}".encode("utf-8")).decode("ascii")
-    return [pw, b64, "Basic " + b64]
+    return [Secret(pw), Secret(b64), Secret("Basic " + b64)]
 
 
 def _run(cmd: list[str], *, timeout: float = 120, check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -401,14 +416,15 @@ class Stack:
 
     # --- секреты и агенты мест (файлы фикстуры) ---
 
-    def password(self, n: int) -> str:
-        return (self.secrets_dir / f"student-{n:02d}.pw").read_text(encoding="ascii")
+    # секреты мест — Secret: в трассировке pytest «<скрыт>» (итоговое ревью Д6а, P7)
+    def password(self, n: int) -> Secret:
+        return Secret((self.secrets_dir / f"student-{n:02d}.pw").read_text(encoding="ascii"))
 
-    def llm_token(self, n: int) -> str:
-        return (self.secrets_dir / f"student-{n:02d}.llm-token").read_text(encoding="ascii")
+    def llm_token(self, n: int) -> Secret:
+        return Secret((self.secrets_dir / f"student-{n:02d}.llm-token").read_text(encoding="ascii"))
 
-    def data_token(self, n: int) -> str:
-        return (self.secrets_dir / f"student-{n:02d}.data-token").read_text(encoding="ascii")
+    def data_token(self, n: int) -> Secret:
+        return Secret((self.secrets_dir / f"student-{n:02d}.data-token").read_text(encoding="ascii"))
 
     def agents_dir(self, n: int) -> Path:
         return self.agents_root / f"student-{n:02d}"

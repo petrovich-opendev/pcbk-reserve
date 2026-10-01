@@ -23,7 +23,7 @@ import pytest
 
 import cdp
 import conftest
-from conftest import REPO, STAND_ORIGIN, Secret
+from conftest import REPO, STAND_ORIGIN, Secret, failure, leaks
 from gateway_cases import ALLOWED, OC, SES_FAKE, TWINS
 
 STAND = "https://stand.pcbk.test:18443"
@@ -43,6 +43,18 @@ RUNNING_JS = "!!document.querySelector('.composer .stop')"
 # permission, question), все — разом. Остановленная обёртка дальше в сеть не ходит, так что отказов (401, 503) — не больше
 # одного круга, иначе это шторм (Review Focus 2)
 RECONNECT_ROUND = 6
+# что веб хранит в браузере: [записей localStorage и sessionStorage, баз IndexedDB, document.cookie]; проба кладёт
+# по записи в оба хранилища, базу и cookie без HttpOnly, уборка их снимает
+STORED_JS = ("(async () => [localStorage.length + sessionStorage.length, (await indexedDB.databases()).length, "
+             "document.cookie])()")
+STORE_PROBE_JS = ("(async () => { localStorage.setItem('pcbk-probe', '1'); sessionStorage.setItem('pcbk-probe', '1'); "
+                  "document.cookie = 'pcbk-probe=1; path=/chat/; SameSite=Strict'; await new Promise((ok, no) => { "
+                  "const r = indexedDB.open('pcbk-probe'); r.onsuccess = () => { r.result.close(); ok(1); }; "
+                  "r.onerror = () => no(r.error); }); return 1; })()")
+STORE_CLEAN_JS = ("(async () => { localStorage.removeItem('pcbk-probe'); sessionStorage.removeItem('pcbk-probe'); "
+                  "document.cookie = 'pcbk-probe=; path=/chat/; max-age=0'; await new Promise((ok, no) => { "
+                  "const r = indexedDB.deleteDatabase('pcbk-probe'); r.onsuccess = () => ok(1); "
+                  "r.onerror = () => no(r.error); }); return 1; })()")
 # форма входа видна: /me ответил 401 (без сессии); при живой сессии форма так и остаётся скрытой
 LOGIN_FORM_JS = "(() => { const e = document.getElementById('login'); return !!e && e.getClientRects().length > 0; })()"
 # строка «Веб-чат» страницы состояния — в середину экрана (для снимка 04)
@@ -154,11 +166,12 @@ def tool_output(stack, n: int, sid: str, tool: str) -> str:
     return outs[-1]
 
 
-def not_allowed(stack, reqs: list[dict]) -> list[tuple[str, str]]:
-    """Запросы вкладки под /pcbk/api/oc/, которым нет правила белого списка шлюза, — одной сверкой в образе core
-    (rules.match, те же 15 правил; путь без /pcbk/api/oc и без «?…»). Контроль в той же сверке: разрешённые пары
-    проходят, «близнецы» — нет, иначе пустой ответ ничего бы не значил."""
-    pairs = [[r["method"], r["path"][len(OC):]] for r in reqs]
+def not_allowed(stack, calls: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Пары (метод, путь без «?…») запросов вкладки под /pcbk/api/oc/, которым нет правила белого списка шлюза, —
+    одной сверкой в образе core (rules.match, те же 15 правил; путь без /pcbk/api/oc). Контроль в той же сверке:
+    разрешённые пары проходят, «близнецы» — нет, иначе пустой ответ ничего бы не значил. На входе — пары, а не записи
+    запросов (итоговое ревью Д6а, P6)."""
+    pairs = [[m, p[len(OC):]] for m, p in calls]
     assert pairs, "вкладка не ходила в /pcbk/api/oc/ — сверять нечего"
     names = json.loads(stack._docker("exec", "pcbk-core", "python", "-c", RULES_PY,
                                      json.dumps(pairs + RULES_CONTROL_OK + RULES_CONTROL_NO)).stdout)
@@ -181,29 +194,6 @@ def shot(page, name: str) -> None:
     where = os.environ.get("PCBK_SHOTS")
     if where:
         page.screenshot(Path(where) / name)
-
-
-def failure(fn, *args, **kw) -> BaseException:
-    """Исключение вызова fn; его трассировка начинается с этого кадра — без кадра теста и его переменных."""
-    try:
-        fn(*args, **kw)
-    except Exception as e:                      # noqa: BLE001 — нужно любое
-        return e
-    raise AssertionError("ждали отказ вызова")
-
-
-def leaks(exc: BaseException, secret: Secret) -> bool:
-    """Значение secret есть в трассировке exc так, как её печатал бы pytest при --tb=long --showlocals: аргументы и
-    локальные переменные каждого кадра, с цепочкой причин, — строже вывода по умолчанию. Два вида: с обрезкой
-    значений, как по умолчанию, и без неё. Без обрезки длинное значение pprint режет на куски по строкам ('…'\n 'b…'),
-    и они склеиваются обратно; подсветка исходника (ANSI) снимается."""
-    info = pytest.ExceptionInfo.from_exception(exc)
-    for cut in (True, False):
-        text = re.sub(r"\x1b\[[0-9;]*m", "", str(info.getrepr(style="long", showlocals=True, truncate_locals=cut,
-                                                               truncate_args=cut, chain=True)))
-        if str(secret) in text or str(secret) in re.sub(r"""['"]\s*\n\s*b?['"]""", "", text):
-            return True
-    return False
 
 
 class _BrokenSocket:
@@ -259,12 +249,29 @@ def test_passwords_hidden_in_tracebacks_cdp():                                  
     assert json.loads(json.dumps({"text": probe})) == {"text": str(probe)}               # в браузер уходит значение
 
 
+def test_cookie_hidden_in_tracebacks():                                                  # без стенда: итоговое ревью Д6а, P6
+    cookie = Secret("pcbk_session=" + secrets.token_hex(16))
+    page = cdp.Page.__new__(cdp.Page)
+    page._lock = threading.Lock()
+    page._order = [{"method": "GET", "url": STAND + OC + "/event", "path": OC + "/event", "status": 200, "protocol": "h2",
+                    "headers": {"cookie": str(cookie), "origin": STAND}, "chunks": 3}]
+
+    def check(reqs):
+        raise AssertionError("сбой проверки запросов")
+    assert leaks(failure(check, page._order), cookie)                                     # контроль: сырая запись видна
+    plain = page.requests(OC + "/")
+    assert "headers" not in plain[0] and not leaks(failure(check, plain), cookie)          # по умолчанию — без заголовков
+    full = page.requests(OC + "/", headers=True)
+    assert full[0]["headers"] == {"cookie": str(cookie), "origin": STAND}                 # значения сравниваются как есть
+    assert not leaks(failure(check, full), cookie)                                         # cookie — «<скрыт>»
+
+
 def test_login_leads_to_chat(stack, page, web_users):                                  # Review Focus 1
     assert login_to_chat(page, "web-a", web_users["web-a"]) == "form"                    # первый тест: вход формой
     assert page.wait_text(re.escape(STAND_WARNING), 5) and page.wait_text(r"Стенд работает|Внимание|Сбой", 20)
     assert page.wait_text(r"Вы вошли как web-a", 5)
     assert page.csp() == [] and page.console_errors() == []
-    assets = [(r["path"], r["status"]) for r in page.requests("/chat/assets/")]           # без заголовков: в них cookie
+    assets = [(r["path"], r["status"]) for r in page.requests("/chat/assets/")]
     assert assets and all(status == 200 for _, status in assets), assets
     assert [r["status"] for r in page.requests("/chat/") if r["path"] == "/chat/"] == [200]
     # положительный контроль наблюдателей (доводка 1, I1): без него тихо сломанный слушатель CSP или разбор консоли
@@ -290,14 +297,23 @@ def test_chat_answers_through_gateway(stack, page, web_users):                  
     shot(page, "01-chat-answer.png")
     assert page.csp() == [] and page.console_errors() == []
     assert stack.gw_health()["refused_1h"] == before
-    bad = not_allowed(stack, page.requests("/pcbk/api/oc/"))   # вне assert: pytest показал бы запросы с заголовками
+    bad = not_allowed(stack, [(r["method"], r["path"]) for r in page.requests("/pcbk/api/oc/")])
     assert bad == [], bad                                                                  # те же 15 правил
+    # веб ничего не хранит (Global Constraints Д6): ни localStorage, ни sessionStorage, ни IndexedDB; cookie сессии —
+    # HttpOnly, скрипту её не видно (итоговое ревью Д6а, P5)
+    assert page.eval(STORED_JS) == [0, 0, ""]
+    page.eval(STORE_PROBE_JS)                                                              # положительный контроль
+    try:
+        assert page.eval(STORED_JS) == [2, 1, "pcbk-probe=1"]
+    finally:
+        page.eval(STORE_CLEAN_JS)
+    assert page.eval(STORED_JS) == [0, 0, ""]
 
 
 def test_browser_headers_and_h2_stream(stack, page, web_users):                           # хвост Д5б [?]
     login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)                         # разговор открыт — поток есть
-    posts = [(r["path"], r["headers"].get("sec-fetch-site"), r["headers"].get("origin"))  # не весь запрос: в нём cookie
-             for r in page.requests("/pcbk/api/") if r["method"] == "POST"]
+    posts = [(r["path"], r["headers"].get("sec-fetch-site"), r["headers"].get("origin"))  # заголовки — по запросу (P6)
+             for r in page.requests("/pcbk/api/", headers=True) if r["method"] == "POST"]
     assert posts and all(site == "same-origin" for _, site, _ in posts), posts
     assert all(origin == STAND for _, _, origin in posts), posts                            # при Referrer-Policy no-referrer
     ev = [r["protocol"] for r in page.requests("/pcbk/api/oc/event") if r["status"] == 200]
