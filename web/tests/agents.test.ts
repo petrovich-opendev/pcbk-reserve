@@ -63,6 +63,9 @@ test("parse_agents_contract_fields", () => {
     { agents: [item({ name: "" })], own: 1, limit: 20 }, { agents: [item({ title: null })], own: 1, limit: 20 },
     { agents: [item({ purpose: 3 })], own: 1, limit: 20 }, { agents: [item({ kind: "image" })], own: 1, limit: 20 },
     { agents: [null], own: 1, limit: 20 },
+    // случаи брифа — и с own и limit по договору: отказ из-за элемента, а не из-за верхнего уровня
+    { agents: [{ name: 1 }], own: 1, limit: 20 }, { agents: [item({ state: "odd" })], own: 1, limit: 20 },
+    { agents: [item({ state: "archived" })], own: 1, limit: 20 }, { agents: [item({ name: undefined })], own: 1, limit: 20 },
   ]) expect(parseAgents(bad), JSON.stringify(bad)).toBeNull();
 });
 
