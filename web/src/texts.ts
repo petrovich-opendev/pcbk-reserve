@@ -1,6 +1,6 @@
 // Все строки людям веб-чата (Д6-R39…R44, таблица Д6-R43). Тексты, общие с соседями, сверяют тесты:
-// STAND_WARNING — с login.html, тексты места — с viewFor login.js (tests/workplace.test.ts), MAX_TEXT — с
-// rules.py шлюза, номер предупреждения NOTICES — с NOTICE accounts.py, запасные тексты отказов — с proxy.py и edge
+// STAND_WARNING — с login.html, тексты места — с viewFor login.js (tests/workplace.test.ts), MAX_TEXT и MAX_TITLE —
+// с rules.py шлюза, номер предупреждения NOTICES — с NOTICE accounts.py, запасные тексты отказов — с proxy.py и edge
 // (tests/texts.test.ts).
 
 // предупреждение «учебный стенд» — тот же текст, что .stand на login.html (R44)
@@ -57,6 +57,23 @@ export const T_TOOL_ERROR = "ошибка";
 export const T_TOOL_LINE = (what: string, state: string): string => `Запрос к данным: ${what} — ${state}`;
 export const T_PENDING = "Агент ждёт ответа, которого этот чат пока не умеет дать";
 export const T_REJECT = "Отклонить";
+
+// --- список разговоров слева (R52): «В архив» и «Переименовать»; «Из архива» и «Удалить» нет ---
+export const MAX_TITLE = 200;                           // имя разговора — 1–200 знаков, MAX_TITLE правил шлюза (Н20)
+export const T_THREADS = "Разговоры";                   // подпись списка для чтения с экрана
+export const T_UNTITLED = "Без названия";
+export const T_ARCHIVE = "В архив";
+export const T_RENAME = "Переименовать";
+export const T_RENAME_FIELD = "Новое имя разговора";
+export const T_RENAME_SAVE = "Сохранить";
+export const T_RENAME_CANCEL = "Отмена";
+export const T_RENAME_HINT = `Имя разговора — от 1 до ${MAX_TITLE} знаков`;
+
+// --- молчание в браузере (R51): строка хода и сбой интерфейса; отчёт уходит администратору ---
+export const T_TURN_SILENT =
+  "Ответа нет уже 3 минуты. Можно нажать «Стоп» и спросить снова — сбой отмечен для администратора.";
+export const T_UI_CRASH = "Чат столкнулся с ошибкой. Сбой отмечен для администратора.";
+export const T_UI_RESTART = "Перезапустить чат";
 
 // --- отказы шлюза (таблица R43) ---
 export const T_SIGNED_OUT = "Сессия закончилась — войдите снова";

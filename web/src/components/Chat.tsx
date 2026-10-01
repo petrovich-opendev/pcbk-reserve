@@ -2,21 +2,26 @@
 // монтирование. Размонтирование (401, «место спит», «Выйти») закрывает поток адаптера (registry.dispose), а
 // новое монтирование после «Разбудить» открывает последний разговор (initialSessionId от App).
 // Без defaultAgent и defaultModel (агента выбирает default_agent места) и без adapters (нет вложений).
+// Д6б: список разговоров слева (R52) и сторожа молчания (R51): ход без прироста ответа 3 мин — строка и отчёт
+// turn_silent (один на ход), связь с потоком потеряна дольше 2 мин — отчёт stream_down при восстановлении (один на
+// эпизод). Отчёт уходит через onReport, пока чат смонтирован и обёртка не остановлена (после 401 и «спит» — нет).
 import {
   createOpencodeClient, useOpenCodePermissions, useOpenCodeQuestions, useOpenCodeRuntime,
   useOpenCodeRuntimeExtras, type OpenCodePermissionRequest, type OpenCodeQuestionRequest,
 } from "@assistant-ui/react-opencode";
-import { ThreadListPrimitive } from "@assistant-ui/react";
 import { useEffect, useRef, useState } from "react";
 import { createGatewayFetch, explainError, streamLine } from "../gateway";
-import { T_NEW_THREAD } from "../texts";
+import { T_TURN_SILENT } from "../texts";
+import { createStreamWatch, useTurnWatch } from "../watch";
 import { ChatView } from "./ChatView";
 import { PendingInteractions } from "./PendingInteractions";
+import { ThreadSidebar } from "./ThreadSidebar";
 
 export interface ChatProps {
   onHalt(kind: "signed_out" | "asleep"): void;
   initialSessionId?: string;
   onThreadIdChange?(id: string | undefined): void;
+  onReport?(kind: "turn_silent" | "stream_down"): void;   // отчёт браузера о молчании (R51)
 }
 
 // Висящие разрешения и вопросы — из хуков адаптера. Хуки с запасным значением работают и до того, как у
@@ -62,14 +67,24 @@ export function Chat(p: ChatProps) {
     setError(text);
   }).current;
 
+  // отчёт — пока чат смонтирован и обёртка не остановлена: снятому или остановленному чату сессии уже нет
+  const report = useRef((kind: "turn_silent" | "stream_down"): void => {
+    if (halted.current || !mounted.current) return;
+    props.current.onReport?.(kind);
+  }).current;
+
   // клиент и обёртка — один раз на монтирование: useOpenCodeRuntime держит реестр потока по клиенту
   const [client] = useState(() => {
+    const streamWatch = createStreamWatch({ now: () => Date.now(), onRecoveredAfterLongDown: () => report("stream_down") });
     const gatewayFetch = createGatewayFetch({
       onHalt: (kind) => {
         halted.current = true;
         props.current.onHalt(kind);
       },
-      onStream: (s) => setStream(streamLine(s)),
+      onStream: (s) => {
+        setStream(streamLine(s));
+        streamWatch.onStream(s);
+      },
     });
     // SDK зовёт fetch всегда с готовым Request (обёртка другого не принимает)
     return createOpencodeClient({ baseUrl: `${location.origin}/pcbk/api/oc`, fetch: gatewayFetch as typeof fetch });
@@ -102,13 +117,17 @@ export function Chat(p: ChatProps) {
     });
   }, [runtime]);
 
+  // ход без прироста ответа: строка над полем ввода и отчёт (Ф11 — начало хода по isRunning, не по onNew)
+  const silent = useTurnWatch(runtime, { onSilent: () => report("turn_silent") });
+
   return (
     <ChatView
       runtime={runtime}
       streamLine={stream ?? undefined}
+      silentLine={silent ? T_TURN_SILENT : undefined}
       error={error || undefined}
       pending={<RuntimePending onError={onError} />}
-      toolbar={<ThreadListPrimitive.New className="new-thread">{T_NEW_THREAD}</ThreadListPrimitive.New>}
+      sidebar={<ThreadSidebar runtime={runtime} onError={onError} />}
     />
   );
 }

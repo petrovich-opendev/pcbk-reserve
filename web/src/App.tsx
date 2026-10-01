@@ -4,9 +4,14 @@
 // Поля notice нет (core Д5) — как null (== null); номер без текста в NOTICES — ошибка без «Понятно» (Ф14).
 // Конец сессии в любой фазе и «Выйти» — на /login. Шапка — во всех фазах, кроме загрузки. App помнит последний
 // открытый разговор (onThreadIdChange) и после «Разбудить» монтирует чат с ним.
+// Молчание в браузере (R51): старт отмечается загрузчику (window.__pcbkStarted) при монтировании App, ещё до ответа
+// /me — экран места или предупреждения дольше 20 с не дают ложного boot_failed (preflight Ф9); без загрузчика (edge
+// до Д6б, откат) App работает. Чат — внутри ErrorBoundary: сбой отрисовки — отчёт ui_crash и «Перезапустить чат».
+// Отчёты чата (turn_silent, stream_down) уходят через api.report — только от нынешнего чата и не при уходе на вход.
 import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
-import { replyText, type Api, type Reply } from "./api";
+import { replyText, type Api, type ReportKind, type Reply } from "./api";
 import { Chat, type ChatProps } from "./components/Chat";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Header } from "./components/Header";
 import { NoticeScreen } from "./components/NoticeScreen";
 import { WorkplaceScreen } from "./components/WorkplaceScreen";
@@ -36,6 +41,12 @@ type Phase =
 // notice — как пришло: номер редакции, null — подтверждено, undefined — поля нет (core Д5)
 interface Who { login: string; role: "student" | "teacher"; place: string | null; notice: unknown }
 
+declare global {
+  interface Window {
+    __pcbkStarted?: () => void;           // загрузчик boot.js (R51): чат запустился, boot_failed больше не нужен
+  }
+}
+
 const LOGIN_URL = "/login";
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object";
@@ -61,6 +72,20 @@ export function App(p: AppProps) {
   const lastSession = useRef<string | undefined>(undefined);
   const mounts = useRef(0);                             // номер монтирования чата
   const leaving = useRef(false);
+  const started = useRef(false);
+
+  // старт — при первом показе App (фаза «загрузка»), один раз; функции нет — загрузчика нет, ничего не делаем
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    window.__pcbkStarted?.();
+  }, []);
+
+  // отчёт браузера: ответ не нужен, ошибка не повторяется; при уходе на вход сессии уже нет
+  const report = useCallback((kind: ReportKind): void => {
+    if (leaving.current) return;
+    void props.current.api.report(kind).catch(() => undefined);
+  }, []);
 
   const goLogin = useCallback((): void => {
     if (leaving.current) return;
@@ -171,16 +196,18 @@ export function App(p: AppProps) {
     case "chat": {
       const mount = phase.mount;
       body = (
-        <ChatImpl
-          key={mount}
-          initialSessionId={phase.sessionId}
-          onThreadIdChange={(id) => { if (mount === mounts.current) lastSession.current = id; }}
-          onHalt={(kind) => {
-            if (mount !== mounts.current) return;       // снятый чат не решает за нынешний
-            if (kind === "signed_out") goLogin();
-            else setPhase({ kind: "asleep" });
-          }}
-        />
+        <ErrorBoundary key={mount} onCrash={() => report("ui_crash")}>
+          <ChatImpl
+            initialSessionId={phase.sessionId}
+            onThreadIdChange={(id) => { if (mount === mounts.current) lastSession.current = id; }}
+            onHalt={(kind) => {
+              if (mount !== mounts.current) return;     // снятый чат не решает за нынешний
+              if (kind === "signed_out") goLogin();
+              else setPhase({ kind: "asleep" });
+            }}
+            onReport={(kind) => { if (mount === mounts.current) report(kind); }}
+          />
+        </ErrorBoundary>
       );
       break;
     }

@@ -1,4 +1,5 @@
-// Вызовы шлюза вне OpenCode (Д6-R39, R49): вход, выход, подтверждение предупреждения и рабочее место. Тот же вид запроса, что call() страницы
+// Вызовы шлюза вне OpenCode (Д6-R39, R49, R50): вход, выход, подтверждение предупреждения, рабочее место и отчёты
+// браузера о молчании чата. Тот же вид запроса, что call() страницы
 // входа: cookie сессии своего сайта (HttpOnly — её ставит и стирает шлюз), Accept JSON, тело — только JSON.
 // Ответ — всегда Reply: сеть оборвалась — status 0, тело не JSON — текст как есть.
 import { T_DOWN, T_UNKNOWN } from "./texts";
@@ -31,12 +32,16 @@ export async function callJson(method: "GET" | "POST", path: string, body?: unkn
   }
 }
 
+// виды отчётов браузера (R50): boot_failed шлёт загрузчик boot.js, прочие — чат
+export type ReportKind = "boot_failed" | "ui_crash" | "turn_silent" | "stream_down";
+
 export interface Api {
   me(): Promise<Reply>;
   logout(): Promise<Reply>;
   wake(): Promise<Reply>;
   workplace(): Promise<Reply>;
   ackNotice(notice: string): Promise<Reply>;          // тело ровно {"notice": N}; ответ — 204 (R49)
+  report(kind: ReportKind): Promise<void>;            // тело ровно {"kind": K}; ответ не читается, ошибки глушатся (R51)
 }
 
 export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
@@ -46,6 +51,14 @@ export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
     wake: () => callJson("POST", "/pcbk/api/workplace/wake", undefined, fetchImpl),
     workplace: () => callJson("GET", "/pcbk/api/workplace", undefined, fetchImpl),
     ackNotice: (notice) => callJson("POST", "/pcbk/api/auth/notice", { notice }, fetchImpl),
+    // отчёт не повторяется (в том числе 404 старого core и 429 предела): потерянный отчёт дешевле шторма
+    report: async (kind) => {
+      try {
+        await callJson("POST", "/pcbk/api/web/report", { kind }, fetchImpl);
+      } catch {
+        /* отчёт не ушёл — второй попытки нет */
+      }
+    },
   };
 }
 

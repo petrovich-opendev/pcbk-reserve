@@ -29,6 +29,7 @@ function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: An
     wake: vi.fn(queue(o.wake)),
     logout: vi.fn(queue(o.logout ?? [200, { ok: true }])),
     ackNotice: vi.fn(queue(o.ackNotice)),
+    report: vi.fn(async (_kind: string) => {}),
   } satisfies Api;
 }
 

@@ -3,7 +3,7 @@
 // шлюза, запасные тексты отказов — с текстами шлюза и edge (веб показывает их, когда в ответе нет своего).
 import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
-import { MAX_TEXT, NOTICES, STAND_WARNING, T_BUSY, T_DOWN, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
+import { MAX_TEXT, MAX_TITLE, NOTICES, STAND_WARNING, T_BUSY, T_DOWN, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
 
 test("stand_warning_same_as_login_page", () => {
   const html = readFileSync("../edge/static/login.html", "utf8");
@@ -34,4 +34,8 @@ test("notice_number_same_as_core", () => {                                      
   // Текст редакции закреплён: новый текст — новый номер (и в accounts.py), иначе студент «подтвердит» то, чего не видел
   expect(NOTICES.get("teacher-reads-1")).toBe(
     "Преподаватель видит ваши разговоры и агентов на этом стенде (только чтение). Не пишите сюда пароли и личные данные.");
+});
+
+test("max_title_same_as_gateway_rules", () => {                                   // preflight Н20: имя разговора 1–200 знаков
+  expect(readFileSync("../core/pcbk_core/gateway/rules.py", "utf8")).toMatch(new RegExp(`^MAX_TITLE = ${MAX_TITLE}$`, "m"));
 });

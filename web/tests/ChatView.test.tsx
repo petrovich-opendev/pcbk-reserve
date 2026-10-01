@@ -7,7 +7,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { Chat } from "../src/components/Chat";
 import { ChatView } from "../src/components/ChatView";
 import { PendingInteractions } from "../src/components/PendingInteractions";
-import { MAX_TEXT, T_TOO_MANY_TABS } from "../src/texts";
+import { MAX_TEXT, T_TOO_MANY_TABS, T_TURN_SILENT } from "../src/texts";
 
 type Status = NonNullable<ThreadMessageLike["status"]>;
 const DONE: Status = { type: "complete", reason: "stop" };
@@ -355,4 +355,127 @@ test("chat_client_once_per_mount", async () => {
   rerender(<Chat onHalt={vi.fn()} />);
   await sleep(100);
   expect(calls.filter((c) => c.path === "/pcbk/api/oc/experimental/session")).toHaveLength(1);
+});
+
+// --- Д6б: список слева, молчание хода и потеря связи (R51, R52; preflight Ф11, Ф13) ---
+
+// поток /event, в который тест дописывает события сам (после того как разговор загрузился)
+function controlledEvents() {
+  const enc = new TextEncoder();
+  let ctl: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const response = () => new Response(new ReadableStream<Uint8Array>({
+    start(c) {
+      ctl = c;
+      c.enqueue(enc.encode(`data: ${JSON.stringify({ type: "server.connected", properties: {} })}\n\n`));
+    },
+    cancel() { ctl = null; },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  const push = (...events: object[]) => { for (const e of events) ctl?.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`)); };
+  return { response, push };
+}
+
+test("chat_sidebar_title_follows_session", async () => {
+  // Ф13: имя открытого разговора — из useOpenCodeSession; адаптер кладёт session.updated в разговор, а не в список,
+  // поэтому список перечитывается при смене имени — один раз, а не на каждое session.updated (limit_req 20 r/s)
+  let lists = 0;
+  const named = (title: string, updated = 1) => ({ ...SESSION, title, time: { created: 1, updated } });
+  const events = controlledEvents();
+  stubOpenSession((_method, path) => {
+    if (path === "/pcbk/api/oc/experimental/session") {
+      lists += 1;
+      return ocJson(200, [named(lists === 1 ? "New session - 2026-10-01" : "Значение T1")]);
+    }
+    if (path === `/pcbk/api/oc/session/${SES}`) return ocJson(200, named("New session - 2026-10-01"));
+    if (path === "/pcbk/api/oc/event") return events.response();
+    return undefined;
+  });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES} />);
+  const row = () => container.querySelector(`[data-session-id="${SES}"]`)?.textContent ?? "";
+  await waitFor(() => expect(row()).toContain("New session - 2026-10-01"));
+  await sleep(100);
+  expect(lists).toBe(1);                                                    // имена сходятся — список не перечитан
+  events.push({ type: "session.updated", properties: { info: named("Значение T1", 2) } });     // самозаголовок OpenCode
+  await waitFor(() => expect(row()).toContain("Значение T1"));
+  expect(lists).toBe(2);
+  events.push({ type: "session.updated", properties: { info: named("Значение T1", 3) } },      // то же имя — не перечитывать
+              { type: "session.updated", properties: { info: named("Значение T1", 4) } });
+  await sleep(150);
+  expect(lists).toBe(2);
+});
+
+// видимость вкладки в jsdom: своё свойство поверх геттера документа
+function setVisibility(state: "visible" | "hidden"): void {
+  Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+test("chat_reports_turn_silent_once", async () => {
+  // Ф11: начало хода — isRunning false → true (session.status busy), часы — Date.now; вкладка в фоне
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  stubOpenSession((_method, path) => path === "/pcbk/api/oc/event" ? eventStream([
+    { type: "server.connected", properties: {} },
+    { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } },
+  ]) : undefined);
+  const onReport = vi.fn();
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
+  await screen.findByRole("button", { name: "Стоп" });                        // ход идёт
+  try {
+    setVisibility("hidden");
+    now += 181_000;                                                           // 3 мин без прироста ответа
+    await waitFor(() => expect(onReport).toHaveBeenCalledWith("turn_silent"), { timeout: 3000 });   // тик раз в секунду
+    expect(await screen.findByText(T_TURN_SILENT)).toBeTruthy();
+    await sleep(1_500);
+    expect(onReport).toHaveBeenCalledTimes(1);                                // один на ход
+  } finally {
+    delete (document as { visibilityState?: unknown }).visibilityState;
+  }
+});
+
+test("chat_reports_stream_down_after_long_outage", async () => {
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  let events = 0;
+  stubOpenSession((_method, path) => {
+    if (path !== "/pcbk/api/oc/event") return undefined;
+    events += 1;
+    if (events === 1) return ocJson(503, { name: "Unavailable", data: { message: "Серверный слой не отвечает" } });
+    now += 130_000;                                                           // связи не было 130 с
+    return eventStream([{ type: "server.connected", properties: {} }]);
+  });
+  const onReport = vi.fn();
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
+  await waitFor(() => expect(onReport).toHaveBeenCalledWith("stream_down"), { timeout: 4000 });   // при восстановлении
+  await sleep(100);
+  expect(onReport).toHaveBeenCalledTimes(1);
+  expect(events).toBe(2);
+});
+
+test("chat_no_reports_after_halt", async () => {
+  // без сессии отчёты не шлются: место уснуло посреди хода (503 WorkplaceNotReady на «Стоп») — чат остановлен,
+  // сторож хода дотикал до 3 минут, а отчёта нет (App снимет чат, но до того отчёт уже ушёл бы впустую)
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  stubOpenSession((method, path) => {
+    if (path === "/pcbk/api/oc/event") return eventStream([
+      { type: "server.connected", properties: {} },
+      { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } },
+    ]);
+    if (method === "POST" && path.endsWith("/abort"))
+      return ocJson(503, { name: "WorkplaceNotReady", data: { message: "Рабочее место спит" } });
+    return undefined;
+  });
+  const onReport = vi.fn(); const onHalt = vi.fn();
+  render(<Chat onHalt={onHalt} initialSessionId={SES} onReport={onReport} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Стоп" }));
+  await waitFor(() => expect(onHalt).toHaveBeenCalledWith("asleep"));
+  try {
+    setVisibility("hidden");
+    now += 181_000;
+    await sleep(1_500);                                                       // тик был — ход всё ещё «идёт»
+    expect(onReport).not.toHaveBeenCalled();
+  } finally {
+    delete (document as { visibilityState?: unknown }).visibilityState;
+  }
 });
