@@ -1,6 +1,7 @@
 // Все строки людям веб-чата (Д6-R39…R44, таблица Д6-R43). Тексты, общие с соседями, сверяют тесты:
 // STAND_WARNING — с login.html, тексты места — с viewFor login.js (tests/workplace.test.ts), MAX_TEXT — с
-// rules.py шлюза, запасные тексты отказов — с proxy.py и edge (tests/texts.test.ts).
+// rules.py шлюза, номер предупреждения NOTICES — с NOTICE accounts.py, запасные тексты отказов — с proxy.py и edge
+// (tests/texts.test.ts).
 
 // предупреждение «учебный стенд» — тот же текст, что .stand на login.html (R44)
 export const STAND_WARNING =
@@ -21,6 +22,17 @@ export const T_SIGNED_IN = (login: string): string => `Вы вошли как ${
 export const T_LOGOUT = "Выйти";
 export const T_RETRY = "Повторить";
 export const T_TEACHER = "У преподавателя пока нет чата — он появится в следующих выпусках стенда.";
+
+// --- предупреждение при первом входе (R49) ---
+// Номер редакции живёт в core (NOTICE accounts.py), текст — здесь. Новый текст — новый номер в обоих местах: иначе
+// студент «подтвердит» текст, которого не видел. Номер, которого здесь нет, не подтверждается (preflight Ф14).
+export const NOTICES: ReadonlyMap<string, string> = new Map([
+  ["teacher-reads-1",
+   "Преподаватель видит ваши разговоры и агентов на этом стенде (только чтение). Не пишите сюда пароли и личные данные."],
+]);
+export const T_NOTICE_ACK = "Понятно";
+export const T_NOTICE_UNKNOWN =
+  "Стенд просит подтвердить предупреждение, которого эта версия чата не знает — обновите страницу или сообщите преподавателю.";
 
 // --- рабочее место: те же тексты, что viewFor страницы входа (R39) ---
 export const T_PLACE_PREPARING = "Готовлю рабочее место…";

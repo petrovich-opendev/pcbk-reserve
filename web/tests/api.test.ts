@@ -41,3 +41,13 @@ test("call_json_network_and_html", async () => {
   const cut = recorder(() => Promise.resolve(new Response(new ReadableStream({ start(c) { c.error(new TypeError("reset")); } }), { status: 200 })));
   expect(await callJson("GET", "/pcbk/api/workplace", undefined, cut.fetchImpl)).toEqual({ status: 0, body: null });  // обрыв тела — как сеть
 });
+
+test("ack_notice_posts_exact_body", async () => {                                // Д6-R49: тело ровно {"notice": N}
+  const { seen, fetchImpl } = recorder(() => Promise.resolve(new Response(null, { status: 204 })));
+  const r = await createApi(fetchImpl).ackNotice("teacher-reads-1");
+  expect(r.status).toBe(204);
+  expect(seen.map((s) => `${s.init.method} ${s.path}`)).toEqual(["POST /pcbk/api/auth/notice"]);
+  expect(seen[0].init.credentials).toBe("same-origin");
+  expect(seen[0].init.headers).toEqual({ Accept: "application/json", "Content-Type": "application/json" });
+  expect(seen[0].init.body).toBe('{"notice":"teacher-reads-1"}');
+});

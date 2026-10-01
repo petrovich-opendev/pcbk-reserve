@@ -3,7 +3,7 @@
 // шлюза, запасные тексты отказов — с текстами шлюза и edge (веб показывает их, когда в ответе нет своего).
 import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
-import { MAX_TEXT, STAND_WARNING, T_BUSY, T_DOWN, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
+import { MAX_TEXT, NOTICES, STAND_WARNING, T_BUSY, T_DOWN, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
 
 test("stand_warning_same_as_login_page", () => {
   const html = readFileSync("../edge/static/login.html", "utf8");
@@ -25,4 +25,13 @@ test("fallback_texts_same_as_gateway", () => {
 
 test("tool_labels", () => {
   expect(TOOL_LABELS).toEqual({ pcbk_tag_now: "текущее значение", pcbk_tag_period: "сводка за период", pcbk_catalog_search: "поиск тегов" });
+});
+
+test("notice_number_same_as_core", () => {                                        // preflight Ф14: номер — в core, текст — здесь
+  const m = /^NOTICE = "([a-z0-9-]+)"$/m.exec(readFileSync("../core/pcbk_core/gateway/accounts.py", "utf8"));
+  expect(m).not.toBeNull();
+  expect([...NOTICES.keys()]).toEqual([m![1]]);                                  // текст есть ровно у номера core
+  // Текст редакции закреплён: новый текст — новый номер (и в accounts.py), иначе студент «подтвердит» то, чего не видел
+  expect(NOTICES.get("teacher-reads-1")).toBe(
+    "Преподаватель видит ваши разговоры и агентов на этом стенде (только чтение). Не пишите сюда пароли и личные данные.");
 });

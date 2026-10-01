@@ -1,9 +1,11 @@
-"""Ручки шлюза (Д5-R25…R27, Д5-R31): вход, выход, «кто я», рабочее место и его пробуждение.
+"""Ручки шлюза (Д5-R25…R27, Д5-R31): вход, выход, «кто я», предупреждение при первом входе (Д6-R49), рабочее место и
+его пробуждение.
 
 Все пути — под /pcbk/api/, ответы об ошибках — JSON вида OpenCode {"name", "data": {"message"}} без
 WWW-Authenticate. Порядок проверок: зона (front_only, вне pcbk-front — 404) → ошибка настройки (configured,
-503) → источник записи (Origin или Sec-Fetch-Site, 403) → сессия (current_account, 401); у пробуждения места —
-сессия раньше источника (остаток Д5б): запрос без учётки — 401 без строки журнала и счётчика origin_refused.
+503) → источник записи (Origin или Sec-Fetch-Site, 403) → сессия (current_account, 401); у пробуждения места и
+подтверждения предупреждения — сессия раньше источника (остаток Д5б, preflight Д6б Ф10): запрос без учётки — 401 без
+строки журнала и счётчика origin_refused.
 Строка «gw origin refused» — одна на ручку за ORIGIN_LOG_S с n= и since_s=. Зависимости отказывают исключением
 GatewayRefusal с готовым ответом; его отдаёт обработчик HTTPException роли, поставленный через реестр
 hooks_of(app).http_exception.
@@ -12,6 +14,12 @@ hooks_of(app).http_exception.
 Две и больше pcbk_session в запросе — все предъявленные сессии закрываются, 401 и набор удалений cookie
 (clear_cookies): строки собираются здесь, короткие, сумма байт ограничена COOKIE_HEADERS_BUDGET при любом
 Host. Номер места — только из учётки сессии.
+
+«Кто я» (GET /pcbk/api/auth/me) — учётка сессии и "notice": NOTICE, если студент не подтвердил эту редакцию
+предупреждения, иначе (и у преподавателя) null; сбой базы на этом чтении — 503 store, как у сессии. Ответ входа
+предупреждения не несёт. Подтверждение — POST /pcbk/api/auth/notice с телом ровно {"notice": NOTICE}: 204 (повтор —
+тоже 204), иной номер или тело — 400 bad_body, строка журнала «gw notice ack login=… notice=…». Место ни «кто я», ни
+подтверждение не будят: будит только POST /pcbk/api/workplace/wake.
 
 Вход: замок (store.locked вместе с незаписанными неудачами логина) → очередь сверок (не больше
 LOGIN_PARALLEL попыток разом, ждущих — не больше LOGIN_QUEUE, незаписанных неудач — не больше LOGIN_BACKLOG,
@@ -41,7 +49,7 @@ from starlette.types import Receive, Scope, Send
 from .. import zones
 from ..hooks import safe_path
 from . import clip
-from .accounts import Account, AccountStore, StoreError, login_key
+from .accounts import NOTICE, Account, AccountStore, StoreError, login_key
 
 if TYPE_CHECKING:
     from . import GatewayRole
@@ -409,10 +417,31 @@ def _place_nn(place: int | None) -> str:
     return "-" if place is None else f"{place:02d}"
 
 
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
+    """object_pairs_hook: повтор ключа — тело не того вида."""
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("повтор ключа")
+    return obj
+
+
+def notice_of(raw: bytes) -> str | None:
+    """Номер предупреждения из тела ровно {"notice": NOTICE} — нынешней редакции; иначе None. Номер ни в ответ, ни в
+    журнал не идёт как ввод клиента: дальше в ход идёт только NOTICE."""
+    try:
+        body = json.loads(raw, object_pairs_hook=_unique_keys)
+    except (ValueError, RecursionError):   # в том числе UnicodeDecodeError
+        return None
+    if not isinstance(body, dict) or set(body) != {"notice"} or body["notice"] != NOTICE:
+        return None
+    return NOTICE
+
+
 def auth_router(role: "GatewayRole") -> APIRouter:
-    """POST /pcbk/api/auth/login, POST /pcbk/api/auth/logout, GET /pcbk/api/auth/me."""
+    """POST /pcbk/api/auth/login, POST /pcbk/api/auth/logout, GET /pcbk/api/auth/me, POST /pcbk/api/auth/notice."""
     router = APIRouter()
-    origin = Depends(origin_checked(role))
+    check_origin = origin_checked(role)
+    origin = Depends(check_origin)
     account_of = current_account(role)
 
     @router.post(f"{PREFIX}/auth/login", dependencies=[origin])
@@ -464,7 +493,29 @@ def auth_router(role: "GatewayRole") -> APIRouter:
 
     @router.get(f"{PREFIX}/auth/me")
     async def me(account: Account = Depends(account_of)) -> JSONResponse:
-        return JSONResponse(account.to_json())
+        notice = None                   # у преподавателя предупреждения нет (Д6-R49) — и чтения базы
+        if account.role == "student":
+            try:
+                acked = await asyncio.to_thread(role.store.notice_acked, account.login, NOTICE)
+            except StoreError:
+                return _error(503, "store")
+            notice = None if acked else NOTICE
+        return JSONResponse({**account.to_json(), "notice": notice})
+
+    @router.post(f"{PREFIX}/auth/notice")
+    async def notice(request: Request, account: Account = Depends(account_of)) -> Response:
+        await check_origin(request)     # после сессии (Ф10): без учётки — 401, ни строки, ни счётчика
+        acked = notice_of(await request.body())
+        if acked is None:
+            return _error(400, "bad_body")
+        try:
+            await asyncio.to_thread(role.store.ack_notice, account.login, acked)
+        except StoreError:
+            return _error(503, "store")
+        except ValueError:              # учётку отключили между сессией и записью — как конец сессии
+            return _error(401, "need_login")
+        log.info("gw notice ack login=%s notice=%s", account.login, acked)
+        return Response(status_code=204)
 
     return router
 

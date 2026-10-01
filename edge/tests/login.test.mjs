@@ -106,10 +106,13 @@ function harness(routes) {
 const NEED_LOGIN = [401, { name: "Unauthorized", data: { message: "Нужно войти" } }];
 const STU = { login: "stu-03", role: "student", place: "03" };
 const place = (state, detail = "") => ({ place: "03", state, detail });
+// /me: первый вопрос страницы — без сессии, после входа (Д6б) — учётка; ответ входа предупреждения не несёт
+const meAfterLogin = (account) => (n) => (n === 1 ? NEED_LOGIN : [200, account]);
+const NOTICE = "teacher-reads-1";
 
 test("вход студента: форма, «Готовлю…», потом «готово»", async () => {
   const h = harness({
-    "GET /pcbk/api/auth/me": NEED_LOGIN,
+    "GET /pcbk/api/auth/me": meAfterLogin(STU),
     "POST /pcbk/api/auth/login": [200, STU],
     "POST /pcbk/api/workplace/wake": [202, place("starting")],
     "GET /pcbk/api/workplace": (n) => [200, place(n < 2 ? "starting" : "ready")],
@@ -136,6 +139,8 @@ test("вход студента: форма, «Готовлю…», потом �
   assert.equal(h.els.logout.hidden, false);
   assert.equal(h.els.state.textContent, "Готовлю рабочее место…");
   assert.equal(h.count("POST /pcbk/api/workplace/wake"), 1);
+  assert.deepEqual(h.calls.map((c) => c.key), ["GET /pcbk/api/auth/me", "POST /pcbk/api/auth/login",
+                                               "GET /pcbk/api/auth/me", "POST /pcbk/api/workplace/wake"]);   // будит после /me
   for (const c of h.calls) assert.equal(c.init.credentials, "same-origin", c.key);
 
   await h.advance(1000);
@@ -308,7 +313,7 @@ test("ответ, пришедший после выхода или срока, 
 test("ready_navigates_to_chat_once", async () => {
   assert.equal(CHAT_URL, "/chat/");
   const h = harness({
-    "GET /pcbk/api/auth/me": NEED_LOGIN,
+    "GET /pcbk/api/auth/me": meAfterLogin(STU),
     "POST /pcbk/api/auth/login": [200, STU],
     "POST /pcbk/api/workplace/wake": [202, place("starting")],
     "GET /pcbk/api/workplace": (n) => [200, place(n < 2 ? "starting" : "ready")],
@@ -347,7 +352,8 @@ test("ready_navigates_to_chat_once", async () => {
 test("teacher_never_navigates", async () => {
   const TEACH = { login: "teach", role: "teacher", place: null };
   const signedIn = harness({ "GET /pcbk/api/auth/me": [200, TEACH] });
-  const fresh = harness({ "GET /pcbk/api/auth/me": NEED_LOGIN, "POST /pcbk/api/auth/login": [200, TEACH] });
+  const fresh = harness({ "GET /pcbk/api/auth/me": meAfterLogin({ ...TEACH, notice: null }),
+                          "POST /pcbk/api/auth/login": [200, TEACH] });
   await fresh.flush();
   fresh.els.login.value = "teach";
   fresh.els.password.value = "<test-pw>";
@@ -359,6 +365,117 @@ test("teacher_never_navigates", async () => {
     assert.equal(h.els["to-chat"].hidden, true);
     assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
   }
+});
+
+// --- предупреждение при первом входе (Д6-R49, Review Focus 1 Д6б): вход не будит место до «Понятно» ------------
+
+async function submitLogin(h) {
+  await h.flush();
+  h.els.login.value = "stu-03";
+  h.els.password.value = "<test-pw>";
+  h.els["login-form"].fire("submit");
+  await h.flush();
+}
+
+test("login_does_not_wake_before_notice", async () => {
+  const h = harness({
+    "GET /pcbk/api/auth/me": meAfterLogin({ ...STU, notice: NOTICE }),
+    "POST /pcbk/api/auth/login": [200, STU],                                         // ответ входа — без notice
+    "POST /pcbk/api/workplace/wake": [202, place("starting")],
+  });
+  await submitLogin(h);
+  assert.deepEqual(h.navigations, [CHAT_URL]);                                       // предупреждение — в чате
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
+  assert.equal(h.count("GET /pcbk/api/auth/me"), 2);
+  assert.equal(h.els["to-chat"].hidden, false);                                      // запасная ссылка «Открыть чат»
+  assert.equal(h.els["login-form"].hidden, true);
+  assert.equal(h.els.who.textContent, "Вы вошли как stu-03");
+  assert.equal(h.els.logout.hidden, false);
+  await h.advance(GIVE_UP_S * 1000);
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);                         // и потом не будит
+  assert.deepEqual(h.navigations, [CHAT_URL]);
+  assert.equal(h.pending(), 0);
+
+  const odd = harness({                                                              // незнакомое значение — тоже чат решает
+    "GET /pcbk/api/auth/me": meAfterLogin({ ...STU, notice: 7 }),
+    "POST /pcbk/api/auth/login": [200, STU],
+  });
+  await submitLogin(odd);
+  assert.deepEqual(odd.navigations, [CHAT_URL]);
+  assert.equal(odd.count("POST /pcbk/api/workplace/wake"), 0);
+});
+
+test("open_session_with_notice_goes_to_chat", async () => {
+  const h = harness({ "GET /pcbk/api/auth/me": [200, { ...STU, notice: NOTICE }] });
+  await h.advance(GIVE_UP_S * 1000);
+  assert.deepEqual(h.navigations, [CHAT_URL]);
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
+  assert.equal(h.calls.length, 1);                                                   // /me уже прочитан — второй не нужен
+  assert.equal(h.els["login-form"].hidden, true);
+  assert.equal(h.els["to-chat"].hidden, false);
+
+  const acked = harness({                                                            // подтверждено (null) — как в Д6а
+    "GET /pcbk/api/auth/me": [200, { ...STU, notice: null }],
+    "POST /pcbk/api/workplace/wake": [200, place("ready")],
+  });
+  await acked.flush();
+  assert.equal(acked.count("POST /pcbk/api/workplace/wake"), 1);
+  assert.equal(acked.els.state.textContent, "Рабочее место готово");
+  assert.deepEqual(acked.navigations, [CHAT_URL]);
+});
+
+test("me_failure_after_login_does_not_wake", async () => {                           // раунд 2, В4
+  const STORE = [503, { name: "Unavailable", data: { message: "Учётные записи недоступны — повторите позже" } }];
+  for (const [answer, text] of [[STORE, "Учётные записи недоступны — повторите позже"], [[0], "Серверный слой не отвечает"],
+                                [[502, "<html>"], "Серверный слой не отвечает"]]) {
+    const h = harness({
+      "GET /pcbk/api/auth/me": (n) => (n === 1 ? NEED_LOGIN : answer),
+      "POST /pcbk/api/auth/login": [200, STU],
+      "POST /pcbk/api/workplace/wake": [202, place("starting")],
+    });
+    await submitLogin(h);
+    assert.equal(h.els.state.textContent, text, text);
+    assert.equal(h.els.state.attrs["data-kind"], "fail");
+    assert.equal(h.els["to-chat"].hidden, false);                                    // решит чат своим «Повторить»
+    assert.equal(h.els["login-form"].hidden, true);                                  // вход удался — сессия есть
+    assert.equal(h.els.who.textContent, "Вы вошли как stu-03");
+    assert.equal(h.els.logout.hidden, false);
+    await h.advance(GIVE_UP_S * 1000);
+    assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0, text);
+    assert.deepEqual(h.navigations, []);
+    assert.equal(h.pending(), 0);
+  }
+
+  const gone = harness({                                                             // Н5: /me после входа 401 — форма, не ссылка
+    "GET /pcbk/api/auth/me": NEED_LOGIN,
+    "POST /pcbk/api/auth/login": [200, STU],
+  });
+  await submitLogin(gone);
+  assert.equal(gone.els["login-form"].hidden, false);
+  assert.equal(gone.els["to-chat"].hidden, true);
+  assert.equal(gone.els.state.textContent, "Нужно войти");
+  assert.equal(gone.count("POST /pcbk/api/workplace/wake"), 0);
+});
+
+test("login_form_busy_until_me_answers", async () => {                               // второй вход, пока /me в пути, не уходит
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const h = harness({
+    "GET /pcbk/api/auth/me": (n) => (n === 1 ? NEED_LOGIN : held),
+    "POST /pcbk/api/auth/login": [200, STU],
+    "POST /pcbk/api/workplace/wake": [200, place("ready")],
+  });
+  await submitLogin(h);
+  assert.equal(h.els.submit.disabled, true);
+  h.els.password.value = "<test-pw>";
+  h.els["login-form"].fire("submit");
+  await h.flush();
+  assert.equal(h.count("POST /pcbk/api/auth/login"), 1);
+  release([200, STU]);
+  await h.flush();
+  assert.equal(h.els.submit.disabled, false);
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 1);                         // notice нет (старый core) — как в Д6а
+  assert.deepEqual(h.navigations, [CHAT_URL]);
 });
 
 // --- статика: CSP без встроенного, без внешних ресурсов, без хранилищ --------------------------

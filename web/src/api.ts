@@ -1,4 +1,4 @@
-// Вызовы шлюза вне OpenCode (Д6-R39): вход, выход и рабочее место. Тот же вид запроса, что call() страницы
+// Вызовы шлюза вне OpenCode (Д6-R39, R49): вход, выход, подтверждение предупреждения и рабочее место. Тот же вид запроса, что call() страницы
 // входа: cookie сессии своего сайта (HttpOnly — её ставит и стирает шлюз), Accept JSON, тело — только JSON.
 // Ответ — всегда Reply: сеть оборвалась — status 0, тело не JSON — текст как есть.
 import { T_DOWN, T_UNKNOWN } from "./texts";
@@ -36,6 +36,7 @@ export interface Api {
   logout(): Promise<Reply>;
   wake(): Promise<Reply>;
   workplace(): Promise<Reply>;
+  ackNotice(notice: string): Promise<Reply>;          // тело ровно {"notice": N}; ответ — 204 (R49)
 }
 
 export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
@@ -44,6 +45,7 @@ export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
     logout: () => callJson("POST", "/pcbk/api/auth/logout", undefined, fetchImpl),
     wake: () => callJson("POST", "/pcbk/api/workplace/wake", undefined, fetchImpl),
     workplace: () => callJson("GET", "/pcbk/api/workplace", undefined, fetchImpl),
+    ackNotice: (notice) => callJson("POST", "/pcbk/api/auth/notice", { notice }, fetchImpl),
   };
 }
 
