@@ -17,9 +17,10 @@ SEC = 10 ** 9
 # без этих правил студент одобряет чтение вне /work, и пароль из /proc/self/environ уходит в разговор;
 # "task": "deny" убирает инструмент task из запроса к модели — подагентов нет (Д4б-R20); "webfetch": "deny" —
 # интернета у стенда нет, тело каждого запроса короче (оценка — байт на токен), ручки core без токена из места
-# не читаются (до Д5)
+# не читаются (до Д5); "pcbk_save_agent": "deny" — второй слой, не граница (Д7-R63): правила конфигурации идут до
+# правил агента, allow у konstruktor побеждает, у агентов без своего правила инструмента записи нет
 PERMISSION = {"external_directory": "deny", "task": "deny", "webfetch": "deny",
-              "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}}
+              "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}, "pcbk_save_agent": "deny"}
 # MCP службы данных: токен места — файлом, без OAuth (Д4б-R19)
 MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True, "oauth": False,
                 "headers": {"Authorization": "Bearer {file:/run/secrets/data-token}"}}}
@@ -27,6 +28,11 @@ MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True
 FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 1 (Д6а); меняется только пересборкой образа\n'
          'description: "Помощник по данным: текущие значения и сводки тегов БДРВ"\nmode: primary\nsteps: 8\n'
          'permission:\n  "*": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n  pcbk_tag_period: allow\n')
+# Конструктор агентов (Д7-R63, research/09 §3.1): фронтматтер — побайтно; модели нет — модель стенда
+K_FRONT = ('# pcbk-reserve: встроенный агент образа, редакция 1 (Д7); меняется только пересборкой образа\n'
+           'description: "Конструктор агентов: за один разговор собирает с технологом его агента по узлу"\n'
+           'mode: primary\nsteps: 12\npermission:\n  "*": deny\n  pcbk_catalog_search: allow\n'
+           '  pcbk_tag_now: allow\n  pcbk_save_agent: allow\n')
 # пробный агент теста external_directory — только в тесте, не в образе: без блока permission наследует правила
 # opencode.json — образа (точка монтирования агентов Д7) или копии без правил (у pomoshnik read нет вовсе,
 # охрану проверяет он)
@@ -165,9 +171,30 @@ def test_default_agent_file():                                                  
     _, front, body = text.split("---\n", 2)
     assert front == FRONT                                                # ни name, ни model, ни question
     for rule in ("только из ответов этих инструментов", "Не составляй имя тега сам", "не называй их",
-                 "Смысл _MV у регуляторов не", "общие знания, не из данных стенда"):
+                 "Смысл _MV у регуляторов не", "общие знания, не норматив ПЦБК"):        # пометка — как в AGENTS.md
         assert rule in body, rule
-    assert sorted(p.name for p in (CONFIG / "agent").iterdir()) == ["pomoshnik.md"]
+    assert "не из данных стенда" not in body
+
+
+def test_konstruktor_file():                                                    # Д7-R63
+    _, front, body = (CONFIG / "agent" / "konstruktor.md").read_text().split("---\n", 2)
+    assert front == K_FRONT                                              # ни name, ни model, ни question
+    flat = " ".join(body.split())                      # фразы сверяются без переносов строк (Д7б, П7)
+    assert flat.startswith("Ты — Конструктор агентов учебного стенда ПЦБК.")   # первая строка — её ждёт Б4
+    for rule in ("Имена тегов бери ТОЛЬКО из ответов pcbk_catalog_search", "Черновик агента",
+                 "Сохраняй только после явного согласия", "status \"unavailable\" или \"rate\"",
+                 "общие знания, не норматив ПЦБК", "Больше двух повторных попыток не делай",
+                 "в этом ходе pcbk_save_agent больше не вызывай",                      # Д7б, m9
+                 "дословно, одной строкой",                                          # student_reply ≤200 знаков
+                 "Он появится в списке „Мои агенты“ через несколько секунд"):        # Д7-R63, поправка 2
+        assert rule in flat, rule
+    stand = (CONFIG / "AGENTS.md").read_text()                       # правила стенда в системном тексте всех агентов
+    assert stand.startswith("# Правила учебного стенда ПЦБК (для всех агентов)")
+    for rule in ("Норматива в данных стенда нет", "общие знания, не норматив ПЦБК", "Шкала прибора"):
+        assert rule in " ".join(stand.split()), rule
+    permission = json.loads((CONFIG / "opencode.json").read_text())["permission"]
+    assert permission["pcbk_save_agent"] == "deny" and list(permission)[-1] == "pcbk_save_agent"   # Д7б, П8
+    assert sorted(p.name for p in (CONFIG / "agent").iterdir()) == ["konstruktor.md", "pomoshnik.md"]
 
 
 def config_with_probe(tmp_path: Path, rules: bool) -> Path:

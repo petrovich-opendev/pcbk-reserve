@@ -7,11 +7,12 @@ import time
 
 import pytest
 
-from conftest import TEST_MGMT_KEY, TEST_OPENROUTER_KEY, wait_for
+from conftest import TEST_MGMT_KEY, TEST_OPENROUTER_KEY, system_text, turn_bodies, wait_for
 
 Q = "что сейчас по тегу 20FAKE_001_PV?"
 MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
 PCBK3 = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period"}       # инструменты агента по умолчанию (Д6-R45)
+KONSTRUKTOR = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_save_agent"}  # инструменты Конструктора (Д7-R63)
 
 
 @pytest.fixture(scope="module")
@@ -137,6 +138,20 @@ def test_default_agent_tools_are_data_only(stack, place01):                    #
     assert tool_names(stack, out["session"]) - {"invalid"} == PCBK3   # «invalid» — служебный, если OpenCode его шлёт
     msgs = json.loads(stack.oc(1, "GET", f"/session/{out['session']}/message", 1)[1])
     assert {m["info"].get("agent") for m in msgs if m["info"]["role"] == "assistant"} == {"pomoshnik"}
+
+
+def test_agent_tool_sets(stack, place01):                                       # инструменты агентов образа (Д7-R63)
+    # «что умеешь?» без слова FAKESAVE*: двойник зовёт pcbk_tag_now, а не запись агента (Д7б, m22)
+    k = stack.converse(1, "что умеешь?", agent="konstruktor")
+    # allow агента побеждает глобальный "pcbk_save_agent": "deny" — правила конфигурации идут раньше (О7)
+    assert tool_names(stack, k["session"]) - {"invalid"} == KONSTRUKTOR
+    assert k["status"] == "done" and not [t for t in k["tools"] if t["tool"] == "pcbk_save_agent"]
+    p = stack.converse(1, "что умеешь?")                                        # агент по умолчанию места
+    assert "pcbk_save_agent" not in tool_names(stack, p["session"])             # тем же способом, что у Конструктора
+    assert tool_names(stack, p["session"]) - {"invalid"} == PCBK3                # MCP подключён — проверка не пуста
+    ks, ps = (system_text(turn_bodies(stack, 1, out["session"])[0]) for out in (k, p))   # тела хода по сессии (I4)
+    assert "Правила учебного стенда ПЦБК" in ks and "Правила учебного стенда ПЦБК" in ps   # AGENTS.md — у каждого
+    assert "Ты — Конструктор агентов учебного стенда ПЦБК" in ks and "Конструктор агентов" not in ps
 
 
 def test_model_question_is_rejected_and_reported(stack, place01):               # раунд 2: уточняющий вопрос модели

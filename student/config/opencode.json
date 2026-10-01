@@ -19,7 +19,8 @@
       "*": "allow",
       "*.env": "deny",
       "*.env.*": "deny"
-    }
+    },
+    "pcbk_save_agent": "deny"
   },
   "provider": {
     "pcbk": {

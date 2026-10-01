@@ -281,10 +281,14 @@ def test_env_holds_only_own_secret(stack, running):
 def test_default_agent_is_pomoshnik(stack, running):                # Д6-R45: встроенные агенты выключены
     agents = json.loads(stack.oc(1, "GET", "/agent", 1)[1])
     primary = {a["name"] for a in agents if not a.get("hidden") and a.get("mode") != "subagent"}
-    assert primary == {"pomoshnik"}
+    assert primary == {"pomoshnik", "konstruktor"}                   # агенты образа (Д7-R63)
     p = next(a for a in agents if a["name"] == "pomoshnik")
     assert (p["native"], p["mode"]) == (False, "primary")
+    k = next(a for a in agents if a["name"] == "konstruktor")
+    assert (k["native"], k["mode"], k["steps"], k.get("model")) == (False, "primary", 12, None)   # модель стенда
     assert not {"build", "plan", "general", "explore"} & {a["name"] for a in agents}
+    default = json.loads(stack.oc(1, "GET", "/config", 1)[1])["default_agent"]   # в теле /config — токен места:
+    assert default == "pomoshnik"                                      # в сбой идёт только значение, не тело
 
 
 def test_hung_workplace_row(stack, running):                       # Review Focus 3; последний в модуле
