@@ -160,6 +160,15 @@ STAND_ORIGIN = f"https://{STAND_HOST}"
 CONNECTED = re.compile(r"Established connection|Connected to")
 
 
+class Secret(str):
+    """Пароль: значение — как у строки, repr — «<скрыт>». pytest печатает аргументы кадров трассировки (первого и
+    последнего, при --tb=long — всех) и локальные переменные при --showlocals через repr. Склейка (secret + "\\n")
+    даёт обычную str — оборачивать после неё."""
+
+    def __repr__(self) -> str:
+        return "<скрыт>"
+
+
 def wait_for(pred: Callable[[], bool], timeout: float, step: float = 1.0) -> None:
     """Ждать, пока pred() не станет истинным, опрос раз в step с; по сроку — AssertionError.
 
@@ -502,14 +511,14 @@ class Stack:
         """Учётка шлюза командой администратора в pcbk-core; пароль — в stdin, не в argv."""
         cmd = ["docker", "exec", "-i", "pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "add",
                "--login", login, "--role", role, *(() if place is None else ("--place", str(place)))]
-        _run(cmd, input=password + "\n")
+        _run(cmd, input=Secret(password + "\n"))       # склейка даёт str — Secret поверх неё
 
-    def passwd(self, login: str) -> str:
+    def passwd(self, login: str) -> Secret:
         """Новый пароль учётки командой администратора (passwd закрывает все её сессии); пароль — в stdin, не в
-        argv. Возвращает новый пароль."""
-        password = secrets.token_urlsafe(12)
+        argv. Возвращает новый пароль (Secret: в трассировках pytest — «<скрыт>»)."""
+        password = Secret(secrets.token_urlsafe(12))
         _run(["docker", "exec", "-i", "pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "passwd",
-              "--login", login], input=password + "\n")
+              "--login", login], input=Secret(password + "\n"))
         return password
 
     def gw_health(self) -> dict:

@@ -49,6 +49,21 @@ CSP_LISTENER = """(() => {
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
+class _Wire(str):
+    """Сообщение CDP на проводе: в трассировке — только длина. В нём бывает пароль поля входа (Input.insertText), а
+    pytest печатает аргументы кадров send и _frame, если отправка рвётся (причина CDPError)."""
+
+    def __repr__(self) -> str:
+        return f"<сообщение CDP: {len(self)} знаков>"
+
+
+class _WireBytes(bytes):
+    """То же сообщение в байтах кадра WebSocket."""
+
+    def __repr__(self) -> str:
+        return f"<кадр WebSocket: {len(self)} байт>"
+
+
 class CDPError(RuntimeError):
     """Отказ CDP (ответ с error), срок ответа или обрыв соединения с браузером."""
 
@@ -104,7 +119,7 @@ class _WebSocket:
             self._sock.sendall(head + key + _mask(payload, key))
 
     def send(self, text: str) -> None:
-        self._frame(0x1, text.encode("utf-8"))
+        self._frame(0x1, _WireBytes(text.encode("utf-8")))
 
     def _read(self, n: int) -> bytes:
         while len(self._buf) < n:
@@ -179,7 +194,7 @@ class _Connection:
         if session is not None:
             msg["sessionId"] = session
         try:
-            self._ws.send(json.dumps(msg))
+            self._ws.send(_Wire(json.dumps(msg)))
         except OSError as e:
             with self._lock:
                 self._waiting.pop(mid, None)
@@ -359,7 +374,9 @@ class Page:
             raise AssertionError(f"{selector}: не принял фокус")
 
     def type(self, selector: str, text: str, timeout: float = 10) -> None:
-        """Фокус в поле и ввод текста, как с клавиатуры (Input.insertText: события input — у React тоже)."""
+        """Фокус в поле и ввод текста, как с клавиатуры (Input.insertText: события input — у React тоже). Пароль —
+        строкой с безопасным repr (conftest.Secret): этот кадр и params вызова pytest печатает при сбое как есть, а
+        провод (send, _frame) печатается только длиной."""
         self._focus(selector, timeout)
         self._call("Input.insertText", {"text": text})
 

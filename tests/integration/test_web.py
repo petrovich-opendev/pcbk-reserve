@@ -15,12 +15,15 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from conftest import REPO, STAND_ORIGIN
+import cdp
+import conftest
+from conftest import REPO, STAND_ORIGIN, Secret
 from gateway_cases import ALLOWED, OC, SES_FAKE, TWINS
 
 STAND = "https://stand.pcbk.test:18443"
@@ -32,6 +35,7 @@ STAND_WARNING = html.unescape(re.search(r'<div class="stand" role="note">(.*?)</
 Q = "что сейчас по тегу 20FAKE_001_PV?"
 ANSWER = r"Готово: .+"                          # ответ двойника OpenRouter: «Готово: » и начало вывода инструмента
 TOOL_DONE = r"Запрос к данным: текущее значение — готово"
+ANSWER_HEAD = 40                                # столько знаков вывода инструмента сверяется с ответом
 # сообщения агента в разговоре (ChatView: один узел на ход — адаптер склеивает шаги хода) и идущий ход («Стоп»)
 ASSISTANT_TEXTS_JS = "[...document.querySelectorAll('.msg[data-role=\"assistant\"]')].map((e) => e.innerText)"
 RUNNING_JS = "!!document.querySelector('.composer .stop')"
@@ -58,21 +62,22 @@ for method, path in json.loads(sys.argv[1]):
         names.append(None)
 print(json.dumps(names))
 """
-# контроль сверки: 15 разрешённых пар — правило есть, «близнецы» (удалить разговор, прочие методы) — нет
+# контроль сверки: 15 разрешённых пар — правило есть; нет — у опасной ручки (GET /config: ключи провайдеров), удаления
+# разговора и «близнеца» каждого разрешённого пути (первый чужой метод на этом пути)
 RULES_CONTROL_OK = [[m, p[len(OC):]] for m, p in ALLOWED]
-RULES_CONTROL_NO = [["DELETE", f"/session/{SES_FAKE}"], *([m, p[len(OC):]] for m, p in TWINS[:5])]
+RULES_CONTROL_NO = [["GET", "/config"], ["DELETE", f"/session/{SES_FAKE}"],
+                    *({p: [m, p[len(OC):]] for m, p in reversed(TWINS)}.values())]
 
 
-class Passwords(dict):
-    """Пароли учёток модуля: pytest печатает аргументы упавшего теста — repr без значений (в журналах их нет)."""
-
-    def __repr__(self) -> str:
-        return "{" + ", ".join(f"{k!r}: '<скрыт>'" for k in self) + "}"
+def new_passwords() -> dict[str, Secret]:
+    """Пароли учёток модуля — Secret: pytest печатает аргументы кадров (фикстуру теста, password входа, text ввода)
+    через repr, а у Secret он — «<скрыт>»."""
+    return {"web-a": Secret(secrets.token_urlsafe(12)), "web-t": Secret(secrets.token_urlsafe(12))}
 
 
 @pytest.fixture(scope="module")
 def web_users(stack):
-    pw = Passwords({"web-a": secrets.token_urlsafe(12), "web-t": secrets.token_urlsafe(12)})
+    pw = new_passwords()
     try:
         stack.add_account("web-a", "student", PLACE, pw["web-a"])
         stack.add_account("web-t", "teacher", None, pw["web-t"])
@@ -83,14 +88,15 @@ def web_users(stack):
             stack.stop(name)
 
 
-def login_to_chat(page, login, password):
+def login_to_chat(page, login, password) -> str:
     """Вход на /login; «Рабочее место готово» ведёт в чат сама страница входа. «Вы вошли как» не годится признаком
     чата: этот текст есть и на странице входа, и в шапке чата на экранах места и предупреждения (раунд 2, Minor 7) —
     он сверяет только учётку, когда поле ввода чата уже видно.
 
     Сессия этой вкладки уже есть (cookie вкладок одного контекста общие, браузер — на модуль) — страница входа сама
     будит место и ведёт в чат, формы нет: второй вход не нужен. Каждый вход — новая сессия, а их у учётки не больше
-    трёх (новая вытесняет старую), так что тесты входят как можно реже."""
+    трёх (новая вытесняет старую), так что тесты входят как можно реже. Возвращает "form" (вошли формой) или "chat"
+    (сессия уже была)."""
     page.goto(STAND + "/login")
     how = page.wait(lambda: "chat" if page.url().split("?")[0].endswith("/chat/")
                     else "form" if page.eval(LOGIN_FORM_JS) else None, 90, "форма входа или переход в чат")
@@ -101,6 +107,7 @@ def login_to_chat(page, login, password):
     page.wait_url("/chat/", 90)
     page.wait_selector("textarea", 90)
     page.wait_text(rf"Вы вошли как {re.escape(login)}\b", 10)
+    return how
 
 
 def ask(page, text: str, timeout: float = 120) -> str:
@@ -143,6 +150,7 @@ def tool_output(stack, n: int, sid: str, tool: str) -> str:
     outs = [p["state"]["output"] for m in json.loads(body) for p in m["parts"]
             if p.get("type") == "tool" and p.get("tool") == tool and p["state"].get("status") == "completed"]
     assert outs, f"в разговоре нет завершённого вызова {tool}"
+    assert len(norm(outs[-1])) >= ANSWER_HEAD, len(norm(outs[-1]))                       # иначе сверка с ответом пуста
     return outs[-1]
 
 
@@ -175,8 +183,84 @@ def shot(page, name: str) -> None:
         page.screenshot(Path(where) / name)
 
 
+def failure(fn, *args, **kw) -> BaseException:
+    """Исключение вызова fn; его трассировка начинается с этого кадра — без кадра теста и его переменных."""
+    try:
+        fn(*args, **kw)
+    except Exception as e:                      # noqa: BLE001 — нужно любое
+        return e
+    raise AssertionError("ждали отказ вызова")
+
+
+def leaks(exc: BaseException, secret: Secret) -> bool:
+    """Значение secret есть в трассировке exc так, как её печатал бы pytest при --tb=long --showlocals: аргументы и
+    локальные переменные каждого кадра, с цепочкой причин, — строже вывода по умолчанию. Два вида: с обрезкой
+    значений, как по умолчанию, и без неё. Без обрезки длинное значение pprint режет на куски по строкам ('…'\n 'b…'),
+    и они склеиваются обратно; подсветка исходника (ANSI) снимается."""
+    info = pytest.ExceptionInfo.from_exception(exc)
+    for cut in (True, False):
+        text = re.sub(r"\x1b\[[0-9;]*m", "", str(info.getrepr(style="long", showlocals=True, truncate_locals=cut,
+                                                               truncate_args=cut, chain=True)))
+        if str(secret) in text or str(secret) in re.sub(r"""['"]\s*\n\s*b?['"]""", "", text):
+            return True
+    return False
+
+
+class _BrokenSocket:
+    """Сокет браузера, на котором отправка рвётся: отказ CDP посреди ввода пароля. recv ждёт закрытия."""
+
+    def __init__(self):
+        self._closed = threading.Event()
+
+    def sendall(self, data: bytes) -> None:
+        raise BrokenPipeError("браузер закрыл соединение")
+
+    def recv(self, n: int) -> bytes:
+        self._closed.wait(5)
+        return b""
+
+    def shutdown(self, how: int) -> None:
+        self._closed.set()
+
+    def close(self) -> None:
+        self._closed.set()
+
+
+def test_passwords_hidden_in_tracebacks_run(monkeypatch):                               # без стенда: ревью А7, I1
+    probe = Secret("pcbk-probe-" + secrets.token_hex(8))
+    assert leaks(failure(conftest._run, ["false"], input=str(probe) + "\n"), probe)       # контроль: открытый виден
+    assert not leaks(failure(conftest._run, ["false"], input=Secret(probe + "\n")), probe)
+    assert {type(v) for v in new_passwords().values()} == {Secret}                        # пароли фикстуры
+    calls = []                                                                            # пароли — Secret в stdin
+    monkeypatch.setattr(conftest, "_run", lambda cmd, **kw: calls.append(kw))
+    stack = conftest.Stack.__new__(conftest.Stack)
+    stack.add_account("x", "student", PLACE, probe)
+    new = stack.passwd("x")
+    assert [type(kw["input"]) for kw in calls] == [Secret, Secret] and type(new) is Secret
+    assert [str(kw["input"]) for kw in calls] == [probe + "\n", new + "\n"]
+
+
+def test_passwords_hidden_in_tracebacks_cdp():                                            # без стенда: ревью А7, I1
+    probe = Secret("pcbk-probe-" + secrets.token_hex(8))
+    ws = cdp._WebSocket.__new__(cdp._WebSocket)          # настоящие send/_frame, сокет — рвущийся
+    ws._sock, ws._buf, ws._send_lock = _BrokenSocket(), bytearray(), threading.Lock()
+    conn = cdp._Connection(ws)
+    try:
+        page = cdp.Page.__new__(cdp.Page)
+        page._conn, page.session_id = conn, "probe-session"
+        page._focus = lambda selector, timeout: None     # фокус — не предмет проверки
+        open_exc = failure(page.type, "#password", str(probe))
+        assert isinstance(open_exc, cdp.CDPError) and leaks(open_exc, probe)              # контроль: открытый виден
+        exc = failure(page.type, "#password", probe)
+        assert isinstance(exc, cdp.CDPError) and isinstance(exc.__cause__, OSError)       # цепочка до кадров провода
+        assert not leaks(exc, probe)
+    finally:
+        conn.close()
+    assert json.loads(json.dumps({"text": probe})) == {"text": str(probe)}               # в браузер уходит значение
+
+
 def test_login_leads_to_chat(stack, page, web_users):                                  # Review Focus 1
-    login_to_chat(page, "web-a", web_users["web-a"])
+    assert login_to_chat(page, "web-a", web_users["web-a"]) == "form"                    # первый тест: вход формой
     assert page.wait_text(re.escape(STAND_WARNING), 5) and page.wait_text(r"Стенд работает|Внимание|Сбой", 20)
     assert page.wait_text(r"Вы вошли как web-a", 5)
     assert page.csp() == [] and page.console_errors() == []
@@ -202,7 +286,7 @@ def test_chat_answers_through_gateway(stack, page, web_users):                  
     sid = last_session(stack, PLACE)
     assert page_sessions(page) == [sid]                                                    # вопрос ушёл в этот разговор
     tool = tool_output(stack, PLACE, sid, "pcbk_tag_now")                                   # вывод инструмента из места
-    assert norm(tool)[:40] in norm(answer), (norm(tool)[:40], norm(answer))                # ответ построен на выводе
+    assert norm(tool)[:ANSWER_HEAD] in norm(answer), (norm(tool)[:ANSWER_HEAD], norm(answer))  # ответ построен на выводе
     shot(page, "01-chat-answer.png")
     assert page.csp() == [] and page.console_errors() == []
     assert stack.gw_health()["refused_1h"] == before
@@ -218,8 +302,8 @@ def test_browser_headers_and_h2_stream(stack, page, web_users):                 
     assert all(origin == STAND for _, _, origin in posts), posts                            # при Referrer-Policy no-referrer
     ev = [r["protocol"] for r in page.requests("/pcbk/api/oc/event") if r["status"] == 200]
     assert ev and ev[-1] == "h2", ev
-    n0 = page.chunks("/pcbk/api/oc/event"); time.sleep(35)
-    assert page.chunks("/pcbk/api/oc/event") - n0 >= 3                                     # пульс 10 с идёт через edge
+    n0 = page.chunks("/pcbk/api/oc/event")
+    page.wait(lambda: page.chunks("/pcbk/api/oc/event") - n0 >= 3, 35, "три пульса потока")  # пульс 10 с идёт через edge
     assert page.csp() == []
 
 
@@ -245,10 +329,10 @@ def test_signed_out_goes_to_login(stack, page, web_users):                      
     assert [r["status"] for r in page.requests("/pcbk/api/oc/event") if r["status"] == 200]  # поток был (M18)
     web_users["web-a"] = stack.passwd("web-a")                                             # passwd закрывает сессии
     page.wait_url("/login", 45)
-    n = len(page.requests("/pcbk/api/oc/")); time.sleep(10)
-    assert [r["path"] for r in page.requests("/pcbk/api/oc/")[n:]] == []                   # после ухода — ни одного
+    # после ухода чата нет (страница входа в /pcbk/api/oc/ не ходит), так что шторм виден только до ухода: 401 — не
+    # больше одного круга переподключения (M18, доводка 1: проверка «после /login тихо» убрана как вакуумная)
     unauth = [f for f in refusals(page) if f[1] == 401]
-    assert unauth and len(unauth) <= RECONNECT_ROUND, unauth                               # до ухода — один круг 401 (M18)
+    assert unauth and len(unauth) <= RECONNECT_ROUND, unauth
     assert page.csp() == []                     # консоль не сверяется — как у сна места: console.error самого адаптера
 
 
