@@ -16,6 +16,7 @@ from conftest import wait_for
 from gateway_cases import (ALLOW_PERM, EVENT_TYPES, MSG_FAKE, SES_FAKE, check_forbidden, check_mangled,
                            expected_refusals)
 from gwclient import GwClient
+from secret import Secret
 
 LIVE = {k: os.environ.get(k) for k in ("PCBK_LIVE_BASE", "PCBK_LIVE_A", "PCBK_LIVE_B", "PCBK_LIVE_SESSIONS")}
 pytestmark = pytest.mark.skipif(not all(LIVE.values()),
@@ -25,7 +26,7 @@ pytestmark = pytest.mark.skipif(not all(LIVE.values()),
 def client(which: str) -> GwClient:
     login, pw = Path(LIVE[which]).read_text(encoding="utf-8").splitlines()[:2]
     c = GwClient(LIVE["PCBK_LIVE_BASE"], same_origin=True)
-    c.login(login, pw)
+    c.login(login, Secret(pw))                     # пароль живой пробной учётки — не в трассировку
     return c
 
 

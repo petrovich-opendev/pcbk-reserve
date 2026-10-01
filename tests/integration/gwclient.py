@@ -4,9 +4,10 @@
 разрешается. TLS без проверки сертификата: сертификат тестовый, на сервере — туннель. Путь уходит как есть
 (putrequest), без нормализации. Каждый вызов — своё соединение HTTP/1.1.
 
-Пароль и cookie в трассировке pytest не печатаются (итоговое ревью Д6а, P7): тело запроса — SecretBytes (его несут
-кадры http.client: endheaders, _send_output, send), cookie сессии и заголовок Cookie — Secret. Пароль вызывающий
-передаёт строкой Secret: аргумент login и тело call — его кадры.
+Пароль в трассировке pytest не печатается (итоговое ревью Д6а, P7): тело запроса — SecretBytes (его несут
+кадры http.client: endheaders, _send_output, send); пароль вызывающий передаёт строкой Secret — аргумент login
+и тело call. Cookie сессии и заголовок Cookie — Secret, но байты заголовков http.client видны в кадре send при
+--tb=long, а разбор Set-Cookie — при --showlocals: тестовые cookie одноразового стенда (остаточный риск оснастки).
 """
 from __future__ import annotations
 
