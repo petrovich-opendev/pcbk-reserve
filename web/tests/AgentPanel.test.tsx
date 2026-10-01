@@ -330,11 +330,33 @@ test("pick_before_previous_thread_opens", async () => {
   await waitFor(() => expect(container.querySelector(`[data-session-id="${SES_P}"]`)).toBeTruthy());
   await sleep(150);
   expect(gw.calls.filter((c) => c.path.startsWith(`/pcbk/api/oc/session/${SES_P}`))).toEqual([]);
+  expect(onThreadIdChange).not.toHaveBeenCalled();                               // и не забыт: решать нечего (как Д6б)
   expect(agentLine(container)).toBe("Агент: Конструктор агентов");
   const first = await send(gw, "привет");
   expect(first.session).not.toBe(SES_P);
   expect(first.body).toMatchObject({ agent: "konstruktor" });
   expect(onThreadIdChange.mock.calls.flat()).not.toContain(SES_P);
+}, CHAT_TIMEOUT_MS);
+
+test("pick_unlocks_before_list_loaded", async () => {
+  // m1 и m15: выбор агента — решение студента (новый разговор с ним): отправка открыта, не дожидаясь списка
+  // разговоров, а пришедший список прежний разговор поверх не открывает
+  let releaseList: (r: Response) => void = () => {};
+  const gw = chatGateway({ list: () => new Promise<Response>((resolve) => { releaseList = resolve; }) });
+  const onThreadIdChange = vi.fn();
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents}
+                                     onThreadIdChange={onThreadIdChange} />);
+  await screen.findByRole("button", { name: /Помощник по данным/ });
+  expect(box().disabled).toBe(true);                                             // решения ещё нет (m1)
+  await pickAgent(/Помощник по данным/);
+  const first = await send(gw, "что сейчас");                                    // список всё ещё в пути
+  expect(first.session).not.toBe(SES_K);
+  expect(first.body).not.toHaveProperty("agent");
+  releaseList(ocJson(200, [session(SES_K, "Агент по узлу 3")]));
+  await waitFor(() => expect(container.querySelector(`[data-session-id="${SES_K}"]`)).toBeTruthy());
+  await sleep(150);
+  expect(gw.loads(SES_K)).toBe(0);
+  expect(onThreadIdChange.mock.calls.flat()).not.toContain(SES_K);
 }, CHAT_TIMEOUT_MS);
 
 test("agent_line_shows_name_when_not_listed", async () => {
