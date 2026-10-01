@@ -91,7 +91,7 @@ services:
   watchdog:
     build: ./watchdog
     # :d6a остаётся на сервере для отката Д6б (:d5b — для отката Д6а)
-    image: pcbk-reserve/watchdog:d6b
+    image: pcbk-reserve/watchdog:d7a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -205,7 +205,7 @@ services:
     build: ./core
     # :d6a остаётся на сервере для отката Д6б (:d5b — для отката Д6а); откат только статики и login.js при core:d6b
     # снимает предупреждение при первом входе (deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d6b
+    image: pcbk-reserve/core:d7a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
