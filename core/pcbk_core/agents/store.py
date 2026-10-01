@@ -410,8 +410,9 @@ class AgentStore:
     def save(self, place: int, draft: Draft, text: str, now: datetime) -> Literal["saved", "already"]:
         """Запись агента места по шагам Д7-R56.
 
-        1. Короткое чтение: живая строка с тем же именем и digest — "already" (ничего не пишется), с другим —
-           NameTaken. Живых строк и файлов **/*.md вместе ≥ MAX_AGENTS — TooManyAgents.
+        1. Короткое чтение: живая строка с тем же именем и digest — "already" (ничего не пишется), с другим или в
+           карантине (quarantined, Д7б П5 а) — NameTaken. Живых строк и файлов **/*.md вместе ≥ MAX_AGENTS —
+           TooManyAgents.
         2. Файл вне транзакции (см. модуль); <имя>.md уже есть — NameTaken.
         3. Строка saved и метка очереди (seq + 1, since не сдвигается) — одной короткой транзакцией. Не прошла —
            свой файл удаляется, NameTaken (уникальность) или StoreError.
@@ -429,9 +430,13 @@ class AgentStore:
         at, since = _iso(now), _utc(now).isoformat()
         digest = draft_digest(draft)
 
-        live = {row_name: row_digest for row_name, row_digest, _ in self._live_rows(place)}
+        rows = self._live_rows(place)
+        live = {row_name: row_digest for row_name, row_digest, _ in rows}
         if name in live:
-            if live[name] == digest:
+            # тот же черновик в карантине — не already (предпроверка Д7б, П5 а): место его не видит, и «сохранено»
+            # было бы ложью; имя занято живой строкой, пока администратор не унесёт её в архив
+            state = next(row_state for row_name, _, row_state in rows if row_name == name)
+            if live[name] == digest and state != "quarantined":
                 return "already"
             raise NameTaken(live)
         scan = self._scan(place)

@@ -29,11 +29,25 @@ sp-ctl молчит) воркер пропускает и из очереди н
 
 DRILL_AGENTS=freeze_reload — после первого прохода воркер замирает: checked_at стоит, и строка сторожа «молчит».
 
+Карантин (Д7-R59, задача А6 Д7б). Место, которое не может прочесть файл агента, отвечает 400 с телом Config…Error и
+путём файла (data.path) на все ручки — и dispose его не лечит, только перезапуск процесса. repair(n, тело) — общий для
+воркера (шаг в, после dispose) и пробуждения (Workplaces.repair): путь в каталоге агентов места (agents_rel_path) —
+файл в карантин (AgentStore.quarantine в потоке, строка агента — quarantined), не больше QUARANTINE_MAX_PER_H за час на
+место (метки — deque времён monotonic, окно QUARANTINE_WINDOW_S); путь вне каталога — файл образа, ничего не двигается
+(image); предел — capped; сбой переноса (DirUnavailable, StoreError) — тоже image (предпроверка Д7б, m6). image и capped
+— счётчик image_config. Воркер после любого Config…Error отпускает замок места и до конца ворот зовёт
+Workplaces.restart (П5 в): после карантина — перезапуск места, при image и capped — место гаснет с текстом config. Так
+сломанное место не получает dispose раз в RELOAD_RETRY_S. reload_done при этом не зовётся (раунд 1, m1): метка остаётся,
+и место, снова готовое, перезагружается и сверяет оставшиеся saved — не раньше RELOAD_RETRY_S после неудачи (_failed_at;
+reload_failed считается и при карантине, m4).
+
 Строки журнала — без имён агентов, только номер места, итог и числа:
 - gw agents reload place=NN result=visible n=K wait_s=S;
 - … result=not_visible n=K;
-- … result=failed step=<шаг> error=<Класс или status_NNN>;
-- … result=delayed wait_s=S.
+- … result=failed step=<шаг> error=<Класс или status_NNN или config_<итог repair>>;
+- … result=delayed wait_s=S;
+- gw agents quarantine place=NN result=moved|missing|image|capped [error=<Класс>] — без имени файла (missing — файла
+  уже нет: перезапуск нужен всё равно, кэш экземпляра сломан).
 
 Только память и учёт: модуль не импортирует accounts (команда администратора шлюза, runpy).
 """
@@ -42,18 +56,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 
 from ..agents.stats import AgentStats
-from ..agents.store import AgentRow, AgentStore, PendingReload, StoreError
+from ..agents.store import AgentRow, AgentStore, DirUnavailable, PendingReload, StoreError
 from . import places
-from .places import Workplaces
+from .places import RepairResult, Workplaces
 
 log = logging.getLogger("pcbk_core.gateway.reload")
 
@@ -69,26 +85,51 @@ RELOAD_RETRY_S = 30.0         # после неудачи у места — не
 RELOAD_DELAYED_S = 900.0      # ждёт дольше — reload_delayed, один раз на ожидание
 DIR_CHECK_S = 10.0            # проверка каталога агентов
 
-RepairResult = Literal["quarantined", "image", "capped", "not_config"]
+# Д7-R59: каталог агентов внутри места (XDG_CONFIG_HOME=/etc/pcbk-opencode, привязка …/opencode/agents) и предел
+PLACE_AGENTS_DIR = "/etc/pcbk-opencode/opencode/agents"
+QUARANTINE_MAX_PER_H = 3      # карантинов на место за час; дальше — capped, нужен человек
+QUARANTINE_WINDOW_S = 3600.0
 
 _EXPECTED = ("saved", "visible")         # место должно видеть после перезагрузки (как AgentStore.expected)
 # нет ответа места: соединение, срок (asyncio.timeout — TimeoutError), обрыв, нет пароля места (OSError)
 _NO_ANSWER = (httpx.HTTPError, TimeoutError, OSError)
+_REL_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")   # путь файла агента от каталога агентов места (как у AgentStore)
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _config_error_body(body: bytes) -> bool:
-    """Тело 400 места — ошибка конфигурации OpenCode: JSON-объект, name начинается с Config и кончается на Error.
-    Разбор пути и карантин — задача А6 (Д7б, Д7-R59)."""
+def config_error_path(body: bytes) -> str | None:
+    """Путь файла из тела 400 места, если это ошибка конфигурации OpenCode (Д7-R59): JSON-объект, name начинается с
+    Config и кончается на Error, data.path — строка. Иначе None — не ошибка конфигурации, прежнее поведение. Одна
+    функция и для воркера, и для пробуждения (предпроверка Д7б, m25)."""
     try:
         obj = json.loads(body)
-    except (ValueError, RecursionError):
-        return False
-    name = obj.get("name") if isinstance(obj, dict) else None
-    return isinstance(name, str) and name.startswith("Config") and name.endswith("Error")
+    except (ValueError, RecursionError):            # не JSON (в том числе не UTF-8) или вложенность глубже предела
+        return None
+    if not isinstance(obj, dict):
+        return None
+    name, data = obj.get("name"), obj.get("data")
+    if not (isinstance(name, str) and name.startswith("Config") and name.endswith("Error")):
+        return None
+    path = data.get("path") if isinstance(data, dict) else None
+    return path if isinstance(path, str) else None
+
+
+def agents_rel_path(path: str) -> str | None:
+    """Путь файла агента от каталога агентов места (Д7-R59): path начинается с PLACE_AGENTS_DIR + "/", остаток —
+    [A-Za-z0-9._/-]{1,200} без пустых частей, «.» и «..» и кончается на .md. Иначе None — файл образа (или путь, который
+    служба не трогает): ничего не переносится."""
+    prefix = PLACE_AGENTS_DIR + "/"
+    if not isinstance(path, str) or not path.startswith(prefix):
+        return None
+    rel = path[len(prefix):]
+    if not _REL_RE.fullmatch(rel) or not rel.endswith(".md"):
+        return None
+    if any(part in ("", ".", "..") for part in rel.split("/")):
+        return None
+    return rel
 
 
 class GateTimeout(Exception):
@@ -195,6 +236,7 @@ class AgentReloads:
         self._dir_at: float | None = None               # последняя проверка каталога (monotonic)
         self._hooks: set[asyncio.Task] = set()          # задачи крючка готовности
         self._queue_failed = False                      # прошлое чтение очереди не удалось (строка журнала — на смене)
+        self._quarantines: dict[int, deque[float]] = {}  # карантины места за окно (monotonic), Д7-R59
 
     # --- прокси и места ---
 
@@ -245,9 +287,43 @@ class AgentReloads:
         return len(marks), max(0, int((now - oldest).total_seconds()))
 
     async def repair(self, n: int, body: bytes) -> RepairResult:
-        """Карантин файла агента, сломавшего конфигурацию места (Д7-R59), — задача А6 (Д7б). До неё — заглушка: тело
-        «не про конфигурацию», и 400 после dispose — неудача перезагрузки."""
-        return "not_config"
+        """Карантин файла агента, сломавшего конфигурацию места (Д7-R59). Тело 400 места:
+        - не Config…Error с data.path — not_config: прежнее поведение, ни счётчиков, ни журнала;
+        - путь вне каталога агентов места (файл образа, «..», имя вне правил) — image: ничего не двигается;
+        - у места уже QUARANTINE_MAX_PER_H карантинов за окно — capped: файл остаётся, нужен человек;
+        - иначе файл — в карантин (AgentStore.quarantine в потоке), строка агента — quarantined; файла уже нет — тоже
+          quarantined: экземпляр места всё равно сломан, перезапуск нужен. Сбой переноса (DirUnavailable, StoreError) —
+          image с классом ошибки в журнале, а не исключение и срок пробуждения (m6).
+        image и capped — счётчик image_config, quarantined — quarantined. Метка окна ставится до переноса (без await
+        между проверкой предела и меткой) и снимается, если перенос не удался. Зовут под замком места (шаг в воркера,
+        пробуждение), так что у одного места repair не идут разом."""
+        path = config_error_path(body)
+        if path is None:
+            return "not_config"
+        rel = agents_rel_path(path)
+        if rel is None:
+            return self._not_moved(n, "image")
+        now = self._monotonic()
+        marks = self._quarantines.setdefault(n, deque())
+        while marks and now - marks[0] >= QUARANTINE_WINDOW_S:
+            marks.popleft()
+        if len(marks) >= QUARANTINE_MAX_PER_H:
+            return self._not_moved(n, "capped")
+        marks.append(now)
+        try:
+            moved = await asyncio.to_thread(self.store.quarantine, n, rel, self._wallclock())
+        except (DirUnavailable, StoreError) as exc:
+            marks.remove(now)
+            return self._not_moved(n, "image", type(exc).__name__)
+        self.stats.event("quarantined")
+        log.warning("gw agents quarantine place=%02d result=%s", n, "missing" if moved is None else "moved")
+        return "quarantined"
+
+    def _not_moved(self, n: int, result: RepairResult, error: str = "") -> RepairResult:
+        """image или capped: файл не двигается, счётчик image_config, строка журнала без имени файла."""
+        self.stats.event("image_config")
+        log.warning("gw agents quarantine place=%02d result=%s%s", n, result, f" error={error}" if error else "")
+        return result
 
     # --- цикл ---
 
@@ -372,6 +448,8 @@ class AgentReloads:
             held = False
             if seen is None:
                 self._failed(n, "agent", failure)
+                if failure.startswith("config_"):       # Д7-R59, П5 в: без await после release и до end_reload (m4, m7)
+                    w.restart(n, broken=failure != "config_quarantined")
                 return
             step[0] = "mark"                            # г)
             now_wall = self._wallclock()
@@ -433,7 +511,7 @@ class AgentReloads:
     async def _visible(self, n: int, expected: set[str]) -> tuple[set[str] | None, str]:
         """GET /agent до VISIBLE_TRIES раз (попытка — places.READY_ATTEMPT_S, пауза VISIBLE_PAUSE_S), пока место не
         увидит всех expected. (имена последнего ответа 200, "") или (None, причина): ни одного 200, или 400 с
-        ошибкой конфигурации — тогда repair (до А6 — заглушка not_config) и без повторов."""
+        ошибкой конфигурации (config_error_path) — тогда repair и без повторов, причина config_<итог repair>."""
         seen: set[str] | None = None
         why = "no_answer"
         for attempt in range(VISIBLE_TRIES):
@@ -444,7 +522,7 @@ class AgentReloads:
             except _NO_ANSWER as exc:
                 why = type(exc).__name__
                 continue
-            if r.status_code == 400 and _config_error_body(r.content):
+            if r.status_code == 400 and config_error_path(r.content) is not None:
                 return None, f"config_{await self.repair(n, r.content)}"
             if r.status_code != 200:
                 why = f"status_{r.status_code}"

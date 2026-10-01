@@ -68,6 +68,7 @@ def _build_env(tmp_path, *, ready=(3,), save=True, sleep=quick_sleep, agents_roo
                            drill=role.gw.DRILL_AGENTS)
     role.reloads = reloads
     role.workplaces.on_ready = reloads.place_ready
+    role.workplaces.repair = reloads.repair     # Д7б (А6, m3): карантин при пробуждении — тот же воркер, его часы
     if save:
         draft = replace(AGENT_DRAFT, name="proverka")
         assert store.save(3, draft, agent_text(draft), NOW) == "saved"
@@ -591,13 +592,13 @@ async def test_agent_list_unanswered_is_failure(env):                      # ш�
 
 
 @pytest.mark.anyio
-async def test_config_error_after_dispose_is_failure(env, monkeypatch):    # шаг в: repair до А6 — заглушка not_config
+async def test_config_error_after_dispose_is_failure(env, monkeypatch):    # шаг в: путь вне каталога агентов (Д7б, П4)
     real = env.oc._answer
 
     async def answer(request, n):
         if request.url.path == "/agent" and env.oc.dispose_calls[n]:
             return httpx.Response(400, json={"name": "ConfigInvalidError",
-                                             "data": {"path": "/etc/pcbk-opencode/opencode/agents/proverka.md"}})
+                                             "data": {"path": "/etc/pcbk-opencode/opencode/opencode.json"}})
         return await real(request, n)
     monkeypatch.setattr(env.oc, "_answer", answer)
     assert await env.reloads.repair(3, b"{}") == "not_config"
@@ -605,7 +606,14 @@ async def test_config_error_after_dispose_is_failure(env, monkeypatch):    # ш�
     agent_calls = [r for r in place_requests(env.oc, 3) if r.path == "/agent"]
     assert env.oc.dispose_calls[3] == 1 and len(agent_calls) == 1          # конфигурация сломана — без повторов
     assert env.stats.count_1h("reload_failed") == 1 and env.stats.count_1h("quarantined") == 0
+    assert env.stats.count_1h("image_config") == 1                         # файл образа: ничего не двигается
+    assert (env.root / "student-03" / "proverka.md").exists() and list((env.root / "quarantine").iterdir()) == []
     assert env.store.list_place(3)[0].state == "saved" and 3 in env.store.pending()
+    view = await env.role.workplaces.wait_ready(3)                          # П5 в: место гаснет с текстом config
+    assert (view.state, view.detail) == ("failed", "Настройка рабочего места сломана — сообщите администратору.")
+    assert not env.docker.containers[3]["running"]
+    env.mono.advance(RELOAD_RETRY_S + 1); await settle(env)
+    assert env.oc.dispose_calls[3] == 1                                     # dispose раз в RELOAD_RETRY_S не идёт
 
 
 @pytest.mark.anyio
