@@ -8,6 +8,7 @@ import time
 import pytest
 
 from conftest import TEST_MGMT_KEY, TEST_OPENROUTER_KEY, system_text, turn_bodies, wait_for
+from secret import Secret
 
 Q = "что сейчас по тегу 20FAKE_001_PV?"
 MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
@@ -115,6 +116,7 @@ def test_openrouter_key_never_in_workplace(stack, place01):                     
         code, found, _ = grep(key)
         assert (code, found) == (1, ""), key                                     # 1 — grep ничего не нашёл
     code, body = stack.oc(1, "GET", "/config", 1)
+    body = Secret(body)                    # в теле /config — токен LLM места: ни в traceback, ни в --showlocals его нет
     own, leaked = stack.llm_token(1) in body, [k for k in keys if k in body]     # {file:} подставлен — ответ тот
     assert (code, own, leaked) == (200, True, [])
 

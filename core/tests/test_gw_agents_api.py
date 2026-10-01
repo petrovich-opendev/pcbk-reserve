@@ -76,7 +76,10 @@ def test_agents_api_own_place_only(gw):                                         
 
 
 def test_agents_api_refusals(gw):
-    assert gw.anon().get(AGENTS_PATH).status_code == 401
+    r = gw.anon().get(AGENTS_PATH)                                                   # тело 401 — JSON шлюза (ревью Б2)
+    assert (r.status_code, r.headers["content-type"], r.json()) == \
+        (401, "application/json", {"name": "Unauthorized", "data": {"message": GW_MESSAGES["need_login"]}})
+    assert GW_MESSAGES["need_login"] == "Нужно войти"
     r = gw.as_("teach").get(AGENTS_PATH)
     assert (r.status_code, r.json()["data"]["message"]) == (403, TEACHER_TEXT)
     assert gw.as_("stu-03", client=PLACE_NET).get(AGENTS_PATH).status_code == 404
