@@ -648,7 +648,7 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
   }
 
   const proxied = ["/pcbk/api/auth/", "/pcbk/api/auth/me", "/pcbk/api/auth/notice", "/pcbk/api/workplace",
-                   "/pcbk/api/workplace/wake"];
+                   "/pcbk/api/workplace/wake", "/pcbk/api/agents"];                    // «Мои агенты» (Д7б, Д7-R64)
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
   const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
@@ -707,6 +707,15 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.ok(b.includes("limit_req zone=pcbk_place_rate burst=20 nodelay;"), path);
     assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], path);   // busy.json, не 429 входа
     assert.ok(b.includes("limit_req_log_level warn;"), path);
+  }
+  // «Мои агенты» (Д7б, Д7-R64): копия location = /pcbk/api/workplace — зона pcbk_place_rate, 509 → busy.json, тело
+  // 64k, срок 30 с, сверка сырого пути; тела сравниваются без комментариев и с точностью до пробелов
+  {
+    const flat = (path) => loc(path).body.trim().split(/\s+/).join(" ");
+    assert.equal(loc("/pcbk/api/agents").exact, true);
+    assert.equal(locs.filter((l) => l.port === 8443 && l.path === "/pcbk/api/agents").length, 1);
+    assert.ok(flat("/pcbk/api/workplace").includes("limit_req zone=pcbk_place_rate burst=20 nodelay;"));   // контроль
+    assert.equal(flat("/pcbk/api/agents"), flat("/pcbk/api/workplace"));
   }
   assert.ok(loc("/pcbk/api/").body.includes("if ($pcbk_bad_api_uri) { return 400"));
   assert.match(loc("/pcbk/api/").body, /return 404 '\{"name":"NotFound"/);
