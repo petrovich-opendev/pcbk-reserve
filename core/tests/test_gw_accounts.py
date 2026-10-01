@@ -436,7 +436,8 @@ def test_store_opens_d5_db(tmp_path):                                           
     assert "gw_notices" in tables(db)
     assert store.verify("stu-03", PW) is not None                                         # учётка Д5 жива, gw_accounts не тронута
     assert store.notice_acked("stu-03", NOTICE) is False
-    store.ack_notice("stu-03", NOTICE); store.ack_notice("stu-03", NOTICE)               # повтор — без ошибки
+    assert store.ack_notice("stu-03", NOTICE) is True                                     # первое — записано
+    assert store.ack_notice("stu-03", NOTICE) is False                                    # повтор — без ошибки и записи
     assert store.notice_acked("stu-03", NOTICE) and not store.notice_acked("stu-03", "teacher-reads-2")
     assert notice_rows(db) == [("stu-03", NOTICE)]                                        # повтор строку не множит
     assert NOTICE == "teacher-reads-1"

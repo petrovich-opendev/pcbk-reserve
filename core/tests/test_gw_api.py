@@ -599,8 +599,8 @@ def test_notice_ack_rules(tmp_path, gwlog):                                     
         assert role.workplaces.view(3).state == "sleeping"                              # подтверждение места не будит
         assert not [call for call in role.fake_docker.calls if call[0] == "start"]
     text = gwlog.text
-    assert text.count("gw notice ack login=stu-03 notice=teacher-reads-1") == 2       # положительный контроль журнала
-    assert text.count("gw notice ack") == 2                                            # отказы — без строки
+    assert text.count("gw notice ack login=stu-03 notice=teacher-reads-1") == 1       # положительный контроль журнала;
+    assert text.count("gw notice ack") == 1                                            # повтор и отказы — без строки (Б2-m2)
     assert "gw origin refused path=/pcbk/api/auth/notice n=1 since_s=0" in text
 
 

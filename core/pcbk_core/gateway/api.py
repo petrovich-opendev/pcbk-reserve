@@ -18,8 +18,9 @@ Host. Номер места — только из учётки сессии.
 «Кто я» (GET /pcbk/api/auth/me) — учётка сессии и "notice": NOTICE, если студент не подтвердил эту редакцию
 предупреждения, иначе (и у преподавателя) null; сбой базы на этом чтении — 503 store, как у сессии. Ответ входа
 предупреждения не несёт. Подтверждение — POST /pcbk/api/auth/notice с телом ровно {"notice": NOTICE}: 204 (повтор —
-тоже 204), иной номер или тело — 400 bad_body, строка журнала «gw notice ack login=… notice=…». Место ни «кто я», ни
-подтверждение не будят: будит только POST /pcbk/api/workplace/wake.
+тоже 204), иной номер или тело — 400 bad_body, строка журнала «gw notice ack login=… notice=…» — только на первое
+подтверждение (итоговая доводка Д6б, Б2-m2). Место ни «кто я», ни подтверждение не будят: будит только
+POST /pcbk/api/workplace/wake.
 
 Вход: замок (store.locked вместе с незаписанными неудачами логина) → очередь сверок (не больше
 LOGIN_PARALLEL попыток разом, ждущих — не больше LOGIN_QUEUE, незаписанных неудач — не больше LOGIN_BACKLOG,
@@ -509,12 +510,13 @@ def auth_router(role: "GatewayRole") -> APIRouter:
         if acked is None:
             return _error(400, "bad_body")
         try:
-            await asyncio.to_thread(role.store.ack_notice, account.login, acked)
+            first = await asyncio.to_thread(role.store.ack_notice, account.login, acked)
         except StoreError:
             return _error(503, "store")
         except ValueError:              # учётку отключили между сессией и записью — как конец сессии
             return _error(401, "need_login")
-        log.info("gw notice ack login=%s notice=%s", account.login, acked)
+        if first:                       # повтор (вторая вкладка, двойное нажатие) — 204 без строки журнала
+            log.info("gw notice ack login=%s notice=%s", account.login, acked)
         return Response(status_code=204)
 
     return router

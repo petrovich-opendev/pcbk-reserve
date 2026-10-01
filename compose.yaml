@@ -90,7 +90,7 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d5b остаётся на сервере для отката Д6а
+    # :d6a остаётся на сервере для отката Д6б (:d5b — для отката Д6а)
     image: pcbk-reserve/watchdog:d6b
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
@@ -203,7 +203,8 @@ services:
   # на адресе core в pcbk-front (Д5-R31). Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d5b остаётся на сервере для отката Д6а
+    # :d6a остаётся на сервере для отката Д6б (:d5b — для отката Д6а); откат только статики и login.js при core:d6b
+    # снимает предупреждение при первом входе (deploy/README.md, «Откат»)
     image: pcbk-reserve/core:d6b
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core

@@ -58,6 +58,10 @@ limit_req_zone $pcbk_oc_session zone=pcbk_place_rate:1m rate=5r/s;
 # отчёты браузеров о молчании чата (Д6б, Д6-R50): та же карта cookie, без cookie — корзина «-»; не по IP — весь класс
 # бывает за одним адресом. Браузер шлёт отчёт раз в эпизод, core считает не чаще раза в минуту на (логин, вид)
 limit_req_zone $pcbk_oc_session zone=pcbk_web:1m rate=1r/s;
+# «кто я» и подтверждение предупреждения (итоговая доводка Д6б, m2; preflight Н17): та же карта cookie, без cookie —
+# корзина «-» (без сессии обе ручки отвечают 401). По IP класс за одним NAT делил бы с ними корзину входа — около пяти
+# запросов /pcbk/api/auth/ на студента при входе, и вход класса в одну секунду получал 429. Вход и выход — по IP
+limit_req_zone $pcbk_oc_session zone=pcbk_auth_session:1m rate=5r/s;
 
 # временные файлы тел запросов и ответов core — на томе pcbk-edge-temp (диск), не в tmpfs: tmpfs считается в
 # mem_limit 64m edge, а ответ core — до 4 МиБ (Д5-R36), тело /pcbk/api/oc/ — до 512 КиБ. Каталоги создаёт мастер
@@ -118,7 +122,7 @@ server {
     error_page 494 =400 /pcbk-errors/400.json;            # большие заголовки и cookie (cookie Dify на том же хосте)
     error_page 429 /pcbk-errors/429.json;
     error_page 502 503 504 =503 /pcbk-errors/503.json;    # «=503»: без него код остался бы 502 или 504
-    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn и limit_req под /pcbk/api/oc/, у ручек места и отчётов (509 — только их код)
+    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn и limit_req под /pcbk/api/oc/, у ручек места, отчётов, me и notice (509 — только их код)
 
     location = /pcbk-errors/400.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
     location = /pcbk-errors/405.json { internal; default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
@@ -255,12 +259,37 @@ server {
     }
 
     # пути шлюза в core — только эти (Д5а, /pcbk/api/oc/ — Д5б); error_page, буферы, Connection "", X-Forwarded-Host
-    # и заголовки ответа — от server: своих error_page, proxy_set_header и add_header здесь нет
+    # и заголовки ответа — от server: своих error_page, proxy_set_header и add_header здесь нет.
+    # Вход и выход (и прочее под /pcbk/api/auth/ — 404 core) — предел по IP, отказ 429 «Слишком много попыток входа»
     location /pcbk/api/auth/ {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
         limit_req zone=pcbk_login burst=20 nodelay;
         limit_req_status 429;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    # «кто я» и подтверждение предупреждения (итоговая доводка Д6б, m2): предел на cookie сессии, а не по IP входа;
+    # отказ — 509 → busy.json (503 WorkplaceBusy), как у ручек места: «Повторить» чата и форма входа его переживают
+    location = /pcbk/api/auth/me {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_auth_session burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    location = /pcbk/api/auth/notice {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_auth_session burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
         client_max_body_size 64k;
         proxy_read_timeout 30s;
         proxy_pass http://$pcbk_core;

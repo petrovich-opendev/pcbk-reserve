@@ -506,19 +506,21 @@ class AccountStore:
             return db.execute("SELECT 1 FROM gw_notices WHERE login = ? AND notice = ?",
                               (login, notice)).fetchone() is not None
 
-    def ack_notice(self, login: str, notice: str) -> None:
-        """Подтверждение предупреждения notice действующей учёткой login; повтор — ничего (время первого
-        подтверждения остаётся). Нет учётки или она отключена — ValueError: строки без учётки не копятся. Сбой
-        SQLite — StoreError (сбой записи)."""
+    def ack_notice(self, login: str, notice: str) -> bool:
+        """Подтверждение предупреждения notice действующей учёткой login. True — первое подтверждение (строка
+        записана), False — повтор: ничего не меняется, время первого подтверждения остаётся (итоговая доводка Д6б,
+        Б2-m2: строку журнала шлюз пишет только на первое). Нет учётки или она отключена — ValueError: строки без
+        учётки не копятся. Сбой SQLite — StoreError (сбой записи)."""
         _check_login(login)
         _check_notice(notice)
         with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM gw_accounts WHERE login = ? AND disabled = 0", (login,)).fetchone() is None:
                 raise ValueError("учётки нет или она отключена")
-            db.execute("INSERT INTO gw_notices (login, notice, acked_at) VALUES (?, ?, ?)"
-                       " ON CONFLICT (login, notice) DO NOTHING", (login, notice, self.clock()))
+            written = db.execute("INSERT INTO gw_notices (login, notice, acked_at) VALUES (?, ?, ?)"
+                                 " ON CONFLICT (login, notice) DO NOTHING", (login, notice, self.clock())).rowcount
             db.execute("COMMIT")
+            return written == 1
 
     # --- вход и сессии ---
 

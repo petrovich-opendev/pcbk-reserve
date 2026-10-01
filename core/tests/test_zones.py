@@ -133,12 +133,16 @@ def test_gateway_needs_front_client_too(tmp_path):                              
         assert place.post("/pcbk/api/auth/login", **big).status_code == 404
         r = place.post("/pcbk/api/web/report", json={"kind": "ui_crash"}, headers={"Origin": ORIGIN})   # Д6б
         assert (r.status_code, r.json()["name"]) == (404, "NotFound")
+        r = place.post("/pcbk/api/auth/notice", json={"notice": "teacher-reads-1"}, headers={"Origin": ORIGIN})   # Б2-m4
+        assert (r.status_code, r.json()["name"]) == (404, "NotFound")
     for client in (("172.31.250.35", 40000), ("172.31.250.36", 40000)):                # edge, сторож
         with TestClient(app, base_url="http://172.31.250.34:8000", client=client) as front:
             assert front.get("/pcbk/api/auth/me").status_code == 401, client
             assert front.get("/health/gateway").status_code == 200, client
             assert front.get("/health/web").status_code == 200, client
             assert front.post("/pcbk/api/web/report", json={"kind": "ui_crash"}).status_code == 401, client
+            assert front.post("/pcbk/api/auth/notice", json={"notice": "teacher-reads-1"},
+                              headers={"Origin": ORIGIN}).status_code == 401, client
             assert front.post("/pcbk/api/auth/login", **big).status_code == 413, client
     with TestClient(app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 40000)) as loop:   # петля
         assert loop.get("/health/gateway").status_code == 200
@@ -147,6 +151,8 @@ def test_gateway_needs_front_client_too(tmp_path):                              
         assert host.get("/health/gateway").status_code == 404                          # pcbk-egress — не front
         assert host.get("/health/web").status_code == 404
         assert host.post("/pcbk/api/web/report", json={"kind": "ui_crash"}).status_code == 404
+        assert host.post("/pcbk/api/auth/notice", json={"notice": "teacher-reads-1"},
+                         headers={"Origin": ORIGIN}).status_code == 404
 
 
 def test_health_llm_full_only_for_admin_client(tmp_path, fake_or):                     # M3: /health/llm

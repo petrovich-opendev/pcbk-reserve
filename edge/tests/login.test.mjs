@@ -516,9 +516,28 @@ test("index.html: ссылки «Войти» на /login и «Чат» на /ch
 
 // --- шаблон edge: то, что без nginx -t видно по тексту (сам nginx -t — задача А6) --------------
 
+// комментарий nginx — от «#» в начале слова вне кавычек до конца строки: скобки в нём разборщик не считает
+// (итоговая доводка Д6б, Б4-m5). Комментарий заменяется пробелами — смещения и номера строк те же
+function stripComments(conf) {
+  return conf.split("\n").map((line) => {
+    let quote = null;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = null;
+      } else if (ch === "'" || ch === '"') quote = ch;
+      else if (ch === "#" && (i === 0 || /[\s;{}]/.test(line[i - 1]))) return line.slice(0, i) + " ".repeat(line.length - i);
+    }
+    return line;
+  }).join("\n");
+}
+
 // location с модификатором (= или ^~) и портом своего server: server-блоки идут подряд на верхнем уровне, так что
-// location принадлежит последнему server перед ним. Регулярных location (~, ~*) в шаблоне нет — разборщик их не видит
-function locations(conf) {
+// location принадлежит последнему server перед ним. Регулярных location (~, ~*) в шаблоне нет — разборщик их не видит.
+// Тела — без комментариев
+function locations(raw) {
+  const conf = stripComments(raw);
   const servers = [...conf.matchAll(/^server\s*\{/gm)].map((m) => ({
     at: m.index, port: Number(/^\s*listen\s+(\d+)/m.exec(conf.slice(m.index))[1]),
   }));
@@ -539,6 +558,17 @@ function locations(conf) {
   }
   return out;
 }
+
+test("разборщик шаблона: скобки и кавычки в комментариях не в счёт", () => {   // Б4-m5, положительный контроль
+  const conf = 'server {\n    listen 8443;\n    # чужое { в комментарии\n' +
+               '    location = /a { # ещё { и }\n        return 200 \'{"a":"#не комментарий"}\';  # хвост }\n    }\n' +
+               '    location ^~ /b/ { return 204; }\n}\n';
+  const locs = locations(conf);
+  assert.deepEqual(locs.map((l) => [l.mod, l.path, l.port]), [["=", "/a", 8443], ["^~", "/b/", 8443]]);
+  assert.equal(locs[0].body.trim(), 'return 200 \'{"a":"#не комментарий"}\';');          // «#» в кавычках — текст
+  assert.equal(locs[1].body.trim(), "return 204;");
+  assert.equal(stripComments(conf).length, conf.length);
+});
 
 test("шаблон edge: ошибки JSON на уровне server, пути шлюза, страница входа", () => {
   const conf = read("../pcbk.conf.template");
@@ -617,7 +647,8 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.match(l.body, new RegExp(`try_files /login\\.${path === "/login" ? "html" : path.split(".")[1]} =404;`), path);
   }
 
-  const proxied = ["/pcbk/api/auth/", "/pcbk/api/workplace", "/pcbk/api/workplace/wake"];
+  const proxied = ["/pcbk/api/auth/", "/pcbk/api/auth/me", "/pcbk/api/auth/notice", "/pcbk/api/workplace",
+                   "/pcbk/api/workplace/wake"];
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
   const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
@@ -643,6 +674,19 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.doesNotMatch(b, /zone=pcbk_login|zone=pcbk_oc|zone=pcbk_place|limit_conn/, report);           // своя зона
   }
   assert.equal(loc("/pcbk/api/auth/").exact, false);
+  // «кто я» и подтверждение (итоговая доводка Д6б, m2; Н17): предел на cookie сессии, а не корзина входа по IP — класс
+  // за одним NAT не делит её с /me; отказ — 509 → busy.json, как у ручек места
+  assert.ok(conf.includes("limit_req_zone $pcbk_oc_session zone=pcbk_auth_session:1m rate=5r/s;"));
+  assert.equal(conf.match(/zone=pcbk_auth_session:/g).length, 1);
+  for (const path of ["/pcbk/api/auth/me", "/pcbk/api/auth/notice"]) {
+    const b = loc(path).body;
+    assert.equal(loc(path).exact, true, path);
+    assert.ok(b.includes("limit_req zone=pcbk_auth_session burst=20 nodelay;"), path);
+    assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], path);   // не 429 входа
+    assert.ok(b.includes("limit_req_log_level warn;"), path);
+    assert.doesNotMatch(b, /zone=pcbk_login|zone=pcbk_oc|zone=pcbk_place|zone=pcbk_web|limit_conn/, path);
+  }
+  assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/pcbk/api/auth/")).length, 3);   // вход и выход — по IP
   assert.equal(loc("/pcbk/api/workplace").exact, true);
   assert.equal(loc("/pcbk/api/workplace/wake").exact, true);
   for (const path of proxied) {
