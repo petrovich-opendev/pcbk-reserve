@@ -1,10 +1,11 @@
 """Наблюдение раньше функции (задача А1 Д7а, Д7-R60): счётчики AgentStats за час, GET /health/agents — ровно 15 ключей,
-только числа и тексты, только зона front, отказы — обработчиком шлюза из реестра; DRILL_AGENTS — в drill. До воркера
-перезагрузки (А5) checked_at — null, и строка сторожа честно «неизвестно»."""
+только числа и тексты, только зона front, отказы — обработчиком шлюза из реестра; DRILL_AGENTS — в drill. До первого
+прохода воркера перезагрузки (А5) checked_at — null, и строка сторожа честно «неизвестно»; где тест сам ставит флаги, воркер
+припаркован (helpers.park_reload_worker): его пульс снял бы флаг воркера посреди теста."""
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import FakeMono, make_gateway, run_python
+from helpers import FakeMono, make_gateway, park_reload_worker, run_python
 from pcbk_core.agents.stats import AGENT_KINDS, AgentStats
 from pcbk_core.gateway.agents_api import HEALTH_AGENTS_PATH
 from pcbk_core.gateway.stats import KINDS, GatewayStats
@@ -51,9 +52,10 @@ def test_agents_health_counts_each_kind_to_its_key(tmp_path):
     assert {k: body[f"{k}_1h"] for k in kinds} == {k: i for i, k in enumerate(kinds, start=1)}
 
 
-def test_agents_health_before_reload_worker(tmp_path):                          # до А5: строка «неизвестно»
+def test_agents_health_before_first_pass(tmp_path):                             # до первого прохода: «неизвестно»
     app, role = make_gateway(tmp_path)
-    assert role.reloads is None
+    assert role.reloads is not None and role.reloads.checked_at is None              # с А5 воркер есть всегда
+    park_reload_worker(role)                                                         # прохода не будет
     with TestClient(app, client=FRONT) as c:
         body = c.get("/health/agents").json()
     assert body == {**{k: 0 for k in KEYS}, "checked_at": None, "store_ok": True, "dir_error": None,
@@ -62,6 +64,7 @@ def test_agents_health_before_reload_worker(tmp_path):                          
 
 def test_agents_health_store_flags_and_dir_error(tmp_path):                    # раунд 3, I-р3-1: флаги порознь
     app, role = make_gateway(tmp_path)
+    park_reload_worker(role)                                                         # А5: пульс воркера снял бы его флаг
     s = role.agent_stats
     with TestClient(app, client=FRONT) as c:
         def store_ok():

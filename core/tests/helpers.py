@@ -516,17 +516,20 @@ ORIGIN = "https://stand.test:8443"
 
 def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),
                  stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
-                 accounts: bool = True, **gw_overrides) -> GatewayRole:
+                 accounts: bool = True, agents_root: Path | None = None, **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
     GatewaySettings (без проверок from_env). stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
 
     tmp_path создаётся; база — db_path или tmp_path/core.db. accounts — завести отдельным AccountStore с open()
     учётки stu-03 (место 3), stu-05 (место 5) и teach (преподаватель), у всех пароль PW; иначе база заранее не
     открывается. Места из ready работают в двойнике Docker и готовы без пробуждения: первый такт их не трогает.
+    Корень агентов (Settings.AGENTS_ROOT, Д7а, предпроверка П3) — agents_root как есть, по умолчанию
+    tmp_path/agents, подготовленный make_agents_root: воркер перезагрузки проверяет каталог первым тактом.
     Роли для тестов добавлены fake_docker, fake_places, mono.
     """
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
+    root = make_agents_root(tmp_path / "agents") if agents_root is None else Path(agents_root)
     db = Path(db_path) if db_path is not None else tmp_path / "core.db"
     docker = FakeDocker() if docker is None else docker
     oc = FakePlaces() if oc is None else oc
@@ -544,11 +547,19 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
         s.add("teach", "teacher", None, PW)
     for n in ready:
         ready_place(workplaces, docker, n)
-    role = GatewayRole(replace(SETTINGS, DB_PATH=str(db)), gw, store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S),
-                       workplaces=workplaces, stats=stats, config_error=config_error, monotonic=mono,
-                       stream_recheck_s=stream_recheck_s)
+    role = GatewayRole(replace(SETTINGS, DB_PATH=str(db), AGENTS_ROOT=str(root)), gw,
+                       store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S), workplaces=workplaces, stats=stats,
+                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s)
     role.fake_docker, role.fake_places, role.mono = docker, oc, mono
     return role
+
+
+def park_reload_worker(role: GatewayRole) -> None:
+    """Фоновый воркер перезагрузки агентов (Д7-R58) под lifespan не идёт, а ждёт остановки роли: такты ведёт тест сам
+    (предпроверка m9) — ручной такт и фоновый не спорят о пульсе и флагах учёта."""
+    async def parked() -> None:
+        await asyncio.Event().wait()
+    role.reloads.run = parked
 
 
 def make_gateway(tmp_path, **kw) -> tuple[FastAPI, GatewayRole]:

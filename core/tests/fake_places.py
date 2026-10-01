@@ -12,6 +12,9 @@ pcbk-student-01…10; путь вне правил — 403, метод без п
 (raise_for), помолчать (hang_for) и отдать большое тело кусками по 1 КиБ со счётом отданного (big, big_sent).
 
 Д5б (задача Б4): GET /event — поток событий места (events, event_starts, event_open, event_closed; см. FakePlaces).
+
+Д7а (задача А5): POST /instance/dispose — перезагрузка конфигурации места (dispose_calls, dispose_status, on_dispose,
+agents_after_dispose; см. FakePlaces).
 """
 import asyncio
 import base64
@@ -241,7 +244,11 @@ class FakePlaces:
     - GET /event — 200 text/event-stream с потоком по сценарию events[n] (_EventBody; по умолчанию —
       server.connected и конец); event_starts[n] — сколько потоков место отдало, event_open[n] — сколько открыто
       сейчас, event_closed[n] — закрыт ли хоть один (False, пока не закрыт ни один); пауза до заголовков — hang_for;
-    - POST /session/{id}/prompt_async — 204; прочее — 200 {}.
+    - POST /session/{id}/prompt_async — 204;
+    - POST /instance/dispose (Д7а) — dispose_calls[n] += 1; при dispose_status[n] — этот код и {"name": "Dispose"},
+      иначе 200 true, место «перезагружено» и зовётся on_dispose(n) (если задан); после первого удачного dispose GET
+      /agent места из agents_after_dispose отвечает списком agents_after_dispose[n] вместо agents[n];
+    - прочее — 200 {}.
     agent_calls[n] — сколько раз звали /agent места n; active[n] — запросов к месту n в работе сейчас, max_active[n]
     — наибольшее их число (от записи запроса до ответа; у /event — до заголовков).
     """
@@ -272,6 +279,11 @@ class FakePlaces:
         self.event_starts: Counter[int] = Counter()
         self.event_open: Counter[int] = Counter()
         self.event_closed: defaultdict[int, bool] = defaultdict(bool)
+        self.dispose_calls: Counter[int] = Counter()
+        self.dispose_status: dict[int, int] = {}
+        self.on_dispose: Callable[[int], None] | None = None
+        self.agents_after_dispose: dict[int, list[dict]] = {}
+        self._disposed: set[int] = set()                # места, где dispose уже удался
 
     async def _big_body(self, n: int, size: int):
         while size > 0:
@@ -323,6 +335,8 @@ class FakePlaces:
                 await asyncio.sleep(self.agent_delay)
             if self.never_ready or self.agent_calls[n] < self.ready_after:
                 return _json(503, {"name": "NotReady"})
+            if n in self._disposed and n in self.agents_after_dispose:
+                return _json(200, self.agents_after_dispose[n])
             return _json(200, self.agents.get(n, []))
         if request.method == "GET" and path == "/session/status":
             if self.status_delay:
@@ -334,6 +348,14 @@ class FakePlaces:
             return _json(200, self.pending.get(n, []))
         if request.method == "POST" and _PROMPT_ASYNC.fullmatch(path):
             return httpx.Response(204)
+        if request.method == "POST" and path == "/instance/dispose":
+            self.dispose_calls[n] += 1
+            if n in self.dispose_status:
+                return _json(self.dispose_status[n], {"name": "Dispose"})
+            self._disposed.add(n)
+            if self.on_dispose is not None:
+                self.on_dispose(n)
+            return _json(200, True)
         return _json(200, {})
 
 
