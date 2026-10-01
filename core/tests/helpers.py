@@ -35,7 +35,7 @@ from fake_places import PLACE_PW, FakeDocker, FakePlaces
 from fakes import WHITELIST, FakeHistorian
 from pcbk_core.app import Role, RoleBase, create_app
 from pcbk_core.data import DataRole
-from pcbk_core.data.catalog import Catalog
+from pcbk_core.data.catalog import Catalog, TagInfo
 from pcbk_core.data.events import CallEvent
 from pcbk_core.data.historian import parse_clock
 from pcbk_core.data.service import DataService
@@ -582,3 +582,31 @@ def login_cookie(url: str, name: str, pw: str = PW) -> str:
     assert r.status_code == 200, r.status_code
     line = next(h for h in r.headers.get_list("set-cookie") if h.startswith("pcbk_session="))
     return line.split(";", 1)[0].split("=", 1)[1]
+
+
+# --- Агенты студентов: каталог черновика (Д7а, задача А2) ---
+
+# 16 тегов белого списка с именами ровно по 128 знаков (вид SAFE_NAME) — худший черновик по размеру файла (m10)
+BIG_TAGS = tuple(f"20FAKE_{100 + i:03d}_PV".ljust(128, "X") for i in range(16))
+
+
+def _agent_tag(name: str, description: str, unit: str | None) -> TagInfo:
+    return TagInfo(name=name, description=description, kind="analog", unit=unit, min_eu=0.0, max_eu=100.0,
+                   live=False, live_time=None)
+
+
+def agent_catalog(big: bool = False) -> Catalog:
+    """Каталог черновика агента: 20FAKE_001_PV (в списке; описание с кавычками, переводом строки, «##» и обратными
+    кавычками; °C), 20FAKE_002_PV (вне списка), 20FAKE_003_PV (в списке, без единицы).
+
+    big — ещё BIG_TAGS в белом списке: описания по 50 знаков и единицы по 10 знаков, кириллицей (два байта на знак).
+    """
+    tags = [_agent_tag("20FAKE_001_PV", 'Температура "сукна"\n## x `y`', "°C"),
+            _agent_tag("20FAKE_002_PV", "Скорость сеточного стола", "м/мин"),
+            _agent_tag("20FAKE_003_PV", "Давление пара в сушильной части", None)]
+    listed = {"20FAKE_001_PV", "20FAKE_003_PV"}
+    if big:
+        tags += [_agent_tag(name, f"Описание длинного тега номер {i:02d} ".ljust(50, "ж"), "единицаизм")
+                 for i, name in enumerate(BIG_TAGS)]
+        listed |= set(BIG_TAGS)
+    return Catalog({t.name: t for t in tags}, frozenset(listed))
