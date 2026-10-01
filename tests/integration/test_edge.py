@@ -2,7 +2,10 @@
 import hashlib
 import json
 import re
+import secrets
 import time
+
+from secret import Secret
 
 DECLARED_ENV = {                   # наши переменные сверх переменных базового образа — ровно эти
     "pcbk-watchdog": {"LISTEN_PORT", "TICK_S", "STALE_AFTER_S", "DISPLAY_TZ", "DOCKER_URL",
@@ -211,17 +214,30 @@ def test_edge_routes_web_report(stack):                                     # Д
     assert {b["name"] for c, b in codes if c == 503} == {"WorkplaceBusy"}
 
 
-def test_edge_limits_me_and_notice_by_cookie(stack):                       # итоговая доводка Д6б, m2; preflight Н17
-    """«Кто я» и подтверждение предупреждения — предел на cookie сессии (без cookie — общая корзина «-»), отказ 503
-    WorkplaceBusy, а не 429 входа; корзину входа по IP они не тратят: выход с того же адреса после потока /me — ответ
-    шлюза, не 429 edge (выход, а не вход: неудачный вход растил бы счётчики строки «Шлюз и вход» общего стенда)."""
+def test_edge_limits_me_and_notice_by_cookie_or_address(stack):            # итоговая доводка Д6б, m2; preflight Н17
+    """«Кто я» и подтверждение предупреждения — своя зона: ключ — cookie сессии своего вида, без неё — адрес клиента
+    (общей корзины «-» нет). 30 запросов /me без cookie с одного адреса (класс открыл страницу входа) укладываются в
+    предел адреса; дальше — 503 WorkplaceBusy, а не 429 входа; запросы с cookie в это время — своя корзина. Корзину
+    входа по IP эти ручки не тратят: выход с того же адреса — ответ шлюза (выход, а не вход: неудачный вход растил бы
+    счётчики строки «Шлюз и вход» общего стенда)."""
     gw = stack.gw_client()                                                  # без сессии, Origin стенда
-    for method, path, body in (("GET", "/pcbk/api/auth/me", None),
-                               ("POST", "/pcbk/api/auth/notice", {"notice": "teacher-reads-1"})):
-        codes = [gw.call(method, path, body)[:2] for _ in range(60)]        # 5 r/s, запас 20: часть — отказ
-        assert {c for c, _ in codes} == {401, 503}, (path, [c for c, _ in codes])
-        assert {b["name"] for c, b in codes if c == 503} == {"WorkplaceBusy"}, path
+    cookie = {"Cookie": Secret(f"pcbk_session={secrets.token_urlsafe(32)}")}   # своего вида, сессии нет — 401 шлюза
+    codes = [gw.call("GET", "/pcbk/api/auth/me")[0] for _ in range(30)]
+    assert set(codes) == {401}, codes                                       # класс за одним адресом — в пределе
+    bare, own = [], []
+    for i in range(60):                     # адрес исчерпан, а cookie — своя корзина (её 20 запросов — в запасе 40)
+        bare.append(gw.call("GET", "/pcbk/api/auth/me")[:2])
+        if i % 3 == 2:
+            own.append(gw.call("GET", "/pcbk/api/auth/me", headers=cookie)[:2])
+    assert {c for c, _ in bare} == {401, 503}, [c for c, _ in bare]
+    assert {b["name"] for c, b in bare if c == 503} == {"WorkplaceBusy"}
+    assert {(c, b["name"]) for c, b in own} == {(401, "Unauthorized")}, [c for c, _ in own]
+    assert any(bare[i][0] == 503 for i in range(2, 60, 3))                  # cookie прошла там, где адрес уже отказывал
+    notice = [gw.call("POST", "/pcbk/api/auth/notice", {"notice": "teacher-reads-1"})[:2] for _ in range(20)]
+    assert 503 in {c for c, _ in notice} and {c for c, _ in notice} <= {401, 503}, [c for c, _ in notice]   # та же зона
+    code, body, _ = gw.call("POST", "/pcbk/api/auth/notice", {"notice": "teacher-reads-1"}, headers=cookie)
+    assert (code, body["name"]) == (401, "Unauthorized")
     code, body, _ = gw.call("POST", "/pcbk/api/auth/logout")
     assert (code, body) == (200, {}), (code, body)                          # корзина входа по IP не тронута
     assert 'by zone "pcbk_auth_session"' in stack.logs("pcbk-edge")        # отказы — этой зоны, а не входа
-    time.sleep(5)       # корзина «-» опустеет (5 r/s): следующие модули открывают /login без cookie
+    time.sleep(10)      # корзина адреса опустеет (запас 40, 5 r/s): следующие модули открывают /login без cookie

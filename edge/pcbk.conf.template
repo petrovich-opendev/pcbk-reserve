@@ -58,10 +58,16 @@ limit_req_zone $pcbk_oc_session zone=pcbk_place_rate:1m rate=5r/s;
 # отчёты браузеров о молчании чата (Д6б, Д6-R50): та же карта cookie, без cookie — корзина «-»; не по IP — весь класс
 # бывает за одним адресом. Браузер шлёт отчёт раз в эпизод, core считает не чаще раза в минуту на (логин, вид)
 limit_req_zone $pcbk_oc_session zone=pcbk_web:1m rate=1r/s;
-# «кто я» и подтверждение предупреждения (итоговая доводка Д6б, m2; preflight Н17): та же карта cookie, без cookie —
-# корзина «-» (без сессии обе ручки отвечают 401). По IP класс за одним NAT делил бы с ними корзину входа — около пяти
-# запросов /pcbk/api/auth/ на студента при входе, и вход класса в одну секунду получал 429. Вход и выход — по IP
-limit_req_zone $pcbk_oc_session zone=pcbk_auth_session:1m rate=5r/s;
+# «кто я» и подтверждение предупреждения (итоговая доводка Д6б, m2; preflight Н17): ключ — cookie сессии своего вида,
+# без неё — адрес клиента. Общей корзины «-» нет: запросы без cookie дешёвые (сразу 401), а класс открывает страницу
+# входа одновременно — её первый /me идёт без cookie, и корзина «-» на всех сразу отказала бы части класса. Своя
+# зона, а не корзина входа по IP: класс за одним NAT не делит с /me корзину входа (около пяти запросов
+# /pcbk/api/auth/ на студента при входе). Запас 40 — класс из 30 за одним адресом в одну секунду. Вход и выход — по IP
+map $cookie_pcbk_session $pcbk_me_key {
+    default $binary_remote_addr;
+    "~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;
+}
+limit_req_zone $pcbk_me_key zone=pcbk_auth_session:1m rate=5r/s;
 
 # временные файлы тел запросов и ответов core — на томе pcbk-edge-temp (диск), не в tmpfs: tmpfs считается в
 # mem_limit 64m edge, а ответ core — до 4 МиБ (Д5-R36), тело /pcbk/api/oc/ — до 512 КиБ. Каталоги создаёт мастер
@@ -271,12 +277,13 @@ server {
         proxy_pass http://$pcbk_core;
     }
 
-    # «кто я» и подтверждение предупреждения (итоговая доводка Д6б, m2): предел на cookie сессии, а не по IP входа;
-    # отказ — 509 → busy.json (503 WorkplaceBusy), как у ручек места: «Повторить» чата и форма входа его переживают
+    # «кто я» и подтверждение предупреждения (итоговая доводка Д6б, m2): своя зона — cookie сессии, без неё адрес, —
+    # а не корзина входа; отказ — 509 → busy.json (503 WorkplaceBusy), как у ручек места: «Повторить» чата и форма
+    # входа его переживают
     location = /pcbk/api/auth/me {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
-        limit_req zone=pcbk_auth_session burst=20 nodelay;
+        limit_req zone=pcbk_auth_session burst=40 nodelay;
         limit_req_status 509;
         limit_req_log_level warn;
         client_max_body_size 64k;
@@ -287,7 +294,7 @@ server {
     location = /pcbk/api/auth/notice {
         default_type application/json;
         if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
-        limit_req zone=pcbk_auth_session burst=20 nodelay;
+        limit_req zone=pcbk_auth_session burst=40 nodelay;
         limit_req_status 509;
         limit_req_log_level warn;
         client_max_body_size 64k;

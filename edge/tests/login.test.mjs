@@ -674,14 +674,19 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.doesNotMatch(b, /zone=pcbk_login|zone=pcbk_oc|zone=pcbk_place|limit_conn/, report);           // своя зона
   }
   assert.equal(loc("/pcbk/api/auth/").exact, false);
-  // «кто я» и подтверждение (итоговая доводка Д6б, m2; Н17): предел на cookie сессии, а не корзина входа по IP — класс
-  // за одним NAT не делит её с /me; отказ — 509 → busy.json, как у ручек места
-  assert.ok(conf.includes("limit_req_zone $pcbk_oc_session zone=pcbk_auth_session:1m rate=5r/s;"));
+  // «кто я» и подтверждение (итоговая доводка Д6б, m2; Н17): своя зона, а не корзина входа — класс за одним NAT не
+  // делит её с /me. Ключ — cookie сессии своего вида, без неё — адрес клиента: общей корзины «-» нет (первый /me
+  // страницы входа идёт без cookie, класс открывает её разом); запас 40 — класс из 30 за одним адресом.
+  // Отказ — 509 → busy.json, как у ручек места
+  assert.ok(conf.includes('map $cookie_pcbk_session $pcbk_me_key {\n    default $binary_remote_addr;\n' +
+                          '    "~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;\n}'));
+  assert.ok(conf.includes("limit_req_zone $pcbk_me_key zone=pcbk_auth_session:1m rate=5r/s;"));
   assert.equal(conf.match(/zone=pcbk_auth_session:/g).length, 1);
+  assert.equal(conf.match(/\$pcbk_me_key\b/g).length, 2);                            // карта и зона — больше нигде
   for (const path of ["/pcbk/api/auth/me", "/pcbk/api/auth/notice"]) {
     const b = loc(path).body;
     assert.equal(loc(path).exact, true, path);
-    assert.ok(b.includes("limit_req zone=pcbk_auth_session burst=20 nodelay;"), path);
+    assert.ok(b.includes("limit_req zone=pcbk_auth_session burst=40 nodelay;"), path);
     assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], path);   // не 429 входа
     assert.ok(b.includes("limit_req_log_level warn;"), path);
     assert.doesNotMatch(b, /zone=pcbk_login|zone=pcbk_oc|zone=pcbk_place|zone=pcbk_web|limit_conn/, path);

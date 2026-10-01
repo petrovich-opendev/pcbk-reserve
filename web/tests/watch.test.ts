@@ -7,8 +7,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { StreamState } from "../src/gateway";
 import { T_TURN_SILENT } from "../src/texts";
 import {
-  RESYNC_S, STREAM_DOWN_S, TICK_GAP_S, TURN_SILENT_S, createStreamWatch, createTurnWatch, turnFingerprint,
-  useTurnWatch,
+  STREAM_DOWN_S, TICK_GAP_S, TURN_SILENT_S, createStreamWatch, createTurnWatch, turnFingerprint, useTurnWatch,
 } from "../src/watch";
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -42,27 +41,27 @@ test("turn_watch_progress_resets_and_end_stops", () => {
 
 test("turn_watch_background_tab_uses_clock", () => {
   // вкладку скрыли сразу после отправки, 200 с тиков нет (фон троттлит таймеры), вкладку открыли — тик на
-  // visibilitychange видит 200 с по часам. Это и разрыв тиков: отчёт — на RESYNC_S позже (итоговая доводка Д6б, m4:
-  // адаптер успевает переподключить поток и перечитать разговор), а не через 180 тиков
+  // visibilitychange видит 200 с по часам. Это разрыв тиков: отсчёт заново, отчёт — через полный срок после него
+  // (поправка контролёра к итоговой доводке Д6б: ложный turn_silent хуже сигнала на 3 минуты позже)
   const c = clock(); const onSilent = vi.fn(); const w = createTurnWatch({ now: c.now, onSilent });
   w.started(); c.t = 1_000; w.tick();
-  c.t = 200_000; w.tick(); expect(onSilent).not.toHaveBeenCalled();                     // разрыв — ждём пересинхронизации
-  c.ticksTo(w, 200_000 + RESYNC_S * 1000 - 1); expect(onSilent).not.toHaveBeenCalled();
-  c.ticksTo(w, 200_000 + RESYNC_S * 1000); expect(onSilent).toHaveBeenCalledTimes(1);
+  c.t = 200_000; w.tick(); expect(onSilent).not.toHaveBeenCalled();                     // разрыв — отсчёт заново
+  c.ticksTo(w, 200_000 + TURN_SILENT_S * 1000 - 1); expect(onSilent).not.toHaveBeenCalled();
+  c.ticksTo(w, 200_000 + TURN_SILENT_S * 1000); expect(onSilent).toHaveBeenCalledTimes(1);
 });
 
-test("turn_watch_sleep_gap_holds_report", () => {
+test("turn_watch_sleep_gap_restarts_countdown", () => {
   // Н15 и m4: между тиками больше TICK_GAP_S — машина спала (крышка ноутбука): ход мог кончиться, пока поток стоял, —
-  // отчёт ждёт RESYNC_S, а не уходит на первом тике после сна; ход, кончившийся за это время, отчёта не даёт
+  // отсчёт заново, полные TURN_SILENT_S от пробуждения; ход, который адаптер за это время завершил, отчёта не даёт
   const c = clock(); const onSilent = vi.fn(); const w = createTurnWatch({ now: c.now, onSilent });
   w.started(); c.ticksTo(w, 5_000);
   c.t = 3_600_000; w.tick(); expect(onSilent).not.toHaveBeenCalled();                     // час сна
-  c.ticksTo(w, 3_600_000 + RESYNC_S * 1000 - 1); expect(onSilent).not.toHaveBeenCalled();
-  c.ticksTo(w, 3_600_000 + RESYNC_S * 1000); expect(onSilent).toHaveBeenCalledTimes(1);    // молчит и после — отчёт
-  const quiet = vi.fn(); const v = createTurnWatch({ now: c.now, onSilent: quiet });       // ход кончился за 15 с
-  v.started(); c.t += 3_600_000; v.tick(); c.ticksTo(v, c.t + 5_000); v.ended(); c.ticksTo(v, c.t + 60_000);
+  c.ticksTo(w, 3_600_000 + TURN_SILENT_S * 1000 - 1); expect(onSilent).not.toHaveBeenCalled();
+  c.ticksTo(w, 3_600_000 + TURN_SILENT_S * 1000); expect(onSilent).toHaveBeenCalledTimes(1);   // молчит и после — отчёт
+  const quiet = vi.fn(); const v = createTurnWatch({ now: c.now, onSilent: quiet });       // ход кончился за 179 с
+  v.started(); c.t += 3_600_000; v.tick(); c.ticksTo(v, c.t + 179_000); v.ended(); c.ticksTo(v, c.t + 600_000);
   expect(quiet).not.toHaveBeenCalled();
-  // граница: разрыв ровно TICK_GAP_S — ещё не сон, отчёт на том же тике; на 1 мс больше — сон, отчёт ждёт
+  // граница: разрыв ровно TICK_GAP_S — ещё не сон, отчёт на том же тике; на 1 мс больше — сон, отсчёт заново
   for (const [gap, reports] of [[TICK_GAP_S * 1000, 1], [TICK_GAP_S * 1000 + 1, 0]] as const) {
     const u = clock(); const on = vi.fn(); const x = createTurnWatch({ now: u.now, onSilent: on });
     x.started(); u.ticksTo(x, 170_000); u.t += gap; x.tick();
@@ -70,21 +69,13 @@ test("turn_watch_sleep_gap_holds_report", () => {
   }
 });
 
-test("turn_watch_hold_armed_once_under_throttling", () => {
-  // фоновая вкладка дольше 5 минут: Chrome тикает раз в минуту — каждый тик разрыв. Отсрочка взводится один раз и
-  // снимается только обычным тиком после её срока: иначе отчёта не было бы никогда
+test("turn_watch_throttled_tab_waits_for_visible", () => {
+  // вкладка скрыта дольше 5 минут: Chrome тикает раз в минуту — каждый тик разрыв, отсчёт заново; отчёт приходит,
+  // когда вкладку открыли и тики раз в секунду прошли полный срок (цена правила, запись в D6b.md)
   const c = clock(); const onSilent = vi.fn(); const w = createTurnWatch({ now: c.now, onSilent });
-  w.started(); c.ticksTo(w, 120_000, 60_000); expect(onSilent).not.toHaveBeenCalled();
-  c.ticksTo(w, 180_000, 60_000); expect(onSilent).toHaveBeenCalledTimes(1);               // 180 с — отчёт, как без разрывов
-  // видимая вкладка: обычные тики после срока снимают отсрочку — следующий сон взводит её снова
-  const u = clock(); const on = vi.fn(); const v = createTurnWatch({ now: u.now, onSilent: on });
-  v.started(); u.ticksTo(v, 10_000); u.t = 100_000; v.tick(); u.ticksTo(v, 150_000);       // сон 90 с, потом тики
-  u.t = 1_000_000; v.tick(); expect(on).not.toHaveBeenCalled();                            // второй сон — снова отсрочка
-  u.ticksTo(v, 1_000_000 + RESYNC_S * 1000); expect(on).toHaveBeenCalledTimes(1);
-  // известное ограничение: отсрочку взвёл троттлинг и не снял — сон после неё отчёт сразу (запись в D6b.md)
-  const z = clock(); const late = vi.fn(); const y = createTurnWatch({ now: z.now, onSilent: late });
-  y.started(); z.ticksTo(y, 60_000, 60_000); z.t = 3_600_000; y.tick();
-  expect(late).toHaveBeenCalledTimes(1);
+  w.started(); c.ticksTo(w, 3_600_000, 60_000); expect(onSilent).not.toHaveBeenCalled();  // час в фоне
+  c.ticksTo(w, 3_600_000 + TURN_SILENT_S * 1000 - 1); expect(onSilent).not.toHaveBeenCalled();
+  c.ticksTo(w, 3_600_000 + TURN_SILENT_S * 1000); expect(onSilent).toHaveBeenCalledTimes(1);
 });
 
 test("turn_watch_restarts_per_turn", () => {
@@ -133,37 +124,37 @@ test("stream_watch_too_many_tabs_is_not_loss", () => {
 });
 
 test("stream_watch_sleep_is_not_loss", () => {
-  // итоговая доводка Д6б, m4: связь пропала перед сном (крышка ноутбука), машина проспала час, после пробуждения
-  // адаптер переподключился — эпизод, начатый до разрыва тиков, не отчёт, если связь вернулась в первые RESYNC_S
+  // m4 и поправка контролёра: связь пропала перед сном (крышка ноутбука), машина проспала час — потеря, начатая до
+  // разрыва тиков, считается с пробуждения: время сна в эпизод не входит
   const c = clock(); const on = vi.fn(); const w = createStreamWatch({ now: c.now, onRecoveredAfterLongDown: on });
   const down: StreamState = { failures: 1, nextRetryS: 1, last: "offline" };
   const ok: StreamState = { failures: 1, nextRetryS: null, last: "ok" };
   w.tick(); c.ticksTo(w, 10_000); w.onStream(down);
   c.t = 3_600_000; w.tick();                                                            // первый тик после сна
-  c.t += RESYNC_S * 1000 - 1; w.onStream(ok); expect(on).not.toHaveBeenCalled();        // вернулась за 15 с — это сон
-  // связь не вернулась и через RESYNC_S после пробуждения — потеря настоящая, отчёт
-  c.ticksTo(w, c.t + 10_000); w.onStream(down); c.t += 3_600_000; w.tick();
-  c.ticksTo(w, c.t + RESYNC_S * 1000); w.onStream(ok); expect(on).toHaveBeenCalledTimes(1);
-  // эпизод долгий уже до сна (сервер лежал 130 с при живой машине) — отчёт и при быстром восстановлении после сна
+  c.ticksTo(w, c.t + STREAM_DOWN_S * 1000); w.onStream(ok); expect(on).not.toHaveBeenCalled();   // 120 с после — не дольше
+  // связи нет и дольше STREAM_DOWN_S после пробуждения — потеря настоящая, отчёт
+  w.onStream(down); c.t += 3_600_000; w.tick();
+  c.ticksTo(w, c.t + STREAM_DOWN_S * 1000 + 1_000); w.onStream(ok); expect(on).toHaveBeenCalledTimes(1);
+  // эпизод долгий уже к тику перед сном (сервер лежал 130 с при живой машине) — не переносится, отчёт и при быстром
+  // восстановлении после сна
   w.onStream(down); c.ticksTo(w, c.t + 130_000); c.t += 3_600_000; w.tick();
   c.t += 1_000; w.onStream(ok); expect(on).toHaveBeenCalledTimes(2);
-  // эпизод начался после пробуждения — обычное правило: дольше STREAM_DOWN_S — отчёт
+  // эпизод начался после пробуждения — обычное правило
   c.t += 3_600_000; w.tick(); w.onStream(down); c.ticksTo(w, c.t + STREAM_DOWN_S * 1000 + 1_000);
   w.onStream(ok); expect(on).toHaveBeenCalledTimes(3);
 });
 
-test("stream_watch_throttled_tab_limits", () => {
-  // фоновая вкладка дольше 5 минут: тик раз в минуту — каждый тик разрыв. Восстановление в первые RESYNC_S после тика
-  // эпизода, к прошлому тику ещё не долгого, отчёта не даёт (известное ограничение, запись в D6b.md); позже — даёт
-  const run = (recoverAt: number) => {
-    const c = clock(); const on = vi.fn(); const w = createStreamWatch({ now: c.now, onRecoveredAfterLongDown: on });
-    w.tick(); c.t = 10_000; w.onStream({ failures: 1, nextRetryS: 1, last: "down" });
-    c.ticksTo(w, 180_000, 60_000);                                                      // тики раз в минуту
-    c.t = recoverAt; w.onStream({ failures: 4, nextRetryS: null, last: "ok" });
-    return on.mock.calls.length;
-  };
-  expect(run(180_000 + RESYNC_S * 1000 - 1)).toBe(0);
-  expect(run(180_000 + RESYNC_S * 1000)).toBe(1);
+test("stream_watch_throttled_tab_waits_for_visible", () => {
+  // вкладка скрыта дольше 5 минут: тик раз в минуту — каждый тик разрыв, потеря считается заново с каждого тика, и
+  // stream_down нет (цена правила, запись в D6b.md); вкладку открыли — тики раз в секунду, обычное правило
+  const c = clock(); const on = vi.fn(); const w = createStreamWatch({ now: c.now, onRecoveredAfterLongDown: on });
+  w.tick(); c.t = 10_000; w.onStream({ failures: 1, nextRetryS: 1, last: "down" });
+  c.ticksTo(w, 3_600_000, 60_000);
+  c.t += 59_000; w.tick();                                                              // вкладку открыли: тик — тоже разрыв
+  w.onStream({ failures: 9, nextRetryS: null, last: "ok" });                            // час без связи, тики редкие
+  expect(on).not.toHaveBeenCalled();
+  w.onStream({ failures: 1, nextRetryS: 1, last: "down" }); c.ticksTo(w, c.t + STREAM_DOWN_S * 1000 + 1_000);
+  w.onStream({ failures: 9, nextRetryS: null, last: "ok" }); expect(on).toHaveBeenCalledTimes(1);   // видимая — отчёт
 });
 
 test("turn_watch_pauses_while_stream_down", () => {
@@ -279,10 +270,10 @@ test("use_turn_watch_ticks_on_visibility", async () => {
     vi.setSystemTime(Date.now() + 181_000);                                               // часы ушли, тиков не было (фон)
     expect(onSilent).not.toHaveBeenCalled();
     await act(async () => { setVisibility("visible"); });                                // вернулись — тик по visibilitychange
-    expect(onSilent).not.toHaveBeenCalled();                                              // разрыв тиков — отсрочка (m4)
-    await act(async () => { vi.advanceTimersByTime(RESYNC_S * 1000 - 1_000); });
+    expect(onSilent).not.toHaveBeenCalled();                                              // разрыв тиков — отсчёт заново
+    await act(async () => { vi.advanceTimersByTime(TURN_SILENT_S * 1000 - 1_000); });
     expect(onSilent).not.toHaveBeenCalled();
-    await act(async () => { vi.advanceTimersByTime(1_000); });                            // отчёт — на RESYNC_S позже
+    await act(async () => { vi.advanceTimersByTime(1_000); });                            // полный срок после разрыва
     expect(onSilent).toHaveBeenCalledTimes(1); expect(h.result.current).toBe(true);
     h.unmount();
     vi.setSystemTime(Date.now() + 999_000);
@@ -294,8 +285,8 @@ test("use_turn_watch_ticks_on_visibility", async () => {
 });
 
 test("use_turn_watch_sleep_does_not_report", async () => {
-  // Н15 и m4 через рантайм: машина уснула на час посреди хода — первый тик после сна не отчёт; ход, кончившийся за
-  // RESYNC_S после пробуждения (адаптер перечитал статус), отчёта не даёт; молчание и после — отчёт
+  // Н15 и m4 через рантайм: машина уснула на час посреди хода — отсчёт заново с первого тика после сна; ход, который
+  // адаптер за полный срок завершил (перечитал статус), отчёта не даёт; молчание и после — отчёт через полный срок
   const onSilent = vi.fn();
   const h = watchHook(onSilent);
   h.rerender({ running: true, messages: [USER] });
@@ -303,16 +294,17 @@ test("use_turn_watch_sleep_does_not_report", async () => {
   vi.setSystemTime(Date.now() + 3_600_000);
   await act(async () => { vi.advanceTimersByTime(1_000); });                              // первый тик после сна
   expect(onSilent).not.toHaveBeenCalled();
-  await act(async () => { vi.advanceTimersByTime(RESYNC_S * 1000 - 1_000); });
+  await act(async () => { vi.advanceTimersByTime(TURN_SILENT_S * 1000 - 1_000); });
   expect(onSilent).not.toHaveBeenCalled();
-  await act(async () => { vi.advanceTimersByTime(1_000); });                              // RESYNC_S после него — отчёт
+  await act(async () => { vi.advanceTimersByTime(1_000); });                              // полный срок после него
   expect(onSilent).toHaveBeenCalledTimes(1);
   h.rerender({ running: false, messages: [USER, answer("Число")] });
   h.rerender({ running: true, messages: [USER, answer("Число")] });                       // следующий ход
   await act(async () => { vi.advanceTimersByTime(5_000); });
   vi.setSystemTime(Date.now() + 3_600_000);
   await act(async () => { vi.advanceTimersByTime(1_000); });                              // сон и первый тик
-  h.rerender({ running: false, messages: [USER, answer("Число и ещё")] });                // адаптер: ход кончился во сне
+  await act(async () => { vi.advanceTimersByTime(170_000); });
+  h.rerender({ running: false, messages: [USER, answer("Число и ещё")] });                // адаптер завершил ход
   await act(async () => { vi.advanceTimersByTime(400_000); });
   expect(onSilent).toHaveBeenCalledTimes(1);
   h.unmount();

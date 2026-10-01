@@ -1,14 +1,14 @@
 // Отображение разговора (Д6-R41, R42): только разрешённые кнопки, разметка модели инертна, строка вызова
 // инструмента, ошибка сообщения, висящие разрешения и вопросы — только «Отклонить».
 // runtime — useExternalStoreRuntime({ messages, isRunning, onNew, convertMessage }), без OpenCode и сети.
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useExternalStoreRuntime, type AssistantRuntime, type ThreadMessageLike } from "@assistant-ui/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { Chat } from "../src/components/Chat";
 import { ChatView } from "../src/components/ChatView";
 import { PendingInteractions } from "../src/components/PendingInteractions";
 import { MAX_TEXT, T_TOO_MANY_TABS, T_TURN_SILENT } from "../src/texts";
-import { RESYNC_S } from "../src/watch";
+import { STREAM_DOWN_S, TURN_SILENT_S } from "../src/watch";
 
 // адаптер OpenCode — настоящий; useOpenCodeRuntime лишь отдаёт тесту рантайм чата (итоговая доводка Д6б, Б3-m1)
 const seen = vi.hoisted(() => ({ runtime: null as unknown }));
@@ -420,16 +420,26 @@ test("chat_sidebar_title_follows_session", async () => {
   expect(lists).toBe(2);
 });
 
-// видимость вкладки в jsdom: своё свойство поверх геттера документа
-function setVisibility(state: "visible" | "hidden"): void {
-  Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
-  document.dispatchEvent(new Event("visibilitychange"));
+// Часы чата: Date.now — значение теста. tick() — синхронный тик обоих сторожей (они тикают и на visibilitychange);
+// pass(ms) двигает часы шагами по 20 с с тиком на каждом — без разрыва тиков, как у видимой вкладки; gap(ms) — один
+// скачок с тиком после него: разрыв тиков (сон машины или фон). Настоящие тики раз в секунду видят те же часы
+function chatClock() {
+  const c = {
+    now: Date.now(),
+    tick(): void { act(() => { document.dispatchEvent(new Event("visibilitychange")); }); },
+    pass(ms: number, step = 20_000): void {
+      for (let left = ms; left > 0; left -= step) { c.now += Math.min(step, left); c.tick(); }
+    },
+    gap(ms: number): void { c.now += ms; c.tick(); },
+  };
+  vi.spyOn(Date, "now").mockImplementation(() => c.now);
+  return c;
 }
 
 test("chat_reports_turn_silent_once", async () => {
-  // Ф11: начало хода — isRunning false → true (session.status busy), часы — Date.now; вкладка в фоне
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+  // Ф11: начало хода — isRunning false → true (session.status busy), часы — Date.now. Вкладка была в фоне (или машина
+  // спала): разрыв тиков — отсчёт заново, отчёт через полный срок после него (поправка контролёра к доводке Д6б)
+  const c = chatClock();
   stubOpenSession((_method, path) => path === "/pcbk/api/oc/event" ? eventStream([
     { type: "server.connected", properties: {} },
     { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } },
@@ -437,19 +447,16 @@ test("chat_reports_turn_silent_once", async () => {
   const onReport = vi.fn();
   render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
   await screen.findByRole("button", { name: "Стоп" });                        // ход идёт
-  try {
-    setVisibility("hidden");
-    now += 181_000;                                                           // 3 мин без прироста ответа, тиков не было
-    await sleep(1_500);                                                       // тик увидел разрыв — отсрочка (m4)
-    expect(onReport).not.toHaveBeenCalled();
-    now += RESYNC_S * 1000;                                                   // адаптер успел бы перечитать разговор
-    await waitFor(() => expect(onReport).toHaveBeenCalledWith("turn_silent"), { timeout: 3000 });   // тик раз в секунду
-    expect(await screen.findByText(T_TURN_SILENT)).toBeTruthy();
-    await sleep(1_500);
-    expect(onReport).toHaveBeenCalledTimes(1);                                // один на ход
-  } finally {
-    delete (document as { visibilityState?: unknown }).visibilityState;
-  }
+  c.gap(181_000);                                                             // 3 мин без тиков — разрыв
+  expect(onReport).not.toHaveBeenCalled();
+  c.pass(TURN_SILENT_S * 1000 - 1_000);
+  expect(onReport).not.toHaveBeenCalled();
+  c.pass(1_000);                                                              // полный срок после разрыва
+  expect(onReport.mock.calls).toEqual([["turn_silent"]]);
+  expect(await screen.findByText(T_TURN_SILENT)).toBeTruthy();
+  c.pass(400_000);
+  await sleep(1_200);                                                         // и настоящий тик
+  expect(onReport).toHaveBeenCalledTimes(1);                                  // один на ход
 });
 
 test("chat_reports_stream_down_after_long_outage", async () => {
@@ -473,9 +480,9 @@ test("chat_reports_stream_down_after_long_outage", async () => {
 
 test("chat_no_reports_after_halt", async () => {
   // без сессии отчёты не шлются: место уснуло посреди хода (503 WorkplaceNotReady на «Стоп») — чат остановлен,
-  // сторож хода дотикал до 3 минут, а отчёта нет (App снимет чат, но до того отчёт уже ушёл бы впустую)
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+  // сторож хода дотикал до 3 минут (строка «Ответа нет…» видна), а отчёта нет (App снимет чат, но до того отчёт
+  // ушёл бы впустую)
+  const c = chatClock();
   vi.spyOn(console, "error").mockImplementation(() => {});
   stubOpenSession((method, path) => {
     if (path === "/pcbk/api/oc/event") return eventStream([
@@ -490,16 +497,9 @@ test("chat_no_reports_after_halt", async () => {
   render(<Chat onHalt={onHalt} initialSessionId={SES} onReport={onReport} />);
   fireEvent.click(await screen.findByRole("button", { name: "Стоп" }));
   await waitFor(() => expect(onHalt).toHaveBeenCalledWith("asleep"));
-  try {
-    setVisibility("hidden");
-    now += 181_000;
-    await sleep(1_500);                                                       // тик увидел разрыв — отсрочка
-    now += RESYNC_S * 1000;
-    await sleep(1_500);                                                       // тик после отсрочки — ход всё ещё «идёт»
-    expect(onReport).not.toHaveBeenCalled();
-  } finally {
-    delete (document as { visibilityState?: unknown }).visibilityState;
-  }
+  c.pass(TURN_SILENT_S * 1000 + 1_000);                                       // ход всё ещё «идёт»
+  expect(screen.getByText(T_TURN_SILENT)).toBeTruthy();                      // сторож сработал
+  expect(onReport).not.toHaveBeenCalled();
 });
 
 // --- доводка 1 ---
@@ -591,19 +591,18 @@ test("chat_title_race_waits_for_list_in_flight", async () => {
 
 test("chat_no_turn_silent_while_stream_down", async () => {
   // m4: поток лёг посреди хода — отсчёт хода на паузе: при лежащей связи отчёт не «ответ модели не пришёл»
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const c = chatClock();
   let events = 0;
   const enc = new TextEncoder();
   stubOpenSession((_method, path) => {
     if (path !== "/pcbk/api/oc/event") return undefined;
     events += 1;
     if (events === 1) return new Response(new ReadableStream<Uint8Array>({   // ход пошёл, и поток оборвался
-      start(c) {
+      start(ctl) {
         for (const e of [{ type: "server.connected", properties: {} },
                          { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } }])
-          c.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
-        c.close();
+          ctl.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+        ctl.close();
       },
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
     return ocJson(503, { name: "Unavailable", data: { message: "Серверный слой не отвечает" } });
@@ -613,17 +612,9 @@ test("chat_no_turn_silent_while_stream_down", async () => {
   await screen.findByRole("button", { name: "Стоп" });                     // ход идёт
   await waitFor(() => expect(events).toBeGreaterThanOrEqual(2), { timeout: 8_000 });   // переподключение — 503
   await sleep(100);
-  try {
-    setVisibility("hidden");                                                // фон: тики по часам
-    now += 181_000;
-    await sleep(1_500);                                                       // разрыв тиков — отсрочка
-    now += RESYNC_S * 1000;
-    await sleep(1_500);                                                       // отсрочка прошла — держит пауза
-    expect(onReport).not.toHaveBeenCalled();
-    expect(screen.queryByText(T_TURN_SILENT)).toBeNull();
-  } finally {
-    delete (document as { visibilityState?: unknown }).visibilityState;
-  }
+  c.pass(TURN_SILENT_S * 1000 + 20_000);                                    // время идёт без разрыва — держит пауза
+  expect(onReport).not.toHaveBeenCalled();
+  expect(screen.queryByText(T_TURN_SILENT)).toBeNull();
 }, 15_000);
 
 // --- итоговая доводка Д6б ---
@@ -633,19 +624,18 @@ const UNAVAILABLE = { name: "Unavailable", data: { message: "Серверный 
 test("chat_too_many_tabs_pauses_turn", async () => {
   // Б3-m4: «закройте лишние вкладки» — поток не открыт, прироста ответа не видно: отсчёт хода на паузе, как при лежащей
   // связи (stream_down эта строка при этом не даёт — доводка 1)
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const c = chatClock();
   let events = 0;
   const enc = new TextEncoder();
   stubOpenSession((_method, path) => {
     if (path !== "/pcbk/api/oc/event") return undefined;
     events += 1;
     if (events === 1) return new Response(new ReadableStream<Uint8Array>({   // ход пошёл, и поток кончился
-      start(c) {
+      start(ctl) {
         for (const e of [{ type: "server.connected", properties: {} },
                          { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } }])
-          c.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
-        c.close();
+          ctl.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+        ctl.close();
       },
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
     return ocJson(429, { name: "TooManyRequests", data: { message: T_TOO_MANY_TABS } });   // четвёртая вкладка
@@ -654,27 +644,21 @@ test("chat_too_many_tabs_pauses_turn", async () => {
   render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
   await screen.findByRole("button", { name: "Стоп" });                     // ход идёт
   await waitFor(() => expect(screen.getByRole("status").textContent).toBe(T_TOO_MANY_TABS), { timeout: 8_000 });
-  try {
-    setVisibility("hidden");
-    now += 181_000;
-    await sleep(1_500);                                                       // разрыв тиков — отсрочка
-    now += RESYNC_S * 1000;
-    await sleep(1_500);                                                       // отсрочка прошла — держит пауза
-    expect(onReport).not.toHaveBeenCalled();
-    expect(screen.queryByText(T_TURN_SILENT)).toBeNull();
-  } finally {
-    delete (document as { visibilityState?: unknown }).visibilityState;
-  }
+  c.pass(TURN_SILENT_S * 1000 + 20_000);                                    // время идёт без разрыва — держит пауза
+  expect(onReport).not.toHaveBeenCalled();
+  expect(screen.queryByText(T_TURN_SILENT)).toBeNull();
 }, 15_000);
 
 test.each([
-  ["back_within_resync", false],
-  ["still_down_after_resync", true],
-] as const)("chat_stream_sleep_%s", async (_name, late) => {
-  // m4: связь пропала, машина проспала час; первый тик сторожа потока после сна видит разрыв. Поток вернулся в первые
-  // RESYNC_S — это сон, stream_down нет; не вернулся и через RESYNC_S после пробуждения — потеря настоящая, отчёт
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+  ["back_within_down_s", false, false],
+  ["back_within_down_s_interval_tick", false, true],
+  ["down_long_after_wake", true, false],
+] as const)("chat_stream_sleep_%s", async (_name, late, intervalTick) => {
+  // m4 и поправка контролёра: связь пропала, машина проспала час; первый тик сторожа потока после сна видит разрыв, и
+  // потеря считается с пробуждения. Поток вернулся раньше STREAM_DOWN_S после него — stream_down нет; позже — отчёт.
+  // Разрыв видит тик на visibilitychange или (intervalTick) свой тик раз в секунду — без него сон в видимой вкладке
+  // не заметить
+  const c = chatClock();
   let events = 0;
   let release: (r: Response) => void = () => {};
   stubOpenSession((_method, path) => {
@@ -687,11 +671,12 @@ test.each([
   const onReport = vi.fn();
   render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
   await waitFor(() => expect(events).toBe(2), { timeout: 4_000 });
-  now += 3_600_000;                                                           // сон
-  await sleep(1_200);                                                         // тик после сна — разрыв
-  if (late) {
-    now += RESYNC_S * 1000;
-    await sleep(1_200);
+  if (intervalTick) {
+    c.now += 3_600_000;                                                       // сон
+    await sleep(1_200);                                                       // первый тик после него — только по таймеру
+  } else {
+    c.gap(3_600_000);                                                         // сон и тик на visibilitychange
+    c.pass(late ? STREAM_DOWN_S * 1000 + 1_000 : STREAM_DOWN_S * 1000 - 1_000);
   }
   release(eventStream([{ type: "server.connected", properties: {} }]));       // поток вернулся
   await sleep(200);
