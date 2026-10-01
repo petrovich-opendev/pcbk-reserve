@@ -3,6 +3,7 @@
 //   худший из оставшихся, fail > unknown > warn > ok, как в page.py.
 // - У общих строк владельца (OWNER_ROWS) warn не считается — только fail и unknown (итоговое ревью Д6а, P1): их
 //   warn — о стенде в целом, а не о чате студента, и держится долго, у всех десяти студентов сразу.
+// - fail из OWNER_FAILS — тоже только владельцу (Д7б, А6): см. константу.
 // - «Состояние стенда неизвестно — сторож не отвечает» — только когда молчит сама страница: stale, не 200,
 //   не JSON, повисший запрос и молчание дольше stale_after_s по монотонным часам браузера (как status.js
 //   сторожа). Строки в unknown при живом стороже — «Состояние неизвестно: <названия>» (F7).
@@ -30,6 +31,14 @@ const MAX_TITLES = 3;
 // warn своего места (MCP), службы данных и историана (свежесть и скорость данных) студенту нужен. У контейнеров
 // core и прокси сокета warn держится не дольше 15 мин после падения — это свежий сбой общего сервиса.
 const OWNER_ROWS: ReadonlySet<string> = new Set(["gateway", "edge", "memory", "llm", "agents"]);
+// fail общих строк владельца, который студенту не показывается (Д7б, задача А6; итоговое ревью Д7а): «настройка
+// рабочего места сломана» строки «Агенты студентов» — счётчик image_config за час по всем местам (Д7-R60), а сломано
+// обычно одно место. Его студент видит текст своего места («Настройка рабочего места сломана — сообщите
+// администратору.»), остальным девяти красный баннер на час — ложная тревога. Владелец видит fail на странице сторожа.
+// detail — дословно из сторожа (watchdog checks.agents_verdict): разойдутся — строка снова видна студентам.
+const OWNER_FAILS: ReadonlyMap<string, string> = new Map([
+  ["agents", "настройка рабочего места сломана — место не поднимается"],
+]);
 const STALE_AFTER_S = 30;               // если в ответе нет stale_after_s (как у status.js по умолчанию)
 const SILENT: StatusView = { level: "unknown", text: T_STATUS_UNKNOWN };
 
@@ -53,6 +62,7 @@ export function statusView(data: unknown, ownPlace: string | null): StatusView {
     // незнакомое состояние — «неизвестно», а не «норма»: баннер не врёт в сторону «работает»
     const level: Level = SEVERITY.includes(row.state as Level) ? row.state as Level : "unknown";
     if (level === "warn" && OWNER_ROWS.has(component)) continue;                      // warn — для владельца
+    if (level === "fail" && OWNER_FAILS.get(component) === row.detail) continue;     // одно сломанное место — владельцу
     byLevel[level].push(typeof row.title === "string" && row.title ? row.title : component);
   }
   const worst = SEVERITY.find((l) => l !== "ok" && byLevel[l].length > 0);
