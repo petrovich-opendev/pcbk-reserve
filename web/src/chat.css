@@ -67,10 +67,12 @@ button:disabled { opacity: .6; cursor: default; }
 .thread-title-input { flex: 1 1 100%; min-width: 0; font: inherit; padding: .3rem .5rem; color: var(--fg);
   background: var(--field); border: 1px solid var(--border); border-radius: 6px; }
 .thread-hint { flex: 1 1 100%; margin: 0; font-size: .85em; color: var(--fail); }
-/* панель «Агенты» над списком разговоров (Д7-R65): колонка .side держит ширину и границу вместо .threads */
+/* панель «Агенты» над списком разговоров (Д7-R65): колонка .side держит ширину и границу вместо .threads. Панель не
+   сжимается (итоговая доводка Д7б, замечание Б4): при длинном списке разговоров сжимается и прокручивается список, а
+   панель — только при своём длинном списке, сверх max-height */
 .side { flex: 0 0 17rem; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
 .side > .threads { flex: 1 1 auto; border-right: 0; }
-.agents { flex: 0 1 auto; min-height: 0; max-height: 60%; overflow-y: auto; display: flex; flex-direction: column;
+.agents { flex: 0 0 auto; min-height: 0; max-height: 60%; overflow-y: auto; display: flex; flex-direction: column;
   gap: .35rem; padding: .75rem .75rem .5rem; border-bottom: 1px solid var(--border); }
 .agents-head, .agents-sub { margin: .25rem 0 0; font-size: .8em; font-weight: 600; letter-spacing: .03em;
   text-transform: uppercase; color: var(--muted); }
@@ -87,7 +89,9 @@ button:disabled { opacity: .6; cursor: default; }
   .threads { flex: 0 0 auto; max-height: 30vh; border-right: 0; border-bottom: 1px solid var(--border); }
   .side { flex: 0 0 auto; max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--border); }
   .side > .threads { flex: 1 1 auto; max-height: none; border-bottom: 0; }
-  .agents { max-height: 50%; }
+  /* у колонки без своей высоты проценты max-height не работают; 25vh из 45vh .side — панель без своих агентов видна
+     целиком, списку разговоров остаётся 20vh */
+  .agents { max-height: 25vh; }
 }
 
 /* разговор */

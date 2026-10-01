@@ -20,7 +20,10 @@
 // или переключения), отправка закрыта: isDisabled — поле, isSendDisabled — сама отправка (canSend assistant-ui 0.15
 // isDisabled не смотрит, и кнопка с текстом в поле ушла бы выбранному агенту). Список агентов читает опрос
 // createAgentsPoll (agents.ts): при монтировании, через 1 с после конца хода, пока есть pending — раз в 3 с до 60 с;
-// остановка — при снятии чата и остановке обёртки.
+// остановка — при снятии чата и остановке обёртки. Конец хода — и в разговоре, из которого студент ушёл, пока ход шёл
+// (итоговая доводка Д7б, m-2: ушёл из разговора Конструктора до конца хода сохранения — агент всё равно появится в
+// панели): библиотека держит рантайм начатых разговоров живым, и isRunning строки списка разговоров гаснет с концом
+// его хода. Смена открытого разговора студентом — тоже повод перечитать список (m-2; лишний запрос, не больше).
 // С панелью агентов после перезагрузки или «Разбудить» (initialSessionId) отправка закрыта и до решения, открывать ли
 // прежний разговор (доводка р1, m1): иначе ход ушёл бы выбранному агенту (помощнику) в новый разговор мимо прежнего
 // разговора Конструктора. Решение — прежний открыт или его нет в списке; ещё открывают отправку сбой списка (решать
@@ -30,6 +33,7 @@ import {
   createOpencodeClient, useOpenCodePermissions, useOpenCodeQuestions, useOpenCodeRuntime,
   useOpenCodeRuntimeExtras, type OpenCodePermissionRequest, type OpenCodeQuestionRequest,
 } from "@assistant-ui/react-opencode";
+import type { ThreadListRuntime } from "@assistant-ui/react";
 import { useEffect, useRef, useState } from "react";
 import { DEFAULT_AGENT, createAgentsPoll, parseAgents, sendAgent, type AgentItem, type AgentsPoll } from "../agents";
 import type { Reply } from "../api";
@@ -56,6 +60,21 @@ interface AgentsView { items: AgentItem[] | null | undefined; known: AgentItem[]
 
 const sameSeen = (a: ThreadAgentSeen, b: ThreadAgentSeen): boolean =>
   a.state === b.state && (a.state !== "agent" || a.name === (b as { name: string }).name);
+
+// разговоры, где сейчас идёт ход: isRunning строк списка — и открытого, и оставленных (их рантайм библиотека держит)
+function runningThreads(threads: ThreadListRuntime): Set<string> {
+  const list = threads.getState();
+  const ids = new Set<string>();
+  for (const id of [...list.threadIds, list.mainThreadId, list.newThreadId]) {
+    if (id === undefined || ids.has(id)) continue;
+    try {
+      if (threads.getItemById(id).getState().isRunning) ids.add(id);
+    } catch {
+      // строки уже нет (удалена между getState и getItemById) — хода в ней нет
+    }
+  }
+  return ids;
+}
 
 // Висящие разрешения и вопросы — из хуков адаптера. Хуки с запасным значением работают и до того, как у
 // разговора появился рантайм; rejectQuestion есть только в полных extras — их берёт вложенный компонент,
@@ -243,6 +262,26 @@ export function Chat(p: ChatProps) {
       if (now && !running) setError("");
       if (!now && running && !halted.current) poll.current?.turnEnded();
       running = now;
+    });
+  }, [runtime]);
+
+  // m-2: конец хода в оставленном разговоре и смена открытого разговора — список агентов через 1 с. Конец хода открытого
+  // разговора ловит подписка выше. Смена — только уход из начатого разговора: открытие прежнего разговора при
+  // монтировании (initialSessionId) уходит из пустого нового, и якоря опроса до первого конца хода нет (m16)
+  useEffect(() => {
+    const threads = runtime.threads;
+    let main = threads.getState().mainThreadId;
+    let fresh = threads.getState().newThreadId;            // новый разговор без сообщений — уход из него не в счёт
+    let running = runningThreads(threads);
+    return threads.subscribe(() => {
+      const list = threads.getState();
+      const now = runningThreads(threads);
+      const ended = [...running].some((id) => id !== list.mainThreadId && !now.has(id));
+      const left = list.mainThreadId !== main && main !== fresh;
+      main = list.mainThreadId;
+      fresh = list.newThreadId;
+      running = now;
+      if ((ended || left) && !halted.current) poll.current?.turnEnded();
     });
   }, [runtime]);
 

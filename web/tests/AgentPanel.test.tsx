@@ -333,6 +333,58 @@ test("chat_agents_poll_stops_on_halt", async () => {
   expect(gw.agentCalls).toBe(atHalt);
 }, CHAT_TIMEOUT_MS);
 
+test("agent_appears_after_leaving_konstruktor_mid_turn", async () => {
+  // итоговая доводка Д7б, m-2: студент ушёл из разговора Конструктора, пока ход сохранения шёл, и служба записала
+  // агента уже после ухода. Ход кончился в оставленном разговоре — список через 1 с, pending → опрос → ready
+  let saved = false;
+  let afterSave = 0;
+  const gw = chatGateway({ agents: () => {
+    if (!saved) return ocJson(200, { agents: BUILTIN, own: 0, limit: 20 });
+    afterSave += 1;
+    return ocJson(200, { agents: [...BUILTIN, { ...MINE, state: afterSave === 1 ? "pending" : "ready" }], own: 1, limit: 20 });
+  } });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents} />);
+  await screen.findByText("Какой узел и какие теги?");
+  await waitFor(() => expect(box().disabled).toBe(false));
+  fireEvent.change(box(), { target: { value: "да, сохраняй" } });
+  const sendButton = await screen.findByRole("button", { name: "Отправить" }) as HTMLButtonElement;
+  await waitFor(() => expect(sendButton.disabled).toBe(false));
+  fireEvent.click(sendButton);
+  await waitFor(() => expect(gw.prompts).toHaveLength(1));
+  gw.push({ type: "session.status", properties: { sessionID: SES_K, status: { type: "busy" } } });
+  await screen.findByRole("button", { name: "Стоп" });                            // ход Конструктора идёт
+  openThread(container, SES_P);                                                  // студент ушёл до конца хода
+  await screen.findByText("T1 = 12,5");
+  await sleep(1_500);                                                             // смена разговора — список перечитан,
+  const beforeEnd = gw.agentCalls;                                                // агента ещё нет: опроса дальше нет
+  expect(container.querySelector('[data-agent="moy-agent"]')).toBeNull();
+  saved = true;                                                                   // служба записала агента в том ходе
+  const endedAt = performance.now();
+  gw.push({ type: "session.status", properties: { sessionID: SES_K, status: { type: "idle" } } },
+          { type: "session.idle", properties: { sessionID: SES_K } });
+  await waitFor(() => expect(gw.agentCalls).toBe(beforeEnd + 1), { timeout: 5_000 });
+  expect(gw.agentAt.at(-1)! - endedAt).toBeGreaterThanOrEqual(990);              // через 1 с после конца хода
+  await waitFor(() => expect(button(/Мой агент/).disabled).toBe(false), { timeout: 8_000 });   // pending → ready
+  expect(agentLine(container)).toBe("Агент: Помощник по данным");                 // открытый разговор не тронут
+}, CHAT_TIMEOUT_MS);
+
+test("agents_refresh_on_thread_switch", async () => {
+  // m-2: смена открытого разговора студентом — список через 1 с (переход из идущего хода — Б3-m4, теперь намеренно).
+  // Открытие прежнего разговора при монтировании — не смена: якоря опроса до первого конца хода нет (m16)
+  const gw = chatGateway({ agents: () => ocJson(200, { agents: [...BUILTIN, MINE], own: 1, limit: 20 }) });
+  const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_P} loadAgents={createApi().agents} />);
+  await screen.findByText("T1 = 12,5");
+  await sleep(1_500);
+  expect(gw.agentCalls).toBe(1);                                                  // только монтирование
+  const switchedAt = performance.now();
+  openThread(container, SES_K);
+  await screen.findByText("Какой узел и какие теги?");
+  await waitFor(() => expect(gw.agentCalls).toBe(2), { timeout: 5_000 });
+  expect(gw.agentAt[1]! - switchedAt).toBeGreaterThanOrEqual(990);
+  await sleep(3_500);                                                             // pending — опрос раз в 3 с от якоря
+  expect(gw.agentCalls).toBeGreaterThanOrEqual(3);
+}, CHAT_TIMEOUT_MS);
+
 test("background_history_reload_keeps_composer", async () => {
   // фоновое перечитывание истории (loadState снова loading) не закрывает поле: агент разговора уже известен
   const gw = chatGateway({ hold: (sid, n) => sid === SES_K && n === 2 });

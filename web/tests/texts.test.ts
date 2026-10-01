@@ -24,7 +24,8 @@ test("fallback_texts_same_as_gateway", () => {
 });
 
 test("tool_labels", () => {
-  expect(TOOL_LABELS).toEqual({ pcbk_tag_now: "текущее значение", pcbk_tag_period: "сводка за период", pcbk_catalog_search: "поиск тегов" });
+  expect(TOOL_LABELS).toEqual({ pcbk_tag_now: "текущее значение", pcbk_tag_period: "сводка за период", pcbk_catalog_search: "поиск тегов",
+                               pcbk_save_agent: "сохранение агента" });
 });
 
 test("notice_number_same_as_core", () => {                                        // preflight Ф14: номер — в core, текст — здесь

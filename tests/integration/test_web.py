@@ -158,6 +158,23 @@ FIELD_PROBE_JS = """(() => {
   globalThis.__pcbkFieldProbe = seen;
   return 1;
 })()"""
+# панель «Агенты» при длинном списке разговоров (итоговая доводка Д7б, замечание Б4): в список разговоров на время
+# замера — вставка высотой 4000 px (стиль — через CSSOM, CSP его не запрещает; потом убирается). Ответ — [высота панели
+# до, после, прокрутка панели после (scrollHeight − clientHeight), переполнен ли список разговоров]: панель не сжимается
+# и видна целиком, прокручивается список
+PANEL_SQUEEZE_JS = """(() => {
+  const panel = document.querySelector('.agents'), items = document.querySelector('.thread-items');
+  if (!panel || !items) return null;
+  const before = panel.getBoundingClientRect().height;
+  const filler = document.createElement('div');
+  filler.style.height = '4000px';
+  filler.style.flexShrink = '0';                  // строки списка не сжимаются ниже своего текста
+  items.appendChild(filler);
+  const after = panel.getBoundingClientRect().height, hidden = panel.scrollHeight - panel.clientHeight;
+  const listScrolls = items.scrollHeight > items.clientHeight + 1000;
+  filler.remove();
+  return [before, after, hidden, listScrolls];
+})()"""
 # M10 ревью Б3 живьём (useLayoutEffect у ThreadAgentWatch): с этого момента каждое изменение DOM (MutationObserver —
 # после коммита React, до отрисовки) и каждый кадр (requestAnimationFrame), пока открыт разговор sid, сверяют: поле
 # ввода открыто только вместе со строкой «Агент: Конструктор агентов». С useEffect агент разговора доходил бы до Chat
@@ -685,13 +702,15 @@ def test_first_working_chat_on_twin(stack, page, web_users, record_property):   
 
     Сохранение перезагружает место 09 (dispose), пока поток /event вкладки открыт (m18): консоль страницы сверяется и
     после этого. Поле ввода после первой отправки в новом разговоре — в фокусе (m2 ревью Б3: блокировка на время
-    загрузки истории его не снимает насовсем). Факты (фокус, состояния агента в панели, потоки) — в свойстве d7b
-    отчёта junit."""
+    загрузки истории его не снимает насовсем). Панель при длинном списке разговоров не сжимается (итоговая доводка
+    Д7б, замечание Б4). Факты (фокус, состояния агента в панели, потоки) — в свойстве d7b отчёта junit."""
     konstruktor_md = KONSTRUKTOR_MD.read_text(encoding="utf-8")
     assert KONSTRUKTOR_HEAD in konstruktor_md and f"„{MY_AGENTS}“" in konstruktor_md   # тексты образа (Б1) = панель
     open_chat(stack, page, web_users["web-a"])
     assert page.texts(".agents .agents-sub") == [MY_AGENTS] and page.texts(".agents .agents-note") == [NO_AGENTS]
     assert page.ready_agents() == {"pomoshnik", "konstruktor"}
+    before, after, hidden, list_scrolls = page.eval(PANEL_SQUEEZE_JS)                  # замечание Б4: длинный список
+    assert list_scrolls and abs(after - before) < 1 and hidden <= 1, (before, after, hidden)   # панель не сжата
     shot(page, "02-agents-panel.png")
     page.click_agent("konstruktor")
     assert page.agent_line() == "Агент: Конструктор агентов"

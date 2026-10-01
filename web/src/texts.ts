@@ -9,11 +9,13 @@ export const STAND_WARNING =
 
 export const MAX_TEXT = 20000;                          // поле ввода — MAX_TEXT правил шлюза Д5б (R42)
 
-// имена инструментов в строке вызова (R42); прочие — своим именем
+// имена инструментов в строке вызова (R42); прочие — своим именем. pcbk_save_agent — инструмент Конструктора (Д7б,
+// итоговая доводка, замечание Б4): системное имя студенту не показывается
 export const TOOL_LABELS: Readonly<Record<string, string>> = {
   pcbk_tag_now: "текущее значение",
   pcbk_tag_period: "сводка за период",
   pcbk_catalog_search: "поиск тегов",
+  pcbk_save_agent: "сохранение агента",
 };
 
 // --- шапка и фазы чата (R39) ---
