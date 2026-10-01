@@ -354,11 +354,11 @@ class AgentReloads:
             # создана, но замок ещё не взять, или ждать его, когда он только что отпущен
             if lock.locked() or not w.is_ready(n) or w.is_waking(n):
                 return
-            # m3: замок свободен, и между проверкой и захватом нет await — acquire берёт его без ожидания. Ждущими
-            # у замка места бывают только задачи пробуждения (А6: и перезапуска) и встающие за ними: _reap и _restore
-            # сначала смотрят _busy (замок или задача) и на занятом замке не ждут. Пока такая задача есть, is_waking
-            # истинно — и сюда не дойти; поэтому окна «замок отпущен, но ждущий ещё не проснулся» здесь нет. restart
-            # после карантина (А6) зовётся уже после release ниже — воркер своего же замка не ждёт.
+            # m3: замок свободен, и между проверкой и захватом нет await — acquire берёт его без ожидания. Ждать у
+            # замка места может только задача пробуждения (А6: и перезапуска): _reap и _restore сначала смотрят _busy
+            # (замок или задача) и на занятом замке не ждут. Пока такая задача есть, is_waking истинно — и сюда не
+            # дойти; поэтому окна «замок отпущен, но ждущий ещё не проснулся» здесь нет. restart после карантина (А6)
+            # зовётся уже после release ниже — воркер своего же замка не ждёт.
             await lock.acquire()
             held = True
             step[0] = "dispose"
@@ -463,11 +463,15 @@ class AgentReloads:
         return seen, why
 
     def _settle_rows(self, n: int, rows: list[AgentRow], seen: set[str], now: datetime) -> tuple[int, int, int]:
-        """Шаг г в потоке: ожидаемые (saved, visible) и прежде невидимые (not_visible) строки, которые место видит, —
-        visible; ожидаемые, которых не видит, — not_visible. Ответ — (стало видно, видно всего, не видно)."""
-        candidates = [row for row in rows if row.state in (*_EXPECTED, "not_visible")]
-        visible = [row for row in candidates if row.name in seen]
-        invisible = [row for row in rows if row.state in _EXPECTED and row.name not in seen]
+        """Шаг г в потоке. Состояния строк — перечитанные сейчас (итоговое ревью Д7а, m1): за время перезагрузки агента
+        могли унести в архив или карантин. Ожидаемые (saved, visible) и прежде невидимые (not_visible) строки, которые
+        место видит, — visible. Невидимые — только те, что ждали этой перезагрузки (ожидаемые в rows до dispose) и
+        ожидаемые до сих пор: ушедший в архив агент — не not_visible, а сохранённый после чтения rows дождётся своей
+        перезагрузки (его метка пришла позже). Ответ — (стало видно, видно всего, не видно)."""
+        waited = {row.name for row in rows if row.state in _EXPECTED}
+        current = self.store.list_place(n)
+        visible = [row for row in current if row.state in (*_EXPECTED, "not_visible") and row.name in seen]
+        invisible = [row for row in current if row.state in _EXPECTED and row.name in waited and row.name not in seen]
         if visible:
             self.store.mark_visible(n, [row.name for row in visible], now)
         for row in invisible:

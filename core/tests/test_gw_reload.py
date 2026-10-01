@@ -882,3 +882,29 @@ async def test_waking_place_skipped(env, monkeypatch):                     # m1:
     await asyncio.wait_for(env.reloads.tick(), 2)
     assert len(statuses) == 3 and env.oc.dispose_calls[3] == 0 and not w.lock(3).locked()
     never.set(); await w._tasks[3]
+
+
+# --- итоговая доводка Д7а ---
+
+@pytest.mark.anyio
+async def test_archived_during_reload_not_invisible(env):                  # m1: шаг г — состояния перечитаны
+    env.oc.agents_after_dispose[3] = []
+    env.oc.on_dispose = lambda n: env.store.archive(n, "proverka", NOW)     # администратор унёс агента посреди перезагрузки
+    env.mono.advance(10); await settle(env)
+    assert env.oc.dispose_calls[3] == 1 and env.store.list_place(3) == []
+    assert env.stats.count_1h("not_visible") == 0 and env.stats.count_1h("reload_failed") == 0
+    assert 3 in env.store.pending()                                         # метка архива — следующей перезагрузке
+
+
+@pytest.mark.anyio
+async def test_saved_during_reload_waits_its_own(env):                     # m1: сохранён после чтения строк
+    second = replace(AGENT_DRAFT, name="vtoroy")
+    env.oc.agents_after_dispose[3] = [AGENT]
+    env.oc.on_dispose = lambda n: env.store.save(n, second, agent_text(second), NOW)
+    env.mono.advance(10); await settle(env)
+    assert {r.name: r.state for r in env.store.list_place(3)} == {"proverka": "visible", "vtoroy": "saved"}
+    assert env.stats.count_1h("not_visible") == 0 and 3 in env.store.pending()
+    env.oc.on_dispose = None; env.oc.agents_after_dispose[3] = [AGENT, {**AGENT, "name": "vtoroy"}]
+    env.mono.advance(IDLE_SETTLE_S + 0.1); await settle(env)
+    assert {r.name: r.state for r in env.store.list_place(3)} == {"proverka": "visible", "vtoroy": "visible"}
+    assert env.stats.count_1h("visible") == 2 and env.store.pending() == {}
