@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from fake_places import PLACE_PW, FakeDocker, FakePlaces
 from fakes import WHITELIST, FakeHistorian
+from pcbk_core.agents.draft import Draft, render_agent_file
 from pcbk_core.app import Role, RoleBase, create_app
 from pcbk_core.data import DataRole
 from pcbk_core.data.catalog import Catalog, TagInfo
@@ -610,3 +611,33 @@ def agent_catalog(big: bool = False) -> Catalog:
                  for i, name in enumerate(BIG_TAGS)]
         listed |= set(BIG_TAGS)
     return Catalog({t.name: t for t in tags}, frozenset(listed))
+
+
+# --- Агенты студентов: учёт и файлы (Д7а, задача А3) ---
+
+AGENT_NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
+# черновик агента тестов: синтетический текст, без тегов (данных заказчика в файле нет)
+AGENT_DRAFT = Draft(name="sushka-bdm2", title="Сушка БДМ-2", node="Сушильная часть",
+                    purpose="Текущие значения и сводка за смену", tools=("catalog_search", "tag_now"), tags=(),
+                    prompt="Ты — помощник технолога по узлу «Сушка». Отвечай про температуру и давление коротко. " * 4,
+                    student_reply="да, сохраняй")
+
+
+def agent_text(draft: Draft = AGENT_DRAFT, caller: str = "student-03") -> str:
+    """Файл агента по шаблону v1 (Д7-R55) для черновика тестов."""
+    return render_agent_file(draft, {}, caller=caller, created_at=AGENT_NOW)
+
+
+def make_agents_root(path) -> Path:
+    """Корень агентов, как на сервере после смены владельца (Д7-R55): student-01…10 — 0755, quarantine и
+    archive — 0700. Сам корень — 0700 (у владельца тестов)."""
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    for n in range(1, 11):
+        (root / f"student-{n:02d}").mkdir(exist_ok=True)
+        (root / f"student-{n:02d}").chmod(0o755)
+    for side in ("quarantine", "archive"):
+        (root / side).mkdir(exist_ok=True)
+        (root / side).chmod(0o700)
+    return root

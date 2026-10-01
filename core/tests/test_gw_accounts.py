@@ -10,7 +10,9 @@ from contextlib import closing
 
 import pytest
 
-from helpers import PW, FakeMono, fail_connect, full_disk, store
+from helpers import AGENT_DRAFT, AGENT_NOW, PW, FakeMono, agent_text, fail_connect, full_disk, make_agents_root, store
+from pcbk_core.agents import admin
+from pcbk_core.agents.store import AgentStore
 from pcbk_core.gateway import accounts
 from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, MAX_SESSIONS_PER_LOGIN, NOTICE, UNKNOWN_KEYS,
                                         AccountStore, StoreError, hash_password, verify_password)
@@ -500,3 +502,66 @@ def test_remove_clears_notices(tmp_path):                                       
     assert notice_rows(tmp_path / "core.db") == [("stu-03", NOTICE)]                      # чужие строки на месте
     s.add("d6-probe-n", "student", 9, PW, same_person=True)                               # новая учётка с тем же логином —
     assert s.notice_acked("d6-probe-n", NOTICE) is False                                  # спросит снова
+
+
+# --- освобождение места пробной учётки: агенты места (Д7-R61, задача А3) ---
+
+AGENTS_LEFT = "на месте остались агенты — сначала python -m pcbk_core.agents.admin archive --place 10 --yes"
+
+
+@pytest.fixture
+def agents_root(tmp_path, monkeypatch):
+    """Корень агентов и core.db в окружении команды: accounts.main берёт Settings.from_env() (раунд 2, m-н2)."""
+    root = make_agents_root(tmp_path / "agents")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
+    monkeypatch.setenv("AGENTS_ROOT", str(root))
+    return root
+
+
+@pytest.fixture
+def probe_off_on_10(tmp_path, agents_root):
+    """Пробная учётка d7-probe-a на месте 10, отключена."""
+    s = store(tmp_path)
+    s.add("d7-probe-a", "student", 10, PW); s.disable("d7-probe-a")
+    return s
+
+
+@pytest.fixture
+def agent_on_10(tmp_path, agents_root):
+    """У места 10 сохранён агент (строка учёта и файл)."""
+    a = AgentStore(str(tmp_path / "core.db"), str(agents_root))
+    assert a.open(), a.last_error
+    assert a.save(10, AGENT_DRAFT, agent_text(caller="student-10"), AGENT_NOW) == "saved"
+    return a
+
+
+def test_release_place_refused_with_agents(probe_off_on_10, agent_on_10, capsys):
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 1
+    assert "на месте остались агенты — сначала python -m pcbk_core.agents.admin archive --place 10 --yes" \
+        in capsys.readouterr().err
+    admin.main(["archive", "--place", "10", "--yes"])
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 0
+
+def test_release_place_refused_with_stray_file(probe_off_on_10, agents_root, capsys):     # I2: файл без строки учёта
+    (agents_root / "student-10" / "manual.md").write_text("x")
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 1
+    assert AGENTS_LEFT in capsys.readouterr().err                                       # m21: отказ — по агентам
+    (agents_root / "student-10" / "manual.md").unlink()
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 0               # положительный контроль
+
+
+def test_release_place_refused_when_agents_dir_unreadable(probe_off_on_10, agents_root, capsys):
+    (agents_root / "student-10").rmdir()                                                 # каталога места нет
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 1
+    assert "каталог агентов места недоступен" in capsys.readouterr().err
+    assert probe_off_on_10.bindings() == [(10, "d7-probe-a", True)]                       # закрепление на месте
+
+
+def test_release_not_probe_place_refused_before_agents(tmp_path, agents_root, capsys):
+    """Место не пробной учётки с агентами: отказ по учётке, а не подсказка «сначала archive» — иначе администратор
+    унёс бы в архив агентов настоящего студента, а место всё равно не освободилось бы."""
+    s = store(tmp_path); s.add("ivanov", "student", 10, PW); s.disable("ivanov")
+    (agents_root / "student-10" / "manual.md").write_text("x")
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "освобождать можно только места пробных учёток после disable" in err and "archive" not in err
