@@ -67,9 +67,27 @@ button:disabled { opacity: .6; cursor: default; }
 .thread-title-input { flex: 1 1 100%; min-width: 0; font: inherit; padding: .3rem .5rem; color: var(--fg);
   background: var(--field); border: 1px solid var(--border); border-radius: 6px; }
 .thread-hint { flex: 1 1 100%; margin: 0; font-size: .85em; color: var(--fail); }
+/* панель «Агенты» над списком разговоров (Д7-R65): колонка .side держит ширину и границу вместо .threads */
+.side { flex: 0 0 17rem; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+.side > .threads { flex: 1 1 auto; border-right: 0; }
+.agents { flex: 0 1 auto; min-height: 0; max-height: 60%; overflow-y: auto; display: flex; flex-direction: column;
+  gap: .35rem; padding: .75rem .75rem .5rem; border-bottom: 1px solid var(--border); }
+.agents-head, .agents-sub { margin: .25rem 0 0; font-size: .8em; font-weight: 600; letter-spacing: .03em;
+  text-transform: uppercase; color: var(--muted); }
+.agents-head { margin-top: 0; }
+.agents-note { margin: 0; font-size: .85em; color: var(--muted); }
+.agent { display: flex; flex-direction: column; align-items: flex-start; gap: .1rem; padding: .35rem .6rem;
+  text-align: left; overflow-wrap: anywhere; }
+.agent[aria-current="true"] { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.agent-title { font-weight: 600; }
+.agent-purpose, .agent-state { font-size: .85em; color: var(--muted); }
+.agent[data-state="broken"] .agent-state { color: var(--fail); }
 @media (max-width: 48rem) {
   .chat { flex-direction: column; }
   .threads { flex: 0 0 auto; max-height: 30vh; border-right: 0; border-bottom: 1px solid var(--border); }
+  .side { flex: 0 0 auto; max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--border); }
+  .side > .threads { flex: 1 1 auto; max-height: none; border-bottom: 0; }
+  .agents { max-height: 50%; }
 }
 
 /* разговор */
@@ -108,6 +126,7 @@ button:disabled { opacity: .6; cursor: default; }
 .stream-line { margin: .3rem 1rem; color: var(--muted); }
 .silent-line { margin: .3rem 1rem; color: var(--warn); font-weight: 600; }
 .error-line { margin: .3rem 1rem; color: var(--fail); font-weight: 600; }
+.agent-line { margin: .3rem 1rem 0; font-size: .9em; color: var(--muted); }
 
 .composer { display: flex; align-items: flex-end; gap: .5rem; padding: .6rem 1rem .9rem;
   border-top: 1px solid var(--border); }

@@ -12,6 +12,7 @@
 // снова дал бы петлю ui_crash, поэтому следующий перезапуск открывает новый разговор, а прежний App забывает
 // (итоговая доводка Д6б, Б3-m6). Сбой вне границы (шапка, фазы до чата) ловит корень — mount.tsx.
 // Отчёты чата (turn_silent, stream_down) уходят через api.report — только от нынешнего чата и не при уходе на вход.
+// Список агентов места (Д7-R65) чат читает сам — App отдаёт ему загрузчик api.agents (preflight П11).
 import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
 import { Chat, type ChatProps } from "./components/Chat";
@@ -217,6 +218,7 @@ export function App(p: AppProps) {
               else setPhase({ kind: "asleep" });
             }}
             onReport={(kind) => { if (mount === mounts.current) report(kind); }}
+            loadAgents={p.api.agents}
           />
         </ErrorBoundary>
       );

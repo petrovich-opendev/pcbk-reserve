@@ -152,7 +152,7 @@ function fakeApi(o: { me?: Answer; workplace?: Answer }) {
   const reply = (a: Answer | undefined) => async (): Promise<Reply> => ({ status: a?.[0] ?? 500, body: a?.[1] ?? null });
   return {
     me: vi.fn(reply(o.me)), workplace: vi.fn(reply(o.workplace)), wake: vi.fn(reply(undefined)),
-    logout: vi.fn(reply([200, { ok: true }])), ackNotice: vi.fn(reply([204, null])),
+    logout: vi.fn(reply([200, { ok: true }])), ackNotice: vi.fn(reply([204, null])), agents: vi.fn(reply(undefined)),
     report: vi.fn(async (_kind: string) => {}),
   } satisfies Api;
 }

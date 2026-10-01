@@ -1,7 +1,7 @@
 // Чат поверх шлюза (Д6-R42, R43): клиент OpenCode, обёртка fetch шлюза и рантайм — свои на каждое
 // монтирование. Размонтирование (401, «место спит», «Выйти») закрывает поток адаптера (registry.dispose), а
 // новое монтирование после «Разбудить» открывает последний разговор (initialSessionId от App).
-// Без defaultAgent и defaultModel (агента выбирает default_agent места) и без adapters (нет вложений).
+// Без defaultModel и без adapters (нет вложений). defaultAgent — агент хода (Д7-R65, ниже).
 // Д6б: список разговоров слева (R52) и сторожа молчания (R51): ход без прироста ответа 3 мин — строка и отчёт
 // turn_silent (один на ход), связь с потоком потеряна дольше 2 мин — отчёт stream_down при восстановлении (один на
 // эпизод). Отчёт уходит через onReport, пока чат смонтирован и обёртка не остановлена (после 401 и «спит» — нет).
@@ -11,18 +11,30 @@
 // (PATCH time.archived = null — против R52), а разговор мог уйти в архив в другой вкладке или до перезапуска. Чат
 // открывает его сам — на первой успешной загрузке списка (список упал при монтировании — на той, что библиотека
 // перечитает позже: online, возврат вкладки; итоговая доводка Д6б, Б3-m5), только если он есть среди неархивных и
-// студент ещё не начал новый разговор, и с unarchive: false. Иначе — новый разговор, а App забывает прежний
-// (onThreadIdChange(undefined)).
+// студент ещё не начал новый разговор и не выбрал агента в панели (m15), и с unarchive: false. Иначе — новый
+// разговор, а App забывает прежний (onThreadIdChange(undefined)).
+// Д7б (Д7-R65, Review Focus 1): панель «Агенты» над списком разговоров — только с loadAgents (App отдаёт api.agents;
+// без него ни панели, ни вызова — preflight П11). Агент хода: у начатого разговора — из его истории (ThreadAgentWatch),
+// у нового — выбранный в панели (newAgent, по умолчанию помощник; «Новый разговор» его сохраняет); defaultAgent =
+// sendAgent(агент). Пока агент открытого разговора неизвестен (история ещё грузится — после перезагрузки, «Разбудить»
+// или переключения), отправка закрыта: isDisabled — поле, isSendDisabled — сама отправка (canSend assistant-ui 0.15
+// isDisabled не смотрит, и кнопка с текстом в поле ушла бы выбранному агенту). Список агентов читает опрос
+// createAgentsPoll (agents.ts): при монтировании, через 1 с после конца хода, пока есть pending — раз в 3 с до 60 с;
+// остановка — при снятии чата и остановке обёртки.
 import {
   createOpencodeClient, useOpenCodePermissions, useOpenCodeQuestions, useOpenCodeRuntime,
   useOpenCodeRuntimeExtras, type OpenCodePermissionRequest, type OpenCodeQuestionRequest,
 } from "@assistant-ui/react-opencode";
 import { useEffect, useRef, useState } from "react";
+import { DEFAULT_AGENT, createAgentsPoll, parseAgents, sendAgent, type AgentItem, type AgentsPoll } from "../agents";
+import type { Reply } from "../api";
 import { createGatewayFetch, explainError, streamLine } from "../gateway";
-import { T_TURN_SILENT } from "../texts";
+import { T_AGENT_LINE, T_TURN_SILENT } from "../texts";
 import { TICK_MS, createStreamWatch, useTurnWatch } from "../watch";
+import { AgentPanel } from "./AgentPanel";
 import { ChatView } from "./ChatView";
 import { PendingInteractions } from "./PendingInteractions";
+import { ThreadAgentWatch, type ThreadAgentSeen } from "./ThreadAgentWatch";
 import { ThreadSidebar } from "./ThreadSidebar";
 
 export interface ChatProps {
@@ -30,7 +42,15 @@ export interface ChatProps {
   initialSessionId?: string;
   onThreadIdChange?(id: string | undefined): void;
   onReport?(kind: "turn_silent" | "stream_down"): void;   // отчёт браузера о молчании (R51)
+  loadAgents?: () => Promise<Reply>;                      // GET /pcbk/api/agents (Д7-R64); без него — ни панели, ни вызова
 }
+
+// список агентов: items — последний ответ (undefined — ответа ещё нет, null — не 200); known — последний ответ 200,
+// по нему название в строке «Агент: …» (агента нет в списке — имя, m14)
+interface AgentsView { items: AgentItem[] | null | undefined; known: AgentItem[] }
+
+const sameSeen = (a: ThreadAgentSeen, b: ThreadAgentSeen): boolean =>
+  a.state === b.state && (a.state !== "agent" || a.name === (b as { name: string }).name);
 
 // Висящие разрешения и вопросы — из хуков адаптера. Хуки с запасным значением работают и до того, как у
 // разговора появился рантайм; rejectQuestion есть только в полных extras — их берёт вложенный компонент,
@@ -67,6 +87,12 @@ export function Chat(p: ChatProps) {
   props.current = p;
   const halted = useRef(false);            // обёртка остановлена (401, «место спит»)
   const mounted = useRef(false);
+  const [withAgents] = useState(() => p.loadAgents !== undefined);   // панель — на всё монтирование
+  const [agents, setAgents] = useState<AgentsView>({ items: undefined, known: [] });
+  const [newAgent, setNewAgent] = useState(DEFAULT_AGENT);            // агент нового разговора — выбор в панели
+  const [seen, setSeen] = useState<ThreadAgentSeen>({ state: "none" });   // агент открытого разговора
+  const picked = useRef(false);            // студент выбрал агента — прежний разговор поверх выбора не открывается (m15)
+  const poll = useRef<AgentsPoll | null>(null);
 
   // Ошибка действия → строка над полем ввода. Остановку (signed_out, asleep) показывает App, своя отмена
   // и отвергнутые после остановки вызовы (halted) не показываются вовсе.
@@ -88,6 +114,7 @@ export function Chat(p: ChatProps) {
     const gatewayFetch = createGatewayFetch({
       onHalt: (kind) => {
         halted.current = true;
+        poll.current?.stop();              // остановленному чату список агентов не нужен
         props.current.onHalt(kind);
       },
       onStream: (s) => {
@@ -121,6 +148,34 @@ export function Chat(p: ChatProps) {
     return () => { mounted.current = false; };
   }, []);
 
+  // список агентов (R65): опрос на монтирование; ответ снятому или остановленному чату не нужен
+  useEffect(() => {
+    const load = props.current.loadAgents;
+    if (load === undefined) return;
+    const agentsPoll = createAgentsPoll({
+      load: async () => {
+        const r = await load();
+        return r.status === 200 ? parseAgents(r.body) : null;
+      },
+      onItems: (items) => {
+        if (halted.current || !mounted.current) return;
+        setAgents((prev) => ({ items, known: items ?? prev.known }));
+      },
+      now: () => Date.now(),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+    });
+    poll.current = agentsPoll;
+    if (!halted.current) agentsPoll.start();
+    return () => {
+      agentsPoll.stop();
+      if (poll.current === agentsPoll) poll.current = null;
+    };
+  }, []);
+
+  // агент хода: открытого разговора — из истории, нового — выбранный; пока агент разговора неизвестен — не отправлять
+  const locked = seen.state === "loading";
+  const agent = seen.state === "agent" ? seen.name : newAgent;
   const runtime = useOpenCodeRuntime({
     client,
     onError,
@@ -129,7 +184,15 @@ export function Chat(p: ChatProps) {
       setError("");                        // другой разговор — прежняя ошибка к нему не относится
       props.current.onThreadIdChange?.(id);
     },
+    defaultAgent: sendAgent(agent),
+    isDisabled: locked,
+    isSendDisabled: locked,
   });
+
+  // ThreadAgentWatch сообщает только смену; тот же вид — без перерисовки
+  const onAgent = useRef((next: ThreadAgentSeen): void => {
+    setSeen((prev) => sameSeen(prev, next) ? prev : next);
+  }).current;
 
   // прежний разговор (I1): открыть, только если он в неархивном списке, — на первой успешной загрузке списка (Б3-m5).
   // Пока список грузится или упал, неизвестно, в архиве ли разговор: не открывать и не забывать — ждать следующей
@@ -147,6 +210,7 @@ export function Chat(p: ChatProps) {
       done = true;
       unsubscribe();
       if (list.mainThreadId !== list.newThreadId) return;  // студент уже начал новый разговор — не уводим
+      if (picked.current) return;                          // или выбрал агента — новый разговор с ним (m15)
       if (!list.threadIds.includes(want)) {                // в архиве или удалён — новый разговор
         props.current.onThreadIdChange?.(undefined);
         return;
@@ -161,19 +225,33 @@ export function Chat(p: ChatProps) {
     };
   }, [runtime, onError]);
 
-  // новый ход пошёл — ошибка прошлого действия больше не нужна
+  // новый ход пошёл — ошибка прошлого действия больше не нужна; ход кончился — список агентов через 1 с (R65)
   useEffect(() => {
     let running = runtime.thread.getState().isRunning;
     return runtime.thread.subscribe(() => {
       const now = runtime.thread.getState().isRunning;
       if (now && !running) setError("");
+      if (!now && running && !halted.current) poll.current?.turnEnded();
       running = now;
     });
   }, [runtime]);
 
+  // клик по агенту в панели (только ready): новый разговор с ним (R65)
+  const pick = (name: string): void => {
+    if (halted.current) return;
+    picked.current = true;
+    setNewAgent(name);
+    runtime.threads.switchToNewThread().catch(onError);
+  };
+
   // ход без прироста ответа: строка над полем ввода и отчёт (Ф11 — начало хода по isRunning, не по onNew)
   const silent = useTurnWatch(runtime, { onSilent: () => report("turn_silent"), streamOk });
 
+  // строка «Агент: …» и подсветка в панели — агент, которому уйдёт ход; пока он неизвестен — ни строки, ни подсветки
+  const shown = locked ? undefined : agent;
+  const title = shown === undefined ? undefined : agents.known.find((a) => a.name === shown)?.title ?? shown;
+  const threads = <ThreadSidebar runtime={runtime} onError={onError} />;
+  const watch = <ThreadAgentWatch onAgent={onAgent} />;    // внутри провайдера, ничего не рисует
   return (
     <ChatView
       runtime={runtime}
@@ -181,7 +259,14 @@ export function Chat(p: ChatProps) {
       silentLine={silent ? T_TURN_SILENT : undefined}
       error={error || undefined}
       pending={<RuntimePending onError={onError} />}
-      sidebar={<ThreadSidebar runtime={runtime} onError={onError} />}
+      sidebar={withAgents ? (
+        <div className="side">
+          <AgentPanel items={agents.items} current={shown ?? ""} onPick={pick} />
+          {threads}
+          {watch}
+        </div>
+      ) : <>{threads}{watch}</>}
+      agentLine={withAgents && agents.items !== undefined && title !== undefined ? T_AGENT_LINE(title) : undefined}
     />
   );
 }
