@@ -57,13 +57,14 @@ def test_login_wake_ready_and_row(stack, accounts):                             
 
 def test_place_sees_no_gateway(stack, accounts):                                       # Review Focus 2 (Д4б-R23)
     assert stack.gw_client().call("GET", "/pcbk/api/auth/me")[0] == 401               # положительный контроль: через edge
-    for path in ("/pcbk/api/auth/me", "/pcbk/api/workplace", "/health/gateway"):
+    for path in ("/pcbk/api/auth/me", "/pcbk/api/workplace", "/health/gateway", "/health/web"):   # Д6б: /health/web
         code, body = stack.from_place(1, path)                                         # место 01 работает с прошлого теста
         assert (code, json.loads(body)["name"]) == (404, "NotFound"), path
     code, body = stack.from_place(1, "/health/llm")
     assert code == 200 and not set(MONEY) & set(json.loads(body))
     assert set(MONEY) <= set(stack.llm_health())                                       # администратор (pcbk-egress) видит
     assert stack.http_from_core("GET", "http://127.0.0.1:8000/health/gateway") == 200  # петля — своя зона и по источнику
+    assert stack.http_from_core("GET", "http://127.0.0.1:8000/health/web") == 200
     stack.stop("pcbk-student-01")
 
 
@@ -85,7 +86,7 @@ def test_edge_passes_only_gateway_paths(stack):                                 
         code, body, _ = c.call("TRACE", path)                                          # отвергается до выбора location
         assert (code, body["name"]) == (405, "MethodNotAllowed"), path
     for path in ("/api/auth/me", "/api/data/tag_now", "/healthz/data", "/health/historian", "/health/gateway", "/mcp",
-                 "/pcbk-errors/503.json"):                                             # внутренние location снаружи не видны
+                 "/health/web", "/pcbk-errors/503.json"):                              # внутренние location снаружи не видны
         assert stack.https(path)[0] == 404, path
     code, body, _ = c.call("POST", "/pcbk/api/auth/login", {"login": "x", "password": "я" * 70000})
     assert (code, body["name"]) == (413, "PayloadTooLarge")

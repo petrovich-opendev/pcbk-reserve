@@ -12,6 +12,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
@@ -23,7 +24,8 @@ from .page import Snapshot, is_stale, render_html, status_json
 
 log = logging.getLogger("pcbk_watchdog")
 
-# вид проверки → обязательные поля в components.json сверх id и title
+# вид проверки → обязательные поля в components.json сверх id и title; необязательные — ok_detail (http),
+# unhealthy_detail (container), reports_url (web, Д6б: /health/web core — отчёты браузеров)
 KINDS: dict[str, tuple[str, ...]] = {
     "memory": (), "http": ("url",), "tls": ("host", "port"), "docker_ping": (),
     "container": ("container", "sleeping_ok"), "absent": (), "historian": ("url",),
@@ -101,7 +103,7 @@ class Settings:
         Начатая до срока проверка идёт ещё до двух сроков сокета — их запас
         вычитается. У http и historian это общий срок всей проверки
         (checks.HTTP_CHECK_SPANS): соединение, заголовки и тело; у web — один
-        такой срок на все её запросы (страница, опись, файлы). У tls и Docker —
+        такой срок на все её запросы (страница, опись, файлы, отчёты браузеров). У tls и Docker —
         срок на соединение и на каждое чтение: ответ, капающий по байту, их
         продлил бы — это свои службы стенда.
         """
@@ -153,6 +155,10 @@ def load_components(path: str) -> list[dict]:
                                         or len(c["unhealthy_detail"]) > REASON_CHARS):
             raise ValueError(f"components: unhealthy_detail у {c['id']!r} — только непустая строка "
                              f"до {REASON_CHARS} знаков вида container")
+        if "reports_url" in c and (kind != "web" or not isinstance(c["reports_url"], str)
+                                   or urlsplit(c["reports_url"]).scheme != "http"
+                                   or not urlsplit(c["reports_url"]).hostname):
+            raise ValueError(f"components: reports_url у {c['id']!r} — только адрес http:// с хостом вида web")
     return comps
 
 
@@ -185,7 +191,7 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
     if kind == "gateway":
         return check_gateway(cid, title, comp["url"], now, settings.GW_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "web":
-        return check_web(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S)
+        return check_web(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S, reports_url=comp.get("reports_url"))
     if kind == "tls":
         return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
                          timeout=NET_CHECK_TIMEOUT_S)

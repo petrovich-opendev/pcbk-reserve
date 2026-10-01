@@ -128,6 +128,13 @@ WEB_PAGE_DETAIL = "страница чата не отдаётся"
 WEB_PARTIAL_DETAIL = "сборка чата неполная"
 WEB_OK_DETAIL = "страница чата отдаётся"
 WEB_BAD_MANIFEST = "опись неверна"
+# отчёты браузеров (задача Б1 Д6б, Д6-R50): ответ /health/web core — ровно эти четыре счётчика за час; строки
+# warn — в порядке проверки, первая с числом больше нуля; нет ответа, срок или не по договору — ok с пометкой
+WEB_REPORT_ROWS = (("boot_failed_1h", "чат не запускается в браузере"),
+                   ("ui_crash_1h", "чат падает в браузере"),
+                   ("turn_silent_1h", "ответ модели не пришёл вовремя"),
+                   ("stream_down_1h", "браузеры теряют связь с сервером"))
+WEB_NO_REPORTS = "отчёты браузеров недоступны"
 
 
 @dataclass(frozen=True)
@@ -854,13 +861,31 @@ def _web_manifest(body: bytes) -> tuple[str, list[str]] | None:
     return build, list(files)
 
 
-def check_web(component: str, title: str, url: str, timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
-    """Страница чата и опись сборки (таблица Д6-R46): GET url (тело — метка сборки) → GET build.json →
-    GET каждого файла описи (тело не читается).
+def _web_reports(body: bytes) -> dict[str, int] | None:
+    """Ответ /health/web → счётчики; не JSON, не объект, ключи не ровно четыре счётчика, значение не целое
+    не меньше нуля (bool — не целое) — None."""
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # в том числе UnicodeDecodeError и тело, не дочитанное к сроку
+        return None
+    keys = {key for key, _ in WEB_REPORT_ROWS}
+    if not isinstance(reply, dict) or set(reply) != keys:
+        return None
+    if not all(type(reply[key]) is int and reply[key] >= 0 for key in keys):
+        return None
+    return reply
 
-    Один срок HTTP_CHECK_SPANS × timeout от начала на все запросы — так проверка, начатая до конца такта,
-    кончается не позже запаса tick_budget_s. Нет соединения или срок — «не отвечает», в том числе когда
-    срок оборвал тело страницы или описи.
+
+def check_web(component: str, title: str, url: str, timeout: float = NET_CHECK_TIMEOUT_S,
+              reports_url: str | None = None) -> Check:
+    """Страница чата и опись сборки (таблица Д6-R46): GET url (тело — метка сборки) → GET build.json →
+    GET каждого файла описи (тело не читается); если статика в порядке и задан reports_url — последним GET
+    отчётов браузеров (таблица Д6-R50).
+
+    Один срок HTTP_CHECK_SPANS × timeout от начала на все запросы, отчёты тоже — так проверка, начатая до конца
+    такта, кончается не позже запаса tick_budget_s. Нет соединения или срок — «не отвечает», в том числе когда
+    срок оборвал тело страницы или описи. Отчёты строку не роняют: нет ответа, срок (и вышедший до их запроса),
+    не 200 или не по договору — ok с пометкой «отчёты браузеров недоступны» (core без ручки во время выкладки).
     """
     deadline = time.monotonic() + HTTP_CHECK_SPANS * timeout
 
@@ -893,7 +918,20 @@ def check_web(component: str, title: str, url: str, timeout: float = NET_CHECK_T
                 return fail(WEB_PARTIAL_DETAIL, f"нет {path}")
     except (OSError, http.client.HTTPException):
         return fail(WEB_DOWN_DETAIL)
-    return Check(component, title, "ok", WEB_OK_DETAIL, f"сборка {build}")
+    note = f"сборка {build}"
+    if reports_url is None:
+        return Check(component, title, "ok", WEB_OK_DETAIL, note)
+    try:
+        status, body = get(reports_url, lambda code: code == 200)
+    except (OSError, http.client.HTTPException):
+        status, body = None, b""
+    counts = _web_reports(body) if status == 200 else None
+    if counts is None:
+        return Check(component, title, "ok", WEB_OK_DETAIL, f"{note}; {WEB_NO_REPORTS}")
+    for key, detail in WEB_REPORT_ROWS:
+        if counts[key] > 0:
+            return Check(component, title, "warn", detail, f"{counts[key]} за час")
+    return Check(component, title, "ok", WEB_OK_DETAIL, note)
 
 
 def tls_verdict(not_after: datetime, now: datetime, warn_days: int = 14) -> tuple[State, str]:

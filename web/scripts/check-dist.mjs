@@ -12,6 +12,9 @@ import { fileURLToPath } from "node:url";
 
 export const BASE = "/chat/";
 export const WEB_MAX_FILES = 8;
+// Загрузчик Д6б (Д6-R51, preflight Ф15): ровно один классический <script src="/chat/boot.js"> без type, async и
+// defer — иначе отчёт boot_failed молча пропал бы или пришёл бы после бандла. Прочие <script src> — только модули.
+export const BOOT_SRC = BASE + "boot.js";
 // Договор со сторожем (watchdog/pcbk_watchdog/checks.py, _web_manifest и check_web): WEB_META_RE —
 // search в первых MAX_BODY_BYTES страницы, WEB_FILE_RE — fullmatch и без «.»/«..» последним звеном,
 // sha256 — 64 знака в нижнем регистре, записей в описи — от 1 до WEB_MAX_FILES (preflight M1).
@@ -154,6 +157,8 @@ function urlsOf(name, value) {
 }
 
 function checkIndexHtml(html, dir, errors) {
+  let boots = 0;                                                          // <script> с src загрузчика
+  let classicBoots = 0;                                                   // … классических, без async и defer
   for (const m of html.matchAll(/<style\b/gi)) errors.push(`index.html: встроенный <style> (смещение ${m.index})`);
   for (const open of html.matchAll(/<[A-Za-z]/g)) {
     TAG_RE.lastIndex = open.index;
@@ -177,6 +182,14 @@ function checkIndexHtml(html, dir, errors) {
         }
         if (tag === "a") continue;                                        // переходы (<a href="/login">) — не файлы сборки
         const path = value.replace(/[?#].*$/, "");
+        if (tag === "script" && name === "src") {                         // только src, прошедший проверку схемы
+          const type = attrs.get("type");
+          if (path === BOOT_SRC) {
+            boots++;
+            if (type === undefined && !attrs.has("async") && !attrs.has("defer")) classicBoots++;
+          } else if (type?.trim().toLowerCase() !== "module")
+            errors.push(`${at}: скрипт не модуль (классический — только загрузчик ${BOOT_SRC})`);
+        }
         if (!path.startsWith(BASE)) {
           errors.push(`${at}: ${name} вне ${BASE}`);
           continue;
@@ -187,6 +200,9 @@ function checkIndexHtml(html, dir, errors) {
       }
     }
   }
+  if (boots !== 1 || classicBoots !== 1)
+    errors.push(`index.html: загрузчик ${BOOT_SRC} — нужен ровно один классический <script src> без type, async и `
+      + `defer (тегов с ним: ${boots}) — без него отчёт boot_failed пропадёт молча`);
 }
 
 /** Предупреждения по списку шаблонов; вхождения внутри фрагментов KNOWN идут в `known`. */
