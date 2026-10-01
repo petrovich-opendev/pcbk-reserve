@@ -287,8 +287,12 @@ def test_default_agent_is_pomoshnik(stack, running):                # Д6-R45: �
     k = next(a for a in agents if a["name"] == "konstruktor")
     assert (k["native"], k["mode"], k["steps"], k.get("model")) == (False, "primary", 12, None)   # модель стенда
     assert not {"build", "plan", "general", "explore"} & {a["name"] for a in agents}
-    default = json.loads(stack.oc(1, "GET", "/config", 1)[1])["default_agent"]   # в теле /config — токен места:
-    assert default == "pomoshnik"                                      # в сбой идёт только значение, не тело
+    code, body = stack.oc(1, "GET", "/config", 1)                    # в теле /config — токен места: в traceback
+    try:                                                               # (аргументы json.loads) оно не попадает
+        default = json.loads(body)["default_agent"]
+    except ValueError:
+        default = None
+    assert (code, default) == (200, "pomoshnik")
 
 
 def test_hung_workplace_row(stack, running):                       # Review Focus 3; последний в модуле
