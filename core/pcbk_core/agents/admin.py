@@ -2,9 +2,10 @@
 (в core: docker compose exec core python -m pcbk_core.agents.admin …).
 
 - list [--place N] — строки учёта: место, имя, название, состояние, создан, признаки черновика («-» — нет). Последние
-  строки — расхождения файлов с учётом (drift): с --place — «файлы без учёта: a.md; учёт без файлов: c; ссылки: d.md»
-  или «расхождений нет», без --place — то же с «место NN: » по каждому месту с расхождениями. Места, каталог которых
-  не читается, — одной строкой в stderr и код 1 (строки учёта и сверка остальных мест всё равно выводятся);
+  строки — расхождения файлов с учётом (drift) и прочие файлы, держащие место: с --place — «файлы без учёта: a.md;
+  учёт без файлов: c; ссылки: d.md; прочие файлы: .e.md.tmp-1» или «расхождений нет», без --place — то же с
+  «место NN: » по каждому месту с расхождениями. Места, каталог которых не читается, — одной строкой в stderr и
+  код 1 (строки учёта и сверка остальных мест всё равно выводятся);
 - archive --place N [--name X] --yes — файлы в архив, строки archived, место в очередь перезагрузки. Без --name
   уносит все файлы каталога места — и без учёта, и символьные ссылки, и временные файлы оборванной записи: после него
   release-place не упирается в агентов места, а новому студенту не остаётся данных прежнего;
@@ -67,6 +68,7 @@ def _place(place: int) -> int:
 
 def _drift_text(store: AgentStore, place: int) -> str:
     files, rows, links = store.drift(place)
+    others = store.stray_files(place)
     parts = []
     if files:
         parts.append("файлы без учёта: " + ", ".join(map(_show, files)))
@@ -74,6 +76,8 @@ def _drift_text(store: AgentStore, place: int) -> str:
         parts.append("учёт без файлов: " + ", ".join(map(_show, rows)))
     if links:
         parts.append("ссылки: " + ", ".join(map(_show, links)))
+    if others:                                      # не агенты, но держат место: release-place откажет (А3 п. 2)
+        parts.append("прочие файлы: " + ", ".join(map(_show, others)))
     return "; ".join(parts)
 
 

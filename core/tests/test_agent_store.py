@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from helpers import AGENT_DRAFT, agent_text, make_agents_root, non_root, run_python
+from pcbk_core.agents import store as store_module
 from pcbk_core.agents.store import (MAX_AGENTS, AgentStore, DirUnavailable, NameTaken, PendingReload, StoreError,
                                     TooManyAgents, place_of_caller)
 
@@ -370,3 +371,40 @@ def test_name_taken_lists_only_valid_names(store, draft):                 # m7: 
     with pytest.raises(NameTaken) as e:
         store.save(3, replace(draft, name="davlenie", title="Другое"), TEXT, NOW)
     assert e.value.existing == ("davlenie",)
+
+
+# --- итоговая доводка Д7а (А3, m2 — вторая сторона) ---
+
+def test_archive_move_refused_keeps_file_and_row(store, draft, monkeypatch):    # PermissionError — не «исчез»
+    store.save(3, draft, TEXT, NOW)
+    real = os.replace
+
+    def refuse(src, dst, *a, **k):
+        if os.path.basename(src) == "sushka-bdm2.md":
+            raise PermissionError(13, "Permission denied")
+        return real(src, dst, *a, **k)
+
+    with monkeypatch.context() as m:
+        m.setattr(store_module.os, "replace", refuse)
+        with pytest.raises(DirUnavailable):
+            store.archive(3, None, NOW)
+    assert (store.place_dir(3) / "sushka-bdm2.md").read_text("utf-8") == TEXT
+    assert store.list_place(3)[0].state == "saved"                          # строка не archived
+    assert list((store.root / "archive").glob("student-03-*/sushka-bdm2*")) == []     # заглушка имени убрана
+
+
+def test_archive_dir_vanished_keeps_files(store, draft, monkeypatch):       # каталог архива пропал после _side_dir
+    store.save(3, draft, TEXT, NOW)
+    (store.place_dir(3) / "manual.md").write_text("x")
+    real = store._side_dir
+
+    def side_then_vanish(side, name):
+        path = real(side, name)
+        path.rmdir()
+        return path
+
+    monkeypatch.setattr(store, "_side_dir", side_then_vanish)
+    with pytest.raises(DirUnavailable):
+        store.archive(3, None, NOW)
+    assert sorted(p.name for p in store.place_dir(3).iterdir()) == ["manual.md", "sushka-bdm2.md"]
+    assert store.list_place(3)[0].state == "saved" and list((store.root / "archive").iterdir()) == []

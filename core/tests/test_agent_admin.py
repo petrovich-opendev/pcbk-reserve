@@ -78,3 +78,18 @@ def test_list_unreadable_places_one_stderr_line(env_store, capsys):     # m6: д
     assert admin.main(["list", "--place", "4"]) == 1
     assert capsys.readouterr().err.splitlines() == [
         "место 04: расхождения не сверены — каталог места отсутствует или не читается"]
+
+
+# --- итоговая доводка Д7а (А3, п. 2) ---
+
+def test_list_shows_stray_files_holding_place(env_store, capsys):        # что держит место, видно в list
+    (env_store.place_dir(3) / ".sushka-bdm2.md.tmp-0a1b2c3d").write_text("x")      # оборванная запись
+    (env_store.place_dir(3) / "sub").mkdir(); (env_store.place_dir(3) / "sub" / "notes.txt").write_text("x")
+    assert env_store.drift(3) == ((), (), ()) and env_store.place_has_agents(3)     # drift прежний, место занято
+    assert admin.main(["list", "--place", "3"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["прочие файлы: .sushka-bdm2.md.tmp-0a1b2c3d, sub/notes.txt"]
+    assert admin.main(["list"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["место 03: прочие файлы: .sushka-bdm2.md.tmp-0a1b2c3d, sub/notes.txt"]
+    assert admin.main(["archive", "--place", "3", "--yes"]) == 0
+    capsys.readouterr()
+    assert admin.main(["list", "--place", "3"]) == 0 and capsys.readouterr().out.splitlines() == ["расхождений нет"]

@@ -652,6 +652,12 @@ class AgentStore:
                               f" WHERE {_LIVE} ORDER BY id", (place,)).fetchall()
         return [AgentRow(*row) for row in rows]
 
+    def stray_files(self, place: int) -> tuple[str, ...]:
+        """Прочие не-каталоги места — не *.md и не ссылки (временные файлы оборванной записи, любые другие файлы), пути
+        от каталога места по алфавиту. Агентами они не считаются (drift их не показывает), но место держат
+        (place_has_agents) и уходят в archive без name: их показывает admin list (доводка Д7а, А3 п. 2)."""
+        return self._scan(place).others
+
     def drift(self, place: int) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
         """Расхождения файлов и учёта (Д7-R61): (файлы *.md без живой строки, строки saved/visible/not_visible без
         своего файла, символьные ссылки) — пути от каталога места и имена, по алфавиту."""
