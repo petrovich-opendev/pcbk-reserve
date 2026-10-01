@@ -2,6 +2,8 @@
 по HTTP/2, сон места и конец сессии, ошибка модели, преподаватель без чата, баннер и строка «Веб-чат» сторожа. Д6б:
 предупреждение при первом входе (место не будится до «Понятно»), список разговоров (имя OpenCode, переименование и архив
 через шлюз), четвёртая вкладка («закройте лишние»), повторы модели (живая проверка m3 Б3), отчёты браузеров в строке.
+Д7б (Б4): панель «Агенты», первый работающий чат на двойнике (Конструктор сохраняет агента — агент в панели — ответ
+агента), разговор Конструктора после перезагрузки страницы (Review Focus 1 Д7б), сломанный свой агент — «не загрузился».
 
 Место модуля — 09: модули Д5 берут 1, 3–8, прежние дни — 01, 02, 03 и 10. Модуль идёт последним по алфавиту и
 гасит своё место к концу, в том числе в finally фикстуры web_users. Учётки: web-a (студент, место 9) и web-t
@@ -15,13 +17,16 @@
 2. тесты Д6а и повторы модели; прочие тесты перед входом подтверждают предупреждение мимо шлюза — ensure_notice_acked
    (Ф5: без пароля и без новой сессии, она вытеснила бы сессию вкладок);
 3. список разговоров и четвёртая вкладка;
-4. учения Д6а (баннер, строка «Веб-чат»): строка ждёт точную тройку ok — ложный отчёт любого теста выше её ловит;
-5. test_reports_reach_row — последним: после него строка «Веб-чат» жёлтая час.
+4. Д7б: панель агентов и первый работающий чат, перезагрузка, сломанный агент. Агенты места 09 — web-proverka (его
+   сохраняет Конструктор, остаётся до конца прогона) и web-slomannyj (в архив в finally своего теста). Учётку web-b
+   Б4 не заводит (preflight П13: свободных мест на стенде нет) — чужие агенты сверяет test_agents;
+5. учения Д6а (баннер, строка «Веб-чат»): строка ждёт точную тройку ok — ложный отчёт любого теста выше её ловит;
+6. test_reports_reach_row — последним: после него строка «Веб-чат» жёлтая час.
 
 Снимки для владельца (preflight M17): при PCBK_SHOTS=<каталог> тесты кладут туда снимки в своих точках — к концу
 прогона стенд уже опущен, снимать потом не на чем: Д6а — 01-chat-answer, 02-banner-unknown, 03-place-asleep,
-04-status-web-row; Д6б — 01-notice, 02-web-row-warn, 03-sidebar, 04-fourth-tab. Данные на снимках — тестовые (тег
-20FAKE_…, учётки web-a и web-t).
+04-status-web-row; Д6б — 01-notice, 02-web-row-warn, 03-sidebar, 04-fourth-tab; Д7б — 02-agents-panel,
+03-konstruktor-saved, 04-own-agent-answer. Данные на снимках — тестовые (тег 20FAKE_…, учётки web-a и web-t).
 """
 import html
 import json
@@ -36,7 +41,8 @@ import pytest
 
 import cdp
 import conftest
-from conftest import REPO, STAND_ORIGIN, Secret, failure, leaks, wait_for
+from conftest import REPO, STAND_ORIGIN, Secret, failure, leaks, system_text, tool_names_of, turn_bodies, wait_for
+from fake_openrouter import save_args                                   # core/tests на пути импорта (conftest, П7)
 from gateway_cases import ALLOWED, OC, SES_FAKE, TWINS
 
 STAND = "https://stand.pcbk.test:18443"
@@ -111,6 +117,73 @@ print(json.dumps(names))
 RULES_CONTROL_OK = [[m, p[len(OC):]] for m, p in ALLOWED]
 RULES_CONTROL_NO = [["GET", "/config"], ["DELETE", f"/session/{SES_FAKE}"],
                     *({p: [m, p[len(OC):]] for m, p in reversed(TWINS)}.values())]
+# --- Д7б: панель «Агенты» и агент разговора (Д7-R64, R65) ---
+BUILTIN_TITLES = ["Помощник по данным", "Конструктор агентов"]       # встроенные агенты — первыми, в порядке R64
+MY_AGENTS, NO_AGENTS = "Мои агенты", "Пока нет — соберите агента вместе с Конструктором"
+AGENT_PENDING, AGENT_BROKEN = "появится после ответа Конструктора", "не загрузился — сообщите преподавателю"
+OWN_AGENT = "web-proverka"                      # его сохраняет Конструктор на двойнике (FAKESAVE agent=…)
+OWN_TITLE = save_args(OWN_AGENT)["title"]       # «Проверка Д7» — черновик двойника (save_args)
+OWN_TOOLS = {"pcbk_catalog_search", "pcbk_tag_now"}                  # инструменты черновика двойника
+BROKEN_AGENT = "web-slomannyj"                  # агент, чей файл портится мимо службы (not_visible → broken)
+# файл агента, который место 1.18.33 при загрузке пропускает молча — строка учёта становится not_visible. Frontmatter не
+# разбирается ни как есть, ни после sanitize OpenCode (описание с «: » sanitize переписывает в блок, незакрытая кавычка
+# остаётся): ConfigAgent.load ловит ошибку и идёт дальше. Пропуск — только при первой загрузке этого текста в процессе
+# OpenCode: gray-matter кладёт текст в кэш до разбора, и следующая загрузка (новый dispose) берёт его из кэша без
+# ошибки — агент с пустым frontmatter. Текст, который sanitize не меняет, загружается уже первой загрузкой: второй
+# разбор того же текста — из кэша (прогон sub1 Б4)
+BROKEN_YAML = '---\ndescription: a: b\nmode: "x\n---\nx\n'
+# первая строка промпта Конструктора в образе (Б1; preflight Д7б, п. 12); в его ответе ok — панель «Мои агенты» (R63)
+KONSTRUKTOR_MD = REPO / "student/config/agent/konstruktor.md"
+KONSTRUKTOR_HEAD = "Ты — Конструктор агентов учебного стенда ПЦБК"
+# кнопка агента панели: [data-state, disabled, текст DOM] или null — договор разметки Б3 ↔ Б4 (preflight П12)
+AGENT_ROW_JS = ("(() => { const e = document.querySelector(%s); "
+                "return e ? [e.dataset.state, e.disabled, e.textContent.trim()] : null; })()")
+# состояние агента в ответе ручки — fetch страницы чата (та же cookie, через edge и шлюз): [код, state или null]
+AGENT_API_STATE_JS = ("fetch('/pcbk/api/agents').then(async (r) => { "
+                      "const b = r.status === 200 ? await r.json() : null; "
+                      "const a = b && b.agents.find((x) => x.name === %s); return [r.status, a ? a.state : null]; })")
+FOCUS_JS = "document.activeElement === document.querySelector('textarea')"   # поле ввода в фокусе (m2 ревью Б3)
+# m2 ревью Б3 — что было с полем ввода на первой отправке: смены пары [закрыто, в фокусе] по изменениям DOM, до 50
+FIELD_PROBE_JS = """(() => {
+  const seen = [];
+  const look = () => {
+    const f = document.querySelector('textarea');
+    const now = [!!f && f.disabled, !!f && document.activeElement === f];
+    const last = seen[seen.length - 1];
+    if ((!last || last[0] !== now[0] || last[1] !== now[1]) && seen.length < 50) seen.push(now);
+  };
+  look();
+  new MutationObserver(look).observe(document.body,
+    { subtree: true, childList: true, attributes: true, characterData: true });
+  globalThis.__pcbkFieldProbe = seen;
+  return 1;
+})()"""
+# M10 ревью Б3 живьём (useLayoutEffect у ThreadAgentWatch): с этого момента каждое изменение DOM (MutationObserver —
+# после коммита React, до отрисовки) и каждый кадр (requestAnimationFrame), пока открыт разговор sid, сверяют: поле
+# ввода открыто только вместе со строкой «Агент: Конструктор агентов». С useEffect агент разговора доходил бы до Chat
+# после отрисовки — был бы коммит, где разговор уже открыт, а поле открыто ходу помощника (выбор панели по умолчанию).
+# Счётчики: open — проверок с открытым разговором sid, locked — из них с закрытым полем, bad — строки при открытом поле
+OPEN_PROBE_JS = """(() => {
+  const want = %s, line = %s;
+  const probe = { checks: 0, open: 0, locked: 0, bad: [] };
+  const look = () => {
+    probe.checks += 1;
+    const row = document.querySelector('.thread-item[data-active="true"]');
+    if (!row || row.dataset.sessionId !== want) return;
+    probe.open += 1;
+    const field = document.querySelector('textarea');
+    if (!field || field.disabled) { probe.locked += 1; return; }
+    const shown = document.querySelector('.agent-line');
+    const text = shown ? shown.innerText.trim() : '';
+    if (text !== line && probe.bad.length < 20) probe.bad.push(text || '(строки нет)');
+  };
+  new MutationObserver(look).observe(document.body,
+    { subtree: true, childList: true, attributes: true, characterData: true });
+  const frame = () => { look(); requestAnimationFrame(frame); };
+  requestAnimationFrame(frame);
+  globalThis.__pcbkOpenProbe = probe;
+  return 1;
+})()"""
 
 
 def new_passwords() -> dict[str, Secret]:
@@ -250,6 +323,32 @@ def shot(page, name: str) -> None:
     where = os.environ.get("PCBK_SHOTS")
     if where:
         page.screenshot(Path(where) / name)
+
+
+def open_chat(stack, page, password) -> None:
+    """Чат web-a (предупреждение подтверждено мимо шлюза) с загруженной панелью «Агенты»: встроенные агенты — первыми,
+    в порядке Д7-R64. До ответа ручки в панели только заголовок."""
+    ensure_notice_acked(stack, "web-a")
+    login_to_chat(page, "web-a", password)
+    page.wait(lambda: page.texts(".agents .agent-title")[:2] == BUILTIN_TITLES, 30, "встроенные агенты в панели")
+
+
+def agent_row(page, name: str) -> list | None:
+    """Кнопка агента name в панели: [data-state, disabled, текст DOM]; нет кнопки — None."""
+    return page.eval(AGENT_ROW_JS % json.dumps(f'.agents button[data-agent="{name}"]'))
+
+
+def user_agents(stack, n: int, sid: str) -> list[str | None]:
+    """info.agent сообщений студента разговора sid места n по порядку — из места мимо шлюза: кому ушёл каждый ход."""
+    code, body = stack.oc(n, "GET", f"/session/{sid}/message", n)
+    assert code == 200, code
+    return [m["info"].get("agent") for m in json.loads(body) if m["info"]["role"] == "user"]
+
+
+def place_agent_state(stack, n: int, name: str) -> str | None:
+    """Состояние строки учёта агента name места n по `admin list --place n` (столбцы через табуляцию)."""
+    rows = [line.split("\t") for line in stack.agents_admin("list", "--place", str(n)).splitlines()]
+    return next((r[3] for r in rows if len(r) == 6 and r[1] == name), None)
 
 
 class _BrokenSocket:
@@ -576,6 +675,134 @@ def test_fourth_tab_told_to_close(stack, browser, page, web_users):             
     finally:
         for p in pages[1:]:
             p.close()
+
+
+def test_first_working_chat_on_twin(stack, page, web_users, record_property):            # Д7б: первый работающий чат
+    """Первый работающий чат на двойнике (Б4). Панель «Агенты» — встроенные агенты и пустые «Мои агенты». Конструктор
+    сохраняет агента (двойник OpenRouter по слову FAKESAVE), и тот появляется в панели сам — опросом после конца хода,
+    без перезагрузки страницы. Разговор с ним уходит в место с его инструкцией и только его инструментами — тело запроса
+    к модели по сессии разговора (I4). Ручку «Мои агенты» вкладка зовёт через edge с cookie — только 200 (П13).
+
+    Сохранение перезагружает место 09 (dispose), пока поток /event вкладки открыт (m18): консоль страницы сверяется и
+    после этого. Поле ввода после первой отправки в новом разговоре — в фокусе (m2 ревью Б3: блокировка на время
+    загрузки истории его не снимает насовсем). Факты (фокус, состояния агента в панели, потоки) — в свойстве d7b
+    отчёта junit."""
+    konstruktor_md = KONSTRUKTOR_MD.read_text(encoding="utf-8")
+    assert KONSTRUKTOR_HEAD in konstruktor_md and f"„{MY_AGENTS}“" in konstruktor_md   # тексты образа (Б1) = панель
+    open_chat(stack, page, web_users["web-a"])
+    assert page.texts(".agents .agents-sub") == [MY_AGENTS] and page.texts(".agents .agents-note") == [NO_AGENTS]
+    assert page.ready_agents() == {"pomoshnik", "konstruktor"}
+    shot(page, "02-agents-panel.png")
+    page.click_agent("konstruktor")
+    assert page.agent_line() == "Агент: Конструктор агентов"
+    events = len(page.requests(EVENT))
+    page.eval(FIELD_PROBE_JS)
+    ask(page, f"FAKESAVE agent={OWN_AGENT}")
+    turn_end = time.monotonic()
+    focus_first = page.eval(FOCUS_JS)                                                     # m2: первая отправка
+    field = page.eval("globalThis.__pcbkFieldProbe")
+    sid = page.current_thread_id()
+    assert page_sessions(page) == [sid] and user_agents(stack, PLACE, sid) == ["konstruktor"]
+    assert re.search(r'"status":\s*"ok"', tool_output(stack, PLACE, sid, "pcbk_save_agent"))   # служба сохранила
+    assert page.agent_line() == "Агент: Конструктор агентов"
+    seen: list = []                                 # кнопка своего агента, пока ждём ready: [state, disabled, текст]
+
+    def ready() -> bool:
+        row = agent_row(page, OWN_AGENT)
+        if not seen or seen[-1] != row:
+            seen.append(row)
+        return OWN_AGENT in page.ready_agents()
+    page.wait(ready, 15, f"{OWN_AGENT} готов в панели (без перезагрузки страницы)")       # панель обновилась сама
+    to_ready = round(time.monotonic() - turn_end, 1)
+    events_ready = [r["status"] for r in page.requests(EVENT)]    # поток разговора Конструктора и его переподключения
+    assert all(r[1] and AGENT_PENDING in r[2] for r in seen if r and r[0] == "pending"), seen   # pending — неактивна
+    state, disabled, text = agent_row(page, OWN_AGENT)
+    assert (state, disabled) == ("ready", False) and OWN_TITLE in text and save_args(OWN_AGENT)["purpose"] in text
+    assert page.texts(".agents .agents-note") == []                                       # «Пока нет» ушло
+    shot(page, "03-konstruktor-saved.png")
+    page.click_agent(OWN_AGENT)
+    assert page.agent_line() == f"Агент: {OWN_TITLE}"
+    ask(page, "что сейчас?")
+    focus_own = page.eval(FOCUS_JS)
+    own = page.current_thread_id()
+    assert own != sid and page_sessions(page) == [sid, own]
+    assert user_agents(stack, PLACE, own) == [OWN_AGENT]                                   # истина места: ход — агенту
+    body = turn_bodies(stack, PLACE, own)[0]                                               # I4: по сессии разговора
+    assert f"Ты — агент «{OWN_TITLE}»" in system_text(body) and KONSTRUKTOR_HEAD not in system_text(body)
+    assert tool_names_of(body) - {"invalid"} == OWN_TOOLS
+    calls = [(r["method"], r["status"]) for r in page.requests("/pcbk/api/agents")]
+    assert calls and set(calls) == {("GET", 200)}, calls                                   # с cookie — 200 (П13)
+    facts = {"focus_after_first_send": [focus_first, focus_own], "field_first_send": field, "own_agent_rows": seen,
+             "turn_end_to_ready_s": to_ready, "event_before_save": events, "event_at_ready": events_ready,
+             "event_at_end": len(page.requests(EVENT)), "agents_calls": len(calls)}
+    record_property("d7b", json.dumps(facts, ensure_ascii=False))
+    print(f"Б4 журнал: {json.dumps(facts, ensure_ascii=False)}")
+    assert focus_first and focus_own, facts                                                 # m2: поле не теряет фокус
+    assert page.csp() == [] and page.console_errors() == []                                # и после dispose места (m18)
+    shot(page, "04-own-agent-answer.png")
+
+
+def test_konstruktor_thread_survives_reload(stack, page, web_users, record_property):    # Review Focus 1 Д7б
+    """Разговор Конструктора переживает перезагрузку страницы: после неё чат открывает новый разговор с помощником
+    (контроль: агент — не память страницы), разговор Конструктора открывается из списка, и следующий ход уходит
+    Конструктору — истина места (info.agent) и системный текст запроса к модели. Перед отправкой — текст прежнего
+    ответа (П14). С открытия разговора до ответа поле ввода ни в одном коммите не открыто ходу другого агента (M10
+    ревью Б3)."""
+    open_chat(stack, page, web_users["web-a"])
+    page.click_agent("konstruktor")
+    first = ask(page, "привет")
+    focus_first = page.eval(FOCUS_JS)                                                     # m2: первая отправка
+    sid = page.current_thread_id()
+    assert user_agents(stack, PLACE, sid) == ["konstruktor"]
+    page.reload()
+    page.wait_selector("textarea", 90)
+    page.wait(lambda: page.texts(".agents .agent-title")[:2] == BUILTIN_TITLES, 30, "панель после перезагрузки")
+    page.wait(lambda: page.agent_line() == "Агент: Помощник по данным", 10, "новый разговор — помощник (контроль)")
+    page.wait_selector(cdp.Page.thread_row(sid), 30)
+    page.eval(OPEN_PROBE_JS % (json.dumps(sid), json.dumps("Агент: Конструктор агентов")))
+    page.open_thread(sid)
+    done = re.search(ANSWER, first)[0]
+    page.wait(lambda: any(done in t for t in page.eval(ASSISTANT_TEXTS_JS)), 30, "прежний ответ Конструктора")  # П14
+    page.wait(lambda: page.agent_line() == "Агент: Конструктор агентов", 10, "агент разговора — Конструктор")
+    ask(page, "ещё")
+    assert page.current_thread_id() == sid and page_sessions(page) == [sid, sid]
+    assert user_agents(stack, PLACE, sid) == ["konstruktor", "konstruktor"]               # истина места
+    bodies = turn_bodies(stack, PLACE, sid)
+    assert KONSTRUKTOR_HEAD in system_text(bodies[0]) and KONSTRUKTOR_HEAD in system_text(bodies[-1])
+    probe = page.eval("globalThis.__pcbkOpenProbe")
+    record_property("d7b", json.dumps({"focus_after_first_send": focus_first, "open_probe": probe}, ensure_ascii=False))
+    print(f"Б4 журнал: перезагрузка — фокус после первой отправки {focus_first}; проба M10 {probe}")
+    # M10; locked > 0 — проба застала окно загрузки истории (разговор открыт, поле закрыто), а не только время после
+    assert probe["locked"] > 0 and probe["open"] > probe["locked"] and probe["bad"] == [], probe
+    assert focus_first                                                                      # m2
+    assert page.csp() == [] and page.console_errors() == []
+
+
+def test_broken_own_agent_not_loaded(stack, page, web_users):                         # ревью Б2: not_visible → broken
+    """Свой агент, которого место после перезагрузки не видит, — в панели «не загрузился — сообщите преподавателю»,
+    кнопка неактивна (R64, R65). Агента сохраняет служба (save_agent с токеном места), место его показывает; потом его
+    файл портится мимо службы (BROKEN_YAML: первая загрузка места его пропускает) и место перезагружается командой
+    администратора — строка учёта not_visible, ручка — broken. В конце агент уходит в архив (файла больше нет — кэш
+    gray-matter места ничего не вернёт), очередь перезагрузки пустеет."""
+    open_chat(stack, page, web_users["web-a"])
+    assert stack.mcp_save(PLACE, save_args(BROKEN_AGENT))["status"] == "ok"
+    try:
+        page.wait(lambda: page.eval(AGENT_API_STATE_JS % json.dumps(BROKEN_AGENT)) == [200, "ready"], 30,
+                  f"{BROKEN_AGENT} готов в ответе ручки")                                   # положительный контроль
+        stack.put_agent_file(PLACE, BROKEN_AGENT, BROKEN_YAML)
+        stack.agents_admin("reload", "--place", str(PLACE))
+        page.wait(lambda: page.eval(AGENT_API_STATE_JS % json.dumps(BROKEN_AGENT)) == [200, "broken"], 60,
+                  f"{BROKEN_AGENT} broken в ответе ручки")
+        assert place_agent_state(stack, PLACE, BROKEN_AGENT) == "not_visible"             # не карантин: файл на месте
+        page.reload()
+        page.wait(lambda: agent_row(page, BROKEN_AGENT), 30, f"{BROKEN_AGENT} в панели после перезагрузки")
+        state, disabled, text = agent_row(page, BROKEN_AGENT)
+        assert (state, disabled) == ("broken", True) and AGENT_BROKEN in text and OWN_TITLE in text
+        assert BROKEN_AGENT not in page.ready_agents()
+        assert page.csp() == [] and page.console_errors() == []
+    finally:
+        stack.agents_admin("archive", "--place", str(PLACE), "--name", BROKEN_AGENT, "--yes")
+        wait_for(lambda: stack.agents_health()["pending"] == 0, 30)                         # место перезагружено
 
 
 def test_banner_follows_watchdog(stack, page, web_users):                                 # Review Focus 5; учение — ближе к концу
