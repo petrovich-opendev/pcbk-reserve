@@ -1,6 +1,7 @@
 """Учёт агентов студентов и их файлы (Д7-R56): атомарная запись, повтор и занятое имя, предел мест, очередь перезагрузок
 с поколением, карантин и архив внутри корня, обход файлов места как у загрузчика OpenCode (вложенные, точечные,
 символьные ссылки)."""
+import os
 import re
 import sqlite3
 import stat
@@ -126,8 +127,10 @@ def test_reload_done_keeps_newer_mark(store, draft):                    # I-н2�
 
 def test_reset_since(store, draft):                                        # m-н6
     store.save(3, draft, TEXT, NOW); later = NOW + timedelta(hours=2)
+    seq = store.pending()[3].seq                                            # доводка р1, M5: seq растёт и при reset_since
     store.mark_reload(3, later); assert store.pending()[3].since == NOW
     store.mark_reload(3, later, reset_since=True); assert store.pending()[3].since == later
+    assert store.pending()[3] == PendingReload(later, seq + 2)
 
 def test_nested_and_dot_files_count(store):                                # m-н3
     (store.place_dir(3) / "sub" / ".hidden").mkdir(parents=True)
@@ -261,3 +264,109 @@ def test_store_and_admin_are_stdlib_only():                               # Д7-
             "'pcbk_core.data', 'pcbk_core.llm') if m in sys.modules))")
     assert run_python(code).strip() == "[]"
     assert run_python("import sys, pcbk_core.agents; print('pcbk_core.agents.admin' in sys.modules)").strip() == "False"   # m20
+
+
+# --- доводка р1: охранные ветки (I1) и Minor m2, m3, m4, m7 ---
+
+def test_rows_without_file_hold_place(store, draft):                     # M1
+    store.save(3, draft, TEXT, NOW); store.quarantine(3, "sushka-bdm2.md", NOW)
+    assert list(store.place_dir(3).iterdir()) == [] and store.place_has_agents(3)
+    store.save(4, draft, TEXT, NOW); store.set_state(4, "sushka-bdm2", "not_visible", NOW)
+    (store.place_dir(4) / "sushka-bdm2.md").unlink()
+    assert list(store.place_dir(4).iterdir()) == [] and store.place_has_agents(4)
+    assert not store.place_has_agents(5)                                    # отрицательный контроль
+
+def test_archive_does_not_walk_into_linked_dir(store):                   # M11
+    (store.place_dir(4) / "x.md").write_text("4"); (store.place_dir(3) / "evil").symlink_to("../student-04")
+    assert store.drift(3) == ((), (), ("evil",)) and store.archive(3, None, NOW) == ("evil",)
+    assert (store.place_dir(4) / "x.md").read_text() == "4" and store.place_has_agents(4)
+    assert next((store.root / "archive").glob("student-03-*/evil")).is_symlink()
+
+def test_archive_name_cannot_leave_place(store):                          # M4: файл, который мутант унёс бы, есть
+    (store.place_dir(4) / "x.md").write_text("4")
+    for name in ("../student-04/x", "/x", "a/../x", "./x", "a//x"):
+        with pytest.raises(ValueError):
+            store.archive(3, name, NOW)
+    assert (store.place_dir(4) / "x.md").read_text() == "4" and store.pending() == {}
+    assert list((store.root / "archive").iterdir()) == []
+
+def test_archive_by_name_queues_reload(store, draft):                     # M2 (Д7-R61)
+    store.save(3, draft, TEXT, NOW); store.reload_done(3, store.pending()[3].seq)
+    assert store.archive(3, "sushka-bdm2", NOW) == ("sushka-bdm2",) and 3 in store.pending()
+
+def test_empty_archive_still_queues(store):                               # M3: «место в очередь» — всегда
+    assert store.archive(3, None, NOW) == () and 3 in store.pending()
+
+def test_limit_counts_nested_md(store, draft):                            # M6
+    for i in range(19):
+        store.save(3, replace(draft, name=f"a{i:02d}"), TEXT, NOW)
+    (store.place_dir(3) / "sub" / ".h").mkdir(parents=True); (store.place_dir(3) / "sub" / ".h" / "m.md").write_text("x")
+    with pytest.raises(TooManyAgents):
+        store.save(3, draft, TEXT, NOW)
+    (store.place_dir(3) / "sub" / ".h" / "m.md").unlink()
+    assert store.save(3, draft, TEXT, NOW) == "saved"                       # положительный контроль: 20-й проходит
+
+def test_set_state_does_not_revive_archived(store, draft):                # M7
+    store.save(3, draft, TEXT, NOW); store.archive(3, "sushka-bdm2", NOW)
+    for state in ("visible", "saved", "quarantined"):
+        store.set_state(3, "sushka-bdm2", state, NOW)
+    assert store.live_count(3) == 0 and store.list_place(3) == [] and store.expected(3) == ()
+    assert store.save(3, draft, TEXT, NOW) == "saved"                       # имя свободно, строка новая
+
+def test_place_dir_symlink_is_unavailable(store, draft, tmp_path):       # M9 и m4: по каталогу-ссылке — ни шагу
+    elsewhere = tmp_path / "elsewhere"; elsewhere.mkdir(); (elsewhere / "x.md").write_text("чужой")
+    store.place_dir(5).rmdir(); store.place_dir(5).symlink_to(elsewhere)
+    calls = (lambda: store.place_has_agents(5), lambda: store.save(5, draft, TEXT, NOW),
+             lambda: store.drift(5), lambda: store.archive(5, None, NOW), lambda: store.archive(5, "x", NOW),
+             lambda: store.quarantine(5, "x.md", NOW))
+    for call in calls:
+        with pytest.raises(DirUnavailable):
+            call()
+    assert [p.name for p in elsewhere.iterdir()] == ["x.md"] and (elsewhere / "x.md").read_text() == "чужой"
+    assert list((store.root / "archive").iterdir()) == [] and list((store.root / "quarantine").iterdir()) == []
+    assert store.dir_problem() == "каталог места отсутствует или не пишется"
+
+def test_side_dirs_are_not_created_by_store(store):                       # M8: их создаёт выкладка (Д7-R55)
+    (store.place_dir(3) / "manual.md").write_text("x")
+    (store.root / "archive").rmdir()
+    with pytest.raises(DirUnavailable):
+        store.archive(3, None, NOW)
+    (store.root / "quarantine").rmdir()
+    with pytest.raises(DirUnavailable):
+        store.quarantine(3, "manual.md", NOW)
+    assert not (store.root / "archive").exists() and not (store.root / "quarantine").exists()
+    assert [p.name for p in store.place_dir(3).iterdir()] == ["manual.md"]          # файл остался на месте
+
+def test_archive_skips_file_vanished_mid_move(store, monkeypatch):        # m2
+    for n in ("a", "b", "c"):
+        (store.place_dir(3) / f"{n}.md").write_text(n)
+    real = store._scan
+    def scan_then_vanish(place):
+        out = real(place)
+        (store.place_dir(place) / "b.md").unlink()                          # исчез после обхода, до переноса
+        return out
+    monkeypatch.setattr(store, "_scan", scan_then_vanish)
+    assert store.archive(3, None, NOW) == ("a", "c") and 3 in store.pending()
+    assert sorted(p.name for p in (store.root / "archive").glob("student-03-*/*")) == ["a.md", "c.md"]
+
+def test_archive_takes_leftovers_of_interrupted_save(store):              # m3 (и M18)
+    (store.place_dir(3) / ".sushka-bdm2.md.tmp-0a1b2c3d").write_text(TEXT)   # процесс упал между записью и os.link
+    (store.place_dir(3) / "sub").mkdir(); (store.place_dir(3) / "sub" / "notes.txt").write_text("прежний студент")
+    assert store.drift(3) == ((), (), ()) and store.place_has_agents(3)     # не агент, но место держит
+    assert store.archive(3, None, NOW) == (".sushka-bdm2.md.tmp-0a1b2c3d", "sub/notes.txt")
+    assert [p for p in store.place_dir(3).rglob("*") if not p.is_dir()] == [] and not store.place_has_agents(3)
+    assert sorted(p.name for p in (store.root / "archive").glob("student-03-*/*")) == [
+        ".sushka-bdm2.md.tmp-0a1b2c3d", "sub__notes.txt"]
+
+def test_name_taken_lists_only_valid_names(store, draft):                 # m7: existing уходит в ответ модели
+    store.save(3, replace(draft, name="davlenie"), TEXT, NOW)
+    for odd in ("Bad Name.md", "x\ny.md", "ab.md", "manual.md", "sushka-bdm2.md"):
+        (store.place_dir(3) / odd).write_text("x")
+    fd = os.open(os.path.join(os.fsencode(store.place_dir(3)), b"\xff\xfe.md"), os.O_WRONLY | os.O_CREAT, 0o644)
+    os.close(fd)
+    with pytest.raises(NameTaken) as e:
+        store.save(3, draft, TEXT, NOW)
+    assert e.value.existing == ("davlenie", "manual", "sushka-bdm2")
+    with pytest.raises(NameTaken) as e:
+        store.save(3, replace(draft, name="davlenie", title="Другое"), TEXT, NOW)
+    assert e.value.existing == ("davlenie",)

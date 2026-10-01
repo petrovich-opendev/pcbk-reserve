@@ -769,7 +769,8 @@ def _refuse_if_agents(settings: Settings, place: int) -> None:
     таблиц отказ пришёл бы от «no such table», а не по агентам (m21). Каталог или учёт не читаются — тоже отказ."""
     agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
     if not agents.open():
-        raise ValueError(f"учёт агентов не открывается: {agents.last_error} — освобождать место нельзя")
+        detail = f" ({agents.last_error})" if agents.last_error else ""
+        raise ValueError(f"учёт агентов не открывается{detail} — освобождать место нельзя")
     try:
         left = agents.place_has_agents(place)
     except DirUnavailable:

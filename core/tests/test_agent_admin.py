@@ -62,3 +62,19 @@ def test_errors_are_one_line_code_1(env_store, capsys):
         err = capsys.readouterr()
         assert err.out == "" and len(err.err.strip().splitlines()) == 1, argv
     assert env_store.live_count(3) == 1                                       # ничего не ушло в архив
+
+
+# --- доводка р1 ---
+
+def test_list_unreadable_places_one_stderr_line(env_store, capsys):     # m6: договор — одна строка в stderr
+    env_store.save(3, AGENT_DRAFT, agent_text(), AGENT_NOW)
+    (env_store.place_dir(5) / "manual.md").write_text("x")
+    env_store.place_dir(4).rmdir(); env_store.place_dir(6).rmdir()
+    assert admin.main(["list"]) == 1
+    out, err = capsys.readouterr()
+    assert err.splitlines() == ["места 04, 06: расхождения не сверены — каталог места отсутствует или не читается"]
+    assert out.splitlines() == ["03\tsushka-bdm2\tСушка БДМ-2\tsaved\t2026-10-07T09:00:00+00:00\t-",
+                                "место 05: файлы без учёта: manual.md"]
+    assert admin.main(["list", "--place", "4"]) == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "место 04: расхождения не сверены — каталог места отсутствует или не читается"]

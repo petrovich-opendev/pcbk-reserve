@@ -30,7 +30,7 @@ import re
 import secrets
 import sqlite3
 import stat
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -92,11 +92,13 @@ class DirUnavailable(Exception):
 
 
 class NameTaken(Exception):
-    """Имя занято живым агентом места или файлом без строки учёта; existing — занятые имена места по алфавиту."""
+    """Имя занято живым агентом места или файлом без строки учёта. existing — занятые имена места по алфавиту, только
+    годные имена агента (NAME_RE, 3–40 знаков): А4 кладёт их в ответ модели, а файл без учёта с переводом строки или
+    не в UTF-8 в имени туда попасть не должен (доводка р1, m7)."""
 
-    def __init__(self, existing: Sequence[str]):
+    def __init__(self, existing: Iterable[str]):
         super().__init__("имя агента на месте уже занято")
-        self.existing = tuple(existing)
+        self.existing = tuple(sorted({name for name in existing if _valid_name(name)}))
 
 
 class TooManyAgents(Exception):
@@ -127,10 +129,13 @@ class PendingReload:
 
 @dataclass(frozen=True)
 class _Scan:
-    """Обход каталога места: files — обычные файлы *.md, links — все символьные ссылки (пути от каталога места, «/»)."""
+    """Обход каталога места (пути от каталога места, «/»): files — обычные файлы *.md, links — все символьные ссылки,
+    others — прочие не-каталоги (временные файлы оборванной записи, любые другие файлы): они тоже держат место и
+    уходят в архив — новому студенту не остаётся данных прежнего (доводка р1, m3)."""
 
     files: tuple[str, ...]
     links: tuple[str, ...]
+    others: tuple[str, ...] = ()
 
     @property
     def agent_names(self) -> set[str]:
@@ -146,6 +151,10 @@ def place_of_caller(caller: object) -> int | None:
     return int(m[1]) if m else None
 
 
+def _valid_name(name: object) -> bool:
+    return isinstance(name, str) and NAME_MIN <= len(name) <= NAME_MAX and NAME_RE.fullmatch(name) is not None
+
+
 def _check_place(place: object) -> int:
     if type(place) is not int or place not in PLACES:
         raise ValueError("место: 1…10")
@@ -155,7 +164,7 @@ def _check_place(place: object) -> int:
 def _check_name(name: object) -> str:
     """Имя файла агента ещё раз по правилам check_draft (заметка А2: Draft собирается и в обход проверки) — до того,
     как из имени строится путь."""
-    if not (isinstance(name, str) and NAME_MIN <= len(name) <= NAME_MAX and NAME_RE.fullmatch(name)):
+    if not _valid_name(name):
         raise ValueError("имя агента вне правил")
     if name in RESERVED_NAMES or name.startswith(RESERVED_PREFIX):
         raise ValueError("имя агента занято стендом")
@@ -294,14 +303,25 @@ class AgentStore:
     def place_dir(self, place: int) -> Path:
         return self.root / f"student-{_check_place(place):02d}"
 
+    def _place_base(self, place: int) -> Path:
+        """Каталог места — настоящий каталог (lstat: не ссылка), иначе DirUnavailable. Его проверяют и обход, и
+        перенос (доводка р1, m4): по каталогу-ссылке служба не читает и не переносит."""
+        base = self.place_dir(place)
+        try:
+            if stat.S_ISDIR(os.lstat(base).st_mode):
+                return base
+            name = "NotADirectoryError"
+        except OSError as exc:
+            name = type(exc).__name__
+        raise DirUnavailable(f"{DIR_PLACE} ({name})")
+
     def _scan(self, place: int) -> _Scan:
         """Обход каталога места без следования по ссылкам; любая ошибка чтения — DirUnavailable."""
-        base = self.place_dir(place)
+        base = self._place_base(place)
         files: list[str] = []
         links: list[str] = []
+        others: list[str] = []
         try:
-            if not stat.S_ISDIR(os.lstat(base).st_mode):
-                raise NotADirectoryError
             stack = [("", base)]
             while stack:
                 prefix, path = stack.pop()
@@ -314,14 +334,19 @@ class AgentStore:
                             stack.append((rel + "/", Path(entry.path)))
                         elif entry.name.endswith(".md") and entry.is_file(follow_symlinks=False):
                             files.append(rel)
+                        else:
+                            others.append(rel)
         except OSError as exc:
             raise DirUnavailable(f"{DIR_PLACE} ({type(exc).__name__})") from None
-        return _Scan(tuple(sorted(files)), tuple(sorted(links)))
+        return _Scan(tuple(sorted(files)), tuple(sorted(links)), tuple(sorted(others)))
 
     def _locate(self, place: int, parts: Sequence[str]) -> tuple[Path, str] | None:
         """Что переносить по пути parts внутри места: сам файл (обычный или ссылку) или первую ссылку на пути — по
-        ссылке перенос не идёт (раунд 3, m-р3-2). Нет файла, часть пути не каталог, сам путь — каталог — None."""
-        path = self.place_dir(place)
+        ссылке перенос не идёт (раунд 3, m-р3-2). Нет файла, часть пути не каталог, сам путь — каталог — None.
+        Каталог места — ссылка или не читается — DirUnavailable (m4). Между проверкой промежуточных каталогов и
+        переносом есть окно гонки: подменить каталог на ссылку в нём могут только root и uid 10003 (core), а
+        dir_problem такое место ловит — известно и принято (доводка р1)."""
+        path = self._place_base(place)
         for i, part in enumerate(parts):
             path = path / part
             try:
@@ -399,13 +424,13 @@ class AgentStore:
         if name in live:
             if live[name] == digest:
                 return "already"
-            raise NameTaken(sorted(live))
+            raise NameTaken(live)
         scan = self._scan(place)
         taken = set(live) | scan.agent_names
         if len(taken) >= MAX_AGENTS:
             raise TooManyAgents()
         if name in taken:                               # файл без строки учёта (или ссылка) с этим именем
-            raise NameTaken(sorted(taken))
+            raise NameTaken(taken)
 
         base = self.place_dir(place)
         final = base / f"{name}.md"
@@ -417,7 +442,7 @@ class AgentStore:
                     self._insert(db, place, draft, digest, hashlib.sha256(data).hexdigest(), at)
                 except sqlite3.IntegrityError:
                     names = {r[0] for r in db.execute(f"SELECT name FROM agents WHERE {_LIVE}", (place,))}
-                    raise NameTaken(sorted(taken | names | {name})) from None
+                    raise NameTaken(taken | names | {name}) from None
                 db.execute(_UPSERT_RELOAD, (place, since, 0))
                 db.execute("COMMIT")
         except BaseException:
@@ -446,7 +471,7 @@ class AgentStore:
                 os.close(fd)
             os.link(tmp, final)
         except FileExistsError:
-            raise NameTaken(sorted(taken | {final.name[:-3]})) from None
+            raise NameTaken(taken | {final.name[:-3]}) from None
         except OSError as exc:
             raise DirUnavailable(f"{DIR_PLACE} ({type(exc).__name__})") from None
         finally:
@@ -524,12 +549,14 @@ class AgentStore:
         return name
 
     def archive(self, place: int, name: str | None, now: datetime) -> tuple[str, ...]:
-        """В архив: без name — все неархивные строки места (и quarantined) и все **/*.md и символьные ссылки каталога
-        места; с name — строка и файл <name>.md. Файлы — в один каталог <root>/archive/student-NN-<YYYYmmddTHHMMSSZ>/
-        на вызов (вызовы в одну секунду делят его, m19) под именем «путь с «/» → «__»», совпадение — хвост -<hex6>
-        (раунд 3, m-р3-3). Строки — archived, место — в очередь перезагрузки (seq + 1).
+        """В архив: без name — все неархивные строки места (и quarantined) и все не-каталоги каталога места, рекурсивно:
+        **/*.md, символьные ссылки и прочие файлы — временные файлы оборванной записи тоже (доводка р1, m3); с name —
+        строка и файл <name>.md. Файлы — в один каталог <root>/archive/student-NN-<YYYYmmddTHHMMSSZ>/ на вызов (вызовы
+        в одну секунду делят его, m19) под именем «путь с «/» → «__»», совпадение — хвост -<hex6> (раунд 3, m-р3-3).
+        Пустые подкаталоги остаются в месте. Строки — archived, место — в очередь перезагрузки (seq + 1).
 
-        Ответ — имена по алфавиту. С name, когда ни строки, ни файла нет, — () и ничего не меняется. Файлы
+        Ответ — имена по алфавиту (у файлов не *.md — путь как есть). С name, когда ни строки, ни файла нет, — () и
+        ничего не меняется. Файл, исчезнувший посреди переноса, пропускается, остальные переносятся (m2). Файлы
         переносятся до транзакции: при её сбое (StoreError) повтор archive доводит дело до конца.
         """
         _check_place(place)
@@ -540,7 +567,8 @@ class AgentStore:
             rows = [r[0] for r in db.execute(sql, (place,) if name is None else (place, name))]
         if parts is None:
             scan = self._scan(place)
-            targets = [(rel, self.place_dir(place) / rel) for rel in sorted(set(scan.files) | set(scan.links))]
+            every = set(scan.files) | set(scan.links) | set(scan.others)
+            targets = [(rel, self.place_dir(place) / rel) for rel in sorted(every)]
         else:
             found = self._locate(place, parts)
             targets = [] if found is None else [(found[1], found[0])]
@@ -552,6 +580,10 @@ class AgentStore:
             for rel, src in targets:
                 try:
                     _move_no_clobber(src, adir, rel.replace("/", "__"), always_suffix=False)
+                except FileNotFoundError:
+                    if os.path.lexists(src):                # пропал каталог архива, а не файл места
+                        raise DirUnavailable(f"{DIR_PLACE} (FileNotFoundError)") from None
+                    continue                                # файл исчез посреди переноса (доводка р1, m2)
                 except OSError as exc:
                     raise DirUnavailable(f"{DIR_PLACE} ({type(exc).__name__})") from None
                 moved.append(rel)
@@ -590,12 +622,13 @@ class AgentStore:
             return db.execute(f"SELECT count(*) FROM agents WHERE {_LIVE}", (place,)).fetchone()[0]
 
     def place_has_agents(self, place: int) -> bool:
-        """Живые строки или любой **/*.md (и любая символьная ссылка) в каталоге места (раунд 1, I2; раунд 2, m-н3).
-        Ошибка чтения каталога — DirUnavailable: не «агентов нет»."""
+        """Живые строки (и quarantined, not_visible — без файла тоже) или любой не-каталог в каталоге места: **/*.md,
+        символьная ссылка, прочий файл (раунд 1, I2; раунд 2, m-н3; доводка р1, m3) — ровно то, что уносит archive
+        без name. Ошибка чтения каталога — DirUnavailable: не «агентов нет»."""
         if self.live_count(place):
             return True
         scan = self._scan(place)
-        return bool(scan.files or scan.links)
+        return bool(scan.files or scan.links or scan.others)
 
     def has_saved(self, place: int) -> bool:
         """Есть строки saved — крючок готовности ставит место в очередь (Д7-R58)."""

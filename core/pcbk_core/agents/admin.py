@@ -3,9 +3,11 @@
 
 - list [--place N] — строки учёта: место, имя, название, состояние, создан, признаки черновика («-» — нет). Последние
   строки — расхождения файлов с учётом (drift): с --place — «файлы без учёта: a.md; учёт без файлов: c; ссылки: d.md»
-  или «расхождений нет», без --place — то же с «место NN: » по каждому месту с расхождениями;
+  или «расхождений нет», без --place — то же с «место NN: » по каждому месту с расхождениями. Места, каталог которых
+  не читается, — одной строкой в stderr и код 1 (строки учёта и сверка остальных мест всё равно выводятся);
 - archive --place N [--name X] --yes — файлы в архив, строки archived, место в очередь перезагрузки. Без --name
-  уносит и файлы без учёта, и символьные ссылки: после него release-place не упирается в агентов места;
+  уносит все файлы каталога места — и без учёта, и символьные ссылки, и временные файлы оборванной записи: после него
+  release-place не упирается в агентов места, а новому студенту не остаётся данных прежнего;
 - reload --place N — место в очередь перезагрузки (после ручной правки файлов).
 
 Коды выхода и вывод — как у pcbk_core.gateway.accounts (П6): удача — 0; ошибка, в том числе ошибка разбора и archive
@@ -81,22 +83,23 @@ def _list(store: AgentStore, place: int | None) -> int:
         for row in store.list_place(n):
             flags = ",".join(store.flags_of(n, row.name)) or "-"
             print(f"{n:02d}\t{_show(row.name)}\t{_show(row.title)}\t{row.state}\t{row.created_at}\t{flags}")
-    code, lines = 0, []
+    lines, unreadable = [], []
     for n in places:
         try:
             text = _drift_text(store, n)
-        except DirUnavailable as exc:
-            print(f"место {n:02d}: расхождения не сверены — {exc}", file=sys.stderr)
-            code = 1
+        except DirUnavailable:
+            unreadable.append(f"{n:02d}")
             continue
         if text:
             lines.append(text if place is not None else f"место {n:02d}: {text}")
-    if code == 0:
+    if not unreadable:
         print("\n".join(lines) or "расхождений нет")
-    else:
-        for line in lines:
-            print(line)
-    return code
+        return 0
+    for line in lines:
+        print(line)
+    # договор команды — одна строка в stderr (доводка р1, m6): все недоступные места в ней
+    where = f"место {unreadable[0]}" if len(unreadable) == 1 else f"места {', '.join(unreadable)}"
+    return _fail(f"{where}: расхождения не сверены — каталог места отсутствует или не читается")
 
 
 def _run(store: AgentStore, args: argparse.Namespace) -> int:

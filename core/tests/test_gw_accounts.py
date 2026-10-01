@@ -565,3 +565,21 @@ def test_release_not_probe_place_refused_before_agents(tmp_path, agents_root, ca
     assert accounts.main(["release-place", "--place", "10", "--yes"]) == 1
     err = capsys.readouterr().err
     assert "освобождать можно только места пробных учёток после disable" in err and "archive" not in err
+
+
+def test_release_place_refused_with_quarantined_row(probe_off_on_10, agent_on_10, capsys):   # доводка р1, M1
+    assert agent_on_10.quarantine(10, "sushka-bdm2.md", AGENT_NOW) == "sushka-bdm2"           # файла в месте нет
+    assert list(agent_on_10.place_dir(10).iterdir()) == []
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 1
+    assert AGENTS_LEFT in capsys.readouterr().err
+    assert admin.main(["archive", "--place", "10", "--yes"]) == 0                              # строку уносит archive
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 0
+
+
+def test_release_place_refused_when_agent_store_does_not_open(probe_off_on_10, agents_root, capsys,
+                                                              monkeypatch):                    # доводка р1, M17
+    monkeypatch.setattr(AgentStore, "open", lambda self: False)
+    assert accounts.main(["release-place", "--place", "10", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "учёт агентов не открывается — освобождать место нельзя" in err and len(err.splitlines()) == 1
+    assert probe_off_on_10.bindings() == [(10, "d7-probe-a", True)]                            # закрепление на месте
