@@ -183,3 +183,29 @@ def test_edge_serves_chat_under_csp(stack):                                # Д6
     assert (code, h["cache-control"]) == (204, "no-store")                 # решение по А4: иконки нет — не 404
     assert stack.http_from_watchdog("GET", "http://pcbk-edge:8080/chat/build.json") == 200   # из сети сторожа (M13)
 
+
+def test_edge_serves_boot_js_no_store(stack):                               # Д6-R51: загрузчик без хеша — без кэша
+    build = json.loads((stack.static_dir / "chat/build.json").read_text(encoding="utf-8"))
+    assert "boot.js" in build["files"]                                     # в описи — иначе сверять не с чем
+    code, raw, h = stack.https_full("/chat/boot.js", headers={"Accept-Encoding": "gzip"})
+    assert (code, h["content-security-policy"], h["cache-control"], h["x-content-type-options"], h["referrer-policy"]) \
+        == (200, CHAT_CSP, "no-store", "nosniff", "no-referrer")
+    assert h["content-type"] == "application/javascript; charset=utf-8"    # русский текст сбоя — charset
+    assert h.get("content-encoding") is None                               # как есть, без gzip ассетов
+    assert hashlib.sha256(raw.encode("utf-8")).hexdigest() == build["files"]["boot.js"]
+
+
+def test_edge_routes_web_report(stack):                                     # Д6-R50: отчёты браузеров через edge
+    gw = stack.gw_client()                                                  # без сессии, Origin стенда
+    code, body, h = gw.call("POST", "/pcbk/api/web/report", {"kind": "turn_silent"})
+    assert (code, body["name"], h["content-type"]) == (401, "Unauthorized", "application/json"), (code, body)
+    code, body, h = gw.call("POST", "/pcbk/api/web/report", {"kind": "x" * 2048})   # тело 2 КиБ — до core не дошло
+    assert (code, body["name"], h["content-type"]) == (413, "PayloadTooLarge", "application/json"), (code, body)
+    code, body, h = gw.call("POST", "/pcbk/api/web/other", {"kind": "turn_silent"})
+    assert (code, body["name"], h["content-type"]) == (404, "NotFound", "application/json"), (code, body)
+    code, body, _ = gw.call("POST", "/pcbk/api/web//report", {"kind": "turn_silent"})   # сырой путь — как у прочих
+    assert (code, body["name"]) == (400, "BadRequest"), (code, body)
+    # предел частоты (корзина «-» без cookie, 1 r/s, запас 10): отказ — 509 → busy.json, 503 WorkplaceBusy, не 429
+    codes = [gw.call("POST", "/pcbk/api/web/report", {"kind": "turn_silent"})[:2] for _ in range(20)]
+    assert {c for c, _ in codes} == {401, 503}, [c for c, _ in codes]
+    assert {b["name"] for c, b in codes if c == 503} == {"WorkplaceBusy"}

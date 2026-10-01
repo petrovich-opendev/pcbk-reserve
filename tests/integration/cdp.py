@@ -1,7 +1,7 @@
 """Headless Chrome по протоколу DevTools (CDP), только stdlib: запуск, вкладки, ввод, ожидания, сеть, CSP, снимки.
 
-Для браузерных тестов веб-чата (Д6а): фикстуры browser (на модуль) и page (на тест, вкладка закрывается) — в
-conftest.py. Все вкладки — сессии одного соединения с браузером (Target.attachToTarget, flatten). Клиент WebSocket —
+Для браузерных тестов веб-чата (Д6а; список разговоров — rename_thread, open_thread, click_text_in — Д6б): фикстуры
+browser (на модуль) и page (на тест, вкладка закрывается) — в conftest.py. Все вкладки — сессии одного соединения с браузером (Target.attachToTarget, flatten). Клиент WebSocket —
 свой, по RFC 6455 в том объёме, что нужен CDP: только ws://127.0.0.1, текстовые кадры, длина до 64 бит.
 
 Что видит страница:
@@ -47,6 +47,13 @@ CSP_LISTENER = """(() => {
   })), true);
 })();""" % CSP_BINDING
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# видимая доступная кнопка или ссылка с текстом (точно, без пробелов по краям) внутри корня: %s — выражение корня
+# (document или querySelector), %s — текст JSON; ответ — середина элемента или null
+_CLICKABLE_JS = ("(() => { const root = %s; if (!root) return null; const want = %s; const el = [...root.querySelectorAll("
+                 "'button, a, [role=\"button\"], summary, input[type=\"submit\"], input[type=\"button\"]')].find((e) => "
+                 "(e.innerText || e.value || '').trim() === want && e.getClientRects().length && !e.disabled); "
+                 "if (!el) return null; el.scrollIntoView({block: 'center'}); const r = el.getBoundingClientRect(); "
+                 "return [r.left + r.width / 2, r.top + r.height / 2]; })()")
 
 
 class _Wire(str):
@@ -400,15 +407,52 @@ class Page:
 
     def click_text(self, text: str, timeout: float = 10) -> None:
         """Щелчок мышью по видимой доступной кнопке или ссылке с этим текстом (точно, без пробелов по краям)."""
-        js = ("(() => { const want = %s; const el = [...document.querySelectorAll("
-              "'button, a, [role=\"button\"], summary, input[type=\"submit\"], input[type=\"button\"]')].find((e) => "
-              "(e.innerText || e.value || '').trim() === want && e.getClientRects().length && !e.disabled); "
-              "if (!el) return null; el.scrollIntoView({block: 'center'}); const r = el.getBoundingClientRect(); "
-              "return [r.left + r.width / 2, r.top + r.height / 2]; })()") % json.dumps(text)
-        x, y = self.wait(lambda: self.eval(js), timeout, f"кнопка или ссылка «{text}»")
+        self._click_found(_CLICKABLE_JS % ("document", json.dumps(text)), timeout, f"кнопка или ссылка «{text}»")
+
+    def click_text_in(self, css: str, text: str, timeout: float = 10) -> None:
+        """Как click_text, но кнопка или ссылка — внутри первого элемента css (строка списка, а не первая похожая
+        кнопка на странице)."""
+        root = f"document.querySelector({json.dumps(css)})"
+        self._click_found(_CLICKABLE_JS % (root, json.dumps(text)), timeout, f"кнопка или ссылка «{text}» в {css}")
+
+    def _click_found(self, js: str, timeout: float, what: str) -> None:
+        x, y = self.wait(lambda: self.eval(js), timeout, what)
         for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
             self._call("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, "button": "left",
                                                      "buttons": 1 if kind == "mousePressed" else 0, "clickCount": 1})
+
+    def click(self, css: str, timeout: float = 10) -> None:
+        """Щелчок мышью по середине видимого элемента css."""
+        js = (f"(() => {{ const e = document.querySelector({json.dumps(css)}); "
+              "if (!e || !e.getClientRects().length) return null; e.scrollIntoView({block: 'center'}); "
+              "const r = e.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()")
+        self._click_found(js, timeout, f"видимый {css}")
+
+    # --- список разговоров чата (Д6-R52; договор строки — задача Б3) ---
+
+    @staticmethod
+    def thread_row(sid: str) -> str:
+        """CSS строки списка разговоров по id разговора OpenCode (data-session-id), а не «первой» строки."""
+        return f'[data-session-id="{sid}"]'
+
+    def rename_thread(self, sid: str, title: str, timeout: float = 10) -> None:
+        """«Переименовать» в строке разговора sid: поле input[name=title] открывается в фокусе с выделенным именем —
+        ввод (Input.insertText) заменяет имя целиком; Enter сохраняет."""
+        row = self.thread_row(sid)
+        self.click_text_in(row, "Переименовать", timeout)
+        field = f'{row} input[name="title"]'
+        self.wait_selector(field, timeout)
+        selected = (f"(() => {{ const e = document.querySelector({json.dumps(field)}); return !!e && "
+                    "document.activeElement === e && e.selectionStart === 0 && e.selectionEnd === e.value.length; })()")
+        self.wait(lambda: self.eval(selected), timeout, f"{field}: в фокусе, имя выделено")
+        self.type(field, title, timeout)
+        self.press_enter(field, timeout)
+        self.wait(lambda: not self.eval(f"!!document.querySelector({json.dumps(field)})"), timeout,
+                  f"{field} закрылось после Enter")
+
+    def open_thread(self, sid: str, timeout: float = 10) -> None:
+        """Открыть разговор sid щелчком по его имени в списке (button.thread-open строки)."""
+        self.click(f"{self.thread_row(sid)} button.thread-open", timeout)
 
     def screenshot(self, path: str | Path) -> None:
         data = self._call("Page.captureScreenshot", {"format": "png"}, timeout=60)["data"]
@@ -429,13 +473,26 @@ class Page:
               "return !!e && e.getClientRects().length > 0; })()")
         self.wait(lambda: self.eval(js), timeout, f"видимый {css}")
 
-    def _text(self) -> str:
-        return self.eval("document.body ? document.body.innerText : ''") or ""
+    def _text(self, css: str | None = None) -> str:
+        """Видимый текст страницы или первого элемента css (нет элемента — пусто)."""
+        root = "document.body" if css is None else f"document.querySelector({json.dumps(css)})"
+        return self.eval(f"(() => {{ const e = {root}; return e ? e.innerText : ''; }})()") or ""
 
-    def wait_text(self, pattern: str, timeout: float = 10) -> str:
-        """Видимый текст страницы совпал с регулярным выражением; возвращает совпавший кусок."""
-        found = self.wait(lambda: re.search(pattern, self._text()), timeout, f"текст /{pattern}/")
+    def wait_text(self, pattern: str, timeout: float = 10, css: str | None = None) -> str:
+        """Видимый текст страницы (или первого элемента css) совпал с регулярным выражением; возвращает совпавший
+        кусок."""
+        where = "" if css is None else f" в {css}"
+        found = self.wait(lambda: re.search(pattern, self._text(css)), timeout, f"текст /{pattern}/{where}")
         return found.group(0)
+
+    def has_text(self, pattern: str, within: float = 0, css: str | None = None) -> bool:
+        """True, если текст страницы (или первого элемента css) совпал с выражением за within с; within=0 — одна
+        проверка сейчас. В отличие от wait_text, срок — не сбой: для «этого текста здесь нет»."""
+        try:
+            self.wait(lambda: re.search(pattern, self._text(css)), within, f"текст /{pattern}/")
+        except AssertionError:
+            return False
+        return True
 
     def wait_gone(self, pattern: str, timeout: float = 10) -> None:
         self.wait(lambda: re.search(pattern, self._text()) is None, timeout, f"исчезновение /{pattern}/")

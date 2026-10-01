@@ -55,6 +55,9 @@ limit_req_zone $pcbk_oc_session zone=pcbk_oc_event:1m rate=20r/s;
 # ручки места (остаток Д5б): та же карта cookie, без cookie — корзина «-»; страница входа опрашивает состояние раз в
 # секунду, чат — реже; поток запросов без учётки не доходит до core сверх 5 в секунду
 limit_req_zone $pcbk_oc_session zone=pcbk_place_rate:1m rate=5r/s;
+# отчёты браузеров о молчании чата (Д6б, Д6-R50): та же карта cookie, без cookie — корзина «-»; не по IP — весь класс
+# бывает за одним адресом. Браузер шлёт отчёт раз в эпизод, core считает не чаще раза в минуту на (логин, вид)
+limit_req_zone $pcbk_oc_session zone=pcbk_web:1m rate=1r/s;
 
 # временные файлы тел запросов и ответов core — на томе pcbk-edge-temp (диск), не в tmpfs: tmpfs считается в
 # mem_limit 64m edge, а ответ core — до 4 МиБ (Д5-R36), тело /pcbk/api/oc/ — до 512 КиБ. Каталоги создаёт мастер
@@ -115,7 +118,7 @@ server {
     error_page 494 =400 /pcbk-errors/400.json;            # большие заголовки и cookie (cookie Dify на том же хосте)
     error_page 429 /pcbk-errors/429.json;
     error_page 502 503 504 =503 /pcbk-errors/503.json;    # «=503»: без него код остался бы 502 или 504
-    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn и limit_req под /pcbk/api/oc/ и у ручек места (509 — только их код)
+    error_page 509 =503 /pcbk-errors/busy.json;           # limit_conn и limit_req под /pcbk/api/oc/, у ручек места и отчётов (509 — только их код)
 
     location = /pcbk-errors/400.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
     location = /pcbk-errors/405.json { internal; default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
@@ -222,6 +225,17 @@ server {
         try_files $uri =404;
     }
 
+    # загрузчик чата (Д6б, Д6-R51): имя без хеша, поэтому no-store своей location, а не год из assets/; точный «=»
+    # сильнее ^~ /chat/ ниже. charset — в нём русский текст сбоя; заголовки server повторены, как у /chat/
+    location = /chat/boot.js {
+        charset utf-8;
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        try_files /chat/boot.js =404;
+    }
+
     # прочее под /chat/ — не на 8443: опись build.json читает только сторож через 8080, index.html — только как /chat/.
     # types {} — тип ответа не по расширению пути (иначе 404 на build.json ушёл бы как application/json)
     location ^~ /chat/ {
@@ -271,6 +285,19 @@ server {
         limit_req_log_level warn;
         client_max_body_size 64k;
         proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    # отчёты браузеров (Д6б, Д6-R50): тело ровно {"kind": …} — core сам режет до 256 Б, edge — до 1 КиБ (413 JSON);
+    # предел частоты на cookie сессии — 509 → busy.json, как у прочих пределов Д5б (ответ отчёта веб не показывает)
+    location = /pcbk/api/web/report {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_web burst=10 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 1k;
+        proxy_read_timeout 10s;
         proxy_pass http://$pcbk_core;
     }
 

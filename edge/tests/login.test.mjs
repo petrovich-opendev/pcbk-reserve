@@ -619,13 +619,29 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
 
   const proxied = ["/pcbk/api/auth/", "/pcbk/api/workplace", "/pcbk/api/workplace/wake"];
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
+  const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
   assert.equal(passes.length, conf.match(/proxy_pass\b/g).length);                     // каждый proxy_pass — внутри location
   assert.equal(new Set(passes.map(([path]) => path)).size, passes.length);              // по одному на location
   assert.deepEqual(Object.fromEntries(passes), {                                        // в core — только пути шлюза
     "/status": "http://$pcbk_watchdog", "/status.js": "http://$pcbk_watchdog", "/status.json": "http://$pcbk_watchdog",
-    ...Object.fromEntries([...proxied, ...oc].map((path) => [path, "http://$pcbk_core"])),
+    ...Object.fromEntries([...proxied, ...oc, report].map((path) => [path, "http://$pcbk_core"])),
   });
+  // отчёты браузеров (Д6-R50): частота — по cookie сессии (карта Б5, без cookie — корзина «-»), а не по IP: весь класс
+  // бывает за одним адресом; отказ предела — 509 → busy.json (503 WorkplaceBusy), как у прочих пределов Д5б (Н2);
+  // тело — до 1 КиБ (core сам режет до 256 Б), срок — 10 с
+  assert.ok(conf.includes("limit_req_zone $pcbk_oc_session zone=pcbk_web:1m rate=1r/s;"));
+  assert.equal(conf.match(/zone=pcbk_web:/g).length, 1);
+  assert.equal(loc(report).exact, true);
+  {
+    const b = loc(report).body;
+    for (const line of ["proxy_pass http://$pcbk_core;", "if ($pcbk_bad_api_uri) { return 400",
+                        "limit_req zone=pcbk_web burst=10 nodelay;", "limit_req_log_level warn;",
+                        "client_max_body_size 1k;", "proxy_read_timeout 10s;"])
+      assert.ok(b.includes(line), `${report}: ${line}`);
+    assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], report);   // не 429 входа
+    assert.doesNotMatch(b, /zone=pcbk_login|zone=pcbk_oc|zone=pcbk_place|limit_conn/, report);           // своя зона
+  }
   assert.equal(loc("/pcbk/api/auth/").exact, false);
   assert.equal(loc("/pcbk/api/workplace").exact, true);
   assert.equal(loc("/pcbk/api/workplace/wake").exact, true);
@@ -709,19 +725,26 @@ test("шаблон edge: чат на 8443 — свой CSP, кэш и сжати
   const page = one(8443, "=", "/chat/");
   const assets = one(8443, "^~", "/chat/assets/");
   const other = one(8443, "^~", "/chat/");                                              // 404 прочего под /chat/
+  const boot = one(8443, "=", "/chat/boot.js");                                         // загрузчик Д6б (Д6-R51)
   // CSP R41 и заголовки server — у всех ответов /chat*: и у перенаправления, и у 404 (итоговое ревью Д6а, P3)
-  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["/chat/assets/", assets], ["^~ /chat/", other]]) {
+  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["/chat/assets/", assets], ["^~ /chat/", other],
+                           ["/chat/boot.js", boot]]) {
     assert.ok(b.includes(`add_header Content-Security-Policy "${CHAT_CSP}" always;`), name);
     assert.ok(b.includes('add_header X-Content-Type-Options "nosniff" always;'), name);   // server-заголовки не наследуются
     assert.ok(b.includes('add_header Referrer-Policy "no-referrer" always;'), name);
     assert.equal(b.match(/add_header Cache-Control /g)?.length, 1, name);
+    assert.equal(b.match(/add_header /g)?.length, 4, name);                             // и ничего сверх четырёх
     assert.doesNotMatch(b, /unsafe-|data:|blob:|proxy_pass/, name);
   }
-  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["^~ /chat/", other]])
+  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["^~ /chat/", other], ["/chat/boot.js", boot]])
     assert.ok(b.includes('add_header Cache-Control "no-store" always;'), name);
   assert.match(page, /charset utf-8;/);
   assert.match(page, /try_files \/chat\/index\.html =404;/);
   assert.doesNotMatch(page, /gzip/);
+  // загрузчик — имя без хеша: no-store своей location, а не год из assets/; в нём русский текст сбоя — charset
+  assert.match(boot, /charset utf-8;/);
+  assert.match(boot, /try_files \/chat\/boot\.js =404;/);
+  assert.doesNotMatch(boot, /gzip|pcbk_asset_cache|immutable/);
   for (const line of ["add_header Cache-Control $pcbk_asset_cache always;", "gzip on;",
                       "gzip_types application/javascript text/javascript text/css;", "gzip_vary on;", "try_files $uri =404;"])
     assert.ok(assets.includes(line), line);
@@ -732,12 +755,12 @@ test("шаблон edge: чат на 8443 — свой CSP, кэш и сжати
   assert.match(one(8443, "^~", "/chat/"),                                              // build.json и прочее — не на 8443,
                /types \{ \}\s*default_type "text\/plain; charset=utf-8";\s*return 404 /);  // тип — не по расширению
   assert.match(one(8443, "=", "/favicon.ico"), /return 204;/);                         // решение по А4: без 404 иконки
-  assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/chat")).length, 4);
+  assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/chat")).length, 5);
 
   // карта CSP /pcbk/api/ (Д5б) /chat/ не накрывает: иначе default-src 'none' второй строкой заголовка
   const api = new RegExp(/map \$uri \$pcbk_api_csp \{\n\s*default "";\n\s*"~([^"]+)"/.exec(conf)[1]);
   assert.ok(api.test("/pcbk/api/oc/session") && api.test("/pcbk-errors/503.json"));   // положительный контроль
-  for (const path of ["/chat", "/chat/", "/chat/assets/index-abc.js", "/chat/build.json", "/favicon.ico"])
+  for (const path of ["/chat", "/chat/", "/chat/assets/index-abc.js", "/chat/boot.js", "/chat/build.json", "/favicon.ico"])
     assert.equal(api.test(path), false, path);
 
   // 8080 (А1, Д6-R46): страница и опись для сторожа — тот же корень, без TLS

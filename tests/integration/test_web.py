@@ -1,5 +1,7 @@
-"""Чат в браузере (Д6а): вход ведёт в чат, страница чата под CSP в настоящем Chrome (cdp.py); ответ через шлюз, поток по
-HTTP/2, сон места и конец сессии, ошибка модели, преподаватель без чата, баннер и строка «Веб-чат» сторожа.
+"""Чат в браузере (Д6а, Д6б): вход ведёт в чат, страница чата под CSP в настоящем Chrome (cdp.py); ответ через шлюз, поток
+по HTTP/2, сон места и конец сессии, ошибка модели, преподаватель без чата, баннер и строка «Веб-чат» сторожа. Д6б:
+предупреждение при первом входе (место не будится до «Понятно»), список разговоров (имя OpenCode, переименование и архив
+через шлюз), четвёртая вкладка («закройте лишние»), повторы модели (живая проверка m3 Б3), отчёты браузеров в строке.
 
 Место модуля — 09: модули Д5 берут 1, 3–8, прежние дни — 01, 02, 03 и 10. Модуль идёт последним по алфавиту и
 гасит своё место к концу, в том числе в finally фикстуры web_users. Учётки: web-a (студент, место 9) и web-t
@@ -7,8 +9,19 @@ HTTP/2, сон места и конец сессии, ошибка модели,
 больше трёх потоков на логин и трёх живых сессий на учётку, а вкладки одного профиля делят cookie. Поток /event есть
 только у открытого разговора (Д6-R43), поэтому тесты потока сначала задают вопрос двойнику OpenRouter.
 
-Снимки для владельца (preflight M17): при PCBK_SHOTS=<каталог> тесты кладут туда 01–04 в своих точках — к концу
-прогона стенд уже опущен, снимать потом не на чем. Данные на снимках — тестовые (тег 20FAKE_…, учётка web-a).
+Порядок модуля (Д6б):
+1. test_first_login_notice — первым из тестов стенда: web-a ещё не подтверждала предупреждение. Вкладка — со своими
+   cookie (isolated_page, preflight Ф3): иначе следующий тест вошёл бы без формы;
+2. тесты Д6а и повторы модели; прочие тесты перед входом подтверждают предупреждение мимо шлюза — ensure_notice_acked
+   (Ф5: без пароля и без новой сессии, она вытеснила бы сессию вкладок);
+3. список разговоров и четвёртая вкладка;
+4. учения Д6а (баннер, строка «Веб-чат»): строка ждёт точную тройку ok — ложный отчёт любого теста выше её ловит;
+5. test_reports_reach_row — последним: после него строка «Веб-чат» жёлтая час.
+
+Снимки для владельца (preflight M17): при PCBK_SHOTS=<каталог> тесты кладут туда снимки в своих точках — к концу
+прогона стенд уже опущен, снимать потом не на чем: Д6а — 01-chat-answer, 02-banner-unknown, 03-place-asleep,
+04-status-web-row; Д6б — 01-notice, 02-web-row-warn, 03-sidebar, 04-fourth-tab. Данные на снимках — тестовые (тег
+20FAKE_…, учётки web-a и web-t).
 """
 import html
 import json
@@ -23,7 +36,7 @@ import pytest
 
 import cdp
 import conftest
-from conftest import REPO, STAND_ORIGIN, Secret, failure, leaks
+from conftest import REPO, STAND_ORIGIN, Secret, failure, leaks, wait_for
 from gateway_cases import ALLOWED, OC, SES_FAKE, TWINS
 
 STAND = "https://stand.pcbk.test:18443"
@@ -60,6 +73,25 @@ LOGIN_FORM_JS = "(() => { const e = document.getElementById('login'); return !!e
 # строка «Веб-чат» страницы состояния — в середину экрана (для снимка 04)
 WEB_ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
                         "&& e.textContent.trim() === 'Веб-чат').scrollIntoView({block: 'center'}), 1")
+EVENT = OC + "/event"                           # поток событий вкладки (только у открытого разговора)
+# предупреждение при первом входе (Д6-R49, текст — web/src/texts.ts)
+NOTICE_RE = r"Преподаватель видит ваши разговоры"
+DEFAULT_TITLE = "New session - "               # имя разговора OpenCode до самозаголовка
+TOO_MANY_TABS = r"Открыто слишком много вкладок чата — закройте лишние"
+# подтверждение предупреждения мимо шлюза (preflight Ф5): без пароля и без новой сессии — вход вытеснил бы сессию вкладок
+# (живых сессий у учётки не больше трёх), а пароль web-a меняет test_signed_out_goes_to_login. Путь через шлюз
+# проверяют test_first_login_notice и test_notice_ack_rules (Б2). Та же база и тот же open(), что у команды
+# администратора; argv — логин
+NOTICE_ACK_PY = """\
+import sys
+from pcbk_core.gateway.accounts import NOTICE, AccountStore
+from pcbk_core.settings import Settings
+store = AccountStore(Settings.from_env().DB_PATH)
+if not store.open():
+    sys.exit("база учётных записей не открывается")
+store.ack_notice(sys.argv[1], NOTICE)
+"""
+NO_REPORTS = {"boot_failed_1h": 0, "ui_crash_1h": 0, "turn_silent_1h": 0, "stream_down_1h": 0}
 PROMPT_PATH = re.compile(rf"{re.escape(OC)}/session/(ses_[0-9A-Za-z]{{26}})/prompt_async")
 # сверка путей браузера с правилами шлюза в образе core (preflight F1: gateway_cases.py — без импорта pcbk_core, на хосте
 # нет fastapi): argv — пары [метод, путь после /pcbk/api/oc без «?…»], ответ — имя правила или null на каждую
@@ -189,6 +221,30 @@ def row(d: dict, component: str) -> tuple[str, str, str]:
     return next((c["state"], c["detail"], c.get("note", "")) for c in d["checks"] if c["component"] == component)
 
 
+def noticed(stack, login: str) -> str:
+    """Столбец «предупреждён» строки accounts list — целиком (preflight Н3): да, нет или «-» у преподавателя."""
+    return stack.accounts_list_row(login).split("\t")[-1]
+
+
+def ensure_notice_acked(stack, login: str) -> None:
+    """Предупреждение login подтверждено — мимо шлюза, если ещё нет; после — сверка строки accounts list."""
+    if noticed(stack, login) == "нет":
+        stack.exec("pcbk-core", "python", "-c", NOTICE_ACK_PY, login)
+    assert noticed(stack, login) == "да"
+
+
+def session_of(stack, n: int, sid: str) -> dict:
+    """Разговор sid места n (GET /session/<sid>) — из сети места мимо шлюза (истина о месте)."""
+    code, body = stack.oc(n, "GET", f"/session/{sid}", n)
+    assert code == 200, code
+    return json.loads(body)
+
+
+def web_reports(stack) -> dict:
+    """/health/web серверного слоя изнутри сторожа (pcbk-front): счётчики отчётов браузеров за час."""
+    return json.loads(stack.body_from_watchdog("http://pcbk-core:8000/health/web"))
+
+
 def shot(page, name: str) -> None:
     """Снимок вкладки в PCBK_SHOTS (снимки для владельца, M17); без переменной — ничего."""
     where = os.environ.get("PCBK_SHOTS")
@@ -266,7 +322,28 @@ def test_cookie_hidden_in_tracebacks():                                         
     assert not leaks(failure(check, full), cookie)                                         # cookie — «<скрыт>»
 
 
+def test_first_login_notice(stack, isolated_page, web_users):                          # Review Focus 1 Д6б
+    """Первый вход web-a: экран предупреждения в чате, ни вход, ни чат не будят место и не ходят в /pcbk/api/oc/, пока
+    нет «Понятно»; подтверждение — POST через edge и шлюз (204), после него чат и «да» в accounts list. Вкладка — со
+    своими cookie (preflight Ф3): сессия этого входа не достаётся следующему тесту, тот входит формой."""
+    page = isolated_page
+    assert noticed(stack, "web-a") == "нет"                                               # отрицательный контроль (Н3)
+    page.goto(f"{STAND}/login")
+    page.type("#login", "web-a"); page.type("#password", web_users["web-a"]); page.press_enter("#password")
+    page.wait_url("/chat/", 60); page.wait_text(NOTICE_RE, 30)
+    assert [r for r in page.requests("/pcbk/api/workplace") if r["method"] == "POST"] == []   # ни вход, ни чат не будили
+    assert page.requests("/pcbk/api/oc/") == []
+    assert page.requests("/pcbk/api/auth/notice") == [] and noticed(stack, "web-a") == "нет"
+    shot(page, "01-notice.png")
+    page.click_text("Понятно"); page.wait_gone(NOTICE_RE, 30)
+    page.wait_selector("textarea", 90)                                                    # поле чата, не шапка (Minor 7)
+    assert [(r["method"], r["status"]) for r in page.requests("/pcbk/api/auth/notice")] == [("POST", 204)]
+    assert noticed(stack, "web-a") == "да"
+    assert page.csp() == [] and page.console_errors() == []
+
+
 def test_login_leads_to_chat(stack, page, web_users):                                  # Review Focus 1
+    ensure_notice_acked(stack, "web-a")
     assert login_to_chat(page, "web-a", web_users["web-a"]) == "form"                    # первый тест: вход формой
     assert page.wait_text(re.escape(STAND_WARNING), 5) and page.wait_text(r"Стенд работает|Внимание|Сбой", 20)
     assert page.wait_text(r"Вы вошли как web-a", 5)
@@ -286,6 +363,7 @@ def test_login_leads_to_chat(stack, page, web_users):                           
 
 
 def test_chat_answers_through_gateway(stack, page, web_users):                            # Review Focus 1, 4
+    ensure_notice_acked(stack, "web-a")
     before = stack.gw_health()["refused_1h"]
     login_to_chat(page, "web-a", web_users["web-a"])
     answer = ask(page, Q)
@@ -311,6 +389,7 @@ def test_chat_answers_through_gateway(stack, page, web_users):                  
 
 
 def test_browser_headers_and_h2_stream(stack, page, web_users):                           # хвост Д5б [?]
+    ensure_notice_acked(stack, "web-a")
     login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)                         # разговор открыт — поток есть
     posts = [(r["path"], r["headers"].get("sec-fetch-site"), r["headers"].get("origin"))  # заголовки — по запросу (P6)
              for r in page.requests("/pcbk/api/", headers=True) if r["method"] == "POST"]
@@ -324,6 +403,7 @@ def test_browser_headers_and_h2_stream(stack, page, web_users):                 
 
 
 def test_place_asleep_shows_wake_and_goes_quiet(stack, page, web_users):                  # Review Focus 2
+    ensure_notice_acked(stack, "web-a")
     login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)
     sid = last_session(stack, PLACE)
     stack.stop("pcbk-student-09")
@@ -341,6 +421,7 @@ def test_place_asleep_shows_wake_and_goes_quiet(stack, page, web_users):        
 
 
 def test_signed_out_goes_to_login(stack, page, web_users):                                # Review Focus 2
+    ensure_notice_acked(stack, "web-a")
     login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)
     assert [r["status"] for r in page.requests("/pcbk/api/oc/event") if r["status"] == 200]  # поток был (M18)
     web_users["web-a"] = stack.passwd("web-a")                                             # passwd закрывает сессии
@@ -353,10 +434,74 @@ def test_signed_out_goes_to_login(stack, page, web_users):                      
 
 
 def test_model_error_visible_in_chat(stack, page, web_users):
+    ensure_notice_acked(stack, "web-a")
     login_to_chat(page, "web-a", web_users["web-a"])
     page.type("textarea", "FAKE402 что сейчас?"); page.press_enter("textarea")
     page.wait_text(r"На счёте OpenRouter кончились деньги", 90)
     assert page.csp() == [] and page.console_errors() == []
+
+
+def test_model_retries_recorded(stack, page, web_users, record_property):              # живая проверка m3 ревью Б3
+    """m3 ревью Б3: пишет ли место (OpenCode 1.18.33) часть retry на каждую попытку модели. Отпечаток хода веба (watch.ts)
+    берёт число частей последнего ответа и его последнюю часть: будь часть retry на попытку — ход, который только
+    повторяет запрос к модели, сбрасывал бы отсчёт и turn_silent не дал бы никогда. Двойник отвечает на FAKE500 ошибкой
+    500, LLM-прокси отдаёт месту 502, OpenCode повторяет. Во время повторов опрашиваются статус разговора и части
+    ответа в месте (мимо шлюза), после трёх попыток ход снимается «Стопом». Факты — свойство m3 отчёта junit.
+
+    Как ведёт себя 1.18.33 (прогоны Б4): повтор виден только статусом разговора (session/status — retry с номером
+    попытки), частей у ответа нет ни одной — отпечаток стоит, и молчание дольше 180 с ход с одними повторами ловит.
+    Тест закрепляет это: место, начавшее писать части retry, его уронит — тогда отпечаток надо править (m3). Разговор —
+    с готовым именем: запрос самозаголовка не смешан с повторами хода; отчётов браузера за это время нет."""
+    ensure_notice_acked(stack, "web-a")
+    login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)
+    sid = last_session(stack, PLACE)
+    wait_for(lambda: not session_of(stack, PLACE, sid)["title"].startswith(DEFAULT_TITLE), timeout=60)
+    first = max((c["id"] for c in stack.llm_calls(1)), default=0)
+
+    def calls() -> list[dict]:                      # вызовы LLM-прокси этого разговора после вопроса (новые — первыми)
+        return [c for c in stack.llm_calls(50) if c["session"] == sid and c["id"] > first]
+
+    def attempts() -> int:
+        return sum(1 for c in calls() if c["code"] == "pcbk_upstream_down")
+
+    def answer_parts() -> list[dict]:               # части ответов места на последний вопрос
+        code, body = stack.oc(PLACE, "GET", f"/session/{sid}/message", PLACE)
+        assert code == 200, code
+        msgs = json.loads(body)
+        asked = max(i for i, m in enumerate(msgs) if m["info"]["role"] == "user")
+        return [p for m in msgs[asked + 1:] if m["info"]["role"] == "assistant" for p in m["parts"]]
+
+    def running() -> bool:
+        return bool(page.eval(RUNNING_JS))
+
+    seen: list[list] = []                           # во время хода: [вид статуса места, попытка, частей ответа]
+
+    def retried_enough() -> bool:
+        code, body = stack.oc(PLACE, "GET", "/session/status", PLACE)
+        st = (json.loads(body) if code == 200 else {}).get(sid) or {}
+        sample = [st.get("type"), st.get("attempt"), len(answer_parts())]
+        if not seen or seen[-1] != sample:
+            seen.append(sample)
+        n = attempts()
+        return (n >= 3 and any(t == "retry" for t, _, _ in seen)) or (n >= 1 and not running())
+
+    started = time.monotonic()
+    page.type("textarea", "FAKE500 что сейчас?"); page.press_enter("textarea")
+    wait_for(retried_enough, timeout=150, step=0.5)
+    stopped = running()
+    if stopped:
+        page.click_text("Стоп")
+        page.wait(lambda: not running(), 30, "ход снят «Стопом»")
+    parts = answer_parts()
+    facts = {"attempts": attempts(), "seen": seen, "stopped": stopped, "turn_s": round(time.monotonic() - started, 1),
+             "part_types": [p.get("type") for p in parts],
+             "calls": [[c["step"], c["status"], c["code"], c["http_status"]] for c in reversed(calls())]}
+    record_property("m3", json.dumps(facts, ensure_ascii=False))
+    assert facts["attempts"] >= 3 and stopped, facts                                     # повторы были, ход шёл
+    assert [t for t, _, _ in seen if t == "retry"], facts                                # повтор виден статусом
+    assert all(n == 0 for _, _, n in seen) and "retry" not in facts["part_types"], facts  # частей на попытку нет
+    assert web_reports(stack) == NO_REPORTS                                                # повторы — не «ответа нет»
+    assert page.csp() == []
 
 
 def test_teacher_sees_no_chat(stack, isolated_page, web_users):                           # свои cookie: web-a не задет
@@ -369,7 +514,58 @@ def test_teacher_sees_no_chat(stack, isolated_page, web_users):                 
     assert page.csp() == [] and page.console_errors() == []
 
 
+def test_rename_and_archive_through_gateway(stack, page, web_users):                    # Review Focus 4 Д6б
+    """Список разговоров через шлюз: имя от OpenCode доходит до строки (Ф13), переименование и «В архив» строки по id
+    (не «первой», Minor 9) меняют разговор в месте; отказов шлюза нет."""
+    ensure_notice_acked(stack, "web-a")
+    before = stack.gw_health()["refused_1h"]
+    login_to_chat(page, "web-a", web_users["web-a"]); ask(page, Q)
+    sid = last_session(stack, PLACE)
+    row_css = cdp.Page.thread_row(sid)
+    wait_for(lambda: not session_of(stack, PLACE, sid)["title"].startswith(DEFAULT_TITLE), timeout=60)  # самозаголовок — до ручного
+    page.wait_text(re.escape(session_of(stack, PLACE, sid)["title"]), 30, css=row_css)   # Ф13: имя OpenCode в строке
+    page.rename_thread(sid, "Проверка Д6б")
+    wait_for(lambda: session_of(stack, PLACE, sid)["title"] == "Проверка Д6б", timeout=20)
+    page.wait_text(r"Проверка Д6б", 10, css=row_css)
+    shot(page, "03-sidebar.png")
+    page.click_text_in(row_css, "В архив")
+    wait_for(lambda: session_of(stack, PLACE, sid).get("time", {}).get("archived") is not None, timeout=20)
+    page.wait_gone(r"Проверка Д6б", 10)
+    assert stack.gw_health()["refused_1h"] == before
+    assert page.csp() == [] and page.console_errors() == []
+
+
+def test_fourth_tab_told_to_close(stack, browser, page, web_users):                    # хвост Д5б, 429 streams; Б-2
+    """Четыре вкладки одной учётки в одном разговоре: поток — у трёх, четвёртой — «закройте лишние» (и только ей);
+    закрыли одну — следующая попытка четвёртой по паузе проходит. Вкладки сверх фикстуры page закрываются в finally
+    (preflight Ф4): их потоки не достаются следующему тесту."""
+    ensure_notice_acked(stack, "web-a")
+    pages = [page]
+    try:
+        for _ in range(3):
+            pages.append(browser.page())
+        login_to_chat(pages[0], "web-a", web_users["web-a"]); ask(pages[0], Q)       # разговор открыт — поток есть
+        sid = last_session(stack, PLACE)
+        for i, p in enumerate(pages[1:], 1):
+            p.goto(f"{STAND}/chat/"); p.wait_url("/chat/", 30); p.wait_selector(cdp.Page.thread_row(sid), 60)
+            p.open_thread(sid)                                                          # тот же разговор — свой поток у вкладки
+            if i < 3:                               # поток второй и третьей — до следующей: четвёртая по счёту — pages[3]
+                p.wait(lambda p=p: any(r["status"] == 200 for r in p.requests(EVENT)), 30, f"поток вкладки {i + 1}")
+        pages[3].wait_text(TOO_MANY_TABS, 60)
+        assert [p.has_text(r"закройте лишние") for p in pages[:3]] == [False] * 3        # сказано только лишней
+        shot(pages[3], "04-fourth-tab.png")
+        pages[1].close()
+        pages[3].wait_gone(r"закройте лишние", 45)                                     # следующая попытка по паузе прошла
+        assert any(r["status"] == 200 for r in pages[3].requests(EVENT))
+        # 509/503 WorkplaceBusy на вспомогательных GET при открытии четырёх вкладок допустимы: у edge 10 на cookie
+        assert all(p.csp() == [] for p in pages)
+    finally:
+        for p in pages[1:]:
+            p.close()
+
+
 def test_banner_follows_watchdog(stack, page, web_users):                                 # Review Focus 5; учение — ближе к концу
+    ensure_notice_acked(stack, "web-a")
     login_to_chat(page, "web-a", web_users["web-a"])
     stack.stop("pcbk-watchdog")                                                            # preflight M14: stop/start стенда
     try:
@@ -381,7 +577,7 @@ def test_banner_follows_watchdog(stack, page, web_users):                       
     assert page.csp() == [] and page.console_errors() == []
 
 
-def test_web_row_and_drill(stack, page):                                                  # учение строки «Веб-чат» — последним
+def test_web_row_and_drill(stack, page):                                                  # учение строки «Веб-чат» — до отчётов
     build = json.loads((stack.static_dir / "chat/build.json").read_text())
     stack.wait_status(lambda d: row(d, "web") == ("ok", "страница чата отдаётся", f"сборка {build['build']}"), timeout=60)
     asset = stack.static_dir / "chat" / next(p for p in build["files"] if p.endswith(".css"))
@@ -396,3 +592,21 @@ def test_web_row_and_drill(stack, page):                                        
     page.wait_text(r"Веб-чат", 20); page.wait_text(r"страница чата отдаётся", 20)
     page.eval(WEB_ROW_INTO_VIEW_JS)                                                        # строка — последняя, ниже экрана
     shot(page, "04-status-web-row.png")
+
+
+def test_reports_reach_row(stack, page, web_users):                                      # последним в модуле
+    """Отчёт браузера через edge и шлюз (fetch страницы чата: та же cookie, Origin и Content-Type, что у api.report)
+    красит строку «Веб-чат». До него отчётов нет: ложный отчёт любого теста выше виден здесь и в учении строки."""
+    ensure_notice_acked(stack, "web-a")
+    assert web_reports(stack) == NO_REPORTS
+    login_to_chat(page, "web-a", web_users["web-a"])
+    code = page.eval("fetch('/pcbk/api/web/report',{method:'POST',headers:{'Content-Type':'application/json'},"
+                     "body:JSON.stringify({kind:'turn_silent'})}).then(r=>r.status)")
+    assert code == 204
+    assert web_reports(stack) == {**NO_REPORTS, "turn_silent_1h": 1}
+    stack.wait_status(lambda d: row(d, "web") == ("warn", "ответ модели не пришёл вовремя", "1 за час"), timeout=60)
+    page.goto(f"{STAND}/status")                                                           # строка на странице владельца
+    page.wait_text(r"ответ модели не пришёл вовремя", 20)
+    page.eval(WEB_ROW_INTO_VIEW_JS)
+    shot(page, "02-web-row-warn.png")
+    assert page.csp() == [] and page.console_errors() == []
