@@ -242,6 +242,65 @@
 
 ---
 
+## Изменения по критике, раунд 3
+
+Блокеров нет, находки раунда 2 закрыты. Внесены 2 Important и 9 Minor; раунда 4 не будет — в конце
+самопроверка.
+
+**Important**
+- **I-р3-1 — пульс не прячет отказ учёта (решение контроллера).**
+  - `checked_at` ставится после **удачного** `store.pending()` и до мест; пустая очередь — тоже удача.
+  - `StoreError` прохода ставит отдельный флаг воркера `AgentStats.worker_store_failed(...)`, его не
+    стирает `store_ok()` роли «данные». `store_ok` в `/health/agents` ложно, пока стоит любой из двух
+    флагов, и строка «Агенты студентов» показывает сбой.
+  - Исключение прохода места (в том числе `StoreError` на шаге г) ставит отметку неудачи места
+    (повтор не раньше `RELOAD_RETRY_S`) и снимает `idle_since`: `dispose` не повторяется каждые 2 с.
+  - Тесты А5: `test_heartbeat_after_pending_and_per_place` (заменил `test_heartbeat_before_each_place`,
+    m-р3-6), `test_store_failure_flags_row`, `test_store_error_on_step_g_no_redispose`.
+- **I-р3-2 — спящие места из очереди не снимаются вовсе.** `pending_view` считает только готовые
+  места, а крючок готовности ставит место в очередь со свежим `since`. Закрыт путь «перезапуск `core`
+  при молчащем `sp-ctl` → метка администратора потеряна → архивный агент в кэше места». Правило
+  `ticks ≥ 1` раунда 2 больше не нужно. Тесты А5: `test_asleep_place_stays_queued_not_counted`
+  (вместо `test_asleep_place_dropped_from_queue`), `test_spctl_silent_first_tick_keeps_mark` (вместо
+  `test_no_asleep_drop_before_first_reaper_tick`), пересмотренные `test_saved_rows_checked_after_wake`
+  и `test_admin_archive_sleeping_place`. Фикстура А7 по-прежнему ждёт `pending == 0` до гашения мест.
+
+**Minor**
+- m-р3-1 — из А7 убрана фраза про пересоздания `core` в `test_entry`/`test_gateway`: строку в `ok`
+  возвращает сам тест карантина (I-н3).
+- m-р3-2 — OpenCode символьные ссылки разыменовывает (`Glob.scan(..., {symlink: true})` → `follow`).
+  Служба любую символьную ссылку в каталоге места считает расхождением (`drift`) и агентом места
+  (`place_has_agents`), а `archive` переносит саму ссылку, не следуя по ней. Тест А3
+  `test_symlink_is_drift_and_archived_as_link`.
+- m-р3-3 — архив сохраняет путь файла («/» → «__», как в карантине); совпадение имён получает
+  хвост `-<token_hex(3)>`, без перезаписи. Тест А3 `test_archive_keeps_nested_paths`.
+- m-р3-4 — `waiting -= 1` стоит в `finally` при любом выходе, включая `CancelledError`. Тест А5
+  `test_waiting_released_on_cancel`.
+- m-р3-5 — воркер держит `workplaces.lock(n)` на шагах б–в (`dispose` и проверка видимости): пробуждение,
+  остановка и перезапуск места действительно с ними не пересекаются. `restart` после карантина
+  зовётся уже после замка. Тест А5 `test_place_lock_held_during_dispose`.
+- m-р3-6 — см. I-р3-1.
+- m-р3-7 — `save` ставит место в очередь тем же upsert, что `mark_reload`: `seq` растёт. Тест А3
+  `test_save_bumps_seq`.
+- m-р3-8 — README «Рабочие места», шаг 1 после смены владельца переписан целиком: строка
+  `install -d -m 0700 "$SD" "$AD"` дала бы EPERM на `$AD` (А8, шаг 3).
+- m-р3-9 — основание «один день» для Д7а связано с прецедентом явно: 19,5 ч — на 0,45 ч длиннее
+  Д4а (19,05).
+
+**Самопроверка (раунд 3).**
+- Часы не изменились: Д7а 19,5 ч (А0 0,5, А1 1,75, А2 2,75, А3 2,75, А4 2,0, А5 3,5, А7 2,75, А8 1,25,
+  А9 1,0, А10 1,25), Д7б 15,0 ч (Б0 0,5, А6 2,0, Б1 1,75, Б2 1,0, Б3 2,75, Б4 2,25, Б5 1,25, Б6 2,25,
+  Б7 1,25), всего 34,5 ч. I-р3-2 убрал правило снятия спящих мест и столько же добавил I-р3-1.
+- Черты: Д7а — конец 8-го часа, до неё 16,0 ч кода, ловит темп хуже 0,5. Д7б — 5,5 ч, до неё 10,25 ч,
+  ловит темп хуже ≈0,54. `pace` в А10 — 15,5 ч (А1–А5, А7), в Б7 — 9,75 ч (А6, Б1–Б4).
+- Ссылки на тесты: имена в Review Focus совпадают с тестами задач. Разделы изменений раундов 1–2
+  упоминают и три теста, заменённых в раунде 3 (`test_asleep_place_dropped_from_queue`,
+  `test_no_asleep_drop_before_first_reaper_tick`, `test_heartbeat_before_each_place`): их замены
+  названы выше. Номера строк кода OpenCode и стенда — по исходникам 1.18.33 и дереву `304eb16`,
+  перечислены в «Сверке с кодом».
+
+---
+
 ## Разрез Д7 на два дня
 
 Одним днём по плановой шкале Д1–Д6 — **34,5 ч**:
@@ -415,8 +474,9 @@
 
 Задача А6 (карантин) — в Д7б («Изменения по критике, раунд 1»).
 
-**Основание «один день»** — как у Д4а (19,05) и Д6а (18,5): живой темп по git 0,22–0,30. При 0,30 —
-около 5,9 ч.
+**Основание «один день».** 19,5 ч — на 0,45 ч длиннее Д4а (19,05), самого длинного из дней, принятых
+одним днём (Д6а — 18,5). Живой темп по git 0,22–0,30 даёт 4,3–5,9 ч работы, а черта отсечения ниже
+ловит темп хуже 0,5 — тогда остаток дня переносится, как в Д6а.
 
 **Черта отсечения — конец 8-го часа.** К черте должны быть зелёны А0–А5 и А7: 16,0 ч по шкале, около
 4,8 ч при 0,30. Черта ловит темп хуже 0,5. После каждой задачи кода — `pace` Д4а от коммита А1 до
@@ -543,7 +603,8 @@ permission:
     места);
   - карантин — `/srv/agents/quarantine/student-NN/<путь с «/» → «__»>.<YYYYmmddTHHMMSSZ>-<token_hex(3)>`
     (совпадение в одну секунду не затирает файл);
-  - архив — `/srv/agents/archive/student-NN-<YYYYmmddTHHMMSSZ>/<файл>`.
+  - архив — `/srv/agents/archive/student-NN-<YYYYmmddTHHMMSSZ>/<путь с «/» → «__»>`; совпадение имён —
+    хвост `-<token_hex(3)>`, без перезаписи (раунд 3, m-р3-3).
 - Таблицы в `core.db`:
 
 ```sql
@@ -568,16 +629,21 @@ CREATE TABLE IF NOT EXISTS agent_reloads (place INTEGER PRIMARY KEY, since TEXT 
   2. Файл **вне транзакции**: `.<имя>.md.tmp-<token_hex(4)>` (OpenCode его не сканирует) → `fsync` →
      `os.link(tmp, "<имя>.md")` → `unlink(tmp)` → `fsync` каталога. Если `<имя>.md` уже есть (файл без
      строки), `FileExistsError` превращается в `NameTaken`. Права `0644`.
-  3. Короткой транзакцией: строка `saved` и строка очереди `agent_reloads` (upsert, `since` не
-     сдвигается). Не прошла (в том числе нарушение уникальности) — свой файл удаляется, `NameTaken`
+  3. Короткой транзакцией: строка `saved` и строка очереди `agent_reloads` — тем же upsert, что
+     `mark_reload`: `seq + 1`, `since` не сдвигается (раунд 3, m-р3-7). Не прошла (в том числе нарушение уникальности) — свой файл удаляется, `NameTaken`
      или `StoreError`.
 - Каталога места нет или он не пишется — `DirUnavailable`.
 - «У места есть агенты» (`place_has_agents`) — живые строки **или** любой `*.md` в каталоге места:
   файл без строки учёта тоже агент для места (раунд 1, I2).
 - **Обход файлов места (раунд 2, m-н3)** — как загрузчик OpenCode (`O:config/agent.ts:12–18`):
-  рекурсивно `**/*.md`, с точечными каталогами и файлами; символьные ссылки не разыменовываются, а
-  считаются файлом. Так считают `place_has_agents`, `archive`, `drift` и предел `MAX_AGENTS`. Ошибка
-  чтения любого подкаталога — `DirUnavailable` (отказ), а не «агентов нет».
+  рекурсивно `**/*.md`, с точечными каталогами и файлами. Так считают `place_has_agents`, `archive`,
+  `drift` и предел `MAX_AGENTS`. Ошибка чтения любого подкаталога — `DirUnavailable` (отказ), а не
+  «агентов нет».
+- **Символьные ссылки (раунд 3, m-р3-2).** OpenCode их разыменовывает (`Glob.scan(..., {symlink:
+  true})` → `follow: true`): ссылка в каталоге места на файл или каталог вне него была бы прочитана.
+  Служба пишет только обычные файлы. Любая символьная ссылка в каталоге места (на что угодно) —
+  расхождение: `drift` называет её третьим списком «ссылки», `place_has_agents` — истина, `archive`
+  переносит саму ссылку (`os.replace` без следования). Обход службы по ссылкам не ходит.
 - **Очередь с поколением (раунд 2, I-н2б).** `mark_reload` — upsert, `seq = seq + 1`; `since` не
   сдвигается, кроме `reset_since=True` (крючок готовности, m-н6). `pending()` отдаёт
   `PendingReload(since, seq)`. `reload_done(place, seq)` удаляет строку только `WHERE place = ? AND
@@ -632,8 +698,8 @@ CREATE TABLE IF NOT EXISTS agent_reloads (place INTEGER PRIMARY KEY, since TEXT 
 «свободно» (`free`, изначально установлен). Замков и `Condition` нет: всё меняется в цикле событий без
 `await` между проверкой и записью.
 - `async with gates.turn(n)` — `prompt_async`, читатель. Пока `reloading`: `waiting += 1`, ожидание
-  `free.wait()` под `asyncio.timeout(RELOAD_WAIT_S)`, `waiting -= 1` после пробуждения (и в `finally`
-  при сроке). Затем `active += 1` до выхода. Читатели друг друга не ждут: вторая вкладка не получает
+  `free.wait()` под `asyncio.timeout(RELOAD_WAIT_S)`; `waiting -= 1` — в `finally` при любом выходе:
+  пробуждение, срок или `CancelledError` (раунд 3, m-р3-4). Затем `active += 1` до выхода. Читатели друг друга не ждут: вторая вкладка не получает
   503 без перезагрузки. Не дождался — `GateTimeout`.
 - `gates.try_reload(n) -> bool` — писатель, без ожидания. Отказ, если `reloading`, `active > 0` или
   `waiting > 0`: воркер не пролезает перед уже ждущим `prompt_async`. Иначе `reloading = True`,
@@ -649,25 +715,26 @@ CREATE TABLE IF NOT EXISTS agent_reloads (place INTEGER PRIMARY KEY, since TEXT 
   - Прочие правила ворот не берут: новый ход начинает только `prompt_async`.
 
 **Очередь и неготовые места (раунд 1, Б2).**
-- Место из очереди **не в `workplaces.running` и не будится** (`not workplaces.is_waking(n)`) —
-  `store.reload_done(n, seq)`, строка журнала `result=asleep`. Строки `saved` остаются `saved`.
-  **Только после первого прохода уборщика** (`workplaces.ticks ≥ 1`, раунд 2, I-н2а): до него
-  `running` пуст у всех мест, и снятие стёрло бы метки `archive`/`reload` администратора у работающих
-  мест.
-- Место работает или будится, но не `is_ready(n)` — пропуск; в `pending` и `pending_oldest_s` оно не
-  считается.
+- **Неготовое место (спит, будится, `sp-ctl` молчит) — пропуск; из очереди оно не снимается
+  никогда** (раунд 3, I-р3-2). В `pending` и `pending_oldest_s` оно не считается. Так метка
+  `archive`/`reload` администратора переживает и сон места, и перезапуск `core` при молчащем `sp-ctl`,
+  когда `running` ещё пуст: место, проснувшись, всё равно будет перезагружено и не оставит архивного
+  агента в кэше (неуспех 3).
 - **Крючок готовности.** `Workplaces.on_ready: Callable[[int], None] | None` зовётся, когда место
   стало готовым (`_await_ready` и `_restore` удачно). `AgentReloads.place_ready(n)` фоновой задачей
-  делает `store.mark_reload(n, now, reset_since=True)`, если `store.has_saved(n)`. Так агент,
-  сохранённый перед сном места, сверяется после ближайшего пробуждения, а время сна не входит в
-  «ждёт дольше 15 минут» (раунд 2, m-н6).
+  делает `store.mark_reload(n, now, reset_since=True)`, если место уже в очереди или
+  `store.has_saved(n)`. Так агент, сохранённый перед сном места, сверяется после ближайшего
+  пробуждения, а время сна не входит в «ждёт дольше 15 минут» (раунд 2, m-н6; раунд 3, I-р3-2).
 - `pending_view(now)` — (`pending`, `pending_oldest_s`) только по местам очереди, которые
   `is_ready`.
 
 Проход (`tick`) раз в `RELOAD_TICK_S`:
-0. **`checked_at = now` — первым делом, до любого обращения к учёту** (раунд 2, Б-н1): пульс есть и
-   при пустой очереди, и при сбое учёта.
 1. Очередь — `store.pending()` в потоке; раз в `DIR_CHECK_S` — `store.dir_problem()` в `stats.dir_error`.
+   - **Удача** (пустая очередь — тоже удача): `checked_at = now`, `stats.worker_store_ok()` — пульс
+     есть и без очереди (раунд 2, Б-н1).
+   - **`StoreError`**: `stats.worker_store_failed(<класс>)`, `checked_at` не ставится, проход
+     кончается. Строка «Агенты студентов» — «учёт агентов недоступен», а при долгом сбое — «молчит»
+     (раунд 3, I-р3-1). Флаг воркера отдельный: `store_ok()` роли «данные» его не стирает.
 2. Для каждого места `n` из очереди по порядку; **перед каждым местом — снова `checked_at = now`**
    (раунд 1, m3: проход по десяти местам до ≈15 с на место не даёт ложного «молчит»):
    - правила «Очередь и неготовые места» выше;
@@ -682,18 +749,25 @@ CREATE TABLE IF NOT EXISTS agent_reloads (place INTEGER PRIMARY KEY, since TEXT 
    - `gates.try_reload(n)` не вышло — выйти. Под воротами:
      - а) ещё раз `GET /session/status` — пусто, иначе снять ворота и выйти. Замок места
        `workplaces.lock(n).locked()` (идёт пробуждение, остановка или перезапуск) или не
-       `is_ready(n)` — снять ворота и выйти (раунд 2, m-н12);
+       `is_ready(n)` — снять ворота и выйти (раунд 2, m-н12). Иначе воркер **берёт
+       `workplaces.lock(n)`** (свободный замок берётся без ожидания) и держит его на шагах б–в
+       (раунд 3, m-р3-5);
      - б) `POST /instance/dispose` со сроком `DISPOSE_TIMEOUT_S`. Не 200 или нет ответа —
        `reload_failed`, отметка неудачи, выйти;
      - в) `GET /agent` до `VISIBLE_TRIES` раз. На 400 с телом `Config…Error` — `repair(n, body)`
        (Д7-R59; в Д7а заглушка `not_config` — это `reload_failed`). Нет ответа или иной код за все
-       попытки — `reload_failed`;
+       попытки — `reload_failed`. Замок места отпускается здесь; `restart` после карантина зовётся
+       уже после него;
      - г) сверка с ожидаемыми именами (строки `saved` и `visible` места): видимые → `visible` с
        `visible_at`, `stats.visible`; невидимые после всех попыток → `not_visible`,
        `stats.not_visible`. Затем `store.reload_done(n, seq)` с `seq` из начала прохода и
        `idle_since[n]` снят. Не удалил (пришла новая метка) — место остаётся в очереди и следующим
        проходом перезагружается снова (раунд 2, I-н2б);
-     - `gates.end_reload(n)` — в `finally`.
+     - `gates.end_reload(n)` и освобождение замка места (если ещё держится) — в `finally`.
+   - **Любое исключение прохода места** (в том числе `StoreError` на шаге г): отметка неудачи места —
+     повтор не раньше `RELOAD_RETRY_S`; `idle_since[n]` снят; `stats.reload_failed`; строка журнала
+     `result=failed step=<шаг> error=<Класс>`. У `StoreError` — ещё `stats.worker_store_failed`. Так
+     `dispose` не повторяется каждые 2 с (раунд 3, I-р3-1). Проход идёт к следующему месту.
 
 Предпроверки «уже видно — без `dispose`» нет. `dispose` стоит 5–22 мс (research/09, О10), а
 `reload --place N` администратора должен перезагрузить место, даже если ожидаемых имён нет.
@@ -704,7 +778,6 @@ CREATE TABLE IF NOT EXISTS agent_reloads (place INTEGER PRIMARY KEY, since TEXT 
 Строки журнала:
 - `gw agents reload place=NN result=visible n=K wait_s=S`;
 - `… result=not_visible n=K`;
-- `… result=asleep`;
 - `… result=failed step=dispose|agent error=<Класс>`;
 - `… result=delayed wait_s=S`.
 
@@ -793,7 +866,7 @@ CREATE TABLE IF NOT EXISTS agent_reloads (place INTEGER PRIMARY KEY, since TEXT 
 **Д7-R61 — администратор.**
 - Команда `python -m pcbk_core.agents.admin` (в `core`: `docker compose exec core …`):
   - `list [--place N]` — место, имя, название, состояние, создан. Последняя строка — расхождения
-    по `drift`: «файлы без учёта: a.md, b.md; учёт без файлов: c» или «расхождений нет»;
+    по `drift`: «файлы без учёта: a.md, b.md; учёт без файлов: c; ссылки: d.md» или «расхождений нет»;
   - `archive --place N [--name X] --yes` — файлы в архив, строки `archived`, место в очередь
     перезагрузки;
   - `reload --place N` — место в очередь перезагрузки (после ручной правки).
@@ -832,14 +905,16 @@ CREATE TABLE IF NOT EXISTS agent_reloads (place INTEGER PRIMARY KEY, since TEXT 
    - задача А2 — `test_render_injection_safe`, `test_tag_description_sanitized`;
    - задача А7 — `test_service_file_parsed_by_opencode`.
 3. **Очередь перезагрузки висит у неработающего места** (раунд 1, Б2). Место уснуло сразу после
-   сохранения, администратор архивировал агентов спящего места, тесты погасили места. Итог — ложный
-   `warn` «ждёт дольше 15 минут» навсегда и красный `test_status_json_overall_ok`. Ожидание: спящее
-   место снято из очереди, его `saved` сверяется после ближайшего пробуждения, `pending` считает
-   только готовые места. Ещё одно: вторая вкладка с `prompt_async` не получает 503, пока
-   перезагрузки нет.
+   сохранения, администратор архивировал агентов спящего места, тесты погасили места, `core`
+   перезапущен при молчащем `sp-ctl`. Итог — ложный `warn` «ждёт дольше 15 минут» навсегда и красный
+   `test_status_json_overall_ok` или, наоборот, потерянная метка и архивный агент в кэше места.
+   Ожидание: неготовое место остаётся в очереди, но не считается; после пробуждения оно
+   перезагружается с новым `since`. Ещё одно: вторая вкладка с `prompt_async` не получает 503, пока
+   перезагрузки нет, а отказ учёта виден в строке, а не прячется за пульсом.
    Тесты:
-   - задача А5 — `test_asleep_place_dropped_from_queue`, `test_saved_rows_checked_after_wake`,
-     `test_admin_archive_sleeping_place`, `test_two_prompts_do_not_block_each_other`,
+   - задача А5 — `test_asleep_place_stays_queued_not_counted`, `test_saved_rows_checked_after_wake`,
+     `test_admin_archive_sleeping_place`, `test_spctl_silent_first_tick_keeps_mark`,
+     `test_store_failure_flags_row`, `test_two_prompts_do_not_block_each_other`,
      `test_gate_wait_not_in_move_deadline`;
    - задача А7 — `pending == 0` после гашения мест в фикстуре `users`.
 4. **Агент не в том месте.** Токен места 03 пишет в каталог 04, `ops` пишет агента, воркер
@@ -961,8 +1036,10 @@ docs/checks/D7a.md, docs/checks/D7a/*.png
     прежнее поведение по умолчанию;
   - `AGENT_KINDS = frozenset({"saved", "refused", "unavailable", "visible", "not_visible", "quarantined", "reload_failed", "image_config", "reload_delayed"})`;
   - `class AgentStats(GatewayStats)` — `__init__(self, monotonic=time.monotonic)` с `AGENT_KINDS`,
-    поля `store_error: str | None`, `dir_error: str | None`, методы `store_failed(text: str) -> None`
-    и `store_ok() -> None`;
+    поля `store_error: str | None`, `worker_store_error: str | None`, `dir_error: str | None`, методы
+    `store_failed(text: str) -> None`, `store_ok() -> None` (роль «данные») и
+    `worker_store_failed(text: str) -> None`, `worker_store_ok() -> None` (воркер, раунд 3, I-р3-1);
+    в `/health/agents` `store_ok` истинно, только когда оба поля `None`;
   - `Settings.AGENTS_ROOT: str = "/srv/agents"`; `GatewaySettings.DRILL_AGENTS: str = ""`
     (допустимо `""`, `"freeze_reload"`);
   - `GatewayRole(..., agent_stats: AgentStats | None = None)`, атрибуты `agent_stats`, `reloads`
@@ -1257,8 +1334,8 @@ def test_digest_ignores_student_reply():
     - `has_saved(place: int) -> bool` — есть строки `saved` (крючок готовности, Д7-R58);
     - `flags` черновика пишутся в столбец `flags` (JSON-список); `flags_of(place: int, name: str) -> tuple[str, ...]`;
     - `list_place(place: int) -> list[AgentRow]`;
-    - `drift(place: int) -> tuple[tuple[str, ...], tuple[str, ...]]` — (файлы без строки, строки без
-      файла);
+    - `drift(place: int) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]` — (файлы без
+      строки, строки без файла, символьные ссылки; раунд 3, m-р3-2);
     - `dir_problem() -> str | None` — тексты Д7-R60;
   - `pcbk_core.agents.admin.main(argv: list[str] | None = None) -> int` — Д7-R61.
 
@@ -1368,6 +1445,27 @@ def test_nested_and_dot_files_count(store):                                # m-�
     (store.place_dir(3) / ".y.md").write_text("y")
     assert store.place_has_agents(3) and store.drift(3)[0] == (".y.md", "sub/.hidden/x.md")
     assert store.archive(3, None, NOW) == (".y", "sub/.hidden/x") and not store.place_has_agents(3)
+
+def test_symlink_is_drift_and_archived_as_link(store, tmp_path):          # m-р3-2
+    outside = tmp_path / "outside.md"; outside.write_text("чужой")
+    (store.place_dir(3) / "link.md").symlink_to(outside)
+    assert store.place_has_agents(3) and store.drift(3)[2] == ("link.md",)
+    store.archive(3, None, NOW)
+    moved = next((store.root / "archive").glob("student-03-*/link.md"))
+    assert moved.is_symlink() and outside.read_text() == "чужой"             # перенесена ссылка, цель цела
+
+def test_archive_keeps_nested_paths(store):                                # m-р3-3
+    (store.place_dir(3) / "sub").mkdir()
+    (store.place_dir(3) / "sub" / "x.md").write_text("1"); (store.place_dir(3) / "sub__x.md").write_text("2")
+    store.archive(3, None, NOW)
+    names = sorted(p.name for p in (store.root / "archive").glob("student-03-*/*"))
+    assert len(names) == 2 and names[0] == "sub__x.md" and names[1].startswith("sub__x.md-")
+    assert sorted(p.read_text() for p in (store.root / "archive").glob("student-03-*/*")) == ["1", "2"]
+
+def test_save_bumps_seq(store, draft):                                     # m-р3-7
+    store.mark_reload(3, NOW); seq = store.pending()[3].seq
+    store.save(3, draft, TEXT, NOW)
+    assert store.pending()[3].seq == seq + 1
 
 def test_unreadable_subdir_is_refusal(store):                              # m-н3
     (store.place_dir(3) / "sub").mkdir(); (store.place_dir(3) / "sub").chmod(0)
@@ -1572,7 +1670,7 @@ def test_log_line_has_no_name(served, caplog):           # строка журн
   - `Workplaces.request`, `is_ready`, `running`, `_waking`, `READY_ATTEMPT_S`, `BUSY_CHECK_S` (Д5а);
   - `AgentStore.pending` (`PendingReload`), `expected`, `mark_visible`, `set_state`, `reload_done(place, seq)`,
     `mark_reload(..., reset_since=)`, `has_saved`, `dir_problem` (А3);
-  - `Workplaces.ticks`, `lock(n)` (Д5а);
+  - `Workplaces.lock(n)` (Д5а);
   - `AgentStats` (А1).
 - Produces:
   - `gateway/reload.py`:
@@ -1615,7 +1713,9 @@ def test_log_line_has_no_name(served, caplog):           # строка журн
 # env_sync — то же окружение под TestClient из зоны front; env_freeze — DRILL_AGENTS=freeze_reload и RELOAD_TICK_S = 0,05
 # (без учений checked_at за 0,3 с сменился бы — отрицательный контроль в журнал задачи); env_freeze_empty — то же с
 # пустым учётом; env_fresh — место 3 работает в FakeDocker, но уборщик ещё не проходил (ticks == 0), очередь места 3 —
-# метка администратора. FakePlaces.on_dispose: Callable[[int], None] | None — зовётся при удачном dispose
+# метка администратора. FakePlaces.on_dispose: Callable[[int], None] | None — зовётся при удачном dispose;
+# env_sync_async — env с помощником health() (GET /health/agents из зоны front); _place_pass(n, pending) — внутренний
+# шаг прохода по одному месту; на нём тест проверяет пульс
 AGENT = {"name": "proverka", "native": False, "mode": "primary"}
 NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
 
@@ -1721,26 +1821,31 @@ async def test_unready_running_place_skipped_not_counted(env):
     assert env.reloads.pending_view(NOW) == (0, None)
 
 @pytest.mark.anyio
-async def test_asleep_place_dropped_from_queue(env):                       # Б2
+async def test_asleep_place_stays_queued_not_counted(env):                 # I-р3-2
     env.docker.containers[3]["running"] = False; await env.role.workplaces.tick()   # уборщик увидел остановку
     await env.reloads.tick()
-    assert env.store.pending() == {} and env.store.list_place(3)[0].state == "saved" and place_requests(env.oc, 3) == []
+    assert 3 in env.store.pending() and env.store.list_place(3)[0].state == "saved"
+    assert place_requests(env.oc, 3) == [] and env.reloads.pending_view(NOW) == (0, None)
 
 @pytest.mark.anyio
 async def test_saved_rows_checked_after_wake(env):                         # Б2: крючок готовности
     env.docker.containers[3]["running"] = False; await env.role.workplaces.tick(); await env.reloads.tick()
+    since = env.store.pending()[3].since; env.clock.advance(3600)
     env.oc.agents_after_dispose[3] = [AGENT]
     await env.role.workplaces.wake(3); await env.role.workplaces.wait_ready(3)
-    await wait_until_async(lambda: env.store.pending() != {})
+    await wait_until_async(lambda: env.store.pending()[3].since > since)    # m-н6: since — от пробуждения
     env.mono.advance(10); await settle(env)
-    assert env.store.list_place(3)[0].state == "visible"
+    assert env.store.list_place(3)[0].state == "visible" and env.store.pending() == {}
 
-def test_admin_archive_sleeping_place(env_sync):                           # Б2: строка ok, очередь пуста
+def test_admin_archive_sleeping_place(env_sync):                           # I-р3-2: метка цела, строка ok
     env_sync.docker.containers[3]["running"] = False; env_sync.run(env_sync.role.workplaces.tick())
     env_sync.store.archive(3, None, NOW)                                    # archive ставит место в очередь
     env_sync.run(env_sync.reloads.tick())
     body = env_sync.get("/health/agents").json()
-    assert (body["pending"], body["pending_oldest_s"]) == (0, None) and env_sync.store.pending() == {}
+    assert (body["pending"], body["pending_oldest_s"]) == (0, None) and 3 in env_sync.store.pending()
+    env_sync.run(env_sync.role.workplaces.wake(3)); env_sync.run(env_sync.role.workplaces.wait_ready(3))
+    env_sync.mono.advance(10); env_sync.run(settle(env_sync))
+    assert env_sync.oc.dispose_calls[3] == 1 and env_sync.store.pending() == {}   # архивный агент ушёл из кэша
 
 @pytest.mark.anyio
 async def test_admin_reload_without_expected_names(env):                   # reload администратора: dispose всё равно
@@ -1781,7 +1886,7 @@ async def test_queue_survives_restart(env):
     assert env.store.list_place(3)[0].state == "visible"
 
 @pytest.mark.anyio
-async def test_heartbeat_with_empty_queue(env):                           # Б-н1: пульс без очереди
+async def test_heartbeat_with_empty_queue(env):                           # Б-н1: пульс без очереди (удача)
     env.store.archive(3, None, NOW); env.store.reload_done(3, env.store.pending()[3].seq)
     assert env.store.pending() == {}
     await env.reloads.tick(); first = env.reloads.checked_at
@@ -1790,12 +1895,17 @@ async def test_heartbeat_with_empty_queue(env):                           # Б-�
     assert env.reloads.checked_at != first
 
 @pytest.mark.anyio
-async def test_no_asleep_drop_before_first_reaper_tick(env_fresh):         # I-н2а: core только что запущен
-    assert env_fresh.role.workplaces.ticks == 0 and env_fresh.role.workplaces.running == set()
-    await env_fresh.reloads.tick()
+async def test_spctl_silent_first_tick_keeps_mark(env_fresh):              # I-р3-2: core запущен, sp-ctl молчит
+    env_fresh.docker.down = True
+    await env_fresh.role.workplaces.tick()                                  # sp_ctl «down», running пуст
+    assert env_fresh.role.workplaces.sp_ctl == "down" and env_fresh.role.workplaces.running == set()
+    await env_fresh.reloads.tick(); await env_fresh.reloads.tick()
     assert 3 in env_fresh.store.pending()                                   # метка администратора цела
-    await env_fresh.role.workplaces.tick(); await env_fresh.reloads.tick()  # уборщик увидел место работающим
-    assert 3 in env_fresh.store.pending()
+    env_fresh.docker.down = False; env_fresh.oc.agents_after_dispose[3] = []
+    await env_fresh.role.workplaces.tick()                                  # возврат «готово» (_restore)
+    await wait_until_async(lambda: env_fresh.role.workplaces.is_ready(3))
+    env_fresh.mono.advance(10); await settle(env_fresh)
+    assert env_fresh.oc.dispose_calls[3] == 1 and env_fresh.store.pending() == {}
 
 @pytest.mark.anyio
 async def test_mark_during_reload_not_lost(env):                           # I-н2б
@@ -1804,6 +1914,50 @@ async def test_mark_during_reload_not_lost(env):                           # I-�
     env.mono.advance(10); await settle(env)
     assert env.oc.dispose_calls[3] == 1 and 3 in env.store.pending()
     env.oc.on_dispose = None; env.mono.advance(IDLE_SETTLE_S + 0.1); await settle(env)
+    assert env.oc.dispose_calls[3] == 2 and env.store.pending() == {}
+
+@pytest.mark.anyio
+async def test_place_lock_held_during_dispose(env):                        # m-р3-5
+    seen = []
+    env.oc.on_dispose = lambda n: seen.append(env.role.workplaces.lock(n).locked())
+    env.oc.agents_after_dispose[3] = [AGENT]; env.mono.advance(10); await settle(env)
+    assert seen == [True] and not env.role.workplaces.lock(3).locked()
+
+@pytest.mark.anyio
+async def test_waiting_released_on_cancel(env):                            # m-р3-4
+    gates = env.reloads.gates
+    assert gates.try_reload(3)
+    async def reader():
+        async with gates.turn(3):
+            pass
+    task = asyncio.create_task(reader()); await asyncio.sleep(0)
+    assert gates.waiting(3) == 1
+    task.cancel(); await asyncio.gather(task, return_exceptions=True)
+    assert gates.waiting(3) == 0
+    gates.end_reload(3); assert gates.try_reload(3)
+
+@pytest.mark.anyio
+async def test_store_failure_flags_row(env_sync_async, monkeypatch):       # I-р3-1
+    env = env_sync_async
+    monkeypatch.setattr(env.store, "pending", lambda: (_ for _ in ()).throw(StoreError("disk")))
+    await env.reloads.tick()
+    assert env.reloads.checked_at is None and env.stats.worker_store_error is not None
+    env.stats.store_ok()                                                    # роль «данные» записала удачно
+    body = await env.health()
+    assert body["store_ok"] is False                                        # флаг воркера не стёрт
+    monkeypatch.undo(); await env.reloads.tick()
+    assert env.reloads.checked_at is not None and (await env.health())["store_ok"] is True
+
+@pytest.mark.anyio
+async def test_store_error_on_step_g_no_redispose(env, monkeypatch):       # I-р3-1
+    env.oc.agents_after_dispose[3] = [AGENT]
+    monkeypatch.setattr(env.store, "reload_done", lambda *a: (_ for _ in ()).throw(StoreError("disk")))
+    env.mono.advance(10); await settle(env)
+    assert env.oc.dispose_calls[3] == 1 and env.stats.count_1h("reload_failed") == 1
+    for _ in range(3):
+        env.mono.advance(RELOAD_TICK_S); await env.reloads.tick()
+    assert env.oc.dispose_calls[3] == 1                                     # не каждые 2 с
+    monkeypatch.undo(); env.mono.advance(RELOAD_RETRY_S); await settle(env)
     assert env.oc.dispose_calls[3] == 2 and env.store.pending() == {}
 
 @pytest.mark.anyio
@@ -1823,16 +1977,18 @@ async def test_prompt_after_gate_rechecks_ready(env, client_a):            # m-�
     assert (r.status_code, r.json()["name"]) == (503, "WorkplaceNotReady")
 
 @pytest.mark.anyio
-async def test_heartbeat_before_each_place(env, monkeypatch):              # m3
-    stamps = []
-    async def place_pass(n):                                                # каждое место «идёт» 20 с
+async def test_heartbeat_after_pending_and_per_place(env, monkeypatch):    # I-р3-1, m3 (вместо прежнего m3)
+    calls, stamps = [], []
+    real = env.store.pending
+    monkeypatch.setattr(env.store, "pending", lambda: calls.append(env.reloads.checked_at) or real())
+    async def place_pass(n, pending):                                       # каждое место «идёт» 20 с
         stamps.append(env.reloads.checked_at); env.clock.advance(20)
     monkeypatch.setattr(env.reloads, "_place_pass", place_pass)
     for n in (5, 6):
         env.store.mark_reload(n, NOW); ready_place(env.role.workplaces, env.docker, n)
     await env.reloads.tick()
-    assert len(stamps) == 3 and None not in stamps and len(set(stamps)) == 3     # пульс — перед каждым местом
-    assert stamps[0] is not None                                            # Б-н1: первый — ещё до мест
+    assert calls == [None]                                                  # пульс — после удачного pending()
+    assert len(stamps) == 3 and None not in stamps and len(set(stamps)) == 3     # и перед каждым местом
 
 def test_place_connections_include_worker():                               # m4
     assert PLACE_CONNECTIONS == MAX_STREAMS_PER_LOGIN + PROXY_PARALLEL + 2
@@ -1856,7 +2012,7 @@ async def test_freeze_drill_empty_queue(env_freeze_empty):                 # Б-
     task.cancel()
 ```
 
-  `_place_pass(n)` — внутренний шаг прохода по одному месту; на нём тест проверяет пульс (m3).
+  `_place_pass(n, pending)` — внутренний шаг прохода по одному месту; на нём тест проверяет пульс (m3).
   `env_sync.run(coro)` — исполнение корутины в цикле `TestClient` (как помощники Д5а).
 - [ ] **Step 2: Run** — `(cd core && CORE_PYTEST tests/test_gw_reload.py)`. Expected: FAIL.
 - [ ] **Step 3: Implement по Interfaces и Д7-R58.**
@@ -1869,7 +2025,9 @@ async def test_freeze_drill_empty_queue(env_freeze_empty):                 # Б-
     бросает `RuntimeError`.
   - После ворот в `_proxy` — снова `is_ready(n)`, иначе `_not_ready` (m-н4).
   - Перед `dispose` — `workplaces.lock(n).locked()` и `is_ready(n)` (m-н12).
-  - Снятие «спящих» — только при `workplaces.ticks ≥ 1` (I-н2а); `reload_done(n, seq)` (I-н2б).
+  - Неготовые места из очереди не снимаются (раунд 3, I-р3-2); `reload_done(n, seq)` (I-н2б).
+  - Пульс — после удачного `store.pending()`; `StoreError` — `worker_store_failed`; исключение места —
+    отметка неудачи и снятый `idle_since` (I-р3-1). Замок места — на шагах б–в (m-р3-5).
   - В `_proxy` для `rule.name == "prompt_async"` всё, что идёт после разбора тела, оборачивается в
     `async with reloads.gates.turn(n)` **снаружи** `asyncio.timeout(PROXY_DEADLINE_S)`. Перед
     `PROXY_DEADLINE_S` — `note_turn_start(n)`. `GateTimeout` превращается в ответ
@@ -2033,8 +2191,8 @@ def test_agents_row_ok(stack, users):                                  # m13: st
   пусто.
 
   `test_status_json_overall_ok` (`test_socket_proxy`, Ш4) ждёт `ok` у всех строк, в том числе
-  «Агенты студентов». Очередь после модуля пуста (Д7-R58), а `warn` от учения карантина (А6, Д7б)
-  снимают пересоздания `core` в `test_entry` и `test_gateway`.
+  «Агенты студентов». Очередь после модуля пуста (фикстура ждёт `pending == 0` до гашения мест), а
+  учение карантина (А6, Д7б) само возвращает строку в `ok` пересозданием `core` в конце теста (I-н3).
 - [ ] **Step 2: Run** — под `flock`: `… pytest -q tests/integration/test_agents.py`. Expected: FAIL.
   ID откатных образов сняты до прогона.
 - [ ] **Step 3: Implement** — привязка в `compose.yaml`, помощники `conftest`, слова двойника, поле
@@ -2078,10 +2236,16 @@ def test_agents_row_ok(stack, users):                                  # m13: st
   каталог с хоста не читается (`0700` у 10003): все `stat`, `find` и `ls` — через
   `docker exec pcbk-core` (раунд 1, m11).
 
-  README «Рабочие места», шаг 1 (раунд 2, m-н11): после Д7а строка `install -d -m 0755 "$AD/student-$n"`
-  с хоста не сработает. Каталог агентов нового места создаётся
-  `docker exec -u 10003 pcbk-core install -d -m 0755 /srv/agents/student-NN`, а до первой выкладки Д7а —
-  прежней строкой и затем этой же сменой владельца. Правка README — в этом шаге, коммит — шаг 5.
+  README «Рабочие места», шаг 1 переписывается **целиком** (раунд 2, m-н11; раунд 3, m-р3-8): после
+  смены владельца с хоста не сработает ни `install -d -m 0700 "$SD" "$AD"` (EPERM на `$AD`: chmod чужого
+  каталога), ни `install -d -m 0755 "$AD/student-$n"` (каталог `0700` у 10003). Новый вид шага:
+  - секреты — прежний цикл, но `install -d -m 0700 "$SD"` только для `$SD`;
+  - тома мест — прежней строкой;
+  - каталоги агентов — `docker exec -u 10003 pcbk-core install -d -m 0755 /srv/agents/student-NN`;
+  - первая выкладка на чистый сервер (до Д7а-выкладки ещё нет `core`) — прежние строки, затем смена
+    владельца этого шага.
+
+  Правка README — в этом шаге, коммит — шаг 5.
 - [ ] **Step 4: Службы по порядку.**
   1. `docker compose up -d --no-build core` → `healthy`, 13 сетей.
      `docker exec pcbk-core python -c 'import os; print(os.access("/srv/agents/student-10", os.W_OK))'` → `True`;
