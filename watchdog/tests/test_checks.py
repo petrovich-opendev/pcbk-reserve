@@ -19,7 +19,9 @@ from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_K
                                   check_historian, check_http, check_llm, check_memory, check_tls, check_web,
                                   fmt_total, fmt_usd, not_installed, tls_verdict,
                                   LLM_RUN_SILENT_S, RUN_CAP_DETAIL, RUN_KEYS, RUN_SILENT_DETAIL, LlmReply,
-                                  DRILL_NOTE, FAILING_MAX, TOOL_FAILING_DETAIL, llm_note, llm_verdict)
+                                  DRILL_NOTE, FAILING_MAX, TOOL_FAILING_DETAIL, llm_note, llm_verdict,
+                                  TEACHER_DETAILS, TEACHER_DRILL_MODES, TEACHER_KEYS, TEACHER_STUDENT_FAIL,
+                                  TeacherReply, check_teacher, teacher_verdict)
 from pcbk_watchdog import checks as checks_module
 from pcbk_watchdog.journal import Journal
 
@@ -1581,3 +1583,202 @@ def test_web_owner_fails_match_agents_row():
     ids = [c["id"] for c in COMPONENTS if c["kind"] == "agents"]
     assert state == "fail" and ids == ["agents"]
     assert web_owner_fails((web / "src/status.ts").read_text("utf-8")) == {"agents": detail}
+
+
+# --- строка «Кабинет преподавателя и доли» (задача А1 Д10а, Д10-R96): ответ /health/teacher core -------------------
+
+NOW_T = datetime(2026, 10, 11, 9, tzinfo=timezone.utc)
+T_BASE = {"checked_at": NOW_T.isoformat(), "shares_loaded": True, "shares_ok": True, "shares_drift": 0,
+          "shares_sum_usd": 1000.0, "total_usd": 1000.0, "store_ok": True, "reads_1h": 3, "read_failed_1h": 0,
+          "changes_1h": 1, "change_failed_1h": 0, "role_refused_1h": 0, "drill": ""}
+
+
+@pytest.mark.parametrize("patch,want", [
+    ({}, ("ok", "доли сходятся, журнал действий пишется",
+          "распределено $1000.00 из $1000; прочитано за час: 3; изменений за час: 1")),
+    ({"store_ok": False, "checked_at": None}, ("fail", "журнал действий преподавателя не пишется — кабинет закрыт", "")),
+    ({"checked_at": None, "shares_loaded": False}, ("unknown", "сверка долей ещё не проходила", "")),
+    ({"shares_loaded": False}, ("fail", "доли бюджета не загружены — LLM-прокси закрыт для студентов", "")),
+    ({"shares_ok": False}, ("fail", "сверка долей не прочла таблицу — расхождение не видно", "")),     # m-3
+    ({"shares_drift": 2}, ("fail", "LLM-прокси считает доли не так, как сохранено", "мест: 2")),
+    ({"checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}, ("fail", "сверка долей молчит", "")),
+    ({"shares_sum_usd": 1000.02}, ("warn", "сумма долей мест больше общего бюджета — держит общий бюджет",
+                                   "распределено $1000.02 из $1000")),
+    ({"changes_1h": 0, "change_failed_1h": 3}, ("warn", "изменения преподавателя не проходят", "3 за час")),
+    ({"read_failed_1h": 3}, ("warn", "разговоры студентов не читаются", "3 за час")),
+    ({"role_refused_1h": 10}, ("warn", "кабинет преподавателя открывают без роли преподавателя", "10 за час")),
+])
+def test_teacher_verdicts(patch, want):
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, **patch}), NOW_T, 120) == want
+
+
+@pytest.mark.parametrize("bad", [{**T_BASE, "extra": 1}, {k: v for k, v in T_BASE.items() if k != "drill"},
+                                 {**T_BASE, "reads_1h": -1}, {**T_BASE, "drill": "other"}, {**T_BASE, "total_usd": 0},
+                                 {**T_BASE, "shares_sum_usd": -0.01}, {**T_BASE, "shares_ok": "yes"},
+                                 {**T_BASE, "shares_loaded": None}, []])
+def test_teacher_off_contract(bad):
+    with pytest.raises(ValueError):
+        TeacherReply.parse(bad)
+
+
+def test_teacher_student_fail_is_a_row_detail():                        # I-3: этот текст видит баннер студента
+    assert TEACHER_STUDENT_FAIL in TEACHER_DETAILS
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_loaded": False}), NOW_T, 120)[1] == TEACHER_STUDENT_FAIL
+
+
+def test_check_teacher_codes(json_site):
+    c = check_teacher("teacher", "Кабинет преподавателя и доли", json_site(404, {"name": "NotFound"}), NOW_T, 120)
+    assert (c.state, c.detail) == ("unknown", "кабинет преподавателя ещё не выложен")
+    c = check_teacher("teacher", "Кабинет преподавателя и доли",
+                      json_site(200, {**T_BASE, "shares_drift": 2, "drill": "shares_stale"}), NOW_T, 120)
+    assert (c.state, c.note) == ("fail", "учения: shares_stale; мест: 2")
+    c = check_teacher("teacher", "Кабинет преподавателя и доли", json_site(200, {**T_BASE, "x": 1}), NOW_T, 120)
+    assert (c.state, c.detail) == ("fail", "кабинет преподавателя ответил не по договору")
+    c = check_teacher("teacher", "Кабинет преподавателя и доли", "http://127.0.0.1:9/x", NOW_T, 120)
+    assert (c.state, c.detail) == ("fail", "кабинет преподавателя не отвечает")
+
+
+def test_teacher_details_fit_80_chars():                                 # правило журнала Д1
+    for detail in TEACHER_DETAILS:
+        assert len(detail) <= 80 and not any(ch.isdigit() for ch in detail), detail
+
+
+# --- сверх брифа ---
+
+TEACHER_DOWN = ("fail", "кабинет преподавателя не отвечает", "")
+TEACHER_OFF = ("fail", "кабинет преподавателя ответил не по договору", "")
+
+
+def teacher_row(json_site, obj, code=200, stale_s=120):
+    return row(check_teacher("teacher", "Кабинет преподавателя и доли", json_site(code, obj), NOW_T, stale_s,
+                             timeout=0.5))
+
+
+def test_teacher_contract_constants():
+    assert TEACHER_KEYS == set(T_BASE) and len(TEACHER_KEYS) == 13
+    assert TEACHER_KEYS == {f.name for f in fields(TeacherReply)}                  # договор = поля разбора
+    assert TEACHER_DRILL_MODES == {"shares_stale", "journal_down"}                 # DRILL_TEACHER, кроме ""
+    r = TeacherReply.parse({**T_BASE, "shares_sum_usd": 0, "total_usd": 50, "checked_at": None})
+    assert (r.checked_at, r.shares_sum_usd, r.total_usd, r.store_ok) == (None, 0, 50, True)   # целые деньги — тоже числа
+    assert len(TEACHER_DETAILS) == len(set(TEACHER_DETAILS)) == 14               # 11 строк таблицы и 3 ответа ручки
+
+
+def test_teacher_verdict_order_and_bounds():                                   # первая подходящая строка таблицы R96
+    every = {"store_ok": False, "checked_at": None, "shares_loaded": False, "shares_ok": False, "shares_drift": 3,
+             "shares_sum_usd": 2000.0, "changes_1h": 0, "change_failed_1h": 5, "read_failed_1h": 4,
+             "role_refused_1h": 11}
+    order = [("store_ok", "журнал действий преподавателя не пишется — кабинет закрыт"),
+             ("checked_at", "сверка долей ещё не проходила"),
+             ("shares_loaded", "доли бюджета не загружены — LLM-прокси закрыт для студентов"),
+             ("shares_ok", "сверка долей не прочла таблицу — расхождение не видно"),
+             ("shares_drift", "LLM-прокси считает доли не так, как сохранено"),
+             ("shares_sum_usd", "сумма долей мест больше общего бюджета — держит общий бюджет"),
+             ("change_failed_1h", "изменения преподавателя не проходят"),
+             ("read_failed_1h", "разговоры студентов не читаются"),
+             ("role_refused_1h", "кабинет преподавателя открывают без роли преподавателя")]
+    obj = {**T_BASE, **every}
+    for key, detail in order:                                                      # снимаем по одной сверху вниз
+        assert teacher_verdict(TeacherReply.parse(obj), NOW_T, 120)[1] == detail, key
+        obj[key] = T_BASE[key]
+    assert teacher_verdict(TeacherReply.parse(obj), NOW_T, 120)[:2] == ("ok", "доли сходятся, журнал действий пишется")
+    stale = {**T_BASE, "checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}
+    assert teacher_verdict(TeacherReply.parse({**stale, "shares_drift": 1}), NOW_T, 120)[1] == \
+           "LLM-прокси считает доли не так, как сохранено"                         # расхождение выше молчания
+    assert teacher_verdict(TeacherReply.parse({**stale, "read_failed_1h": 9}), NOW_T, 120)[1] == \
+           "сверка долей молчит"                                                   # молчание выше warn
+    assert teacher_verdict(TeacherReply.parse({**stale, "store_ok": False}), NOW_T, 120)[1] == \
+           "журнал действий преподавателя не пишется — кабинет закрыт"
+    for patch, state in (({"checked_at": (NOW_T - timedelta(seconds=120)).isoformat()}, "ok"),   # ровно порог
+                         ({"checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}, "fail"),
+                         ({"shares_sum_usd": 1000.005}, "ok"),                    # запас полцента: ещё не больше
+                         ({"shares_sum_usd": 1000.0051}, "warn"),
+                         ({"shares_sum_usd": 999.99}, "ok"),
+                         ({"changes_1h": 0, "change_failed_1h": 2}, "ok"),
+                         ({"changes_1h": 1, "change_failed_1h": 30}, "ok"),       # хоть одно изменение прошло
+                         ({"changes_1h": 0, "change_failed_1h": 3}, "warn"),
+                         ({"read_failed_1h": 2}, "ok"), ({"read_failed_1h": 3}, "warn"),
+                         ({"role_refused_1h": 9}, "ok"), ({"role_refused_1h": 10}, "warn")):
+        assert teacher_verdict(TeacherReply.parse({**T_BASE, **patch}), NOW_T, 120)[0] == state, patch
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}),
+                           NOW_T, 300)[0] == "ok"                                  # порог — из TEACHER_STALE_S
+
+
+def test_teacher_notes_money_and_numbers():
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_sum_usd": 812.34, "reads_1h": 0, "changes_1h": 7}),
+                           NOW_T, 120) == ("ok", "доли сходятся, журнал действий пишется",
+                                           "распределено $812.34 из $1000; прочитано за час: 0; изменений за час: 7")
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_sum_usd": 0}), NOW_T, 120)[2].startswith(
+        "распределено $0.00 из $1000;")
+    # учение «бюджет стенда израсходован» (compose.test.yaml, LLM_TOTAL_USD=0.001): бюджет не целый — с центами
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "total_usd": 0.001}), NOW_T, 120) == \
+           ("warn", "сумма долей мест больше общего бюджета — держит общий бюджет", "распределено $1000.00 из $0.0010")
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_sum_usd": 1000, "total_usd": 1000}), NOW_T, 120)[2] \
+        .startswith("распределено $1000.00 из $1000;")                              # целые из JSON — как дробные
+
+
+def test_teacher_details_constant_numbers_only_in_note(tmp_path):              # правило журнала Д1
+    objs = [{**T_BASE, **p} for p in ({"store_ok": False}, {"checked_at": None}, {"shares_loaded": False},
+                                       {"shares_ok": False}, {"shares_drift": 1},
+                                       {"checked_at": "2026-10-11T08:00:00+00:00"}, {"shares_sum_usd": 1500.0},
+                                       {"changes_1h": 0, "change_failed_1h": 3}, {"read_failed_1h": 3},
+                                       {"role_refused_1h": 10}, {})]
+    details = [teacher_verdict(TeacherReply.parse(o), NOW_T, 120)[1] for o in objs]
+    assert set(details) | {"кабинет преподавателя не отвечает", "кабинет преподавателя ещё не выложен",
+                           "кабинет преподавателя ответил не по договору"} == set(TEACHER_DETAILS)
+    journal = Journal(str(tmp_path / "j.db"))
+    rows = [Check("teacher", "Кабинет преподавателя и доли",
+                  *teacher_verdict(TeacherReply.parse({**T_BASE, "shares_drift": k}), NOW_T, 120)) for k in (1, 2, 7)]
+    rows += [Check("teacher", "Кабинет преподавателя и доли",
+                   *teacher_verdict(TeacherReply.parse({**T_BASE, "reads_1h": k}), NOW_T, 120)) for k in (0, 3, 9)]
+    assert len({r.note for r in rows}) == 6
+    assert sum(len(journal.record([r], NOW_T + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 2
+
+
+def test_teacher_off_contract_reply_has_own_text(json_site):                   # Ш8: как у строки агентов
+    missing = [{k: v for k, v in T_BASE.items() if k != key} for key in T_BASE]
+    counts = [k for k in T_BASE if k.endswith("_1h")] + ["shares_drift"]
+    for obj in (*missing, "строка", 7, None, {}, [T_BASE], {**T_BASE, "extra": 0}, {**T_BASE, "pending": 0},
+                {**T_BASE, "checked_at": 12}, {**T_BASE, "checked_at": "вчера"}, {**T_BASE, "checked_at": True},
+                *({**T_BASE, k: v} for k in ("shares_loaded", "shares_ok", "store_ok") for v in (None, 1, 0, "true")),
+                *({**T_BASE, k: v} for k in counts for v in (-1, True, 1.5, "1", None)),
+                *({**T_BASE, k: v} for k in ("shares_sum_usd", "total_usd") for v in ("1000", None, True, [], 10 ** 400)),
+                {**T_BASE, "shares_sum_usd": -0.01}, {**T_BASE, "total_usd": 0}, {**T_BASE, "total_usd": -5},
+                {**T_BASE, "drill": None}, {**T_BASE, "drill": "SHARES_STALE"}, {**T_BASE, "drill": "freeze_reload"},
+                {**T_BASE, "drill": "journal_down "}, {**T_BASE, "drill": " "}):
+        assert teacher_row(json_site, obj) == TEACHER_OFF, obj
+        with pytest.raises(ValueError):                                            # не KeyError и не TypeError
+            TeacherReply.parse(obj)
+    assert len(missing) == 13
+    for key in ("shares_sum_usd", "total_usd"):
+        for bad in (float("nan"), float("inf")):                                   # json.dumps пишет NaN/Infinity
+            with pytest.raises(ValueError):
+                TeacherReply.parse({**T_BASE, key: bad})
+
+
+def test_teacher_http_errors_are_down(json_site, raw_http):
+    for code in (500, 503, 401, 302):                                              # 404 — своя строка
+        assert teacher_row(json_site, T_BASE, code=code) == TEACHER_DOWN, code
+
+    def text_reply(conn, stop):
+        body = "не json".encode()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+    r = check_teacher("teacher", "Кабинет преподавателя и доли", raw_http(text_reply) + "/health/teacher", NOW_T, 120,
+                      timeout=0.5)
+    assert row(r) == TEACHER_DOWN
+    r, took = timed(check_teacher, "teacher", "Кабинет преподавателя и доли",
+                    raw_http(headers_then_stall) + "/health/teacher", NOW_T, 120, timeout=SOCK_S)
+    assert row(r) == TEACHER_DOWN and took < BOUND_S                               # тело оборвал общий срок
+    assert teacher_row(json_site, {"detail": "Not Found"}, code=404) == \
+           ("unknown", "кабинет преподавателя ещё не выложен", "")                    # core :d9a — 404 FastAPI
+
+
+def test_teacher_drill_goes_first_in_note(json_site):
+    stale = {**T_BASE, "drill": "shares_stale"}
+    assert teacher_row(json_site, stale) == \
+           ("ok", "доли сходятся, журнал действий пишется",
+            "учения: shares_stale; распределено $1000.00 из $1000; прочитано за час: 3; изменений за час: 1")
+    down = {**T_BASE, "drill": "journal_down", "store_ok": False}
+    assert teacher_row(json_site, down) == \
+           ("fail", "журнал действий преподавателя не пишется — кабинет закрыт", "учения: journal_down")
+    assert teacher_row(json_site, {**down, "store_ok": True, "checked_at": None}) == \
+           ("unknown", "сверка долей ещё не проходила", "учения: journal_down")

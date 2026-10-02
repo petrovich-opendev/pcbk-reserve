@@ -69,6 +69,8 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "AGENTS_STALE_S", "DRILL_AGENTS",
                         # прогон отбора модели у core и порог «прогон отбора молчит» у сторожа (Д8а)
                         "LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS", "LLM_RUN_SILENT_S",
+                        # учения кабинета преподавателя у core и срок молчания сверки долей у сторожа (Д10а)
+                        "DRILL_TEACHER", "TEACHER_STALE_S",
                         # двойник историана стенда отбора у core — только compose.test.yaml (Д8-R75)
                         "PCBK_TWIN_HISTORIAN",
                         # статика edge тестового стенда со сборкой чата (Д6а): compose.test.yaml, «:?»

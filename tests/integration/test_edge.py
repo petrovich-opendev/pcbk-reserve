@@ -15,13 +15,15 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
                       "GW_STALE_S",                                    # строка «Шлюз и вход» (Д5а)
                       "AGENTS_STALE_S",                                # строка «Агенты студентов» (Д7а, П10)
-                      "LLM_RUN_SILENT_S"},                             # «прогон отбора молчит» (Д8а)
+                      "LLM_RUN_SILENT_S",                              # «прогон отбора молчит» (Д8а)
+                      "TEACHER_STALE_S"},                              # «Кабинет преподавателя и доли» (Д10а)
     "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
                   "DRILL_DATA",                                    # учения службы данных (Д9а, Д9-R83)
                   "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
                   # шлюз (Д5а): сети мест для сверки токенов и адресов мест, origin входа, простой, такт, учения
                   "STU_NET", "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY",
                   "DRILL_AGENTS",                                  # учения агентов студентов (Д7а, П10)
+                  "DRILL_TEACHER",                                 # учения кабинета преподавателя (Д10а)
                   "LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS",  # прогон отбора модели (Д8-R69)
                   # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
                   # бюджет (учение «бюджет стенда израсходован», Д4б); обёртка запуска и двойник историана (Д8-R75)

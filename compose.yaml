@@ -131,6 +131,9 @@ services:
       # строка «LLM-прокси и бюджет» (Д8а): к модели прогона отбора не обращались дольше LLM_RUN_SILENT_S —
       # «прогон отбора молчит»; учения тишины ставят меньше
       LLM_RUN_SILENT_S: ${LLM_RUN_SILENT_S:-300}
+      # строка «Кабинет преподавателя и доли» (Д10а): сверка долей (такт уборщика шлюза) старше TEACHER_STALE_S —
+      # «сверка долей молчит»; не меньше 4 × GW_REAPER_TICK_S у core
+      TEACHER_STALE_S: ${TEACHER_STALE_S:-120}
     volumes:
       # только сертификат: им сторож проверяет, что edge отдаёт именно его
       - type: bind
@@ -265,6 +268,10 @@ services:
       # учения агентов студентов (Д7а): freeze_reload — воркер перезагрузки мест замирает после первого
       # прохода; пусто — нет
       DRILL_AGENTS: ${DRILL_AGENTS:-}
+      # учения кабинета преподавателя (Д10а): shares_stale — перевод доли пишет диск и журнал действий, а память
+      # LLM-прокси не обновляет; journal_down — журнал действий не пишется (кабинет закрыт); пусто — нет. Опечатка —
+      # ошибка настройки шлюза и закрытый LLM-прокси, процесс жив
+      DRILL_TEACHER: ${DRILL_TEACHER:-}
     volumes:
       - {type: bind, source: "${DATA_DIR:?DATA_DIR не задан}/whitelist.txt", target: /app/data/whitelist.txt,
          read_only: true, bind: {create_host_path: false}}

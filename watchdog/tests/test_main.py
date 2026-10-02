@@ -263,7 +263,7 @@ def test_components_file_d4a():                    # было test_components_fi
 def test_components_file_d4b():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
-    assert ids[-7:-2] == ["core", "core-container", "historian", "llm", "gateway"]
+    assert ids[-8:-3] == ["core", "core-container", "historian", "llm", "gateway"]       # Д10а: строка teacher — последней
     cc = comps[ids.index("core-container")]
     assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
            ("container", "pcbk-core", False, "Серверный слой — контейнер")
@@ -277,19 +277,59 @@ def test_components_file_d5a():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
     g = comps[ids.index("gateway")]
-    assert ids[-3] == "gateway"
+    assert ids[-4] == "gateway"
     assert (g["title"], g["kind"], g["url"]) == ("Шлюз и вход", "gateway", "http://pcbk-core:8000/health/gateway")
 
 
 def test_components_have_web_row():
     comps = load_components("components.json")
-    assert comps[-2] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
+    assert comps[-3] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
                          "reports_url": "http://pcbk-core:8000/health/web"}                # Д6б: отчёты браузеров
 
 
 def test_components_have_agents_row():
-    assert load_components("components.json")[-1] == {"id": "agents", "title": "Агенты студентов", "kind": "agents",
+    assert load_components("components.json")[-2] == {"id": "agents", "title": "Агенты студентов", "kind": "agents",
                                                       "url": "http://pcbk-core:8000/health/agents"}
+
+
+def test_components_have_teacher_row():                                        # задача А1 Д10а (Д10-R96)
+    assert load_components("components.json")[-1] == {"id": "teacher", "title": "Кабинет преподавателя и доли",
+                                                      "kind": "teacher", "url": "http://pcbk-core:8000/health/teacher"}
+
+
+def test_teacher_stale_setting():
+    assert Settings.from_env({}).TEACHER_STALE_S == 120
+    with pytest.raises(ValueError, match="TEACHER_STALE_S"):
+        Settings.from_env({"TEACHER_STALE_S": "0"})
+
+
+def test_teacher_stale_bounds_and_tick_budget():                               # сверх брифа
+    assert Settings.from_env({"TEACHER_STALE_S": "20"}).TEACHER_STALE_S == 20   # ручка учения
+    for bad in ({"TEACHER_STALE_S": "-5"}, {"TEACHER_STALE_S": "abc"}, {"TEACHER_STALE_S": "1.5"}):
+        with pytest.raises(ValueError):
+            Settings.from_env(bad)
+    # как AGENTS_STALE_S: проверка кабинета — один HTTP-запрос, правило срока такта порог не затрагивает
+    assert Settings(TEACHER_STALE_S=1).tick_budget_s == Settings().tick_budget_s
+
+
+def test_run_checks_teacher_kind(json_site):
+    # вид teacher идёт через _check_one в check_teacher с порогом TEACHER_STALE_S; note доходит до снимка
+    assert pcbk_watchdog.main.KINDS["teacher"] == ("url",)
+    assert "teacher" not in pcbk_watchdog.main.LOCAL_KINDS
+    reply = {"checked_at": (T0 - timedelta(seconds=30)).isoformat(), "shares_loaded": True, "shares_ok": True,
+             "shares_drift": 0, "shares_sum_usd": 999.5, "total_usd": 1000.0, "store_ok": True, "reads_1h": 2,
+             "read_failed_1h": 0, "changes_1h": 4, "change_failed_1h": 0, "role_refused_1h": 0, "drill": ""}
+    comps = [{"id": "teacher", "title": "Кабинет преподавателя и доли", "kind": "teacher",
+              "url": json_site(200, reply)}]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert [(c.component, c.title, c.state, c.detail, c.note) for c in checks] == [
+        ("teacher", "Кабинет преподавателя и доли", "ok", "доли сходятся, журнал действий пишется",
+         "распределено $999.50 из $1000; прочитано за час: 2; изменений за час: 4")]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), replace(SETTINGS, TEACHER_STALE_S=20), T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "сверка долей молчит")
+    comps[0]["url"] = "http://127.0.0.1:9/health/teacher"
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "кабинет преподавателя не отвечает")
 
 
 def test_run_checks_web_kind(web_site):                                        # M2 предпроверки Д6а

@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .checks import (HTTP_OK_DETAIL, LLM_RUN_SILENT_S, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
                      check_agents, check_container, check_gateway, check_historian, check_http, check_llm,
-                     check_memory, check_tls, check_web, not_installed)
+                     check_memory, check_teacher, check_tls, check_web, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
 from .page import Snapshot, is_stale, render_html, status_json
@@ -29,7 +29,7 @@ log = logging.getLogger("pcbk_watchdog")
 KINDS: dict[str, tuple[str, ...]] = {
     "memory": (), "http": ("url",), "tls": ("host", "port"), "docker_ping": (),
     "container": ("container", "sleeping_ok"), "absent": (), "historian": ("url",),
-    "llm": ("url",), "gateway": ("url",), "web": ("url",), "agents": ("url",),
+    "llm": ("url",), "gateway": ("url",), "web": ("url",), "agents": ("url",), "teacher": ("url",),
 }
 # виды без сети — их срок такта не отменяет
 LOCAL_KINDS = frozenset({"memory", "absent"})
@@ -75,6 +75,9 @@ class Settings:
     # прогон отбора модели (Д8-R69): к модели прогона не обращались дольше этого, с — «прогон отбора молчит»;
     # учения тишины ставят меньше
     LLM_RUN_SILENT_S: int = LLM_RUN_SILENT_S
+    # сверка долей мест (такт уборщика шлюза, GW_REAPER_TICK_S = 30 с) старше этого, с — «сверка долей молчит»
+    # (Д10-R96): 4 такта уборщика
+    TEACHER_STALE_S: int = 120
 
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:
@@ -100,6 +103,9 @@ class Settings:
         # LLM_RUN_SILENT_S — так же: порог строки «LLM-прокси и бюджет», один HTTP-запрос
         if self.LLM_RUN_SILENT_S <= 0:
             raise ValueError("LLM_RUN_SILENT_S должен быть больше нуля")
+        # TEACHER_STALE_S — так же: проверка кабинета преподавателя — один HTTP-запрос
+        if self.TEACHER_STALE_S <= 0:
+            raise ValueError("TEACHER_STALE_S должен быть больше нуля")
 
     @property
     def tz(self) -> ZoneInfo:
@@ -207,6 +213,8 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
         return check_web(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S, reports_url=comp.get("reports_url"))
     if kind == "agents":
         return check_agents(cid, title, comp["url"], now, settings.AGENTS_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
+    if kind == "teacher":
+        return check_teacher(cid, title, comp["url"], now, settings.TEACHER_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "tls":
         return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
                          timeout=NET_CHECK_TIMEOUT_S)

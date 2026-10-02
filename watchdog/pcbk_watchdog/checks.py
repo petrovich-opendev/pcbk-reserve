@@ -1,5 +1,5 @@
 """Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана,
-LLM-прокси и бюджет, шлюз и вход, веб-чат, агенты студентов."""
+LLM-прокси и бюджет, шлюз и вход, веб-чат, агенты студентов, кабинет преподавателя и доли."""
 import http.client
 import io
 import json
@@ -165,6 +165,44 @@ AGENTS_OFF_CONTRACT_DETAIL = "служба агентов ответила не 
 AGENTS_DELAYED_S = 900
 # столько отказов save_agent за час без единого сохранения — «внимание»
 AGENTS_REFUSED_WARN = 6
+
+# строка «Кабинет преподавателя и доли» (задача А1 Д10а, Д10-R96): ответ /health/teacher core — ровно эти 13 ключей,
+# только числа и флаги; drill — "" или режим DRILL_TEACHER. Одна строка на две вещи — доли мест и журнал действий
+# преподавателя; ключи раздельные: понадобятся две строки — делится без переделки договора
+TEACHER_KEYS = frozenset({"checked_at", "shares_loaded", "shares_ok", "shares_drift", "shares_sum_usd", "total_usd",
+                          "store_ok", "reads_1h", "read_failed_1h", "changes_1h", "change_failed_1h", "role_refused_1h",
+                          "drill"})
+TEACHER_DRILL_MODES = frozenset({"shares_stale", "journal_down"})
+TEACHER_DOWN_DETAIL = "кабинет преподавателя не отвечает"
+TEACHER_NOT_DEPLOYED_DETAIL = "кабинет преподавателя ещё не выложен"   # 404: core старше сторожа (выкладка)
+TEACHER_OFF_CONTRACT_DETAIL = "кабинет преподавателя ответил не по договору"
+# единственный detail строки, который видит баннер чата студентов (Д10-R106): ему нужно знать, почему молчит модель.
+# web/src/status.ts держит его дословно (TEACHER_STUDENT_FAIL) — сверяет тест сторожа
+TEACHER_STUDENT_FAIL = "доли бюджета не загружены — LLM-прокси закрыт для студентов"
+# тексты строк таблицы вердикта R96 по порядку (1–11)
+TEACHER_JOURNAL_DOWN_DETAIL = "журнал действий преподавателя не пишется — кабинет закрыт"
+TEACHER_NOT_CHECKED_DETAIL = "сверка долей ещё не проходила"
+TEACHER_SHARES_UNREAD_DETAIL = "сверка долей не прочла таблицу — расхождение не видно"
+TEACHER_DRIFT_DETAIL = "LLM-прокси считает доли не так, как сохранено"
+TEACHER_SILENT_DETAIL = "сверка долей молчит"
+TEACHER_OVER_TOTAL_DETAIL = "сумма долей мест больше общего бюджета — держит общий бюджет"
+TEACHER_CHANGES_DETAIL = "изменения преподавателя не проходят"
+TEACHER_READS_DETAIL = "разговоры студентов не читаются"
+TEACHER_ROLE_DETAIL = "кабинет преподавателя открывают без роли преподавателя"
+TEACHER_OK_DETAIL = "доли сходятся, журнал действий пишется"
+# все тексты detail строки — для проверки длины и постоянства (правило журнала Д1)
+TEACHER_DETAILS = (TEACHER_JOURNAL_DOWN_DETAIL, TEACHER_NOT_CHECKED_DETAIL, TEACHER_STUDENT_FAIL,
+                   TEACHER_SHARES_UNREAD_DETAIL, TEACHER_DRIFT_DETAIL, TEACHER_SILENT_DETAIL, TEACHER_OVER_TOTAL_DETAIL,
+                   TEACHER_CHANGES_DETAIL, TEACHER_READS_DETAIL, TEACHER_ROLE_DETAIL, TEACHER_OK_DETAIL,
+                   TEACHER_DOWN_DETAIL, TEACHER_NOT_DEPLOYED_DETAIL, TEACHER_OFF_CONTRACT_DETAIL)
+# сумма долей больше общего бюджета больше чем на полцента — «внимание» (доли — целые центы, бюджет — доллары)
+TEACHER_SUM_SLACK_USD = 0.005
+# столько неудачных изменений за час без единого удачного — «внимание»
+TEACHER_CHANGE_FAILS_WARN = 3
+# столько неудачных чтений за час — «внимание»
+TEACHER_READ_FAILS_WARN = 3
+# столько обращений к кабинету не-преподавателя за час — «внимание»
+TEACHER_ROLE_REFUSED_WARN = 10
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1100,116 @@ def check_agents(component: str, title: str, url: str, now: datetime, stale_s: i
     except ValueError:
         return Check(component, title, "fail", AGENTS_OFF_CONTRACT_DETAIL)
     state, detail, note = agents_verdict(parsed, now, stale_s)
+    if parsed.drill:
+        note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
+    return Check(component, title, state, detail, note)
+
+
+@dataclass(frozen=True)
+class TeacherReply:
+    """Ответ /health/teacher (Д10-R96): все 13 ключей, типы проверены при разборе."""
+    checked_at: datetime | None
+    shares_loaded: bool
+    shares_ok: bool
+    shares_drift: int
+    shares_sum_usd: float
+    total_usd: float
+    store_ok: bool
+    reads_1h: int
+    read_failed_1h: int
+    changes_1h: int
+    change_failed_1h: int
+    role_refused_1h: int
+    drill: str
+
+    @classmethod
+    def parse(cls, reply) -> "TeacherReply":
+        """Ответ не по договору — только ValueError (Ш8), как у AgentsReply: не объект JSON, лишний или недостающий
+        ключ, тип не тот, счётчик или сумма долей меньше нуля, total_usd не больше нуля, деньги — не конечное число,
+        drill не "" и не из TEACHER_DRILL_MODES."""
+        if not isinstance(reply, dict):
+            raise ValueError("ответ — не объект JSON")
+        if set(reply) != TEACHER_KEYS:
+            raise ValueError("в ответе кабинета преподавателя лишний или недостающий ключ")
+        try:
+            r = cls(checked_at=_time(reply, "checked_at"),           # не ISO — ValueError из fromisoformat
+                    shares_loaded=_flag(reply, "shares_loaded"), shares_ok=_flag(reply, "shares_ok"),
+                    shares_drift=_gw_count(reply, "shares_drift"),
+                    shares_sum_usd=_usd(reply, "shares_sum_usd"), total_usd=_usd(reply, "total_usd"),
+                    store_ok=_flag(reply, "store_ok"),
+                    **{key: _gw_count(reply, key) for key in sorted(TEACHER_KEYS) if key.endswith("_1h")},
+                    drill=_text(reply, "drill"))
+        except (KeyError, TypeError, ArithmeticError) as e:     # ArithmeticError — целое больше float в isfinite
+            raise ValueError(f"ответ кабинета преподавателя не по договору: {type(e).__name__} {e}") from e
+        if r.shares_sum_usd < 0:
+            raise ValueError("shares_sum_usd — меньше нуля")
+        if r.total_usd <= 0:
+            raise ValueError("бюджет не больше нуля")
+        if r.drill and r.drill not in TEACHER_DRILL_MODES:
+            raise ValueError("неизвестный режим учений")
+        return r
+
+
+def _budget_text(x: float) -> str:
+    """Общий бюджет в note: целый — fmt_total ($1000), иначе с центами (fmt_usd): малый бюджет учения «бюджет стенда
+    израсходован» (LLM_TOTAL_USD = 0.001) не показывается как «$0» — как потолок прогона в llm_note."""
+    return fmt_total(x) if float(x).is_integer() else fmt_usd(x)
+
+
+def teacher_verdict(r: TeacherReply, now: datetime, stale_s: int) -> tuple[State, str, str]:
+    """Первая подходящая строка таблицы Д10-R96: (состояние, detail, note без учений).
+
+    В warn/fail текст постоянный — числа идут в note (правило журнала Д1); деньги — fmt_usd и fmt_total, как в llm_note.
+    """
+    if not r.store_ok:
+        return "fail", TEACHER_JOURNAL_DOWN_DETAIL, ""
+    if r.checked_at is None:
+        return "unknown", TEACHER_NOT_CHECKED_DETAIL, ""
+    if not r.shares_loaded:
+        return "fail", TEACHER_STUDENT_FAIL, ""
+    if not r.shares_ok:
+        return "fail", TEACHER_SHARES_UNREAD_DETAIL, ""
+    if r.shares_drift > 0:
+        return "fail", TEACHER_DRIFT_DETAIL, f"мест: {r.shares_drift}"
+    if (now - r.checked_at).total_seconds() > stale_s:
+        return "fail", TEACHER_SILENT_DETAIL, ""
+    allocated = f"распределено {fmt_usd(r.shares_sum_usd)} из {_budget_text(r.total_usd)}"
+    if r.shares_sum_usd > r.total_usd + TEACHER_SUM_SLACK_USD:
+        return "warn", TEACHER_OVER_TOTAL_DETAIL, allocated
+    if r.change_failed_1h >= TEACHER_CHANGE_FAILS_WARN and r.changes_1h == 0:
+        return "warn", TEACHER_CHANGES_DETAIL, f"{r.change_failed_1h} за час"
+    if r.read_failed_1h >= TEACHER_READ_FAILS_WARN:
+        return "warn", TEACHER_READS_DETAIL, f"{r.read_failed_1h} за час"
+    if r.role_refused_1h >= TEACHER_ROLE_REFUSED_WARN:
+        return "warn", TEACHER_ROLE_DETAIL, f"{r.role_refused_1h} за час"
+    return "ok", TEACHER_OK_DETAIL, f"{allocated}; прочитано за час: {r.reads_1h}; изменений за час: {r.changes_1h}"
+
+
+def check_teacher(component: str, title: str, url: str, now: datetime, stale_s: int,
+                  timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
+    """Кабинет преподавателя и доли по ручке /health/teacher службы (только числа и флаги, без логинов и номеров мест).
+
+    Нет ответа, срок, не JSON, код не 200 и не 404 — «кабинет преподавателя не отвечает»; 404 (core старше сторожа во
+    время выкладки) — «неизвестно»; JSON не по договору — свой текст (Ш8). При учениях к note любой строки таблицы первым
+    добавляется «учения: <режим>».
+    """
+    try:
+        status, body = _http_get(url, timeout, lambda code: code == 200)
+    except (OSError, http.client.HTTPException):
+        return Check(component, title, "fail", TEACHER_DOWN_DETAIL)
+    if status == 404:
+        return Check(component, title, "unknown", TEACHER_NOT_DEPLOYED_DETAIL)
+    if status != 200:
+        return Check(component, title, "fail", TEACHER_DOWN_DETAIL)
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
+        return Check(component, title, "fail", TEACHER_DOWN_DETAIL)
+    try:
+        parsed = TeacherReply.parse(reply)
+    except ValueError:
+        return Check(component, title, "fail", TEACHER_OFF_CONTRACT_DETAIL)
+    state, detail, note = teacher_verdict(parsed, now, stale_s)
     if parsed.drill:
         note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
     return Check(component, title, state, detail, note)

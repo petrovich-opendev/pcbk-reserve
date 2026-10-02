@@ -206,6 +206,10 @@ class LlmSettings:
 DRILL_GATEWAY_MODES = frozenset({"", "freeze_reaper", "bad_place_pw"})
 # учения агентов студентов (Д7-R53, Д7-R58): freeze_reload — воркер перезагрузки замирает после первого прохода
 DRILL_AGENTS_MODES = frozenset({"", "freeze_reload"})
+# учения кабинета преподавателя (Д10-R96): shares_stale — перевод доли пишет диск и журнал действий, а память LLM-прокси
+# не обновляет; journal_down — любая запись журнала действий (и пульс) падает до SQL. Поле GatewaySettings, а не Settings
+# (m-7): опечатка — config_error шлюза при живом процессе, а не падение всего core
+DRILL_TEACHER_MODES = frozenset({"", "shares_stale", "journal_down"})
 _GW_ORIGIN = re.compile(r"https://[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::(?P<port>[1-9][0-9]{0,4}))?")
 _OCTET = r"(0|[1-9][0-9]{0,2})"
 _STU_NET = re.compile(_OCTET + r"\." + _OCTET)
@@ -271,6 +275,12 @@ def _drill_agents(raw: str) -> str:
     return raw
 
 
+def _drill_teacher(raw: str) -> str:
+    if raw not in DRILL_TEACHER_MODES:
+        raise ValueError("DRILL_TEACHER: пусто, shares_stale или journal_down")
+    return raw
+
+
 # проверка каждого поля по отдельности: значение из env → значение поля или ValueError (имя и правило)
 _GW_FIELD_CHECKS: dict[str, Callable[[str], object]] = {
     "GW_ORIGIN": _gw_origin,
@@ -284,6 +294,7 @@ _GW_FIELD_CHECKS: dict[str, Callable[[str], object]] = {
     "DRILL_GATEWAY": _drill_gateway,
     "GW_MAX_BODY_BYTES": _gw_max_body,
     "DRILL_AGENTS": _drill_agents,
+    "DRILL_TEACHER": _drill_teacher,
 }
 
 
@@ -302,6 +313,7 @@ class GatewaySettings:
     DRILL_GATEWAY: str = ""                   # учения: freeze_reaper, bad_place_pw
     GW_MAX_BODY_BYTES: int = 524288           # предел тела /pcbk/api/oc/ (Д5-R36; у edge — client_max_body_size 512k)
     DRILL_AGENTS: str = ""                    # учения агентов студентов (Д7а): freeze_reload
+    DRILL_TEACHER: str = ""                   # учения кабинета преподавателя (Д10а): shares_stale, journal_down
 
     @classmethod
     def _parse(cls, env: Mapping[str, str] | None) -> tuple[dict[str, object], list[str]]:

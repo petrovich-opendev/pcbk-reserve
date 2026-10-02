@@ -27,8 +27,13 @@ workplaces.repair = reloads.repair. lifespan открывает учёт аге�
 передаёт main.build_roles) в процессе; без службы маршрут отвечает 503. DataService здесь — только под TYPE_CHECKING
 (m12).
 
-Модули accounts, agents_api, api, calc_api, proxy и web (а через них — accounts) здесь импортируются только внутри
-методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
+Кабинет преподавателя (Д10а): наблюдение раньше функций (задача А1, Д10-R96) — teacher_router: GET /health/teacher (зона
+front, тот же обработчик отказов из реестра), счётчики TeacherStats — в памяти роли (teacher_stats), окно — час. Тело —
+teacher_health_json: до долей и журнала действий (А2) llm и teacher_log — None, checked_at — null, и строка сторожа
+честно «неизвестно». Учения DRILL_TEACHER — поле GatewaySettings (m-7); строка WARNING — в lifespan.
+
+Модули accounts, agents_api, api, calc_api, proxy, teacher_api и web (а через них — accounts) здесь импортируются только
+внутри методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
 загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
 """
 from __future__ import annotations
@@ -51,13 +56,14 @@ from ..agents.stats import AgentStats
 from ..agents.store import AgentStore
 from ..app import RoleBase
 from ..hooks import hooks_of
-from ..settings import GatewaySettings, Settings
+from ..settings import GatewaySettings, LlmSettings, Settings
 from .places import PLACES, Workplaces
 from .reload import AgentReloads
-from .stats import GatewayStats
+from .stats import GatewayStats, TeacherStats
 
 if TYPE_CHECKING:
     from ..data.service import DataService
+    from ..llm import LlmRole
     from .accounts import AccountStore
 
 log = logging.getLogger("pcbk_core.gateway")
@@ -243,6 +249,11 @@ class GatewayRole(RoleBase):
         self.agent_stats = AgentStats(monotonic=monotonic) if agent_stats is None else agent_stats
         # служба данных для калькуляторов страницы (Д9-R87): общая с ролью «данные» из build_roles; None — 503
         self.calc = calc
+        # кабинет преподавателя (Д10-R96): счётчики за час — свои, по монотонным часам роли; роль llm (доли мест) и журнал
+        # действий преподавателя (TeacherLog) приходят с задачей А2 — до неё всегда None
+        self.teacher_stats = TeacherStats(monotonic=monotonic)
+        self.llm: LlmRole | None = None
+        self.teacher_log = None
         # учёт агентов шлюза (Д7-R53: свой AgentStore на тот же core.db) и воркер перезагрузки (Д7-R58)
         self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
         self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
@@ -259,6 +270,7 @@ class GatewayRole(RoleBase):
         from .api import auth_router, catch_all_router, configured, front_only, workplace_router
         from .calc_api import calc_router
         from .proxy import proxy_router
+        from .teacher_api import teacher_router
         from .web import web_router
 
         router = APIRouter()
@@ -270,6 +282,7 @@ class GatewayRole(RoleBase):
         router.include_router(agents_router(self))      # /health/agents (Д7а) и /pcbk/api/agents (Д7б): зона и
                                                         # настройка — у маршрутов (m24); до ловящего
         router.include_router(calc_router(self))        # калькуляторы страницы (Д9а): зона и настройка — у маршрута
+        router.include_router(teacher_router(self))     # /health/teacher (Д10а): зона — у маршрута; до ловящего
 
         @router.get(HEALTH_PATH, dependencies=[Depends(front_only)])
         async def health_gateway() -> JSONResponse:
@@ -285,10 +298,12 @@ class GatewayRole(RoleBase):
         А4, M3), — и у /pcbk/api/oc/ с пределом GW_MAX_BODY_BYTES (Д5-R36): самый длинный префикс берёт его, и
         без respond= сеть места получила бы 413 и узнала бы ручку; у него же общий бюджет тел (H2, сверх — 503
         busy, вне pcbk-front — 404); сеть мест для сверки токенов служб (Ш25). /health/web (Д6б) и /health/agents
-        (Д7а) — тот же обработчик, что /health/gateway: отказ зоны и 405 — 404 вида OpenCode без Allow."""
+        (Д7а) и /health/teacher (Д10а) — тот же обработчик, что /health/gateway: отказ зоны и 405 — 404 вида OpenCode без
+        Allow."""
         from .agents_api import HEALTH_AGENTS_PATH
         from .api import PREFIX, http_exception_handler, too_large
         from .proxy import GW_BODY_BUDGET_BYTES, OC_PREFIX, body_busy
+        from .teacher_api import HEALTH_TEACHER_PATH
         from .web import HEALTH_WEB_PATH
 
         hooks = hooks_of(app)
@@ -296,6 +311,7 @@ class GatewayRole(RoleBase):
         hooks.http_exception(HEALTH_PATH, http_exception_handler)
         hooks.http_exception(HEALTH_WEB_PATH, http_exception_handler)
         hooks.http_exception(HEALTH_AGENTS_PATH, http_exception_handler)
+        hooks.http_exception(HEALTH_TEACHER_PATH, http_exception_handler)
         hooks.body_limit(PREFIX + "/", BODY_LIMIT, respond=too_large)
         # общий бюджет тел до обработчика (H2); не меньше предела одного тела — иначе оно не поместилось бы; вне
         # pcbk-front бюджет не доступен: 404 без чтения тела (медленные тела из сети места его не займут)
@@ -370,6 +386,32 @@ class GatewayRole(RoleBase):
             "drill": self.gw.DRILL_AGENTS,
         }
 
+    def teacher_health_json(self, now: datetime) -> dict:
+        """Договор сторожа /health/teacher (Д10-R96): ровно 13 ключей, только числа и флаги — ни логинов, ни номеров мест.
+        Только память.
+
+        Задача А1 — наблюдение раньше функций: долей (роль llm, Shares) и журнала действий (TeacherLog) ещё нет — сверки
+        не было (checked_at — null), доли не загружены и не сверены, сумма — 0, store_ok — истина (журнала ещё нет). Строка
+        сторожа — «неизвестно» «сверка долей ещё не проходила». total_usd — LLM_TOTAL_USD роли llm, без неё — умолчание
+        LlmSettings. Поля долей и журнала заполняет задача А2."""
+        count = self.teacher_stats.count_1h
+        total = LlmSettings().LLM_TOTAL_USD if self.llm is None else self.llm.llm.LLM_TOTAL_USD
+        return {
+            "checked_at": None,
+            "shares_loaded": False,
+            "shares_ok": False,
+            "shares_drift": 0,
+            "shares_sum_usd": 0,
+            "total_usd": total,
+            "store_ok": True,
+            "reads_1h": count("read"),
+            "read_failed_1h": count("read_failed"),
+            "changes_1h": count("change"),
+            "change_failed_1h": count("change_failed"),
+            "role_refused_1h": count("role_refused"),
+            "drill": self.gw.DRILL_TEACHER,
+        }
+
     # --- жизненный цикл ---
 
     def _add_config_error(self, why: str) -> None:
@@ -390,6 +432,8 @@ class GatewayRole(RoleBase):
     async def _lifespan(self):
         try:
             self.started_at = self.wallclock()
+            if self.gw.DRILL_TEACHER:               # учения кабинета (Д10-R96): видны в журнале с первой строки шлюза
+                log.warning("УЧЕНИЯ: DRILL_TEACHER=%s", self.gw.DRILL_TEACHER)
             if not await asyncio.to_thread(self.store.open):
                 self._add_config_error(f"учётные записи не открываются: {self.store.last_error or 'сбой'}")
             await self._open_agents()               # не бросает: сбой — флаг воркера, не config_error (П13)

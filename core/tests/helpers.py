@@ -523,7 +523,8 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
                  accounts: bool = True, agents_root: Path | None = None, calc: DataService | None = None,
                  **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
-    GatewaySettings (без проверок from_env). stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
+    GatewaySettings (без проверок from_env), в том числе учения DRILL_GATEWAY, DRILL_AGENTS и DRILL_TEACHER (Д10а, m-6).
+    stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
 
     tmp_path создаётся; база — db_path или tmp_path/core.db. accounts — завести отдельным AccountStore с open()
     учётки stu-03 (место 3), stu-05 (место 5) и teach (преподаватель), у всех пароль PW; иначе база заранее не
