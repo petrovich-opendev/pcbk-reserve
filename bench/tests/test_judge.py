@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from fakes import M1, M2, M3, M4
-from helpers import (CLEAN_VERDICT, REPO, VOCAB, agent_text, card, cards, honest_a_record, now_call, packet_with,
+from helpers import (CLEAN_VERDICT, REPO, VOCAB, agent_text, call, card, cards, honest_a_record, now_call, packet_with,
                      period_call, pid_is_control, rec, search_call, transcript_line)
 from pcbk_bench.__main__ import main
 from pcbk_bench.cards import ALLOWED_TOOLS
@@ -102,6 +102,99 @@ def test_runner_tool_names_match_core():                                        
     draft = _module(REPO / "core" / "pcbk_core" / "agents" / "draft.py")
     want = {f"pcbk_{tool}" for tool in draft.AGENT_TOOLS} | {"pcbk_save_agent"}
     assert TOOL_NAMES == _TOOL_NAMES == want and {"pcbk_tag_series", "pcbk_calc_runtime"} <= TOOL_NAMES
+
+
+# --- итоговое ревью Д9а, I-1: ряд и наработка в пакете судьи — как сводка (набор инструментов — ALLOWED_TOOLS) ---
+
+LIQUOR = "Уровень черного щелока выпарной станции"           # слова «заказчика» (выдуманы), не из двойника
+SERIES_OUT = {"tool": "tag_series", "status": "ok", "notes": [], "cache": "miss", "points": 9,
+              "period": {"start": "2026-10-02T06:00:00+05:00", "end": "2026-10-02T14:00:00+05:00", "tz": "+05:00",
+                         "preset": "prev_shift"},
+              "items": [{"tag": "20FAKE_104_PV", "status": "ok", "description": LIQUOR, "unit": "бар",
+                         "points": [["2026-10-02T06:00:00+05:00", 3.38], ["2026-10-02T14:00:00+05:00", 3.42]],
+                         "profile": {"first": 3.38, "first_time": "2026-10-02T06:00:00+05:00", "last": 3.42,
+                                     "last_time": "2026-10-02T14:00:00+05:00", "change": 0.04, "min": 3.31,
+                                     "min_time": "2026-10-02T09:00:00+05:00", "max": 3.47,
+                                     "max_time": "2026-10-02T11:00:00+05:00"}}]}
+RUNTIME_OUT = {"tool": "calc_runtime", "status": "ok", "notes": [], "cache": "miss",
+               "period": SERIES_OUT["period"],
+               "items": [{"tag": "20FAKE_104_PV", "status": "ok", "description": LIQUOR, "covered_percent": 100.0,
+                          "period_hours": 8.0,
+                          "states": [{"value": 1, "label": "работает (по суффиксу)", "hours": 6.5, "percent": 81.25,
+                                      "count": 2},
+                                     {"value": 0, "label": "не работает (по суффиксу)", "hours": 1.5,
+                                      "percent": 18.75, "count": 3}]}]}
+
+
+def calc_call(tool: str) -> object:
+    out = SERIES_OUT if tool == "tag_series" else RUNTIME_OUT
+    args = {"tags": ["20FAKE_104_PV"], "period": "prev_shift", **({"points": 9} if tool == "tag_series" else {})}
+    return call(f"pcbk_{tool}", args, out)
+
+
+@pytest.mark.parametrize("tool", ["tag_series", "calc_runtime"])
+def test_series_runtime_description_words_masked(tool):
+    """Частичная цитата описания из вывода ряда или наработки: слова — в словаре прогона и закрыты маской; пакет, где
+    они не закрыты, сканер не пускает (judge_refused_data), — как у tag_period."""
+    r = rec("B3", answer="Уровень щелока на выпарной станции за смену менялся мало.", tools=[calc_call(tool)])
+    vocab = build_vocab([r], cards())
+    assert {"щелока", "выпарной"} <= vocab
+    p = build_packet(r, BY_ID["B3"], card("B3"), vocab)
+    assert "щелок" not in p.text.lower() and "выпарн" not in p.text.lower() and "[скрыто]" in agent_text(p)
+    assert_packet_clean(p, [], vocab, [])
+    bare = build_packet(r, BY_ID["B3"], card("B3"), frozenset())                  # словарь без них — слова в пакете
+    with pytest.raises(DataInPacket, match="слово каталога"):
+        assert_packet_clean(bare, [], vocab, [])
+
+
+def test_series_runtime_numbers_have_output_sources():
+    """Числа профиля и наработки — источники «вывод: <инструмент>.<поле>», аргументы — по полям, как у tag_period."""
+    answer = ("В начале смены 3,38 бар, в конце 3,42 бар, изменение 0,04 бар, минимум 3,31 бар. Насос работал 6,5 ч — "
+              "81,25 % периода, переходов в работу 2.")
+    p = build_packet(rec("B3", answer=answer, tools=[calc_call("tag_series"), calc_call("calc_runtime")]),
+                     BY_ID["B3"], card("B3"), VOCAB)
+    assert_packet_clean(p, [], VOCAB, [])
+    sources = {s for n in p.fields["numbers"].values() for s in n["sources"]}
+    assert {"вывод: tag_series.first", "вывод: tag_series.last", "вывод: tag_series.change", "вывод: tag_series.min",
+            "вывод: tag_series.first_time", "вывод: calc_runtime.hours", "вывод: calc_runtime.percent",
+            "вывод: calc_runtime.count", "вывод: calc_runtime.period_hours"} <= sources
+    calls = [e for e in p.fields["transcript"] if e["role"] == "инструмент"]
+    assert [sorted(e["args"]) for e in calls] == [["period", "points", "tags"], ["period", "tags"]]
+    assert calls[0]["args"]["tags"] == ["ТЕГ-1"] and calls[0]["output"]["items"][0]["description"] == "уровень, бар"
+    assert calls[1]["output"]["items"][0]["states"][0]["label"].endswith("(по суффиксу)")    # слово — по словарю
+    said = re.findall(r"Ч-\d+", agent_text(p))
+    assert len(said) == 7 and all(p.fields["numbers"][a]["sources"] for a in said), p.fields["numbers"]   # без сирот
+
+
+def _tool_literals(path: Path, known: set[str]) -> set[str]:
+    """Строки на месте имени инструмента: в сравнении, в _calls/_key_items/need и в наборе-литерале, где есть имя из
+    known (с pcbk_ или без); коды отказов и провалов автомата (acc.fail, HARD_CODES) сюда не попадают."""
+    import ast
+
+    def names(nodes) -> set[str]:
+        return {n.value.removeprefix("pcbk_") for n in nodes
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Compare):
+            found |= names([node.left, *node.comparators])
+            for c in node.comparators:
+                if isinstance(c, (ast.Tuple, ast.List, ast.Set)):
+                    found |= names(c.elts)
+        elif isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("_calls", "_key_items", "need"):
+            found |= names(node.args)
+        elif isinstance(node, (ast.Tuple, ast.List, ast.Set)) and names(node.elts) & known:
+            found |= names(node.elts)
+    return {n for n in found if re.fullmatch(r"(?:catalog|tag|calc|save)_[a-z_]+", n)}
+
+
+def test_tool_literals_in_allowed_tools():                       # итоговое ревью Д9а, I-1: копий набора не осталось
+    from pcbk_bench.judge import _SERVICE_TEXT
+    allowed = set(ALLOWED_TOOLS) | {"save_agent"}
+    for module in ("judge.py", "checks.py"):
+        found = _tool_literals(REPO / "bench" / "pcbk_bench" / module, allowed)
+        assert found and found <= allowed, (module, found - allowed)
+    assert set(ALLOWED_TOOLS) <= set(_SERVICE_TEXT.split())
 
 
 def test_exact_match_shares_output_alias():                                      # I-р3-1
