@@ -26,7 +26,7 @@ from collections import Counter
 import pytest
 
 from benchstand import BenchHarness, agents_left
-from conftest import row_of, wait_for
+from conftest import CORE_URL, row_of, wait_for
 from pcbk_bench.cards import CHECK_GOOD, cards_check
 from pcbk_bench.checks import check_run
 from pcbk_bench.judge import (Packet, assert_packet_clean, build_vocab, check_verdicts, collect_verdicts, controls_ok,
@@ -46,6 +46,8 @@ PENDING_WAIT_S = 60                     # перезагрузка места �
 OUT_FILES = ("runs.jsonl", "sessions.log", "progress.json", "tag_units.json", "health_end.json")
 TWIN_VOCAB_WORDS = ("коллектор", "сушильн", "конденсатн")                         # из описаний bench-historian.json
 FULL_RUNS = 128                                                                  # A×2, B×3, C×3 на 4 места
+DIAL_MAX = 10                           # дозвон до потолка (итоговая доводка Д8б, I-1): прямых вызовов не больше
+DIAL_CHAT = {"model": PLACES[5].split("/", 1)[1], "stream": True, "messages": [{"role": "user", "content": "вопрос"}]}
 
 
 @pytest.fixture(scope="module")
@@ -117,6 +119,23 @@ def test_bench_twin_run(bench):
           f"калькулятор ops до сих пор — {bench.stand.calc_calls} вызовов, rate — {bench.stand.calc_rate}")
 
 
+def _dial_to_cap(stack) -> list[int]:
+    """Дозвон до потолка (итоговая доводка Д8б, I-1): прямые вызовы /llm/v1/chat/completions токеном места 05 (место
+    прогона) по одному, пока прокси не ответит 402 pcbk_run_spent, — не больше DIAL_MAX. Прокси отказывает по расходу
+    с резервами идущих вызовов, и после остановки cap расход без резервов бывает ниже потолка: строка страницы тогда
+    «молчит», а не «потолок исчерпан». По одному вызову резервов нет — 402 приходит только на расходе ≥ потолка.
+    Коды ответов по порядку."""
+    codes: list[int] = []
+    for _ in range(DIAL_MAX):
+        code, text = stack.http_host("POST", CORE_URL + "/llm/v1/chat/completions", DIAL_CHAT, token=stack.llm_token(5))
+        codes.append(code)
+        if code == 402:
+            assert json.loads(text)["error"]["code"] == "pcbk_run_spent"
+            break
+        assert code == 200 and text.rstrip().endswith("data: [DONE]")
+    return codes
+
+
 def test_bench_cap_stops_and_page_warns(bench):                                  # m8
     bench.recreate_core(run_id="d8-cap", cap=0.01)
     out = bench.tmp / "cap"
@@ -131,12 +150,18 @@ def test_bench_cap_stops_and_page_warns(bench):                                 
     assert "capped" in statuses and statuses <= {"capped", "interrupted"}
     end = json.loads((out / "health_end.json").read_text(encoding="utf-8"))["run"]
     assert json.loads((out / "progress.json").read_text(encoding="utf-8"))["run_spent_usd"] == end["spent_usd"] > 0
+    before = bench.run_spent()
+    codes = _dial_to_cap(bench.stack)                                                # I-1: дозвон до потолка
+    assert codes[-1] == 402 and set(codes[:-1]) <= {200}                            # 402 — не позже DIAL_MAX вызовов
     bench.stack.wait_status(lambda s: row_of(s, "llm")["detail"] == RUN_CAP_DETAIL, 30)
     run = bench.stack.llm_health()["run"]
     assert run["id"] == "d8-cap" and run["spent_usd"] >= run["cap_usd"]
-    assert run["spent_usd"] <= run["cap_usd"] + 4 * 3 * FAKE_CALL_USD                # до трёх на место
-    print(f"А6 журнал: потолок $0.01 — потрачено ${run['spent_usd']:.4f}, отказов pcbk_run_spent "
-          f"{bench.refusals('pcbk_run_spent')}, прогонов {len(recs)}: {dict(Counter(r.status for r in recs))}")
+    assert run["spent_usd"] <= run["cap_usd"] + (4 * 3 + 1) * FAKE_CALL_USD          # до трёх на место и дозвон
+    if len(codes) > 1:                                                              # дозванивались: шаг — один вызов
+        assert run["spent_usd"] < run["cap_usd"] + FAKE_CALL_USD + 1e-9
+    print(f"А6 журнал: потолок $0.01 — после стопа ${before:.4f}, дозвон {len(codes) - 1} вызовов до 402, итог "
+          f"${run['spent_usd']:.4f}, отказов pcbk_run_spent {bench.refusals('pcbk_run_spent')}, прогонов "
+          f"{len(recs)}: {dict(Counter(r.status for r in recs))}")
     bench.shot("twin-01-run-cap.png")
 
 
