@@ -58,7 +58,10 @@ from .scenarios import BENCH_AGENT, SCENARIO_IDS
 from .stand import DATA_TOOLS, Stand, calc_patient
 from .student import CONSENT, CONSENT_RE
 
-# AGENT_TOOLS Д7 (core/pcbk_core/agents/draft.py) — значением, не импортом: bench только на stdlib
+# инструменты агента студента — AGENT_TOOLS службы (core/pcbk_core/agents/draft.py, с Д9а пять, Д9-R89) — значением,
+# не импортом: bench только на stdlib. По ним check_run судит права файла сохранённого агента (tools_ok)
+ALLOWED_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
+# инструменты заготовленного агента bench-uzel — прежний набор Д7: стенд отбора Д8 не меняется
 AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period")
 # пределы полей save_agent (draft.py TEXT_LIMITS, PROMPT_MIN/MAX, MAX_TAGS) — значением
 NODE_LIMITS = (2, 100)

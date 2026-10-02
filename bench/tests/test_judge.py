@@ -13,6 +13,7 @@ from fakes import M1, M2, M3, M4
 from helpers import (CLEAN_VERDICT, REPO, VOCAB, agent_text, card, cards, honest_a_record, now_call, packet_with,
                      period_call, pid_is_control, rec, search_call, transcript_line)
 from pcbk_bench.__main__ import main
+from pcbk_bench.cards import ALLOWED_TOOLS
 from pcbk_bench.judge import (CONST_TOKENS, MASKS, PERIOD_PRESETS, REAL_DATA_CONSENT, REFUSAL_TEXTS, SOURCE_KINDS,
                               VERDICT_SCHEMA, DataInPacket, Packet, SecretInPacket, assert_packet_clean,
                               audit_transcripts, build_packet, build_vocab, check_verdicts, collect_verdicts,
@@ -22,6 +23,7 @@ from pcbk_bench.record import parse_turn
 from pcbk_bench.runner import RunRefused
 from pcbk_bench.scenarios import BY_ID, JUDGE_ITEMS_CREATE
 from pcbk_bench.secret import Secret
+from pcbk_bench.stand import DATA_TOOLS
 from pcbk_bench.twin_judge import write_twin_verdicts
 
 
@@ -87,6 +89,12 @@ def test_refusal_texts_and_presets_match_core():                                
     want = {code: re.sub(r"\{(?:v|field|min|max)\}", "…", text).replace(", например sushka-bdm2", "")
             for code, text in draft.PROBLEM_TEXTS.items()}
     assert REFUSAL_TEXTS == want and PERIOD_PRESETS == periods.PRESETS
+
+
+def test_allowed_tools_match_core():                                             # Д9-R89, сверх брифа: копии значением
+    draft = _module(REPO / "core" / "pcbk_core" / "agents" / "draft.py")
+    assert ALLOWED_TOOLS == draft.AGENT_TOOLS == DATA_TOOLS
+    assert "tag_series" in REFUSAL_TEXTS["tool_not_allowed"] and "calc_runtime" in REFUSAL_TEXTS["tools_useless"]
 
 
 def test_exact_match_shares_output_alias():                                      # I-р3-1

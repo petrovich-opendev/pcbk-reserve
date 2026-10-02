@@ -15,6 +15,7 @@ import urllib.request
 import pytest
 
 from helpers import CORE_DIR, TOKEN, http_post, make_role, mcp_session, non_root, run_python, serve_role
+from pcbk_core.agents.draft import AGENT_TOOLS
 from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data.budget import PER_CALLER_LIMIT
 from pcbk_core.data.mcp_server import TOOL_DESCRIPTIONS, mcp_auth
@@ -55,7 +56,7 @@ async def test_mcp_lists_tools(core_server):
     assert set(props) == set(SAVE_REQUIRED) and "mode" not in props and "steps" not in props
     assert (props["name"]["pattern"], props["name"]["minLength"], props["name"]["maxLength"]) == (
         "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", 3, 40)
-    assert props["tools"]["items"]["enum"] == ["catalog_search", "tag_now", "tag_period"]
+    assert props["tools"]["items"]["enum"] == list(AGENT_TOOLS)                       # Д9а: пять (Д9-R89)
     assert (props["tags"]["maxItems"], props["prompt"]["minLength"], props["prompt"]["maxLength"]) == (16, 200, 4000)
     assert saver.description == SAVE_DESCRIPTION == (
         "Сохраняет агента студента после его явного согласия на последний показанный черновик. Служба проверяет "

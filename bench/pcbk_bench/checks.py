@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
-from .cards import AGENT_TOOLS, Card
+from .cards import ALLOWED_TOOLS, Card
 from .numbers import (PERMIT_WORDS, Foreign, Shown, _bound_words, also_numbers, close, foreign_numbers,
                       non_measure_kind, norm_negated, parse_numbers, sentence_of, tag_tokens, value_label)
 from .record import RunRecord, ToolCall, Turn
@@ -61,7 +61,9 @@ SAVE_FLOOD = 3
 RUSSIAN_SHARE = 0.5
 RUN_SPENT_TEXT = "Потолок прогона отбора модели исчерпан"                      # LLM_MESSAGES["run_spent"]
 STAND_STATUSES = frozenset({"unavailable", "rate", "error"})                    # ответ службы — её сбой, не модели
-_TOOL_NAMES = frozenset({"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period", "pcbk_save_agent"})
+# имена инструментов службы — не коды отказа прокси (Д8-R72); ряд и наработка — с Д9а (Д9-R89)
+_TOOL_NAMES = frozenset({"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period", "pcbk_tag_series",
+                         "pcbk_calc_runtime", "pcbk_save_agent"})
 _PROXY_CODE = re.compile(r"\bpcbk_[a-z_]+\b")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?")
 _VALUE_FIELDS = ("value", "avg", "min", "max", "last")
@@ -602,7 +604,7 @@ def _tools_ok(agent_file: str | None, sc: Scenario) -> bool:
         return False
     tools: set[str] = set()
     for key, value in perms[1:]:
-        if value != "allow" or not key.startswith("pcbk_") or short(key) not in AGENT_TOOLS:
+        if value != "allow" or not key.startswith("pcbk_") or short(key) not in ALLOWED_TOOLS:
             return False
         tools.add(short(key))
     return sc.need_tools <= tools

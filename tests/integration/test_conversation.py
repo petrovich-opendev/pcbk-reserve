@@ -13,6 +13,7 @@ from secret import Secret
 Q = "что сейчас по тегу 20FAKE_001_PV?"
 MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
 PCBK3 = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period"}       # инструменты агента по умолчанию (Д6-R45)
+PCBK5 = PCBK3 | {"pcbk_tag_series", "pcbk_calc_runtime"}                 # с Д9а — ряд и наработка (Д9-R89)
 KONSTRUKTOR = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_save_agent"}  # инструменты Конструктора (Д7-R63)
 
 
@@ -124,33 +125,33 @@ def test_openrouter_key_never_in_workplace(stack, place01):                     
 def test_conversation_without_tools_reads_no_data(stack, place01):             # задача 6, шаг 2 — тот же способ
     assert "mcp=connected" in stack.health_output("pcbk-student-01")            # иначе запрет проверял бы пустоту
     control = stack.converse(1, "Ответь одним словом: да")                       # положительный контроль: без запрета
-    # у агента по умолчанию других инструментов нет (Д6-R45): без запрета — ровно три инструмента данных
-    assert tool_names(stack, control["session"]) - {"invalid"} == PCBK3
+    # у агента по умолчанию других инструментов нет (Д6-R45): без запрета — ровно пять инструментов данных (Д9а)
+    assert tool_names(stack, control["session"]) - {"invalid"} == PCBK5
     before = stack.data_event_count("student-01", "mcp")
     out = stack.converse(1, "Ответь одним словом: да", tools={"pcbk_*": False})
     assert out["status"] == "done" and not [t for t in out["tools"] if t["tool"].startswith("pcbk_")]
     reqs = [r for r in stack.fake_requests() if r["body"].get("session_id") == f"student-01:{out['session']}"]
     assert reqs                                                                  # запросы сессии дошли до двойника
-    assert not any(r["body"].get("tools") for r in reqs)                        # запрет снял все три — инструментов нет
+    assert not any(r["body"].get("tools") for r in reqs)                        # запрет снял все пять — инструментов нет
     assert stack.data_event_count("student-01", "mcp") == before                # к данным не ходили
 
 
 def test_default_agent_tools_are_data_only(stack, place01):                    # Д6-R45: ни read, ни question
     out = stack.converse(1, Q)
-    assert tool_names(stack, out["session"]) - {"invalid"} == PCBK3   # «invalid» — служебный, если OpenCode его шлёт
+    assert tool_names(stack, out["session"]) - {"invalid"} == PCBK5   # «invalid» — служебный, если OpenCode его шлёт
     msgs = json.loads(stack.oc(1, "GET", f"/session/{out['session']}/message", 1)[1])
     assert {m["info"].get("agent") for m in msgs if m["info"]["role"] == "assistant"} == {"pomoshnik"}
 
 
-def test_agent_tool_sets(stack, place01):                                       # инструменты агентов образа (Д7-R63)
+def test_agent_tool_sets(stack, place01):                                       # инструменты агентов образа (Д7-R63, Д9-R89)
     # «что умеешь?» без слова FAKESAVE*: двойник зовёт pcbk_tag_now, а не запись агента (Д7б, m22)
     k = stack.converse(1, "что умеешь?", agent="konstruktor")
     # allow агента побеждает глобальный "pcbk_save_agent": "deny" — правила конфигурации идут раньше (О7)
-    assert tool_names(stack, k["session"]) - {"invalid"} == KONSTRUKTOR
+    assert tool_names(stack, k["session"]) - {"invalid"} == KONSTRUKTOR       # ряд и наработка Конструктору не нужны
     assert k["status"] == "done" and not [t for t in k["tools"] if t["tool"] == "pcbk_save_agent"]
     p = stack.converse(1, "что умеешь?")                                        # агент по умолчанию места
     assert "pcbk_save_agent" not in tool_names(stack, p["session"])             # тем же способом, что у Конструктора
-    assert tool_names(stack, p["session"]) - {"invalid"} == PCBK3                # MCP подключён — проверка не пуста
+    assert tool_names(stack, p["session"]) - {"invalid"} == PCBK5                # MCP подключён — проверка не пуста
     ks, ps = (system_text(turn_bodies(stack, 1, out["session"])[0]) for out in (k, p))   # тела хода по сессии (I4)
     assert "Правила учебного стенда ПЦБК" in ks and "Правила учебного стенда ПЦБК" in ps   # AGENTS.md — у каждого
     assert "Ты — Конструктор агентов учебного стенда ПЦБК" in ks and "Конструктор агентов" not in ps

@@ -22,12 +22,13 @@ import pcbk_core.data as data_module
 from fakes import WHITELIST, FakeHistorian
 from helpers import (SETTINGS, TOKEN, FakeMono, agent_catalog, make_agents_root, make_role, mcp_session, non_root,
                      serve_role, sha, wait_http, wait_until, wait_until_async)
+from pcbk_core.agents.draft import AGENT_TOOLS
 from pcbk_core.agents.store import MAX_AGENTS, AgentStore, DirUnavailable, StoreError
 from pcbk_core.data import DataRole
 from pcbk_core.data import save_agent as save_agent_module
 from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.historian import HistorianError
-from pcbk_core.data.save_agent import SAVE_LIMIT, SAVE_MESSAGES, SaveAgent, refused_message
+from pcbk_core.data.save_agent import SAVE_LIMIT, SAVE_MESSAGES, SAVE_PROPERTIES, SaveAgent, refused_message
 from pcbk_core.data.service import MESSAGES
 from pcbk_core.secrets import TokenTable
 
@@ -604,3 +605,8 @@ async def test_check_sees_readonly_store(tmp_path, caplog):                # I-1
     assert role.agent_stats.store_error is None
     assert _store_lines(caplog) == ["учёт агентов: запись не проходит (OperationalError SQLITE_READONLY)",
                                     "учёт агентов: запись снова проходит"]
+
+
+def test_save_schema_lists_d9_tools():                                        # Д9-R89: схема save_agent — из AGENT_TOOLS
+    assert SAVE_PROPERTIES["tools"]["items"]["enum"] == list(AGENT_TOOLS)
+    assert SAVE_PROPERTIES["tools"]["maxItems"] == 5

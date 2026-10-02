@@ -28,10 +28,12 @@ PERMISSION = {"*": "deny", "external_directory": "deny", "task": "deny", "webfet
 # MCP службы данных: токен места — файлом, без OAuth (Д4б-R19)
 MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True, "oauth": False,
                 "headers": {"Authorization": "Bearer {file:/run/secrets/data-token}"}}}
-# агент по умолчанию (Д6-R45): фронтматтер файла — побайтно; ни name, ни model, ни question
-FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 1 (Д6а); меняется только пересборкой образа\n'
+# агент по умолчанию (Д6-R45): фронтматтер файла — побайтно; ни name, ни model, ни question. Редакция 2 (Д9а, Д9-R89):
+# ряд и наработка — двумя строками allow в конце
+FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 2 (Д9а); меняется только пересборкой образа\n'
          'description: "Помощник по данным: текущие значения и сводки тегов БДРВ"\nmode: primary\nsteps: 8\n'
-         'permission:\n  "*": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n  pcbk_tag_period: allow\n')
+         'permission:\n  "*": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n  pcbk_tag_period: allow\n'
+         '  pcbk_tag_series: allow\n  pcbk_calc_runtime: allow\n')
 # Конструктор агентов (Д7-R63, research/09 §3.1): фронтматтер — побайтно; модели нет — модель стенда
 K_FRONT = ('# pcbk-reserve: встроенный агент образа, редакция 1 (Д7); меняется только пересборкой образа\n'
            'description: "Конструктор агентов: за один разговор собирает с технологом его агента по узлу"\n'
@@ -183,6 +185,9 @@ def test_default_agent_file():                                                  
                  "Смысл _MV у регуляторов не", "общие знания, не норматив ПЦБК"):        # пометка — как в AGENTS.md
         assert rule in body, rule
     assert "не из данных стенда" not in body
+    assert "пять вещей" in body and "три вещи" not in body                       # Д9а (m9): ряд и наработка
+    for tool in ("pcbk_tag_series", "pcbk_calc_runtime"):
+        assert tool in body, tool
 
 
 def test_konstruktor_file():                                                    # Д7-R63
@@ -199,8 +204,12 @@ def test_konstruktor_file():                                                    
                  "служба отклоняет такие слова и в запрете",                         # доводка р1, I1: prompt_forbidden
                  "В инструкции и назначении агента НЕЛЬЗЯ",                          # m3: норма-число и в purpose
                  "«konstruktor» и не с «pcbk» в начале",                             # m1: name_reserved службы
-                 "Сохранённого агента поменять нельзя"):                             # m2: name_taken — только новый
+                 "Сохранённого агента поменять нельзя",                              # m2: name_taken — только новый
+                 "умеет только пять вещей", "tag_series", "calc_runtime",            # Д9а (Д9-R89, m8, I-1)
+                 "как менялся параметр, наработка, поиск тегов",                     # строка «Что умеет» черновика
+                 "Выясни три вещи"):                                                 # шаг 1 не трогается
         assert rule in flat, rule
+    assert "умеет только три вещи" not in flat
     assert "через минуту" not in flat                                  # при сбое — пересказ message службы (р1)
     stand = (CONFIG / "AGENTS.md").read_text()                       # правила стенда в системном тексте всех агентов
     assert stand.startswith("# Правила учебного стенда ПЦБК (для всех агентов)")

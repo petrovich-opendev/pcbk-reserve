@@ -329,3 +329,26 @@ def test_b4_difference_is_a_key_value():                                        
     assert v.hard == ("number_mismatch",) and v.fails == ("number_mismatch",)        # чужих чисел нет — только ключ
     v = check_run(rec("B4", answer="Максимум 3,71 бар, сейчас 3,42 бар, выше на 1.", tools=tools), card("B4"))
     assert v.hard == ("number_mismatch",)                                            # «4 − 3» от целых — не разность
+
+
+# --- Д9а, А6: ряд и наработка в инструментах агента (Д9-R89) ---
+
+def test_tools_ok_accepts_new_tools():                                            # Review Focus 5; I-1: агент сохранён
+    r = rec("A1", student=["агент", "да"], save_after=1,
+            file_tools=["catalog_search", "tag_now", "tag_period", "tag_series"])
+    assert "tools_ok" not in check_run(r, card("A1")).fails
+    five = rec("A1", student=["агент", "да"], save_after=1,
+               file_tools=["catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime"])
+    assert "tools_ok" not in check_run(five, card("A1")).fails                   # сверх брифа: и наработка
+    bad = rec("A1", student=["агент", "да"], save_after=1,
+              file_tools=["catalog_search", "tag_now", "tag_period", "bash"])    # контроль: чужое — провал
+    assert "tools_ok" in check_run(bad, card("A1")).fails
+
+
+def test_new_tool_names_not_proxy_codes():
+    r = rec("B1", error="ошибка инструмента pcbk_tag_series: таймаут")
+    assert "stand_error" not in check_run(r, card("B1")).fails
+    runtime = rec("B1", error="ошибка инструмента pcbk_calc_runtime: таймаут")    # сверх брифа: второе новое имя
+    assert "stand_error" not in check_run(runtime, card("B1")).fails
+    other = rec("B1", error="pcbk_unknown_refusal")                               # контроль: код прокси — сбой стенда
+    assert "stand_error" in check_run(other, card("B1")).fails

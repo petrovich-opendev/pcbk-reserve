@@ -53,7 +53,8 @@ CURL_IMAGE = "curlimages/curl:8.16.0"
 REMOTE_DIR = "/opt/pcbk-reserve"
 # имя агента службы (core/pcbk_core/agents/draft.py NAME_RE, 3–40 знаков) — значением: стенд только на stdlib
 AGENT_NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", re.ASCII)
-DATA_TOOLS = ("catalog_search", "tag_now", "tag_period")
+# инструменты чтения службы данных (с Д9а — и ряд с наработкой, Д9-R89): калькулятор стенда и субагент карточек
+DATA_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
 STU_RE = re.compile(r"\d{1,3}\.\d{1,3}")                        # STU_NET compose: первые два октета сетей мест
 REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]+")
 

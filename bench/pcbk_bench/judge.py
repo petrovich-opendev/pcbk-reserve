@@ -127,9 +127,11 @@ REFUSAL_TEXTS: dict[str, str] = {
     "prompt_length": "Инструкция агента — от 200 до 4000 знаков",
     "forbidden": "В поле … недопустимый фрагмент «…»: инструкции обхода, SQL, адреса, пути и пароли на стенде "
                  "запрещены",
-    "tools_empty": "Агенту нужен хотя бы один инструмент: catalog_search, tag_now, tag_period",
-    "tool_not_allowed": "Инструмента «…» на стенде нет. Можно: catalog_search, tag_now, tag_period.",
-    "tools_useless": "Агенту нужен tag_now или tag_period, а без тегов — ещё catalog_search",
+    "tools_empty": "Агенту нужен хотя бы один инструмент: catalog_search, tag_now, tag_period, tag_series, calc_runtime",
+    "tool_not_allowed": "Инструмента «…» на стенде нет. Можно: catalog_search, tag_now, tag_period, tag_series, "
+                        "calc_runtime.",
+    "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series или calc_runtime), а без тегов — "
+                     "ещё catalog_search",
     "tags_too_many": "Тегов не больше 16",
     "tag_unknown": "Такого тега нет в каталоге историана",
     "tag_unlisted": "Тег не входит в белый список стенда",
