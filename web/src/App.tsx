@@ -13,21 +13,29 @@
 // (итоговая доводка Д6б, Б3-m6). Сбой вне границы (шапка, фазы до чата) ловит корень — mount.tsx.
 // Отчёты чата (turn_silent, stream_down) уходят через api.report — только от нынешнего чата и не при уходе на вход.
 // Список агентов места (Д7-R65) чат читает сам — App отдаёт ему загрузчик api.agents (preflight П11).
+// Вкладки (Д9-R88): у студента в фазах места, «спит» и чата шапка показывает «Чат» и «Калькуляторы». Чат при этом не
+// снимается: тело фаз лежит в обёртке с атрибутом hidden, поток /event и разговор живы. Вкладка калькуляторов
+// монтируется при первом открытии и остаётся (форма и итог переживают переход в чат), снимается только с уходом из фаз
+// вкладок; у неё своя ErrorBoundary (m5) со своими текстами: сбой — отчёт ui_crash, «Перезапустить калькуляторы»
+// перемонтирует только её, чат не трогается.
 import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
+import { CalcPage, type CalcPageProps } from "./components/CalcPage";
 import { Chat, type ChatProps } from "./components/Chat";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { Header } from "./components/Header";
+import { Header, type View } from "./components/Header";
 import { NoticeScreen } from "./components/NoticeScreen";
 import { WorkplaceScreen } from "./components/WorkplaceScreen";
 import { startStatusPolling } from "./status";
-import { NOTICES, T_ASLEEP, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TEACHER, T_UNKNOWN, T_WAKE } from "./texts";
+import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TEACHER, T_UNKNOWN,
+         T_WAKE } from "./texts";
 import { placeView, type Timers } from "./workplace";
 
 export interface AppProps {
   api: Api;
   navigate(url: string): void;
   ChatImpl?: ComponentType<ChatProps>;
+  CalcImpl?: ComponentType<CalcPageProps>;                // подмена вкладки «Калькуляторы» в тестах, как ChatImpl
   startPolling?: typeof startStatusPolling;
   pollMs?: number;              // опрос места — для тестов (preflight M11)
   timers?: Timers;
@@ -68,10 +76,13 @@ const noAnswer = (): Reply => ({ status: 0, body: null });
 
 export function App(p: AppProps) {
   const ChatImpl = p.ChatImpl ?? Chat;
+  const CalcImpl = p.CalcImpl ?? CalcPage;
   const startPolling = p.startPolling ?? startStatusPolling;
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [who, setWho] = useState<Who | null>(null);
   const [attempt, setAttempt] = useState(0);            // «Повторить» после сбоя /me
+  const [view, setView] = useState<View>("chat");        // открытая вкладка (Д9-R88)
+  const [calcOpened, setCalcOpened] = useState(false);   // вкладку калькуляторов уже открывали — она смонтирована
   const props = useRef(p);
   props.current = p;
   const lastSession = useRef<string | undefined>(undefined);
@@ -230,13 +241,30 @@ export function App(p: AppProps) {
   }
 
   const header = phase.kind !== "loading" && !(phase.kind === "leaving" && who === null);
+  // вкладки — только у студента и только в фазах места и чата: калькуляторы ходят в шлюз, не на место
+  const tabs = who?.role === "student" && (phase.kind === "workplace" || phase.kind === "asleep" || phase.kind === "chat");
+  const showView = (v: View): void => {
+    setView(v);
+    if (v === "calc") setCalcOpened(true);
+  };
   return (
     <div className="app">
       {header && (
         <Header login={who?.login ?? null} ownPlace={who?.place ?? null} startPolling={startPolling}
-                onLogout={() => void logout()} leaving={phase.kind === "leaving"} />
+                onLogout={() => void logout()} leaving={phase.kind === "leaving"} view={tabs ? view : null}
+                onView={showView} />
       )}
-      <main className="main">{body}</main>
+      <main className="main">
+        {/* обёртка — во всех фазах: смена фазы не перемонтирует чат, вкладка калькуляторов его только прячет */}
+        <div className="view" hidden={tabs && view === "calc"}>{body}</div>
+        {tabs && calcOpened && (
+          <div className="view" hidden={view !== "calc"}>
+            <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_CALC_CRASH} restartText={T_CALC_RESTART}>
+              <CalcImpl api={p.api} onSignedOut={goLogin} />
+            </ErrorBoundary>
+          </div>
+        )}
+      </main>
     </div>
   );
 }

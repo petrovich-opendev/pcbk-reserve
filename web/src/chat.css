@@ -29,6 +29,12 @@ button:disabled { opacity: .6; cursor: default; }
 .who span { font-weight: 600; }
 .main { flex: 1; min-height: 0; display: flex; flex-direction: column; width: 100%; max-width: 76rem;
   margin: 0 auto; }
+/* вкладки «Чат» и «Калькуляторы» (Д9-R88): обёртка фаз чата и вкладка — колонкой на всю высоту .main; скрытая — атрибутом
+   hidden, его правило выше перебивает display обёртки (m6) */
+.view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.tabs { display: flex; gap: .35rem; }
+.tabs button { padding: .3rem .8rem; }
+.tabs button[aria-pressed="true"] { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
 
 /* баннер состояния: цвет — по уровню */
 .banner { display: flex; align-items: center; gap: .6rem; min-height: 1.45em; }
@@ -138,3 +144,44 @@ button:disabled { opacity: .6; cursor: default; }
   background: var(--field); border: 1px solid var(--border); border-radius: 6px; }
 .send { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
 .stop { color: var(--fail); border-color: var(--fail); }
+
+/* вкладка «Калькуляторы» (Д9-R88): поиск тега, форма расчёта, итог; график профиля — атрибуты SVG и классы, без style */
+.calc { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: .75rem; padding: 1rem; }
+.calc > * { flex-shrink: 0; }   /* колонка прокручивается сама: список совпадений и итог не сжимаются под высоту окна */
+.calc h2 { margin: 0; font-size: 1.2rem; }
+.calc h3 { margin: 0 0 .4rem; font-size: 1rem; overflow-wrap: anywhere; }
+.calc-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .6rem .75rem; }
+.calc-field { display: flex; flex-direction: column; gap: .2rem; min-width: 0; }
+.calc-wide { flex: 1 1 16rem; }
+.calc-field label { font-size: .85em; color: var(--muted); }
+.calc-field input, .calc-field select { font: inherit; min-width: 0; height: 2.4rem; padding: .3rem .6rem; color: var(--fg);
+  background: var(--field); border: 1px solid var(--border); border-radius: 6px; }
+.calc-matches { list-style: none; margin: 0; padding: 0; max-height: 16rem; overflow-y: auto; display: flex;
+  flex-direction: column; gap: .3rem; }
+.calc-matches button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+.calc-hint { margin: 0; color: var(--muted); }
+.calc-msg { margin: 0; color: var(--fail); font-weight: 600; }
+.calc-result { display: flex; flex-direction: column; gap: .6rem; }
+.calc-item { padding: .75rem 1rem; border: 1px solid var(--border); border-radius: 6px; background: var(--field); }
+.calc-off { margin: 0; display: flex; flex-wrap: wrap; gap: .2rem .6rem; }
+.calc-tag { font-weight: 600; }
+.calc-numbers { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: .5rem 1rem; margin: .4rem 0; }
+.calc-numbers dt { font-size: .85em; color: var(--muted); }
+.calc-numbers dd { margin: 0; }
+.calc-num { font-size: 1.15em; font-weight: 600; }
+.calc-when { display: block; font-size: .85em; color: var(--muted); }
+.calc-chart { margin: .4rem 0; max-width: 600px; }
+svg.profile { display: block; width: 100%; height: auto; overflow: visible; }
+svg.profile .frame { fill: none; stroke: var(--border); stroke-width: 1; }
+svg.profile polyline { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg.profile circle { fill: var(--accent); }
+.calc-axis { display: flex; justify-content: space-between; gap: 1rem; font-size: .85em; color: var(--muted); }
+.calc-table { border-collapse: collapse; margin: .4rem 0; }
+.calc-table th, .calc-table td { padding: .3rem .7rem; border: 1px solid var(--border); text-align: left; }
+.calc-table td:not(:first-child), .calc-table th:not(:first-child) { text-align: right; }
+.calc-covered, .calc-period { margin: .3rem 0 0; }
+.calc-about { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: .2rem .75rem; font-size: .9em; }
+.calc-about div { display: contents; }
+.calc-about dt { color: var(--muted); }
+.calc-about dd { margin: 0; overflow-wrap: anywhere; }
+.calc-notes { margin: .3rem 0 0; padding-left: 1.2rem; font-size: .9em; color: var(--warn); }

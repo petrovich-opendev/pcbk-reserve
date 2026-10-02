@@ -10,12 +10,14 @@ export const STAND_WARNING =
 export const MAX_TEXT = 20000;                          // поле ввода — MAX_TEXT правил шлюза Д5б (R42)
 
 // имена инструментов в строке вызова (R42); прочие — своим именем. pcbk_save_agent — инструмент Конструктора (Д7б,
-// итоговая доводка, замечание Б4): системное имя студенту не показывается
+// итоговая доводка, замечание Б4): системное имя студенту не показывается. Ряд и наработка — с Д9а (Д9-R88)
 export const TOOL_LABELS: Readonly<Record<string, string>> = {
   pcbk_tag_now: "текущее значение",
   pcbk_tag_period: "сводка за период",
   pcbk_catalog_search: "поиск тегов",
   pcbk_save_agent: "сохранение агента",
+  pcbk_tag_series: "ряд и профиль",
+  pcbk_calc_runtime: "наработка",
 };
 
 // --- шапка и фазы чата (R39) ---
@@ -92,6 +94,78 @@ export const T_TURN_SILENT =
   "Ответа нет уже 3 минуты. Можно нажать «Стоп» и спросить снова — сбой отмечен для администратора.";
 export const T_UI_CRASH = "Чат столкнулся с ошибкой. Сбой отмечен для администратора.";
 export const T_UI_RESTART = "Перезапустить чат";
+
+// --- вкладки «Чат» и «Калькуляторы» (Д9-R88): только у студента; калькуляторы — те же инструменты службы, что у агентов ---
+export const T_TABS = "Разделы";                       // подпись группы вкладок для чтения с экрана
+export const T_TAB_CHAT = "Чат";
+export const T_TAB_CALC = "Калькуляторы";
+export const T_CALC_TITLE = "Калькуляторы БДРВ — те же расчёты, что у агентов";
+export const T_CALC_FIND = "Найти тег";
+export const T_CALC_RUN = "Посчитать";
+export const T_CALC_BUSY = "Считаю…";
+export const T_CALC_NO_TAG = "Выберите тег — найдите его по словам или впишите имя";
+export const T_CALC_NO_RANGE = "Укажите начало и конец своего периода";
+export const T_CALC_NOTHING = "Ничего не найдено — попробуйте другие слова";
+export const T_CALC_PERIOD_LINE = (start: string, end: string, tz: string): string => `Период: ${start} — ${end} (${tz})`;
+export const T_CALC_ASOF_LINE = (asof: string, tz: string): string => `Прочитано: ${asof} (${tz})`;   // у текущего значения
+export const T_CALC_COVERED = (percent: string): string => `Данные покрывают ${percent} % периода`;
+export const T_CALC_SECONDS = (s: string): string => `${s} с`;
+export const T_CALC_PERCENT = (p: string): string => `${p} %`;
+export const T_CALC_STATE_VALUE = (v: string): string => `значение ${v}`;   // состояние без подписи по суффиксу
+// сбой вкладки — своя граница ошибок (m5); тексты — не чата (m-3)
+export const T_CALC_CRASH = "Вкладка калькуляторов столкнулась с ошибкой. Сбой отмечен для администратора.";
+export const T_CALC_RESTART = "Перезапустить калькуляторы";
+// подписи полей, режимов, периодов и чисел вкладки (R88). Ключи режимов — CalcMode, ключи периодов — PRESETS службы
+// (periods.py) и custom; значения полей и порядок — calc.ts
+export const CALC_LABELS = {
+  query: "Слова для поиска",
+  tag: "Тег",
+  mode: "Режим",
+  period: "Период",
+  from: "С",
+  to: "По",
+  points: "Точек на графике",
+  modes: {
+    now: "Текущее значение",
+    period: "Сводка за период: среднее, минимум, максимум, размах",
+    profile: "Профиль: как менялся параметр",
+    runtime: "Наработка по тегу состояния",
+  },
+  periods: {
+    last_hour: "Последний час",
+    last_8h: "Последние 8 часов",
+    last_24h: "Последние сутки",
+    current_shift: "Текущая смена",
+    prev_shift: "Прошлая смена",
+    today: "Сегодня",
+    yesterday: "Вчера",
+    last_7d: "Последние 7 суток",
+    last_30d: "Последние 30 суток",
+    custom: "Свой период (время историана)",
+  },
+  matches: "Найденные теги",
+  value: "Значение",
+  time: "Время замера",
+  age: "Возраст",
+  quality: "Качество",
+  avg: "Среднее",
+  min: "Минимум",
+  max: "Максимум",
+  range: "Размах",
+  good: "Доля достоверных",
+  first: "В начале",
+  last: "В конце",
+  change: "Изменение",
+  gridMin: "Минимум сетки",
+  gridMax: "Максимум сетки",
+  chart: "График профиля",
+  state: "Состояние",
+  hours: "Часов",
+  percent: "% периода",
+  count: "Переходов",
+  source: "Источник",
+  avgKind: "Вид среднего",
+} as const;
 
 // --- отказы шлюза (таблица R43) ---
 export const T_SIGNED_OUT = "Сессия закончилась — войдите снова";

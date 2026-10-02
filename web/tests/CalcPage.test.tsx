@@ -1,0 +1,170 @@
+// Вкладка «Калькуляторы» (Д9-R88): ничего не спрашивает при открытии, поиск тега, расчёт по режимам, отказы и конец
+// сессии. calcApi: ответы по инструментам — один ответ на каждый вызов или список по очереди (как api() в App.test.tsx);
+// прочие ручки Api — vi.fn(), которые тест не зовёт.
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { expect, test, vi } from "vitest";
+import type { Api, CalcTool, Reply } from "../src/api";
+import { profileSegments } from "../src/calc";
+import { CalcPage } from "../src/components/CalcPage";
+import { T_CALC_BUSY, T_CALC_NO_RANGE, T_CALC_NO_TAG, T_DOWN } from "../src/texts";
+
+type Answer = [number, unknown];
+function calcApi(o: Partial<Record<CalcTool, Answer | Answer[]>>) {
+  const left = new Map(Object.entries(o).map(([k, v]) => [k, typeof v![0] === "number" ? [v as Answer] : (v as Answer[])]));
+  const calc = vi.fn(async (tool: CalcTool, _args: Record<string, unknown>) => {
+    const list = left.get(tool) ?? [[500, null] as Answer];
+    const [status, body] = list.length > 1 ? list.shift()! : list[0]!;
+    return { status, body };
+  });
+  return { me: vi.fn(), logout: vi.fn(), wake: vi.fn(), workplace: vi.fn(), ackNotice: vi.fn(), agents: vi.fn(),
+           report: vi.fn(async () => {}), calc } as unknown as Api & { calc: typeof calc };
+}
+
+const PERIOD_OK = { tool: "tag_period", status: "ok", notes: ["границы смен 06:00, 14:00, 22:00 — допущение, технологом не подтверждено"],
+  period: { start: "2026-09-30T22:00:00+05:00", end: "2026-10-01T06:00:00+05:00", tz: "UTC+05:00", preset: "prev_shift" },
+  source: "сводка историана по сырым данным: AnalogSummaryHistory, одна корзина на весь период",
+  avg_kind: { code: "unverified", text: "вид не подтверждён сверкой" },
+  items: [{ tag: "20FAKE_001_PV", status: "ok", unit: "л/час", avg: 12.4, min: 10, max: 15, range: 5, percent_good: 100 }] };
+
+test("calc_page_no_calls_on_open", () => {
+  const api = calcApi({});
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  expect(api.calc).not.toHaveBeenCalled();
+});
+
+test("calc_page_search_and_pick", async () => {
+  const api = calcApi({ catalog_search: [200, { status: "ok", matches: [{ tag: "20FAKE_001_PV", description: "Факт. знач. - расход массы", unit: "л/час", kind: "analog" }] }] });
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Слова для поиска"), { target: { value: "расход" } });
+  fireEvent.click(screen.getByRole("button", { name: "Найти тег" }));
+  fireEvent.click(await screen.findByRole("button", { name: /20FAKE_001_PV — Факт\. знач\. - расход массы — л\/час/ }));
+  expect((screen.getByLabelText("Тег") as HTMLInputElement).value).toBe("20FAKE_001_PV");
+  expect(api.calc).toHaveBeenCalledWith("catalog_search", { query: "расход", limit: 20 });
+});
+
+test("calc_page_period_result", async () => {
+  const api = calcApi({ tag_period: [200, PERIOD_OK] });
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(await screen.findByText("12,4 л/час")).toBeTruthy();
+  for (const t of ["Среднее", "Минимум", "Максимум", "Размах", PERIOD_OK.notes[0], PERIOD_OK.source, "вид не подтверждён сверкой"])
+    expect(screen.getByText(t)).toBeTruthy();
+  expect(screen.getByText(/Период: .* — .* \(UTC\+05:00\)/)).toBeTruthy();
+  expect(api.calc).toHaveBeenCalledWith("tag_period", { tags: ["20FAKE_001_PV"], period: "prev_shift" });
+});
+
+const SERIES_OK = { tool: "tag_series", status: "ok", notes: [], points: 4,
+  period: { start: "2026-10-01T04:00:00+05:00", end: "2026-10-01T12:00:00+05:00", tz: "UTC+05:00", preset: "last_8h" },
+  items: [{ tag: "20FAKE_001_PV", status: "ok", unit: "л/час",
+            points: [["2026-10-01T04:00:00+05:00", 10], ["2026-10-01T06:40:00+05:00", 15],
+                     ["2026-10-01T09:20:00+05:00", null], ["2026-10-01T12:00:00+05:00", 12.5]],
+            profile: { first: 10, first_time: "2026-10-01T04:00:00+05:00", last: 12.5, last_time: "2026-10-01T12:00:00+05:00",
+                       change: 2.5, min: 10, min_time: "2026-10-01T04:00:00+05:00", max: 15, max_time: "2026-10-01T06:40:00+05:00" } }] };
+const RUNTIME_OK = { tool: "calc_runtime", status: "ok", notes: [],
+  period: { start: "2026-09-30T00:00:00+05:00", end: "2026-10-01T00:00:00+05:00", tz: "UTC+05:00", preset: "yesterday" },
+  items: [{ tag: "25FAKE_007_CLS", status: "ok", covered_percent: 100, period_hours: 24,
+            states: [{ value: 1, label: "закрыт (по суффиксу)", hours: 18, percent: 75, count: 3 },
+                     { value: 0, label: "не закрыт (по суффиксу)", hours: 6, percent: 25, count: 3 }] }] };
+
+async function run(api: ReturnType<typeof calcApi>, mode: string, tag: string) {
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Режим"), { target: { value: mode } });
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: tag } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+}
+
+test("calc_page_profile_chart", async () => {
+  const api = calcApi({ tag_series: [200, SERIES_OK] });
+  await run(api, "profile", "20FAKE_001_PV");
+  await screen.findByText("В начале");
+  const lines = [...document.querySelectorAll("svg.profile polyline")].map((p) => p.getAttribute("points"));
+  expect(lines).toEqual(profileSegments([10, 15, null, 12.5], 600, 160).filter((s) => s.includes(" ")));
+  for (const t of ["10 л/час", "12,5 л/час", "2,5 л/час"]) expect(screen.getAllByText(t).length).toBeGreaterThan(0);
+  expect(document.querySelectorAll("svg.profile circle").length).toBe(1);          // отрезок из одной точки — кружок
+  expect(api.calc).toHaveBeenCalledWith("tag_series", { tags: ["20FAKE_001_PV"], period: "prev_shift", points: 24 });
+});
+
+test("calc_page_runtime_table", async () => {
+  const api = calcApi({ calc_runtime: [200, RUNTIME_OK] });
+  await run(api, "runtime", "25FAKE_007_CLS");
+  const row = (await screen.findByText("закрыт (по суффиксу)")).closest("tr")!;
+  expect([...row.querySelectorAll("td")].map((td) => td.textContent)).toEqual(["закрыт (по суффиксу)", "18", "75", "3"]);
+  expect(screen.getByText("Данные покрывают 100 % периода")).toBeTruthy();
+});
+
+test("calc_page_refusal_and_signed_out", async () => {                            // Review Focus 4
+  const onSignedOut = vi.fn();
+  const api = calcApi({ tag_now: [[200, { status: "refused", message: "неверные аргументы: tags: нужен хотя бы один тег" }],
+                                  [503, { name: "Unavailable", data: { message: "Калькуляторы недоступны — служба данных не подключена" } }],
+                                  [401, { name: "Unauthorized" }]] });
+  render(<CalcPage api={api} onSignedOut={onSignedOut} />);
+  fireEvent.change(screen.getByLabelText("Режим"), { target: { value: "now" } });
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  for (const want of ["неверные аргументы: tags: нужен хотя бы один тег", "Калькуляторы недоступны — служба данных не подключена"]) {
+    fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+    expect(await screen.findByText(want)).toBeTruthy();
+  }
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  await waitFor(() => expect(onSignedOut).toHaveBeenCalled());
+});
+
+// --- сверх брифа: пустая форма, свой период, кнопка в пути, текущее значение и частичный ответ, CSP ---
+
+test("calc_page_needs_tag_and_range", async () => {
+  const api = calcApi({ tag_period: [200, PERIOD_OK] });
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(screen.getByText(T_CALC_NO_TAG)).toBeTruthy();
+  expect(screen.queryByLabelText("С")).toBeNull();                                  // поля своего периода — только у «свой»
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.change(screen.getByLabelText("Период"), { target: { value: "custom" } });
+  fireEvent.change(screen.getByLabelText("С"), { target: { value: "2026-10-01T08:00" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(screen.getByText(T_CALC_NO_RANGE)).toBeTruthy();
+  expect(api.calc).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByLabelText("По"), { target: { value: "2026-10-01T12:00" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  await screen.findByText("12,4 л/час");
+  expect(api.calc).toHaveBeenCalledWith("tag_period", { tags: ["20FAKE_001_PV"], start: "2026-10-01T08:00", end: "2026-10-01T12:00" });
+});
+
+test("calc_page_button_busy_while_in_flight", async () => {
+  const api = calcApi({});
+  let answer: (r: Reply) => void = () => {};
+  api.calc.mockImplementation(() => new Promise<Reply>((resolve) => { answer = resolve; }));
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  const busy = await screen.findByRole("button", { name: T_CALC_BUSY }) as HTMLButtonElement;
+  expect(busy.disabled).toBe(true);
+  fireEvent.click(busy);
+  expect(api.calc).toHaveBeenCalledTimes(1);                                       // второй вызов не ушёл
+  answer({ status: 0, body: null });
+  expect(await screen.findByText(T_DOWN)).toBeTruthy();                            // сеть — текст replyText
+  expect((screen.getByRole("button", { name: "Посчитать" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+test("calc_page_now_value_and_partial", async () => {
+  const api = calcApi({ tag_now: [200, { tool: "tag_now", status: "partial", notes: [], asof: "2026-10-01T12:00:00+05:00",
+    tz: "UTC+05:00", source: "текущее значение из таблицы Live историана",
+    items: [{ tag: "20FAKE_001_PV", status: "ok", description: "Факт. знач. - расход массы", unit: "л/час", kind: "analog",
+              value: 1250.4567, time: "2026-10-01T11:59:40+05:00", age_s: 20, quality: "хорошее",
+              item_notes: ["метка тега впереди часов историана на 61 с"] },
+            { tag: "20FAKE_999_PV", status: "unknown", text: "такого тега нет в каталоге историана" }] }] });
+  await run(api, "now", "20FAKE_001_PV");
+  expect(await screen.findByText("1 250,457 л/час")).toBeTruthy();
+  for (const t of ["Значение", "Время замера", "Возраст", "Качество", "01.10.2026 11:59:40", "20 с", "хорошее",
+                   "метка тега впереди часов историана на 61 с", "такого тега нет в каталоге историана",
+                   "текущее значение из таблицы Live историана"])
+    expect(screen.getByText(t)).toBeTruthy();
+  expect(screen.queryByText(/^Период:/)).toBeNull();                                // у текущего значения периода нет
+});
+
+test("calc_page_no_style_attributes", async () => {                              // CSP style-src 'self' (Д6-R41)
+  const api = calcApi({ tag_series: [200, SERIES_OK] });
+  await run(api, "profile", "20FAKE_001_PV");
+  await screen.findByText("В начале");
+  expect(document.querySelector("section.calc-result")).not.toBeNull();
+  expect(document.querySelectorAll("[style]").length).toBe(0);
+});
