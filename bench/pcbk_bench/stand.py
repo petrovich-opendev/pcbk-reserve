@@ -17,7 +17,9 @@ ServerStand(ssh, core_url, edge_url, edge_host, secrets, remote_dir):
 - calc — POST core_url/api/data/<инструмент> токеном данных ops (secrets/ops.data-token) через туннель к core;
 - health_llm — GET core_url/health/llm; status — GET edge_url/status.json сторожа с Host = edge_host.
 
-STU_NET и SECRETS_DIR берутся из .env в remote_dir (/opt/pcbk-reserve), как у compose; без строк — умолчания compose.
+STU_NET и SECRETS_DIR берутся из .env в remote_dir (/opt/pcbk-reserve) один раз простым grep, сверяются по виду и
+идут в команды литералами (SD=…; STU=…;) — подстановки команд «$(…)» в удалённых командах нет; без строк в .env —
+умолчания compose.
 Тексты StandError — без вывода команд и тел ответов: в них бывают данные.
 """
 from __future__ import annotations
@@ -48,6 +50,8 @@ REMOTE_DIR = "/opt/pcbk-reserve"
 # имя агента службы (core/pcbk_core/agents/draft.py NAME_RE, 3–40 знаков) — значением: стенд только на stdlib
 AGENT_NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", re.ASCII)
 DATA_TOOLS = ("catalog_search", "tag_now", "tag_period")
+STU_RE = re.compile(r"\d{1,3}\.\d{1,3}")                        # STU_NET compose: первые два октета сетей мест
+REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]+")
 
 # строки журнала вызовов сессий прогона: stdin — JSON-список id сессий; только столбцы llm_calls
 LLM_ROWS_PY = """\
@@ -152,7 +156,10 @@ class ServerStand:
         self.edge_url = edge_url.rstrip("/")
         self.edge_host = edge_host
         self.secrets = Path(secrets)
+        if not REMOTE_PATH_RE.fullmatch(remote_dir):
+            raise ValueError("remote_dir — абсолютный путь из [A-Za-z0-9._/-]")
         self.remote_dir = remote_dir
+        self._env: tuple[str, str] | None = None
         self._run = run
         self._ctx = ssl.create_default_context()
         self._ctx.check_hostname = False
@@ -176,11 +183,26 @@ class ServerStand:
         argv = ["docker", "exec", "-i", *(("-u", str(CORE_UID)) if user else ()), CORE, "python", "-c", script, *args]
         return self._ssh(shlex.join(argv), stdin=stdin, timeout=timeout)
 
+    def remote_env(self) -> tuple[str, str]:
+        """(STU_NET, SECRETS_DIR) из .env в remote_dir (последняя строка ключа) или умолчания compose; читается один
+        раз простым grep и сверяется здесь: в командах — только проверенные значения, без подстановки команд «$(…)»."""
+        if self._env is None:
+            out = self._ssh(f"cd {shlex.quote(self.remote_dir)} && grep -E '^(STU_NET|SECRETS_DIR)=' .env || true")
+            found: dict[str, str] = {}
+            for line in out.splitlines():
+                key, _, value = line.partition("=")
+                found[key.strip()] = value.strip()
+            stu = found.get("STU_NET") or "172.31"
+            sd = found.get("SECRETS_DIR") or f"{self.remote_dir.rstrip('/')}/secrets"
+            if not STU_RE.fullmatch(stu) or not REMOTE_PATH_RE.fullmatch(sd):
+                raise StandError(".env сервера: STU_NET или SECRETS_DIR не того вида")
+            self._env = (stu, sd)
+        return self._env
+
     def _env_prefix(self) -> str:
-        """cd в каталог выкладки; STU и SD — из .env (STU_NET, SECRETS_DIR) или умолчания compose."""
-        d = shlex.quote(self.remote_dir)
-        return (f"cd {d} && STU=$(sed -n 's/^STU_NET=//p' .env | tail -n 1); STU=${{STU:-172.31}}; "
-                f"SD=$(sed -n 's/^SECRETS_DIR=//p' .env | tail -n 1); SD=${{SD:-{d}/secrets}}; ")
+        """SD и STU — проверенные значения remote_env() литералами (SD=/opt/…/secrets; STU=172.31; )."""
+        stu, sd = self.remote_env()
+        return f"SD={shlex.quote(sd)}; STU={shlex.quote(stu)}; "
 
     @staticmethod
     def _json(text: str) -> Any:

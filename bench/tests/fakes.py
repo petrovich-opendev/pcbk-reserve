@@ -5,14 +5,17 @@
   — всем), сон места до wake (asleep_until_wake), удалённые сессии (abort → 404), ход без конца (never_idle), сбой
   места (fail_place — на new_session и send), первый send с отказом (fail_first_send), отказ прокси в каждом ходе
   (error — код pcbk_* в responseBody; error_place — только у этих мест), B3 с уточнением (b3_asks), место засыпает
-  после send (fall_asleep_after_send), сбой ожидания хода (fail_wait — GatewayError из wait_idle).
+  после send (fall_asleep_after_send), сбой ожидания хода (fail_wait — GatewayError из wait_idle), on_send(место, n) —
+  после n-й реплики, ignore_aborts — столько первых abort место не видит, slow_new_session — пауза перед сессией.
   Журнал calls, wakes, aborted, sessions; wakes_while_waiting(n) — пробуждения, пока у места нет идущего хода.
   advance=FakeClock — задержка идёт по общим подставным часам шагами FAKE_STEP_S с короткой настоящей паузой
   (m16: ждущее место видит, как идут часы, и будится по clock).
 - FakeStand — стенд: блок run (расход — по сессиям привязанных FakeChat и cost_per_run группы), вызывающие, модели
   мест, mcp=connected через mcp_after_s, единицы каталога, агенты мест (bench-uzel есть с начала), архив,
   saved_after_abort, visible_after_s, archive_delay_s (архивный агент ещё виден в «Мои агенты» — перезагрузка
-  места), строки сторожа, калькулятор (calc_rate — столько первых ответов «rate»).
+  места), строки сторожа, калькулятор (calc_rate — столько первых ответов «rate»); строки журнала: rows_none — ни
+  одной, rows_skip_bridge — без моста; health_advance=(FakeClock, с) — /health/llm двигает часы;
+  health_fail_after_gone — после первого ответа без блока run /health/llm бросает исключение.
 - FakeClock — подставные часы: mono, now (с поясом), sleep двигает время.
 - cfg(…), runner(…) — фабрики; out по умолчанию — свой каталог под OUT_BASE (автофикстура test_runner — tmp_path).
   runner(kill_after_session_create=True) — смерть процесса сразу после создания первой сессии (m14): без abort и строк
@@ -161,7 +164,8 @@ class FakeChat:
                  fail_place: dict | None = None, delay_s: dict | None = None, minutes: float | None = None,
                  advance: FakeClock | None = None, error: str | None = None, b3_asks: bool = False,
                  fail_first_send: Exception | None = None, fall_asleep_after_send=(), error_place: dict | None = None,
-                 fail_wait: dict | None = None):
+                 fail_wait: dict | None = None, on_send=None, ignore_aborts: int = 0,
+                 slow_new_session: dict | None = None):
         self.never = never_idle
         self.asleep = set(asleep_until_wake)
         self.deleted = set(deleted_sessions)
@@ -172,6 +176,10 @@ class FakeChat:
         self.error = error
         self.error_place = dict(error_place or {})
         self.fail_wait = dict(fail_wait or {})
+        self.on_send = on_send
+        self.slow_new_session = dict(slow_new_session or {})
+        self.ignore_aborts = ignore_aborts
+        self._sends = 0
         self.b3_asks = b3_asks
         self._fail_first_send = fail_first_send
         self.fall_asleep_after_send = set(fall_asleep_after_send)
@@ -232,6 +240,8 @@ class FakeChat:
             self.asleep.discard(place)
 
     def _new_session(self, place: int) -> str:
+        if place in self.slow_new_session:
+            time.sleep(self.slow_new_session[place])
         with self._lock:
             self.calls.append(("new_session", place))                  # и неудачная попытка — в журнале
         self._check(place, conversation=True)
@@ -260,6 +270,10 @@ class FakeChat:
             if place in self.fall_asleep_after_send:
                 self.fall_asleep_after_send.discard(place)
                 self.asleep.add(place)
+            self._sends += 1
+            count = self._sends
+        if self.on_send is not None:
+            self.on_send(place, count)
 
     def _pass(self, seconds: float, s: _Session) -> None:
         if seconds <= 0:
@@ -315,6 +329,9 @@ class FakeChat:
             self.calls.append(("abort", session))
             if session in self.deleted:
                 raise GatewayError(404, "NotFound")
+            if self.ignore_aborts > 0:                  # abort пришёл раньше реплики — место его не увидело
+                self.ignore_aborts -= 1
+                return
             self.aborted.append(session)
             self.abort_places.append((place, session))
             s = self._sess.get(session)
@@ -451,7 +468,9 @@ class FakeStand:
                  rows_model: str | None = None, units: dict | None = None, mcp_after_s: dict | None = None,
                  save_answer: dict | None = None, saved_after_abort: dict | None = None,
                  visible_after_s: float = 0.0, cost_per_run: dict | None = None, status_rows: dict | None = None,
-                 health: dict | None = None, calc_rate: int = 0, archive_delay_s: float = 0.0):
+                 health: dict | None = None, calc_rate: int = 0, archive_delay_s: float = 0.0,
+                 rows_none: bool = False, rows_skip_bridge: bool = False, health_advance: tuple | None = None,
+                 health_fail_after_gone: bool = False):
         self.run_over = dict(run or {})
         self._run_callers = None if run_callers is None else frozenset(run_callers)
         self.place_models = dict(place_models or {})
@@ -466,6 +485,11 @@ class FakeStand:
         self.health_extra = dict(health or {})
         self.calc_rate = calc_rate
         self.archive_delay_s = archive_delay_s
+        self.rows_none = rows_none
+        self.rows_skip_bridge = rows_skip_bridge
+        self.health_advance = health_advance
+        self.health_fail_after_gone = health_fail_after_gone
+        self._gone_seen = False
         self._leaving: dict[tuple[int, str], float] = {}
         self.archived: list[tuple[int, str]] = []
         self.mcp_checks: Counter = Counter()
@@ -548,10 +572,18 @@ class FakeStand:
     # --- Stand ---
 
     def health_llm(self) -> dict:
+        if self.health_advance is not None:             # /health/llm отвечает долго (часы — подставные)
+            clock, seconds = self.health_advance
+            clock.sleep(seconds)
         cfg = self.cfg
         run = {"id": cfg.run_id, "cap_usd": cfg.cap_usd, "spent_usd": 0.0, "callers": len(cfg.places),
                "calls_10m": 0, "idle_s": 0.0}
         run.update(self.run_over)
+        if self.health_fail_after_gone and run["id"] != cfg.run_id:
+            with self._lock:
+                seen, self._gone_seen = self._gone_seen, True
+            if seen:                                    # блок пропал, и /health/llm больше не читается
+                raise RuntimeError("health down")
         run["spent_usd"] = round(float(run["spent_usd"]) + self.spent(), 6)
         return {"run": run, "spent_usd": run["spent_usd"], "key_spent_usd": None, **self.health_extra}
 
@@ -590,8 +622,12 @@ class FakeStand:
     def llm_rows(self, sessions: list[str]) -> list[dict]:
         known = self._sessions()
         rows = []
+        if self.rows_none:
+            return rows
         for i, sid in enumerate(sessions):
             if sid not in known or known[sid][1] is None:
+                continue
+            if self.rows_skip_bridge and known[sid][1] not in BUILTIN:
                 continue
             place, agent, first = known[sid]
             group = self._group(agent, first)
@@ -756,7 +792,7 @@ def close_runners() -> None:
 def write_config(tmp: Path, **patch: Any) -> Path:
     """Конфиг прогона JSON в tmp/config.json: умолчания и patch поверх (значение None — null)."""
     raw: dict[str, Any] = {"run_id": "d8-test", "places": {"7": M1, "8": M2}, "reps": dict(REPS), "cap_usd": 80.0,
-                           "stop_margin_usd": 10.0, "window_start": "2026-10-08T10:00:00+05:00", "out_dir": "out",
+                           "stop_margin_usd": 10.0, "window_start": "2026-10-01T10:00:00+05:00", "out_dir": "out",
                            "cards": str(CARDS), "stand": "stand.json"}
     raw.update(patch)
     path = Path(tmp) / "config.json"

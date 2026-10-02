@@ -396,10 +396,11 @@ def test_run_spent_402_is_capped_and_stops():
     assert len(recs) == 1 and recs[0].status == "capped"
 
 
-def test_hard_stop_reaches_other_place_mid_conversation():                       # после money — ни реплики
-    chat = FakeChat.honest(error_place={7: "pcbk_money_out"}, delay_s={7: 0.1, 8: 0.3})     # 8 — посреди хода
+@pytest.mark.parametrize("code, reason", [("pcbk_money_out", "money"), ("pcbk_run_spent", "cap")])
+def test_hard_stop_reaches_other_place_mid_conversation(code, reason):           # после 402 — ни реплики (р1, m5)
+    chat = FakeChat.honest(error_place={7: code}, delay_s={7: 0.1, 8: 0.3})     # 8 — посреди хода
     r = runner(chat=chat, places={7: M1, 8: M2})
-    assert r.run() == "money"
+    assert r.run() == reason
     rec8 = next(x for x in load_records(r.out) if x.key.place == 8)
     sends8 = [c for c in chat.calls if c[0] == "send" and c[1] in rec8.sessions]
     assert rec8.status == "interrupted" and len(sends8) == 1                        # первый ход — и всё
@@ -411,6 +412,104 @@ def test_hard_stop_sends_no_more_messages():                                    
     assert r.run() == "money"
     sends = [c for c in chat.calls if c[0] == "send"]
     assert len(sends) <= 2                                                          # по ходу на место, не больше
+
+
+def test_partial_place_stop_is_place_reason(capsys):                            # р1, I1
+    r = runner(chat=FakeChat.honest(fail_place={8: GatewayError(500, "Boom")}), places={7: M1, 8: M2})
+    assert r.run() == "place"
+    p = json.loads((r.out / "progress.json").read_text())
+    assert (p["state"], p["stop_reason"]) == ("stopped", "place") and p["by_place"]["8"]["status"] == "stopped"
+    capsys.readouterr()
+    assert status_main(r.out, 120) == 2
+    assert "места остановлены: 08" in capsys.readouterr().out
+
+
+def test_run_block_gone_mid_conversation_no_more_sends():                       # р1, I2
+    stand = FakeStand()
+
+    def gone(place, n):
+        if n == 2:
+            stand.run_over["id"] = "d8-gone"                                        # core пересоздан без прогона
+    chat = FakeChat.honest(on_send=gone)
+    r = runner(chat=chat, stand=stand, places={7: M1}, only=[RunKey(7, "A1", 1)])
+    assert r.run() == "stand"
+    assert [c for c in chat.calls if c[0] == "send"] == [("send", chat.sessions[0])] * 2   # третьей реплики нет
+    assert load_records(r.out)[0].status == "interrupted" and r._hard.is_set()
+
+
+@pytest.mark.parametrize("first_detector", ["guard", "cap"])
+def test_run_block_gone_hard_stop_when_health_then_unreadable(first_detector):   # р1, I2: hard — не только сторож
+    stand = FakeStand(health_fail_after_gone=True)
+
+    def gone(place, n):
+        if place == 8:
+            stand.run_over["id"] = "d8-gone"
+    if first_detector == "guard":       # место 7 замечает пропажу перед своей репликой, место 8 — посреди хода
+        only = [RunKey(7, "B1", 1), RunKey(7, "B2", 1), RunKey(8, "A1", 1)]
+        chat = FakeChat.honest(on_send=gone, delay_s={8: 0.4}, slow_new_session={7: 0.2, 8: 0.1})
+    else:                               # место 8 замечает её проверкой потолка перед B2, место 7 — посреди A
+        only = [RunKey(7, "A1", 1), RunKey(8, "B1", 1), RunKey(8, "B2", 1)]
+        chat = FakeChat.honest(on_send=gone, delay_s={7: 0.4}, slow_new_session={8: 0.1})
+    r = runner(chat=chat, stand=stand, places={7: M1, 8: M2}, only=only)
+    assert r.run() == "stand" and r._hard.is_set()
+    sends = [c for c in chat.calls if c[0] == "send"]
+    a1 = next(x for x in load_records(r.out) if x.key.scenario == "A1")
+    assert a1.status == "interrupted" and sum(1 for c in sends if c[1] in a1.sessions) == 1
+
+
+def test_deadline_between_turns_sends_nothing():                                 # р1, m1
+    clock = FakeClock(start=T0)
+    chat = FakeChat.honest(b3_asks=True, delay_s={7: 600}, advance=clock)          # первый ход съел весь срок
+    r = runner(chat=chat, places={7: M1}, now=clock.now, clock=clock.mono, sleep=clock.sleep,
+               run_timeout_s={"number": 600})
+    rec = r.run_one(RunKey(7, "B3", 1))
+    assert rec.status == "timeout" and len(rec.turns) == 1
+    assert [c for c in chat.calls if c[0] == "send"] == [("send", rec.sessions[0])]     # уточнения нет
+
+
+def test_window_checked_after_slow_health():                                     # р1, m3
+    clock = FakeClock(start=T0)
+    stand = FakeStand(health_advance=(clock, 50 * 60))                             # каждый /health/llm — 50 мин
+    r = runner(stand=stand, places={7: M1}, only=[RunKey(7, "B1", 1)], now=clock.now, clock=clock.mono,
+               sleep=clock.sleep)
+    assert r.run() == "window" and not r.started and stand.sessions_started == 0
+
+
+def test_prepare_refuses_busy_place(monkeypatch):                                # р1, m4: чужой прогонщик, другой OUT
+    import pcbk_bench.runner as mod
+    monkeypatch.setattr(mod, "IDLE_WAIT_S", 0.05)
+    chat = FakeChat.never_idle()
+    other = chat.view(7)
+    other.send(other.new_session(), "Что сейчас по 20FAKE_104_PV?", "bench-uzel")   # ход чужого прогонщика идёт
+    with pytest.raises(RunRefused, match="place_busy"):
+        runner(chat=chat, places={7: M1}).prepare()
+
+
+def test_future_window_start_refused(tmp_path, capsys):                         # р1, m7
+    with pytest.raises(RunRefused, match="window_start"):
+        runner(window_start=now() + timedelta(minutes=10)).prepare()
+    runner(window_start=now() + timedelta(minutes=4)).prepare()                    # в пределах 5 мин — можно
+    cfg_path = write_config(tmp_path, window_start=iso(now() + timedelta(minutes=10)))
+    assert main(["run", str(cfg_path)]) == 2                                        # до stand.json: его нет
+    assert capsys.readouterr().err.strip().endswith("RunRefused: window_start")
+
+
+def test_no_rows_is_stand_error():                                               # р1, m5
+    rec = runner(stand=FakeStand(rows_none=True), sleep=lambda s: None).run_one(RunKey(7, "B1", 1))
+    assert rec.status == "stand_error" and rec.llm_rows == []
+
+
+def test_foreign_model_on_timeout_is_stand_error():                              # р1, m5
+    stand = FakeStand(rows_model="z-ai/other")
+    rec = runner(chat=FakeChat.never_idle(), stand=stand, turn_timeout_s=0.1).run_one(RunKey(7, "B1", 1))
+    assert rec.status == "stand_error"
+
+
+def test_rows_needed_for_each_session_with_turn():                              # р1, m6: мост без строк
+    stand = FakeStand(rows_skip_bridge=True)
+    rec = runner(stand=stand, sleep=lambda s: None).run_one(RunKey(7, "A1", 1))
+    assert rec.bridge is not None and len(rec.sessions) == 2 and len(rec.llm_rows) == 1
+    assert rec.status == "stand_error"
 
 
 def test_stand_rows_pause_then_stop():
@@ -437,8 +536,31 @@ def test_interrupt_aborts_live_session_and_marks():
     threading.Thread(target=fire, daemon=True).start()
     assert r.run() == "interrupt"
     recs = load_records(r.out)
-    assert recs[0].status == "interrupted" and chat.aborted == [chat.sessions[0]]
+    assert recs[0].status == "interrupted" and set(chat.aborted) == {chat.sessions[0]}
     assert f"{chat.sessions[0]}\t07\tend" in (r.out / "sessions.log").read_text()
+
+
+def test_interrupt_reaborts_every_tick():                                        # р1, m2: первый abort не дошёл
+    chat = FakeChat.never_idle(ignore_aborts=1)
+    r = runner(chat=chat, places={7: M1}, only=[RunKey(7, "B1", 1)], turn_timeout_s=5)
+
+    def fire():
+        deadline = time.monotonic() + 10
+        while not chat.sessions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        r._on_signal(signal.SIGINT, None)
+    threading.Thread(target=fire, daemon=True).start()
+    assert r.run() == "interrupt"
+    assert load_records(r.out)[0].status == "interrupted" and chat.calls.count(("abort", chat.sessions[0])) >= 2
+
+
+def test_interrupt_during_send_aborts_before_turn():                             # р1, m2: сигнал, пока реплика уходит
+    holder = {}
+    chat = FakeChat.never_idle(on_send=lambda place, n: holder["r"]._on_signal(signal.SIGINT, None))
+    r = holder["r"] = runner(chat=chat, places={7: M1}, turn_timeout_s=2)
+    rec = r.run_one(RunKey(7, "B1", 1))
+    assert rec.status == "interrupted" and rec.turns == [] and chat.aborted == [rec.sessions[0]]
 
 
 def test_run_restores_signal_handlers():
@@ -542,7 +664,7 @@ def test_progress_keys_after_run(tmp_path):
 # --- CLI ---
 
 def test_cli_hides_exception_text(tmp_path, capsys):                             # m-р4-16
-    cfg_path = write_config(tmp_path, window_start="2026-10-08T10:00:00+05:00")
+    cfg_path = write_config(tmp_path, window_start="2026-10-01T10:00:00+05:00")      # р1, m7: начало окна — не будущее
     with fake_stand_raising(RuntimeError("tag 20FAKE_104_PV value 3.42")):
         assert main(["run", str(cfg_path)]) == 1
     out = capsys.readouterr()
@@ -550,7 +672,7 @@ def test_cli_hides_exception_text(tmp_path, capsys):                            
 
 
 def test_cli_locked_is_two(tmp_path, capsys):
-    cfg_path = write_config(tmp_path, window_start="2026-10-08T10:00:00+05:00")
+    cfg_path = write_config(tmp_path, window_start="2026-10-01T10:00:00+05:00")
     holder = runner(out=tmp_path / "out")
     holder.prepare()
     with fake_stand_raising(RuntimeError("x")):
@@ -776,15 +898,17 @@ def test_gateway_password_not_in_repr(gate):
 # --- стенд сервера (SSH подставной) ---
 
 class _Ssh:
-    def __init__(self, out="", code=0, raise_timeout=False):
-        self.out, self.code, self.raise_timeout = out, code, raise_timeout
+    def __init__(self, out="", code=0, raise_timeout=False, env=""):
+        self.out, self.code, self.raise_timeout, self.env = out, code, raise_timeout, env
         self.calls = []
 
     def __call__(self, argv, input=None, capture_output=True, text=True, timeout=None):
         self.calls.append((argv, input, timeout))
-        if self.raise_timeout:
+        env_read = "grep -E" in argv[-1]
+        if self.raise_timeout and not env_read:
             raise subprocess.TimeoutExpired(argv, timeout)
-        return subprocess.CompletedProcess(argv, self.code, self.out, "секретный вывод 20FAKE_104_PV")
+        out = self.env if env_read else self.out
+        return subprocess.CompletedProcess(argv, self.code, out, "секретный вывод 20FAKE_104_PV")
 
 
 def _server(ssh, tmp_path):
@@ -815,7 +939,9 @@ def test_server_stand_commands(tmp_path):
     ssh.out = '{"status": "ok", "name": "bench-uzel", "already": true}'
     assert stand.save_agent(7, {"name": "bench-uzel", "tags": ["20FAKE_101_PV"]})["already"] is True
     argv, stdin, timeout = ssh.calls[-1]
-    assert '"$SD/student-07.data-token"' in argv[4] and "streamable_http_client" in argv[4] and timeout == 120
+    assert argv[4].startswith('SD=/opt/pcbk-reserve/secrets; STU=172.31; '
+                              '{ cat "$SD/student-07.data-token"; echo; cat; } | docker exec -i pcbk-core python -c ')
+    assert "streamable_http_client" in argv[4] and timeout == 120
     assert json.loads(stdin)["name"] == "bench-uzel"                                # токен — на сервере, не в stdin
     ssh.out = ""
     stand.archive_agent(7, "bench-a1b2c3")
@@ -825,6 +951,29 @@ def test_server_stand_commands(tmp_path):
         stand.archive_agent(7, "../etc")
     with pytest.raises(StandError):
         stand.agent_rows(11)
+    ssh.out = '{"model": "pcbk/z-ai/glm-5.3"}'
+    stand.place_model(7)
+    ssh.out = "student-07\n"
+    stand.run_callers()
+    ssh.out = ""
+    stand.agent_file(7, "bench-uzel")
+    stand.place_mcp_ok(7)
+    assert len(ssh.calls) == 8 and not [c for c in ssh.calls if "$(" in c[0][4]]     # р1, m5: без «$(» нигде
+
+
+def test_server_stand_remote_env_literal_and_checked(tmp_path):                # р1, m5
+    ssh = _Ssh(out='{"model": "pcbk/z-ai/glm-5.3"}', env="STU_NET=10.9\nSECRETS_DIR=/srv/pcbk/secrets\n")
+    stand = _server(ssh, tmp_path)
+    stand.place_model(7)
+    stand.place_model(8)
+    env_read = "cd /opt/pcbk-reserve && grep -E '^(STU_NET|SECRETS_DIR)=' .env || true"
+    assert [c[0][4] for c in ssh.calls].count(env_read) == 1                       # .env читается один раз
+    assert ssh.calls[-1][0][4].startswith("SD=/srv/pcbk/secrets; STU=10.9; docker run ")
+    for bad in ("STU_NET=$(reboot)\n", "SECRETS_DIR=/srv/a b\n", "SECRETS_DIR=relative\n"):
+        ssh = _Ssh(out='{"model": "pcbk/z-ai/glm-5.3"}', env=bad)
+        with pytest.raises(StandError):
+            _server(ssh, tmp_path).place_model(7)
+        assert len(ssh.calls) == 1                                                  # до команд дело не дошло
 
 
 def test_server_stand_place_model_and_callers(tmp_path):

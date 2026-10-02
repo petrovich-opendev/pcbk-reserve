@@ -2,8 +2,9 @@
 [--stale-s N].
 
 - override CONFIG — файл переопределения мест (render_override) в stdout;
-- run CONFIG — прогон: load_config → window_start (без него — RunRefused("window_start") до подключения к стенду) →
-  connect (stand.json и secrets/ рядом с ним) → Runner.run(); в stdout — причина конца прогона;
+- run CONFIG — прогон: load_config → window_start (без него или позже сейчас + 5 мин — RunRefused("window_start")
+  до подключения к стенду) → connect (stand.json и secrets/ рядом с ним) → Runner.run(); в stdout — причина конца
+  прогона;
 - status OUT — код состояния прогона по OUT/progress.json (status_main): 0 — идёт и свеж или закончен, 1 — молчит
   или завис, 2 — остановлен или на паузе.
 
@@ -21,13 +22,14 @@ import argparse
 import json
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .cards import load_cards
 from .config import BenchConfig, load_config
 from .gateway import GatewayChat
 from .override import render_override
-from .runner import Runner, RunRefused, status_main
+from .runner import FUTURE_WINDOW_S, Runner, RunRefused, status_main
 from .secret import Secret
 from .stand import ServerStand, Stand
 
@@ -79,8 +81,8 @@ def connect(cfg: BenchConfig) -> tuple[Stand, dict[int, GatewayChat]]:
 
 def _run(config: Path) -> int:
     cfg = load_config(config, OPENCODE_JSON)
-    if cfg.window_start is None:
-        raise RunRefused("window_start")
+    if cfg.window_start is None or cfg.window_start > datetime.now(timezone.utc) + timedelta(seconds=FUTURE_WINDOW_S):
+        raise RunRefused("window_start")             # нет начала окна или оно в будущем (р1, m7) — до стенда
     stand, chats = connect(cfg)
     runner = Runner(cfg, stand, chats, load_cards(cfg.cards))
     print(runner.run())

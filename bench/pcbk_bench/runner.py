@@ -7,34 +7,41 @@
 KEEPALIVE_S по clock получает POST …/workplace/wake (продлевает простой места; GET-опрос его не продлевает).
 Остановленное место (PLACE_STRIKES stand_error подряд) барьер не ждёт и в следующих повторах не идёт.
 
-Подготовка — prepare(), порядок строгий (I-р4-7): замок OUT/.lock (fcntl, pid внутри) → пульс (поток-демон, раз в
-heartbeat_s атомарно переписывает OUT/progress.json; П7) → блок run в /health/llm и LLM_RUN_CALLERS → вход учёткой
-и ensure_ready каждого места → abort сессий из OUT/sessions.log без строки конца через своё место (П5; 404 — «уже
-нет»), ожидание пустого /session/status → модель места (GET /config) → единицы тегов карточек (OUT/tag_units.json)
-→ архив чужих агентов места → bench-uzel и его ready. Любое расхождение — RunRefused с кодом; замок и пульс
-снимаются (close()). run() зовёт prepare() сам, если его не звали; close() — в finally у run().
+Подготовка — prepare(), порядок строгий (I-р4-7): window_start не позже сейчас + 5 мин (иначе RunRefused
+("window_start"), р1 m7) → замок OUT/.lock (fcntl, pid внутри) → пульс (поток-демон, раз в heartbeat_s атомарно
+переписывает OUT/progress.json; П7) → блок run в /health/llm и LLM_RUN_CALLERS → вход учёткой и ensure_ready каждого
+места → abort сессий из OUT/sessions.log без строки конца через своё место (П5; 404 — «уже нет») → пустой
+/session/status у каждого места (≤ IDLE_WAIT_S, иначе place_busy: чужой прогонщик с другим OUT, р1 m4) → модель
+места (GET /config) → единицы тегов карточек (OUT/tag_units.json) → архив чужих агентов места → bench-uzel и его
+ready. Любое расхождение — RunRefused с кодом; замок и пульс снимаются (close()). run() зовёт prepare() сам, если его
+не звали; close() — в finally у run().
 
 Прогон (run_one): пробуждение места (ensure_ready: GET /workplace, не ready — wake и ожидание ready, затем
 mcp=connected), разговор со сценарным ботом или скриптом (ScriptedStudent), у A — после удачного save_agent ожидание
 ready нового агента, мост к нему в новой сессии и архив всех агентов места, кроме bench-uzel, при любом статусе (и
 сохранённых уже после abort, m-р4-3), с ожиданием их ухода из «Мои агенты» — внутри срока прогона. Затем калькулятор
 по аргументам последних вызовов tag_now и tag_period хода (статус rate — пауза и повтор, m10) и строки журнала
-прокси сессий: model строк — не модель места → stand_error (Д8-R71).
+прокси: у каждой сессии с законченным ходом (и у моста) есть строки, их model — модель места, иначе stand_error
+(Д8-R71, р1 m6).
 
 Сроки (m-р4-5): ожидание хода — min(turn_timeout_s, срок прогона − сейчас), у A срок разговора — без
-archive_reserve_s. Срок — abort сессии через шлюз, статус timeout. 503 от шлюза посреди прогона (WorkplaceNotReady
+archive_reserve_s. Срок — abort сессии через шлюз, статус timeout; срок, вышедший между ходами, — timeout без новой
+реплики (р1, m1). 503 от шлюза посреди прогона (WorkplaceNotReady
 или WorkplaceBusy после повторов клиента) — ensure_ready и один повтор вызова, а не stand_error.
 
 Конец окна: window_end() = min(начало прогона + 130 мин, window_start + 165 мин). Новый прогон группы g стартует,
-только если now() + run_timeout_s[g] ≤ window_end(); не успевает — ключ остаётся для возобновления, причина window.
+только если now() + run_timeout_s[g] ≤ window_end() — время берётся после проверки потолка (р1, m3); не успевает —
+ключ остаётся для возобновления, причина window.
 
 Остановки (STOP_REASONS): cap — run.spent_usd + stop_margin_usd ≥ cap (новые прогоны не начинаются) или 402
 pcbk_run_spent в ходе; money — pcbk_money_out, pcbk_key_limit, pcbk_budget_spent, pcbk_share_spent; stand — строка
 «LLM-прокси и бюджет» fail или «Память сервера» не ok STAND_STRIKES проверок подряд через STAND_CHECK_S (одна
-проверка на прогонщик: перед повтором и в главном потоке, m13), или все места остановлены; window; interrupt —
-SIGINT/SIGTERM: идущие сессии получают abort, прогоны — interrupted; projection — пауза на барьере 1: прогноз
-Σ_g(расход повтора 1 группы g × reps[g]) больше cap − stop_margin, а projection_ack нет. После cap по 402, money и
-interrupt места новых реплик не шлют («жёсткая» остановка).
+проверка на прогонщик: перед повтором и в главном потоке, m13), или в /health/llm нет блока run этого прогона (перед
+каждым прогоном и каждой репликой, р1 I2); window; interrupt — SIGINT/SIGTERM: идущие сессии получают abort каждый
+такт, пока они идут (р1 m2), прогоны — interrupted; projection — пауза на барьере 1: прогноз Σ_g(расход повтора 1
+группы g × reps[g]) больше cap − stop_margin, а projection_ack нет; place — у места, остановленного PLACE_STRIKES
+stand_error подряд, остались прогоны плана (р1, I1; state stopped, status — код 2). После cap по 402, money,
+interrupt и пропавшего блока run места новых реплик не шлют («жёсткая» остановка).
 
 Журнал сессий OUT/sessions.log — строки «<id>\\t<NN>\\tstart» при создании сессии и «<id>\\t<NN>\\tend» в конце
 прогона, при abort и при уборке (П5). Записи прогонов — OUT/runs.jsonl (RunRecord.to_json, по строке); возобновление
@@ -67,7 +74,7 @@ from .student import ScriptedStudent
 
 log = logging.getLogger("pcbk_bench.runner")
 
-STOP_REASONS = ("cap", "money", "stand", "window", "interrupt", "projection")
+STOP_REASONS = ("cap", "money", "stand", "window", "interrupt", "projection", "place")
 MONEY_CODES = frozenset({"pcbk_money_out", "pcbk_key_limit", "pcbk_budget_spent", "pcbk_share_spent"})
 CAP_CODE = "pcbk_run_spent"
 RUN_SPENT_TEXT = "Потолок прогона отбора модели исчерпан"           # LLM_MESSAGES["run_spent"]
@@ -80,6 +87,7 @@ WAKE_TIMEOUT_S = 120.0
 MCP_TIMEOUT_S = 90.0
 AGENT_WAIT_S = 60.0
 IDLE_WAIT_S = 60.0
+FUTURE_WINDOW_S = 300.0                                    # window_start позже сейчас + 5 мин — отказ (р1, m7)
 ABORT_WAIT_S = 10.0
 STAND_CHECK_S = 60.0
 STAND_STRIKES = 3
@@ -190,8 +198,12 @@ def status_main(out: Path, stale_s: float) -> int:
         print("прогон: progress.json не объект")
         return 1
     state = st.get("state")
+    by_place = st.get("by_place") if isinstance(st.get("by_place"), dict) else {}
+    stopped = sorted(f"{int(n):02d}" for n, v in by_place.items()
+                     if isinstance(v, dict) and v.get("status") == "stopped" and str(n).isdecimal())
+    tail = f", места остановлены: {', '.join(stopped)}" if stopped else ""
     print(f"прогон {st.get('run_id')}: {state}, сделано {st.get('done')} из {st.get('total')}, повтор {st.get('rep')},"
-          f" причина {st.get('stop_reason') or '-'}")
+          f" причина {st.get('stop_reason') or '-'}{tail}")
     if state == "finished":
         return 0
     if state in ("stopped", "paused"):
@@ -318,6 +330,7 @@ class Runner:
         self._live: dict[int, str] = {}
         self._waiting: dict[int, float] = {}
         self._ended: set[str] = set()
+        self._turned: set[str] = set()                  # сессии с законченным ходом (строки журнала — у каждой)
         self._thread_errors: list[BaseException] = []
         latest: dict[RunKey, RunRecord] = {}
         for rec in load_records(self.out):
@@ -395,6 +408,9 @@ class Runner:
         """Порядок Д8-R74 (см. шапку); расхождение — RunRefused с кодом, замок и пульс снимаются."""
         if self._prepared:
             return
+        ws = self.cfg.window_start
+        if ws is not None and ws > self.now() + timedelta(seconds=FUTURE_WINDOW_S):
+            raise RunRefused("window_start")             # начало окна — первая строка Б5, не будущее (р1, m7)
         self._acquire_lock()
         try:
             with self._lock:
@@ -414,6 +430,10 @@ class Runner:
                     log.warning("подготовка: место %02d не готово (%s)", n, type(exc).__name__)
                     raise RunRefused("not_ready") from None
             self._resume_sessions()
+            for n in self.cfg.places:                     # чужой прогонщик (другой OUT) на тех же местах (р1, m4)
+                if not self._until(lambda n=n: not self.chats[n].session_status(), IDLE_WAIT_S):
+                    log.warning("подготовка: на месте %02d идёт чужой разговор", n)
+                    raise RunRefused("place_busy")
             for n, ref in self.cfg.places.items():
                 if self.stand.place_model(n) != ref:
                     log.warning("подготовка: модель места %02d — не из конфига", n)
@@ -476,9 +496,6 @@ class Runner:
                     if exc.status != 404:
                         raise RunRefused("not_ready") from None
             self._journal(sid, targets[0], "end")
-            for p in targets:
-                if not self._until(lambda p=p: not self.chats[p].session_status(), IDLE_WAIT_S):
-                    raise RunRefused("not_ready")
             log.info("возобновление: сессия прошлого запуска прервана (место %02d)", targets[0])
 
     def _card_tags(self) -> list[str]:
@@ -676,8 +693,12 @@ class Runner:
                 if attempt < HEALTH_TRIES - 1:
                     self.sleep(HEALTH_PAUSE_S)
         run = health.get("run") if isinstance(health, dict) else None
-        if not isinstance(run, dict) or run.get("id") != self.cfg.run_id:
+        if health is None:
             self._set_stop("stand")
+            return True
+        if not isinstance(run, dict) or run.get("id") != self.cfg.run_id:
+            log.warning("в /health/llm нет блока этого прогона — потолок прокси его не держит")
+            self._set_stop("stand", hard=True)           # ни новых прогонов, ни реплик (р1, I2)
             return True
         spent = float(run.get("spent_usd") or 0.0)
         cap = min(self.cfg.cap_usd, float(run.get("cap_usd") or self.cfg.cap_usd))
@@ -687,6 +708,20 @@ class Runner:
             self._set_stop("cap")
             return True
         return False
+
+    def _run_guard(self) -> None:
+        """Перед каждой репликой: блок run этого прогона есть в /health/llm, иначе жёсткая остановка stand (р1, I2).
+        /health/llm не прочитан — реплика идёт: потолок держит прокси, а молчание стенда ловят проверки повтора."""
+        try:
+            health = self.stand.health_llm()
+        except Exception as exc:
+            log.warning("/health/llm не прочитан перед репликой (%s)", type(exc).__name__)
+            return
+        run = health.get("run") if isinstance(health, dict) else None
+        if not isinstance(run, dict) or run.get("id") != self.cfg.run_id:
+            log.warning("в /health/llm нет блока этого прогона — реплики остановлены")
+            self._set_stop("stand", hard=True)
+            raise _RunStatus("interrupted")
 
     # --- прогон ---
 
@@ -766,9 +801,17 @@ class Runner:
             while msg is not None:
                 if self._hard.is_set():
                     raise _RunStatus("interrupted")
+                if self.clock() >= deadline:              # срок вышел между ходами — реплики нет (р1, m1)
+                    raise _RunStatus("timeout")
+                self._run_guard()
                 self._gw(place, chat.send, session, msg, agent)
                 sent = self.now()
+                if self._interrupt.is_set():              # сигнал пришёл, пока реплика уходила (р1, m2)
+                    self._abort(place, session)
+                    raise _RunStatus("interrupted")
                 messages = self._wait_turn(place, session, deadline)
+                with self._lock:
+                    self._turned.add(session)
                 turn = parse_turn(messages, since, msg)
                 since = len(messages)
                 if not turn.started:
@@ -923,28 +966,37 @@ class Runner:
                 rec.notes.append(f"калькулятор: сбой {type(exc).__name__}")
 
     def _llm_rows(self, rec: RunRecord) -> None:
-        """Строки журнала прокси сессий прогона; model строки — не модель места → stand_error (Д8-R71)."""
+        """Строки журнала прокси сессий прогона (Д8-R71): у КАЖДОЙ сессии с законченным ходом (и у моста) есть строки
+        (р1, m6), model строк — модель места; иначе — stand_error у прогона done или timeout."""
         if not rec.sessions:
             return
+        with self._lock:
+            need = [s for s in rec.sessions if s in self._turned]
+        checked = rec.status in ("done", "timeout")
+
+        def missing(rows: list[dict]) -> list[str]:
+            have = {r.get("session") for r in rows}
+            return [s for s in need if s not in have]
         try:
             rows = self.stand.llm_rows(rec.sessions)
-            if not rows and rec.status == "done":
+            if checked and missing(rows):
                 self.sleep(ROWS_RETRY_S)                    # журнал пишет строки с задержкой (flush)
                 rows = self.stand.llm_rows(rec.sessions)
         except Exception as exc:
             rec.notes.append(f"журнал прокси не прочитан: {type(exc).__name__}")
-            if rec.status == "done":
+            if checked:
                 rec.status = "stand_error"
             return
         rec.llm_rows = rows
         expected = rec.model.split("/", 1)[1]
         if any(r.get("model") != expected for r in rows):
             rec.notes.append("модель в журнале прокси — не модель места")
-            if rec.status in ("done", "timeout"):
+            if checked:
                 rec.status = "stand_error"
-        elif not rows and rec.status == "done":
-            rec.notes.append("у сессий прогона нет строк журнала прокси")
-            rec.status = "stand_error"
+        elif missing(rows):
+            rec.notes.append("у сессии с законченным ходом нет строк журнала прокси")
+            if checked:
+                rec.status = "stand_error"
 
     def _finish(self, rec: RunRecord) -> None:
         for session in rec.sessions:
@@ -979,14 +1031,14 @@ class Runner:
             except Exception as exc:
                 self._not_ready(key, exc)
                 continue
-            wall = self.now()
+            if self._cap_reached():
+                break
+            wall = self.now()                             # после /health/llm: он мог идти долго (р1, m3)
             span = timedelta(seconds=self.cfg.run_timeout_s[BY_ID[key.scenario].group])
             if wall + span > self.window_end():
                 with self._lock:
                     self._window_hit = True
                 continue
-            if self._cap_reached():
-                break
             self._run(key, wall)
         with self._lock:
             if self._place[place]["status"] != "stopped":
@@ -1027,14 +1079,12 @@ class Runner:
             t.start()
         strikes = 0
         next_check = self.clock() + STAND_CHECK_S
-        aborted = False
         while True:
             alive = [t for t in threads if t.is_alive()]
             if not alive:
                 break
             alive[0].join(BARRIER_TICK_S)
-            if self._interrupt.is_set() and not aborted:
-                aborted = True
+            if self._interrupt.is_set():                  # каждый такт: реплика могла уйти после прошлого abort
                 self._abort_live()
             self._keepalive()
             if self.clock() >= next_check:
@@ -1074,10 +1124,15 @@ class Runner:
             self._run_rep(rep, keys)
             if self._stop_reason is not None or self._window_hit:
                 break
-        reason = self._stop_reason or ("window" if self._window_hit else None)
+        reason = self._stop_reason
         if reason is None:
-            stopped = all(self._place[n]["status"] == "stopped" for n in self.cfg.places)
-            reason = "stand" if stopped and len(self._done_keys & self._plan_set) < len(self.plan) else "finished"
+            undone = {k.place for k in self.plan if k not in self._done_keys}
+            stopped = [n for n in self.cfg.places if self._place[n]["status"] == "stopped" and n in undone]
+            if stopped:                                   # у остановленного места остались прогоны (р1, I1)
+                log.warning("места остановлены: %s", ", ".join(f"{n:02d}" for n in stopped))
+                reason = "place"
+            else:
+                reason = "window" if self._window_hit else "finished"
         with self._lock:
             if self._stop_reason is None and reason != "finished":
                 self._stop_reason = reason
