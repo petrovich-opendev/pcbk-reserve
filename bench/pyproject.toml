@@ -1,0 +1,12 @@
+[project]
+name = "pcbk-bench"
+version = "0.1.0"
+requires-python = ">=3.12"
+description = "Стенд отбора модели (Д8): только stdlib, только машина разработчика — в образы и на сервер не едет"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+# uv run не создаёт здесь .venv и uv.lock
+[tool.uv]
+managed = false
