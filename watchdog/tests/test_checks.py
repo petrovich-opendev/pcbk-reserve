@@ -1743,6 +1743,7 @@ def test_teacher_off_contract_reply_has_own_text(json_site):                   #
                 *({**T_BASE, k: v} for k in counts for v in (-1, True, 1.5, "1", None)),
                 *({**T_BASE, k: v} for k in ("shares_sum_usd", "total_usd") for v in ("1000", None, True, [], 10 ** 400)),
                 {**T_BASE, "shares_sum_usd": -0.01}, {**T_BASE, "total_usd": 0}, {**T_BASE, "total_usd": -5},
+                {**T_BASE, "shares_drift": 11}, {**T_BASE, "shares_drift": 10 ** 4000},   # мест больше десяти (р1, m-1)
                 {**T_BASE, "drill": None}, {**T_BASE, "drill": "SHARES_STALE"}, {**T_BASE, "drill": "freeze_reload"},
                 {**T_BASE, "drill": "journal_down "}, {**T_BASE, "drill": " "}):
         assert teacher_row(json_site, obj) == TEACHER_OFF, obj
@@ -1782,3 +1783,22 @@ def test_teacher_drill_goes_first_in_note(json_site):
            ("fail", "журнал действий преподавателя не пишется — кабинет закрыт", "учения: journal_down")
     assert teacher_row(json_site, {**down, "store_ok": True, "checked_at": None}) == \
            ("unknown", "сверка долей ещё не проходила", "учения: journal_down")
+
+
+def test_teacher_huge_money_is_off_contract_not_check_error(json_site):          # доводка р1, I-1: как у check_llm
+    # fmt_usd (Decimal, 28 знаков) не форматирует сумму от 1e26: строка — «не по договору», а не «ошибка проверки»
+    for obj in ({**T_BASE, "shares_sum_usd": 1e30}, {**T_BASE, "shares_sum_usd": 1e26},
+                {**T_BASE, "shares_sum_usd": 1e30, "total_usd": 1e300}):
+        TeacherReply.parse(obj)                                                    # разбор пропускает: число по договору
+        assert teacher_row(json_site, obj) == TEACHER_OFF, obj
+    assert teacher_row(json_site, {**T_BASE, "shares_sum_usd": 5e-324, "total_usd": 1e300})[:2] == \
+           ("ok", "доли сходятся, журнал действий пишется")                         # малые и большие, но форматируемые
+    assert teacher_row(json_site, {**T_BASE, "shares_sum_usd": 1e25})[:2] == \
+           ("warn", "сумма долей мест больше общего бюджета — держит общий бюджет")
+
+
+def test_teacher_drift_bounded_by_places(json_site):                             # доводка р1, m-1: note не растёт
+    assert teacher_row(json_site, {**T_BASE, "shares_drift": 10}) == \
+           ("fail", "LLM-прокси считает доли не так, как сохранено", "мест: 10")       # все десять мест — по договору
+    for drift in (11, 10 ** 4000):
+        assert teacher_row(json_site, {**T_BASE, "shares_drift": drift}) == TEACHER_OFF, drift

@@ -173,6 +173,8 @@ TEACHER_KEYS = frozenset({"checked_at", "shares_loaded", "shares_ok", "shares_dr
                           "store_ok", "reads_1h", "read_failed_1h", "changes_1h", "change_failed_1h", "role_refused_1h",
                           "drill"})
 TEACHER_DRILL_MODES = frozenset({"shares_stale", "journal_down"})
+# мест в стенде: shares_drift — число мест с расхождением, больше — не по договору (длина note ограничена)
+TEACHER_PLACES = 10
 TEACHER_DOWN_DETAIL = "кабинет преподавателя не отвечает"
 TEACHER_NOT_DEPLOYED_DETAIL = "кабинет преподавателя ещё не выложен"   # 404: core старше сторожа (выкладка)
 TEACHER_OFF_CONTRACT_DETAIL = "кабинет преподавателя ответил не по договору"
@@ -1125,8 +1127,8 @@ class TeacherReply:
     @classmethod
     def parse(cls, reply) -> "TeacherReply":
         """Ответ не по договору — только ValueError (Ш8), как у AgentsReply: не объект JSON, лишний или недостающий
-        ключ, тип не тот, счётчик или сумма долей меньше нуля, total_usd не больше нуля, деньги — не конечное число,
-        drill не "" и не из TEACHER_DRILL_MODES."""
+        ключ, тип не тот, счётчик или сумма долей меньше нуля, shares_drift больше TEACHER_PLACES, total_usd не больше
+        нуля, деньги — не конечное число, drill не "" и не из TEACHER_DRILL_MODES."""
         if not isinstance(reply, dict):
             raise ValueError("ответ — не объект JSON")
         if set(reply) != TEACHER_KEYS:
@@ -1143,6 +1145,8 @@ class TeacherReply:
             raise ValueError(f"ответ кабинета преподавателя не по договору: {type(e).__name__} {e}") from e
         if r.shares_sum_usd < 0:
             raise ValueError("shares_sum_usd — меньше нуля")
+        if r.shares_drift > TEACHER_PLACES:
+            raise ValueError("shares_drift — больше числа мест")
         if r.total_usd <= 0:
             raise ValueError("бюджет не больше нуля")
         if r.drill and r.drill not in TEACHER_DRILL_MODES:
@@ -1191,7 +1195,8 @@ def check_teacher(component: str, title: str, url: str, now: datetime, stale_s: 
 
     Нет ответа, срок, не JSON, код не 200 и не 404 — «кабинет преподавателя не отвечает»; 404 (core старше сторожа во
     время выкладки) — «неизвестно»; JSON не по договору — свой текст (Ш8). При учениях к note любой строки таблицы первым
-    добавляется «учения: <режим>».
+    добавляется «учения: <режим>». Сумма, которую не форматирует fmt_usd (Decimal: от 1e26 — больше 28 знаков), — тоже
+    «не по договору», а не «ошибка проверки» (как у check_llm, доводка р1 А1, I-1).
     """
     try:
         status, body = _http_get(url, timeout, lambda code: code == 200)
@@ -1207,9 +1212,9 @@ def check_teacher(component: str, title: str, url: str, now: datetime, stale_s: 
         return Check(component, title, "fail", TEACHER_DOWN_DETAIL)
     try:
         parsed = TeacherReply.parse(reply)
-    except ValueError:
+        state, detail, note = teacher_verdict(parsed, now, stale_s)
+    except (ValueError, ArithmeticError):   # ArithmeticError — Decimal fmt_usd (InvalidOperation), как у check_llm
         return Check(component, title, "fail", TEACHER_OFF_CONTRACT_DETAIL)
-    state, detail, note = teacher_verdict(parsed, now, stale_s)
     if parsed.drill:
         note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
     return Check(component, title, state, detail, note)
