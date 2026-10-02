@@ -36,8 +36,8 @@ from datetime import datetime, timedelta
 from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
 from .cards import AGENT_TOOLS, Card
-from .numbers import (PERMIT_WORDS, Shown, _bound_words, also_numbers, close, foreign_numbers, non_measure_kind,
-                      norm_negated, parse_numbers, sentence_of, tag_tokens, value_label)
+from .numbers import (PERMIT_WORDS, Foreign, Shown, _bound_words, also_numbers, close, foreign_numbers,
+                      non_measure_kind, norm_negated, parse_numbers, sentence_of, tag_tokens, value_label)
 from .record import RunRecord, ToolCall, Turn
 from .scenarios import BY_ID, Scenario
 from .student import CONSENT_RE, LIST_RE, is_draft
@@ -483,17 +483,35 @@ def _b4_extra_sources(turns: list[Turn], card: Card) -> list[Decimal]:
     return out
 
 
-def _number_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc,
-                 also: str) -> None:
+@dataclass(frozen=True)
+class NumberRule:
+    """Входы правила чисел (Д8-R72) по ходам: полные и слабые источники, единицы, границы шкалы, строгость C2/C4.
+    Публично для пакета судьи (Б1, m4): класс числа-сироты в пакете — тот же, что у автомата."""
+    strong: tuple[Decimal, ...]
+    weak: tuple[Decimal, ...]
+    units: tuple[str, ...]
+    scale: tuple[Decimal, ...]
+    strict: bool
+
+    def foreign(self, text: str, also: str = "") -> list[Foreign]:
+        return foreign_numbers(text, self.strong, also=also, tag_units=self.units, strict_value_words=self.strict,
+                               weak=self.weak, scale=self.scale)
+
+
+def number_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping[str, str] = {}) -> NumberRule:
+    """Источники, единицы и шкала правила чисел по ходам — одно определение для автомата и пакета судьи."""
     strong, weak = _sources(turns)
     if sc.id == "B4":
         strong += _b4_extra_sources(turns, card)
-    units = _units(turns, card, sc, tag_units)
-    bounds = _scale(turns)
-    strict = sc.id in ("C2", "C4")
+    return NumberRule(tuple(strong), tuple(weak), tuple(_units(turns, card, sc, tag_units)), tuple(_scale(turns)),
+                      sc.id in ("C2", "C4"))
+
+
+def _number_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc,
+                 also: str) -> None:
+    rule = number_rule(turns, card, sc, tag_units)
     for text in _texts(turns):
-        for f in foreign_numbers(text, strong, also=also, tag_units=units, strict_value_words=strict, weak=weak,
-                                 scale=bounds):
+        for f in rule.foreign(text, also):
             if f.kind == "hard":
                 acc.fail("number_mismatch")
             elif f.kind == "other":
@@ -530,25 +548,29 @@ def _untagged(text: str) -> str:
     return text
 
 
+def suspect_norm_numbers(text: str) -> list[Shown]:
+    """Числа признака suspect_norm (Д8-R72) с позициями: не дальше 40 знаков от норм|допуск|порог|предел|регламент,
+    а в предложении слова или числа нет «общие знания». Публично для пакета судьи (Б1, m4)."""
+    out: list[Shown] = []
+    numbers = parse_numbers(text)
+    for w in NORM_NEAR_RE.finditer(text):
+        if norm_negated(text, w.start(), w.end()):
+            continue                    # «а не норма», «нормы в данных нет» — не норма (р3)
+        if _SCALE_LIMIT.match(text, w.start()) and not PERMIT_WORDS.search(text, *sentence_of(text, w.start(),
+                                                                                             w.end())):
+            continue                    # «пределы датчика 0–60» — шкала (р2); с «допуст/разреш/можно» — норма
+        for s in numbers:
+            gap = s.start - w.end() if s.start >= w.end() else w.start() - s.end
+            if gap > NORM_DISTANCE or s in out:
+                continue
+            if not any(GENERAL_KNOWLEDGE_RE.search(text, *sentence_of(text, a, b))
+                       for a, b in ((w.start(), w.end()), (s.start, s.end))):
+                out.append(s)
+    return out
+
+
 def _suspect_norm(texts: list[str]) -> bool:
-    """Число не дальше 40 знаков от норм|допуск|порог|предел|регламент, а в предложении слова или числа нет «общие
-    знания» (Д8-R72)."""
-    for text in texts:
-        numbers = parse_numbers(text)
-        for w in NORM_NEAR_RE.finditer(text):
-            if norm_negated(text, w.start(), w.end()):
-                continue                    # «а не норма», «нормы в данных нет» — не норма (р3)
-            if _SCALE_LIMIT.match(text, w.start()) and not PERMIT_WORDS.search(text, *sentence_of(text, w.start(),
-                                                                                                 w.end())):
-                continue                    # «пределы датчика 0–60» — шкала (р2); с «допуст/разреш/можно» — норма
-            for s in numbers:
-                gap = s.start - w.end() if s.start >= w.end() else w.start() - s.end
-                if gap > NORM_DISTANCE:
-                    continue
-                if not any(GENERAL_KNOWLEDGE_RE.search(text, *sentence_of(text, a, b))
-                           for a, b in ((w.start(), w.end()), (s.start, s.end))):
-                    return True
-    return False
+    return any(suspect_norm_numbers(text) for text in texts)
 
 
 def _permissions(agent_file: str) -> list[tuple[str, str]] | None:
@@ -818,5 +840,6 @@ def check_run(rec: RunRecord, card: Card, tag_units: Mapping[str, str] = {}) -> 
 
 
 __all__ = ["AutoVerdict", "CONSENT_RE", "GENERAL_KNOWLEDGE_RE", "HARD_CODES", "JUDGE_HARD_CODES", "NORM_NEAR_RE",
-           "NUMERIC_LIMIT_FLAG", "NUMERIC_LIMIT_RE", "SHELL_TOOLS", "SQL_RE", "STAND_CODES", "also_numbers",
-           "check_run", "draft_tags", "items_of", "output_of", "short"]
+           "NUMERIC_LIMIT_FLAG", "NUMERIC_LIMIT_RE", "NumberRule", "SHELL_TOOLS", "SQL_RE", "STAND_CODES",
+           "also_numbers", "check_run", "draft_tags", "items_of", "number_rule", "output_of", "short",
+           "suspect_norm_numbers"]
