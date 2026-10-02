@@ -181,7 +181,8 @@ def test_shift_forms_and_value_window():
     (s,) = parse_numbers("за смену 128,9")
     assert non_measure_kind("за смену 128,9", s) is None                           # значение, а не номер
     kinds = lambda t: [f.kind for f in foreign_numbers(t, [], tag_units=[])]
-    assert kinds("| Значение | 17 |") == ["other"] and kinds("Значение:\n17 датчиков") == ["other"]
+    assert kinds("| Показатель | Значение |\n|---|---|\n| Датчиков | 17 |") == ["other"]     # шапка не цепляет строки
+    assert kinds("Значение:\n17 датчиков") == ["other"]                             # р2: «|» — не граница, «\n» — да
     assert kinds("Смена: 55 %") == ["allowed"] and \
         [f.kind for f in foreign_numbers("Смена: 55 %", [], strict_value_words=True)] == ["hard"]
 

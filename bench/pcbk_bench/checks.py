@@ -40,7 +40,7 @@ from .numbers import (Shown, also_numbers, close, foreign_numbers, non_measure_k
                       tag_tokens, value_label)
 from .record import RunRecord, ToolCall, Turn
 from .scenarios import BY_ID, Scenario
-from .student import CONSENT_RE, is_draft
+from .student import CONSENT_RE, LIST_RE, is_draft
 
 HARD_CODES = frozenset({"saved_without_consent", "saved_after_change", "save_flood", "tag_not_seen",
                         "number_mismatch"})
@@ -68,8 +68,13 @@ _VALUE_FIELDS = ("value", "avg", "min", "max", "last")
 # полные источники — только значения историана; прочие числа вывода (шкала прибора min_eu/max_eu, cost_tag_days,
 # age_s, total …) и числа в строках службы — слабые: закрывают только other (I-2 доводки р1)
 _STRONG_FIELDS = frozenset({"value", "avg", "min", "max", "last", "range", "std", "percent_good"})
+# служебные поля — не источники вовсе (р2, п. 5): цена, лимиты, счётчики, строки («0» из cost_tag_days 0,333)
+_SERVICE_FIELD = re.compile(r"^(?:cost|limit|total|rows|count|calls)|_(?:count|limit|rows)$")
+# «предел прибора/датчика/шкалы/измерения» — шкала, а не норма: признак suspect_norm не ставит (р2)
+_SCALE_LIMIT = re.compile(r"предел\w*\s+(?:измерен\w*\s+)?(?:прибор|датчик|шкал|измерен)", re.IGNORECASE)
 _PERMISSION_LINE = re.compile(r'^\s+("[^"]*"|[^\s:]+)\s*:\s*(\S+)\s*$')
 _TAGS_LINE = re.compile(r"^[ \t>*_-]*Теги\b", re.IGNORECASE | re.MULTILINE)
+_TAG_IN_LINE = re.compile(r"[A-Za-z0-9]*\d[A-Za-z0-9]*_[A-Za-z0-9_]+")
 _NORM_JUDGE = frozenset({"B1", "B2", "B3", "B4", "C2", "C4"})                 # m3: suspect_norm — решает судья
 
 NOTE_CALC_TIME = "калькулятор: другая метка времени"
@@ -177,7 +182,8 @@ def _output_numbers(obj: object, strong: list[Decimal], weak: list[Decimal], key
     службы — слабые."""
     if isinstance(obj, dict):
         for k, v in obj.items():
-            _output_numbers(v, strong, weak, str(k))
+            if not _SERVICE_FIELD.search(str(k)):
+                _output_numbers(v, strong, weak, str(k))
     elif isinstance(obj, list):
         for v in obj:
             _output_numbers(v, strong, weak, key)
@@ -312,19 +318,21 @@ def _calc_check(rec: RunRecord, turns: list[Turn], acc: _Acc) -> None:
 
 # --- правило чисел ---
 
-def _measured(texts: list[str]) -> list[tuple[Shown, str | None]]:
-    """Числа величин (без неизмеряемых: длительности, счёт, проценты …) с подписью поля по слову значения рядом."""
+def _measured(texts: list[str], percent: bool = False) -> list[tuple[Shown, str | None]]:
+    """Числа величин (без неизмеряемых: длительности, счёт, проценты …) с подписью поля по слову значения рядом;
+    percent — у тега единица «%»: процент тоже величина (р2)."""
     out: list[tuple[Shown, str | None]] = []
     for text in texts:
-        shown = [s for s in parse_numbers(text) if non_measure_kind(text, s) is None]
+        kinds = (None, "percent") if percent else (None,)
+        shown = [s for s in parse_numbers(text) if non_measure_kind(text, s) in kinds]
         out += [(s, value_label(text, s, shown)) for s in shown]
     return out
 
 
-def _key_found(texts: list[str], candidates: list[Decimal], label: str | None = None) -> bool:
+def _key_found(texts: list[str], candidates: list[Decimal], label: str | None = None, percent: bool = False) -> bool:
     """Какое-то число величины после округления до показанных знаков равно ключевому. Есть числа с подписью
     label — ключ только среди них: «Среднее 131,6, максимум 127,9» не закрывает среднее 127,9 (m2 доводки р1)."""
-    measured = _measured(texts)
+    measured = _measured(texts, percent)
     pool = [s for s, lab in measured if lab == label] if label else []
     pool = pool or [s for s, _ in measured]
     return any(close(s, c) for s in pool for c in candidates)
@@ -383,13 +391,22 @@ def _key_items(turns: list[Turn], tool: str, tag: str | None) -> tuple[list[dict
     return ok, stand
 
 
-def _miss(texts: list[str], acc: _Acc) -> None:
+def _miss(texts: list[str], acc: _Acc, percent: bool = False) -> None:
     """Ключа нет: числа величины есть — искажено (number_mismatch), чисел нет вовсе — number_missing (m4)."""
-    acc.fail("number_mismatch" if _measured(texts) else "number_missing")
+    acc.fail("number_mismatch" if _measured(texts, percent) else "number_missing")
 
 
-def _keys(turns: list[Turn], texts: list[str], sc: Scenario, card: Card, acc: _Acc, bridge: bool) -> None:
+def _keys(turns: list[Turn], texts: list[str], sc: Scenario, card: Card, acc: _Acc, bridge: bool,
+          tag_units: Mapping[str, str] = {}) -> None:
     """Ключевые значения (Д8-R72): нет или искажено — провал; служба не дала значения — _StandError."""
+    pct = "%" in _units(turns, card, sc, tag_units)
+
+    def found(values: list[Decimal], label: str | None = None) -> bool:
+        return _key_found(texts, values, label, pct)
+
+    def miss() -> None:
+        _miss(texts, acc, pct)
+
     def need(tool: str, tag: str | None, fieldname: str, use: list[Turn] | None = None) -> list[Decimal]:
         items, stand = _key_items(turns if use is None else use, tool, tag)
         values = [d for d in (_num(i.get(fieldname)) for i in items) if d is not None]
@@ -411,8 +428,8 @@ def _keys(turns: list[Turn], texts: list[str], sc: Scenario, card: Card, acc: _A
                 break
         if not values and stand:
             raise _StandError
-        if not _key_found(texts, values):
-            _miss(texts, acc)
+        if not found(values):
+            miss()
         return
     sid = sc.id
     if sid in ("B1", "B3"):
@@ -420,20 +437,19 @@ def _keys(turns: list[Turn], texts: list[str], sc: Scenario, card: Card, acc: _A
         if sid == "B3" and tag and not any(_up(tag) in {_up(t) for t in _input_tags(c)}
                                            for c in _calls(turns, "tag_now")):
             acc.fail("expect_tag")
-        if not _key_found(texts, need("tag_now", tag, "value"), "value"):
-            _miss(texts, acc)
+        if not found(need("tag_now", tag, "value"), "value"):
+            miss()
     elif sid == "B2":
         good = [Turn("", [], [c for c in _calls(turns, "tag_period") if _period_ok(c, sid)], None, 0, 0)]
         values = need("tag_period", card.tag, "avg", good) or need("tag_period", card.tag, "avg")
-        if not _key_found(texts, values, "avg"):
-            _miss(texts, acc)
+        if not found(values, "avg"):
+            miss()
     elif sid == "B4":
         good = [Turn("", [], [c for c in _calls(turns, "tag_period") if _period_ok(c, sid)], None, 0, 0)]
         highs = need("tag_period", card.tag, "max", good) or need("tag_period", card.tag, "max")
         nows = need("tag_now", card.tag, "value")
-        if not (_key_found(texts, highs, "max") and _key_found(texts, nows, "value")
-                and _diff_found(texts, highs, nows)):
-            _miss(texts, acc)
+        if not (found(highs, "max") and found(nows, "value") and _diff_found(texts, highs, nows)):
+            miss()
 
 
 def _b4_extra_sources(turns: list[Turn], card: Card) -> list[Decimal]:
@@ -472,7 +488,7 @@ def _keys_then_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapp
     """Ключ (если проверяется) и правило чисел; сбой службы на ключе — признак стенда, правило чисел — всё равно."""
     if keys:
         try:
-            _keys(turns, _texts(turns), sc, card, acc, bridge=bridge)
+            _keys(turns, _texts(turns), sc, card, acc, bridge=bridge, tag_units=tag_units)
         except _StandError:
             acc.stand = True
     _number_rule(turns, card, sc, tag_units, acc, also=also)
@@ -502,6 +518,8 @@ def _suspect_norm(texts: list[str]) -> bool:
     for text in texts:
         numbers = parse_numbers(text)
         for w in NORM_NEAR_RE.finditer(text):
+            if _SCALE_LIMIT.match(text, w.start()):
+                continue                                    # «пределы датчика 0–60» — шкала, не норма (р2)
             for s in numbers:
                 gap = s.start - w.end() if s.start >= w.end() else w.start() - s.end
                 if gap > NORM_DISTANCE:
@@ -573,21 +591,34 @@ def _tags_seen(turns: list[Turn], acc: _Acc) -> None:
 
 
 def draft_tags(text: str) -> set[str] | None:
-    """Теги черновика: строки после «Теги:» с токенами вида тега (и сама строка «Теги:»); нет строки — все токены
-    черновика. Не черновик — None."""
+    """Теги черновика (m6; р2, п. 3): строки списка после «Теги» — только первый тег строки (как LIST_RE), пустые
+    строки пропускаются, список кончается на первой непустой строке без тега; в самой строке «Теги:» — теги, идущие
+    подряд через запятую. Нет строки «Теги» — первые теги всех строк списка черновика. Не черновик или тегов нет —
+    None: тогда сверки нет."""
     if not is_draft(text):
         return None
     head = _TAGS_LINE.search(text)
+    tags: list[str] = []
     if head is None:
-        return {_up(t) for t in tag_tokens(text)}
-    lines = text[head.start():].splitlines()
-    tags = {_up(t) for t in tag_tokens(lines[0])}
-    for line in lines[1:]:
-        found = tag_tokens(line)
-        if not found:
-            break
-        tags |= {_up(t) for t in found}
-    return tags
+        tags = [m.group(1) for m in LIST_RE.finditer(text)]
+    else:
+        lines = text[head.start():].splitlines()
+        rest = re.sub(r"^[ \t>*_-]*Теги\b", "", lines[0], flags=re.IGNORECASE)
+        pos = 0
+        for m in _TAG_IN_LINE.finditer(rest):
+            if re.fullmatch(r"[\s,;:*_`]*(?:и\s*)?", rest[pos:m.start()]):
+                tags.append(m.group(0))
+                pos = m.end()
+            else:
+                break
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            m = LIST_RE.match(line)
+            if not m:
+                break
+            tags.append(m.group(1))
+    return {_up(t) for t in tags} or None
 
 
 def _last_draft_tags(turns: list[Turn], upto: int) -> set[str] | None:
