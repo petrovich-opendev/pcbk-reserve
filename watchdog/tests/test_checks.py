@@ -19,7 +19,7 @@ from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_K
                                   check_historian, check_http, check_llm, check_memory, check_tls, check_web,
                                   fmt_total, fmt_usd, not_installed, tls_verdict,
                                   LLM_RUN_SILENT_S, RUN_CAP_DETAIL, RUN_KEYS, RUN_SILENT_DETAIL, LlmReply,
-                                  llm_note, llm_verdict)
+                                  DRILL_NOTE, FAILING_MAX, TOOL_FAILING_DETAIL, llm_note, llm_verdict)
 from pcbk_watchdog import checks as checks_module
 from pcbk_watchdog.journal import Journal
 
@@ -410,6 +410,68 @@ def test_historian_off_contract_reply_has_own_text(fake_core):
                 fresh(5, catalog_age_s="много"), fresh(float("-inf")), fresh(float("nan"))):
         fake_core.set(obj)
         r = check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5)
+        assert (r.state, r.detail) == OFF_CONTRACT, obj
+
+
+# Д9а, задача А1: серия ошибок по инструменту и учение DRILL_DATA (Д9-R83)
+
+def test_historian_failing_tools_row(fake_core):                                  # Review Focus 3
+    gate = {"user_paused": False, "p95_ms": 100}
+    cases = [(fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": ["tag_series"]}),
+              ("warn", TOOL_FAILING_DETAIL, "tag_series")),                       # мало вызовов — доля молчит, серия нет
+             (fresh(10, gate=gate, tools={"recent": 40, "errors": 6, "failing": ["calc_runtime", "tag_series"]}),
+              ("warn", TOOL_FAILING_DETAIL, "calc_runtime, tag_series")),
+             (fresh(10, gate=gate, tools={"recent": 50, "errors": 12, "failing": ["tag_now"]}),
+              ("warn", "инструменты отвечают ошибкой", "12 из 50")),             # доля — раньше серии
+             (fresh(10, gate=gate, tools={"recent": 40, "errors": 0, "failing": []}),
+              ("ok", "последняя метка 10 с назад", "")),
+             (fresh(10, gate=gate, tools={"recent": 40, "errors": 0}),
+              ("ok", "последняя метка 10 с назад", ""))]                          # core старше Д9а
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+        assert len(r.detail) <= 80
+    for bad in ({"recent": 3, "errors": 3, "failing": "tag_now"}, {"recent": 3, "errors": 3, "failing": [1]},
+                {"recent": 3, "errors": 3, "failing": ["DROP TABLE"]},
+                {"recent": 3, "errors": 3, "failing": ["tag_now"] * 9}):
+        assert (hist(fake_core, fresh(10, gate=gate, tools=bad)).state,
+                hist(fake_core, fresh(10, gate=gate, tools=bad)).detail) == OFF_CONTRACT, bad
+
+
+def test_historian_drill_note(fake_core):                                         # m4 критики р1
+    gate = {"user_paused": False, "p95_ms": 100}
+    r = hist(fake_core, fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": ["tag_series"]},
+                              drill="tool_error"))
+    assert (r.state, r.detail, r.note) == ("warn", TOOL_FAILING_DETAIL, "tag_series; учения: tool_error")
+    r = hist(fake_core, fresh(10, gate=gate, tools={"recent": 0, "errors": 0, "failing": []}, drill="tool_error"))
+    assert (r.state, r.note) == ("ok", "учения: tool_error")
+    assert hist(fake_core, fresh(10, drill=None)).note == ""
+    assert (hist(fake_core, fresh(10, drill="other")).state,) == ("unknown",)
+
+
+# сверх брифа: учение — в note строки любого состояния; вид failing проверяется и при сработавшей доле
+
+
+def test_historian_drill_note_any_state_and_failing_edges(fake_core):
+    gate = {"user_paused": False, "p95_ms": 100}
+    cases = [(fresh(901, drill="tool_error"), ("fail", "последняя метка старше 900 с", DRILL_NOTE)),
+             (fresh(None, checked_at=None, drill="tool_error"),
+              ("unknown", "служба ещё не опрашивала историан", DRILL_NOTE)),
+             (fresh(10, gate=gate, tools={"recent": 50, "errors": 12, "failing": ["tag_now"]}, drill="tool_error"),
+              ("warn", "инструменты отвечают ошибкой", f"12 из 50; {DRILL_NOTE}")),
+             (fresh(10, drill=""), ("ok", "последняя метка 10 с назад", "")),
+             (fresh(10, gate=gate, tools={"recent": 8, "errors": 8, "failing": [f"tool_{c}" for c in "abcdefgh"]}),
+              ("warn", TOOL_FAILING_DETAIL, ", ".join(f"tool_{c}" for c in "abcdefgh")))]
+    assert FAILING_MAX == 8
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+    for obj in (fresh(10, gate=gate, tools={"recent": 50, "errors": 12, "failing": "tag_now"}),
+                fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": ["t" * 33]}),
+                fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": [""]}),
+                fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": None}),
+                fresh(10, drill=5), fresh(10, drill=["tool_error"]), fresh(None, checked_at=None, drill="other")):
+        r = hist(fake_core, obj)
         assert (r.state, r.detail) == OFF_CONTRACT, obj
 
 

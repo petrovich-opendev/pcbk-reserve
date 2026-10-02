@@ -3,20 +3,21 @@ import asyncio
 import json
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
 
 from fakes import LIVE_ROWS
-from helpers import make_role, make_service, sent_of
+from helpers import SETTINGS, make_role, make_service, sent_of
 from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data import service as service_module
 from pcbk_core.data.gate import GateRefused, GateResult, SlidingWindow
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.periods import Period
-from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, ERROR_MESSAGE, ITEM_TEXTS, MESSAGES, NO_LAST_NOTE,
-                                    OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE, SOURCE_LIVE, SOURCE_SUMMARY, STD_KIND,
-                                    TOOL_WINDOW)
+from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, DRILL_SUMMARY, ERROR_MESSAGE, FAIL_STALE_S, FAIL_STREAK,
+                                    ITEM_TEXTS, MESSAGES, NO_LAST_NOTE, OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE,
+                                    SOURCE_LIVE, SOURCE_SUMMARY, STD_KIND, TOOL_WINDOW)
 from pcbk_core.data.sql import HAS_LAST, SUMMARY_COLUMNS, clock_sql, live_sql
 from pcbk_core.logs import setup_logging
 
@@ -509,7 +510,7 @@ async def test_tools_stats_window(svc):
         s.role.gate.clear_pause()
     fake.fail = None
     await s.tag_now("student-09", "mcp", ["20FAKE_001_PV"])
-    assert s.tools_stats() == {"recent": 4, "errors": 3}
+    assert s.tools_stats() == {"recent": 4, "errors": 3, "failing": []}
 
 
 async def test_catalog_search_event_has_returned(svc):
@@ -536,4 +537,77 @@ async def test_tools_stats_last_fifty_from_memory(svc, monkeypatch):
 
     monkeypatch.setattr(s.role.events, "recent", no_sqlite)
     monkeypatch.setattr(s.role.events, "count", no_sqlite)
-    assert s.tools_stats() == {"recent": TOOL_WINDOW, "errors": 1}
+    assert s.tools_stats() == {"recent": TOOL_WINDOW, "errors": 1, "failing": []}
+
+
+# Д9а, задача А1: серия ошибок по инструменту, канал web, учение DRILL_DATA (Д9-R83)
+
+
+async def test_failing_streak_per_tool(svc):                                     # Review Focus 3
+    s, fake = svc
+    fake.fail = HistorianError("query", "x")
+    for _ in range(FAIL_STREAK - 1):
+        await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert s.tools_stats()["failing"] == []
+    await s.tag_now("student-01", "mcp", ["20FAKE_001_PV"])
+    assert s.tools_stats()["failing"] == ["tag_now"]
+    fake.fail = None
+    await s.tag_period("student-01", "http", ["20FAKE_001_PV"], period="prev_shift")
+    assert s.tools_stats()["failing"] == ["tag_now"]                              # серия — своя у каждого инструмента
+    await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert s.tools_stats()["failing"] == []
+
+
+async def test_refusals_do_not_count_as_failing(svc):
+    s, _ = svc
+    for _ in range(FAIL_STREAK + 1):
+        await s.tag_now("student-01", "http", ["20FAKE_404_PV"])                 # refused — без SQL
+        await s.refuse_args("student-01", "mcp", "tag_period", ["x"], "tags: нужен список")
+    assert s.tools_stats()["failing"] == []
+
+
+async def test_web_channel_counted(svc):
+    s, fake = svc
+    fake.fail = HistorianError("query", "x")
+    for _ in range(FAIL_STREAK):
+        await s.tag_now("student-03", "web", ["20FAKE_001_PV"])
+    assert s.tools_stats() == {"recent": FAIL_STREAK, "errors": FAIL_STREAK, "failing": ["tag_now"]}
+    assert s.role.events.recent()[0].channel == "web"
+
+
+async def test_failing_expires_without_calls(svc):                                # m3 критики р1
+    s, fake = svc
+    fake.fail = HistorianError("query", "x")
+    for _ in range(FAIL_STREAK):
+        await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    s.role.monotonic.advance(FAIL_STALE_S - 1)                                    # FakeMono роли make_service
+    assert s.tools_stats()["failing"] == ["tag_now"]
+    s.role.monotonic.advance(2)
+    assert s.tools_stats()["failing"] == []
+
+
+async def test_drill_tool_error_no_sql(tmp_path):                                 # Review Focus 3
+    s, fake = make_service(tmp_path, settings=replace(SETTINGS, DRILL_DATA="tool_error"))
+    for _ in range(FAIL_STREAK):
+        r = await s.tag_now("ops", "http", ["20FAKE_001_PV"])
+        assert (r["status"], r["message"]) == ("error", ERROR_MESSAGE) and "items" not in r
+    assert fake.calls == [] and s.tools_stats()["failing"] == ["tag_now"]       # SQL не ушёл ни разу
+    assert s.role.events.recent()[0].summary == DRILL_SUMMARY
+    r = await s.catalog_search("ops", "http", "расход")                           # каталог в памяти — тоже без данных
+    assert r["status"] == "error" and "matches" not in r
+
+
+# сверх брифа: учение и у tag_period, отказ по аргументам остаётся отказом, строка журнала «error=drill» (Д9-R90)
+
+
+async def test_drill_tag_period_and_log_line(tmp_path, capfd, restore_logging):
+    setup_logging()
+    s, fake = make_service(tmp_path, settings=replace(SETTINGS, DRILL_DATA="tool_error"))
+    r = await s.tag_period("ops", "http", ["20FAKE_001_PV"], period="last_8h")
+    assert (r["status"], r["message"]) == ("error", ERROR_MESSAGE) and "items" not in r and "period" not in r
+    a = await s.refuse_args("ops", "mcp", "tag_now", ["x"], "tags: нужен список")
+    assert a["status"] == "refused" and fake.calls == []
+    e = s.role.events.recent()[1]
+    assert (e.tool, e.outcome, e.summary, e.sent, e.rows) == ("tag_period", "error", DRILL_SUMMARY, (), 0)
+    err = capfd.readouterr().err
+    assert "tool=tag_period caller=ops channel=http" in err and "rows=0" in err and "outcome=error error=drill" in err

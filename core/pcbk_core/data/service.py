@@ -2,9 +2,9 @@
 
 Порядок в каждом инструменте:
 0. ошибка настройки (F5) — ответ unavailable с причиной; ни частоты, ни каталога, ни ворот;
-1. частота вызывающего; 2. аргументы; 3. каталог загружен; 4. разбор имён (повторы схлопываются,
-   порядок — как во вводе); 5. период и бюджет (tag_period); 6. кэш → single-flight → ворота;
-7. ответ → событие → строка журнала.
+1. частота вызывающего; 1а. учение DRILL_DATA=tool_error — ответ error без SQL (Д9-R83); 2. аргументы;
+3. каталог загружен; 4. разбор имён (повторы схлопываются, порядок — как во вводе); 5. период и бюджет
+(tag_period); 6. кэш → single-flight → ворота; 7. ответ → событие → строка журнала.
 
 Любой отказ до ворот SQL не шлёт. Событие пишется на каждый вызов: requested — сырой ввод, tags —
 канонические имена со статусами ok/no_value/no_data, sent — только от ворот (GateResult.sent,
@@ -16,9 +16,13 @@ HistorianError.sent). У попадания в кэш, у ожидающего s
 «Сейчас историана» — последние часы (каталог, опрос свежести раз в 30 с) плюс прошедшее по
 монотонным часам роли; часы старше CLOCK_STALE_S сначала обновляются запросом [clock_sql()].
 
-Исходы последних TOOL_WINDOW вызовов каналов http и mcp служба держит в памяти (tools_stats): ручка
+Исходы последних TOOL_WINDOW вызовов каналов http, mcp и web служба держит в памяти (tools_stats): ручка
 /health/historian идёт в цикле событий, журнал событий там не читается (F9, К7). После перезапуска
-окно пустое.
+окно пустое. Там же — серии ошибок подряд по имени инструмента (Д9-R83): инструмент с серией не меньше
+FAIL_STREAK — в tools_stats()["failing"], пока его звали не дольше FAIL_STALE_S назад.
+
+Учение DRILL_DATA=tool_error (Д9-R83): каждый инструмент чтения сразу после частоты вызывающего отвечает
+ошибкой с summary DRILL_SUMMARY — SQL не уходит, данных (и каталога) в ответе нет.
 """
 from __future__ import annotations
 
@@ -86,6 +90,8 @@ STATE_LABELS = {"_RUN": ("работает", "стоит"), "_OPN": ("откры
 # непредвиденный сбой самой службы (и отказ ворот unlisted — его быть не должно): своего текста в MESSAGES нет
 ERROR_MESSAGE = "сбой службы данных — вызов записан в журнал"
 CONFIG_SUMMARY = "ошибка настройки"
+# summary события под учением DRILL_DATA=tool_error (Д9-R83)
+DRILL_SUMMARY = "учения: tool_error"
 
 CLOCK_STALE_S = 300.0           # часы старше — сначала [clock_sql()]
 TAG_CHARS = 128                 # строка тега (Global Constraints)
@@ -96,7 +102,9 @@ AHEAD_NOTE_S = 60               # метка впереди часов исто�
 STILL_NOTE_S = 600              # значение не менялось — заметка
 GOOD_PERCENT = 99.0
 CALLER_LOG_CHARS = 64
-TOOL_WINDOW = 50                # tools_stats: столько последних вызовов инструментов (http и mcp)
+TOOL_WINDOW = 50                # tools_stats: столько последних вызовов инструментов (http, mcp и web)
+FAIL_STREAK = 3                 # столько ошибок инструмента подряд — он в tools_stats()["failing"] (Д9-R83)
+FAIL_STALE_S = 1800.0           # инструмент не звали дольше (монотонные часы роли) — из failing уходит сам
 
 # код ошибки ворот или историана → текст для людей; исход — outcome_for (OUTCOME_BY_CODE, F11)
 _CODE_MESSAGES = {"connect": MESSAGES["connect"], "auth": MESSAGES["auth"], "timeout": MESSAGES["timeout"],
@@ -106,7 +114,7 @@ _DATA_STATUSES = frozenset({"ok", "no_value", "no_data"})
 _QUIET_OUTCOMES = frozenset({"ok", "partial", "refused", "budget", "rate"})
 # «инструменты отвечают ошибкой» (Д4б-R22): ошибка, срок или недоступность; отказы по правилам — не ошибка
 _TOOL_ERRORS = frozenset({"error", "timeout", "unavailable"})
-_TOOL_CHANNELS = frozenset({"http", "mcp"})
+_TOOL_CHANNELS = frozenset({"http", "mcp", "web"})
 _CLOCK_FLIGHT = "clock"         # ключ single-flight обновления часов; ключи кэша — sha256, не совпадут
 
 log = logging.getLogger("pcbk_core.data.service")
@@ -381,11 +389,23 @@ class DataService:
         self.per_caller = SlidingWindow(PER_CALLER_LIMIT, RATE_WINDOW_S) if per_caller is None else per_caller
         # исходы последних вызовов инструментов — только в памяти (К7); пополняет _finish в цикле событий
         self._tool_outcomes: deque[Outcome] = deque(maxlen=TOOL_WINDOW)
+        # ошибок подряд и момент последнего вызова по имени инструмента (Д9-R83) — тоже только в памяти
+        self._streaks: dict[str, int] = {}
+        self._last_called: dict[str, float] = {}
 
-    def tools_stats(self) -> dict[str, int]:
-        """{"recent": n, "errors": k} по последним TOOL_WINDOW вызовам каналов http и mcp; без ввода-вывода."""
+    def tools_stats(self) -> dict[str, Any]:
+        """{"recent": n, "errors": k, "failing": [...]} по вызовам каналов http, mcp и web; без ввода-вывода.
+
+        recent и errors — по последним TOOL_WINDOW вызовам; failing — инструменты с ошибками не меньше FAIL_STREAK
+        подряд, по алфавиту, кроме тех, кого не звали дольше FAIL_STALE_S (после обрыва и учений строка сторожа
+        не держит «внимание» до первого удачного вызова редкого калькулятора).
+        """
+        now = self.role.monotonic()
+        failing = sorted(tool for tool, streak in self._streaks.items()
+                         if streak >= FAIL_STREAK and now - self._last_called[tool] <= FAIL_STALE_S)
         return {"recent": len(self._tool_outcomes),
-                "errors": sum(1 for outcome in self._tool_outcomes if outcome in _TOOL_ERRORS)}
+                "errors": sum(1 for outcome in self._tool_outcomes if outcome in _TOOL_ERRORS),
+                "failing": failing}
 
     # --- инструменты ---
 
@@ -436,6 +456,7 @@ class DataService:
 
     async def _catalog_search(self, call: _Call, query: str, limit: int) -> dict[str, Any]:
         self._check_rate(call)
+        self._check_drill()
         reason = _query_problem(query, limit)
         if reason:
             raise _args_refusal(reason)
@@ -456,6 +477,7 @@ class DataService:
 
     async def _tag_now(self, call: _Call, tags: list[str]) -> dict[str, Any]:
         self._check_rate(call)
+        self._check_drill()
         reason = _tags_problem(tags)
         if reason:
             raise _args_refusal(reason)
@@ -478,6 +500,7 @@ class DataService:
     async def _tag_period(self, call: _Call, tags: list[str], preset: str | None, start: str | None,
                           end: str | None) -> dict[str, Any]:
         self._check_rate(call)
+        self._check_drill()
         reason = _tags_problem(tags) or _period_problem(preset, start, end)
         if reason:
             raise _args_refusal(reason)
@@ -540,6 +563,11 @@ class DataService:
     def _check_rate(self, call: _Call) -> None:
         if not self.per_caller.allow(call.caller, self.role.monotonic()):
             raise _Refusal("rate", MESSAGES["rate"], "rate: частота вызывающего")
+
+    def _check_drill(self) -> None:
+        """Учение DRILL_DATA=tool_error (Д9-R83) — сразу после частоты: ни аргументов, ни каталога, ни ворот."""
+        if self.role.settings.DRILL_DATA == "tool_error":
+            raise _Refusal("error", ERROR_MESSAGE, DRILL_SUMMARY, error="drill")
 
     def _loaded_catalog(self) -> Catalog:
         """До загрузки каталог отвечает unknown на любое имя — поэтому сначала loaded."""
@@ -716,9 +744,16 @@ class DataService:
         return await self._finish(call, answer, error)
 
     async def _finish(self, call: _Call, answer: dict[str, Any], error: str | None = None) -> dict[str, Any]:
-        """Событие — в потоке (asyncio.to_thread роли), SQLite не в цикле; сбой записи ответ не ломает."""
+        """Событие — в потоке (asyncio.to_thread роли), SQLite не в цикле; сбой записи ответ не ломает.
+
+        Окно исходов и серия ошибок инструмента — только у каналов http, mcp и web: ошибка, срок или недоступность
+        продлевают серию, любой другой исход её обнуляет (Д9-R83).
+        """
         if call.channel in _TOOL_CHANNELS:
-            self._tool_outcomes.append(answer["status"])
+            status = answer["status"]
+            self._tool_outcomes.append(status)
+            self._streaks[call.tool] = (self._streaks.get(call.tool, 0) + 1) if status in _TOOL_ERRORS else 0
+            self._last_called[call.tool] = self.role.monotonic()
         event = self._event(call, answer["status"])
         if event is not None:
             await self.role._write_event(event)

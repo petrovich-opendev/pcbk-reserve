@@ -68,6 +68,13 @@ USER_PAUSED_DETAIL = "запросы людей к историану на па�
 # порог — из SLOW_P95_MS: при его смене текст не соврёт (5000 → «5 с», 5500 → «5,5 с»)
 SLOW_P95_DETAIL = f"историан отвечает медленно: p95 больше {format(SLOW_P95_MS / 1000, 'g').replace('.', ',')} с"
 TOOL_ERRORS_DETAIL = "инструменты отвечают ошибкой"
+# серия ошибок по инструменту (Д9-R83): необязательное поле tools.failing службы Д9а — имена в note
+TOOL_FAILING_DETAIL = "инструменты службы данных отвечают ошибкой подряд"
+FAILING_MAX = 8
+TOOL_NAME_RE = re.compile(r"[a-z_]{1,32}")
+# учение службы данных (необязательное поле drill): дописывается к note строки любого состояния
+DATA_DRILL_MODES = frozenset({"tool_error"})
+DRILL_NOTE = "учения: tool_error"
 
 # строка «LLM-прокси и бюджет» (задача 7 Д4а)
 LLM_DOWN_DETAIL = "LLM-прокси не отвечает"
@@ -376,11 +383,28 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
-    """Строки нагрузки историана (задача 1 Д4б): пауза людей, медленный p95, ошибки инструментов.
+def _failing(tools: dict) -> list[str] | None:
+    """tools.failing (Д9-R83): нет ключа — None (служба старше Д9а); иначе список не длиннее FAILING_MAX из имён
+    TOOL_NAME_RE — или TypeError/ValueError (ответ не по договору)."""
+    if "failing" not in tools:
+        return None
+    failing = tools["failing"]
+    if not isinstance(failing, list):
+        raise TypeError("tools.failing — не список")
+    if len(failing) > FAILING_MAX:
+        raise ValueError(f"tools.failing: больше {FAILING_MAX} имён")
+    if not all(isinstance(name, str) and TOOL_NAME_RE.fullmatch(name) for name in failing):
+        raise ValueError("tools.failing: не имя инструмента")
+    return failing
 
-    Нет ключа tools или новых полей gate (служба :d4a) — строка не срабатывает; поле не того вида —
-    TypeError или ValueError (ответ не по договору). «k из N» — в note: detail постоянный.
+
+def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
+    """Строки нагрузки историана (задача 1 Д4б): пауза людей, медленный p95, ошибки инструментов; после доли
+    ошибок — серия ошибок по инструменту (Д9-R83).
+
+    Нет ключа tools или новых полей gate (служба :d4a), нет tools.failing (служба старше Д9а) — строка не
+    срабатывает; поле не того вида — TypeError или ValueError (ответ не по договору). «k из N» и имена
+    инструментов — в note: detail постоянный.
     """
     gate = reply.get("gate")
     if gate is not None:
@@ -403,20 +427,43 @@ def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
         recent, errors = _count(tools, "recent"), _count(tools, "errors")
         if not 0 <= errors <= recent:
             raise ValueError("tools: число ошибок вне 0…recent")
+        failing = _failing(tools)           # вид — до вердикта доли: поле не по договору не прячется за долей
         if recent >= TOOL_ERRORS_MIN_CALLS and errors / recent >= TOOL_ERRORS_SHARE:
             return "warn", TOOL_ERRORS_DETAIL, f"{errors} из {recent}"
+        if failing:
+            return "warn", TOOL_FAILING_DETAIL, ", ".join(failing)
     return None
+
+
+def _drill(reply: dict) -> bool:
+    """Поле drill (Д9-R83): нет, null или пусто — учений нет; иначе только "tool_error", прочее — ValueError."""
+    drill = reply.get("drill")
+    if drill is None or drill == "":
+        return False
+    if not isinstance(drill, str) or drill not in DATA_DRILL_MODES:
+        raise ValueError("drill — неизвестное учение")
+    return True
 
 
 def historian_verdict(reply, now: datetime, warn_s: int, fail_s: int,
                       stale_s: int) -> tuple[State, str, str]:
     """Вердикт по ответу /health/historian: (состояние, detail, note); первая подходящая строка таблицы
-    задачи 6 Д3а со строками нагрузки задачи 1 Д4б перед каталогом.
+    задачи 6 Д3а со строками нагрузки задачи 1 Д4б перед каталогом. Под учением службы данных (drill) к note
+    строки любого состояния дописывается DRILL_NOTE через «; »: забытое учение видно на странице.
 
     Ответ не по договору — ValueError, TypeError, KeyError или OverflowError.
     """
     if not isinstance(reply, dict):
         raise TypeError("ответ — не объект JSON")
+    drill = _drill(reply)
+    state, detail, note = _historian_row(reply, now, warn_s, fail_s, stale_s)
+    if drill:
+        note = f"{note}; {DRILL_NOTE}" if note else DRILL_NOTE
+    return state, detail, note
+
+
+def _historian_row(reply: dict, now: datetime, warn_s: int, fail_s: int, stale_s: int) -> tuple[State, str, str]:
+    """Строка таблицы без учения; reply — уже объект JSON."""
     checked_raw = reply["checked_at"]
     if checked_raw is None:
         return "unknown", "служба ещё не опрашивала историан", ""

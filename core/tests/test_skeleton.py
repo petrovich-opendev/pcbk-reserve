@@ -82,6 +82,13 @@ def test_settings_errors_name_the_field():
             Settings.from_env({name: raw})
 
 
+def test_drill_data_setting():                                                  # Д9-R83
+    assert Settings.from_env({"DRILL_DATA": "tool_error"}).DRILL_DATA == "tool_error"
+    assert Settings.from_env({}).DRILL_DATA == ""
+    with pytest.raises(ValueError, match="DRILL_DATA"):
+        Settings.from_env({"DRILL_DATA": "calc"})
+
+
 def test_install_hook_exact_mounts_and_no_docs():                     # Review Focus 4
     with TestClient(create_app(SETTINGS, [DummyRole("data", (True, "ок"), installs=True)])) as c:
         assert c.get("/healthz").headers["X-Role-Installed"] == "1"

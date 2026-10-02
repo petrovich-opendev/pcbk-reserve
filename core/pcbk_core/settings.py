@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 # режимы учений свежести: "" — учений нет
 DRILL_MODES = frozenset({"", "freeze_stamps", "freeze_poll"})
+# учения службы данных (Д9-R83): tool_error — все инструменты чтения отвечают ошибкой без SQL; "" — учений нет
+DRILL_DATA_MODES = frozenset({"", "tool_error"})
 # два запаса ворот по 5 с: при меньшем сроке каталог не загрузится никогда
 MIN_CATALOG_DEADLINE_S = 10.0
 
@@ -26,6 +28,8 @@ class Settings:
     CATALOG_DEADLINE_S: float = 60.0
     # учения: freeze_stamps — метки не растут, freeze_poll — опрос встаёт после первого
     DRILL_FRESHNESS: str = ""
+    # учения службы данных: tool_error — инструменты чтения отвечают ошибкой, SQL не уходит (Д9-R83)
+    DRILL_DATA: str = ""
     # агенты студентов (Д7-R53): ${AGENTS_DIR} хоста на запись; student-NN — каталоги мест (их точки монтирования),
     # quarantine и archive — в корне, вне каталогов мест
     AGENTS_ROOT: str = "/srv/agents"
@@ -62,6 +66,8 @@ class Settings:
         if settings.DRILL_FRESHNESS not in DRILL_MODES:
             raise ValueError(f"DRILL_FRESHNESS: неизвестный режим {settings.DRILL_FRESHNESS!r}, "
                              "допустимо: пусто, freeze_stamps, freeze_poll")
+        if settings.DRILL_DATA not in DRILL_DATA_MODES:
+            raise ValueError(f"DRILL_DATA: неизвестный режим {settings.DRILL_DATA!r}, допустимо: пусто, tool_error")
         return settings
 
 
