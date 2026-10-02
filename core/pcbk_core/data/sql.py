@@ -11,13 +11,14 @@ tagname»), а второй LIKE отвергает. Поэтому здесь �
 инструкция или комментарий не проходят даже с именами из белого списка.
 
 Сводка (summary_sql) несёт ещё даты по DATE_FMT и значение интерполяции из
-WW_CONSTANTS; ворота пускают их через allowed_literal. Её SQL и форма
+PIN_INTERPOLATIONS (⊂ WW_CONSTANTS); ворота пускают их через allowed_literal. Её SQL и форма
 строятся из одних констант пробы (SummaryShape) — правка DATE_FMT,
 PIN_INTERPOLATION или HAS_LAST меняет и то, и другое.
 
 Ряд (series_sql, Д9-R84) — AnalogHistory на равномерной сетке: литерал 'Cyclic' из WW_CONSTANTS и число точек
-SERIES_MIN_POINTS…SERIES_MAX_POINTS без кавычек; форма пускает ровно эти числа. Наработка (state_sql, Д9-R85) —
-StateSummaryHistory одной корзиной, как сводка. ORDER BY нет ни там, ни там: порядок задаёт служба.
+SERIES_MIN_POINTS…SERIES_MAX_POINTS без кавычек; форма пускает ровно эти числа и не больше SERIES_MAX_TAGS имён.
+Наработка (state_sql, Д9-R85) — StateSummaryHistory одной корзиной, как сводка. ORDER BY нет ни там, ни там: порядок
+задаёт служба.
 """
 import re
 from collections.abc import Sequence
@@ -89,6 +90,9 @@ LAST_COLUMNS = ("Last", "LastDateTime")
 SERIES_MODE = "Cyclic"
 # значения ww-столбцов, которые ворота пускают литералом (закрытый набор)
 WW_CONSTANTS = frozenset({"STAIRSTEP", SERIES_MODE})
+# интерполяции сводки (PIN_INTERPOLATION) — своё подмножество: режим выборки ряда (Cyclic) — не интерполяция
+# (ревью А2, m-3: ошибочная правка пробы не должна дать сводку с wwInterpolationType = 'Cyclic')
+PIN_INTERPOLATIONS = frozenset({"STAIRSTEP"})
 
 
 @dataclass(frozen=True)
@@ -126,10 +130,10 @@ def _summary_head(shape: SummaryShape) -> str:
 
 
 def _summary_tail(shape: SummaryShape) -> str:
-    # значение интерполяции — только из WW_CONSTANTS: иначе ворота не пустили бы ни одной сводки,
-    # а кавычка в нём сломала бы литерал; для PIN_INTERPOLATION это ValueError уже при импорте
-    if shape.pin is not None and shape.pin not in WW_CONSTANTS:
-        raise ValueError("интерполяция сводки — только значение из WW_CONSTANTS")
+    # значение интерполяции — только из PIN_INTERPOLATIONS (⊂ WW_CONSTANTS): иначе ворота не пустили бы ни одной
+    # сводки, а кавычка в нём сломала бы литерал; для PIN_INTERPOLATION это ValueError уже при импорте
+    if shape.pin is not None and shape.pin not in PIN_INTERPOLATIONS:
+        raise ValueError("интерполяция сводки — только значение из PIN_INTERPOLATIONS")
     return _SUMMARY_CYCLES + ("" if shape.pin is None else f" AND wwInterpolationType = '{shape.pin}'")
 
 
@@ -200,6 +204,9 @@ _SERIES_START = " AND DateTime >= "
 _SERIES_END = " AND DateTime <= "
 _SERIES_GRID = f" AND wwRetrievalMode = '{SERIES_MODE}' AND wwCycleCount = "
 _STATE_HEAD = "SELECT TagName, " + ", ".join(STATE_COLUMNS) + " FROM StateSummaryHistory WHERE TagName IN "
+# список имён формы ряда — не больше SERIES_MAX_TAGS, как у series_sql (итоговое ревью Д9а, m-3): ворота — последняя
+# линия, ошибка службы с 16 именами ряда не прошла бы их
+_SERIES_NAME_LIST = rf"\({_NAME_LITERAL}(?:, {_NAME_LITERAL}){{0,{SERIES_MAX_TAGS - 1}}}\)"
 # число точек в форме — ровно десятичная запись одного из чисел SERIES_MIN_POINTS…SERIES_MAX_POINTS
 _POINTS_FORM = "(?:" + "|".join(str(n) for n in range(SERIES_MAX_POINTS, SERIES_MIN_POINTS - 1, -1)) + ")"
 
@@ -230,7 +237,8 @@ def state_sql(names: Sequence[str], start: datetime, end: datetime) -> str:
 
 def _series_form() -> re.Pattern[str]:
     date = _date_form(DATE_FMT)
-    return re.compile(re.escape(_SERIES_HEAD) + _NAME_LIST + re.escape(_SERIES_START) + date + re.escape(_SERIES_END)
+    return re.compile(re.escape(_SERIES_HEAD) + _SERIES_NAME_LIST + re.escape(_SERIES_START) + date
+                      + re.escape(_SERIES_END)
                       + date + re.escape(_SERIES_GRID) + _POINTS_FORM, re.ASCII)
 
 
