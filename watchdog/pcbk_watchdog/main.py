@@ -15,7 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, Check, check_container, check_historian,
-                     check_http, check_memory, check_tls, not_installed)
+                     check_http, check_llm, check_memory, check_tls, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
 from .page import Snapshot, is_stale, render_html, status_json
@@ -26,6 +26,7 @@ log = logging.getLogger("pcbk_watchdog")
 KINDS: dict[str, tuple[str, ...]] = {
     "memory": (), "http": ("url",), "tls": ("host", "port"), "docker_ping": (),
     "container": ("container", "sleeping_ok"), "absent": (), "historian": ("url",),
+    "llm": ("url",),
 }
 # виды без сети — их срок такта не отменяет
 LOCAL_KINDS = frozenset({"memory", "absent"})
@@ -166,6 +167,8 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
         return check_historian(cid, title, comp["url"], now, settings.HIST_WARN_S,
                                settings.HIST_FAIL_S, settings.HIST_STALE_S,
                                timeout=NET_CHECK_TIMEOUT_S)
+    if kind == "llm":
+        return check_llm(cid, title, comp["url"], now, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "tls":
         return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
                          timeout=NET_CHECK_TIMEOUT_S)

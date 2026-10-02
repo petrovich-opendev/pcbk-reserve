@@ -6,12 +6,13 @@
 - Ответ инструмента — 200 при любом его статусе.
 
 Тело разбирает FastAPI по моделям ниже; его ошибки (битый JSON, лишние теги, неизвестный период)
-ловит validation_handler в том же порядке: 401, 503, иначе 422 с событием refused. BodyLimit
-стоит на всём приложении до маршрутизации: тело больше MAX_BODY_BYTES — 413 и строка журнала, в том числе
-тело без длины. Оба крючка ставит DataRole.install — app.py не меняется.
+ловит validation_handler в том же порядке: 401, 503, иначе 422 с событием refused. DataRole.install
+регистрирует его в реестре крючков приложения на префикс /api/data/ (hooks.py). Предел тела — общее звено
+hooks.BodyLimit на всём приложении до маршрутизации: у /api/data/ и /mcp — по умолчанию, MAX_BODY_BYTES;
+больше — 413 и строка журнала, в том числе тело без длины. BodyLimit, size_text и safe_path живут в
+hooks.py, здесь — реэкспорт для прежних импортов.
 """
 import logging
-from collections import deque
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Request
@@ -19,9 +20,8 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, StringConstraints
-from starlette.datastructures import Headers
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ..hooks import DEFAULT_BODY_LIMIT, BodyLimit, safe_path, size_text  # noqa: F401 — реэкспорт Д3б
 from ..secrets import TokenTable
 from .periods import PRESETS
 from .service import QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
@@ -30,9 +30,8 @@ from .sql import MAX_NAMES
 if TYPE_CHECKING:
     from . import DataRole
 
-MAX_BODY_BYTES = 65536
+MAX_BODY_BYTES = DEFAULT_BODY_LIMIT
 UNAUTHORIZED = {"detail": "нужен токен"}
-PATH_LOG_CHARS = 100
 REASON_ERRORS = 3                       # ошибок разбора в тексте 422 — не больше
 # путь → инструмент
 DATA_TOOLS = {"/api/data/catalog_search": "catalog_search", "/api/data/tag_now": "tag_now",
@@ -57,16 +56,6 @@ class TagPeriodArgs(BaseModel):
     period: Literal[PRESETS] | None = None
     start: str | None = None
     end: str | None = None
-
-
-def size_text(n: int) -> str:
-    """Предел тела словами: 65536 — «64 КиБ», не кратное КиБ — в байтах."""
-    return f"{n // 1024} КиБ" if n % 1024 == 0 else f"{n} байт"
-
-
-def safe_path(path: str) -> str:
-    """Путь для строки журнала: управляющие и не-ASCII — экранами, не длиннее PATH_LOG_CHARS."""
-    return ascii(path)[1:-1][:PATH_LOG_CHARS]
 
 
 def bearer_caller(authorization: str | None, tokens: TokenTable) -> str | None:
@@ -203,64 +192,3 @@ def validation_handler(role: "DataRole"):
         return JSONResponse(answer, status_code=422)
 
     return handle
-
-
-class BodyLimit:
-    """Предел тела запроса — чистое ASGI-звено до маршрутизации (по образцу RequestBodyLimitMiddleware mcp).
-
-    Сначала Content-Length; затем тело читается целиком, но не больше max_bytes + 1 байта, и только
-    потом зовётся приложение с тем же телом заново. Так 413 выходит и на теле без длины, и на любом
-    пути: исключение из receive FastAPI превратил бы в 400, а транспорт MCP — в 500.
-    """
-
-    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES):
-        self.app = app
-        self.max_bytes = max_bytes
-        self.too_large = {"detail": f"тело запроса больше {size_text(max_bytes)}"}
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        declared = Headers(scope=scope).get("content-length")
-        if declared is not None:
-            try:
-                size = int(declared)
-            except ValueError:
-                size = None
-            if size is not None and size > self.max_bytes:
-                await self._too_large(scope, receive, send)
-                return
-        body = bytearray()
-        got_request = complete = False
-        trailing: Message | None = None
-        while True:
-            message = await receive()
-            if message["type"] != "http.request":
-                trailing = message
-                break
-            got_request = True
-            chunk = message.get("body", b"")
-            if len(body) + len(chunk) > self.max_bytes:
-                await self._too_large(scope, receive, send)
-                return
-            body.extend(chunk)
-            if not message.get("more_body", False):
-                complete = True
-                break
-        replay: deque[Message] = deque()
-        if got_request:
-            replay.append({"type": "http.request", "body": bytes(body), "more_body": not complete})
-        if trailing is not None:
-            replay.append(trailing)
-
-        async def again() -> Message:
-            if replay:
-                return replay.popleft()
-            return await receive()
-
-        await self.app(scope, again, send)
-
-    async def _too_large(self, scope: Scope, receive: Receive, send: Send) -> None:
-        log.warning("outcome=too_large path=%s limit=%d", safe_path(scope.get("path", "")), self.max_bytes)
-        await JSONResponse(self.too_large, status_code=413)(scope, receive, send)

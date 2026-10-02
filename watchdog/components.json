@@ -15,5 +15,5 @@
   {"id": "student-10", "title": "Рабочее место 10", "kind": "container", "container": "pcbk-student-10", "sleeping_ok": true},
   {"id": "core", "title": "Служба данных", "kind": "http", "url": "http://pcbk-core:8000/healthz/data", "ok_detail": "жива"},
   {"id": "historian", "title": "Историан БДРВ", "kind": "historian", "url": "http://pcbk-core:8000/health/historian"},
-  {"id": "llm", "title": "OpenRouter и бюджет", "kind": "absent"}
+  {"id": "llm", "title": "LLM-прокси и бюджет", "kind": "llm", "url": "http://pcbk-core:8000/health/llm"}
 ]

@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from helpers import CORE_DIR, free_port, run_python, sha, wait_http, write
+from helpers import CORE_DIR, LLM_ENV, free_port, run_python, sha, wait_http, write
 from pcbk_core.egress import egress_guard_installed
 
 
@@ -215,15 +215,16 @@ CRASH = re.compile(r"EgressDenied|PermissionError|Traceback| \| [A-Z]\w*(?:Error
 
 
 @pytest.mark.parametrize("bdrv_text, code, line", [
-    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 1 направление"),
-    (None, 503, "разрешено 0 направлений"),              # нет bdrv.env → config_error, процесс жив (I2)
+    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 2 направления"),
+    (None, 503, "разрешено 1 направление"),              # нет bdrv.env → config_error, процесс жив (I2); OpenRouter — всегда
 ])
 def test_serve_installs_guard_and_stays_up(tmp_path, bdrv_text, code, line):
     port, closed = free_port(), free_port()             # на closed никто не слушает
     env = {**os.environ, "CORE_PORT": str(port), "FRESH_POLL_S": "3600",
            "BDRV_ENV_FILE": write(tmp_path, bdrv_text.format(closed=closed)) if bdrv_text else str(tmp_path / "нет.env"),
            "WHITELIST_PATH": write(tmp_path, "20FAKE_001_PV\n"),
-           "TOKENS_FILE": write(tmp_path, f"ops {sha('tok')}\n"), "DB_PATH": str(tmp_path / "core.db")}
+           "TOKENS_FILE": write(tmp_path, f"ops {sha('tok')}\n"), "DB_PATH": str(tmp_path / "core.db"),
+           **LLM_ENV, "OPENROUTER_BASE_URL": "http://localhost:9/api/v1"}   # П3: тесты не ходят в DNS за openrouter.ai
     p = subprocess.Popen([sys.executable, "-m", "pcbk_core.main"], cwd=CORE_DIR, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
@@ -239,3 +240,277 @@ def test_crash_signal_matches_one_line_exception():
     assert CRASH.search("… ERROR pcbk_core.app: сбой | ImportError: no module @ /app/pcbk_core/x.py:3")
     assert CRASH.search("… ERROR x: сбой | EgressDenied @ /app/pcbk_core/egress.py:9")
     assert not CRASH.search("… WARNING pcbk_core.data: свежесть: нет связи с историаном (connect)")
+
+
+# кэш адресов разрешённых имён (Д4а-R18): подмена _socket.getaddrinfo — до установки, хук и поток обновления
+# связывают её при установке; «or.test» — разрешённое имя, allowed_nets=() — петля сама не пускается;
+# слушатель — на 127.0.0.1, у 127.0.0.2 и 127.0.0.3 соединение отвергает ядро, а не охрана
+ATTEMPT = """
+def attempt(ip):
+    s = socket.socket(); s.settimeout(2)
+    try:
+        s.connect((ip, {a})); return 'PASSED'
+    except egress.EgressDenied:
+        return 'DENIED'
+    except (ConnectionRefusedError, TimeoutError):                   # охрана пустила, отказало ядро
+        return 'PASSED'                                              # (или очередь слушателя полна)
+    finally:
+        s.close()
+"""
+
+
+def test_loop_thread_never_resolves(listeners):                                 # Д4а-R18
+    a, _ = listeners
+    out = run_python(f"""
+import _socket, asyncio, socket, threading
+calls = []                                                           # имя потока каждого вызова getaddrinfo
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    calls.append(threading.current_thread().name)
+    return real('127.0.0.1' if host == 'or.test' else host, *rest, **kw)
+_socket.getaddrinfo = fake                                           # до установки: хук связывает её при установке
+from pcbk_core import egress
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+egress.start_refresh()                                               # первый круг — в потоке pcbk-egress-refresh
+async def main():
+    s = socket.socket()
+    s.connect(('127.0.0.1', {a})); s.close(); print('PASSED')        # тёплый кэш: пропуск без DNS
+    try:
+        socket.socket().connect(('127.0.0.2', {a}))                  # промах в потоке цикла
+    except egress.EgressDenied:
+        print('DENIED')
+    try:                                                             # имя в кортеже в потоке цикла: C разрешил его
+        socket.socket().connect(('localhost', {a}))                  # до хука, хук второй раз не разрешает — отказ
+    except egress.EgressDenied:
+        print('NAME-DENIED')
+asyncio.run(main())
+print(calls.count('pcbk-egress-refresh') >= 1, calls.count('MainThread'))
+""")
+    assert out.split() == ["PASSED", "DENIED", "NAME-DENIED", "True", "0"]   # в потоке цикла DNS нет
+
+
+def test_address_change_keeps_old_and_takes_new(listeners):                     # смена адресов CDN
+    a, _ = listeners
+    out = run_python(f"""
+import _socket, asyncio, socket, threading, time
+calls, answer = [], ['127.0.0.1']
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    if host == 'or.test':
+        calls.append(threading.current_thread().name)
+        host = answer[0]
+    return real(host, *rest, **kw)
+_socket.getaddrinfo = fake
+from pcbk_core import egress
+egress.NAME_REFRESH_S, egress.NAME_KEEP_S = 0.1, 1.0                 # до установки: связываются при ней
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+egress.start_refresh()
+{ATTEMPT.format(a=a)}
+async def until(ip, want, pause):                                    # ждёт итога want не дольше 5 с
+    end = time.monotonic() + 5
+    while (got := attempt(ip)) != want and time.monotonic() < end:
+        await asyncio.sleep(pause)
+    return got
+async def main():                        # слушатель не принимает: на 127.0.0.1 — редко, очередь в 8 не забить
+    print(attempt('127.0.0.2'))                                      # B ещё не видели — отказ
+    answer[0] = '127.0.0.2'                                          # CDN сменил адрес: A → B
+    switched = time.monotonic()
+    print(await until('127.0.0.2', 'PASSED', 0.02))                  # после круга обновления B пускается
+    await asyncio.sleep(max(0, switched + 0.5 - time.monotonic()))
+    print(attempt('127.0.0.1'))                                      # A — до истечения NAME_KEEP_S пускается
+    await asyncio.sleep(max(0, switched + 1.5 - time.monotonic()))
+    print(await until('127.0.0.1', 'DENIED', 0.5), time.monotonic() - switched > 0.8)   # и уходит после
+asyncio.run(main())
+print(calls.count('MainThread'))
+""")
+    assert out.split() == ["DENIED", "PASSED", "PASSED", "DENIED", "True", "0"]
+
+
+def test_dns_failure_keeps_addresses(listeners):                                # stale-if-error
+    a, _ = listeners
+    code = f"""
+import _socket, asyncio, socket, threading
+from pcbk_core.logs import setup_logging
+setup_logging()
+calls, broken = [], [None]
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    if host == 'or.test':
+        calls.append(threading.current_thread().name)
+        if broken[0] is not None:
+            raise broken[0]
+        host = '127.0.0.1'
+    return real(host, *rest, **kw)
+_socket.getaddrinfo = fake
+from pcbk_core import egress
+try: egress.start_refresh()
+except RuntimeError: print('NOT-INSTALLED')
+egress.NAME_KEEP_S, egress.NAME_REFRESH_S = 0.2, 0.05
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+refresher = egress.start_refresh()                                   # первый круг — 127.0.0.1
+try: egress.start_refresh()
+except RuntimeError: print('AGAIN')
+{ATTEMPT.format(a=a)}
+async def main():
+    before = len(calls)
+    broken[0] = socket.gaierror(socket.EAI_AGAIN, 'сбой DNS')        # DNS не отвечает
+    await asyncio.sleep(0.3)
+    broken[0] = RuntimeError('секрет-в-тексте')                      # непредвиденное в круге — поток жив
+    await asyncio.sleep(0.3)
+    print(len(calls) - before > 5, refresher.is_alive(), refresher.name)
+    print(attempt('127.0.0.1'), attempt('127.0.0.2'))                # прежний адрес живёт дольше NAME_KEEP_S
+asyncio.run(main())
+print(calls.count('MainThread'))
+"""
+    p = subprocess.run([sys.executable, "-c", code], cwd=CORE_DIR, capture_output=True, text=True, check=True)
+    assert p.stdout.split() == ["NOT-INSTALLED", "AGAIN", "True", "True", "pcbk-egress-refresh",
+                                "PASSED", "DENIED", "0"]
+    assert p.stderr.count("RuntimeError") == 1 and "секрет" not in p.stderr   # только класс, один раз за серию
+
+
+def test_worker_thread_miss_resolves_like_d3b(listeners):                        # ворота историана — как в Д3б
+    a, _ = listeners
+    out = run_python(f"""
+import _socket, asyncio, socket, threading, time
+calls, answer = [], ['127.0.0.1']
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    if host == 'or.test':
+        calls.append(threading.current_thread().name)
+        host = answer[0]
+    return real(host, *rest, **kw)
+_socket.getaddrinfo = fake
+from pcbk_core import egress
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+egress.start_refresh()                                               # NAME_REFRESH_S = 30: очередного круга за тест нет
+{ATTEMPT.format(a=a)}
+workers = lambda: sum(name.startswith('asyncio_') for name in calls)   # потоки asyncio.to_thread
+async def main():
+    answer[0] = '127.0.0.2'
+    print(await asyncio.to_thread(attempt, '127.0.0.2'), workers())   # промах в потоке: DNS, новый адрес пущен
+    print(attempt('127.0.0.2'))                                       # в множестве имени: и цикл его пускает
+    print(await asyncio.to_thread(attempt, '127.0.0.3'), workers())   # повторный промах за RESOLVE_RETRY_S — без DNS
+    answer[0] = '127.0.0.3'
+    print(attempt('127.0.0.3'))                       # промах в потоке цикла: отказ и внеочередной круг в фоне
+    end = time.monotonic() + 5                        # очередной круг — только через 30 с
+    while attempt('127.0.0.3') != 'PASSED' and time.monotonic() < end:
+        await asyncio.sleep(0.05)
+    print(attempt('127.0.0.3'), workers())
+asyncio.run(main())
+print(calls.count('MainThread'))
+""")
+    assert out.split() == ["PASSED", "1", "PASSED", "DENIED", "1", "DENIED", "PASSED", "1", "0"]
+
+
+def test_install_guard_counts_and_logs():                                        # П3
+    code = ("from pcbk_core.logs import setup_logging; from pcbk_core.egress import install_guard; "
+            "setup_logging(); print(install_guard([('h', 1), ('or.test', None)]))")
+    p = subprocess.run([sys.executable, "-c", code], cwd=CORE_DIR, capture_output=True, text=True, check=True)
+    assert p.stdout.split() == ["2"] and "охрана выхода: разрешено 2 направления" in p.stderr
+
+
+def test_hits_do_not_wake_refresher(listeners):      # промах одной записи при попадании другой — не промах
+    a, _ = listeners
+    out = run_python(f"""
+import _socket, asyncio, socket, threading, time
+calls, answers = [], {{'hist.test': '127.0.0.5', 'or.test': '127.0.0.2'}}
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    if host in answers:
+        calls.append(threading.current_thread().name)
+        host = answers[host]
+    return real(host, *rest, **kw)
+_socket.getaddrinfo = fake
+from pcbk_core import egress
+egress.install_egress_guard([('hist.test', None), ('or.test', {a})], allowed_nets=())   # историан по имени — первым
+egress.start_refresh()                                               # круг: по вызову на имя, очередной — через 30 с
+{ATTEMPT.format(a=a)}
+async def main():
+    print(sorted({{attempt('127.0.0.2') for _ in range(50)}}))       # OpenRouter: запись историана промахивается
+    await asyncio.sleep(1.5)                                         # внеочередной круг шёл бы через 1 с
+    print(len(calls))
+    print(attempt('127.0.0.3'))                                      # настоящий промах будит поток
+    end = time.monotonic() + 5
+    while len(calls) == 2 and time.monotonic() < end:
+        await asyncio.sleep(0.05)
+    print(len(calls) > 2)
+asyncio.run(main())
+print(calls.count('MainThread'))
+""")
+    assert out.split() == ["['PASSED']", "2", "DENIED", "True", "0"]
+
+
+def test_start_refresh_retries_after_failed_start():  # нет потоков (pids_limit) — повторный вызов возможен
+    out = run_python("""
+import threading
+from pcbk_core import egress
+egress.install_egress_guard([('127.0.0.1', None)], allowed_nets=())
+start = threading.Thread.start
+def broken(self): raise RuntimeError('нет потоков')
+threading.Thread.start = broken
+try: egress.start_refresh()
+except RuntimeError as e: print(str(e) == 'нет потоков')
+threading.Thread.start = start
+thread = egress.start_refresh()
+print(thread.is_alive(), thread.name)
+try: egress.start_refresh()
+except RuntimeError as e: print('AGAIN')
+""")
+    assert out.split() == ["True", "True", "pcbk-egress-refresh", "AGAIN"]
+
+
+def test_refresh_status(listeners):                                              # ревью 2а: живость потока адресов
+    a, _ = listeners
+    out = run_python(f"""
+import _socket, time
+from pcbk_core import egress
+print(egress.refresh_status())                                              # до start_refresh
+real, fail = _socket.getaddrinfo, []
+def fake(host, *rest, **kw):
+    if fail: raise _socket.gaierror(-2, 'x')
+    return real('127.0.0.1' if host == 'or.test' else host, *rest, **kw)
+_socket.getaddrinfo = fake
+egress.NAME_REFRESH_S = 0.05
+print(egress.refresh_started_age_s())                                       # поток не запускался
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+egress.start_refresh()
+s = egress.refresh_status(); print(s['alive'], s['last_ok_age_s'] < 1)
+fail.append(1); time.sleep(0.5)                                             # круги с ошибкой — возраст растёт
+print(egress.refresh_status()['last_ok_age_s'] >= 0.4, egress.refresh_started_age_s() >= 0.5)
+""")
+    assert out.split("\n")[:4] == ["{'alive': None, 'last_ok_age_s': None}", "None", "True True", "True True"]
+
+
+def test_refresh_status_never_ok_keeps_last_ok_none(listeners):                 # имя ни разу не разрешилось
+    a, _ = listeners
+    out = run_python(f"""
+import _socket
+from pcbk_core import egress
+def fake(host, *rest, **kw): raise _socket.gaierror(-2, 'x')
+_socket.getaddrinfo = fake
+egress.NAME_REFRESH_S = 0.05
+egress.install_egress_guard([('or.test', {a})], allowed_nets=())
+egress.start_refresh()
+s = egress.refresh_status(); print(s['alive'], s['last_ok_age_s'], egress.refresh_started_age_s() is not None)
+""")
+    assert out.split() == ["True", "None", "True"]
+
+
+def test_refresh_status_per_name(listeners):                                     # ревью B: историан не за OpenRouter
+    a, _ = listeners
+    out = run_python(f"""
+import _socket
+from pcbk_core import egress
+real = _socket.getaddrinfo
+def fake(host, *rest, **kw):
+    if host == 'hist.test': raise _socket.gaierror(-2, 'x')                  # имя историана не разрешается
+    return real('127.0.0.1' if host == 'or.test' else host, *rest, **kw)
+_socket.getaddrinfo = fake
+egress.NAME_REFRESH_S = 0.05
+egress.install_egress_guard([('hist.test', 1433), ('or.test', {a}), ('10.0.0.9', 1433)], allowed_nets=())
+egress.start_refresh()
+print(egress.refresh_status('or.test')['last_ok_age_s'] < 1)                # OpenRouter разрешается
+print(egress.refresh_status('hist.test')['last_ok_age_s'], egress.refresh_status()['last_ok_age_s'])
+print(egress.refresh_status('10.0.0.9')['last_ok_age_s'] < 1, egress.refresh_status('other.test')['last_ok_age_s'])
+""")
+    assert out.split("\n")[:3] == ["True", "None None", "True None"]

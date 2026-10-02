@@ -10,10 +10,29 @@ services:
     ports: !override
       - "127.0.0.1:18443:8443"
 
-  # опрос свежести чаще: строка историана меняется за секунды, а не за полминуты
+  # опрос свежести и OpenRouter чаще: строки историана и LLM меняются за секунды, а не за минуты;
+  # вместо OpenRouter — двойник (ключи стенда — его заглушки, настоящий ключ сюда не попадает)
   core:
     environment:
       FRESH_POLL_S: "5"
+      OPENROUTER_BASE_URL: http://fake-openrouter:8080/api/v1
+      LLM_POLL_S: "5"
+
+  # двойник OpenRouter (core/tests/fake_openrouter.py, только stdlib) в сети выхода рядом с core;
+  # с хоста теста — http://172.31.250.84:8080 (ручки /_requests и др.). Адрес вне динамических .88/29.
+  # Свой образ от закреплённой базы (core/tests/Dockerfile.fake): общий тег python:3.12-slim машины не трогается
+  fake-openrouter:
+    build: {context: ./core/tests, dockerfile: Dockerfile.fake}
+    image: pcbk-test/fake-openrouter:d4a
+    pull_policy: never
+    container_name: pcbk-test-openrouter
+    init: true                      # SIGTERM доходит до python: stop без 10 с ожидания
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      pcbk-egress: {ipv4_address: 172.31.250.84}
 
   # мишень проверок прокси: чужой для прокси контейнер — его inspect должен получать 403
   foreign:

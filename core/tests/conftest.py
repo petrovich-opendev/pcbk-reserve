@@ -1,6 +1,9 @@
 """Фикстуры серверного слоя: асинхронные тесты — через плагин anyio на asyncio."""
+import json
 import logging
 import socket
+import threading
+import urllib.request
 from types import SimpleNamespace
 
 import pytest
@@ -31,10 +34,10 @@ def restore_logging():
 
     С корня снимается только наш обработчик: свои обработчики pytest ставит и снимает на каждую фазу теста.
     """
-    from pcbk_core.logs import _StderrHandler
+    from pcbk_core.logs import QUIET_LOGGERS, _StderrHandler
 
     root, core = logging.getLogger(), logging.getLogger("pcbk_core")
-    levels = {name: logging.getLogger(name).level for name in ("", "pcbk_core", "pytds", "mcp")}
+    levels = {name: logging.getLogger(name).level for name in ("", "pcbk_core", *QUIET_LOGGERS)}
     propagate, handlers, root_handlers = core.propagate, list(core.handlers), list(root.handlers)
     yield
     for h in [h for h in core.handlers if h not in handlers]:
@@ -45,6 +48,58 @@ def restore_logging():
     for name, level in levels.items():
         logging.getLogger(name).setLevel(level)
     assert root.level == levels[""]
+
+
+class FakeOpenRouter:
+    """Клиент ручек двойника OpenRouter (как у стенда — по HTTP, мимо прокси окружения): url — …/api/v1."""
+
+    def __init__(self, server):
+        host, port = server.server_address[:2]
+        self.base = f"http://{host}:{port}"
+        self.url = self.base + "/api/v1"
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _call(self, method: str, path: str, payload: dict | None = None):
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"} if data is not None else {})
+        with self._opener.open(req, timeout=5) as r:
+            return json.loads(r.read())
+
+    @property
+    def requests(self) -> list[dict]:
+        """Записанные запросы чата {"auth_ok", "body"} по порядку."""
+        return self._call("GET", "/_requests")
+
+    @property
+    def aborted(self) -> int:
+        """Сколько потоков оборвал клиент."""
+        return self._call("GET", "/_stats")["aborted"]
+
+    def add_usage(self, x: float, key: str = "a") -> None:
+        """«OpenRouter насчитал больше»: + x к usage ключа a (test-openrouter-key) или b."""
+        self._call("POST", "/_usage", {"add": x, "key": key})
+
+    def set_price(self, model: str, prompt: float, completion: float) -> None:
+        """Нынешняя цена точки модели, $ за 1 млн: выше provider.max_price запроса — 404 max_price."""
+        self._call("POST", "/_price", {"model": model, "prompt": prompt, "completion": completion})
+
+
+@pytest.fixture
+def fake_or():
+    """Двойник OpenRouter на 127.0.0.1:0 в своём потоке — на каждый тест свой."""
+    from fake_openrouter import make_server
+
+    server = make_server("127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                              name="fake-openrouter", daemon=True)
+    thread.start()
+    try:
+        yield FakeOpenRouter(server)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.fixture

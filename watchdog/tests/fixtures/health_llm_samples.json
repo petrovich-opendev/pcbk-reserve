@@ -1,0 +1,155 @@
+{
+ "source": "core e9497ec: LlmRole.health_json через GET /health/llm на двойнике OpenRouter (помощники тестов core); сгенерировано один раз, сторож core не импортирует",
+ "samples": {
+  "not_polled": {
+   "checked_at": null,
+   "config_error": null,
+   "tokens_error": null,
+   "stopped": false,
+   "key": "ok",
+   "mgmt_key": "ok",
+   "drill": "",
+   "ledger_ok": true,
+   "ledger_error": null,
+   "upstream": {
+    "state": "unknown",
+    "text": "OpenRouter ещё не опрашивался",
+    "since": null
+   },
+   "spent_usd": 0.0,
+   "reserved_usd": 0.0,
+   "ledger_usd": 0.0,
+   "estimated_usd": 0.0,
+   "key_spent_usd": null,
+   "key_usage_usd": null,
+   "total_usd": 1000.0,
+   "ops_usd": 0.0,
+   "shares": {
+    "over_80": 0,
+    "spent": 0
+   },
+   "pending": 0,
+   "pending_stuck": 0,
+   "cost_unknown_24h": 0,
+   "provider_mismatch_24h": 0,
+   "account_remaining_usd": null,
+   "models": [
+    "z-ai/glm-5.3",
+    "deepseek/deepseek-v4.1-flash",
+    "google/gemini-3.8-flash",
+    "openai/gpt-6-sol",
+    "z-ai/glm-5.3-flash",
+    "openai/gpt-6-luna",
+    "anthropic/claude-sonnet-5.5"
+   ],
+   "ledger_queue": 0,
+   "ledger_fresh": true,
+   "ledger_reset": false,
+   "egress": {
+    "alive": null,
+    "last_ok_age_s": null
+   },
+   "refresh_started_age_s": null
+  },
+  "working": {
+   "checked_at": "2026-09-30T01:31:43.404181+00:00",
+   "config_error": null,
+   "tokens_error": null,
+   "stopped": false,
+   "key": "ok",
+   "mgmt_key": "ok",
+   "drill": "",
+   "ledger_ok": true,
+   "ledger_error": null,
+   "upstream": {
+    "state": "ok",
+    "text": "OpenRouter отвечает",
+    "since": "2026-09-30T01:31:43.375236+00:00"
+   },
+   "spent_usd": 0.0024,
+   "reserved_usd": 0.0,
+   "ledger_usd": 0.0024,
+   "estimated_usd": 0.0,
+   "key_spent_usd": 0.0024,
+   "key_usage_usd": 0.0024,
+   "total_usd": 1000.0,
+   "ops_usd": 0.0012,
+   "shares": {
+    "over_80": 0,
+    "spent": 0
+   },
+   "pending": 0,
+   "pending_stuck": 0,
+   "cost_unknown_24h": 0,
+   "provider_mismatch_24h": 0,
+   "account_remaining_usd": 30.0,
+   "models": [
+    "z-ai/glm-5.3",
+    "deepseek/deepseek-v4.1-flash",
+    "google/gemini-3.8-flash",
+    "openai/gpt-6-sol",
+    "z-ai/glm-5.3-flash",
+    "openai/gpt-6-luna",
+    "anthropic/claude-sonnet-5.5"
+   ],
+   "ledger_queue": 0,
+   "ledger_fresh": true,
+   "ledger_reset": false,
+   "egress": {
+    "alive": true,
+    "last_ok_age_s": 0.1
+   },
+   "refresh_started_age_s": 0.1
+  },
+  "drill_402": {
+   "checked_at": "2026-09-30T01:31:43.439874+00:00",
+   "config_error": null,
+   "tokens_error": null,
+   "stopped": false,
+   "key": "ok",
+   "mgmt_key": "ok",
+   "drill": "402",
+   "ledger_ok": true,
+   "ledger_error": null,
+   "upstream": {
+    "state": "money_out",
+    "text": "на счёте OpenRouter кончились деньги (учения)",
+    "since": "2026-09-30T01:31:43.427155+00:00"
+   },
+   "spent_usd": 0.0,
+   "reserved_usd": 0.0,
+   "ledger_usd": 0.0,
+   "estimated_usd": 0.0,
+   "key_spent_usd": 0.0,
+   "key_usage_usd": 0.0024,
+   "total_usd": 1000.0,
+   "ops_usd": 0.0,
+   "shares": {
+    "over_80": 0,
+    "spent": 0
+   },
+   "pending": 0,
+   "pending_stuck": 0,
+   "cost_unknown_24h": 0,
+   "provider_mismatch_24h": 0,
+   "account_remaining_usd": 30.0,
+   "models": [
+    "z-ai/glm-5.3",
+    "deepseek/deepseek-v4.1-flash",
+    "google/gemini-3.8-flash",
+    "openai/gpt-6-sol",
+    "z-ai/glm-5.3-flash",
+    "openai/gpt-6-luna",
+    "anthropic/claude-sonnet-5.5"
+   ],
+   "ledger_queue": 0,
+   "ledger_fresh": true,
+   "ledger_reset": false,
+   "egress": {
+    "alive": true,
+    "last_ok_age_s": 0.1
+   },
+   "refresh_started_age_s": 0.1
+  }
+ }
+}

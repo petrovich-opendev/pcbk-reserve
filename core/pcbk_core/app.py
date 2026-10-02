@@ -1,19 +1,25 @@
-"""Протокол роли и сборка приложения: роутеры ролей, здоровье по ролям, точные маршруты."""
+"""Протокол роли и сборка приложения: роутеры ролей, здоровье по ролям и живость, крючки, точные маршруты."""
 import logging
 import re
 from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import Protocol
 
-from fastapi import APIRouter, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from fastapi.routing import iter_route_contexts
 from starlette.routing import Route, WebSocketRoute, compile_path
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .hooks import AppHooks, BodyLimit, hooks_of
 from .settings import Settings
 
 log = logging.getLogger("pcbk_core.app")
+
+# /healthz/live — живость процесса; роль с таким именем её затенила бы
+LIVE = "live"
 
 
 class Role(Protocol):
@@ -32,6 +38,8 @@ class Role(Protocol):
     def install(self, app: FastAPI) -> None:
         """Обработчики исключений и промежуточные звенья уровня приложения — только здесь.
 
+        Обработчик 422 и предел тела — не напрямую, а в реестр hooks_of(app) на свой префикс пути:
+        один обработчик RequestValidationError и одно звено BodyLimit на приложение ставит create_app.
         Mount, Host и frontend() не ставятся ни здесь, ни в router(): create_app откажет.
         """
         ...
@@ -95,11 +103,33 @@ def _route_patterns(app: FastAPI) -> list[tuple[str, re.Pattern]]:
     return patterns
 
 
+def _install_hooks(app: FastAPI) -> None:
+    """Один обработчик 422 и одно звено предела тела на приложение — по реестру ролей.
+
+    Звено ставится последним: оно самое внешнее внутри ServerErrorMiddleware, и 413 выходит раньше
+    звеньев ролей. Обработчик 422 роли мимо реестра общий молча затёр бы — сборка отказывает.
+    """
+    hooks = hooks_of(app)
+    if app.exception_handlers.get(RequestValidationError) is not request_validation_exception_handler:
+        raise ValueError("обработчик 422 ставится через реестр hooks_of(app).validation, не напрямую")
+
+    async def on_validation(request: Request, exc: RequestValidationError) -> Response:
+        handler = hooks.handler_for(request.scope["path"])
+        if handler is None:
+            return await request_validation_exception_handler(request, exc)
+        return await handler(request, exc)
+
+    app.add_exception_handler(RequestValidationError, on_validation)
+    app.add_middleware(BodyLimit, hooks=hooks)
+
+
 def create_app(settings: Settings, roles: Sequence[Role]) -> FastAPI:
     roles = list(roles)
     by_name = {r.name: r for r in roles}
     if len(by_name) != len(roles):
         raise ValueError(f"роли с одинаковыми именами: {[r.name for r in roles]}")
+    if LIVE in by_name:
+        raise ValueError(f"роль {LIVE!r}: имя занято ручкой живости /healthz/{LIVE}")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -113,9 +143,15 @@ def create_app(settings: Settings, roles: Sequence[Role]) -> FastAPI:
     app = FastAPI(title="pcbk-core", docs_url=None, redoc_url=None, openapi_url=None,
                   redirect_slashes=False, lifespan=lifespan)
     app.state.settings = settings
+    app.state.pcbk_hooks = AppHooks()
 
     for role in roles:
         app.include_router(role.router())
+
+    @app.get(f"/healthz/{LIVE}")
+    async def healthz_live() -> JSONResponse:
+        # живость для HEALTHCHECK: здоровье ролей видит сторож, 402 OpenRouter не делает core unhealthy
+        return JSONResponse({"ok": True})
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -133,6 +169,7 @@ def create_app(settings: Settings, roles: Sequence[Role]) -> FastAPI:
 
     for role in roles:
         role.install(app)
+    _install_hooks(app)
 
     # точные маршруты — последними: чужие пути они не перехватывают;
     # путь, который уже ловит другой маршрут, — ошибка сборки, а не тихая тень

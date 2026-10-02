@@ -113,13 +113,12 @@ def test_network_subnets_match_table(stack):
 
 def test_status_json_overall_ok(stack):
     # в тестовом стенде историана нет: его строка — не норма, итог страницы — тоже;
-    # остальные строки — норма, «ещё не установлен» — только LLM (с Д4)
+    # остальные строки — норма, включая LLM-прокси (Д4а, двойник OpenRouter)
     def all_ok(d):
-        return all(c["state"] == ("absent" if c["component"] == "llm" else "ok")
-                   for c in d["checks"] if c["component"] != "historian")
+        return all(c["state"] == "ok" for c in d["checks"] if c["component"] != "historian")
     data = stack.wait_status(all_ok, timeout=30)
-    absent = {c["component"] for c in data["checks"] if c["state"] == "absent"}
-    assert absent == {"llm"}                                     # места и служба данных под наблюдением
+    assert not [c["component"] for c in data["checks"] if c["state"] == "absent"]   # всё под наблюдением
+    assert next(c["state"] for c in data["checks"] if c["component"] == "llm") == "ok"
 
 
 def test_watchdog_sees_socket_proxy_loss(stack):

@@ -177,3 +177,32 @@ test('request is aborted after timeoutMs', async () => {
   assert.equal(calls[0].opts.signal.aborted, true);
   assert.equal(doc.els.silence.hidden, false);
 });
+
+test('note rendered after detail', async () => {
+  const doc = fakeDoc();
+  const json = { ...body(false), checks: [{ component: 'llm', title: 'LLM-прокси и бюджет', state: 'ok',
+    detail: 'OpenRouter отвечает', note: 'расход $1.00 из $1000' }] };
+  await start(doc, () => Promise.resolve(reply(200, json)));
+  await advance(1000);
+  assert.deepEqual(doc.els.checks.children[0].children.map((c) => c.textContent),
+    ['LLM-прокси и бюджет', 'норма', 'OpenRouter отвечает · расход $1.00 из $1000']);
+});
+
+test('note without detail is still shown', async () => {
+  const doc = fakeDoc();
+  const json = { ...body(false), checks: [{ component: 'llm', title: 'LLM-прокси и бюджет', state: 'ok',
+    detail: 'норма', note: 'расход $0.00 из $1000' }] };          // detail совпал с подписью — не повторяется
+  await start(doc, () => Promise.resolve(reply(200, json)));
+  await advance(1000);
+  assert.equal(doc.els.checks.children[0].children[2].textContent, 'расход $0.00 из $1000');
+});
+
+test('row without note has no separator', async () => {
+  const doc = fakeDoc();
+  const json = { ...body(false), checks: [
+    { component: 'edge', title: 'Входной прокси', state: 'ok', detail: 'отвечает', note: '' },
+    { component: 'old', title: 'Прежний сторож', state: 'ok', detail: 'отвечает' }] };   // ответ без note
+  await start(doc, () => Promise.resolve(reply(200, json)));
+  await advance(1000);
+  assert.deepEqual(doc.els.checks.children.map((li) => li.children[2].textContent), ['отвечает', 'отвечает']);
+});

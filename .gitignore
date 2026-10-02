@@ -7,9 +7,13 @@
 *credentials*
 *.pem
 *.key
-# пароли OpenCode и токены LLM мест (SECRETS_DIR)
+# пароли OpenCode и токены LLM мест, таблица хешей токенов LLM (SECRETS_DIR); ключи OpenRouter — *.key выше
 *.pw
 *.llm-token
+llm-tokens
+# токены службы данных и таблица их хешей (SECRETS_DIR)
+core-tokens
+*.data-token
 # белый список тегов и его засев (DATA_DIR) — данные заказчика
 whitelist.txt
 whitelist.extra

@@ -1,10 +1,12 @@
 """Стенд для проверок компоновки: проект pcbk-test на локальном Docker, порт 127.0.0.1:18443.
 
 Образы — только через deploy/images.lock; тестовый TLS, секреты и агенты мест, данные
-серверного слоя, test.env — во временном каталоге; в конце — `down -v` и тома мест по
+серверного слоя, ключи и токены LLM-прокси (заглушки — настоящего OpenRouter нет, есть
+двойник), test.env — во временном каталоге; в конце — `down -v` и тома мест по
 метке, даже при сбое. Чужие контейнеры, сети и тома мест с нашими именами тест не
 трогает — отказывается запускаться.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -15,7 +17,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,11 +44,29 @@ TEST_VOLUME_LABEL = "pcbk-test.volume"
 STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRETS_DIR", "AGENTS_DIR",
                         "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S",
                         "DRILL_FREEZE_LOOP", "DATA_DIR", "FRESH_POLL_S", "CATALOG_DEADLINE_S",
-                        "DRILL_FRESHNESS", "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S"})
+                        "DRILL_FRESHNESS", "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
+                        "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
 # белый список стенда — одно синтетическое имя
 TEST_WHITELIST = ("20FAKE_001_PV",)
+# токен службы данных места 01: не 48 шестнадцатеричных знаков — шаблон проверки на секреты его не ловит;
+# в core-tokens — только его sha256
+TEST_CORE_TOKEN = "test-token-student-01"
+# LLM-прокси: ключи — те, что знает двойник OpenRouter (core/tests/fake_openrouter.py), токен ops —
+# не 48 шестнадцатеричных знаков; токены мест — student-NN.llm-token из make_test_places
+TEST_OPENROUTER_KEY = "test-openrouter-key"
+TEST_MGMT_KEY = "test-mgmt-key"
+TEST_OPS_LLM_TOKEN = "test-llm-token-ops"
+# адреса с хоста теста: серверный слой и двойник OpenRouter в pcbk-egress
+CORE_URL = "http://172.31.250.82:8000"
+FAKE_OPENROUTER_URL = "http://172.31.250.84:8080"
+# строки журнала вызовов изнутри pcbk-core: столбцы llm_calls, содержимого разговоров в таблице нет
+LLM_CALLS_PY = ("import json, sqlite3, sys; "
+                "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
+                "c.row_factory = sqlite3.Row; "
+                "print(json.dumps([dict(r) for r in c.execute("
+                "'SELECT * FROM llm_calls ORDER BY id DESC LIMIT ?', (int(sys.argv[1]),))]))")
 # запрос изнутри сторожа: argv — метод и адрес; печатает код ответа
 WATCHDOG_REQUEST = """\
 import http.client, sys
@@ -71,6 +91,20 @@ sys.stdout.write(body.decode("utf-8"))
 """
 # D1: соединение есть, если curl -v его сообщил
 CONNECTED = re.compile(r"Established connection|Connected to")
+
+
+def wait_for(pred: Callable[[], bool], timeout: float, step: float = 1.0) -> None:
+    """Ждать, пока pred() не станет истинным, опрос раз в step с; по сроку — AssertionError.
+
+    Исключение из pred() не ловится и не повторяется — оно сразу выходит к тесту (сбой сети или
+    неверный ответ — это ошибка, а не «ещё не готово»). Ждать того, что может временно не отвечать, —
+    ловить в самом pred().
+    """
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"за {timeout} с условие не выполнилось")
+        time.sleep(step)
 
 
 def _run(cmd: list[str], *, timeout: float = 120, check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -131,12 +165,33 @@ def make_test_places(secrets_dir: Path, agents_root: Path) -> None:
         d.chmod(0o755)
 
 
+def token_line(caller: str, token: str) -> str:
+    """Строка таблицы хешей (core-tokens, llm-tokens): «<id> <sha256 токена>»."""
+    return f"{caller} {hashlib.sha256(token.encode()).hexdigest()}"
+
+
 def make_test_core_data(secrets_dir: Path, data_dir: Path) -> None:
-    """Как на сервере: bdrv.env — в каталоге секретов (0700), белый список — в DATA_DIR (0700); файлы 0444."""
+    """Как на сервере: bdrv.env и core-tokens — в каталоге секретов (0700), белый список — в DATA_DIR (0700);
+    файлы 0444."""
     data_dir.mkdir(mode=0o700)
     data_dir.chmod(0o700)
-    for f, lines in ((secrets_dir / "bdrv.env", TEST_BDRV_ENV), (data_dir / "whitelist.txt", TEST_WHITELIST)):
+    core_tokens = (token_line("student-01", TEST_CORE_TOKEN),)
+    for f, lines in ((secrets_dir / "bdrv.env", TEST_BDRV_ENV), (data_dir / "whitelist.txt", TEST_WHITELIST),
+                     (secrets_dir / "core-tokens", core_tokens)):
         f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        f.chmod(0o444)
+
+
+def make_test_llm(secrets_dir: Path) -> None:
+    """Как на сервере, файлы 0444 в каталоге секретов: ключи OpenRouter (заглушки двойника), токен ops и
+    llm-tokens — хеши токенов мест (student-NN.llm-token, их пишет make_test_places) и ops."""
+    lines = [token_line(f"student-{n:02d}", (secrets_dir / f"student-{n:02d}.llm-token").read_text("ascii"))
+             for n in PLACES]
+    lines.append(token_line("ops", TEST_OPS_LLM_TOKEN))
+    for name, text in (("openrouter.key", TEST_OPENROUTER_KEY), ("openrouter-mgmt.key", TEST_MGMT_KEY),
+                       ("ops.llm-token", TEST_OPS_LLM_TOKEN), ("llm-tokens", "\n".join(lines) + "\n")):
+        f = secrets_dir / name
+        f.write_text(text, encoding="ascii")
         f.chmod(0o444)
 
 
@@ -165,6 +220,10 @@ class Stack:
         self.stu_net: str = values["STU_NET"]
         self.secrets_dir = Path(values["SECRETS_DIR"])
         self.agents_root = Path(values["AGENTS_DIR"])
+        # токен службы данных места 01 (в core-tokens — его хеш)
+        self.core_token: str = TEST_CORE_TOKEN
+        # токен LLM администратора, он же файл ops.llm-token (в llm-tokens — его хеш)
+        self.ops_llm_token: str = TEST_OPS_LLM_TOKEN
         self._prod_config: dict | None = None
         # готовность после start/restart/unpause; прочим контейнерам хватает Running,
         # местам — healthy (wait_ready); места сюда не входят, up() их не ждёт
@@ -178,10 +237,11 @@ class Stack:
     # --- docker compose и docker ---
 
     def compose(self, *args: str, timeout: float = COMPOSE_TIMEOUT_S, check: bool = True,
-                files: tuple[str, ...] = COMPOSE_FILES) -> str:
+                files: tuple[str, ...] = COMPOSE_FILES, env: Mapping[str, str] | None = None) -> str:
+        """env — окружение docker compose целиком (None — self.env); оно сильнее --env-file."""
         cmd = ["docker", "compose", "-p", PROJECT, "--env-file", str(self.env_file),
                *(a for f in files for a in ("-f", f)), "--profile", PROFILE, *args]
-        return _run(cmd, timeout=timeout, check=check, cwd=REPO, env=self.env).stdout
+        return _run(cmd, timeout=timeout, check=check, cwd=REPO, env=self.env if env is None else env).stdout
 
     def config(self, files: tuple[str, ...] = COMPOSE_FILES) -> dict:
         """Итоговая компоновка; files=("compose.yaml",) — как на сервере, без тестовых правок."""
@@ -311,13 +371,17 @@ class Stack:
                          "--max-time", "20", "-X", method, url)
         return int(r.stdout.strip())
 
-    def http_host(self, method: str, url: str, body: dict | None = None) -> tuple[int, str]:
+    def http_host(self, method: str, url: str, body: dict | None = None,
+                  token: str | None = None) -> tuple[int, str]:
         """Запрос с хоста теста (адрес серверного слоя в pcbk-egress): urllib без прокси и перенаправлений.
 
-        Код ответа и тело; ответ с ошибкой HTTP — тоже результат, а не исключение.
+        token — заголовок Authorization: Bearer. Код ответа и тело; ответ с ошибкой HTTP — тоже результат,
+        а не исключение.
         """
         data = None if body is None else json.dumps(body).encode()
         headers = {} if body is None else {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
         try:
             with opener.open(urllib.request.Request(url, data=data, headers=headers, method=method),
@@ -326,6 +390,24 @@ class Stack:
         except urllib.error.HTTPError as e:
             with e:
                 return e.code, e.read().decode("utf-8", "replace")
+
+    def fake_requests(self) -> list[dict]:
+        """Запросы чата, которые получил двойник OpenRouter ({"auth_ok", "body"}), — с хоста теста."""
+        code, body = self.http_host("GET", FAKE_OPENROUTER_URL + "/_requests")
+        if code != 200:
+            raise RuntimeError(f"двойник OpenRouter: /_requests — код {code}")
+        return json.loads(body)
+
+    def llm_health(self) -> dict:
+        """/health/llm серверного слоя — с хоста теста, без токена."""
+        code, body = self.http_host("GET", CORE_URL + "/health/llm")
+        if code != 200:
+            raise RuntimeError(f"/health/llm: код {code}")
+        return json.loads(body)
+
+    def llm_calls(self, last: int = 5) -> list[dict]:
+        """Последние строки журнала вызовов LLM (новые — первыми): только столбцы llm_calls."""
+        return json.loads(self._docker("exec", "pcbk-core", "python", "-c", LLM_CALLS_PY, str(last)).stdout)
 
     def logs(self, name: str) -> str:
         """Журнал контейнера: stdout и stderr вместе (серверный слой пишет в stderr)."""
@@ -366,6 +448,11 @@ class Stack:
         if r.returncode in (125, 126, 127):
             raise RuntimeError(f"проба в {network}: docker run, код {r.returncode}\n{r.stderr[-1000:]}")
         return 1 if CONNECTED.search(r.stdout + r.stderr) else 0
+
+    def wait_snapshot_after(self, moment: datetime, timeout: float = READY_TIMEOUT_S) -> dict:
+        """Снимок сторожа, чей такт начался позже moment (checked_at — начало такта)."""
+        return self.wait_status(lambda d: bool(d["checked_at"])
+                                and datetime.fromisoformat(d["checked_at"]) > moment, timeout)
 
     def wait_status(self, pred: Callable[[dict], bool], timeout: float) -> dict:
         """/status.json через edge, пока pred не станет истинным; по сроку — AssertionError."""
@@ -455,6 +542,19 @@ class Stack:
         self._docker("unpause", name)
         self.wait_ready(name)
 
+    def recreate(self, service: str, overrides: Mapping[str, str]) -> None:
+        """Пересоздать службу с переменными overrides поверх test.env, дождаться готовности и снимка
+        сторожа, снятого уже после неё.
+
+        Окружение оболочки сильнее --env-file; {} — вернуть значения test.env и умолчания компоновки.
+        --force-recreate обязателен: при прежнем окружении up -d контейнер не трогает, а ключи и
+        переменные серверный слой читает только при старте. Снимок — чтобы wait_status не принял
+        строку такта, пришедшегося на само пересоздание («… не отвечает»), за новое состояние.
+        """
+        self.compose("up", "-d", "--no-build", "--force-recreate", service, env={**self.env, **overrides})
+        self.wait_ready(self.config()["services"][service]["container_name"])
+        self.wait_snapshot_after(datetime.now(timezone.utc))
+
     def stop(self, name: str) -> None:
         self._docker("stop", name)
         if self._state(name)["Running"]:
@@ -513,8 +613,7 @@ class Stack:
                 raise RuntimeError(f"/status через edge не ответил 200 за {READY_TIMEOUT_S} с")
             time.sleep(0.5)
         # первый такт мог пройти до старта edge — ждём снимок, снятый уже при готовом стенде
-        self.wait_status(lambda d: bool(d["checked_at"])
-                         and datetime.fromisoformat(d["checked_at"]) > ready_at, READY_TIMEOUT_S)
+        self.wait_snapshot_after(ready_at)
 
     def down(self) -> None:
         # одноразовые клиенты http_as, оставшиеся после оборванного прогона, — только с нашей меткой
@@ -543,6 +642,7 @@ def stack(tmp_path_factory, student_image):
     make_test_tls(work / "tls")
     make_test_places(work / "secrets", work / "agents")
     make_test_core_data(work / "secrets", work / "data")
+    make_test_llm(work / "secrets")
     env_file = work / "test.env"
     env_file.write_text("\n".join([
         f"DOCKER_GID={docker_gid()}",

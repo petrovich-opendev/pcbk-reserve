@@ -1,21 +1,26 @@
 """Вход серверного слоя: настройки, журнал, охрана выхода, роли, uvicorn; --healthcheck для образа.
 
-FastAPI и uvicorn грузятся только в ветке сервера: проба здоровья раз в 30 с
+FastAPI, uvicorn и httpx грузятся только в ветке сервера: проба здоровья раз в 30 с
 тянет лишь http.client. Охрана выхода ставится только в serve() — точке входа
 процесса: хук не снимается, а main() и build_roles тесты зовут в процессе pytest.
+Импорты pcbk_core.llm — только внутри функций (П8).
 """
 from __future__ import annotations
 
 import http.client
 import logging
 import sys
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from .settings import Settings
 
 if TYPE_CHECKING:
     from .app import Role
+    from .llm import LlmRole
     from .secrets import BdrvConfig
+    from .settings import LlmSettings
 
 USAGE = "использование: python -m pcbk_core.main [--healthcheck]"
 
@@ -40,8 +45,18 @@ def read_bdrv(settings: Settings) -> tuple[BdrvConfig | None, OSError | ValueErr
         return None, exc.with_traceback(None)
 
 
-def build_roles(settings: Settings) -> list[Role]:
-    """Роли процесса: в Д3а — «данные»; Д4 добавит LLM-прокси.
+def egress_targets(llm: LlmSettings, cfg: BdrvConfig | None) -> list[tuple[str, int | None]]:
+    """Направления охраны выхода: историан (BDRV_HOST без экземпляра, BDRV_PORT; None — любой порт) и хост
+    OPENROUTER_BASE_URL (порт из адреса, иначе 443/80). cfg None (bdrv.env не читается) — только OpenRouter
+    (П3). Сигнатуру (llm, cfg) Д5 расширит до (llm, gw, cfg)."""
+    targets: list[tuple[str, int | None]] = [] if cfg is None else [(cfg.host.split("\\")[0], cfg.port)]
+    url = urlsplit(llm.OPENROUTER_BASE_URL)
+    targets.append((url.hostname or "", url.port or (443 if url.scheme == "https" else 80)))
+    return targets
+
+
+def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> list[Role]:
+    """Роли процесса: «данные» и LLM-прокси (Д4а); env — окружение роли llm (None — os.environ), Д5 добавит шлюз.
 
     Нет файла белого списка — роль с пустым списком: /healthz/data отвечает 503
     с причиной, ворота не пускают ни одного имени. bdrv.env или белый список не
@@ -86,15 +101,86 @@ def build_roles(settings: Settings) -> list[Role]:
         log.error("токены %s: %s", settings.TOKENS_FILE, _why(exc))
         tokens_error = TOKENS_ERROR
 
-    return [DataRole(settings, query, whitelist, config_error="; ".join(problems) or None,
-                     tokens=tokens, tokens_error=tokens_error)]
+    data = DataRole(settings, query, whitelist, config_error="; ".join(problems) or None,
+                    tokens=tokens, tokens_error=tokens_error)
+    return [data, build_llm_role(settings, env)]
+
+
+def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> LlmRole:
+    """Роль llm по образцу роли «данные»: ошибка — причина на странице, процесс жив (П6, Д3а I2).
+
+    LLM_* с ошибкой — умолчания (пути к файлам — свои) и config_error «настройки: …»; нечитаемый файл ключа
+    или ключ не из печатных знаков ASCII — ключа нет, config_error; llm-tokens не читается — пустая таблица и
+    tokens_error, это не config_error (П23). Ключ управления необязателен (Д4а-R16): нечитаемый или негодный —
+    опрос /credits выключен, mgmt_key «error», строка WARNING, прокси работает. Строки журнала начинаются с
+    «LLM-прокси: » — проверка журнала службы данных «токены <файл>» их не спутает. Ledger и Upstream в
+    конструкторах ничего не открывают.
+    """
+    from .llm import LLM_TOKENS_ERROR, LlmRole
+    from .llm.ledger import Ledger
+    from .llm.upstream import Upstream
+    from .secrets import KeyFileError, TokenTable, key_fingerprint, read_key_file
+    from .settings import LlmSettings
+
+    log = logging.getLogger("pcbk_core.main")
+    problems: list[str] = []
+    try:
+        llm = LlmSettings.from_env(env)
+    except ValueError as exc:
+        log.error("LLM-прокси: настройки: %s", exc)
+        llm = LlmSettings.files_from_env(env)   # умолчания, но свои файлы токенов и ключей
+        problems.append(f"настройки: {exc}")
+
+    tokens, tokens_error = TokenTable.empty(), None
+    try:
+        tokens = TokenTable.from_file(llm.LLM_TOKENS_FILE)
+    except (OSError, ValueError) as exc:
+        log.error("LLM-прокси: токены LLM %s: %s", llm.LLM_TOKENS_FILE, _why(exc))
+        tokens_error = LLM_TOKENS_ERROR
+
+    key = mgmt = None
+    try:
+        key = read_key_file(llm.OPENROUTER_KEY_FILE)
+    except KeyFileError as exc:               # текст — имя файла и причина, без ключа
+        log.error("LLM-прокси: ключ OpenRouter %s", exc)
+        problems.append("ключ OpenRouter не читается")
+    mgmt_failed = False
+    try:
+        mgmt = read_key_file(llm.OPENROUTER_MGMT_KEY_FILE)
+    except KeyFileError as exc:
+        log.warning("LLM-прокси: ключ управления OpenRouter %s — остаток счёта не опрашивается", exc)
+        mgmt_failed = True
+    upstream = None
+    if key and not problems:
+        try:
+            upstream = Upstream(llm.OPENROUTER_BASE_URL, key, None, drill=llm.DRILL_LLM)
+        except ValueError as exc:             # ключ не из печатных знаков ASCII; текст без ключа
+            log.error("LLM-прокси: %s", exc)
+            problems.append(str(exc))
+        else:
+            if mgmt:
+                try:
+                    upstream = Upstream(llm.OPENROUTER_BASE_URL, key, mgmt, drill=llm.DRILL_LLM)
+                except ValueError as exc:     # негоден только ключ управления: основной уже проверен
+                    log.warning("LLM-прокси: %s — остаток счёта не опрашивается", exc)
+                    mgmt_failed = True
+    role = LlmRole(settings, llm, tokens=tokens, upstream=upstream, ledger=Ledger(settings.DB_PATH),
+                   key_fingerprint=key_fingerprint(key) if key else None,
+                   config_error="; ".join(problems) or None, tokens_error=tokens_error)
+    if mgmt_failed:
+        role.mgmt_key = "error"
+    return role
 
 
 def healthcheck(settings: Settings) -> int:
-    """Для HEALTHCHECK образа: 0 — /healthz ответил 200, иначе 1."""
+    """Для HEALTHCHECK образа — живость процесса: 0 — /healthz/live ответил 200 (uvicorn жив), иначе 1.
+
+    Здоровье ролей сюда не входит: его видит сторож (/healthz/data, /health/llm). Так 402 от OpenRouter
+    или ошибка настройки роли не делают контейнер core unhealthy.
+    """
     conn = http.client.HTTPConnection("127.0.0.1", settings.CORE_PORT, timeout=4)
     try:
-        conn.request("GET", "/healthz")
+        conn.request("GET", "/healthz/live")
         return 0 if conn.getresponse().status == 200 else 1
     except (OSError, http.client.HTTPException):
         return 1
@@ -103,19 +189,27 @@ def healthcheck(settings: Settings) -> int:
 
 
 def serve(settings: Settings) -> None:
-    """Точка входа службы: охрана выхода — до ролей; плохой bdrv.env — охрана без направлений (только
-    петля), причину показывает config_error роли, процесс живёт (Д3а, I2)."""
+    """Точка входа службы: охрана выхода и поток обновления её адресов — до ролей. Плохой bdrv.env — только
+    OpenRouter (и петля), плохие LLM_* — OpenRouter по умолчанию; причины показывают config_error ролей,
+    процесс живёт (Д3а, I2)."""
     # до охраны (F14): pytds/login.py импортирует ctypes, а import ctypes под хуком на 3.14 падает
     import ctypes  # noqa: F401
+    import httpx  # noqa: F401
     import pytds  # noqa: F401
     import uvicorn
 
     from .app import create_app
-    from .egress import install_historian_guard
+    from .egress import install_guard, start_refresh
     from .logs import setup_logging
+    from .settings import LlmSettings
 
     log = setup_logging()
-    install_historian_guard(read_bdrv(settings)[0])
+    try:
+        llm = LlmSettings.from_env()
+    except ValueError:
+        llm = LlmSettings()                 # причину покажет роль llm (build_roles)
+    install_guard(egress_targets(llm, read_bdrv(settings)[0]))
+    start_refresh()                         # адреса OpenRouter — в кэше до первого вызова (Д4а-R18)
     roles = build_roles(settings)
     log.info("серверный слой слушает порт %s, роли: %s",
              settings.CORE_PORT, ", ".join(r.name for r in roles) or "нет")

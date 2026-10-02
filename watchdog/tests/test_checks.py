@@ -1,9 +1,13 @@
+import json
 import time
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from helpers import T0, insp, now_utc
-from pcbk_watchdog.checks import (check_container, check_historian, check_http, check_memory,
-                                  check_tls, not_installed, tls_verdict)
+from helpers import T0, insp, llm_obj, now_utc
+from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD, EGRESS_STALE_S,
+                                  LLM_STALE_S, check_container, check_historian, check_http, check_llm,
+                                  check_memory, check_tls, fmt_total, fmt_usd, not_installed,
+                                  tls_verdict)
 from pcbk_watchdog.journal import Journal
 
 MEMINFO = "MemTotal: 16384000 kB\nMemAvailable: {} kB\n"
@@ -333,3 +337,312 @@ def test_tls_not_yet_valid_certificate(future_tls_server):
     r = check_tls("edge", "Входной прокси", "127.0.0.1", future_tls_server.port,
                   future_tls_server.cafile, now_utc())
     assert (r.state, r.detail) == ("fail", "сертификат ещё не действителен")
+
+
+def up(state, text):
+    return {"state": state, "text": text, "since": None}
+
+
+def spent(x, **kw):                                  # расход x по журналу, без оценок и сверки
+    return llm_obj(**{"spent_usd": x, "ledger_usd": x, **kw})
+
+
+def llm(fake_core, obj):
+    fake_core.set_llm(obj)
+    return check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", T0, timeout=0.5)
+
+
+def test_llm_verdicts(fake_core):                                                # Review Focus 2, 5, 6
+    cases = [
+        (llm_obj(), ("ok", "OpenRouter отвечает", "расход $12.35 из $1000")),
+        (spent(500.0), ("ok", "OpenRouter отвечает", "расход $500.00 из $1000")),   # ровно 50 % — ещё не «больше»
+        (spent(501.0), ("warn", "израсходовано больше 50 % бюджета", "расход $501.00 из $1000")),
+        (spent(801.0), ("warn", "израсходовано больше 80 % бюджета", "расход $801.00 из $1000")),
+        (spent(951.0), ("warn", "израсходовано больше 95 % бюджета", "расход $951.00 из $1000")),
+        (spent(1000.0), ("fail", "бюджет $1000 исчерпан — модель не отвечает", "расход $1000.00 из $1000")),
+        # полоса не прячет остальное (раунд 1): те же $600 и одно из предупреждений
+        (spent(600.0, account_remaining_usd=5.0),
+         ("warn", "на счёте OpenRouter меньше $20", "расход $600.00 из $1000 · на счёте $5.00")),
+        (spent(600.0, provider_mismatch_24h=1),
+         ("warn", "за сутки были ответы не от закреплённого провайдера", "расход $600.00 из $1000")),
+        (spent(600.0, cost_unknown_24h=1, estimated_usd=0.49),
+         ("warn", "цена неизвестна у части вызовов — в расходе по верхней оценке",
+          "расход $600.00 из $1000 · по оценке $0.4900")),
+        (spent(600.0, pending=1, pending_stuck=1, estimated_usd=0.49),
+         ("warn", "цена ждёт дозапроса дольше 15 минут", "расход $600.00 из $1000 · по оценке $0.4900")),
+        (llm_obj(spent_usd=14.0, key_spent_usd=14.0),                            # ledger_usd 12.35: разница $1.65
+         ("warn", "OpenRouter насчитал больше, чем учёл прокси", "расход $14.00 из $1000 · по ключу OpenRouter $14.00")),
+        (llm_obj(key_spent_usd=12.9), ("ok", "OpenRouter отвечает", "расход $12.35 из $1000 · по ключу OpenRouter $12.90")),
+        (spent(600.0, mgmt_key="rejected"),
+         ("warn", "ключ управления OpenRouter отклонён — остаток счёта не виден", "расход $600.00 из $1000")),
+        (llm_obj(shares={"over_80": 2, "spent": 1}),
+         ("ok", "OpenRouter отвечает", "расход $12.35 из $1000 · доля больше 80 %: 2 · доля исчерпана: 1")),
+        (llm_obj(ledger_ok=False), ("fail", "журнал вызовов не пишется", "расход $12.35 из $1000")),
+        # ревью задач 2а и 4: молчание потока адресов и пропавшая core.db
+        (llm_obj(egress={"alive": False, "last_ok_age_s": 40.0}),
+         ("fail", "охрана выхода: поток обновления адресов остановлен", "расход $12.35 из $1000")),
+        (llm_obj(egress={"alive": True, "last_ok_age_s": 301.0}),
+         ("warn", "охрана выхода: адреса OpenRouter не обновлялись больше 5 минут", "расход $12.35 из $1000")),
+        (llm_obj(egress={"alive": None, "last_ok_age_s": None}), ("ok", "OpenRouter отвечает", "расход $12.35 из $1000")),
+        (llm_obj(ledger_fresh=True, ledger_reset=True),
+         ("warn", "журнал вызовов начат заново при ненулевом расходе ключа", "расход $12.35 из $1000")),
+        (llm_obj(config_error="ключ OpenRouter не читается"),
+         ("fail", "ошибка настройки: ключ OpenRouter не читается", "расход $12.35 из $1000")),
+        (llm_obj(tokens_error="токены LLM не читаются"),                        # П23: не config_error
+         ("fail", "токены LLM не читаются", "расход $12.35 из $1000")),
+        # резервы идущих вызовов полосу не двигают (раунд 2): $499.90 без резервов — ещё норма
+        (spent(499.9, reserved_usd=2.0, ledger_usd=501.9, estimated_usd=2.0),
+         ("ok", "OpenRouter отвечает", "расход $499.90 из $1000 · идёт на оценку $2.00")),
+        (llm_obj(checked_at=(T0 - timedelta(seconds=200)).isoformat()),
+         ("unknown", "LLM-прокси давно не опрашивал OpenRouter", "расход $12.35 из $1000")),
+        (llm_obj(upstream=up("unreachable", "OpenRouter недоступен")),
+         ("fail", "OpenRouter недоступен", "расход $12.35 из $1000")),
+        (llm_obj(stopped=True), ("fail", "LLM-прокси остановлен администратором", "расход $12.35 из $1000")),
+        (llm_obj(key="missing"), ("fail", "нет ключа OpenRouter", "расход $12.35 из $1000")),
+        (llm_obj(upstream=up("money_out", "на счёте OpenRouter кончились деньги (учения)")),
+         ("fail", "на счёте OpenRouter кончились деньги (учения)", "расход $12.35 из $1000")),
+        (llm_obj(upstream=up("errors", "OpenRouter отвечает ошибками подряд")),
+         ("warn", "OpenRouter отвечает ошибками подряд", "расход $12.35 из $1000")),
+        (llm_obj(checked_at=None, upstream=up("unknown", "OpenRouter ещё не опрашивался")),
+         ("unknown", "OpenRouter ещё не опрашивался", "расход $12.35 из $1000")),
+        (llm_obj(provider_mismatch_24h=2),
+         ("warn", "за сутки были ответы не от закреплённого провайдера", "расход $12.35 из $1000")),
+        (spent(0.0012, ops_usd=0.0012, account_remaining_usd=5.0),
+         ("warn", "на счёте OpenRouter меньше $20",
+          "расход $0.0012 из $1000 · отбор и проверки $0.0012 · на счёте $5.00")),
+    ]
+    for obj, want in cases:
+        r = llm(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want
+
+
+def test_llm_stale_rule():                                                      # вывод LLM_STALE_S, как у HIST_STALE_S
+    assert LLM_STALE_S >= 60 + 2 * 15 + 10 + 60                                  # LLM_POLL_S, 2 × POLL_TIMEOUT_S, такт, запас
+
+
+def test_llm_down_is_fail(fake_core):
+    r = check_llm("llm", "LLM-прокси и бюджет", "http://127.0.0.1:9/health/llm", T0, timeout=0.5)
+    assert (r.state, r.detail, r.note) == ("fail", "LLM-прокси не отвечает", "")
+
+
+def test_llm_details_fit_80_chars(fake_core):                                    # П20, правило Д3а
+    objs = [llm_obj(config_error="х" * 200), llm_obj(tokens_error="токены LLM не читаются"),
+            llm_obj(upstream=up("region", "OpenRouter отказывает по региону (учения)")), spent(1000.0),
+            spent(951.0), llm_obj(mgmt_key="rejected"), llm_obj(cost_unknown_24h=1), llm_obj(pending_stuck=1),
+            llm_obj(provider_mismatch_24h=1), llm_obj(key_spent_usd=99.0), llm_obj(account_remaining_usd=1.0),
+            llm_obj(ledger_reset=True), llm_obj(egress={"alive": False, "last_ok_age_s": None}),
+            llm_obj(egress={"alive": True, "last_ok_age_s": 999.0}), llm_obj(ledger_error="dropped"),
+            llm_obj(egress={"alive": True, "last_ok_age_s": None}, refresh_started_age_s=999.0),
+            llm_obj(upstream=up("unknown", "OpenRouter ещё не опрашивался"))]
+    details = [llm(fake_core, o).detail for o in objs] + ["LLM-прокси не отвечает", "LLM-прокси ответил не по договору"]
+    assert all(len(d) <= 80 for d in details), [d for d in details if len(d) > 80]
+
+
+def test_fmt_usd_and_total():
+    assert [fmt_usd(x) for x in (0, 0.0, -0.0, 0.0012, 0.49, 0.99994, 1, 12.3456, 999.999, 1234567.891)] == \
+           ["$0.00", "$0.00", "$0.00", "$0.0012", "$0.4900", "$0.9999", "$1.00", "$12.35", "$1000.00", "$1234567.89"]
+    assert (fmt_total(1000.0), fmt_total(1000), fmt_total(250.0)) == ("$1000", "$1000", "$250")
+
+
+def test_fmt_usd_tiny_negative_and_edges():                                     # ревью задачи 7: I2, M3
+    # ненулевой расход не пишется нулём (I2)
+    assert [fmt_usd(x) for x in (0.00001, 0.00009999, 0.0001, 0.00012)] == \
+           ["<$0.0001", "<$0.0001", "$0.0001", "$0.0001"]
+    # минус — перед знаком доллара; округлённый до нуля минус не пишется
+    assert [fmt_usd(x) for x in (-0.5, -12.345, -0.001)] == ["-$0.50", "-$12.35", "$0.00"]
+    # у четырёх знаков доллар — порог: 0.99996 не становится «$1.0000»
+    assert fmt_usd(0.99996) == "$0.9999"
+    # порог не переходится ни вверх, ни вниз; на самом пороге — как есть
+    assert [fmt_usd(x, keep=(1000.0,)) for x in (999.996, 1000.0, 1000.004, 999.994)] == \
+           ["$999.99", "$1000.00", "$1000.01", "$999.99"]
+    assert [fmt_usd(x, keep=(500.0, 1000.0)) for x in (500.004, 499.996, 500.0, 750.004)] == \
+           ["$500.01", "$499.99", "$500.00", "$750.00"]
+    assert [fmt_usd(x, keep=(20.0,)) for x in (19.996, 20.004, 19.5)] == ["$19.99", "$20.01", "$19.50"]
+
+
+def test_llm_constants():
+    assert (EGRESS_STALE_S, LLM_STALE_S, ACCOUNT_WARN_USD, DRIFT_WARN_USD, BUDGET_STEPS) == \
+           (300, 180, 20.0, 1.0, (95, 80, 50))
+
+
+def test_llm_boundaries(fake_core):
+    ok = ("ok", "OpenRouter отвечает")
+    cases = [(llm_obj(checked_at=(T0 - timedelta(seconds=180)).isoformat()), ok),      # ровно LLM_STALE_S — ещё свежо
+             (llm_obj(checked_at="2026-09-29T11:59:50Z"), ok),
+             (llm_obj(checked_at="2026-09-29T11:59:50"), ok),                            # без пояса — UTC, как у историана
+             (llm_obj(egress={"alive": True, "last_ok_age_s": 300.0}), ok),              # ровно EGRESS_STALE_S
+             (llm_obj(account_remaining_usd=20.0), ok),                                  # ровно $20 — не «меньше»
+             (llm_obj(account_remaining_usd=19.99), ("warn", "на счёте OpenRouter меньше $20")),
+             (spent(12.5, key_spent_usd=13.5), ok),                                     # разница ровно $1 — не «больше»
+             (llm_obj(key_spent_usd=10.0), ok),                                          # OpenRouter насчитал меньше
+             (spent(800.0), ("warn", "израсходовано больше 50 % бюджета")),
+             (spent(950.0), ("warn", "израсходовано больше 80 % бюджета")),
+             (spent(999.99), ("warn", "израсходовано больше 95 % бюджета")),
+             (spent(1200.0), ("fail", "бюджет $1000 исчерпан — модель не отвечает")),
+             (spent(30.0, total_usd=50.0), ("warn", "израсходовано больше 50 % бюджета")),  # полосы — от total_usd
+             (llm_obj(mgmt_key="error"), ok),                                            # остаток просто неизвестен
+             (llm_obj(ledger_fresh=True, ledger_reset=False), ok),                       # новая база при нулевом расходе
+             # опрос был, а OpenRouter ни разу не ответил (ревью задачи 7, I1) — не «норма»
+             (llm_obj(upstream=up("unknown", "OpenRouter ещё не опрашивался")),
+              ("unknown", "OpenRouter ещё ни разу не ответил на опрос")),
+             # поток адресов жив, удачного круга не было: ровно EGRESS_STALE_S с запуска — ещё ждём
+             (llm_obj(egress={"alive": True, "last_ok_age_s": None}, refresh_started_age_s=300.0), ok),
+             (llm_obj(egress={"alive": True, "last_ok_age_s": None}, refresh_started_age_s=300.1),
+              ("fail", "охрана выхода: адреса OpenRouter ни разу не получены")),
+             (llm_obj(egress={"alive": None, "last_ok_age_s": None}, refresh_started_age_s=None), ok),  # как в pytest
+             (llm_obj(ledger_ok=False, ledger_error="write"), ("fail", "журнал вызовов не пишется")),
+             (llm_obj(ledger_ok=False, ledger_error="dropped"),
+              ("fail", "строка журнала вызовов потеряна — перезапустите core")),
+             (llm_obj(ledger_error="dropped"), ("fail", "строка журнала вызовов потеряна — перезапустите core")),
+             (llm_obj(ledger_error="write"), ("fail", "журнал вызовов не пишется"))]
+    for obj, want in cases:
+        r = llm(fake_core, obj)
+        assert (r.state, r.detail) == want, obj
+
+
+def test_llm_order(fake_core):
+    # сбои, затем «неизвестно», затем деньги мимо учёта и провайдер, полосы — последними
+    stale = (T0 - timedelta(seconds=999)).isoformat()
+    cases = [(llm_obj(stopped=True, config_error="x"), "LLM-прокси остановлен администратором"),
+             (llm_obj(config_error="x", tokens_error="токены LLM не читаются"), "ошибка настройки: x"),
+             (llm_obj(tokens_error="что угодно", key="missing"), "токены LLM не читаются"),   # текст постоянный
+             (llm_obj(key="missing", ledger_ok=False), "нет ключа OpenRouter"),
+             (llm_obj(ledger_ok=False, egress={"alive": False, "last_ok_age_s": None}), "журнал вызовов не пишется"),
+             (spent(1000.0, egress={"alive": False, "last_ok_age_s": None}),
+              "охрана выхода: поток обновления адресов остановлен"),
+             (llm_obj(ledger_error="dropped", egress={"alive": False, "last_ok_age_s": None}),
+              "строка журнала вызовов потеряна — перезапустите core"),
+             (llm_obj(ledger_ok=False, egress={"alive": True, "last_ok_age_s": None}, refresh_started_age_s=999.0),
+              "журнал вызовов не пишется"),
+             (spent(1000.0, egress={"alive": True, "last_ok_age_s": None}, refresh_started_age_s=999.0),
+              "охрана выхода: адреса OpenRouter ни разу не получены"),
+             (llm_obj(checked_at=None, upstream=up("unknown", "OpenRouter ещё не опрашивался")),
+              "OpenRouter ещё не опрашивался"),
+             (llm_obj(upstream=up("unknown", "OpenRouter ещё не опрашивался"), checked_at=stale),
+              "OpenRouter ещё ни разу не ответил на опрос"),
+             (llm_obj(upstream=up("unknown", "OpenRouter ещё не опрашивался"), account_remaining_usd=1.0),
+              "OpenRouter ещё ни разу не ответил на опрос"),
+             (spent(1000.0, upstream=up("key_limit", "исчерпан лимит ключа OpenRouter")),
+              "бюджет $1000 исчерпан — модель не отвечает"),
+             (spent(1000.0, checked_at=None), "бюджет $1000 исчерпан — модель не отвечает"),
+             (llm_obj(upstream=up("key_rejected", "OpenRouter отклонил ключ стенда"), checked_at=stale),
+              "OpenRouter отклонил ключ стенда"),
+             (llm_obj(upstream=up("unreachable", "OpenRouter недоступен"), checked_at=None), "OpenRouter недоступен"),
+             (llm_obj(checked_at=stale, upstream=up("errors", "OpenRouter отвечает ошибками подряд")),
+              "LLM-прокси давно не опрашивал OpenRouter"),
+             (spent(990.0, checked_at=stale), "LLM-прокси давно не опрашивал OpenRouter"),
+             (llm_obj(upstream=up("errors", "OpenRouter отвечает ошибками подряд"), account_remaining_usd=1.0),
+              "OpenRouter отвечает ошибками подряд"),
+             (llm_obj(account_remaining_usd=1.0, provider_mismatch_24h=1), "на счёте OpenRouter меньше $20"),
+             (llm_obj(provider_mismatch_24h=1, cost_unknown_24h=1), "за сутки были ответы не от закреплённого провайдера"),
+             (llm_obj(cost_unknown_24h=1, pending_stuck=1), "цена неизвестна у части вызовов — в расходе по верхней оценке"),
+             (llm_obj(pending_stuck=1, ledger_reset=True), "цена ждёт дозапроса дольше 15 минут"),
+             (llm_obj(ledger_reset=True, egress={"alive": True, "last_ok_age_s": 999.0}),
+              "журнал вызовов начат заново при ненулевом расходе ключа"),
+             (llm_obj(egress={"alive": True, "last_ok_age_s": 999.0}, key_spent_usd=99.0),
+              "охрана выхода: адреса OpenRouter не обновлялись больше 5 минут"),
+             (llm_obj(key_spent_usd=99.0, mgmt_key="rejected"), "OpenRouter насчитал больше, чем учёл прокси"),
+             (spent(990.0, mgmt_key="rejected"), "ключ управления OpenRouter отклонён — остаток счёта не виден")]
+    for obj, want in cases:
+        assert llm(fake_core, obj).detail == want, obj
+
+
+def test_llm_note_parts_in_order(fake_core):
+    full = spent(900.0, reserved_usd=2.0, estimated_usd=2.49, key_spent_usd=900.5, ops_usd=12.3456,
+                 shares={"over_80": 3, "spent": 1}, account_remaining_usd=250.0)
+    assert llm(fake_core, full).note == ("расход $900.00 из $1000 · идёт на оценку $2.00 · по оценке $0.4900"
+                                         " · по ключу OpenRouter $900.50 · отбор и проверки $12.35"
+                                         " · доля больше 80 %: 3 · доля исчерпана: 1 · на счёте $250.00")
+    # оценка вся — у идущих вызовов: «по оценке» нет, и шум сложения не даёт «$0.0000»
+    assert llm(fake_core, llm_obj(reserved_usd=0.3, estimated_usd=0.1 + 0.2)).note == \
+           "расход $12.35 из $1000 · идёт на оценку $0.3000"
+    assert llm(fake_core, llm_obj(key_spent_usd=0.0, account_remaining_usd=0.0)).note == \
+           "расход $12.35 из $1000 · по ключу OpenRouter $0.00 · на счёте $0.00"   # ноль — тоже известное число
+
+
+def test_llm_note_mgmt_error_and_drill(fake_core):                              # ревью задачи 7: M1, M2
+    assert llm(fake_core, llm_obj(mgmt_key="error")).note == "расход $12.35 из $1000 · остаток счёта не виден"
+    assert llm(fake_core, llm_obj(mgmt_key="rejected")).note == "расход $12.35 из $1000"   # своя строка detail
+    r = llm(fake_core, llm_obj(drill="402", mgmt_key="error",
+                               upstream=up("money_out", "на счёте OpenRouter кончились деньги (учения)")))
+    assert (r.state, r.detail, r.note) == ("fail", "на счёте OpenRouter кончились деньги (учения)",
+                                           "расход $12.35 из $1000 · остаток счёта не виден · учения DRILL_LLM=402")
+
+
+def test_llm_note_number_agrees_with_words(fake_core):                          # ревью задачи 7: M3
+    cases = [(spent(999.996), ("warn", "израсходовано больше 95 % бюджета", "расход $999.99 из $1000")),
+             (spent(500.004), ("warn", "израсходовано больше 50 % бюджета", "расход $500.01 из $1000")),
+             (spent(499.996), ("ok", "OpenRouter отвечает", "расход $499.99 из $1000")),
+             (spent(950.004), ("warn", "израсходовано больше 95 % бюджета", "расход $950.01 из $1000")),
+             (spent(0.00004), ("ok", "OpenRouter отвечает", "расход <$0.0001 из $1000")),
+             (llm_obj(account_remaining_usd=19.996),
+              ("warn", "на счёте OpenRouter меньше $20", "расход $12.35 из $1000 · на счёте $19.99")),
+             (llm_obj(key_spent_usd=-0.5), ("ok", "OpenRouter отвечает", "расход $12.35 из $1000 · по ключу OpenRouter -$0.50"))]
+    for obj, want in cases:
+        r = llm(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+
+
+def test_llm_number_changes_are_not_journal_events(fake_core, tmp_path):        # Review Focus 5
+    journal = Journal(str(tmp_path / "j.db"))
+    rows = [llm(fake_core, spent(x)) for x in (501.0, 502.5, 600.0, 799.99)]
+    assert {(r.state, r.detail) for r in rows} == {("warn", "израсходовано больше 50 % бюджета")}
+    assert len({r.note for r in rows}) == 4
+    assert sum(len(journal.record([r], T0 + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 1
+
+
+def test_llm_bad_reply(fake_core):
+    down = ("fail", "LLM-прокси не отвечает", "")
+    for url in (fake_core.base + "/nope", fake_core.base + "/healthz/data"):     # HTTP ≠ 200 — 404 и 503
+        fake_core.set_health(503, llm_obj())
+        r = check_llm("llm", "LLM-прокси и бюджет", url, T0, timeout=0.5)
+        assert (r.state, r.detail, r.note) == down, url
+    for raw in ("не json", "", "{\"checked_at\": ", "[" * 100_000):
+        fake_core.set_llm_raw(raw)
+        r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", T0, timeout=0.5)
+        assert (r.state, r.detail, r.note) == down, raw[:20]
+
+
+def test_llm_off_contract_reply_has_own_text(fake_core):
+    # JSON пришёл, но не по договору (другая версия core): сбой со своим постоянным текстом, без чисел
+    without = {k: v for k, v in llm_obj().items() if k != "spent_usd"}
+    for obj in ([llm_obj()], "строка", 7, None, {}, without, llm_obj(spent_usd="12"), llm_obj(spent_usd=True),
+                llm_obj(spent_usd=float("nan")), llm_obj(total_usd=0.0), llm_obj(total_usd=float("inf")),
+                llm_obj(checked_at="вчера"), llm_obj(checked_at=12), llm_obj(upstream="ok"),
+                llm_obj(upstream=up("new_state", "что-то новое")), llm_obj(upstream=up("ok", None)),
+                llm_obj(egress=None), llm_obj(egress={"alive": "yes", "last_ok_age_s": None}),
+                llm_obj(shares={"over_80": "2", "spent": 0}), llm_obj(stopped="false"), llm_obj(ledger_ok=None),
+                llm_obj(key_spent_usd="1"), llm_obj(account_remaining_usd=float("-inf")),
+                llm_obj(config_error=5), llm_obj(pending_stuck=None), llm_obj(provider_mismatch_24h=True),
+                llm_obj(upstream=up("ok", "")), llm_obj(upstream=up("errors", "  ")),               # M7
+                llm_obj(ledger_error="other"), llm_obj(ledger_error=1), llm_obj(drill=None),
+                llm_obj(refresh_started_age_s="1"), llm_obj(spent_usd=1e300, ledger_usd=1e300),
+                llm_obj(egress={"alive": True, "last_ok_age_s": None}, refresh_started_age_s=None),
+                {k: v for k, v in llm_obj().items() if k != "ledger_error"},
+                {k: v for k, v in llm_obj().items() if k != "refresh_started_age_s"}):
+        r = llm(fake_core, obj)
+        assert (r.state, r.detail, r.note) == ("fail", "LLM-прокси ответил не по договору", ""), obj
+
+
+# настоящие ответы /health/llm кода задачи 6 (источник — в поле source файла); сторож core не импортирует
+REAL_HEALTH_LLM = json.loads((Path(__file__).parent / "fixtures" / "health_llm_samples.json").read_text("utf-8"))
+
+
+def test_llm_junction_with_real_health_json(fake_core):                         # стык задач 6 и 7
+    samples = REAL_HEALTH_LLM["samples"]
+    want = {"not_polled": ("unknown", "OpenRouter ещё не опрашивался", "расход $0.00 из $1000"),
+            "working": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · по ключу OpenRouter $0.0024"
+                        " · отбор и проверки $0.0012 · на счёте $30.00"),
+            "drill_402": ("fail", "на счёте OpenRouter кончились деньги (учения)",
+                          "расход $0.00 из $1000 · по ключу OpenRouter $0.00 · на счёте $30.00 · учения DRILL_LLM=402")}
+    assert set(samples) == set(want)
+    for name, obj in samples.items():
+        # помощник тестов сторожа держит тот же договор, что и настоящий ответ: 30 ключей и вложенные
+        assert set(obj) == set(llm_obj()) and len(obj) == 30, name
+        assert (set(obj["upstream"]), set(obj["egress"]), set(obj["shares"])) == \
+               ({"state", "text", "since"}, {"alive", "last_ok_age_s"}, {"over_80", "spent"}), name
+        at = datetime.fromisoformat(obj["checked_at"]) if obj["checked_at"] else T0
+        fake_core.set_llm(obj)
+        r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", at + timedelta(seconds=5),
+                      timeout=0.5)
+        assert (r.state, r.detail, r.note) == want[name], name
