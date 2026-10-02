@@ -24,14 +24,23 @@ test-mgmt-key.
 потока), POST /_usage ({"add": x, "key": "a"|"b"}), POST /_price ({"model", "prompt", "completion"} —
 нынешняя цена точки, $ за 1 млн; выше provider.max_price запроса — 404 «No endpoints found matching
 your max_price», max_price в теле нет — обычный ответ).
+
+Стенд отбора модели (Д8-R75): POST /_bench {"personas": {модель: персона}} — 204, включает персоны fake_bench
+(пусто или персона вне PERSONA_NAMES — 400); DELETE /_bench — 204, выключает. Чат с включёнными
+персонами сначала спрашивает bench_answer; None — дальше прежняя логика слов. Провайдер ответа — по закреплённой
+точке запроса (provider.only, PROVIDER_NAMES: «google-vertex/global» → «Google Vertex»); без точки или с чужой —
+«Fireworks», как раньше; слово FAKEPROVIDER сильнее точки — «Together».
 """
 import json
 import re
 import socketserver
 import threading
 import time
+import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from fake_bench import PERSONA_NAMES, bench_answer
 
 KEYS = {"test-openrouter-key": "a", "test-openrouter-key-b": "b"}
 MGMT_KEY = "test-mgmt-key"
@@ -51,6 +60,9 @@ WORDS = ("FAKE402", "FAKE402INFLIGHT", "FAKE403KEY", "FAKE403REGION", "FAKE401",
          "FAKESLOW", "FAKESLOWSTART", "FAKEPROVIDER", "FAKEMIDSTR", "FAKEDRIP",
          "FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD")
 _WORD = re.compile(r"\bFAKE[A-Z0-9]+\b")
+# закреплённая точка запроса (provider.only прокси) → имя провайдера в ответе, как его пишет OpenRouter
+PROVIDER_NAMES = {"fireworks": "Fireworks", "google-vertex/global": "Google Vertex", "azure": "Azure"}
+DEFAULT_PROVIDER = "Fireworks"
 SAVE_WORDS = ("FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD")
 SAVE_NAME = "proverka-d7a"              # имя агента, если в вопросе нет «agent=<имя>»
 _AGENT = re.compile(r"\bagent=([a-z][a-z0-9-]*)")
@@ -91,6 +103,7 @@ class State:
         self.gen_never: set[str] = set()
         self.gen_found: set[str] = set()         # цена по id уже отдана — в usage ключа второй раз не идёт
         self.flaky = 0
+        self.personas: dict[str, str] = {}      # стенд отбора: модель → персона fake_bench (POST /_bench)
 
 
 def _text(content: object) -> str:
@@ -149,6 +162,17 @@ def answer(body: dict, word: str | None, gen: str = "gen-0") -> tuple[dict, str]
     return {"role": "assistant", "content": "Готово: " + tail}, "stop"
 
 
+def provider_of(body: dict, word: str | None) -> str:
+    """Провайдер ответа: FAKEPROVIDER — «Together»; иначе по закреплённой точке (PROVIDER_NAMES), без неё —
+    DEFAULT_PROVIDER."""
+    if word == "FAKEPROVIDER":
+        return "Together"
+    provider = body.get("provider")
+    only = provider.get("only") if isinstance(provider, dict) else None
+    pinned = only[0] if isinstance(only, list) and only and isinstance(only[0], str) else None
+    return PROVIDER_NAMES.get(pinned, DEFAULT_PROVIDER)
+
+
 def _tool_call(gen: str, name: str, args: dict) -> dict:
     return {"role": "assistant", "content": None,
             "tool_calls": [{"index": 0, "id": f"call-{gen}", "type": "function",
@@ -201,6 +225,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _no_content(self) -> None:
+        """204 без тела (ручки /_bench)."""
+        self.send_response(204)
+        self.end_headers()
+
     def _error(self, status: int, message: str, metadata: dict | None = None,
                retry_after: str | None = None) -> None:
         error = {"code": status, "message": message, **({"metadata": metadata} if metadata else {})}
@@ -235,10 +264,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "Not Found")
 
     def do_DELETE(self):
-        if self._path()[0] == "/_requests":
+        path = self._path()[0]
+        if path == "/_requests":
             with self.state.lock:
                 self.state.requests.clear()
             return self._json(200, {"ok": True})
+        if path == "/_bench":
+            with self.state.lock:
+                self.state.personas = {}
+            return self._no_content()
         return self._error(404, "Not Found")
 
     def do_POST(self):
@@ -261,6 +295,14 @@ class Handler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.prices[model] = (float(prompt), float(completion))
             return self._json(200, {"ok": True})
+        if path == "/_bench":
+            personas = payload.get("personas")
+            if not isinstance(personas, dict) or not personas or not all(
+                    isinstance(k, str) and v in PERSONA_NAMES for k, v in personas.items()):
+                return self._error(400, "need {personas: {model: " + "|".join(sorted(PERSONA_NAMES)) + "}}")
+            with self.state.lock:
+                self.state.personas = dict(personas)
+            return self._no_content()
         return self._error(404, "Not Found")
 
     def _generation(self, gen_id: str) -> None:
@@ -306,7 +348,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(401, "User not found.")
         if self._over_max_price(body):
             return self._error(404, "No endpoints found matching your max_price")
-        word = word_of(body)
+        with st.lock:
+            personas = dict(st.personas)
+        try:                                        # персоны стенда отбора — первыми (Д8-R75)
+            bench = bench_answer(body, personas) if personas else None
+        except Exception as exc:                    # сбой персоны — явный 500, а не оборванное соединение
+            if getattr(self.server, "verbose", False):
+                traceback.print_exc()
+            return self._error(500, f"fake bench persona failed: {type(exc).__name__}")
+        word = None if bench is not None else word_of(body)
         if word in ERRORS:
             return self._error(*ERRORS[word])
         if word == "FAKEDRIP":
@@ -323,9 +373,9 @@ class Handler(BaseHTTPRequestHandler):
             st.gen_owner[gen] = key
             if word == "FAKEGENNEVER":
                 st.gen_never.add(gen)
-        provider = "Together" if word == "FAKEPROVIDER" else "Fireworks"
+        provider = provider_of(body, word)
         with_usage = word not in ("FAKENOUSAGE", "FAKEGENNEVER")
-        message, finish = answer(body, word, gen)
+        message, finish = bench if bench is not None else answer(body, word, gen)
         # FAKESAVESLOW медлит только текстом хода после инструмента: запрос заголовка (без инструментов) — быстрый
         slow = word in ("FAKESLOW", "FAKESLOWSTART") or (word == "FAKESAVESLOW" and finish == "stop"
                                                           and bool(_tool_names(body)))

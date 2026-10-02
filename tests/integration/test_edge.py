@@ -23,8 +23,8 @@ DECLARED_ENV = {                   # наши переменные сверх п
                   "DRILL_AGENTS",                                  # учения агентов студентов (Д7а, П10)
                   "LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS",  # прогон отбора модели (Д8-R69)
                   # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
-                  # бюджет (учение «бюджет стенда израсходован», Д4б)
-                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD"},
+                  # бюджет (учение «бюджет стенда израсходован», Д4б); обёртка запуска и двойник историана (Д8-R75)
+                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD", "PYTHONPATH", "PCBK_TWIN_HISTORIAN"},
     "pcbk-edge": set(),
     "pcbk-sp-ro": set(),
     "pcbk-sp-ctl": set(),

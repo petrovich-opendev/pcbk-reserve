@@ -54,6 +54,8 @@ from pcbk_core.settings import GatewaySettings, LlmSettings, Settings
 
 # каталог core/: из него подпроцессы импортируют pcbk_core
 CORE_DIR = Path(__file__).resolve().parent.parent
+# корень репозитория: compose.yaml, bench/ (Д8а)
+REPO = CORE_DIR.parent
 
 _files = itertools.count(1)
 

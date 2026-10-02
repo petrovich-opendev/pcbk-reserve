@@ -1,4 +1,4 @@
-# Двойник OpenRouter для локального тестового стенда (compose.test.yaml, образ pcbk-test/fake-openrouter:d4a);
+# Двойник OpenRouter для локального тестового стенда (compose.test.yaml, образ pcbk-test/fake-openrouter:d8a);
 # на сервер не едет. Только стандартная библиотека; база — та же закреплённая, что у core и сторожа:
 # по дайджесту, без общего тега python:3.12-slim машины разработчика.
 FROM python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
@@ -6,7 +6,10 @@ FROM python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4d
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-COPY fake_openrouter.py /app/fake_openrouter.py
+# персоны стенда отбора (fake_bench, Д8-R75) — рядом с двойником; импорт проверяется при сборке из /app (П1)
+WORKDIR /app
+COPY fake_openrouter.py fake_bench.py /app/
+RUN python -c "import fake_openrouter"
 
 USER 65534:65534
 EXPOSE 8080

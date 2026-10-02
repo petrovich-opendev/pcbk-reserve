@@ -169,3 +169,26 @@ def test_front_subnet_matches_compose(stack):                        # Ш15: з�
     networks = stack.prod_config()["networks"]
     assert networks["pcbk-front"]["ipam"]["config"][0]["subnet"] == zones["FRONT_NETS"][0]
     assert networks["pcbk-egress"]["ipam"]["config"][0]["subnet"] == zones["ADMIN_NETS"][-1]
+
+
+# Д8а: по алфавиту модуль идёт после test_bench (А6) и держится на его уборке — core пересоздан с {}:
+# PCBK_TWIN_HISTORIAN пуст, обёртка запуска остаётся (m-р3-11)
+def test_core_wrapper_healthy_without_twin(stack):                               # I7, m-н2, П3, m22
+    c = stack.inspect("pcbk-core")
+    env = dict(e.split("=", 1) for e in c["Config"]["Env"])
+    assert (env["PYTHONPATH"], env["PCBK_TWIN_HISTORIAN"]) == ("/twin", "")
+    assert c["Config"]["Cmd"] == ["python", "-m", "twin_core"]
+    # П3: после stop/start соседнего теста Docker держит starting до первой проверки по расписанию
+    stack.wait_healthy("pcbk-core")
+    # без переменной — настоящий tds_query: историан тестового стенда (192.0.2.10) недостижим, двойника нет
+    deadline = time.monotonic() + 30
+    while (j := json.loads(stack.http_host("GET", CORE + "/health/historian")[1]))["catalog_error"] is None:
+        assert time.monotonic() < deadline, f"за 30 с каталог не попробовал загрузиться: {j}"
+        time.sleep(1)
+    assert j["catalog_error"] == "connect"
+    # m22: в образе core обёртки нет — модуль виден только через PYTHONPATH=/twin. Положительный контроль — путь А6:
+    # с переменной двойник ставится в самом контейнере (fakes, pytds, pcbk_core, фикстура с привязки от uid 10003)
+    twin = "PCBK_TWIN_HISTORIAN=/twin/data/bench-historian.json"
+    assert stack.sh("pcbk-core", f"{twin} python -c 'import os, twin_core; assert twin_core.install_twin(os.environ)'"
+                    )[0] == 0
+    assert stack.sh("pcbk-core", "PYTHONPATH= python -c 'import twin_core'")[0] != 0

@@ -32,13 +32,22 @@ services:
 
   # опрос свежести и OpenRouter чаще: строки историана и LLM меняются за секунды, а не за минуты;
   # вместо OpenRouter — двойник (ключи стенда — его заглушки, настоящий ключ сюда не попадает);
-  # общий бюджет — только в тестах (учение «бюджет стенда израсходован» в чате места, Д4б)
+  # общий бюджет — только в тестах (учение «бюджет стенда израсходован» в чате места, Д4б).
+  # Обёртка запуска (Д8-R75, core/tests/twin_core.py; core/tests — в /twin только на чтение): с непустой
+  # PCBK_TWIN_HISTORIAN (путь к фикстуре, например /twin/data/bench-historian.json) — двойник историана стенда
+  # отбора вместо tds_query, без неё — обычный pcbk_core.main. Только тестовый стенд: compose.yaml и образ core её
+  # не знают (test_prod_compose_has_no_twin, test_core_wrapper_healthy_without_twin)
   core:
+    command: ["python", "-m", "twin_core"]
     environment:
       FRESH_POLL_S: "5"
       OPENROUTER_BASE_URL: http://fake-openrouter:8080/api/v1
       LLM_POLL_S: "5"
       LLM_TOTAL_USD: ${LLM_TOTAL_USD:-1000}
+      PYTHONPATH: /twin
+      PCBK_TWIN_HISTORIAN: ${PCBK_TWIN_HISTORIAN:-}
+    volumes:
+      - {type: bind, source: ./core/tests, target: /twin, read_only: true, bind: {create_host_path: false}}
 
   # двойник OpenRouter (core/tests/fake_openrouter.py, только stdlib) в сети выхода рядом с core;
   # с хоста теста — http://172.31.250.84:8080 (ручки /_requests и др.). Адрес вне динамических .88/29.
