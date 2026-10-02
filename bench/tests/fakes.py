@@ -14,7 +14,8 @@
 - FakeStand — стенд: блок run (расход — по сессиям привязанных FakeChat и cost_per_run группы), вызывающие, модели
   мест, mcp=connected через mcp_after_s, единицы каталога, агенты мест (bench-uzel есть с начала), архив,
   saved_after_abort, visible_after_s, archive_delay_s (архивный агент ещё виден в «Мои агенты» — перезагрузка
-  места), строки сторожа, калькулятор (calc_rate — столько первых ответов «rate»); строки журнала: rows_none — ни
+  места), строки сторожа, калькулятор (calc_rate — столько первых ответов «rate»; calc_status — {тег: статус item}
+  для tag_now/tag_period: unlisted, unknown, no_data …, Б3); строки журнала: rows_none — ни
   одной, rows_skip_bridge — без моста; health_advance=(FakeClock, с) — /health/llm двигает часы;
   health_fail_after_gone — после первого ответа без блока run /health/llm бросает исключение; health_fail_calls —
   вызовы /health/llm с этими номерами (с 1) бросают исключение.
@@ -127,6 +128,16 @@ def _period_out(tag: str) -> dict:
                        "preset": "prev_shift"},
             "items": [{"tag": tag, "status": "ok", "unit": FAKE_UNITS.get(tag, "бар"), "avg": 3.4, "min": 3.1,
                        "max": 3.7}]}
+
+
+def _status_out(tool: str, tag: str, status: str) -> dict:
+    """Ответ службы по тегу со статусом item (calc_status, Б3): unlisted/unknown — отказ «none» с items (service.py
+    _other_item), no_data — partial без чисел, ok — обычный ответ инструмента."""
+    if status == "ok":
+        return _now_out(tag) if tool == "tag_now" else _period_out(tag)
+    item = {"tag": tag, "status": status, "text": "служба: " + status}
+    head = "refused" if status in ("unlisted", "unknown") else "partial"
+    return {"tool": tool, "status": head, "notes": [], "items": [item]}
 
 
 _FOUND = ["20FAKE_101_PV", "20FAKE_102_PV", "20FAKE_103_PV", "20FAKE_104_PV"]
@@ -477,8 +488,9 @@ class FakeStand:
                  visible_after_s: float = 0.0, cost_per_run: dict | None = None, status_rows: dict | None = None,
                  health: dict | None = None, calc_rate: int = 0, archive_delay_s: float = 0.0,
                  rows_none: bool = False, rows_skip_bridge: bool = False, health_advance: tuple | None = None,
-                 health_fail_after_gone: bool = False, health_fail_calls=()):
+                 health_fail_after_gone: bool = False, health_fail_calls=(), calc_status: dict | None = None):
         self.run_over = dict(run or {})
+        self.calc_status = dict(calc_status or {})
         self._run_callers = None if run_callers is None else frozenset(run_callers)
         self.place_models = dict(place_models or {})
         self.rows_model = rows_model
@@ -629,6 +641,9 @@ class FakeStand:
             matches = [{"tag": q, "description": "Описание тега стенда", "unit": self.units[q], "kind": "analog"}] \
                 if q in self.units else []
             return {"tool": "catalog_search", "status": "ok", "matches": matches, "total": len(matches)}
+        status = self.calc_status.get(args["tags"][0]) if tool in ("tag_now", "tag_period") else None
+        if status is not None:
+            return _status_out(tool, args["tags"][0], status)
         if tool == "tag_now":
             return _now_out(args["tags"][0])
         return _period_out(args["tags"][0])

@@ -412,3 +412,19 @@ def transcript_line(tool: str, input: dict) -> str:
     """Строка транскрипта субагента Claude Code (JSONL) с одним вызовом инструмента."""
     return _json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "toolu_01", "name": tool, "input": input}]}}, ensure_ascii=False)
+
+
+# --- карточки окна (Б3): правки набора без изменения кэша cards() ---
+
+def replace_card(cs: CardSet, sid: str, **changes) -> CardSet:
+    """Набор карточек, где у карточки sid заменены поля changes (CardSet и Card — неизменяемые, cards() не трогается)."""
+    from dataclasses import replace as _replace
+
+    return _replace(cs, cards={**cs.cards, sid: _replace(cs.cards[sid], **changes)})
+
+
+def drop_card(cs: CardSet, sid: str) -> CardSet:
+    """Набор карточек без карточки sid."""
+    from dataclasses import replace as _replace
+
+    return _replace(cs, cards={k: v for k, v in cs.cards.items() if k != sid})

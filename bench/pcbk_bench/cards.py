@@ -17,6 +17,14 @@
 load_cards сверяет только вид (типы, ключи, согласие в on_draft); полноту и коды формы — check_cards (Б3). Тексты
 ValueError — без значений карточек: в них только id сценария и имя поля.
 
+Проверка карточек окна (Б3, Д8-R80, I-р4-6): check_cards(cs) — коды формы без значений: missing:<id> (нет карточки),
+field:<id>.<поле> (нет обязательного поля; у B1, B2, B4, C2, C4 — тега нет в opening; в полях, которые бот или скрипт
+говорит «общими словами», есть токен вида тега), tag_form:<id> (тег не вида тега), a4_opening (в открытии A4 нет узла
+или цели целиком), bench_tags (теги заготовленного агента: пусто, больше MAX_TAGS, не вида тега, нет тега B1, B2, B4
+или C4, есть тег C2). cards_check(cs, stand) — check_cards и статусы калькулятора: «C2: unlisted» и «C4: no_data» —
+годно; иначе «C2: listed», «C4: has_data» или код службы (unknown, discrete, refused, rate …) — отказ карточек.
+Калькулятор — calc_patient (rate — пауза и повтор на всё окно частоты, m14). Значений, тегов и текстов в кодах нет.
+
 Card.bench_tags (сверх брифа) load_cards заполняет у всех карточек тегами заготовленного агента: check_run берёт
 единицы этих тегов в правило чисел у сценариев агента bench (I-р4-4), а сигнатура check_run(rec, card, tag_units)
 CardSet не получает. CardSet.aliases — постоянные псевдонимы тегов и узлов карточек (ТЕГ-n, УЗЕЛ-n) по порядку
@@ -25,12 +33,16 @@ CardSet не получает. CardSet.aliases — постоянные псев
 from __future__ import annotations
 
 import json
+import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 
-from .numbers import TAG_TOKEN_RE
+from .numbers import TAG_TOKEN_RE, tag_tokens
 from .scenarios import BENCH_AGENT, SCENARIO_IDS
+from .stand import Stand, calc_patient
 from .student import CONSENT, CONSENT_RE
 
 # AGENT_TOOLS Д7 (core/pcbk_core/agents/draft.py) — значением, не импортом: bench только на stdlib
@@ -193,3 +205,103 @@ def bench_agent_args(cs: CardSet) -> dict:
     return {"name": BENCH_AGENT, "title": BENCH_TITLE, "node": cs.bench_node.strip(), "purpose": BENCH_PURPOSE,
             "tools": list(AGENT_TOOLS), "tags": list(cs.bench_tags),
             "prompt": BENCH_PROMPT.format(node=cs.bench_node.strip()), "student_reply": CONSENT}
+
+
+# --- проверка карточек окна (Б3): только коды формы и статусы калькулятора ---
+
+CHECK_GOOD = ("C2: unlisted", "C4: no_data")       # cards-check годен ровно с этими кодами
+FIRST = "первый"
+# обязательные поля сценариев (Д8-R80): A — узел, цель, мост; A2 — правки черновика; A4 — просьбы
+_NEED: dict[str, tuple[str, ...]] = {
+    "A1": ("node", "goal", "bridge"), "A2": ("node", "goal", "bridge", "on_draft"), "A3": ("node", "goal", "bridge"),
+    "A4": ("node", "goal", "bridge", "requests"), "B1": ("tag",), "B2": ("tag",), "B3": ("expect_tag", "clarify"),
+    "B4": ("tag",), "C2": ("tag",), "C4": ("tag", "period")}
+_TAG_IN_OPENING = ("B1", "B2", "B4", "C2", "C4")    # имя тега — в вопросе (scenarios: «имя тега — в вопросе»)
+_BENCH_SCENARIO_TAGS = ("B1", "B2", "B4", "C4")     # сценарии заготовленного агента с тегом: тег — в bench_tags
+# поля «общими словами» (Д8-R80): токена вида тега в них нет; тег — только в tag, expect_tag, pick и вопросах B, C
+_WORDS_ONLY: dict[str, tuple[str, ...]] = {
+    **{sid: ("opening", "node", "goal", "bridge", "on_draft", "requests") for sid in ("A1", "A2", "A3", "A4")},
+    "B3": ("opening", "clarify"), "C1": ("opening",), "C3": ("opening",)}
+_CODE_RE = re.compile(r"[a-z_]{1,24}")
+_DATA_STATUSES = ("ok", "no_value")                 # у тега есть данные (service.py, _DATA_STATUSES без no_data)
+
+
+def _flat(text: str) -> str:
+    return " ".join(re.sub(r"[«»\"„“”]", " ", text).lower().split())
+
+
+def _is_tag(value: object) -> bool:
+    return isinstance(value, str) and bool(TAG_TOKEN_RE.fullmatch(value))
+
+
+def check_cards(cs: CardSet) -> list[str]:
+    """Коды формы карточек окна (см. шапку модуля) по порядку сценариев; [] — форма годна. Без значений карточек."""
+    codes: list[str] = []
+    for sid in SCENARIO_IDS:
+        c = cs.cards.get(sid)
+        if c is None:
+            codes.append(f"missing:{sid}")
+            continue
+        for name in _NEED.get(sid, ()):
+            value = getattr(c, name)
+            if not value or (isinstance(value, str) and not value.strip()):
+                codes.append(f"field:{sid}.{name}")
+        tags = [t for t in (c.tag if sid in _TAG_IN_OPENING else None,
+                            c.expect_tag, c.pick if sid == "A3" and c.pick != FIRST else None) if t]
+        if not all(_is_tag(t) for t in tags):
+            codes.append(f"tag_form:{sid}")
+        elif sid in _TAG_IN_OPENING and c.tag and c.tag.upper() not in c.opening.upper():
+            codes.append(f"field:{sid}.opening")
+        for name in _WORDS_ONLY.get(sid, ()):
+            value = getattr(c, name)
+            if any(tag_tokens(v) for v in ((value,) if isinstance(value, str) else value)):
+                codes.append(f"field:{sid}.{name}")
+    a4 = cs.cards.get("A4")
+    if a4 is not None and (not a4.node.strip() or _flat(a4.node) not in _flat(a4.opening)
+                           or (a4.goal.strip() and _flat(a4.goal) not in _flat(a4.opening))):
+        codes.append("a4_opening")
+    bench = list(cs.bench_tags)
+    need = [cs.cards[sid].tag for sid in _BENCH_SCENARIO_TAGS if sid in cs.cards and _is_tag(cs.cards[sid].tag)]
+    c2 = cs.cards.get("C2")
+    upper = {t.upper() for t in bench}
+    if (not bench or len(bench) > MAX_TAGS or not all(_is_tag(t) for t in bench)
+            or any(t.upper() not in upper for t in need) or (c2 is not None and _is_tag(c2.tag)
+                                                            and c2.tag.upper() in upper)):
+        codes.append("bench_tags")
+    return codes
+
+
+def _status(answer: object, tag: str, good: str, data: str) -> str:
+    """Статус калькулятора по тегу: good — годный статус item; данные (ok, no_value) — data; иначе код item или ответа
+    службы, если он вида кода; прочее — error. Только коды: значений и текстов нет."""
+    if not isinstance(answer, dict):
+        return "error"
+    items = answer.get("items") if isinstance(answer.get("items"), list) else []
+    item = next((i for i in items if isinstance(i, dict) and str(i.get("tag", "")).upper() == tag.upper()), None)
+    code = item.get("status") if item is not None else answer.get("status")
+    if code == good:
+        return good
+    if item is not None and code in _DATA_STATUSES:
+        return data
+    return code if isinstance(code, str) and _CODE_RE.fullmatch(code) else "error"
+
+
+def cards_check(cs: CardSet, stand: Stand, *, sleep: Callable[[float], None] = time.sleep) -> list[str]:
+    """check_cards и статусы калькулятора C2 (tag_now) и C4 (tag_period за период карточки): годно — CHECK_GOOD в
+    конце списка и ни одного кода формы. rate — пауза и повтор (calc_patient), сбой стенда — stand_error."""
+    codes = check_cards(cs)
+    probes = []
+    c2, c4 = cs.cards.get("C2"), cs.cards.get("C4")
+    if c2 is not None and _is_tag(c2.tag):
+        probes.append(("C2", "tag_now", {"tags": [c2.tag]}, c2.tag, "unlisted", "listed"))
+    if c4 is not None and _is_tag(c4.tag) and c4.period:
+        probes.append(("C4", "tag_period", {"tags": [c4.tag], "start": c4.period["start"], "end": c4.period["end"]},
+                       c4.tag, "no_data", "has_data"))
+    for sid, tool, args, tag, good, data in probes:
+        try:
+            answer = calc_patient(stand, tool, args, sleep=sleep)
+        except Exception:                   # noqa: BLE001 — StandError и сбои стенда: код, без текста исключения
+            codes.append(f"{sid}: stand_error")
+            continue
+        codes.append(f"{sid}: {_status(answer, tag, good, data)}")
+    return codes

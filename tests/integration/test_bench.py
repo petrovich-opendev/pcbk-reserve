@@ -10,7 +10,16 @@
 Модели мест — config.twin.json (m4), персоны — fake_bench.PERSONAS: 05 honest, 06 inventor, 07 off_by_one,
 08 eager_saver. Денег и историана нет: OpenRouter — двойник, историан — twin_historian в core (bench-historian.json).
 Строки «А6 журнал: …» (pytest -rP) — время модуля, итоги прогонов по персонам, вызовы калькулятора ops.
+
+Б3 (Д8б): карточки двойника — cards_check калькулятором двойника (C2 unlisted, C4 no_data); полный план повторов
+(A×2, B×3, C×3 — 128 прогонов) прогонщиком через шлюз → пакеты судьи без цифр → каталог судей во временном каталоге
+теста → судья-двойник (twin_judge) → перенос и разбор вердиктов, J1–J4 → таблица (judge_and_table) и рекомендация:
+честная модель — «рекомендую», плохие персоны — нет, по своим причинам. Калькулятор на пределе частоты ops (60 за 300 с):
+прогонщик ждёт окно, сверка не пропускается молча (calc_skipped таблицы — 0). Строки «Б3 журнал: …» — время прогона,
+статусы, вызовы ops и rate, вердикты.
 """
+import json
+import re
 import time
 from collections import Counter
 
@@ -18,10 +27,15 @@ import pytest
 
 from benchstand import BenchHarness, agents_left
 from conftest import row_of, wait_for
+from pcbk_bench.cards import CHECK_GOOD, cards_check
 from pcbk_bench.checks import check_run
+from pcbk_bench.judge import (Packet, assert_packet_clean, build_vocab, check_verdicts, collect_verdicts, controls_ok,
+                              pack_batches, stage_judges)
 from pcbk_bench.record import RunKey
-from pcbk_bench.runner import load_tag_units
+from pcbk_bench.runner import NOTE_CALC_RATE, load_tag_units
 from pcbk_bench.scenarios import SCENARIO_IDS
+from pcbk_bench.table import recommend
+from pcbk_bench.twin_judge import write_twin_verdicts
 from pcbk_watchdog.checks import RUN_CAP_DETAIL, RUN_SILENT_DETAIL
 
 PLACES = {5: "pcbk/z-ai/glm-5.3", 6: "pcbk/deepseek/deepseek-v4.1-flash", 7: "pcbk/google/gemini-3.8-flash",
@@ -30,6 +44,8 @@ PERSONA = {5: "honest", 6: "inventor", 7: "off_by_one", 8: "eager_saver"}
 FAKE_CALL_USD = 0.0012                  # цена вызова двойника OpenRouter (USAGE fake_openrouter.py)
 PENDING_WAIT_S = 60                     # перезагрузка места — после 3 + 5 с простоя (reload.py), с запасом
 OUT_FILES = ("runs.jsonl", "sessions.log", "progress.json", "tag_units.json", "health_end.json")
+TWIN_VOCAB_WORDS = ("коллектор", "сушильн", "конденсатн")                         # из описаний bench-historian.json
+FULL_RUNS = 128                                                                  # A×2, B×3, C×3 на 4 места
 
 
 @pytest.fixture(scope="module")
@@ -112,6 +128,59 @@ def test_bench_cap_stops_and_page_warns(bench):                                 
     print(f"А6 журнал: потолок $0.01 — потрачено ${run['spent_usd']:.4f}, отказов pcbk_run_spent "
           f"{bench.refusals('pcbk_run_spent')}")
     bench.shot("twin-01-run-cap.png")
+
+
+def test_bench_cards_check_twin(bench):                                          # калькулятор двойника
+    assert cards_check(bench.cards, bench.runner.stand) == ["C2: unlisted", "C4: no_data"] == list(CHECK_GOOD)
+
+
+def test_bench_twin_judged_table(bench):                                         # Review Focus 1 и 4 Д8б
+    bench.recreate_core(run_id="d8-full", cap=5.0)                                 # после теста потолка А6
+    out = bench.tmp / "full"
+    calls0, rate0 = bench.stand.calc_calls, bench.stand.calc_rate
+    t0 = time.monotonic()
+    assert bench.runner_for(out, run_id="d8-full").run() == "finished"
+    took = time.monotonic() - t0
+    recs = bench.records(out)
+    assert len(recs) == FULL_RUNS and {r.status for r in recs} == {"done"}
+    skipped = [r for r in recs if any(isinstance(e, dict) and e.get("status") == "rate" for e in r.calc.values())]
+    assert all(NOTE_CALC_RATE in r.notes for r in skipped)                          # rate — не молча
+    t1 = time.monotonic()
+    batches = pack_batches(out, bench.records(out), bench.cards, bench.secrets(), seed="d8-full")
+    stage = stage_judges(out, "d8-full", root=bench.tmp)                            # каталог судей, как в Б6
+    assert sum(write_twin_verdicts(stage / b.name, stage / "verdicts" / b.name) for b in batches) == 136
+    assert collect_verdicts(stage, out) == 136                                      # 128 + J1–J4 × 2
+    cmap = json.loads((out / "judge" / "map.json").read_text())["controls"]
+    assert controls_ok(check_verdicts(out), cmap) == {"J1": True, "J2": True, "J3": True, "J4": True}
+    rows = {r.model: r for r in bench.judge_and_table(out)}
+    rec = dict(zip(rows, recommend(list(rows.values()), budget_left=1000)))
+    assert rows["z-ai/glm-5.3"].judged == 32 and rows["z-ai/glm-5.3"].create_passed == 8
+    assert rec["z-ai/glm-5.3"] == "рекомендую"
+    assert rec["deepseek/deepseek-v4.1-flash"] == "не рекомендую: неуспех 2/4"      # судья поймал норму C1
+    assert rec["google/gemini-3.8-flash"] == "не рекомендую: неуспех 2/4"           # автомат: среднее B2 + 1
+    assert rec["openai/gpt-6-sol"] == "не проходит по успеху 1"
+    assert rows["z-ai/glm-5.3"].soft.get("numbers_not_from_tools", 0) == 0          # время и «≈» — с источником
+    assert rows["deepseek/deepseek-v4.1-flash"].hard.get("invented_norm", 0) > 0    # причины — свои
+    assert rows["google/gemini-3.8-flash"].hard.get("number_mismatch", 0) > 0
+    assert rows["openai/gpt-6-sol"].create_hard.get("saved_without_consent", 0) > 0
+    assert sum(r.calc_skipped for r in rows.values()) == len(skipped) == 0          # сверка калькулятором — у всех
+    text = "".join(f.read_text() for b in batches for f in b.glob("*.json"))
+    assert "20FAKE_" not in text and not re.search(r"(?i)glm|deepseek|gemini|gpt", text)
+    assert not any(w in text.lower() for w in TWIN_VOCAB_WORDS)                       # описания — классами
+    assert not re.search(r"\b(127[.,]9|3[.,]42|131[.,]6|128[.,]4)\b", text)           # числа — псевдонимами
+    vocab = build_vocab(bench.records(out), bench.cards)
+    nodes = [c.node for c in bench.cards.cards.values() if c.node] + [bench.cards.bench_node]       # m13
+    for f in (f for b in batches for f in b.glob("*.json")):                          # каждая цифра — в белом списке
+        assert_packet_clean(Packet.from_file(f), bench.secrets(), vocab, nodes)
+    statuses = Counter(r.status for r in recs)
+    print(f"Б3 журнал: полный план — {len(recs)} прогонов за {took:.0f} с ({took / 60:.1f} мин), статусы "
+          f"{dict(statuses)}; калькулятор ops за прогон — {bench.stand.calc_calls - calls0} вызовов, rate — "
+          f"{bench.stand.calc_rate - rate0}; записей с rate после пауз — {len(skipped)}; пакеты, судья-двойник и "
+          f"таблица — {time.monotonic() - t1:.0f} с; пачек {len(batches)}")
+    for model, r in rows.items():
+        print(f"Б3 журнал: {model}: оценено {r.judged}/{r.planned}, A прошло {r.create_passed}/{r.create_judged}, "
+              f"жёсткие {r.hard}, A {r.create_hard}, мягкие {r.soft}, не прогнано {r.not_run}, не оценено "
+              f"{r.not_judged}, качество {r.quality}, прогноз 5 000 — {r.f5000}; вердикт: {rec[model]}")
 
 
 def test_bench_cleanup_restores(bench):                                          # последним в модуле

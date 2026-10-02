@@ -1,7 +1,7 @@
 """CLI стенда отбора (Д8-R74, П4, m-р4-16): python -m pcbk_bench override CONFIG | run CONFIG | status OUT
 [--stale-s N] | judge-pack CONFIG [--real-data] | judge-stage CONFIG [--only-missing] [--root DIR] | judge-audit STAGE
 --batch batch-NN --transcript PATH [--discard] | judge-collect CONFIG [--batch batch-NN …] [--root DIR] | judge-check
-CONFIG | table CONFIG ….
+CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG.
 
 - override CONFIG — файл переопределения мест (render_override) в stdout;
 - run CONFIG — прогон: load_config → window_start (без него или позже сейчас + 5 мин — RunRefused("window_start")
@@ -24,6 +24,14 @@ CONFIG | table CONFIG ….
   пропавшие или кривые;
 - table CONFIG … — таблица и рекомендация (pcbk_bench.table.main, Б2), ленивым импортом.
 
+Карточки окна (Б3, Д8-R80, I-р4-6; m19 — только ServerStand, без клиентов шлюза и паролей учёток):
+- calc CONFIG TOOL ARGS — калькулятор (catalog_search, tag_now, tag_period) токеном ops; ARGS — JSON одной строкой
+  ('{"tags": ["…"]}'); в stdout — ответ службы как есть (JSON). Только для субагента карточек (bench/cards/WRITER.md):
+  контроллер его не зовёт;
+- cards-check CONFIG — коды формы карточек конфига и статусы калькулятора (cards_check), по строке: годно — ровно
+  «C2: unlisted» и «C4: no_data», код 0; иначе код 1. Карточки не того вида — код «cards_form». Значений, тегов и
+  текстов в выводе нет.
+
 Коды main: 0 — успех, 2 — RunRefused, 1 — прочее. Ошибка печатается только классом исключения (и кодом RunRefused),
 без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без разговоров и тегов) — в stderr.
 
@@ -41,13 +49,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .cards import load_cards
+from .cards import CHECK_GOOD, cards_check, load_cards
 from .config import BenchConfig, load_config
 from .gateway import GatewayChat
 from .override import render_override
 from .runner import FUTURE_WINDOW_S, Runner, RunRefused, load_records, status_main
 from .secret import Secret
-from .stand import ServerStand, Stand
+from .stand import DATA_TOOLS, ServerStand, Stand
 
 REPO = Path(__file__).resolve().parents[2]
 OPENCODE_JSON = REPO / "student" / "config" / "opencode.json"
@@ -91,11 +99,15 @@ def _parser() -> argparse.ArgumentParser:
     check = sub.add_parser("judge-check", help="разбор вердиктов и контроль J1–J4")
     check.add_argument("config", type=Path)
     sub.add_parser("table", help="таблица и рекомендация (Б2): table CONFIG …", add_help=False)
+    calc = sub.add_parser("calc", help="калькулятор токеном ops (для субагента карточек): ответ службы как есть")
+    calc.add_argument("config", type=Path)
+    calc.add_argument("tool", choices=DATA_TOOLS)
+    calc.add_argument("args")
+    sub.add_parser("cards-check", help="коды формы карточек и статусы калькулятора").add_argument("config", type=Path)
     return p
 
 
-def connect(cfg: BenchConfig) -> tuple[Stand, dict[int, GatewayChat]]:
-    """Стенд сервера и клиенты шлюза мест по stand.json и secrets/ рядом с ним (П4)."""
+def _stand_json(cfg: BenchConfig) -> dict:
     if cfg.stand is None:
         raise ValueError("конфиг: stand — путь к stand.json не задан")
     raw = json.loads(Path(cfg.stand).read_text(encoding="utf-8"))
@@ -103,9 +115,22 @@ def connect(cfg: BenchConfig) -> tuple[Stand, dict[int, GatewayChat]]:
         raise ValueError("stand.json: ключи ssh, core_url, edge_url, edge_host (origin, remote_dir — по желанию)")
     if not isinstance(raw["ssh"], list) or not all(isinstance(a, str) for a in raw["ssh"]):
         raise ValueError("stand.json: ssh — список строк")
-    secrets = Path(cfg.stand).parent / "secrets"
+    return raw
+
+
+def server_stand(cfg: BenchConfig) -> Stand:
+    """Только стенд сервера по stand.json и secrets/ рядом с ним (m19: calc и cards-check — без клиентов шлюза)."""
+    raw = _stand_json(cfg)
     extra = {"remote_dir": raw["remote_dir"]} if raw.get("remote_dir") else {}
-    stand = ServerStand(raw["ssh"], raw["core_url"], raw["edge_url"], raw["edge_host"], secrets, **extra)
+    return ServerStand(raw["ssh"], raw["core_url"], raw["edge_url"], raw["edge_host"],
+                       Path(cfg.stand).parent / "secrets", **extra)
+
+
+def connect(cfg: BenchConfig) -> tuple[Stand, dict[int, GatewayChat]]:
+    """Стенд сервера и клиенты шлюза мест по stand.json и secrets/ рядом с ним (П4)."""
+    raw = _stand_json(cfg)
+    secrets = Path(cfg.stand).parent / "secrets"
+    stand = server_stand(cfg)
     chats = {}
     for n in cfg.places:
         login = PROBE_LOGIN.format(n=n)
@@ -190,6 +215,33 @@ def _judge(args: argparse.Namespace) -> int:
     return 1 if report.missing or report.invalid else 0
 
 
+def _calc(args: argparse.Namespace) -> int:
+    """calc CONFIG TOOL ARGS: ответ службы как есть (JSON одной строкой) — только субагенту карточек."""
+    try:
+        call_args = json.loads(args.args)
+    except ValueError:
+        raise _UsageError("args") from None
+    if not isinstance(call_args, dict):
+        raise _UsageError("args")
+    answer = server_stand(load_config(args.config, OPENCODE_JSON)).calc(args.tool, call_args)
+    print(json.dumps(answer, ensure_ascii=False))
+    return 0
+
+
+def _cards_check(config: Path) -> int:
+    """cards-check CONFIG: коды по строке (cards_check); годно — ровно CHECK_GOOD, код 0; иначе код 1."""
+    cfg = load_config(config, OPENCODE_JSON)
+    try:
+        cs = load_cards(cfg.cards)
+    except (ValueError, OSError, TypeError):
+        print("cards_form")                       # вид карточек не тот: текст ошибки не печатается
+        return 1
+    codes = cards_check(cs, server_stand(cfg))
+    for code in codes:
+        print(code)
+    return 0 if tuple(codes) == CHECK_GOOD else 1
+
+
 def _run(config: Path) -> int:
     cfg = load_config(config, OPENCODE_JSON)
     if cfg.window_start is None or cfg.window_start > datetime.now(timezone.utc) + timedelta(seconds=FUTURE_WINDOW_S):
@@ -221,6 +273,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "status":
             return status_main(args.out, args.stale_s)
+        if args.command == "calc":
+            return _calc(args)
+        if args.command == "cards-check":
+            return _cards_check(args.config)
         return _run(args.config)
     except RunRefused as exc:
         print(f"RunRefused: {exc.code}", file=sys.stderr)

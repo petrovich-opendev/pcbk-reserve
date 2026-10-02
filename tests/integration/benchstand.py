@@ -10,6 +10,10 @@
   и прогоном, сторож с коротким порогом тишины, персоны двойника OpenRouter, места с переопределением модели
   (render_override), учётки d8-probe-bench-NN, прогонщики (runner_for), снимок страницы состояния (shot).
 - agents_left(stack, places) — имена живых (не archived) агентов мест по порядку мест.
+- BenchHarness.judge_and_table(out) (Б3) — таблица отбора по OUT после вердиктов судьи: table.build (check_verdicts,
+  aggregate с load_tag_units(out) и планом конфига прогона OUT); Markdown и table.json — в OUT, копия Markdown — в
+  PCBK_TABLES (twin-table.md, каталог $JOB), снимок страницы проверки с этим Markdown — PCBK_SHOTS/twin-table.png
+  (markdown_page → cdp.Browser, file://).
 
 Уборка (cleanup, решение контроллера П2 — порядок test_agents.py): прогонщики закрыты → персоны выключены → учётки
 disable (до этого — пробуждение работающих мест с агентами: архив перезагружает только готовое место) → агенты мест — в
@@ -23,13 +27,15 @@ bench-historian.json; twin_historian сюда не импортируется (p
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
 import secrets
+import shutil
 import threading
 from collections.abc import Iterable, Mapping
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import cdp
@@ -43,6 +49,7 @@ from pcbk_bench.override import render_override
 from pcbk_bench.record import RunRecord
 from pcbk_bench.runner import Runner, load_records
 from pcbk_bench.stand import AGENT_ROWS_PY, DATA_TOOLS, LLM_ROWS_PY
+from pcbk_bench.table import ModelRow, build, render_markdown
 
 CONFIG = REPO / "bench" / "config.twin.json"
 OPENCODE_JSON = REPO / "student" / "config" / "opencode.json"
@@ -178,6 +185,7 @@ class BenchHarness:
         self.override = self.tmp / "compose.bench.yaml"
         self._pw = {n: Secret(secrets.token_urlsafe(18)) for n in self.places}
         self._runners: list[Runner] = []
+        self._cfgs: dict[Path, BenchConfig] = {}              # конфиг прогонщика по OUT — для таблицы (Б3)
         self.runner: Runner | None = None
         self.data_dir: Path | None = None
 
@@ -244,6 +252,7 @@ class BenchHarness:
         """Прогонщик с OUT out_dir и правками конфига (reps, run_id, cap_usd …); свои клиенты шлюза мест — вход
         делает prepare(). Все прогонщики закрывает cleanup()."""
         cfg = replace(self.cfg, out_dir=Path(out_dir), **cfg_overrides)
+        self._cfgs[Path(out_dir)] = cfg
         runner = Runner(cfg, self.stand, {n: self._chat(n) for n in cfg.places}, self.cards)
         self._runners.append(runner)
         return runner
@@ -272,6 +281,43 @@ class BenchHarness:
     def queued(self) -> int:
         """Строки очереди перезагрузки агентов у мест модуля."""
         return int(self.stack.exec("pcbk-core", "python", "-c", QUEUED_PY, *map(str, self.places)))
+
+    def judge_and_table(self, out: Path) -> list[ModelRow]:
+        """Таблица отбора по OUT (Б3): table.build — check_verdicts, aggregate с load_tag_units(out) и планом конфига
+        прогонщика этого OUT; Markdown — OUT/table.md (и копия PCBK_TABLES/twin-table.md), всё — OUT/table.json;
+        снимок страницы проверки — PCBK_SHOTS/twin-table.png. Строки — в порядке плана."""
+        out = Path(out)
+        cfg = self._cfgs.get(out) or replace(self.cfg, out_dir=out)
+        rows, meta = build(cfg)
+        text = render_markdown(rows, meta)
+        (out / "table.md").write_text(text, encoding="utf-8")
+        doc = {"meta": meta, "rows": [asdict(r) for r in rows], "verdicts": meta["verdicts"]}
+        (out / "table.json").write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        where = os.environ.get("PCBK_TABLES")
+        if where:
+            Path(where).mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(out / "table.md", Path(where) / "twin-table.md")
+        self.page_shot(text, "twin-table.png")
+        return rows
+
+    def page_shot(self, markdown: str, name: str) -> None:
+        """Снимок страницы проверки: Markdown → HTML (markdown_page) → cdp.Browser по file:// → PCBK_SHOTS/name;
+        страница растянута на весь документ. Без PCBK_SHOTS — ничего."""
+        where = os.environ.get("PCBK_SHOTS")
+        if not where:
+            return
+        page_file = self.tmp / (Path(name).stem + ".html")
+        page_file.write_text(markdown_page(markdown), encoding="utf-8")
+        with cdp.Browser() as browser:
+            page = browser.page(isolated=True)
+            page.goto(page_file.as_uri())
+            page.wait_selector("table", 20)
+            width, height = page.eval("[Math.max(document.documentElement.scrollWidth, 1280), "
+                                      "document.documentElement.scrollHeight]")
+            page._call("Emulation.setDeviceMetricsOverride",                 # весь документ — одним снимком
+                       {"width": int(width), "height": int(height), "deviceScaleFactor": 1, "mobile": False})
+            page.screenshot(Path(where) / name)
+            assert browser.handler_errors == [] and page.console_errors() == [], browser.handler_errors
 
     def shot(self, name: str) -> None:
         """Снимок страницы состояния тестового стенда (cdp.py Д6) со строкой «LLM-прокси и бюджет» — в PCBK_SHOTS
@@ -399,4 +445,55 @@ class BenchHarness:
             raise errors[0]
 
 
-__all__ = ["BenchHarness", "StackStand", "agents_left", "bench_env"]
+_MD_CELL = re.compile(r"`([^`]*)`")
+PAGE_CSS = ("body{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1b1b1b;background:#fff}"
+            "h1{font-size:20px}h2{font-size:16px;margin-top:22px}"
+            "table{border-collapse:collapse;margin:8px 0}th,td{border:1px solid #bbb;padding:3px 6px;"
+            "vertical-align:top;font-size:12px}th{background:#f0f0f0}code{background:#f4f4f4;padding:0 2px}"
+            "ul,ol{margin:4px 0 4px 20px;padding:0}")
+
+
+def _md_inline(text: str) -> str:
+    return _MD_CELL.sub(lambda m: f"<code>{m.group(1)}</code>", html.escape(text, quote=False))
+
+
+def markdown_page(text: str) -> str:
+    """HTML страницы проверки из Markdown таблицы отбора (render_markdown Б2): заголовки, списки, таблицы, абзацы и
+    `код` — того, что там бывает, достаточно; прочее — абзацем как есть (с экранированием)."""
+    out: list[str] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].startswith("|"):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                    rows.append(cells)
+                i += 1
+            head, body = rows[0], rows[1:]
+            out.append("<table><thead><tr>" + "".join(f"<th>{_md_inline(c)}</th>" for c in head) + "</tr></thead>"
+                       "<tbody>" + "".join("<tr>" + "".join(f"<td>{_md_inline(c)}</td>" for c in r) + "</tr>"
+                                           for r in body) + "</tbody></table>")
+            continue
+        for tag, rx in (("ul", r"- (.*)"), ("ol", r"\d+\. (.*)")):
+            if re.fullmatch(rx, line):
+                items = []
+                while i < len(lines) and (m := re.fullmatch(rx, lines[i])):
+                    items.append(f"<li>{_md_inline(m.group(1))}</li>")
+                    i += 1
+                out.append(f"<{tag}>{''.join(items)}</{tag}>")
+                break
+        else:
+            if m := re.fullmatch(r"(#{1,3}) (.*)", line):
+                n = len(m.group(1))
+                out.append(f"<h{n}>{_md_inline(m.group(2))}</h{n}>")
+            elif line.strip():
+                out.append(f"<p>{_md_inline(line)}</p>")
+            i += 1
+    return ("<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><title>Таблица отбора — двойники</title>"
+            f"<style>{PAGE_CSS}</style></head><body>{''.join(out)}</body></html>")
+
+
+__all__ = ["BenchHarness", "StackStand", "agents_left", "bench_env", "markdown_page"]
