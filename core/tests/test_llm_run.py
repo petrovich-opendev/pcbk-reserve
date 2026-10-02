@@ -1,17 +1,22 @@
 """Прогон отбора модели в LLM-прокси (Д8-R69): потолок поверх долей и общего бюджета, точка отсчёта в llm_meta,
 отказ 402 pcbk_run_spent, резервы идущих вызовов, блок run в /health/llm — на двойнике OpenRouter."""
 import logging
+import sqlite3
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import LLM_TOKEN, OPS_LLM_TOKEN, SES, auth, chat_body, make_llm_app, wait_until
-from pcbk_core.llm import RUN_BASE_KEY, RUN_WINDOW_S
+from helpers import (LLM_SETTINGS, LLM_TOKEN, LLM_TOKENS, OPS_LLM_TOKEN, SES, SETTINGS, auth, chat_body, make_llm_app,
+                     wait_until)
+from pcbk_core.app import create_app
+from pcbk_core.llm import RUN_BASE_KEY, RUN_WINDOW_S, LlmRole
 from pcbk_core.llm.api import LLM_MESSAGES, REFUSALS
 from pcbk_core.llm.ledger import Budget, Ledger, LedgerWriteLost, RunSpec, Usage
+from pcbk_core.llm.upstream import Upstream
 
 # make_llm_app, chat_body, auth, OPS_LLM_TOKEN Д4а; двойник берёт $0.0012 за вызов
 RUN = {"LLM_RUN_ID": "d8-test", "LLM_RUN_USD": 0.002, "LLM_RUN_CALLERS": "student-01,ops"}
@@ -92,7 +97,7 @@ def test_run_base_counts_unpriced_calls(tmp_path, fake_or, caplog):             
         assert c.get("/health/llm").json()["run"]["spent_usd"] == pytest.approx(est)
         assert post(c, chat_body(), token=OPS_LLM_TOKEN).status_code == 200
         assert post(c, chat_body()).status_code == 200
-    assert "вызовы без цены (1)" in caplog.text
+    assert "вызовы без цены у мест прогона без точки отсчёта, мест: 1" in caplog.text
 
 
 def test_run_json_contract(tmp_path, fake_or):
@@ -115,18 +120,20 @@ def test_no_run_is_null(tmp_path, fake_or):
 
 
 def test_run_base_not_durable_is_config_error(tmp_path, fake_or, monkeypatch):     # Review Focus 1
+    # р1б: ошибка настройки — только брошенная запись (LedgerWriteLost); «не дождались диска» — нет, см.
+    # test_run_base_timeout_is_warning_not_error
     app, role = make_llm_app(tmp_path, fake_or, **RUN)
-    role.run_base_durable_s = 0.6                                                   # m5: повторы — до срока, не вечно
+    calls = []
     def lost(timeout):
-        raise TimeoutError
+        calls.append(timeout)
+        raise LedgerWriteLost("строки нет в файле")
     monkeypatch.setattr(role.ledger, "flush", lost)
     with TestClient(app) as c:
+        assert len(calls) == 1                                                      # без повторов
         r = post(c, chat_body())
     assert (r.status_code, r.json()["error"]["code"]) == (403, "pcbk_config")
-    assert "точка отсчёта не записана" in role.config_error
+    assert "точка отсчёта не записана" in role.config_error and fake_or.requests == []
 
-
-# --- сверх брифа ---
 
 def test_run_base_key_on_disk_per_id_and_caller(tmp_path, fake_or):             # точка — в llm_meta, на диске
     app, role = make_llm_app(tmp_path, fake_or)
@@ -145,33 +152,79 @@ def test_run_base_key_on_disk_per_id_and_caller(tmp_path, fake_or):             
     disk.close()
 
 
-def test_run_base_flush_retried(tmp_path, fake_or, monkeypatch):                 # доводка р1, m5: сбой — не сразу
+def run_keys(*callers):
+    return [RUN_BASE_KEY.format(id="d8-test", caller=c) for c in callers]
+
+
+def test_run_base_timeout_is_warning_not_error(tmp_path, fake_or, monkeypatch, caplog):   # доводка р1б, п. 1
+    # не дождались диска: WARNING, без config_error; вызов не уходит — flush до OpenRouter (Д4а-R19) ждёт тот же диск
     app, role = make_llm_app(tmp_path, fake_or, **RUN)
-    real, calls = role.ledger.flush, []
-    def flaky(timeout):
-        calls.append(timeout)
-        if len(calls) <= 2:
-            raise TimeoutError
-        real(timeout)
-    monkeypatch.setattr(role.ledger, "flush", flaky)
-    with TestClient(app) as c:
-        assert role.config_error is None and len(calls) >= 3                         # два сбоя, потом записано
+    def slow_disk(timeout):
+        raise TimeoutError
+    monkeypatch.setattr(role.ledger, "flush", slow_disk)
+    with caplog.at_level(logging.WARNING, logger="pcbk_core.llm"), TestClient(app) as c:
+        r = post(c, chat_body())
+    assert role.config_error is None and "точка отсчёта ещё не на диске" in caplog.text
+    assert (r.status_code, r.json()["error"]["code"]) == (503, "pcbk_ledger") and fake_or.requests == []
+
+
+def test_run_base_disk_stalled_then_written(tmp_path, fake_or, monkeypatch, caplog):     # доводка р1б, п. 1
+    app, role = make_llm_app(tmp_path, fake_or, **RUN)
+    led, real = role.ledger, role.ledger._connect
+    def stalled(*a, **k):                       # писатель (без аргументов) упирается в блокировку дольше срока
+        if not a and not k:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **k)                    # проба записи (writable) идёт: сбой — у писателя
+    led.retry_pause_s = 0.05
+    monkeypatch.setattr(led, "_connect", stalled)
+    with caplog.at_level(logging.WARNING, logger="pcbk_core.llm"), TestClient(app) as c:
+        assert role.config_error is None and "точка отсчёта ещё не на диске" in caplog.text
+        r = post(c, chat_body())
+        assert (r.status_code, r.json()["error"]["code"]) == (503, "pcbk_ledger")   # пока диск стоит — мимо OpenRouter
+        monkeypatch.setattr(led, "_connect", real)                                  # диск ожил
+        wait_until(lambda: led.queue_size == 0 and led.consecutive_failures == 0)
         assert post(c, chat_body()).status_code == 200
+    assert len(fake_or.requests) == 1
     disk = Ledger(role.settings.DB_PATH)
-    assert disk.open() and disk.meta_get(RUN_BASE_KEY.format(id="d8-test", caller="student-01")) == 0.0
+    assert disk.open() and [disk.meta_get(k) for k in run_keys("ops", "student-01")] == [0.0, 0.0]
     disk.close()
 
 
-def test_run_base_write_lost_not_retried(tmp_path, fake_or, monkeypatch):       # брошенная запись — сразу ошибка
+def test_run_base_returned_not_assigned_in_thread(tmp_path, fake_or):            # доводка р1б, п. 2 (m4)
     app, role = make_llm_app(tmp_path, fake_or, **RUN)
-    calls = []
-    def lost(timeout):
-        calls.append(timeout)
-        raise LedgerWriteLost("строки нет в файле")
-    monkeypatch.setattr(role.ledger, "flush", lost)
+    assert role.ledger.opened                                                       # журнал открыт, как в lifespan
+    assert role.ensure_run_base() == ({"ops": 0.0, "student-01": 0.0}, None)
+    assert (role.budget.run_base, role.config_error) == ({}, None)                 # присваивает только lifespan
+    assert [role.ledger.meta_get(k) for k in run_keys("ops", "student-01")] == [0.0, 0.0]
+
+
+def test_run_base_closed_journal_at_once(tmp_path, fake_or):                     # доводка р1б, п. 3
+    db = str(tmp_path / "нет-каталога" / "core.db")                                # журнал не откроется
+    llm = replace(LLM_SETTINGS, OPENROUTER_BASE_URL=fake_or.url, **RUN)
+    settings = replace(SETTINGS, DB_PATH=db)
+    role = LlmRole(settings, llm, tokens=LLM_TOKENS, upstream=Upstream(llm.OPENROUTER_BASE_URL, "test-openrouter-key",
+                                                                        None), ledger=Ledger(db))
+    started = time.monotonic()
+    with TestClient(create_app(settings, [role])) as c:
+        took = time.monotonic() - started
+        r = post(c, chat_body())
+    assert took < 1.0                                                               # закрытый журнал — сразу
+    assert "журнал вызовов не открылся" in role.config_error
+    assert "прогон: точка отсчёта не записана" in role.config_error
+    assert (r.status_code, r.json()["error"]["code"]) == (403, "pcbk_config") and fake_or.requests == []
+
+
+def test_run_base_includes_final_estimates(tmp_path, fake_or):                   # доводка р1б, п. 4
+    app, role = make_llm_app(tmp_path, fake_or)                                     # дозапрос цены — 3 × 0,01 с
     with TestClient(app) as c:
-        assert (len(calls), role.config_error) == (1, "прогон: точка отсчёта не записана")
-        assert post(c, chat_body()).status_code == 403
+        post(c, chat_body("FAKEGENNEVER"))                                          # цена не найдётся — unknown
+        wait_until(lambda: role.ledger.recent(1)[0].cost_source == "unknown")
+    est = role.ledger.estimated("student-01")
+    assert est > 0.07 and role.ledger.settled("student-01") == pytest.approx(est)   # окончательная оценка — оплачено
+    app, role = make_llm_app(tmp_path, fake_or, **{**RUN, "LLM_RUN_USD": 1.0})
+    with TestClient(app) as c:
+        assert c.get("/health/llm").json()["run"]["spent_usd"] == 0
+    assert role.budget.run_base["student-01"] == pytest.approx(est)
 
 
 def test_run_settings_error_closes_proxy(tmp_path, fake_or):                     # настройки мимо from_env

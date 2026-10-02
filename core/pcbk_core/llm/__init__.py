@@ -49,9 +49,6 @@ STUDENT = re.compile(r"student-[0-9]+")
 RUN_BASE_KEY = "run_base_usd:{id}:{caller}"
 RUN_WINDOW_S = 600
 RUN_BASE_ERROR = "прогон: точка отсчёта не записана"
-# точка отсчёта — на диске до первого вызова: flush повторяется до этого срока, с, потом config_error (доводка р1, m5)
-RUN_BASE_DURABLE_S = 10.0
-RUN_BASE_RETRY_S = 0.25
 
 log = logging.getLogger("pcbk_core.llm")
 
@@ -72,9 +69,8 @@ class LlmRole(RoleBase):
     фоновых циклов, кроме проверки журнала, нет. tokens_error — llm-tokens не прочитан (П23).
 
     Прогон отбора (Д8-R69): run — RunSpec или None; run_calls — монотонные метки begin_call вызывающих прогона за
-    RUN_WINDOW_S, last_run_call_mono — последняя из них, started_mono — запуск роли (тишина без вызовов — от него);
-    run_base_durable_s — срок записи точки отсчёта. LLM_RUN_* с ошибкой (настройки без from_env) — config_error:
-    закрыто при сомнении."""
+    RUN_WINDOW_S, last_run_call_mono — последняя из них, started_mono — запуск роли (тишина без вызовов — от него).
+    LLM_RUN_* с ошибкой (настройки без from_env) — config_error: закрыто при сомнении."""
 
     name = "llm"
 
@@ -107,7 +103,6 @@ class LlmRole(RoleBase):
         self.run_calls: deque[float] = deque()
         self.last_run_call_mono: float | None = None
         self.started_mono = monotonic()
-        self.run_base_durable_s = RUN_BASE_DURABLE_S
         # хост OpenRouter, как его разрешает охрана выхода (egress_targets): живость адресов — только по нему
         self.egress_name = urlsplit(llm.OPENROUTER_BASE_URL).hostname
         self.budget = Budget(ledger, total_usd=llm.LLM_TOTAL_USD, share_usd=llm.LLM_SHARE_USD,
@@ -324,8 +319,8 @@ class LlmRole(RoleBase):
         окончательные оценки, без идущих и ждущих цены вызовов). Цена идущих и ждущих вызовов войдёт в прогон —
         завышение в безопасную сторону, а отказа нет: вызов без цены у места на старте не закрывает прокси (доводка
         р1, I1 — отступление от Д8-R69). Записанная точка не меняется: перезапуск core продолжает тот же прогон, новый
-        id — новая точка. Новые точки ложатся на диск с повтором flush до run_base_durable_s; не легли —
-        RUN_BASE_ERROR. Возврат — (точки по вызывающим, ошибка или None)."""
+        id — новая точка. Новые точки — на диск через _flush_run_base. Возврат — (точки по вызывающим, ошибка или
+        None)."""
         run = self.run
         if run is None:
             return {}, None
@@ -334,7 +329,7 @@ class LlmRole(RoleBase):
         missing = [caller for caller, key in keys.items() if led.meta_get(key) is None]
         unpriced = sum(1 for caller in missing if led.has_open_or_pending_of(caller))
         if unpriced:
-            log.warning("LLM-прокси: прогон %s: у мест прогона без точки отсчёта есть вызовы без цены (%d) — их цена "
+            log.warning("LLM-прокси: прогон %s: вызовы без цены у мест прогона без точки отсчёта, мест: %d — их цена "
                         "войдёт в прогон", run.id, unpriced)
         for caller in missing:
             led.meta_set(keys[caller], led.settled(caller))
@@ -346,25 +341,23 @@ class LlmRole(RoleBase):
         return bases, error
 
     def _flush_run_base(self, run: RunSpec) -> str | None:
-        """flush журнала с повтором до run_base_durable_s (писатель повторяет сбой SQLite); брошенная операция
-        (LedgerWriteLost) или закрытый журнал — сразу RUN_BASE_ERROR. Часы — настоящие: это ожидание диска."""
+        """Новые точки — на диск: flush до LEDGER_DURABLE_S, без повторов (доводка р1б).
+
+        Не дождались диска (TimeoutError) — WARNING, а не ошибка: точку допишет писатель, а строка каждого вызова
+        ложится на диск до OpenRouter (Д4а-R19) — очередь FIFO не выпустит вызов раньше точки, и денег мимо прогона
+        нет. Брошенная операция (LedgerWriteLost) или закрытый журнал — RUN_BASE_ERROR: записи точки не будет."""
         led = self.ledger
-        deadline = time.monotonic() + self.run_base_durable_s
-        while True:
-            try:
-                if not led.opened:              # журнал закрыт: flush() без очереди вернулся бы сразу
-                    raise LedgerWriteLost("журнал вызовов закрыт")
-                led.flush(max(0.0, min(LEDGER_DURABLE_S, deadline - time.monotonic())))
-                return None
-            except LedgerWriteLost as exc:      # дыра в файле держится до нового open(): повтор не поможет
-                why = type(exc).__name__
-            except TimeoutError as exc:
-                why = type(exc).__name__
-                if time.monotonic() + RUN_BASE_RETRY_S < deadline:
-                    time.sleep(RUN_BASE_RETRY_S)
-                    continue
-            log.error("LLM-прокси: прогон %s: точка отсчёта не записана (%s)", run.id, why)
+        try:
+            if not led.opened:                  # журнал закрыт: flush() без очереди вернулся бы сразу
+                raise LedgerWriteLost("журнал вызовов закрыт")
+            led.flush(LEDGER_DURABLE_S)
+        except LedgerWriteLost as exc:          # дыра в файле держится до нового open()
+            log.error("LLM-прокси: прогон %s: точка отсчёта не записана (%s)", run.id, type(exc).__name__)
             return RUN_BASE_ERROR
+        except TimeoutError as exc:
+            log.warning("LLM-прокси: прогон %s: точка отсчёта ещё не на диске (%s) — вызовы ждут записи журнала",
+                        run.id, type(exc).__name__)
+        return None
 
     # --- опрос OpenRouter ---
 
