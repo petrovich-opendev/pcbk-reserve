@@ -22,7 +22,7 @@ from decimal import Decimal                                                     
 import pytest
 from fastapi.testclient import TestClient
 
-from fake_bench import PERSONAS, _fmt, bench_answer
+from fake_bench import NO_TOOL, PERSONAS, _fmt, bench_answer
 from fake_openrouter import PROVIDER_NAMES, provider_of
 from helpers import LLM_TOKEN, REPO, SES, TOKEN, auth, chat_body, make_app, make_llm_app, wait_until
 from pcbk_core.agents.draft import check_draft, render_agent_file
@@ -341,12 +341,14 @@ def test_answer_formats_r92_and_off_by_one_only_in_period():
 
 def test_new_rules_only_with_their_tools():
     """Правила ряда и наработки срабатывают, только если инструмент есть в tools: агент стенда отбора Д8 (три
-    инструмента) их не зовёт; «18 часов» — не «8 часов»."""
+    инструмента) их не зовёт — наработка идёт сводкой за вчера, ряд у агента Д8 — отказ NO_TOOL; «18 часов» — не
+    «8 часов»."""
     runtime_q = "Какая наработка по 20FAKE_210_RUN за вчера: сколько часов в каждом состоянии?"
     msg, _ = bench_answer(body("z-ai/glm-5.3", DATA, [user(runtime_q)]), HONEST)
     assert (tool_of(msg), args_of(msg)) == ("pcbk_tag_period", {"tags": ["20FAKE_210_RUN"], "period": "yesterday"})
-    msg, _ = bench_answer(body("z-ai/glm-5.3", DATA, [user("Как менялся 20FAKE_201_PV за последние 8 часов?")]), HONEST)
-    assert tool_of(msg) == "pcbk_tag_now"
+    msg, finish = bench_answer(body("z-ai/glm-5.3", DATA, [user("Как менялся 20FAKE_201_PV за последние 8 часов?")]),
+                               HONEST)
+    assert (finish, msg["content"]) == ("stop", NO_TOOL)                         # ряда нет — отказ, не tag_now
     msg, _ = bench_answer(ask("Какое среднее по 20FAKE_201_PV за последние 18 часов?"), HONEST)
     assert args_of(msg) == {"tags": ["20FAKE_201_PV"], "period": "prev_shift"}
     msg, _ = bench_answer(ask("Что сейчас по 20FAKE_201_PV?"), HONEST)
@@ -355,6 +357,21 @@ def test_new_rules_only_with_their_tools():
     assert args_of(msg)["period"] == "current_shift"
     msg, _ = bench_answer(ask("Какое среднее по 20FAKE_201_PV 01.10.2026 с 08:00 до 12:00?"), HONEST)
     assert args_of(msg) == {"tags": ["20FAKE_201_PV"], "start": "2026-10-01T08:00:00", "end": "2026-10-01T12:00:00"}
+
+
+def test_period_question_without_its_tool_is_no_tool():
+    """Вопрос о периоде к агенту без своего инструмента (есть только tag_now) — NO_TOOL, а не текущее значение:
+    «Сейчас …» на вопрос о смене, вчера, сутках, 8 часах или наработке — ложный ответ честной персоны (ревью Б2)."""
+    now_only = ("pcbk_catalog_search", "pcbk_tag_now")
+    for q in ("Какое среднее по 20FAKE_201_PV за прошлую смену?", "Какой размах по 20FAKE_201_PV за вчера?",
+              "Какие минимум и максимум по 20FAKE_201_PV за последние сутки?",
+              "Насколько максимум за сутки по 20FAKE_201_PV выше текущего значения?",
+              "Как менялся 20FAKE_201_PV за последние 8 часов?",
+              "Какая наработка по 20FAKE_210_RUN за вчера: сколько часов в каждом состоянии?"):
+        msg, finish = bench_answer(body("z-ai/glm-5.3", now_only, [user(q)]), HONEST)
+        assert (finish, msg["content"]) == ("stop", NO_TOOL), q
+    msg, _ = bench_answer(body("z-ai/glm-5.3", now_only, [user("Что сейчас по 20FAKE_201_PV?")]), HONEST)
+    assert (tool_of(msg), args_of(msg)) == ("pcbk_tag_now", {"tags": ["20FAKE_201_PV"]})   # положительный контроль
 
 
 # --- персоны против проверок стенда отбора А4 ---

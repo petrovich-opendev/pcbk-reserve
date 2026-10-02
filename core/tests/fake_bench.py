@@ -30,7 +30,8 @@ bench_answer(body, personas) -> (message, finish_reason) | None — ответ �
     2. SERIES_RE («как менял…», «профил…», «в начале») — tag_series, 24 точки;
     3. PERIOD_RE («смен», «сутк», «средн», год, «вчера», «размах», «минимум», «максимум») — tag_period; сравнение с
        текущим («выше текущего») — оба вызова и разность;
-    4. иначе — tag_now;
+    4. иначе — tag_now, но только если вопрос не о периоде (RUNTIME_RE, SERIES_RE, PERIOD_RE): вопрос о периоде без
+       своего инструмента — NO_TOOL, а не текущее значение;
   - период вопроса (_period_args): дата с часами — свой период start/end (время историана), «вчера» — yesterday,
     «8 час» — last_8h, «сутк» — last_24h, «текущ…смен» — current_shift, иначе prev_shift;
   - без имени тега — catalog_search по последнему слову вопроса, затем тег, чьё описание делит с вопросом больше
@@ -588,8 +589,8 @@ def _data(body: dict, persona: str, turns: list[_Turn], tools: set[str]) -> tupl
         needed = [SERIES]
     elif PERIOD in tools and PERIOD_RE.search(question):
         needed = [PERIOD] + ([NOW] if compare and NOW in tools else [])
-    elif NOW in tools:
-        needed = [NOW]
+    elif NOW in tools and not any(rx.search(question) for rx in (RUNTIME_RE, SERIES_RE, PERIOD_RE)):
+        needed = [NOW]                  # вопрос о периоде без своего инструмента — NO_TOOL, не текущее значение
     else:
         return _say(NO_TOOL)
     for tool in needed:
