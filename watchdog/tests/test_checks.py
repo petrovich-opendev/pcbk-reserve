@@ -1626,6 +1626,21 @@ def test_teacher_student_fail_is_a_row_detail():                        # I-3: �
     assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_loaded": False}), NOW_T, 120)[1] == TEACHER_STUDENT_FAIL
 
 
+def test_web_teacher_student_fail_matches_row():
+    """I-3 (Д10-R106): баннер студента показывает строку кабинета только с этим detail — текст в вебе дословно равен тексту
+    сторожа, иначе студенты не узнают, почему молчит модель. id строки вида teacher в components.json — тот, что ждёт веб
+    (TEACHER_ROW)."""
+    web = REPO / "web"
+    if not web.is_dir():
+        pytest.skip("в копии нет web/ — сверка с вебом идёт в копии с web")
+    status_ts = (web / "src/status.ts").read_text("utf-8")
+    m = re.search(r'export const TEACHER_STUDENT_FAIL = "([^"]+)";', status_ts)
+    assert m is not None, "TEACHER_STUDENT_FAIL не найден в web/src/status.ts"
+    assert m.group(1) == TEACHER_STUDENT_FAIL
+    assert [c["id"] for c in COMPONENTS if c["kind"] == "teacher"] == ["teacher"]
+    assert re.search(r'export const TEACHER_ROW = "teacher";', status_ts) is not None
+
+
 def test_check_teacher_codes(json_site):
     c = check_teacher("teacher", "Кабинет преподавателя и доли", json_site(404, {"name": "NotFound"}), NOW_T, 120)
     assert (c.state, c.detail) == ("unknown", "кабинет преподавателя ещё не выложен")
