@@ -433,3 +433,26 @@ def test_bad_management_key_disables_only_credits(tmp_path, capfd, restore_loggi
 def test_build_roles_share_agent_stats(monkeypatch, tmp_path):                  # Д7-R53, задача А1 Д7а
     data, _, gw = build_roles(SETTINGS, env={})
     assert data.agent_stats is gw.agent_stats
+
+
+# --- Д10а, задача А2: доли мест — одни у LLM-прокси и шлюза (Д10-R98) ---
+
+def test_build_roles_share_shares_with_gateway(tmp_path):
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    roles = {r.name: r for r in build_roles(settings, LLM_ENV)}
+    assert roles["gateway"].llm is roles["llm"] and roles["llm"].budget.shares is roles["llm"].shares
+    assert roles["llm"].shares.settled_of == roles["llm"].ledger.settled
+
+
+def test_build_llm_role_shares_from_settings(tmp_path):                   # сверх брифа: бюджет, доля, учение
+    from pcbk_core.main import build_llm_role
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    role = build_llm_role(settings, {**LLM_ENV, "LLM_TOTAL_USD": "300", "LLM_SHARE_USD": "25.5"},
+                          shares_drill="shares_stale")
+    s = role.shares
+    assert (s.path, s.total_cents, s.default_cents, s.drill, s.cents(7)) == \
+           (str(tmp_path / "core.db"), 30000, 2550, "shares_stale", 2550)
+    assert s.loaded is False and not (tmp_path / "core.db").exists()           # конструкторы ничего не открывают
+    assert role.config_error is None
+    closed = build_llm_role(settings, LLM_ENV, drill_error=True)
+    assert closed.config_error == "учения DRILL_TEACHER с ошибкой — доли закрыты" and closed.shares.drill == ""

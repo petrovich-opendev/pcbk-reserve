@@ -16,8 +16,11 @@ test-mgmt-key.
 как у FAKESLOW; запрос без инструментов (фоновый заголовок разговора) получает обычный быстрый ответ. FAKESAVEBAD —
 то же, что FAKESAVE, с tools: ["bash"] (отказ службы tool_not_allowed). Ветка — раньше ветки pcbk_tag_now.
 
-/generation по id: первые два запроса — 404, потом total_cost 0.002 (id ответа FAKEGENNEVER — всегда
-404). /key: usage ключа — сумма отданных цен (usage потока и найденные дозапросом, каждая один раз).
+Дорогой ответ (Д10а, Д10-R106): FAKEDEAR — обычный ответ, но цена $0,5037 (не кратна центу, B-1) — в usage потока, в
+теле без потока и в /generation этого id; прочее поведение — как без слова.
+
+/generation по id: первые два запроса — 404, потом total_cost 0.002 (у FAKEDEAR — 0.5037; id ответа FAKEGENNEVER —
+всегда 404). /key: usage ключа — сумма отданных цен (usage потока и найденные дозапросом, каждая один раз).
 /credits: ключом управления — {"total_credits": 50.0, "total_usage": 20.0}, иначе 403.
 
 Ручки только для тестов: GET/DELETE /_requests, GET /_stats ({"aborted": n} — обрывы клиентом посреди
@@ -48,6 +51,8 @@ START_USAGE = {"a": 0.0, "b": 50.0}
 USAGE = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.0012,
          "prompt_tokens_details": {"cached_tokens": 4}, "completion_tokens_details": {"reasoning_tokens": 2}}
 GENERATION_COST = 0.002
+DEAR_COST = 0.5037                      # FAKEDEAR: цена вызова не кратна центу (Д10а, пол доли B-1)
+DEAR_USAGE = {**USAGE, "cost": DEAR_COST}
 GENERATION_MISSES = 2                   # столько первых запросов /generation по id — 404
 FLAKY_FAILURES = 2
 SLOW_EVERY_S, SLOW_CHUNKS = 0.5, 20     # FAKESLOW: чанк каждые 0,5 с 10 с подряд
@@ -58,7 +63,7 @@ ASK_ARGS = {"questions": [{"question": "Какой из тегов?", "header": 
 WORDS = ("FAKE402", "FAKE402INFLIGHT", "FAKE403KEY", "FAKE403REGION", "FAKE401", "FAKE500", "FAKE404",
          "FAKEMIDERR", "FAKEMID402", "FAKENOUSAGE", "FAKEGENNEVER", "FAKEFLAKY", "FAKEASK", "FAKEBREAK",
          "FAKESLOW", "FAKESLOWSTART", "FAKEPROVIDER", "FAKEMIDSTR", "FAKEDRIP",
-         "FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD")
+         "FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD", "FAKEDEAR")
 _WORD = re.compile(r"\bFAKE[A-Z0-9]+\b")
 # закреплённая точка запроса (provider.only прокси) → имя провайдера в ответе, как его пишет OpenRouter
 PROVIDER_NAMES = {"fireworks": "Fireworks", "google-vertex/global": "Google Vertex", "azure": "Azure"}
@@ -102,6 +107,7 @@ class State:
         self.gen_hits: dict[str, int] = {}
         self.gen_never: set[str] = set()
         self.gen_found: set[str] = set()         # цена по id уже отдана — в usage ключа второй раз не идёт
+        self.gen_cost: dict[str, float] = {}     # id → своя цена /generation (FAKEDEAR), иначе GENERATION_COST
         self.flaky = 0
         self.personas: dict[str, str] = {}      # стенд отбора: модель → персона fake_bench (POST /_bench)
 
@@ -315,12 +321,13 @@ class Handler(BaseHTTPRequestHandler):
         with st.lock:
             st.gen_hits[gen_id] = st.gen_hits.get(gen_id, 0) + 1
             found = gen_id not in st.gen_never and st.gen_hits[gen_id] > GENERATION_MISSES
+            cost = st.gen_cost.get(gen_id, GENERATION_COST)
             if found and gen_id not in st.gen_found:
                 st.gen_found.add(gen_id)
-                st.usage[st.gen_owner.get(gen_id, key)] += GENERATION_COST
+                st.usage[st.gen_owner.get(gen_id, key)] += cost
         if not found:
             return self._error(404, f"Generation {gen_id} not found")
-        return self._json(200, {"data": {"id": gen_id, "total_cost": GENERATION_COST}})
+        return self._json(200, {"data": {"id": gen_id, "total_cost": cost}})
 
     def _over_max_price(self, body: dict) -> bool:
         """Нынешняя цена точки модели выше provider.max_price (любая из двух); цены или предела нет — нет."""
@@ -373,8 +380,11 @@ class Handler(BaseHTTPRequestHandler):
             st.gen_owner[gen] = key
             if word == "FAKEGENNEVER":
                 st.gen_never.add(gen)
+            if word == "FAKEDEAR":
+                st.gen_cost[gen] = DEAR_COST
         provider = provider_of(body, word)
         with_usage = word not in ("FAKENOUSAGE", "FAKEGENNEVER")
+        usage = DEAR_USAGE if word == "FAKEDEAR" else USAGE
         message, finish = bench if bench is not None else answer(body, word, gen)
         # FAKESAVESLOW медлит только текстом хода после инструмента: запрос заголовка (без инструментов) — быстрый
         slow = word in ("FAKESLOW", "FAKESLOWSTART") or (word == "FAKESAVESLOW" and finish == "stop"
@@ -383,10 +393,10 @@ class Handler(BaseHTTPRequestHandler):
             reply = {"id": gen, "object": "chat.completion", "created": int(time.time()), "model": body.get("model"),
                      "provider": provider, "choices": [{"index": 0, "message": message, "finish_reason": finish}]}
             if with_usage:
-                reply["usage"] = USAGE
-                self._charge(key, USAGE["cost"])
+                reply["usage"] = usage
+                self._charge(key, usage["cost"])
             return self._json(200, reply, (("X-Generation-Id", gen),))
-        self._stream(key, gen, provider, word, message, finish, with_usage, slow)
+        self._stream(key, gen, provider, word, message, finish, with_usage, slow, usage)
 
     def _drip(self) -> None:
         """502 с телом ошибки по байту раз в DRIP_EVERY_S: каждый кусок успевает до срока чтения."""
@@ -407,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
             self.state.usage[key] += cost
 
     def _stream(self, key: str, gen: str, provider: str, word: str | None, message: dict, finish: str,
-                with_usage: bool, slow: bool = False) -> None:
+                with_usage: bool, slow: bool = False, usage: dict = USAGE) -> None:
         if word == "FAKESLOWSTART":
             time.sleep(SLOW_START_S)                # молчание до строки статуса и заголовков (П7)
         self.send_response(200)
@@ -441,8 +451,8 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(SLOW_EVERY_S)
             send(chunk(message))
             if with_usage:
-                send(chunk({}, finish, usage=USAGE))
-                self._charge(key, USAGE["cost"])
+                send(chunk({}, finish, usage=usage))
+                self._charge(key, usage["cost"])
             else:
                 send(chunk({}, finish))
             send(b"data: [DONE]\n\n")

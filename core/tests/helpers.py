@@ -50,6 +50,7 @@ from pcbk_core.gateway.stats import GatewayStats
 from pcbk_core.hooks import hooks_of
 from pcbk_core.llm import LlmRole
 from pcbk_core.llm.ledger import Ledger
+from pcbk_core.llm.shares import Shares
 from pcbk_core.llm.upstream import Upstream
 from pcbk_core.secrets import BdrvConfig, TokenTable, key_fingerprint
 from pcbk_core.settings import GatewaySettings, LlmSettings, Settings
@@ -389,9 +390,14 @@ def auth(token: str | None, session: str | None = None, parent: str | None = Non
 
 
 def make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key", mgmt: str | None = None,
-                  wallclock: Callable[[], datetime] | None = None, **llm_overrides) -> LlmRole:
+                  wallclock: Callable[[], datetime] | None = None, shares: bool = False, shares_drill: str = "",
+                  **llm_overrides) -> LlmRole:
     """Роль llm на двойнике OpenRouter (fake — фикстура fake_or): журнал — tmp_path/core.db, открыт, как в
-    lifespan; LlmSettings — replace без проверок from_env; таблица из двух токенов; дозапрос цены — 3 × 0,01 с."""
+    lifespan; LlmSettings — replace без проверок from_env; таблица из двух токенов; дозапрос цены — 3 × 0,01 с.
+
+    shares (Д10а, задача А2) — доли мест Shares на том же core.db (бюджет и доля по умолчанию — из LlmSettings, учение —
+    shares_drill), как в build_llm_role. Доли не открыты: их открывает lifespan роли — так тест «доли не загрузились»
+    проверяет настоящий путь."""
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
     if fake is not None:
@@ -400,9 +406,11 @@ def make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key
     settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
     clock = {} if wallclock is None else {"wallclock": wallclock}
     upstream = Upstream(llm.OPENROUTER_BASE_URL, key, mgmt, drill=llm.DRILL_LLM) if key else None
+    places_shares = (Shares(settings.DB_PATH, total_usd=llm.LLM_TOTAL_USD, default_usd=llm.LLM_SHARE_USD,
+                            drill=shares_drill) if shares else None)
     role = LlmRole(settings, llm, tokens=LLM_TOKENS, upstream=upstream, ledger=Ledger(settings.DB_PATH, **clock),
                    key_fingerprint=key_fingerprint(key) if key else None, cost_retry_delays=(0.01, 0.01, 0.01),
-                   **clock)
+                   shares=places_shares, **clock)
     assert role.ledger.open(), role.ledger.last_error
     return role
 
@@ -521,7 +529,7 @@ ORIGIN = "https://stand.test:8443"
 def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),
                  stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
                  accounts: bool = True, agents_root: Path | None = None, calc: DataService | None = None,
-                 **gw_overrides) -> GatewayRole:
+                 llm: LlmRole | None = None, **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
     GatewaySettings (без проверок from_env), в том числе учения DRILL_GATEWAY, DRILL_AGENTS и DRILL_TEACHER (Д10а, m-6).
     stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
@@ -532,6 +540,7 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
     Корень агентов (Settings.AGENTS_ROOT, Д7а, предпроверка П3) — agents_root как есть, по умолчанию
     tmp_path/agents, подготовленный make_agents_root: воркер перезагрузки проверяет каталог первым тактом.
     calc — служба данных калькуляторов страницы (Д9-R87, обычно make_service), None — маршрут отвечает 503.
+    llm — роль LLM-прокси с долями мест (Д10а, задача А2: make_llm_role(…, shares=True)), None — шлюз без неё.
     Роли для тестов добавлены fake_docker, fake_places, mono.
     """
     tmp_path = Path(tmp_path)
@@ -556,7 +565,8 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
         ready_place(workplaces, docker, n)
     role = GatewayRole(replace(SETTINGS, DB_PATH=str(db), AGENTS_ROOT=str(root)), gw,
                        store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S), workplaces=workplaces, stats=stats,
-                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s, calc=calc)
+                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s, calc=calc,
+                       llm=llm)
     role.fake_docker, role.fake_places, role.mono = docker, oc, mono
     return role
 
@@ -575,6 +585,16 @@ def make_gateway(tmp_path, **kw) -> tuple[FastAPI, GatewayRole]:
     app = create_app(SETTINGS, [role])
     app.state.zone_names_ok = True
     return app, role
+
+
+def teacher_gateway(tmp_path, *, ready: Sequence[int] = (3,), **gw_overrides) -> tuple[FastAPI, GatewayRole]:
+    """Шлюз кабинета преподавателя (Д10а, задача А2; m-1): роль llm с долями мест на том же core.db (без ключа
+    OpenRouter, учение долей — DRILL_TEACHER из gw_overrides, как в build_roles), доли открыты здесь (роль llm в
+    приложение шлюза не входит, её lifespan не идёт; итог open() не проверяется — тест «доли не загрузились» его
+    подменяет), затем make_gateway(…, llm=…, ready=ready, **gw_overrides). Место 03 по умолчанию готово."""
+    llm = make_llm_role(tmp_path, key=None, shares=True, shares_drill=gw_overrides.get("DRILL_TEACHER", ""))
+    llm.shares.open()
+    return make_gateway(tmp_path, llm=llm, ready=ready, **gw_overrides)
 
 
 def login(c, name: str, pw: str = PW, **headers) -> httpx.Response:

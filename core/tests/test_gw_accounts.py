@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 from contextlib import closing
+from datetime import datetime, timezone
 
 import pytest
 
@@ -17,6 +18,8 @@ from pcbk_core.gateway import accounts
 from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, MAX_SESSIONS_PER_LOGIN, NOTICE, UNKNOWN_KEYS,
                                         AccountStore, StoreError, hash_password, verify_password)
 from pcbk_core.gateway.accounts import main as accounts_main
+from pcbk_core.llm.shares import Shares
+from pcbk_core.teacher_log import TeacherLog
 
 
 def db_bytes(tmp_path) -> bytes:                                                        # WAL: все три файла
@@ -583,3 +586,44 @@ def test_release_place_refused_when_agent_store_does_not_open(probe_off_on_10, a
     err = capsys.readouterr().err
     assert "учёт агентов не открывается — освобождать место нельзя" in err and len(err.splitlines()) == 1
     assert probe_off_on_10.bindings() == [(10, "d7-probe-a", True)]                            # закрепление на месте
+
+
+# --- Д10а, задача А2: команда journal (I-9); DB_PATH — через monkeypatch.setenv (раунд 2 Д7, m-н2) ---
+
+def test_journal_command_prints_codes_only(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "core.db"
+    monkeypatch.setenv("DB_PATH", str(db))
+    s = Shares(str(db), total_usd=1000.0, default_usd=100.0)
+    assert s.open()
+    s.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=datetime(2026, 10, 11, 9, tzinfo=timezone.utc))
+    log = TeacherLog(str(db))
+    assert log.open()
+    log.requested("teach", "read", 3, "ses_" + "A" * 26)
+    assert accounts_main(["journal", "--last", "5"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split("\t")[1:] == ["teach", "read", "03", "ses_" + "A" * 26, "requested", "-"]
+    assert lines[1].split("\t")[1:] == ["teach", "shares", "-", "-", "ok", '{"03": [10000, 9000], "05": [10000, 11000]}']
+    assert len(lines) == 2
+    assert accounts_main(["journal", "--last", "0"]) == 1                     # число строк — от 1
+
+
+def test_journal_command_reads_only_and_limits(tmp_path, monkeypatch, capsys):   # сверх брифа: mode=ro, 1…1000, 50
+    db = tmp_path / "core.db"
+    monkeypatch.setenv("DB_PATH", str(db))
+    assert accounts_main(["journal"]) == 1                                    # базы нет — не заводит пустую
+    err = capsys.readouterr().err
+    assert not db.exists() and len(err.splitlines()) == 1 and err.startswith("журнал действий: ")
+    log = TeacherLog(str(db))
+    assert log.open()
+    for i in range(60):
+        log.requested("teach", "sessions", 1 + i % 10, None)
+    assert accounts_main(["journal"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 50 and out[0].split("\t")[0].endswith("+00:00")       # по умолчанию 50, время — UTC
+    assert [line.split("\t")[3] for line in out[:2]] == ["10", "09"]          # новые первыми
+    for bad in (["--last", "1001"], ["--last", "-1"], ["--last", "x"]):
+        assert accounts_main(["journal", *bad]) == 1, bad
+    assert len(capsys.readouterr().err.splitlines()) == 3
+    assert accounts_main(["journal", "--last", "1000"]) == 0
+    with closing(sqlite3.connect(db)) as c:                                    # учётки команда не трогала
+        assert c.execute("SELECT count(*) FROM sqlite_master WHERE name = 'gw_accounts'").fetchone()[0] == 0

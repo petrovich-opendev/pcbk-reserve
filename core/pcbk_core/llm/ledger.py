@@ -41,9 +41,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from ..settings import LlmSettings, run_parts
+
+if TYPE_CHECKING:
+    from .shares import Shares
 
 log = logging.getLogger("pcbk_core.llm.ledger")
 
@@ -777,17 +780,20 @@ class Budget:
     прибавляет (Д4а-R13).
 
     run_base — точки отсчёта прогона по вызывающим (llm_meta, ставит lifespan роли по LlmRole.ensure_run_base до
-    первого вызова).
+    первого вызова). shares — доли мест (Д10-R98, Shares: память, без SQLite); None — у всех мест одна share_usd, как
+    до Д10.
     """
 
     def __init__(self, ledger: Ledger, *, total_usd: float, share_usd: float, ops_share_usd: float,
-                 key_spent: Callable[[], float | None] = lambda: None, run: RunSpec | None = None):
+                 key_spent: Callable[[], float | None] = lambda: None, run: RunSpec | None = None,
+                 shares: "Shares | None" = None):
         self.ledger = ledger
         self.total_usd = total_usd
         self.share_usd = share_usd
         self.ops_share_usd = ops_share_usd
         self.key_spent = key_spent
         self.run = run
+        self.shares = shares
         self.run_base: dict[str, float] = {}
 
     def run_spent(self) -> float:
@@ -800,8 +806,16 @@ class Budget:
         return sum((max(0.0, self.ledger.spent(c) - self.run_base.get(c, 0.0)) for c in sorted(run.callers)), 0.0)
 
     def share_of(self, caller: str) -> float:
-        """ops_share_usd для ops, иначе share_usd. Перераспределение долей — Д10."""
-        return self.ops_share_usd if caller == OPS else self.share_usd
+        """Доля вызывающего (Д10-R98): ops — ops_share_usd; место student-NN — его доля из shares (центы / 100, память,
+        без SQLite: отказ — синхронный участок без await); прочие и без shares — share_usd."""
+        if caller == OPS:
+            return self.ops_share_usd
+        shares = self.shares
+        if shares is not None:
+            usd = shares.usd(caller)
+            if usd is not None:
+                return usd
+        return self.share_usd
 
     def total_spent(self) -> float:
         """Итог для отказов: при расходе по ключу выше журнала резервы идущих вызовов тоже в итоге."""

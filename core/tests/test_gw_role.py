@@ -439,3 +439,28 @@ def test_drill_teacher_typo_closes_gateway_keeps_core(tmp_path):                
     gw = roles["gateway"]
     assert gw.config_error == "настройки шлюза: DRILL_TEACHER: пусто, shares_stale или journal_down"
     assert gw.gw.DRILL_TEACHER == "" and "data" in roles
+
+
+# --- Д10а, задача А2: m-7 — опечатка в учении закрывает шлюз и LLM-прокси, процесс жив ---
+
+def test_bad_drill_teacher_closes_gateway_and_llm(tmp_path):
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "DRILL_TEACHER": "drop"})}
+    assert roles["gateway"].config_error.startswith("настройки шлюза: DRILL_TEACHER:")
+    assert "учения DRILL_TEACHER с ошибкой" in roles["llm"].config_error
+    assert roles["llm"].shares.drill == ""                                   # учение не включилось молча
+    # m-1 р2: ошибка раньше по полям (GW_ORIGIN) не прячет опечатку в учении — признак из всего списка _parse
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_ORIGIN": "https://x/path",
+                                                        "DRILL_TEACHER": "drop"})}
+    assert roles["gateway"].config_error.startswith("настройки шлюза: GW_ORIGIN:")
+    assert "учения DRILL_TEACHER с ошибкой" in roles["llm"].config_error
+
+
+def test_good_drill_teacher_reaches_shares_and_journal(tmp_path):         # сверх брифа: учение дошло до обоих
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    for mode in ("shares_stale", "journal_down"):
+        roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "DRILL_TEACHER": mode})}
+        assert (roles["llm"].shares.drill, roles["gateway"].teacher_log.drill) == (mode, mode)
+        assert roles["gateway"].config_error is None and roles["llm"].config_error is None
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_ORIGIN": "https://x/path"})}
+    assert "DRILL_TEACHER" not in (roles["llm"].config_error or "")         # чужая ошибка шлюза доли не закрывает

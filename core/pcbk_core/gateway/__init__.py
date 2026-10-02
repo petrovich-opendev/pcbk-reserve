@@ -29,8 +29,14 @@ workplaces.repair = reloads.repair. lifespan открывает учёт аге�
 
 Кабинет преподавателя (Д10а): наблюдение раньше функций (задача А1, Д10-R96) — teacher_router: GET /health/teacher (зона
 front, тот же обработчик отказов из реестра), счётчики TeacherStats — в памяти роли (teacher_stats), окно — час. Тело —
-teacher_health_json: до долей и журнала действий (А2) llm и teacher_log — None, checked_at — null, и строка сторожа
-честно «неизвестно». Учения DRILL_TEACHER — поле GatewaySettings (m-7); строка WARNING — в lifespan.
+teacher_health_json. Учения DRILL_TEACHER — поле GatewaySettings (m-7); строка WARNING — в lifespan.
+
+Доли и журнал действий (задача А2, Д10-R98…R100): llm — роль LLM-прокси (main.build_roles), её Shares — доли мест;
+teacher_log — журнал действий преподавателя (TeacherLog на тот же core.db, учение — DRILL_TEACHER), открывается в
+lifespan через asyncio.to_thread при любой настройке: неудача — store_ok ложь и строка ERROR, не config_error (вход
+студентов от кабинета не зависит). Такт кабинета teacher_tick — в потоке, в _reaper_loop после store.ping: сверка долей
+(llm.shares.verify с центами, по которым отказывает прокси, — budget.share_of, I-7) и пульс журнала (teacher_log.ping).
+При config_error уборщик не стартует, сверки нет, и строка сторожа — «неизвестно» (m-13).
 
 Модули accounts, agents_api, api, calc_api, proxy, teacher_api и web (а через них — accounts) здесь импортируются только
 внутри методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
@@ -41,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -57,6 +64,7 @@ from ..agents.store import AgentStore
 from ..app import RoleBase
 from ..hooks import hooks_of
 from ..settings import GatewaySettings, LlmSettings, Settings
+from ..teacher_log import TeacherLog
 from .places import PLACES, Workplaces
 from .reload import AgentReloads
 from .stats import GatewayStats, TeacherStats
@@ -226,7 +234,7 @@ class GatewayRole(RoleBase):
                  monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  stream_recheck_s: float = 10.0, agent_stats: AgentStats | None = None,
-                 calc: DataService | None = None):
+                 calc: DataService | None = None, llm: LlmRole | None = None):
         from .accounts import LOCK_WINDOW_S
         from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
         from .web import WebReports
@@ -249,11 +257,15 @@ class GatewayRole(RoleBase):
         self.agent_stats = AgentStats(monotonic=monotonic) if agent_stats is None else agent_stats
         # служба данных для калькуляторов страницы (Д9-R87): общая с ролью «данные» из build_roles; None — 503
         self.calc = calc
-        # кабинет преподавателя (Д10-R96): счётчики за час — свои, по монотонным часам роли; роль llm (доли мест) и журнал
-        # действий преподавателя (TeacherLog) приходят с задачей А2 — до неё всегда None
+        # кабинет преподавателя (Д10-R96): счётчики за час — свои, по монотонным часам роли; роль llm — доли мест (её
+        # Shares, Д10-R98), журнал действий преподавателя — свой TeacherLog на тот же core.db (Д10-R99), учение —
+        # DRILL_TEACHER
         self.teacher_stats = TeacherStats(monotonic=monotonic)
-        self.llm: LlmRole | None = None
-        self.teacher_log = None
+        self.llm: LlmRole | None = llm
+        self.teacher_log = TeacherLog(settings.DB_PATH, drill=gw.DRILL_TEACHER,
+                                      clock=lambda: self.wallclock().timestamp())
+        self._teacher_lock = threading.Lock()   # такт уборщика и ручной такт (тесты) не перекрываются
+        self._shares_seen: tuple[bool, int] = (True, 0)   # (ok, drift) прошлой сверки: строка журнала — на смену
         # учёт агентов шлюза (Д7-R53: свой AgentStore на тот же core.db) и воркер перезагрузки (Д7-R58)
         self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
         self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
@@ -390,20 +402,24 @@ class GatewayRole(RoleBase):
         """Договор сторожа /health/teacher (Д10-R96): ровно 13 ключей, только числа и флаги — ни логинов, ни номеров мест.
         Только память.
 
-        Задача А1 — наблюдение раньше функций: долей (роль llm, Shares) и журнала действий (TeacherLog) ещё нет — сверки
-        не было (checked_at — null), доли не загружены и не сверены, сумма — 0, store_ok — истина (журнала ещё нет). Строка
-        сторожа — «неизвестно» «сверка долей ещё не проходила». total_usd — LLM_TOTAL_USD роли llm, без неё — умолчание
-        LlmSettings. Поля долей и журнала заполняет задача А2."""
+        Доли — Shares роли llm (задача А2): checked_at — конец последней сверки такта уборщика (null — сверки не было:
+        строка «неизвестно»), shares_loaded — доли загружены при запуске прокси, shares_ok — последняя сверка прочла
+        таблицу, shares_drift — мест с расхождением (I-7), shares_sum_usd — сумма долей десяти мест в памяти. Без роли
+        llm или без её долей — сверки нет: null, ложь, 0. store_ok — журнал действий открыт, и его последние запись и
+        пульс прошли. total_usd — LLM_TOTAL_USD роли llm, без неё — умолчание LlmSettings."""
         count = self.teacher_stats.count_1h
-        total = LlmSettings().LLM_TOTAL_USD if self.llm is None else self.llm.llm.LLM_TOTAL_USD
+        llm = self.llm
+        shares = None if llm is None else llm.shares
+        total = LlmSettings().LLM_TOTAL_USD if llm is None else llm.llm.LLM_TOTAL_USD
+        checked = None if shares is None else shares.checked_at
         return {
-            "checked_at": None,
-            "shares_loaded": False,
-            "shares_ok": False,
-            "shares_drift": 0,
-            "shares_sum_usd": 0,
+            "checked_at": None if checked is None else checked.isoformat(),
+            "shares_loaded": shares is not None and shares.loaded,
+            "shares_ok": shares is not None and shares.ok,
+            "shares_drift": 0 if shares is None else shares.drift,
+            "shares_sum_usd": 0 if shares is None else shares.sum_cents() / 100,
             "total_usd": total,
-            "store_ok": True,
+            "store_ok": self.teacher_log.store_ok,
             "reads_1h": count("read"),
             "read_failed_1h": count("read_failed"),
             "changes_1h": count("change"),
@@ -411,6 +427,38 @@ class GatewayRole(RoleBase):
             "role_refused_1h": count("role_refused"),
             "drill": self.gw.DRILL_TEACHER,
         }
+
+    def teacher_tick(self) -> None:
+        """Такт кабинета (Д10-R100) — в потоке (SQLite), из _reaper_loop после store.ping:
+        - llm.shares.verify(now, effective) — всегда, когда у роли llm есть доли, в том числе при loaded == False
+          (m-4 р2: checked_at ставится, и строка — fail «доли не загружены», а не «неизвестно»); effective — центы, по
+          которым отказывает прокси: round(budget.share_of(student-NN) × 100) — сверка сквозная, Budget без долей тоже
+          даёт расхождение (I-7);
+        - teacher_log.ping() — и при сбое сверки (finally): store_ok возвращается сам после сбоя записи.
+        Строка журнала службы — только на смену итога сверки. Исключение уходит вызывающему (уборщик пишет класс)."""
+        with self._teacher_lock:
+            try:
+                llm = self.llm
+                shares = None if llm is None else llm.shares
+                if shares is not None:
+                    budget = llm.budget
+                    effective = {n: round(budget.share_of(f"student-{n:02d}") * 100) for n in PLACES}
+                    shares.verify(self.wallclock(), effective)
+                    self._note_shares(shares.ok, shares.drift, shares.last_error)
+            finally:
+                self.teacher_log.ping()
+
+    def _note_shares(self, ok: bool, drift: int, why: str | None) -> None:
+        """Строка журнала службы на смену итога сверки долей: только числа и класс ошибки."""
+        was, self._shares_seen = self._shares_seen, (ok, drift)
+        if (ok, drift) == was:
+            return
+        if not ok:
+            log.error("кабинет преподавателя: сверка долей не прочла таблицу (%s)", why or "сбой")
+        elif drift:
+            log.error("кабинет преподавателя: LLM-прокси считает доли не так, как сохранено — мест: %d", drift)
+        else:
+            log.info("кабинет преподавателя: доли сходятся")
 
     # --- жизненный цикл ---
 
@@ -436,6 +484,7 @@ class GatewayRole(RoleBase):
                 log.warning("УЧЕНИЯ: DRILL_TEACHER=%s", self.gw.DRILL_TEACHER)
             if not await asyncio.to_thread(self.store.open):
                 self._add_config_error(f"учётные записи не открываются: {self.store.last_error or 'сбой'}")
+            await self._open_teacher_log()          # не бросает: сбой — store_ok ложь, не config_error (R100)
             await self._open_agents()               # не бросает: сбой — флаг воркера, не config_error (П13)
             await self.workplaces.spctl.open()
             await self.workplaces.open()
@@ -451,6 +500,17 @@ class GatewayRole(RoleBase):
             yield
         finally:
             await self._shutdown()
+
+    async def _open_teacher_log(self) -> None:
+        """Журнал действий преподавателя (CREATE IF NOT EXISTS) в потоке. Неудача — store_ok ложь (строка «Кабинет
+        преподавателя и доли» — fail) и строка ERROR; вход студентов от кабинета не зависит — это не config_error."""
+        try:
+            opened = await asyncio.to_thread(self.teacher_log.open)
+        except Exception as exc:
+            self.teacher_log.last_error, opened = type(exc).__name__, False
+        if not opened:
+            log.error("шлюз: журнал действий преподавателя не открыт (%s) — кабинет закрыт",
+                      self.teacher_log.last_error)
 
     async def _open_agents(self) -> None:
         """Таблицы учёта агентов (CREATE IF NOT EXISTS) в потоке. Неудача — флаг сбоя учёта воркера и строка журнала:
@@ -493,8 +553,8 @@ class GatewayRole(RoleBase):
 
     async def _reaper_loop(self) -> None:
         """Строка запуска, первый такт сразу, дальше — через workplaces.next_tick_s(); каждый такт — ещё проба
-        записи store.ping() в потоке. Исключение такта — строка журнала, цикл живёт. freeze_reaper — только
-        первый такт."""
+        записи store.ping() и такт кабинета teacher_tick() (сверка долей и пульс журнала действий, Д10-R100) в потоке.
+        Исключение такта — строка журнала с классом, цикл живёт. freeze_reaper — только первый такт."""
         await self._startup_line()
         while True:
             try:
@@ -505,6 +565,10 @@ class GatewayRole(RoleBase):
                 await asyncio.to_thread(self.store.ping)
             except Exception as exc:
                 log.warning("проба учётных записей: %s", type(exc).__name__)
+            try:                                # сверка долей и пульс журнала действий (Д10-R100)
+                await asyncio.to_thread(self.teacher_tick)
+            except Exception as exc:
+                log.warning("такт кабинета преподавателя: %s", type(exc).__name__)
             if self.gw.DRILL_GATEWAY == "freeze_reaper":
                 log.warning("УЧЕНИЯ: уборщик простоя замер после первого такта")
                 await asyncio.Event().wait()

@@ -6,7 +6,12 @@
 клиента httpx не создаёт. Журнал открывается в начале lifespan через asyncio.to_thread; health() и
 health_json() читают только запомненное. Состояние роли меняется только в цикле событий; SQLite — поток-писатель
 журнала, flush/check/open/close — только через asyncio.to_thread.
-"""
+
+Доли мест (Д10а, Д10-R98): shares — Shares на том же core.db (build_llm_role); роль ставит ему settled_of =
+ledger.settled (пол доли, B-1) и отдаёт его Budget — отказ «доля израсходована» идёт по доле своего места. Доли
+открываются в lifespan сразу после журнала (asyncio.to_thread); не открылись — config_error «доли бюджета не загружены»:
+все вызовы /llm/ — 403 pcbk_config (закрыто при сбое: иначе студент с урезанной долей снова получил бы долю по
+умолчанию)."""
 import asyncio
 import logging
 import math
@@ -29,6 +34,7 @@ from ..settings import LlmSettings, Settings
 from .api import CHAT_DEADLINE_S, LEDGER_DURABLE_S, LlmCall, llm_router, too_large_body
 from .ledger import LEDGER_CHECK_S, OPS, Budget, Ledger, LedgerWriteLost, RunSpec, run_spec
 from .models import select_models
+from .shares import Shares
 from .state import FAIL_STATES, UpstreamState
 from .turns import TurnLimiter
 from .upstream import Upstream, UpstreamError, UpstreamKind
@@ -49,6 +55,8 @@ STUDENT = re.compile(r"student-[0-9]+")
 RUN_BASE_KEY = "run_base_usd:{id}:{caller}"
 RUN_WINDOW_S = 600
 RUN_BASE_ERROR = "прогон: точка отсчёта не записана"
+SHARES_ERROR = "доли бюджета не загружены"           # Д10-R98: закрыто при сбое
+PLACES = range(1, 11)
 
 log = logging.getLogger("pcbk_core.llm")
 
@@ -70,7 +78,9 @@ class LlmRole(RoleBase):
 
     Прогон отбора (Д8-R69): run — RunSpec или None; run_calls — монотонные метки begin_call вызывающих прогона за
     RUN_WINDOW_S, last_run_call_mono — последняя из них, started_mono — запуск роли (тишина без вызовов — от него).
-    LLM_RUN_* с ошибкой (настройки без from_env) — config_error: закрыто при сомнении."""
+    LLM_RUN_* с ошибкой (настройки без from_env) — config_error: закрыто при сомнении.
+
+    shares (Д10-R98) — доли мест или None (у всех мест одна LLM_SHARE_USD, как до Д10)."""
 
     name = "llm"
 
@@ -79,7 +89,7 @@ class LlmRole(RoleBase):
                  tokens_error: str | None = None, monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  cost_retry_delays: Sequence[float] = COST_RETRY_DELAYS_S,
-                 chat_deadline_s: float = CHAT_DEADLINE_S):
+                 chat_deadline_s: float = CHAT_DEADLINE_S, shares: Shares | None = None):
         self.settings = settings
         self.llm = llm
         self.tokens = tokens
@@ -105,8 +115,13 @@ class LlmRole(RoleBase):
         self.started_mono = monotonic()
         # хост OpenRouter, как его разрешает охрана выхода (egress_targets): живость адресов — только по нему
         self.egress_name = urlsplit(llm.OPENROUTER_BASE_URL).hostname
+        # доли мест (Д10-R98): пол доли — от оплаченного по журналу вызовов (B-1), отказ — по доле своего места
+        self.shares = shares
+        if shares is not None:
+            shares.settled_of = ledger.settled
         self.budget = Budget(ledger, total_usd=llm.LLM_TOTAL_USD, share_usd=llm.LLM_SHARE_USD,
-                             ops_share_usd=llm.LLM_OPS_SHARE_USD, key_spent=self.key_spent_usd, run=run)
+                             ops_share_usd=llm.LLM_OPS_SHARE_USD, key_spent=self.key_spent_usd, run=run,
+                             shares=shares)
         self.turns = TurnLimiter(limit=llm.LLM_TURN_CALLS, monotonic=monotonic)
         self.state = UpstreamState(drill=self.drill)
         self.inflight: dict[str, int] = {}
@@ -229,12 +244,13 @@ class LlmRole(RoleBase):
                 "idle_s": round(max(0.0, now_mono - since), 1)}
 
     def _shares(self, by_caller: dict[str, float]) -> dict[str, int]:
-        """Места student-NN: доля больше 80 % (ещё не исчерпана) и исчерпана — только счётчики."""
-        share = self.budget.share_usd
+        """Места student-NN: доля больше 80 % (ещё не исчерпана) и исчерпана — только счётчики. Доля — своя у каждого
+        места (budget.share_of, Д10-R98): после перевода счётчики не врут."""
         over = spent = 0
         for caller, amount in by_caller.items():
             if not STUDENT.fullmatch(caller):
                 continue
+            share = self.budget.share_of(caller)
             if amount >= share:
                 spent += 1
             elif amount > SHARE_WARN * share:
@@ -443,6 +459,10 @@ class LlmRole(RoleBase):
         if not await asyncio.to_thread(self.ledger.open):
             why = f"журнал вызовов не открылся: {self.ledger.last_error}"
             self.config_error = f"{self.config_error}; {why}" if self.config_error else why
+        shares = self.shares
+        if shares is not None and not await asyncio.to_thread(shares.open):   # закрыто при сбое (Д10-R98)
+            why = SHARES_ERROR + (f": {shares.last_error}" if shares.last_error else "")
+            self.config_error = f"{self.config_error}; {why}" if self.config_error else why
         try:                                # точка отсчёта прогона — до первого вызова и до дозапроса цен
             bases, error = await asyncio.to_thread(self.ensure_run_base)
         except Exception as exc:            # закрыто при сомнении; в журнал — только класс
@@ -452,8 +472,9 @@ class LlmRole(RoleBase):
         if error is not None:
             self.config_error = f"{self.config_error}; {error}" if self.config_error else error
         llm = self.llm
-        log.info("LLM-прокси: моделей %d, доля $%g, бюджет $%g", len(self.models), llm.LLM_SHARE_USD,
-                 llm.LLM_TOTAL_USD)
+        allocated = (len(PLACES) * llm.LLM_SHARE_USD if shares is None else shares.sum_cents() / 100)
+        log.info("LLM-прокси: моделей %d, доли мест: распределено $%g из $%g, по умолчанию $%g", len(self.models),
+                 allocated, llm.LLM_TOTAL_USD, llm.LLM_SHARE_USD)
         if self.drill:
             log.warning("УЧЕНИЯ: DRILL_LLM=%s", llm.DRILL_LLM)
         if self.stopped:

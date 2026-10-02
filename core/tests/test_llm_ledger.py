@@ -10,6 +10,7 @@ import pytest
 
 from helpers import wait_until
 from pcbk_core.llm.ledger import STATUSES, WRITE_RETRY_S, WRITE_TIMEOUT_S, Budget, Ledger, LedgerWriteLost, Usage
+from pcbk_core.llm.shares import Shares
 
 
 def lg(path):                                        # журнал, открытый как в lifespan
@@ -674,3 +675,24 @@ def test_overflow_is_dropped_and_flush_raises(tmp_path, monkeypatch):           
     with pytest.raises(LedgerWriteLost):
         led.flush(timeout=2.0)
     assert time.monotonic() - t < 1.0 and (led.writes_dropped_total, led.queue_size) == (1, 0)
+
+
+# --- Д10а, задача А2: Budget по долям мест (Д10-R98) ---
+
+def test_budget_share_of_follows_shares(tmp_path):
+    led = Ledger(str(tmp_path / "core.db"))
+    assert led.open()
+    s = Shares(str(tmp_path / "core.db"), total_usd=1000.0, default_usd=100.0)
+    assert s.open()
+    b = Budget(led, total_usd=1000.0, share_usd=100.0, ops_share_usd=80.0, shares=s)
+    s.apply([(1, 10000, 0), (2, 10000, 20000)], by="teach", now=T)
+    assert (b.share_of("student-01"), b.share_of("student-02"), b.share_of("ops"), b.share_of("bench-x")) == \
+           (0.0, 200.0, 80.0, 100.0)
+    assert (b.refusal("student-01"), b.refusal("student-02")) == ("share_spent", None)
+
+
+def test_budget_without_shares_is_as_before(tmp_path):                    # сверх брифа: Д4а–Д9 без правок
+    led = lg(str(tmp_path / "core.db"))
+    b = Budget(led, total_usd=1000.0, share_usd=100.0, ops_share_usd=80.0)
+    assert b.shares is None and (b.share_of("student-01"), b.share_of("ops"), b.share_of("bench-x")) == \
+           (100.0, 80.0, 100.0)

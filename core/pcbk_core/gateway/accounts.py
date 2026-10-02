@@ -29,7 +29,8 @@ asyncio.to_thread в начале lifespan). Соединение — на ка�
 core.db делят журналы, их запись ждёт блокировку не дольше 0,5 с (Г14).
 
 Пароль не попадает ни в базу (только хеш), ни в тексты исключений, ни в журнал. Команда
-администратора — main(): python -m pcbk_core.gateway.accounts.
+администратора — main(): python -m pcbk_core.gateway.accounts. Её journal (Д10-R99) печатает журнал действий
+преподавателя (pcbk_core.teacher_log, только чтение mode=ro): коды, номера мест, логины и числа.
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ import argparse
 import getpass
 import hashlib
 import hmac
+import json
 import logging
 import re
 import secrets
@@ -55,6 +57,7 @@ from typing import Literal
 from pcbk_core.agents.store import AgentStore, DirUnavailable
 from pcbk_core.agents.store import StoreError as AgentStoreError
 from pcbk_core.settings import Settings
+from pcbk_core.teacher_log import RECENT_MAX, TeacherLog, TeacherLogError
 
 log = logging.getLogger("pcbk_core.gateway.accounts")
 
@@ -75,6 +78,7 @@ NOTICE = "teacher-reads-1"
 SESSION_TOKEN_BYTES = 32           # secrets.token_urlsafe(32) — 43 знака
 MAX_SESSIONS_PER_LOGIN = 3         # живых сессий на учётку (N2): 3 × 10 запросов edge — меньше половины общих 64
 GENERATED_PW_BYTES = 9             # --generate: secrets.token_urlsafe(9) — 12 знаков
+JOURNAL_LAST = 50                  # journal: строк по умолчанию (--last 1…RECENT_MAX)
 # scrypt по Д5-R24: n = 2**14, r = 8, p = 1, соль 16 байт, хеш 32 байта
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 16384, 8, 1
 SALT_BYTES = 16
@@ -738,6 +742,10 @@ def _parser() -> argparse.ArgumentParser:
     release.add_argument("--yes", action="store_true")
     sub.add_parser("list", help="учётки (последний столбец — предупреждён: да/нет, у преподавателя «-») и закрепления"
                                 " мест, без хешей")
+    journal = sub.add_parser("journal", help="журнал действий преподавателя, новые первыми: время, логин, действие,"
+                                             " место, разговор/агент/логин, итог, подробности (только коды и числа)")
+    journal.add_argument("--last", type=int, default=JOURNAL_LAST, metavar="N",
+                         help=f"строк: 1…{RECENT_MAX}, по умолчанию {JOURNAL_LAST}")
     return p
 
 
@@ -782,6 +790,22 @@ def _refuse_if_agents(settings: Settings, place: int) -> None:
         raise ValueError(_AGENTS_LEFT.format(place=place))
 
 
+def _journal(db_path: str, last: int) -> int:
+    """journal (Д10-R99): строки журнала действий преподавателя, новые первыми, по одной на строку через табуляцию —
+    <at> <login> <action> <NN или -> <target или -> <outcome> <detail JSON или ->. Базу открывает TeacherLog только на
+    чтение (mode=ro): пропавшую пустой не заводит, учётки не трогает. N вне 1…RECENT_MAX или сбой чтения — код 1."""
+    if not 1 <= last <= RECENT_MAX:
+        return _fail(f"journal: --last от 1 до {RECENT_MAX}")
+    try:
+        rows = TeacherLog(db_path).recent(last)
+    except TeacherLogError as exc:
+        return _fail(str(exc))
+    for r in rows:
+        detail = "-" if r.detail is None else json.dumps(r.detail, ensure_ascii=False)
+        print("\t".join((r.at, r.login, r.action, _nn(r.place), r.target or "-", r.outcome, detail)))
+    return 0
+
+
 def _run(store: AccountStore, args: argparse.Namespace, settings: Settings) -> int:
     command = args.command
     if command in ("add", "passwd"):
@@ -821,7 +845,8 @@ def main(argv: list[str] | None = None) -> int:
     сверяет агентов места по Settings.from_env().AGENTS_ROOT (Д7-R61).
 
     Удача — код 0; ошибка — код 1 и одна строка в stderr без пароля. Пароль порождённый (--generate)
-    печатается в stdout один раз, после удачи; больше ничего в stdout не идёт (кроме вывода list).
+    печатается в stdout один раз, после удачи; больше ничего в stdout не идёт (кроме вывода list и journal).
+    journal учётки не открывает: журнал действий — только чтение (Д10-R99).
     """
     try:
         args = _parser().parse_args(argv)
@@ -831,6 +856,8 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
     except ValueError as exc:
         return _fail(f"настройки: {exc}")
+    if args.command == "journal":                   # только чтение: учётки не открываются
+        return _journal(settings.DB_PATH, args.last)
     store = AccountStore(settings.DB_PATH)
     if not store.open():
         return _fail(f"база учётных записей не открывается: {store.last_error}")

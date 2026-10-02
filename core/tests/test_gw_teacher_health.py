@@ -1,14 +1,22 @@
 """Наблюдение раньше функции (задача А1 Д10а, Д10-R96): счётчики кабинета TeacherStats за час, GET /health/teacher — ровно
 13 ключей, только числа и флаги, только зона front, отказы — обработчиком шлюза из реестра; DRILL_TEACHER — в drill. До А2
 долей и журнала действий нет: checked_at — null, shares_loaded и shares_ok — false, сумма — 0, store_ok — true, и строка
-сторожа честно «неизвестно»."""
+сторожа честно «неизвестно».
+
+Задача А2: поля долей и журнала — из Shares роли llm и TeacherLog шлюза; teacher_tick — сверка долей с теми, по которым
+отказывает прокси (budget.share_of, I-7), и пульс журнала действий — в такте уборщика."""
+import sqlite3
+from contextlib import closing
+
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import FRONT, PLACE_NET, FakeMono, gateway_role, make_gateway, make_llm_role
+from helpers import (FRONT, PLACE_NET, FakeMono, gateway_role, make_gateway, make_llm_role, now_utc,
+                     teacher_gateway, wait_until)
 from pcbk_core.gateway.stats import TEACHER_KINDS, TeacherStats
 from pcbk_core.gateway.teacher_api import HEALTH_TEACHER_PATH
 from pcbk_core.hourly import WINDOW_S
+from pcbk_core.llm.shares import Shares
 from pcbk_core.settings import LlmSettings
 
 KEYS = {"checked_at", "shares_loaded", "shares_ok", "shares_drift", "shares_sum_usd", "total_usd", "store_ok",
@@ -144,3 +152,114 @@ def test_drill_teacher_warning_in_gateway_lifespan(tmp_path, gwlog):      # R96:
     with TestClient(app, client=FRONT):
         pass
     assert "УЧЕНИЯ: DRILL_TEACHER=shares_stale" in gwlog.text
+
+
+# --- задача А2: сверка в такте уборщика, учение shares_stale в /health/teacher (m-1) ---
+
+def test_teacher_tick_verifies_shares_and_pings_journal(tmp_path):
+    app, role = teacher_gateway(tmp_path, DRILL_TEACHER="shares_stale")
+    assert role.llm.shares.drill == "shares_stale"                          # m-1: учение дошло до долей помощника
+    with TestClient(app, client=FRONT) as c:
+        role.teacher_tick()
+        assert c.get("/health/teacher").json()["shares_drift"] == 0
+        role.llm.shares.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=now_utc())
+        role.teacher_tick()
+        body = c.get("/health/teacher").json()
+    assert (body["shares_loaded"], body["shares_ok"], body["shares_drift"], body["store_ok"],
+            body["shares_sum_usd"]) == (True, True, 2, True, 1000.0)
+    assert body["checked_at"] is not None
+
+
+def test_teacher_tick_sees_budget_without_shares(tmp_path):              # I-7: сверка сквозная
+    app, role = teacher_gateway(tmp_path)
+    role.llm.shares.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=now_utc())
+    role.llm.budget.shares = None                                            # Budget, собранный мимо долей
+    with TestClient(app, client=FRONT) as c:
+        role.teacher_tick()
+        assert c.get("/health/teacher").json()["shares_drift"] == 2
+
+
+def test_teacher_tick_when_shares_not_loaded(tmp_path, monkeypatch):     # m-5 р3: fail, а не unknown
+    monkeypatch.setattr(Shares, "open", lambda self: False)
+    app, role = teacher_gateway(tmp_path)
+    assert role.llm.shares.loaded is False
+    assert role.llm.shares.cents(3) == 10000                                 # умолчания из конструктора, не KeyError
+    with TestClient(app, client=FRONT) as c:
+        role.teacher_tick()
+        body = c.get("/health/teacher").json()
+    assert body["shares_loaded"] is False and body["checked_at"] is not None  # строка сторожа — fail по п. 3
+
+
+# --- сверх брифа ---
+
+def pulses(tmp_path) -> int:
+    """Строк пульса журнала действий в core.db (0 или 1: UPSERT одной строки); таблицы ещё нет — 0."""
+    with closing(sqlite3.connect(tmp_path / "core.db")) as db:
+        try:
+            return db.execute("SELECT count(*) FROM teacher_heartbeat").fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0
+
+
+def test_reaper_runs_teacher_tick(tmp_path):                              # такт уборщика сам, без ручного вызова
+    app, role = teacher_gateway(tmp_path)
+    with TestClient(app, client=FRONT) as c:
+        wait_until(lambda: c.get("/health/teacher").json()["checked_at"] is not None)
+        body = c.get("/health/teacher").json()
+    assert (body["shares_loaded"], body["shares_ok"], body["shares_drift"], body["store_ok"], body["shares_sum_usd"],
+            body["total_usd"], body["drill"]) == (True, True, 0, True, 1000.0, 1000.0, "")
+    assert set(body) == KEYS
+
+
+def test_journal_down_turns_store_ok_false_at_first_tick(tmp_path):      # учение journal_down: пульс не пишется
+    app, role = teacher_gateway(tmp_path, DRILL_TEACHER="journal_down")
+    assert role.teacher_log.drill == "journal_down" and role.llm.shares.drill == "journal_down"
+    with TestClient(app, client=FRONT) as c:
+        wait_until(lambda: c.get("/health/teacher").json()["store_ok"] is False)
+        body = c.get("/health/teacher").json()
+    assert (body["drill"], body["shares_ok"], body["shares_drift"]) == ("journal_down", True, 0)   # доли сходятся
+
+
+def test_store_ok_comes_back_with_the_next_pulse(tmp_path, monkeypatch):  # сбой записи — false, пульс — снова true
+    app, role = teacher_gateway(tmp_path)
+    with TestClient(app, client=FRONT) as c:
+        wait_until(lambda: pulses(tmp_path) == 1)                            # первый такт уборщика прошёл целиком
+        real = role.teacher_log._connect
+        monkeypatch.setattr(role.teacher_log, "_connect", lambda create=False, readonly=False: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")))
+        role.teacher_tick()
+        assert c.get("/health/teacher").json()["store_ok"] is False
+        monkeypatch.setattr(role.teacher_log, "_connect", real)
+        role.teacher_tick()
+        assert c.get("/health/teacher").json()["store_ok"] is True
+
+
+def test_teacher_tick_failure_still_pulses_and_reaper_lives(tmp_path, gwlog, monkeypatch):
+    app, role = teacher_gateway(tmp_path)
+
+    def broken(now, effective):
+        raise RuntimeError("не должно уйти в журнал")
+    monkeypatch.setattr(role.llm.shares, "verify", broken)
+    with TestClient(app, client=FRONT):
+        wait_until(lambda: "такт кабинета преподавателя: RuntimeError" in gwlog.text)
+    assert "не должно уйти" not in gwlog.text                                # только класс
+    assert pulses(tmp_path) == 1                                             # пульс прошёл и так
+
+
+def test_drift_is_logged_once_per_change(tmp_path, gwlog):
+    app, role = teacher_gateway(tmp_path, DRILL_TEACHER="shares_stale")
+    with TestClient(app, client=FRONT):
+        role.teacher_tick()
+        role.llm.shares.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=now_utc())
+        role.teacher_tick()
+        role.teacher_tick()
+    assert gwlog.text.count("кабинет преподавателя: LLM-прокси считает доли не так, как сохранено — мест: 2") == 1
+
+
+def test_shares_sum_is_memory_and_total_from_llm(tmp_path):              # сумма — память прокси, бюджет — LLM_TOTAL_USD
+    llm = make_llm_role(tmp_path, key=None, shares=True, LLM_TOTAL_USD=500.0, LLM_SHARE_USD=40.0)
+    assert llm.shares.open()
+    app, role = make_gateway(tmp_path, llm=llm)
+    with TestClient(app, client=FRONT) as c:
+        body = c.get("/health/teacher").json()
+    assert (body["shares_sum_usd"], body["total_usd"]) == (400.0, 500.0)
