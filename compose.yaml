@@ -90,8 +90,8 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d8a остаётся на сервере для отката Д9а, :d7a — для отката Д8а
-    image: pcbk-reserve/watchdog:d9a
+    # откатный образ — по строке А0, шаг 3 (`watchdog:d9a`; :d8a — для отката Д9а)
+    image: pcbk-reserve/watchdog:d10a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -209,8 +209,8 @@ services:
   # на адресе core в pcbk-front (Д5-R31). Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d8a остаётся на сервере для отката Д9а, :d7b — для отката Д8а (deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d9a
+    # откатный образ — по строке А0, шаг 3 (`core:d9b`, если он есть на сервере, иначе `core:d9a`; deploy/README.md, «Откат»)
+    image: pcbk-reserve/core:d10a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"

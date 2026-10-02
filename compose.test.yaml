@@ -54,7 +54,7 @@ services:
   # Свой образ от закреплённой базы (core/tests/Dockerfile.fake): общий тег python:3.12-slim машины не трогается
   fake-openrouter:
     build: {context: ./core/tests, dockerfile: Dockerfile.fake}
-    image: pcbk-test/fake-openrouter:d8a
+    image: pcbk-test/fake-openrouter:d10a
     pull_policy: never
     container_name: pcbk-test-openrouter
     init: true                      # SIGTERM доходит до python: stop без 10 с ожидания

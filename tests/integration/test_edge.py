@@ -31,7 +31,7 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d9a", "pcbk-core": "pcbk-reserve/core:d9a",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d10a", "pcbk-core": "pcbk-reserve/core:d10a",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d9a"}
