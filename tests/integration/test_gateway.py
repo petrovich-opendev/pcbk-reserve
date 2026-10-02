@@ -18,13 +18,14 @@ from contextlib import contextmanager
 
 import pytest
 
-from conftest import HOST, PORT, STAND_HOST, STAND_ORIGIN, secret_forms, wait_for
+from conftest import HOST, PORT, STAND_HOST, STAND_ORIGIN, Secret, failure, leaks, secret_forms, wait_for
 from gateway_cases import (ALLOW_PERM, ALLOWED, EVENT_TYPES, FORBIDDEN, MANGLED, METHODS, MSG_FAKE, OC, SES_FAKE,
                            check_forbidden, check_mangled, expected_refusals)
 from gwclient import GwClient
 from test_students import PROBE_AGENT
 
-PW = {n: secrets.token_urlsafe(12) for n in ("gw-a", "gw-b", "gw-c", "gw-t")}
+# пароли — Secret: в трассировке pytest «<скрыт>» (итоговое ревью Д6а, P7)
+PW = {n: Secret(secrets.token_urlsafe(12)) for n in ("gw-a", "gw-b", "gw-c", "gw-t")}
 OWN_PLACES = (6, 7, 8)
 # пределы edge на /pcbk/api/oc/ (edge/pcbk.conf.template): на cookie сессии и всего
 EDGE_OC_PER_SESSION = 10
@@ -91,6 +92,36 @@ def refused_counts(stack):
     """Строки «gw refused» журнала core: (по правилам — not_whitelisted и bad_path, по источнику — origin)."""
     logs = stack.logs("pcbk-core")
     return len(REFUSED_RULES.findall(logs)), len(REFUSED_ORIGIN.findall(logs))
+
+
+@contextmanager
+def dropping_port():
+    """Порт 127.0.0.1, который принимает соединение и сразу его закрывает: TLS рвётся посреди вызова клиента."""
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            conn.close()
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        yield srv.getsockname()[1]
+    finally:
+        srv.close()
+
+
+def test_gw_client_hides_password_in_tracebacks():                                      # без стенда: итоговое ревью Д6а, P7
+    probe = Secret("pcbk-probe-" + secrets.token_hex(8))
+    with dropping_port() as port:
+        c = GwClient(f"https://127.0.0.1:{port}", timeout=5)
+        # контроль: тело с открытой строкой — пароль в трассировке виден (кадры call и http.client)
+        assert leaks(failure(c.call, "POST", "/pcbk/api/auth/login", {"login": "gw-a", "password": str(probe)}), probe)
+        assert not leaks(failure(c.login, "gw-a", probe), probe)                       # вход: login, call, http.client
+        assert not leaks(failure(c.call, "POST", "/pcbk/api/auth/login", {"login": "gw-a", "password": probe}), probe)
+    assert {type(v) for v in PW.values()} == {Secret}                                   # пароли модуля
 
 
 def test_event_types_match_core(stack):

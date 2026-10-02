@@ -1,4 +1,6 @@
-"""Прокси входа 8443 и сторож в компоновке: страница, своя страница при смерти сторожа, сети."""
+"""Прокси входа 8443 и сторож в компоновке: страница, своя страница при смерти сторожа, сети, статика чата."""
+import hashlib
+import json
 import re
 import time
 
@@ -20,11 +22,15 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d5b", "pcbk-core": "pcbk-reserve/core:d5b",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d6a", "pcbk-core": "pcbk-reserve/core:d6a",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
-          "pcbk-student-01": "pcbk-reserve/student:d4"}
+          "pcbk-student-01": "pcbk-reserve/student:d6a"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
+# CSP страницы чата — строка Global Constraints Д6 (Д6-R41)
+CHAT_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "
+            "font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
+IMMUTABLE = "public, max-age=31536000, immutable"
 
 
 def test_edge_serves_status_from_watchdog(stack):
@@ -138,3 +144,42 @@ def test_env_holds_only_known_names(stack):
         added = stack.env_names(name) - stack.image_env_names(image)
         assert added == DECLARED_ENV[name], f"{name}: сверх образа {added}"
         assert not {n for n in stack.env_names(name) if re.search(r"PASSWORD|SECRET|TOKEN|APIKEY", n)}
+
+
+def test_edge_serves_chat_under_csp(stack):                                # Д6-R39, R41; раунд 2, В3: кэш и сжатие
+    build = json.loads((stack.static_dir / "chat/build.json").read_text(encoding="utf-8"))
+    assert build["build"].startswith("test-")                              # сборка фикстуры, а не общего дерева
+    code, body, h = stack.https_full("/chat/")
+    assert (code, h["content-security-policy"], h["cache-control"], h["x-content-type-options"], h["referrer-policy"]) \
+        == (200, CHAT_CSP, "no-store", "nosniff", "no-referrer")
+    assert h["content-type"] == "text/html; charset=utf-8"
+    assert f'<meta name="pcbk-build" content="{build["build"]}">' in body
+    assets = [p for p in build["files"] if p.startswith("assets/")]
+    assert assets                                                          # пустая опись — цикл ничего бы не проверил
+    for path in assets:
+        code, _, h = stack.https_full("/chat/" + path, headers={"Accept-Encoding": "gzip"})
+        assert code == 200 and h["content-security-policy"] == CHAT_CSP, path
+        assert (h["cache-control"], h["x-content-type-options"], h["referrer-policy"]) == \
+            (IMMUTABLE, "nosniff", "no-referrer"), path
+        assert h["content-type"].split(";")[0] in ("application/javascript", "text/javascript", "text/css"), path
+        assert (h.get("content-encoding"), h.get("vary")) == ("gzip", "Accept-Encoding"), path
+        code, raw, h = stack.https_full("/chat/" + path)                   # без Accept-Encoding — как есть
+        assert code == 200 and h.get("content-encoding") is None and h["cache-control"] == IMMUTABLE, path
+        assert hashlib.sha256(raw.encode("utf-8")).hexdigest() == build["files"][path], path
+    code, _, h = stack.https_full("/chat/assets/missing-00000000.js")
+    assert (code, h["cache-control"]) == (404, "no-store")                 # отказ не кэшируется на год
+    for path in ("/chat/build.json", "/chat/index.html"):                  # опись — только 8080; страница — только /chat/
+        code, _, h = stack.https_full(path)
+        assert (code, h["content-type"]) == (404, "text/plain; charset=utf-8"), path   # тип — не по расширению
+    code, _, h = stack.https_full("/chat")
+    assert (code, h["location"]) == (301, "/chat/")                        # относительный: туннель не уводит на 8443
+    # CSP R41 и заголовки — у всех ответов /chat*, и у перенаправления и 404 (итоговое ревью Д6а, P3)
+    for path, want in (("/chat", 301), ("/chat/build.json", 404), ("/chat/index.html", 404),
+                       ("/chat/assets/missing-00000000.js", 404)):
+        code, _, h = stack.https_full(path)
+        assert (code, h.get("content-security-policy"), h.get("cache-control"), h.get("x-content-type-options"),
+                h.get("referrer-policy")) == (want, CHAT_CSP, "no-store", "nosniff", "no-referrer"), path
+    code, _, h = stack.https_full("/favicon.ico")
+    assert (code, h["cache-control"]) == (204, "no-store")                 # решение по А4: иконки нет — не 404
+    assert stack.http_from_watchdog("GET", "http://pcbk-edge:8080/chat/build.json") == 200   # из сети сторожа (M13)
+

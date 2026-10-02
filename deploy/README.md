@@ -49,6 +49,58 @@
    --no-build watchdog`, дождаться `stale: false`, затем `docker compose up -d --no-build core`.
 5. Проверка: `curl -sk https://127.0.0.1:8443/status.json` — `stale: false`.
 
+## Статика чата (с Д6а)
+
+Чат — статика `edge` в `edge/static/chat/`: `index.html`, `assets/*` и опись `build.json` (суммы файлов
+и метка сборки). В git её нет. На сервер уходит только собранный каталог — ни `web/`, ни `node_modules`.
+Каталог `edge/` в шаге 2 «Выкладки» — из `git archive`, без `chat/`: чат выкладывается только так.
+
+1. Сборка — на машине разработчика (Node 22.x), из закреплённого коммита выкладки, в `$JOB`:
+   ```bash
+   C=$(git rev-parse --short=12 <коммит выкладки>) && B=$JOB/web-$C && mkdir -p "$B" &&
+   git archive "$C" web edge | tar -x -C "$B" &&
+   (cd "$B/web" && npm ci --ignore-scripts && PCBK_WEB_OUT="$B/chat" PCBK_BUILD="$C" npm run build)
+   ```
+   `npm run build` сам проверяет сборку (`check-dist`: CSP, ссылки, опись и суммы); метка сборки — `$C`.
+2. Копия — в соседний каталог `chat.new`, не поверх рабочего. Остался `chat.new` от прерванной
+   выкладки — сначала удалить его (только его):
+   `scp -r "$B/chat" <сервер>:/opt/pcbk-reserve/edge/static/chat.new`, на сервере
+   `chmod -R o+rX /opt/pcbk-reserve/edge/static/chat.new` — nginx читает файлы от другого пользователя.
+3. Сверка на сервере — суммы по описи, ни лишних, ни недостающих файлов, метка страницы — та же; расхождения
+   называются поимённо:
+   ```bash
+   cd /opt/pcbk-reserve/edge/static/chat.new && python3 -c 'import hashlib, json, os, sys
+   b = json.load(open("build.json")); files = b["files"]
+   sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+   problems = ["нет " + p for p in sorted(files) if not os.path.isfile(p)]
+   problems += ["сумма " + p for p in sorted(files) if os.path.isfile(p) and sha(p) != files[p]]
+   disk = {"assets/" + f for f in os.listdir("assets")} | set(os.listdir(".")) - {"assets", "index.html", "build.json"}
+   problems += ["лишний " + p for p in sorted(disk - set(files))]
+   if "<meta name=\"pcbk-build\" content=\"" + b["build"] + "\">" not in open("index.html").read():
+       problems.append("метка index.html не " + b["build"])
+   print(b["build"], "сходится" if not problems else "НЕ сходится: " + "; ".join(problems)); sys.exit(bool(problems))'
+   ```
+4. Переименование; прежний каталог остаётся для отката (`<прошлый день>` — например, `d6a`). `mv -T` не
+   вкладывает каталог внутрь уже существующего, а занятое имя отката останавливает выкладку:
+   ```bash
+   cd /opt/pcbk-reserve/edge/static &&
+   { [ ! -e chat.<прошлый день> ] || { echo "chat.<прошлый день> уже есть"; false; }; } &&
+   { [ ! -e chat ] || mv -T chat chat.<прошлый день>; } && mv -T chat.new chat
+   ```
+   `edge` не перезапускается: nginx читает файлы при каждом запросе. Между двумя `mv` чат на миг
+   отдаёт 404 — такой ответ не кэшируется (`no-store`), а ассеты с хешем в имени кэшируются на год.
+5. Проверка: `curl -sk https://127.0.0.1:8443/chat/ | grep -o 'pcbk-build" content="[^"]*"'` — метка `$C`;
+   на `/status` строка «Веб-чат» — «страница чата отдаётся», сборка `$C` (сторож смотрит через 8080 `edge`).
+
+**Откат** — с той же защитой имени:
+```bash
+cd /opt/pcbk-reserve/edge/static &&
+{ [ ! -e chat.bad-<день> ] || { echo "chat.bad-<день> уже есть"; false; }; } &&
+mv -T chat chat.bad-<день> && mv -T chat.<прошлый день> chat
+```
+Первой выкладке (Д6а) возвращать нечего: откат чата — это откат всего `edge/` (страница входа Д6а
+ведёт в `/chat/`), каталог `chat` уходит в сторону, строка «Веб-чат» краснеет.
+
 ## Рабочие места (с Д2)
 
 1. Секреты — на сервере, в чат и git не попадают:

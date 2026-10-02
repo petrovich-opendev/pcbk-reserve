@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
                      check_container, check_gateway, check_historian, check_http, check_llm, check_memory,
-                     check_tls, not_installed)
+                     check_tls, check_web, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
 from .page import Snapshot, is_stale, render_html, status_json
@@ -27,7 +27,7 @@ log = logging.getLogger("pcbk_watchdog")
 KINDS: dict[str, tuple[str, ...]] = {
     "memory": (), "http": ("url",), "tls": ("host", "port"), "docker_ping": (),
     "container": ("container", "sleeping_ok"), "absent": (), "historian": ("url",),
-    "llm": ("url",), "gateway": ("url",),
+    "llm": ("url",), "gateway": ("url",), "web": ("url",),
 }
 # виды без сети — их срок такта не отменяет
 LOCAL_KINDS = frozenset({"memory", "absent"})
@@ -100,7 +100,8 @@ class Settings:
         больше STALE_AFTER_S, если длина такта d ≤ min(STALE − TICK, STALE / 2).
         Начатая до срока проверка идёт ещё до двух сроков сокета — их запас
         вычитается. У http и historian это общий срок всей проверки
-        (checks.HTTP_CHECK_SPANS): соединение, заголовки и тело. У tls и Docker —
+        (checks.HTTP_CHECK_SPANS): соединение, заголовки и тело; у web — один
+        такой срок на все её запросы (страница, опись, файлы). У tls и Docker —
         срок на соединение и на каждое чтение: ответ, капающий по байту, их
         продлил бы — это свои службы стенда.
         """
@@ -183,6 +184,8 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
         return check_llm(cid, title, comp["url"], now, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "gateway":
         return check_gateway(cid, title, comp["url"], now, settings.GW_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
+    if kind == "web":
+        return check_web(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S)
     if kind == "tls":
         return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
                          timeout=NET_CHECK_TIMEOUT_S)

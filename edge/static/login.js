@@ -50,9 +50,13 @@ export function meView(status, body) {
   return { form: true, text: loginError(status, body) };
 }
 
+export const CHAT_URL = '/chat/';   // чат (Д6-R39): после «Рабочее место готово» — туда
+
+// navigate — переход на другую страницу; в браузере location.assign, в тестах — своя запись (в Node нет location)
 export function startPage({ doc, fetchImpl,
                             setTimeoutImpl = (fn, ms) => setTimeout(fn, ms),
-                            clearTimeoutImpl = (id) => clearTimeout(id) }) {
+                            clearTimeoutImpl = (id) => clearTimeout(id),
+                            navigate = (url) => location.assign(url) }) {
   const el = (id) => doc.getElementById(id);
   const form = el('login-form');
   const loginInput = el('login');
@@ -61,8 +65,10 @@ export function startPage({ doc, fetchImpl,
   const who = el('who');
   const state = el('state');
   const logout = el('logout');
+  const toChat = el('to-chat');   // запасная ссылка «Открыть чат» — если переход не случился
 
   let run = 0;               // номер хода ожидания места: выход и новый ход гасят прежний
+  let navigatedRun = -1;     // ход, в котором уже был переход в чат: за ход — не больше одного
   let pollTimer = null;
   let giveUpTimer = null;
   let busy = false;
@@ -107,6 +113,7 @@ export function startPage({ doc, fetchImpl,
     who.hidden = true;
     who.textContent = '';
     logout.hidden = true;
+    toChat.hidden = true;
     say(text, kind);
   }
 
@@ -124,11 +131,17 @@ export function startPage({ doc, fetchImpl,
     say(view.text, view.ok ? 'ok' : view.poll ? 'wait' : 'fail');
     if (view.poll) pollTimer = setTimeoutImpl(() => poll(my), POLL_MS);
     else stopWaiting();
+    if (view.ok && navigatedRun !== my) {              // место готово — в чат; у преподавателя сюда не доходит
+      navigatedRun = my;
+      toChat.hidden = false;
+      navigate(CHAT_URL);
+    }
   }
 
   async function wake() {
     stopWaiting();
     const my = run;
+    toChat.hidden = true;
     say(PREPARING, 'wait');
     giveUpTimer = setTimeoutImpl(() => {
       if (my !== run) return;

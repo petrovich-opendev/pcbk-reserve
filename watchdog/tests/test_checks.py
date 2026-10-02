@@ -1,3 +1,4 @@
+import http.client
 import itertools
 import json
 import time
@@ -7,14 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from helpers import T0, gw, insp, llm_obj, now_utc
+from helpers import T0, gw, insp, llm_obj, now_utc, put_build
 from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD, EGRESS_STALE_S,
                                   GW_DRILL_MODES, GW_KEYS_D5A, GW_KEYS_D5B, GW_OFF_CONTRACT_DETAIL,
-                                  GW_SP_CTL_STATES, LLM_STALE_S,
-                                  LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, GatewayReply,
+                                  GW_SP_CTL_STATES, LLM_STALE_S, MAX_BODY_BYTES,
+                                  LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, GatewayReply, _http_get,
                                   check_container, check_gateway,
-                                  check_historian, check_http, check_llm, check_memory, check_tls, fmt_total,
-                                  fmt_usd, not_installed, tls_verdict)
+                                  check_historian, check_http, check_llm, check_memory, check_tls, check_web,
+                                  fmt_total, fmt_usd, not_installed, tls_verdict)
 from pcbk_watchdog.journal import Journal
 
 MEMINFO = "MemTotal: 16384000 kB\nMemAvailable: {} kB\n"
@@ -1049,3 +1050,106 @@ def test_gateway_proxy_rows_constant_text(fake_core, tmp_path):                 
     assert all(len(r.detail) <= REASON_CHARS for r in rows) and len({r.note for r in rows}) == 9
     journal = Journal(str(tmp_path / "j.db"))
     assert sum(len(journal.record([r], T0 + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 3
+
+
+# --- строка «Веб-чат» (задача А1 Д6а, Д6-R46): страница чата и опись сборки через 8080 edge ---------------------
+
+def row(c):
+    return (c.state, c.detail, c.note)
+
+
+def test_web_verdicts(web_site):
+    root, url = web_site                                                   # url = http://127.0.0.1:N/chat/
+    put_build(root)
+    assert row(check_web("web", "Веб-чат", url)) == ("ok", "страница чата отдаётся", "сборка abc123")
+    (root / "chat/assets/index-1.css").unlink()
+    assert row(check_web("web", "Веб-чат", url)) == ("fail", "сборка чата неполная", "нет assets/index-1.css")
+    put_build(root, meta="zzz")
+    assert row(check_web("web", "Веб-чат", url)) == ("fail", "сборка чата неполная", "страница и опись разных сборок")
+    put_build(root, files={"../x.js": b"x"})
+    assert row(check_web("web", "Веб-чат", url))[1:] == ("сборка чата неполная", "опись неверна")
+    put_build(root, files={"assets/index-1.js": b"x", "boot.js": b"b"})    # загрузчик Д6б — законный путь описи
+    assert row(check_web("web", "Веб-чат", url))[0] == "ok"
+    put_build(root, files={f"assets/f{i}.js": b"x" for i in range(9)})
+    assert row(check_web("web", "Веб-чат", url))[2] == "опись неверна"
+    put_build(root, meta="")
+    assert row(check_web("web", "Веб-чат", url)) == ("fail", "страница чата не отдаётся", "нет метки сборки")
+    (root / "chat/index.html").unlink()
+    assert row(check_web("web", "Веб-чат", url)) == ("fail", "страница чата не отдаётся", "HTTP 404")
+    assert row(check_web("web", "Веб-чат", "http://127.0.0.1:9/chat/"))[:2] == ("fail", "не отвечает")
+
+
+def test_web_check_keeps_deadline(slow_site):                              # раунд 2, В1: каждый ответ — через 2,5 с
+    t0 = time.monotonic()                                                   # без общего срока: 2,5 + 2,5 + 2,5 = 7,5 с
+    c = check_web("web", "Веб-чат", slow_site, timeout=3.0)
+    assert time.monotonic() - t0 < 2 * 3.0 + 0.5                           # один срок на всю проверку
+    assert (c.state, c.detail) == ("fail", "не отвечает")
+
+
+def test_http_get_absolute_deadline(slow_site):                             # срок соединения и чтения — не дальше deadline
+    t0 = time.monotonic()
+    with pytest.raises((OSError, http.client.HTTPException)):
+        _http_get(slow_site, 3.0, lambda code: True, deadline=time.monotonic() + 1.0)
+    assert time.monotonic() - t0 < 1.0 + 0.5
+    accepted = len(slow_site.accepted)                                     # M4: «без соединения» — по счёту двойника
+    with pytest.raises(TimeoutError):
+        _http_get(slow_site, 3.0, lambda code: True, deadline=time.monotonic() - 0.1)   # срок уже вышел — без соединения
+    time.sleep(0.2)                                                         # опоздавшее соединение успело бы дойти
+    assert accepted == 1 and len(slow_site.accepted) == accepted           # счёт живой: первый запрос учтён
+
+
+def test_http_get_connect_bounded_by_deadline(full_backlog_url):           # доводка 1: соединение — не дольше остатка
+    t0 = time.monotonic()                                                   # очередь забита: connect висит, пока не срок
+    with pytest.raises(OSError):
+        _http_get(full_backlog_url, 3.0, lambda code: True, deadline=time.monotonic() + 0.5)
+    assert time.monotonic() - t0 < 0.5 + 0.4                               # полный timeout соединения — 3 с
+
+
+def test_web_meta_only_in_contract_form(web_site):                          # доводка 1: WEB_META_RE
+    root, url = web_site
+    put_build(root)
+    for head in ('<meta name="viewport" content="width=device-width, initial-scale=1">',
+                 '<meta name="viewport" content="abc123">'):                # чужое имя с содержимым, как у метки
+        (root / "chat/index.html").write_text(f"<!doctype html><head>{head}</head>")
+        assert row(check_web("web", "Веб-чат", url)) == ("fail", "страница чата не отдаётся", "нет метки сборки"), head
+    for meta in ("abc 123", "a" * 65):                                      # содержимое вне [A-Za-z0-9._-]{1,64}
+        put_build(root, meta=meta)
+        assert row(check_web("web", "Веб-чат", url)) == ("fail", "страница чата не отдаётся", "нет метки сборки"), meta
+    put_build(root, build="a" * 64)                                         # граница: 64 знака — ещё метка
+    assert row(check_web("web", "Веб-чат", url)) == ("ok", "страница чата отдаётся", "сборка " + "a" * 64)
+
+
+def test_web_meta_beyond_body_limit(web_site):                              # доводка 1: тело страницы — до MAX_BODY_BYTES
+    root, url = web_site
+    put_build(root)
+    head, tag = "<!doctype html><head><!--", '<meta name="pcbk-build" content="abc123">'
+    fits = MAX_BODY_BYTES - len(head) - len("-->") - len(tag)              # метка кончается ровно на пределе
+    for filler, want in ((fits, ("ok", "страница чата отдаётся", "сборка abc123")),
+                         (fits + 1, ("fail", "страница чата не отдаётся", "нет метки сборки")),
+                         (MAX_BODY_BYTES, ("fail", "страница чата не отдаётся", "нет метки сборки"))):
+        (root / "chat/index.html").write_text(head + "x" * filler + "-->" + tag + "</head>")
+        assert row(check_web("web", "Веб-чат", url)) == want, filler
+
+
+def test_web_manifest_rows_and_body_stall(web_site, raw_http):             # строки таблицы Д6-R46 сверх test_web_verdicts
+    root, url = web_site
+    put_build(root)
+    manifest = root / "chat/build.json"
+    sha = json.loads(manifest.read_text())["files"]["assets/index-1.js"]
+    for text in ("не JSON", "[1]", "[" * 60_000,                           # глубина — RecursionError, не падение проверки
+                 json.dumps({"build": 1, "files": {"assets/index-1.js": sha}}),
+                 json.dumps({"build": "abc123", "files": ["assets/index-1.js"]}),
+                 json.dumps({"build": "abc123", "files": {}}),               # пустая опись ничего не проверила бы
+                 json.dumps({"build": "abc123", "files": {"assets/index-1.js": "x"}}),        # не sha256
+                 json.dumps({"build": "abc123", "files": {"assets/..": sha}}),                # сам каталог /chat/
+                 json.dumps({"build": "abc123", "files": {"assets/sub/x.js": sha}}),
+                 json.dumps({"build": "abc123", "files": {"boot.js.map": sha}})):
+        manifest.write_text(text)
+        assert row(check_web("web", "Веб-чат", url)) == ("fail", "сборка чата неполная", "опись неверна"), text[:60]
+    manifest.unlink()                                                       # опись не 200
+    assert row(check_web("web", "Веб-чат", url)) == ("fail", "сборка чата неполная", "опись неверна")
+    put_build(root, files={f"assets/f{i}.js": b"x" for i in range(7)} | {"boot.js": b"b"})   # 8 записей с загрузчиком
+    assert row(check_web("web", "Веб-чат", url)) == ("ok", "страница чата отдаётся", "сборка abc123")
+    # тело страницы оборвал срок: это «не отвечает» (строка «срок» таблицы), а не «нет метки сборки»
+    r, took = timed(check_web, "web", "Веб-чат", raw_http(headers_then_stall) + "/chat/", timeout=SOCK_S)
+    assert row(r) == ("fail", "не отвечает", "") and took < BOUND_S

@@ -32,3 +32,6 @@ __pycache__/
 *.pyc
 *.tmp
 node_modules/
+
+# сборка веб-чата — только статика на машине разработчика (Д6-R40); в git её нет
+/edge/static/chat/

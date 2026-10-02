@@ -1,4 +1,4 @@
-"""Фикстуры сторожа: двойники прокси сокета sp-ro, локальный TLS-сервер, страница для браузера."""
+"""Фикстуры сторожа: двойники прокси сокета sp-ro, локальный TLS-сервер, страница для браузера, статика чата."""
 import json
 import socket
 import ssl
@@ -6,14 +6,15 @@ import subprocess
 import threading
 import time
 from contextlib import ExitStack, contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from functools import partial
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from helpers import insp, now_utc
+from helpers import insp, now_utc, put_build
 from pcbk_watchdog.checks import Check
 from pcbk_watchdog.page import Snapshot, render_html
 
@@ -140,6 +141,88 @@ def serve_http(handler):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+class StaticHandler(SimpleHTTPRequestHandler):
+    """Статика каталога без списков: каталог без index.html — 404, как try_files … =404 у edge."""
+
+    def list_directory(self, path):
+        self.send_error(404)
+        return None
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def web_site(tmp_path):
+    """Статика стенда из tmp_path по HTTP, как 8080 edge: (корень, адрес http://127.0.0.1:N/chat/)."""
+    with serve_http(partial(StaticHandler, directory=str(tmp_path))) as base:
+        yield tmp_path, base + "/chat/"
+
+
+# задержка каждого ответа медленной статики до заголовков, с: три запроса проверки «Веб-чат» (страница,
+# опись, файл) — 7,5 с, больше её общего срока 6 с при сроке сокета 3 с; каждый запрос — в своём сроке 6 с
+SLOW_SITE_S = 2.5
+
+
+class SiteUrl(str):
+    """Адрес двойника; accepted — список принятых им соединений (по одному элементу на соединение)."""
+    accepted: list
+
+
+@pytest.fixture
+def slow_site(tmp_path):
+    """Настоящая сборка чата (страница с меткой, опись, два файла — put_build), но каждый ответ — через
+    SLOW_SITE_S до заголовков. Адрес /chat/ — строка; .accepted — счёт соединений (проверка «без соединения»)."""
+    put_build(tmp_path)
+    stop, accepted = threading.Event(), []
+
+    class Handler(StaticHandler):
+        def setup(self):
+            accepted.append(1)   # поток обработчика — на каждое принятое соединение
+            super().setup()
+
+        def do_GET(self):
+            if stop.wait(SLOW_SITE_S):
+                return           # конец теста: не ждать задержку
+            try:
+                super().do_GET()
+            except (BrokenPipeError, ConnectionResetError):
+                pass             # проверка уже ушла по сроку и закрыла соединение
+
+    with serve_http(partial(Handler, directory=str(tmp_path))) as base:
+        url = SiteUrl(base + "/chat/")
+        url.accepted = accepted
+        try:
+            yield url
+        finally:
+            stop.set()
+
+
+@pytest.fixture
+def full_backlog_url():
+    """Сокет слушает с очередью 0 и никого не принимает: очередь забита, новое соединение висит в connect
+    (ядро отбрасывает SYN). Положительный контроль — пробное соединение со сроком 0,2 с не устанавливается."""
+    listener = socket.create_server(("127.0.0.1", 0), backlog=0)
+    addr, fillers = listener.getsockname(), []
+    try:
+        for _ in range(8):
+            probe = socket.socket()
+            probe.settimeout(0.2)
+            try:
+                probe.connect(addr)
+            except TimeoutError:
+                probe.close()
+                break
+            fillers.append(probe)
+        else:
+            pytest.fail("очередь соединений не заполнилась — тест срока соединения ничего не проверил бы")
+        yield f"http://127.0.0.1:{addr[1]}/"
+    finally:
+        for sock in fillers:
+            sock.close()
+        listener.close()
 
 
 @contextmanager

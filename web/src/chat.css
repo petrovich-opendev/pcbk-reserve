@@ -1,0 +1,90 @@
+/* Стили чата (Д6-R41): один свой файл без Tailwind, шрифты — системные; CSP style-src 'self' —
+   ни url() наружу, ни @import. Палитра — как у страницы входа (edge/static/login.css). */
+:root { color-scheme: light dark; --fg: #1f2328; --bg: #f6f8fa; --muted: #6b7280; --field: #ffffff;
+  --border: #d0d7de; --warn-fg: #5c3c00; --warn-bg: #fff4c2; --link: #0969da;
+  --ok: #1a7f37; --fail: #c62828; --warn: #9a6700; --unknown: #6b7280;
+  --accent: #0969da; --accent-fg: #ffffff; --user-bg: #ddf4ff; --code-bg: #eef1f4; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #e6edf3; --bg: #0d1117; --muted: #8b949e; --field: #161b22; --border: #30363d;
+    --warn-fg: #f5d77a; --warn-bg: #3a2f00; --link: #58a6ff;
+    --ok: #3fb950; --fail: #ff6b6b; --warn: #d29922; --unknown: #8b949e;
+    --accent: #1f6feb; --accent-fg: #ffffff; --user-bg: #13233a; --code-bg: #1c2129; } }
+
+[hidden] { display: none !important; }
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body { margin: 0; font: 16px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+a { color: var(--link); }
+button { font: inherit; padding: .45rem .9rem; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); color: var(--fg); background: var(--field); }
+button:disabled { opacity: .6; cursor: default; }
+
+/* каркас: шапка сверху, под ней — фаза или разговор на всю оставшуюся высоту */
+.app { display: flex; flex-direction: column; height: 100%; }
+.top { position: sticky; top: 0; z-index: 1; background: var(--bg); border-bottom: 1px solid var(--border); }
+.stand { padding: .6rem 1rem; text-align: center; font-weight: 600; color: var(--warn-fg); background: var(--warn-bg); }
+.bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .4rem 1rem;
+  padding: .4rem 1rem; }
+.who { display: flex; align-items: center; gap: .75rem; }
+.who span { font-weight: 600; }
+.main { flex: 1; min-height: 0; display: flex; flex-direction: column; width: 100%; max-width: 60rem;
+  margin: 0 auto; }
+
+/* баннер состояния: цвет — по уровню */
+.banner { display: flex; align-items: center; gap: .6rem; min-height: 1.45em; }
+.banner-text { font-weight: 600; }
+.banner-text:empty { display: none; }
+.banner[data-level="ok"] .banner-text { color: var(--ok); }
+.banner[data-level="warn"] .banner-text { color: var(--warn); }
+.banner[data-level="fail"] .banner-text { color: var(--fail); }
+.banner[data-level="unknown"] .banner-text { color: var(--unknown); }
+
+/* фазы без разговора: загрузка, ошибка, преподаватель, место, «спит» */
+.phase, .place { padding: 1.5rem 1rem; }
+.phase p, .place p { margin: 0 0 .75rem; }
+[data-kind="fail"] { color: var(--fail); font-weight: 600; }
+[data-kind="ok"] { color: var(--ok); font-weight: 600; }
+
+/* разговор */
+.thread { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.toolbar { display: flex; justify-content: flex-end; padding: .5rem 1rem 0; }
+.viewport { flex: 1; min-height: 0; overflow-y: auto; padding: .5rem 1rem; }
+.msg { margin: .75rem 0; overflow-wrap: anywhere; }
+.msg[data-role="user"] { margin-left: auto; max-width: 85%; width: fit-content; padding: .5rem .8rem;
+  border-radius: 10px; background: var(--user-bg); }
+.msg[data-role="assistant"] { max-width: 100%; }
+.plain { margin: 0; white-space: pre-wrap; }
+.img-text { color: var(--muted); font-style: italic; }
+.msg-error { margin: .4rem 0; color: var(--fail); font-weight: 600; }
+
+/* markdown ответа */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol { margin: .5rem 0; }
+.md pre { padding: .6rem .8rem; overflow-x: auto; border-radius: 6px; background: var(--code-bg); }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
+.md table { border-collapse: collapse; margin: .5rem 0; display: block; overflow-x: auto; }
+.md th, .md td { padding: .3rem .6rem; border: 1px solid var(--border); text-align: left; }
+
+/* строка вызова инструмента и свёрнутые аргументы и вывод */
+.tool { margin: .4rem 0; color: var(--muted); }
+.tool summary { cursor: pointer; }
+.tool[data-state="error"] summary { color: var(--fail); }
+.tool pre { margin: .4rem 0; padding: .5rem .7rem; max-height: 20rem; overflow: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; border-radius: 6px; color: var(--fg); background: var(--code-bg);
+  font: .85em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.tool pre[data-part="args"] { color: var(--muted); }
+
+/* ожидающие ответа агента, поток, ошибка действия — над полем ввода */
+.pending { list-style: none; margin: 0 1rem; padding: 0; }
+.pending li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem;
+  margin: .4rem 0; padding: .5rem .8rem; border-radius: 6px; color: var(--warn-fg); background: var(--warn-bg); }
+.stream-line { margin: .3rem 1rem; color: var(--muted); }
+.error-line { margin: .3rem 1rem; color: var(--fail); font-weight: 600; }
+
+.composer { display: flex; align-items: flex-end; gap: .5rem; padding: .6rem 1rem .9rem;
+  border-top: 1px solid var(--border); }
+.composer-input { flex: 1; min-width: 0; resize: none; font: inherit; padding: .5rem .7rem; color: var(--fg);
+  background: var(--field); border: 1px solid var(--border); border-radius: 6px; }
+.send { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+.stop { color: var(--fail); border-color: var(--fail); }

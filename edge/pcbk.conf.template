@@ -19,6 +19,15 @@ map $uri $pcbk_api_csp {
     "~^/pcbk(?:/api(?:/|$)|-errors/)" "default-src 'none'";
 }
 
+# кэш ассетов чата (Д6-R41): имена с хешем содержимого — год и immutable, но только у ответа с файлом (200, 304).
+# Отказ — 404 в окне переименования при выкладке, опечатка в пути — no-store, как всё прочее у edge (правило Д1):
+# иначе браузер запомнил бы 404 на год под тем же именем
+map $status $pcbk_asset_cache {
+    default "no-store";
+    200     "public, max-age=31536000, immutable";
+    304     "public, max-age=31536000, immutable";
+}
+
 # журнал доступа 8443 — без строки запроса (в ней бывает auth_token адаптера OpenCode): строка запроса клиента как
 # пришла — метод, сырой путь до «?» и версия; метод — из строки запроса, а не $request_method: после error_page тот — GET
 map $request $pcbk_log_request {
@@ -179,6 +188,58 @@ server {
         try_files /login.css =404;
     }
 
+    # чат (Д6-R39, R41): SPA из статики edge/static/chat/ — index.html и assets/* со своим CSP (строка Global
+    # Constraints Д6, font-src сверх входа). Карта $pcbk_api_csp /chat/ не накрывает, а add_header в location
+    # отменяет заголовки server — nosniff и Referrer-Policy повторены, как у /login. CSP R41 — у всех ответов /chat*,
+    # и у перенаправления и 404 (итоговое ревью Д6а, P3)
+    location = /chat {
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        absolute_redirect off;                    # Location относительный: через туннель абсолютный увёл бы на 8443
+        return 301 /chat/;
+    }
+
+    location = /chat/ {
+        charset utf-8;
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        try_files /chat/index.html =404;
+    }
+
+    # ассеты с хешем в имени: кэш на год (map $pcbk_asset_cache) и gzip — бандл около 914 КБ без сжатия
+    location ^~ /chat/assets/ {
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control $pcbk_asset_cache always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip on;
+        gzip_types application/javascript text/javascript text/css;
+        gzip_vary on;
+        try_files $uri =404;
+    }
+
+    # прочее под /chat/ — не на 8443: опись build.json читает только сторож через 8080, index.html — только как /chat/.
+    # types {} — тип ответа не по расширению пути (иначе 404 на build.json ушёл бы как application/json)
+    location ^~ /chat/ {
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        types { }
+        default_type "text/plain; charset=utf-8";
+        return 404 "не найдено\n";
+    }
+
+    # браузер сам спрашивает иконку, а в страницах её нет: пустой ответ вместо 404 в журнале каждой загрузки
+    location = /favicon.ico {
+        access_log off;
+        return 204;
+    }
+
     # пути шлюза в core — только эти (Д5а, /pcbk/api/oc/ — Д5б); error_page, буферы, Connection "", X-Forwarded-Host
     # и заголовки ответа — от server: своих error_page, proxy_set_header и add_header здесь нет
     location /pcbk/api/auth/ {
@@ -279,7 +340,7 @@ server {
     }
 }
 
-# 8080 — только проверка живости изнутри; не публикуется
+# 8080 — изнутри: живость и статика чата для сторожа; не публикуется
 server {
     listen 8080;
     server_name _;
@@ -289,6 +350,18 @@ server {
     location = /healthz {
         default_type "text/plain; charset=utf-8";
         return 200 "ok\n";
+    }
+
+    # статика чата для строки сторожа «Веб-чат» (Д6-R46): тот же корень, что у 8443, но без TLS; опись
+    # /chat/build.json сторож читает только здесь. Своего root у server 8080 нет — задан в location
+    location = /chat/ {
+        root /usr/share/nginx/pcbk;
+        try_files /chat/index.html =404;
+    }
+
+    location ^~ /chat/ {
+        root /usr/share/nginx/pcbk;
+        try_files $uri =404;
     }
 
     location / {

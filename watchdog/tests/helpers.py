@@ -1,6 +1,8 @@
 """Общие константы и помощники тестов сторожа (импорт явный: from helpers import …)."""
 import atexit
+import hashlib
 import http.client
+import json
 import os
 import shutil
 import subprocess
@@ -66,6 +68,21 @@ def gw(age=5, **kw):
             "place_auth_failed_1h": 0, "logins_failed_1h": 0, "origin_refused_1h": 0, "login_busy_1h": 0,
             "cookies_duplicate_1h": 0,
             "drill": "", **kw}
+
+
+def put_build(root, build="abc123", files=None, meta=None):
+    """Сборка чата в root/chat/ (Д6-R40, договор с задачей А2): index.html с меткой сборки, файлы и опись build.json.
+
+    meta — своя метка страницы (иная сборка), "" — страница без метки; files — {путь: байты}.
+    """
+    files = {"assets/index-1.js": b"x", "assets/index-1.css": b"y"} if files is None else files
+    chat = root / "chat"; (chat / "assets").mkdir(parents=True, exist_ok=True)
+    tag = f'<meta name="pcbk-build" content="{meta or build}">' if meta != "" else ""
+    (chat / "index.html").write_text(f"<!doctype html><head>{tag}</head>")
+    for p, b in files.items():
+        (chat / p).write_bytes(b)
+    (chat / "build.json").write_text(json.dumps({"build": build,
+                                                 "files": {p: hashlib.sha256(b).hexdigest() for p, b in files.items()}}))
 
 
 # /proc/meminfo для тестов: памяти с запасом; файл удаляется при выходе
