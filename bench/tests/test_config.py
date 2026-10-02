@@ -127,3 +127,12 @@ def test_connect_reads_stand_json_and_secrets_without_network(tmp_path):        
     (tmp_path / "stand.json").write_text(json.dumps({"ssh": ["ssh"], "core_url": "x"}))
     with pytest.raises(ValueError):
         connect(load_config(write_config(tmp_path), OC))
+
+
+def test_config_scenarios_filter(tmp_path):                                      # П14: сухой прогон Б4, слой 0 Б5
+    assert load_config(write_config(tmp_path), OC).scenarios is None
+    cfg = load_config(write_config(tmp_path, scenarios=["B3"]), OC)
+    assert cfg.scenarios == ("B3",)
+    for bad in ([], ["Z9"], ["B3", "B3"], "B3", [3]):
+        with pytest.raises(ValueError, match="scenarios"):
+            load_config(write_config(tmp_path, scenarios=bad), OC)

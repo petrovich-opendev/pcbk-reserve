@@ -13,8 +13,8 @@ KEEPALIVE_S по clock получает POST …/workplace/wake (продлев�
 места → abort сессий из OUT/sessions.log без строки конца через своё место (П5; 404 — «уже нет») → пустой
 /session/status у каждого места (≤ IDLE_WAIT_S, иначе place_busy: чужой прогонщик с другим OUT, р1 m4) → модель
 места (GET /config) → единицы тегов карточек (OUT/tag_units.json) → архив чужих агентов места → bench-uzel и его
-ready. Любое расхождение — RunRefused с кодом; замок и пульс снимаются (close()). run() зовёт prepare() сам, если его
-не звали; close() — в finally у run().
+ready (только если в плане есть его сценарии: фильтр scenarios конфига, П14). Любое расхождение — RunRefused с кодом;
+замок и пульс снимаются (close()). run() зовёт prepare() сам, если его не звали; close() — в finally у run().
 
 Прогон (run_one): пробуждение места (ensure_ready: GET /workplace, не ready — wake и ожидание ready, затем
 mcp=connected), разговор со сценарным ботом или скриптом (ScriptedStudent), у A — после удачного save_agent ожидание
@@ -129,10 +129,12 @@ class _RunStatus(Exception):
 # --- план, журналы и состояние на диске ---
 
 def plan_runs(cfg: BenchConfig) -> list[RunKey]:
-    """Ключи плана по повторам: повтор, затем место, затем сценарий; группа идёт, пока reps[группа] ≥ повтора."""
+    """Ключи плана по повторам: повтор, затем место, затем сценарий; группа идёт, пока reps[группа] ≥ повтора;
+    cfg.scenarios (П14) оставляет только эти сценарии."""
     top = max(cfg.reps.values())
+    wanted = set(cfg.scenarios) if cfg.scenarios is not None else set(SCENARIO_IDS)
     return [RunKey(n, sid, rep) for rep in range(1, top + 1) for n in sorted(cfg.places) for sid in SCENARIO_IDS
-            if cfg.reps[BY_ID[sid].group] >= rep]
+            if sid in wanted and cfg.reps[BY_ID[sid].group] >= rep]
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -448,7 +450,8 @@ class Runner:
                     name = row.get("name")
                     if isinstance(name, str) and name != BENCH_AGENT:
                         self.stand.archive_agent(n, name)
-            self._bench_agents()
+            if any(BY_ID[k.scenario].agent == "bench" for k in self.plan):
+                self._bench_agents()                  # без сценариев bench-uzel — не сохраняется (П14)
             self._prepared = True
             log.info("подготовка: готово")
         except BaseException:

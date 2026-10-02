@@ -3,7 +3,11 @@
 Файл — JSON. Обязательные ключи: run_id, places ({"7": "pcbk/z-ai/glm-5.3", …}), reps ({"create", "number",
 "trap"}), cap_usd, stop_margin_usd, window_start (ISO с поясом или null), out_dir, cards. Необязательные: stand (путь к
 stand.json — адрес сервера и туннелей, П4), turn_timeout_s, heartbeat_s, run_timeout_s (по группам, недостающие — из
-RUN_TIMEOUT_S), projection_ack, archive_reserve_s. Пути — относительно каталога файла конфига.
+RUN_TIMEOUT_S), projection_ack, archive_reserve_s, scenarios. Пути — относительно каталога файла конфига.
+
+- scenarios (П14) — фильтр плана: список разных id сценариев (сухой прогон Б4 — ["B3"], слой 0 Б5 — ["B1"]); нет
+  ключа или null — все двенадцать. Без сценариев агента bench-uzel прогонщик его не сохраняет (bench_tags может быть
+  пуст).
 
 - Ссылка модели места — только из model_refs(student/config/opencode.json): «pcbk/<модель>» или «pcbk-or/<модель>»;
   одна модель — одно место (m5): иначе в таблице не различить моделей.
@@ -25,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .scenarios import RUN_TIMEOUT_S
+from .scenarios import RUN_TIMEOUT_S, SCENARIO_IDS
 
 RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")          # RUN_ID_RE LlmSettings (Д8-R69) — значением
 PLACES = range(1, 11)
@@ -35,7 +39,7 @@ MAX_REPS = 10
 
 _REQUIRED = frozenset({"run_id", "places", "reps", "cap_usd", "stop_margin_usd", "window_start", "out_dir", "cards"})
 _OPTIONAL = frozenset({"stand", "turn_timeout_s", "heartbeat_s", "run_timeout_s", "projection_ack",
-                       "archive_reserve_s"})
+                       "archive_reserve_s", "scenarios"})
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ class BenchConfig:
     projection_ack: bool = False
     archive_reserve_s: float = 120.0
     stand: Path | None = None
+    scenarios: tuple[str, ...] | None = None        # фильтр плана (П14); None — все сценарии
 
 
 def model_refs(opencode: Mapping[str, Any]) -> frozenset[str]:
@@ -146,6 +151,15 @@ def _run_timeouts(raw: object) -> dict[str, float]:
     return out
 
 
+def _scenarios(raw: object) -> tuple[str, ...] | None:
+    if raw is None:
+        return None
+    if (not isinstance(raw, list) or not raw or not all(isinstance(s, str) and s in SCENARIO_IDS for s in raw)
+            or len(set(raw)) != len(raw)):
+        raise ValueError("конфиг: scenarios — непустой список разных id сценариев (A1–C4) или null")
+    return tuple(raw)
+
+
 def _path(base: Path, raw: dict, key: str, required: bool) -> Path | None:
     value = raw.get(key)
     if value is None:
@@ -196,7 +210,7 @@ def load_config(path: Path, opencode_json: Path) -> BenchConfig:
         out_dir=_path(base, raw, "out_dir", required=False), cards=_path(base, raw, "cards", required=True),
         turn_timeout_s=_positive(raw, "turn_timeout_s", 900.0), heartbeat_s=_positive(raw, "heartbeat_s", 30.0),
         run_timeout_s=timeouts, projection_ack=ack, archive_reserve_s=reserve,
-        stand=_path(base, raw, "stand", required=False))
+        stand=_path(base, raw, "stand", required=False), scenarios=_scenarios(raw.get("scenarios")))
 
 
 __all__ = ["BenchConfig", "GROUPS", "MAX_REPS", "PLACES", "PROVIDERS", "RUN_ID_RE", "load_config", "model_refs",

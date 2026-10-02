@@ -1040,3 +1040,28 @@ def test_mcp_connected_after_later_start():
     place["Health"]["Log"].append({"End": "2026-10-02T10:00:10Z", "Output": "200 mcp=connected"})
     assert mcp_connected(core, place)
     assert not mcp_connected(core, {"StartedAt": "2026-10-02T10:00:20Z", "Health": place["Health"]})
+
+
+# --- фильтр сценариев (П14) и снимок /health/llm (m-р3-13, П12) ---
+
+def test_plan_scenarios_filter():                                                # П14
+    keys = plan_runs(cfg(places={7: M1, 8: M2}, scenarios=("B3",)))
+    assert [(k.place, k.scenario, k.rep) for k in keys] == [(n, "B3", rep) for rep in (1, 2, 3) for n in (7, 8)]
+    assert {k.scenario for k in plan_runs(cfg(places={7: M1}, scenarios=("A1", "C2")))} == {"A1", "C2"}
+
+
+def test_prepare_skips_bench_agent_without_bench_scenarios():                   # П14: сухой прогон Б4 — только B3
+    stand = FakeStand(save_answer={"status": "refused", "problems": [{"code": "tag_unknown"}]})
+    r = runner(stand=stand, places={7: M1}, scenarios=("B3",))
+    assert r.run() == "finished" and stand.bench_saves == []
+    assert {rec.key.scenario for rec in load_records(r.out)} == {"B3"}
+    stand = FakeStand()
+    runner(stand=stand, places={7: M1}, scenarios=("B1",)).prepare()             # слой 0: B1 — нужен bench-uzel
+    assert stand.bench_saves and stand.bench_saves[0][1]["name"] == "bench-uzel"
+
+
+def test_health_end_snapshot(tmp_path):                                          # m-р3-13, П12: регрессия А5
+    stand = FakeStand(health={"key_spent_usd": 12.5}, run={"spent_usd": 2.0})
+    assert runner(out=tmp_path, stand=stand, only=[RunKey(7, "B1", 1)]).run() == "finished"
+    snap = json.loads((tmp_path / "health_end.json").read_text())
+    assert snap["key_spent_usd"] == 12.5 and snap["run"]["id"] == "d8-test"          # блок run не затёрт
