@@ -8,13 +8,13 @@ KEEPALIVE_S по clock получает POST …/workplace/wake (продлев�
 Остановленное место (PLACE_STRIKES stand_error подряд) барьер не ждёт и в следующих повторах не идёт.
 
 Подготовка — prepare(), порядок строгий (I-р4-7): window_start не позже сейчас + 5 мин (иначе RunRefused
-("window_start"), р1 m7) → замок OUT/.lock (fcntl, pid внутри) → пульс (поток-демон, раз в heartbeat_s атомарно
-переписывает OUT/progress.json; П7) → блок run в /health/llm и LLM_RUN_CALLERS → вход учёткой и ensure_ready каждого
-места → abort сессий из OUT/sessions.log без строки конца через своё место (П5; 404 — «уже нет») → пустой
-/session/status у каждого места (≤ IDLE_WAIT_S, иначе place_busy: чужой прогонщик с другим OUT, р1 m4) → модель
-места (GET /config) → единицы тегов карточек (OUT/tag_units.json) → архив чужих агентов места → bench-uzel и его
-ready (только если в плане есть его сценарии: фильтр scenarios конфига, П14). Любое расхождение — RunRefused с кодом;
-замок и пульс снимаются (close()). run() зовёт prepare() сам, если его не звали; close() — в finally у run().
+("window_start"), р1 m7) → замок OUT/.lock (fcntl, pid внутри; close() его стирает) → пульс (поток-демон, раз в
+heartbeat_s атомарно переписывает OUT/progress.json; П7) → блок run в /health/llm и LLM_RUN_CALLERS → вход учёткой
+и ensure_ready каждого места → abort сессий из OUT/sessions.log без строки конца через своё место (П5; 404 — «уже
+нет») → пустой /session/status у каждого места (≤ IDLE_WAIT_S, иначе place_busy: чужой прогонщик с другим OUT, р1
+m4) → модель места (GET /config) → единицы тегов карточек (OUT/tag_units.json) → архив чужих агентов места →
+bench-uzel и его ready (только если в плане есть его сценарии: фильтр scenarios конфига, П14). Любое расхождение — RunRefused с кодом; замок и пульс снимаются (close()). run() зовёт
+prepare() сам, если его не звали; close() — в finally у run().
 
 Прогон (run_one): пробуждение места (ensure_ready: GET /workplace, не ready — wake и ожидание ready, затем
 mcp=connected), разговор со сценарным ботом или скриптом (ScriptedStudent), у A — после удачного save_agent ожидание
@@ -543,7 +543,9 @@ class Runner:
                 raise RunRefused("bench_agent")
 
     def close(self) -> None:
-        """Снять пульс и замок (идемпотентно); последний progress.json — у владельца замка."""
+        """Снять пульс и замок (идемпотентно); последний progress.json — у владельца замка. pid в OUT/.lock
+        стирается до снятия замка: устаревший pid после конца прогона не назовёт чужой процесс (README, «Аварийная
+        уборка», шаг 2); после смерти процесса pid остаётся, но замок свободен."""
         self._pulse_stop.set()
         pulse = self._pulse
         if pulse is not None and pulse is not threading.current_thread():
@@ -557,6 +559,10 @@ class Runner:
                 self._write_progress()
             except OSError as exc:
                 log.warning("закрытие: progress.json не записан (%s)", type(exc).__name__)
+            try:
+                os.ftruncate(self._lock_fd, 0)
+            except OSError as exc:
+                log.warning("закрытие: pid в .lock не стёрт (%s)", type(exc).__name__)
             fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
             os.close(self._lock_fd)
             self._lock_fd = None
@@ -1158,7 +1164,8 @@ class Runner:
 
     def run(self) -> str:
         """prepare() (если не звали), повторы с барьером; причина из STOP_REASONS или "finished". В конце — снимок
-        /health/llm в OUT/health_end.json; пульс и замок снимаются."""
+        /health/llm в OUT/health_end.json, его run.spent_usd (блок этого прогона) — в run_spent_usd последнего
+        progress.json: после жёсткой остановки cap последнее чтение до прогонов устарело; пульс и замок снимаются."""
         previous = self._install_signals()
         try:
             self.prepare()
@@ -1170,6 +1177,11 @@ class Runner:
                 try:
                     health = self.stand.health_llm()
                     _atomic_write(self.out / "health_end.json", json.dumps(health, ensure_ascii=False, indent=1))
+                    run = health.get("run") if isinstance(health, dict) else None
+                    spent = run.get("spent_usd") if isinstance(run, dict) and run.get("id") == self.cfg.run_id else None
+                    if isinstance(spent, (int, float)) and not isinstance(spent, bool):
+                        with self._lock:
+                            self._run_spent = spent
                 except Exception as exc:
                     log.warning("снимок /health/llm не записан (%s)", type(exc).__name__)
             self.close()

@@ -206,6 +206,24 @@ def test_lock_file_holds_pid(tmp_path):
     assert (tmp_path / ".lock").read_text().strip() == str(os.getpid())
 
 
+def test_close_clears_pid_in_lock(tmp_path):                                     # итоговое ревью Д8а, I-1
+    import os
+    lock = tmp_path / ".lock"
+    r = runner(out=tmp_path)
+    r.prepare()
+    assert lock.read_text().strip() == str(os.getpid())
+    r.close()
+    assert lock.read_text() == ""                                                    # устаревшего pid нет
+    assert runner(out=tmp_path, only=[RunKey(7, "B1", 1)]).run() == "finished"
+    assert lock.read_text() == ""                                                    # и после run()
+    with pytest.raises(RunRefused, match="run_id"):
+        runner(out=tmp_path, stand=FakeStand(run={"id": "d8-other"})).prepare()
+    assert lock.read_text() == ""                                                    # и после отказа prepare()
+    again = runner(out=tmp_path)
+    again.prepare()
+    assert lock.read_text().strip() == str(os.getpid())                              # следующий пишет свой
+
+
 def test_refused_prepare_releases_lock_and_pulse(tmp_path):
     r = runner(out=tmp_path, stand=FakeStand(run={"id": "d8-other"}))
     with pytest.raises(RunRefused, match="run_id"):
@@ -700,6 +718,24 @@ def test_progress_keys_after_run(tmp_path):
                       "rep", "by_place", "run_spent_usd", "projected_usd", "stop_reason"}
     assert (p["state"], p["done"], p["total"]) == ("finished", 1, 1)
     assert json.loads((tmp_path / "health_end.json").read_text())["run"]["id"] == "d8-test"
+
+
+def test_progress_run_spent_from_health_end_after_cap(tmp_path):                 # итоговое ревью Д8а, m8
+    r = runner(out=tmp_path, chat=FakeChat.honest(error="pcbk_run_spent"), places={7: M1})
+    assert r.run() == "cap"                                                         # жёсткая остановка по 402
+    spent = json.loads((tmp_path / "health_end.json").read_text())["run"]["spent_usd"]
+    p = json.loads((tmp_path / "progress.json").read_text())
+    assert spent > 0 and p["run_spent_usd"] == spent                                # не чтение до прогонов (0.0)
+
+
+def test_progress_run_spent_ignores_foreign_run_block(tmp_path):
+    stand = FakeStand()
+    r = runner(out=tmp_path, stand=stand, places={7: M1})
+    r.prepare()
+    stand.run_over.update({"id": "d8-other", "spent_usd": 7.0})                     # core пересоздан с другим прогоном
+    assert r.run() == "stand"
+    assert json.loads((tmp_path / "health_end.json").read_text())["run"]["id"] == "d8-other"
+    assert json.loads((tmp_path / "progress.json").read_text())["run_spent_usd"] == 0.0     # чужой расход не взят
 
 
 # --- CLI ---
