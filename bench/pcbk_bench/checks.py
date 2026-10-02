@@ -75,8 +75,9 @@ _SERVICE_FIELD = re.compile(r"^(?:cost|limit|total|rows|count|calls)|_(?:count|l
 # «предел прибора/датчика/шкалы/измерения» — шкала, а не норма: признак suspect_norm не ставит (р2)
 _SCALE_LIMIT = re.compile(r"предел\w*\s+(?:измерен\w*\s+)?(?:прибор|датчик|шкал|измерен)", re.IGNORECASE)
 _PERMISSION_LINE = re.compile(r'^\s+("[^"]*"|[^\s:]+)\s*:\s*(\S+)\s*$')
-_TAGS_LINE = re.compile(r"^[ \t>*_-]*Теги\b", re.IGNORECASE | re.MULTILINE)
-_TAG_IN_LINE = re.compile(r"[A-Za-z0-9]*\d[A-Za-z0-9]*_[A-Za-z0-9_]+")
+# строка «Теги» черновика и тег в строке — публичны: ими читает раздел «Теги узла» стенд «агент = калькулятор» (Д9б)
+TAGS_LINE_RE = re.compile(r"^[ \t>*_-]*Теги\b", re.IGNORECASE | re.MULTILINE)
+TAG_IN_LINE_RE = re.compile(r"[A-Za-z0-9]*\d[A-Za-z0-9]*_[A-Za-z0-9_]+")
 _NORM_JUDGE = frozenset({"B1", "B2", "B3", "B4", "C2", "C4"})                 # m3: suspect_norm — решает судья
 
 NOTE_CALC_TIME = "калькулятор: другая метка времени"
@@ -642,7 +643,7 @@ def draft_tags(text: str) -> set[str] | None:
     None: тогда сверки нет."""
     if not is_draft(text):
         return None
-    head = _TAGS_LINE.search(text)
+    head = TAGS_LINE_RE.search(text)
     tags: list[str] = []
     if head is None:
         tags = [m.group(1) for m in LIST_RE.finditer(text)]
@@ -650,7 +651,7 @@ def draft_tags(text: str) -> set[str] | None:
         lines = text[head.start():].splitlines()
         rest = re.sub(r"^[ \t>*_-]*Теги\b", "", lines[0], flags=re.IGNORECASE)
         pos = 0
-        for m in _TAG_IN_LINE.finditer(rest):
+        for m in TAG_IN_LINE_RE.finditer(rest):
             if re.fullmatch(r"[\s,;:*_`]*(?:и\s*)?", rest[pos:m.start()]):
                 tags.append(m.group(0))
                 pos = m.end()
@@ -843,5 +844,5 @@ def check_run(rec: RunRecord, card: Card, tag_units: Mapping[str, str] = {}) -> 
 
 __all__ = ["AutoVerdict", "CONSENT_RE", "GENERAL_KNOWLEDGE_RE", "HARD_CODES", "JUDGE_HARD_CODES", "NORM_NEAR_RE",
            "NUMERIC_LIMIT_FLAG", "NUMERIC_LIMIT_RE", "NumberRule", "SHELL_TOOLS", "SQL_RE", "STAND_CODES",
-           "also_numbers", "check_run", "draft_tags", "items_of", "number_rule", "output_of", "short",
-           "suspect_norm_numbers"]
+           "TAGS_LINE_RE", "TAG_IN_LINE_RE", "also_numbers", "check_run", "draft_tags", "items_of", "number_rule",
+           "output_of", "short", "suspect_norm_numbers"]

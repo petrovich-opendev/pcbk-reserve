@@ -18,7 +18,12 @@
   для tag_now/tag_period: unlisted, unknown, no_data …, Б3); строки журнала: rows_none — ни
   одной, rows_skip_bridge — без моста; health_advance=(FakeClock, с) — /health/llm двигает часы;
   health_fail_after_gone — после первого ответа без блока run /health/llm бросает исключение; health_fail_calls —
-  вызовы /health/llm с этими номерами (с 1) бросают исключение.
+  вызовы /health/llm с этими номерами (с 1) бросают исключение. Для стенда «агент = калькулятор» (Д9б, Б1):
+  calc_answers — ответы калькулятора по инструментам ({инструмент: ответ | функция(args) → ответ}); matches — каталог
+  поиска (catalog_search отдаёт совпадения, в имени которых есть запрос, без регистра; [] — ничего, m-7);
+  search_status — статус ответа поиска (не ok — отказ без совпадений, учение — error); seen_tags — теги, которые
+  стенд видел во входах калькулятора и отдал в его ответах (положительный контроль «тегов нет в выводе»);
+  agent_files — {(место, имя): текст файла агента}.
 - FakeClock — подставные часы: mono, now (с поясом), sleep двигает время.
 - cfg(…), runner(…) — фабрики; out по умолчанию — свой каталог под OUT_BASE (автофикстура test_runner — tmp_path).
   runner(kill_after_session_create=True) — смерть процесса сразу после создания первой сессии (m14): без abort и строк
@@ -488,9 +493,16 @@ class FakeStand:
                  visible_after_s: float = 0.0, cost_per_run: dict | None = None, status_rows: dict | None = None,
                  health: dict | None = None, calc_rate: int = 0, archive_delay_s: float = 0.0,
                  rows_none: bool = False, rows_skip_bridge: bool = False, health_advance: tuple | None = None,
-                 health_fail_after_gone: bool = False, health_fail_calls=(), calc_status: dict | None = None):
+                 health_fail_after_gone: bool = False, health_fail_calls=(), calc_status: dict | None = None,
+                 calc_answers: dict | None = None, matches: list | None = None, search_status: str = "ok",
+                 agent_files: dict | None = None):
         self.run_over = dict(run or {})
         self.calc_status = dict(calc_status or {})
+        self.calc_answers = dict(calc_answers or {})
+        self.matches = None if matches is None else list(matches)
+        self.search_status = search_status
+        self.agent_files = dict(agent_files or {})
+        self.seen_tags: set[str] = set()
         self._run_callers = None if run_callers is None else frozenset(run_callers)
         self.place_models = dict(place_models or {})
         self.rows_model = rows_model
@@ -631,11 +643,31 @@ class FakeStand:
     def status(self) -> dict:
         return {"checks": [{"component": c, "state": s} for c, s in self.status_rows.items()]}
 
+    def _seen(self, answer: dict) -> dict:
+        """Теги ответа калькулятора (совпадения поиска и элементы) — в seen_tags."""
+        for row in (answer.get("matches") or []) + (answer.get("items") or []):
+            if isinstance(row, dict) and isinstance(row.get("tag"), str):
+                self.seen_tags.add(row["tag"])
+        return answer
+
     def calc(self, tool: str, args: dict) -> dict:
         self.calc_calls.append((tool, dict(args)))
+        self.seen_tags.update(t for t in args.get("tags") or [] if isinstance(t, str))
         if self.calc_rate > 0:
             self.calc_rate -= 1
             return {"tool": tool, "status": "rate", "message": "слишком часто"}
+        if tool == "catalog_search" and self.search_status != "ok":
+            return {"tool": "catalog_search", "status": self.search_status, "message": "служба: " + self.search_status,
+                    "notes": []}
+        if tool == "catalog_search" and self.matches is not None:
+            q = str(args.get("query", "")).upper()
+            found = [dict(m) for m in self.matches if q and q in str(m.get("tag", "")).upper()]
+            found = found[:int(args.get("limit") or 10)]
+            return self._seen({"tool": "catalog_search", "status": "ok", "notes": [], "query": args.get("query"),
+                               "matches": found, "similar": False, "total": len(found)})
+        if tool in self.calc_answers:
+            answer = self.calc_answers[tool]
+            return self._seen(dict(answer(dict(args)) if callable(answer) else answer))
         if tool == "catalog_search":
             q = args.get("query")
             matches = [{"tag": q, "description": "Описание тега стенда", "unit": self.units[q], "kind": "analog"}] \
@@ -675,6 +707,8 @@ class FakeStand:
                     for a in self._agents.get(place, {}).values()]
 
     def agent_file(self, place: int, name: str) -> str:
+        if (place, name) in self.agent_files:
+            return self.agent_files[(place, name)]
         return ("---\nmode: primary\npermission:\n  \"*\": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n"
                 "  pcbk_tag_period: allow\n---\n")
 
