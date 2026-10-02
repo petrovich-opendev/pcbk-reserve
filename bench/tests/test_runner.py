@@ -805,7 +805,7 @@ def test_turn_code(error, code):
 def test_turn_code_new_tools_like_tag_now(tool):                                 # Д9-R89, доводка А6: не stand_error
     error = f"APIError: tool {tool} failed"
     assert turn_code(error) == turn_code("APIError: tool pcbk_tag_now failed") is None
-    assert turn_code(error + " [pcbk_upstream_down]") == "stand_error"          # контроль: код прокси рядом — сбой стенда
+    assert turn_code(error + " [pcbk_upstream_down]") == "stand_error"          # контроль: код прокси — сбой стенда
 
 
 def test_parse_turn_text_response_body_code():

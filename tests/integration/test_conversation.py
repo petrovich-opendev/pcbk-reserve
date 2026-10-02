@@ -12,7 +12,7 @@ from secret import Secret
 
 Q = "что сейчас по тегу 20FAKE_001_PV?"
 MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
-PCBK3 = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period"}       # инструменты агента по умолчанию (Д6-R45)
+PCBK3 = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period"}       # агент по умолчанию Д6–Д8 (Д6-R45)
 PCBK5 = PCBK3 | {"pcbk_tag_series", "pcbk_calc_runtime"}                 # с Д9а — ряд и наработка (Д9-R89)
 KONSTRUKTOR = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_save_agent"}  # инструменты Конструктора (Д7-R63)
 
@@ -132,7 +132,7 @@ def test_conversation_without_tools_reads_no_data(stack, place01):             #
     assert out["status"] == "done" and not [t for t in out["tools"] if t["tool"].startswith("pcbk_")]
     reqs = [r for r in stack.fake_requests() if r["body"].get("session_id") == f"student-01:{out['session']}"]
     assert reqs                                                                  # запросы сессии дошли до двойника
-    assert not any(r["body"].get("tools") for r in reqs)                        # запрет снял все пять — инструментов нет
+    assert not any(r["body"].get("tools") for r in reqs)                        # запрет снял все пять инструментов
     assert stack.data_event_count("student-01", "mcp") == before                # к данным не ходили
 
 
@@ -143,7 +143,7 @@ def test_default_agent_tools_are_data_only(stack, place01):                    #
     assert {m["info"].get("agent") for m in msgs if m["info"]["role"] == "assistant"} == {"pomoshnik"}
 
 
-def test_agent_tool_sets(stack, place01):                                       # инструменты агентов образа (Д7-R63, Д9-R89)
+def test_agent_tool_sets(stack, place01):                                       # агенты образа (Д7-R63, Д9-R89)
     # «что умеешь?» без слова FAKESAVE*: двойник зовёт pcbk_tag_now, а не запись агента (Д7б, m22)
     k = stack.converse(1, "что умеешь?", agent="konstruktor")
     # allow агента побеждает глобальный "pcbk_save_agent": "deny" — правила конфигурации идут раньше (О7)

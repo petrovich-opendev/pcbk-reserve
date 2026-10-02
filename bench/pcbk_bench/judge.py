@@ -127,7 +127,8 @@ REFUSAL_TEXTS: dict[str, str] = {
     "prompt_length": "Инструкция агента — от 200 до 4000 знаков",
     "forbidden": "В поле … недопустимый фрагмент «…»: инструкции обхода, SQL, адреса, пути и пароли на стенде "
                  "запрещены",
-    "tools_empty": "Агенту нужен хотя бы один инструмент: catalog_search, tag_now, tag_period, tag_series, calc_runtime",
+    "tools_empty": "Агенту нужен хотя бы один инструмент: catalog_search, tag_now, tag_period, tag_series, "
+                   "calc_runtime",
     "tool_not_allowed": "Инструмента «…» на стенде нет. Можно: catalog_search, tag_now, tag_period, tag_series, "
                         "calc_runtime.",
     "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series или calc_runtime), а без тегов — "

@@ -197,6 +197,36 @@ def test_b3_catalog_first_and_expect_tag():
     assert check_run(clar, card("B3")).passed is True
 
 
+def _calc_call(tool: str, tag: str, item: dict) -> ToolCall:
+    """Вызов ряда или наработки (Д9а) за прошлую смену: элемент item — поля ответа службы по тегу."""
+    out = {"tool": tool, "status": "ok", "notes": [], "cache": "miss",
+           "items": [{"tag": tag, "status": "ok", "description": "Расход пара на тестовую сушильную часть", **item}]}
+    return call(f"pcbk_{tool}", {"tags": [tag], "period": "prev_shift"}, out)
+
+
+def test_series_and_runtime_numbers_are_sources():              # итоговая доводка Д9а, ревью А6 m-1: не «чужие»
+    series = _calc_call("tag_series", "20FAKE_105_PV", {"unit": "т/ч", "points": [], "profile": {
+        "first": 40.2, "last": 41.7, "change": 1.5, "min": 39.9, "max": 42.3}})
+    runtime = _calc_call("calc_runtime", "20FAKE_105_PV", {"states": [
+        {"value": 1, "label": "работает (по суффиксу)", "hours": 6.5, "percent": 81.25, "count": 2}]})
+    base = [search_call(["20FAKE_105_PV"]), now_call("20FAKE_105_PV", 41.7)]
+    ok = rec("B3", answer="Сейчас расход 41,7 т/ч (20FAKE_105_PV). За смену: в начале 40,2 т/ч, изменение 1,5 т/ч, "
+                          "максимум 42,3 т/ч — на 2,1 т/ч выше начала. Работал 6,5 ч — 81,25 % смены.",
+             tools=base + [series, runtime])
+    assert check_run(ok, card("B3")).passed is True
+    wrong = rec("B3", answer="Сейчас расход 41,7 т/ч (20FAKE_105_PV). В начале смены было 38,2 т/ч.",
+                tools=base + [series])
+    assert check_run(wrong, card("B3")).hard == ("number_mismatch",)               # контроль: не любое число
+
+
+def test_series_and_runtime_tags_must_be_seen():                # итоговая доводка Д9а, ревью А6 m-1: как tag_now
+    for tool in ("tag_series", "calc_runtime"):
+        r = rec("B3", answer="Сейчас расход 41,7 т/ч (20FAKE_105_PV).",
+                tools=[search_call(["20FAKE_105_PV"]), now_call("20FAKE_105_PV", 41.7),
+                       _calc_call(tool, "20FAKE_104_PV", {})])
+        assert check_run(r, card("B3")).hard == ("tag_not_seen",), tool
+
+
 def test_b4_diff_of_rounded_and_relative_percent():
     r = rec("B4", answer="Максимум за сутки 3,71 бар, сейчас 3,42 бар: выше на 0,29 бар, это 8,5 % от текущего.",
             tools=[period_call("20FAKE_104_PV", high=3.7149, period="last_24h"), now_call("20FAKE_104_PV", 3.4151)])

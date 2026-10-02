@@ -92,8 +92,10 @@ def test_refusal_texts_and_presets_match_core():                                
 
 
 def test_allowed_tools_match_core():                                             # Д9-R89, сверх брифа: копии значением
+    from pcbk_bench.cards import AGENT_TOOLS
     draft = _module(REPO / "core" / "pcbk_core" / "agents" / "draft.py")
     assert ALLOWED_TOOLS == draft.AGENT_TOOLS == DATA_TOOLS
+    assert AGENT_TOOLS and set(AGENT_TOOLS) <= set(ALLOWED_TOOLS)            # bench-uzel — в наборе (А6, m-3)
     assert "tag_series" in REFUSAL_TEXTS["tool_not_allowed"] and "calc_runtime" in REFUSAL_TEXTS["tools_useless"]
 
 
