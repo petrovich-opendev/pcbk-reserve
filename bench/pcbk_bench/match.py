@@ -69,7 +69,7 @@ from typing import Any
 from .cards import ALLOWED_TOOLS
 from .checks import TAG_IN_LINE_RE, TAGS_LINE_RE, output_of
 from .gateway import GatewayChat, GatewayError, WorkplaceNotReady
-from .numbers import Shown, close, non_measure_kind, parse_numbers, value_label
+from .numbers import Shown, close, non_measure_kind, parse_numbers, segment_of, value_label
 from .record import ToolCall, Turn, parse_turn
 from .runner import RunRefused
 from .stand import Stand, calc_patient
@@ -131,9 +131,17 @@ _TAG = re.compile(r"[A-Za-z0-9_]{1,128}")
 _LOGIN = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 # длина периода у hours_top (I-1 итогового ревью Д9б): длительность сразу после «за», «из» (и одного слова вроде
 # «вчерашние»), «период…», «сутк…» или «(» — «за вчера (24 ч)», «Данных за 24 часа нет», «из 24 ч» — не часы состояния
-_PERIOD_LEN = re.compile(r"(?:\b(?:за|из)(?:[ \t ]+(?:вчерашн|последн|прошедш|полн|все|весь)\w*)?|\bпериод\w*|"
-                         r"\bсутк\w*|\()[ \t ]*$", re.IGNORECASE)
+_PERIOD_LEN = re.compile(r"(?:\b(?:за|из)(?:[ \t\u00a0]+(?:вчерашн|последн|прошедш|полн|все|весь)\w*)?|\bпериод\w*|"
+                         r"\bсутк\w*|\()[ \t\u00a0]*$", re.IGNORECASE)
 PERIOD_LEN_WINDOW = 40
+# «16 ч 33 мин» у hours_top (m-1 итогового ревью Д9б) — одно число N + M/60 ч с допуском полминуты
+_HOURS_MIN = re.compile(r"(?<![\d.,])(\d{1,2})[ \t\u00a0]*(?:ч\.?|час\w*)[ \t\u00a0,]+(\d{1,2})[ \t\u00a0]*мин",
+                        re.IGNORECASE)
+HALF_MINUTE_H = Decimal(1) / 120
+# подписи ключей ряда и размаха (m-1 ревью Б1): «в начале 612,25, в конце 600,51» — не first/last наоборот
+OWN_LABELS = (("first", re.compile(r"\b(?:в|на)[ \t\u00a0]+начал\w*|\bсначала\b|\bначальн\w*", re.IGNORECASE)),
+              ("last", re.compile(r"\b(?:в|на)[ \t\u00a0]+кон(?:ц|ец)\w*|\bконечн\w*", re.IGNORECASE)),
+              ("range", re.compile(r"\bразмах\w*", re.IGNORECASE)))
 
 
 @dataclass(frozen=True)
@@ -317,27 +325,76 @@ def period_ok(case: Case, call: ToolCall) -> bool:
             and abs((span[1] - span[0]).total_seconds() - hours * 3600) <= SPAN_SLACK_S)
 
 
+@dataclass(frozen=True)
+class _HoursMin(Shown):
+    """«N ч M мин» у hours_top — одно число N + M/60 ч; допуск — полминуты (округление до показанной минуты)."""
+    tolerance: Decimal = HALF_MINUTE_H
+
+
+def _question_spans(case: Case) -> list[re.Pattern]:
+    """Часы самого вопроса в ответе (m-2 ревью Б1) — не числа величин: у avg_span «с 8 до 12» (часы начала и конца
+    случая, «08», «:00»), у последних N часов — «N-часовой»."""
+    out = []
+    if case.kind == "avg_span" and case.start and case.end:
+        h1, h2 = int(case.start[11:13]), int(case.end[11:13])
+        hour = r"0?{}(?:[:.]00)?(?:[ \t ]*(?:ч\.?|час\w*))?"
+        out.append(re.compile(rf"(?:\b(?:с|от|между)[ \t ]+{hour.format(h1)}[ \t ]*(?:до|по|и|[-–—])|"
+                              rf"\b{hour.format(h1)}[ \t ]*[-–—])[ \t ]*{hour.format(h2)}(?!\d)",
+                              re.IGNORECASE))
+    hours = {"last_24h": 24, "last_8h": 8}.get(case.period or "")
+    if hours is not None:
+        out.append(re.compile(rf"\b{hours}(?:-?х)?[ \t -]*час\w*", re.IGNORECASE))
+    return out
+
+
 def _quantities(text: str, case: Case, unit: Any = None) -> list[Shown]:
-    """Числа величин ответа: parse_numbers без неизмеряемых; процент — величина у тега с единицей «%», часы «ч» —
-    величина hours_top, кроме длины периода (_PERIOD_LEN: «за вчера (24 ч)», «Данных за 24 часа нет»)."""
+    """Числа величин ответа: parse_numbers без неизмеряемых и без часов вопроса (_question_spans); процент — величина
+    у тега с единицей «%», часы «ч» — величина hours_top, кроме длины периода (_PERIOD_LEN: «за вчера (24 ч)», «Данных
+    за 24 часа нет»); «N ч M мин» у hours_top — одно число (_HoursMin)."""
     kinds: set[str | None] = {None}
     if isinstance(unit, str) and unit.strip() == "%":
         kinds.add("percent")
     if "hours_top" in case.keys:
         kinds.add("duration")
-    out = []
+    asked = [m.span() for rx in _question_spans(case) for m in rx.finditer(text)]
+
+    def period_len(start: int) -> bool:
+        return bool(_PERIOD_LEN.search(text, max(0, start - PERIOD_LEN_WINDOW), start))
+
+    out: list[Shown] = []
     for s in parse_numbers(text):
         kind = non_measure_kind(text, s)
-        if kind not in kinds or (kind == "duration"
-                                 and _PERIOD_LEN.search(text, max(0, s.start - PERIOD_LEN_WINDOW), s.start)):
+        if kind not in kinds or (kind == "duration" and period_len(s.start)) or any(a <= s.start < b for a, b in asked):
             continue
         out.append(s)
+    if "hours_top" in case.keys:
+        for m in _HOURS_MIN.finditer(text):
+            if int(m.group(2)) < 60:
+                out = [s for s in out if not m.start() <= s.start < m.end()]
+                if not period_len(m.start()):
+                    out.append(_HoursMin(Decimal(m.group(1)) + Decimal(m.group(2)) / 60, 0, m.start(), m.end()))
+        out.sort(key=lambda s: s.start)
     return out
 
 
+def _own_label(text: str, s: Shown, pool: list[Shown]) -> str | None:
+    """Подпись first, last или range числа (OWN_LABELS): ближнее слово слева в том же отрезке, без числа величины между
+    словом и числом (m-1 ревью Б1)."""
+    left, _ = segment_of(text, s.start, s.end)
+    best: tuple[int, str] | None = None
+    for key, rx in OWN_LABELS:
+        for m in rx.finditer(text, left, s.start):
+            if not any(m.end() <= b.start and b.end <= s.start for b in pool if b is not s) and (
+                    best is None or m.end() > best[0]):
+                best = (m.end(), key)
+    return best[1] if best else None
+
+
 def _key_shown(text: str, key: str, value: Any, pool: list[Shown]) -> bool:
-    """Ключ — среди чисел величин после округления до показанных знаков (правило numbers.matches); у ключа с
-    подписью поля — среди чисел с той же подписью и без подписи, если такая подпись в ответе есть."""
+    """Ключ — среди чисел величин после округления до показанных знаков (правило numbers.matches; «N ч M мин» — до
+    минуты); у ключа с подписью поля — среди чисел с той же подписью и без подписи, если такая подпись в ответе есть;
+    у first, last и range (m-1 ревью Б1) — среди чисел со своей подписью и без подписи вовсе (ни своей, ни поля), если
+    своя подпись в ответе есть: «в начале 612,25, в конце 600,51», «размах 18, максимум 20,5» не сходятся."""
     v = _dec(value)
     if v is None:
         return False
@@ -346,7 +403,12 @@ def _key_shown(text: str, key: str, value: Any, pool: list[Shown]) -> bool:
         labels = [value_label(text, s, pool) for s in pool]
         if label in labels:
             pool = [s for s, lab in zip(pool, labels, strict=True) if lab in (label, None)]
-    return any(close(s, v) for s in pool)
+    elif key in dict(OWN_LABELS):
+        own = [_own_label(text, s, pool) for s in pool]
+        if key in own:
+            pool = [s for s, o in zip(pool, own, strict=True)
+                    if o == key or (o is None and value_label(text, s, pool) is None)]
+    return any(close(s, v, getattr(s, "tolerance", None)) for s in pool)
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -384,8 +446,8 @@ def judge_case(case: Case, turn: Turn | None, calc: dict | None) -> MatchResult:
         return MatchResult(case.id, "service", notes)
     if not period_ok(case, call):
         return MatchResult(case.id, "wrong_period")
-    if no_data:
-        if _quantities(text, case):
+    if no_data:                             # процент — тоже число без источника (m-3 итогового ревью Д9б)
+        if _quantities(text, case, "%"):
             return MatchResult(case.id, "mismatch", ["no_data_number"])
         return MatchResult(case.id, "no_data")
     keys = key_values(case, item)
@@ -412,9 +474,11 @@ def _calc_verdict(case: Case, out: dict, item: dict, keys: dict, calc: dict | No
         return MatchResult(case.id, "match")
     if case.tool == "tag_now":
         moved = calc_item.get("time") != item.get("time")
-    else:
-        period = out.get("period") if isinstance(out.get("period"), dict) else {}
-        moved = period.get("open") is True
+    else:                                   # закрытый готовый период сменился между ходом и калькулятором (граница
+        period = out.get("period")          # смены, полночь) — тоже сдвиг, не calc_differs (m-3 ревью Б1)
+        span, again_span = _span(period), _span(calc.get("period"))
+        moved = (isinstance(period, dict) and period.get("open") is True) or (
+            span is not None and again_span is not None and span != again_span)
     if moved:
         return MatchResult(case.id, "match", ["calc_moved"])
     return MatchResult(case.id, "service", ["calc_differs"])

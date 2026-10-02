@@ -125,6 +125,7 @@ def test_hours_and_profile_keys():
                                           {"value": 0, "hours": 7.5167, "percent": 31.3, "count": 8}]}]}, "completed")
     r = judge_case(CASES["runtime_yesterday"], turn("Работал 16,5 ч, стоял 7,5 ч.", run), run.output)
     assert r.verdict == "match"
+    assert judge_case(CASES["runtime_yesterday"], turn("Стоял 7,5 ч.", run), run.output).verdict == "mismatch"  # m-2 Б2
     series = ToolCall("pcbk_tag_series", {"tags": [TAG], "period": "last_8h", "points": 24},
                       {"status": "ok", "period": {"preset": "last_8h", "start": "2026-10-10T04:00:00+05:00",
                                                   "end": "2026-10-10T12:00:00+05:00", "open": True},
@@ -653,3 +654,57 @@ def test_cases_skip_live_tags_without_history(tmp_path, capsys, monkeypatch):   
     assert main(["match-cases", str(cfg)]) == 0
     assert capsys.readouterr().out.strip() == ("случаев 13: аналоговых 2 (из агента 0), состояний 1; "
                                                "без данных за период пропущено 2")
+
+
+
+# --- итоговая доводка Д9б: Minor вердиктов (m-1, m-3 итога; m-1…m-3 ревью Б1) ---
+
+def test_hours_and_minutes_are_one_number():                                      # m-1 итогового ревью
+    run = runtime_call([{"value": 1, "label": "работает", "hours": 16.55, "percent": 69.0, "count": 8},
+                        {"value": 0, "label": "стоит", "hours": 7.45, "percent": 31.0, "count": 8}])
+    case = CASES["runtime_yesterday"]
+    assert judge_case(case, turn("Работает 16 ч 33 мин, стоит 7 ч 27 мин.", run), run.output).verdict == "match"
+    assert judge_case(case, turn("Работает 16 часов 33 минуты.", run), run.output).verdict == "match"
+    assert judge_case(case, turn("Работает 16 ч 40 мин, стоит 7 ч 20 мин.", run), run.output).verdict == "mismatch"
+    late = runtime_call([{"value": 1, "label": "работает", "hours": 16.5417, "percent": 68.9, "count": 8}])
+    assert judge_case(case, turn("Работает 16 ч 33 мин.", late), late.output).verdict == "match"      # до минуты
+
+
+def test_no_data_with_percent_is_mismatch():                                      # m-3 итогового ревью
+    call = period_call("prev_shift", status="no_data")
+    r = judge_case(CASES["avg_prev_shift"], turn("Данных за смену нет; в среднем держалось 45,2 %.", call),
+                   call.output)
+    assert (r.verdict, r.notes) == ("mismatch", ["no_data_number"])
+    r = judge_case(CASES["avg_prev_shift"], turn("Данных за смену нет: доля достоверных 0 %.", call), call.output)
+    assert r.verdict == "no_data"                                                 # доля достоверности — не величина
+
+
+def test_first_last_and_range_need_their_labels():                                # m-1 ревью Б1
+    eight = series_call(("2026-10-10T04:00:00+05:00", NOW_END), True)
+    case = CASES["profile_last_8h"]
+    assert judge_case(case, turn("В начале 612,25, в конце 600,51.", eight), eight.output).verdict == "mismatch"
+    text = "20FAKE_201_PV: в начале периода 600,51 м/мин (04:00), в конце 612,25 м/мин (12:00), изменение 11,74."
+    assert judge_case(case, turn(text, eight), eight.output).verdict == "match"   # формат двойника (R92)
+    day = period_call("yesterday", mn=0.0, mx=20.5)                               # минимум 0: размах = максимум
+    case = CASES["range_yesterday"]
+    assert judge_case(case, turn("Размах 18, максимум 20,5.", day), day.output).verdict == "mismatch"
+    assert judge_case(case, turn("Минимум 0, максимум 20,5, размах 20,5.", day), day.output).verdict == "match"
+
+
+def test_question_hours_are_not_values():                                         # m-2 ревью Б1
+    span = period_call(span=("2026-10-09T08:00:00+05:00", "2026-10-09T12:00:00+05:00"), avg=12.0)
+    case = CASES["avg_span"]
+    assert judge_case(case, turn("Среднее с 8 до 12 — 15 м/мин.", span), span.output).verdict == "mismatch"
+    assert judge_case(case, turn("Среднее с 8 до 12 — 12 м/мин.", span), span.output).verdict == "match"
+    eight = series_call(("2026-10-10T04:00:00+05:00", NOW_END), True)
+    eight.output["items"][0]["profile"] = {"first": 8.0, "last": 9.0, "change": 1.0}
+    text = "За 8-часовой период: в начале 9, в конце 9."
+    assert judge_case(CASES["profile_last_8h"], turn(text, eight), eight.output).verdict == "mismatch"
+
+
+def test_closed_period_moved_between_turn_and_calc_is_note():                     # m-3 ревью Б1
+    call = period_call("prev_shift")                                              # ход: смена 22–06, закрыта
+    calc = period_call("prev_shift", span=("2026-10-10T06:00:00+05:00", "2026-10-10T14:00:00+05:00"), avg=80.0)
+    assert calc.output["period"]["open"] is False                                 # калькулятор — уже смена 06–14
+    r = judge_case(CASES["avg_prev_shift"], turn("Среднее 81,2.", call), calc.output)
+    assert (r.verdict, r.notes) == ("match", ["calc_moved"])
