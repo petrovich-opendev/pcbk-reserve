@@ -6,7 +6,8 @@ import { expect, test, vi } from "vitest";
 import type { Api, CalcTool, Reply } from "../src/api";
 import { profileSegments } from "../src/calc";
 import { CalcPage } from "../src/components/CalcPage";
-import { T_CALC_BUSY, T_CALC_NO_RANGE, T_CALC_NO_TAG, T_DOWN } from "../src/texts";
+import { SIMILAR_NOTE_CORE } from "../src/calc";
+import { T_CALC_BAD_RANGE, T_CALC_BUSY, T_CALC_NO_RANGE, T_CALC_NO_TAG, T_CALC_SIMILAR, T_DOWN } from "../src/texts";
 
 type Answer = [number, unknown];
 function calcApi(o: Partial<Record<CalcTool, Answer | Answer[]>>) {
@@ -216,4 +217,63 @@ test("calc_page_search_refusal_and_signed_out", async () => {                   
   fireEvent.click(screen.getByRole("button", { name: "Найти тег" }));
   await waitFor(() => expect(onSignedOut).toHaveBeenCalledTimes(1));
   expect(api.calc.mock.calls).toEqual([["catalog_search", { query: "тест", limit: 20 }], ["catalog_search", { query: "тест", limit: 20 }]]);
+});
+
+// --- итоговая доводка Д9а: число точек профиля, заметка поиска, свой период назад, защиты inFlight и alive ---
+
+test("calc_page_profile_shows_points_per_tag", async () => {                      // итоговое ревью, m-6: не «N точек»
+  const api = calcApi({ tag_series: [200, { ...SERIES_OK, source: "равномерная сетка историана (Cyclic): N точек" }],
+                        tag_period: [200, PERIOD_OK] });
+  await run(api, "profile", "20FAKE_001_PV");
+  const row = (await screen.findByText("Точек на тег")).closest("div")!;
+  expect(row.querySelector("dd")!.textContent).toBe("4");                          // points ответа службы
+  fireEvent.change(screen.getByLabelText("Режим"), { target: { value: "period" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  await screen.findByText("12,4 л/час");
+  expect(screen.queryByText("Точек на тег")).toBeNull();                           // только у профиля
+});
+
+test("calc_page_search_similar_note_for_student", async () => {                  // ревью А5, m-3: заметка агента — своя
+  const TRUNC = "описания в историане обрезаны на 50 символах";
+  const api = calcApi({ catalog_search: [200, { status: "ok", notes: [SIMILAR_NOTE_CORE, TRUNC], similar: true,
+    matches: [{ tag: "20FAKE_001_PV", description: "Факт. знач. - расход массы", unit: "л/час" }] }] });
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Слова для поиска"), { target: { value: "расход" } });
+  fireEvent.click(screen.getByRole("button", { name: "Найти тег" }));
+  expect(await screen.findByText(T_CALC_SIMILAR)).toBeTruthy();
+  expect(screen.getByText(TRUNC)).toBeTruthy();                                    // прочие заметки — дословно
+  expect(screen.queryByText(SIMILAR_NOTE_CORE)).toBeNull();
+});
+
+test("calc_page_backward_range_not_sent", async () => {                          // ревью А5, m-4
+  const api = calcApi({ tag_period: [200, PERIOD_OK] });
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.change(screen.getByLabelText("Период"), { target: { value: "custom" } });
+  fireEvent.change(screen.getByLabelText("С"), { target: { value: "2026-10-01T12:00" } });
+  fireEvent.change(screen.getByLabelText("По"), { target: { value: "2026-10-01T08:00" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(screen.getByText(T_CALC_BAD_RANGE)).toBeTruthy();
+  expect(api.calc).not.toHaveBeenCalled();
+});
+
+test("calc_page_in_flight_flag_and_late_answer", async () => {                   // ревью А5, m-2: флаг, не disabled
+  const api = calcApi({});
+  const answers: ((r: Reply) => void)[] = [];
+  api.calc.mockImplementation(() => new Promise<Reply>((resolve) => { answers.push(resolve); }));
+  const onSignedOut = vi.fn();
+  const { unmount } = render(<CalcPage api={api} onSignedOut={onSignedOut} />);
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  const form = screen.getByRole("button", { name: "Посчитать" }).closest("form")!;
+  fireEvent.submit(form);
+  fireEvent.submit(form);                                                          // мимо кнопки: держит флаг
+  fireEvent.change(screen.getByLabelText("Слова для поиска"), { target: { value: "расход" } });
+  const search = screen.getByRole("button", { name: "Найти тег" }).closest("form")!;
+  fireEvent.submit(search);
+  fireEvent.submit(search);
+  expect(api.calc).toHaveBeenCalledTimes(2);                                       // по одному вызову на кнопку
+  unmount();                                                                       // вкладку сняли, ответы — позже
+  for (const answer of answers) answer({ status: 401, body: { name: "Unauthorized" } });
+  await new Promise((r) => setTimeout(r, 0));
+  expect(onSignedOut).not.toHaveBeenCalled();                                      // alive: снятая вкладка не решает
 });

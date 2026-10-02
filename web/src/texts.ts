@@ -105,6 +105,8 @@ export const T_CALC_RUN = "Посчитать";
 export const T_CALC_BUSY = "Считаю…";
 export const T_CALC_NO_TAG = "Выберите тег — найдите его по словам или впишите имя";
 export const T_CALC_NO_RANGE = "Укажите начало и конец своего периода";
+export const T_CALC_BAD_RANGE = "Конец своего периода — позже начала";
+export const T_CALC_SIMILAR = "Точного совпадения нет — вот похожие теги";   // вместо заметки службы для агента
 export const T_CALC_NOTHING = "Ничего не найдено — попробуйте другие слова";
 export const T_CALC_PERIOD_LINE = (start: string, end: string, tz: string): string => `Период: ${start} — ${end} (${tz})`;
 export const T_CALC_ASOF_LINE = (asof: string, tz: string): string => `Прочитано: ${asof} (${tz})`;   // у текущего значения
@@ -164,6 +166,7 @@ export const CALC_LABELS = {
   percent: "% периода",
   count: "Переходов",
   source: "Источник",
+  pointsPerTag: "Точек на тег",                       // у профиля — рядом с источником (его текст: «N точек»)
   avgKind: "Вид среднего",
 } as const;
 
