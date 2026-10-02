@@ -5,14 +5,16 @@ import re
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import datetime, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
-from helpers import CORE_DIR, LLM_ENV, REPO, SETTINGS, TOKEN, make_app, wait_until
-from pcbk_core.data.sql import catalog_sql, clock_sql
+from helpers import CORE_DIR, LLM_ENV, REPO, SETTINGS, TOKEN, make_app, make_service, wait_until
+from pcbk_core.data.sql import SUMMARY_COLUMNS, catalog_sql, clock_sql, series_sql, state_sql, summary_sql
 from pcbk_core.main import build_roles
 from twin_core import install_twin
-from twin_historian import BENCH_FIXTURE, TwinHistorian, bench_whitelist
+from twin_historian import BENCH_FIXTURE, TZ, TwinHistorian, analog_value, bench_whitelist
 
 
 def test_twin_catalog_has_bench_cases():
@@ -104,3 +106,58 @@ def test_fake_bench_stdlib_only():                                              
     imports = {n.split(".")[0] for n in re.findall(r"^\s*(?:from|import)\s+([\w.]+)",
                                                   (REPO / "core/tests/fake_bench.py").read_text(), re.M)}
     assert imports <= set(sys.stdlib_module_names)
+
+
+# --- Д9-R86: сигналы по времени, теги состояний, ряд и наработка ---
+
+NOW = datetime(2026, 10, 10, 7, 0, tzinfo=timezone.utc)                           # историан: 10.10 12:00, UTC+05:00
+L = lambda *a: datetime(*a)                                                       # местное время без пояса
+
+
+def twin():
+    return TwinHistorian.from_fixture(now=lambda: NOW)
+
+
+def test_twin_series_rows():
+    t = twin()
+    rows = t([series_sql(["20FAKE_201_PV"], L(2026, 10, 10, 4), L(2026, 10, 10, 12), 5)], 10.0)[0]
+    assert [r[1] for r in rows] == [L(2026, 10, 10, h) for h in (4, 6, 8, 10, 12)]
+    sig = t.signals["20FAKE_201_PV"]
+    epoch = lambda d: d.replace(tzinfo=TZ).timestamp()
+    assert [r[2] for r in rows] == [pytest.approx(analog_value(sig, epoch(r[1]))) for r in rows]
+    assert {r[3] for r in rows} == {0}
+
+
+def test_twin_summary_depends_on_period():
+    t = twin()
+    shift = t([summary_sql(["20FAKE_201_PV"], L(2026, 10, 9, 22), L(2026, 10, 10, 6))], 10.0)[0][0]
+    day = t([summary_sql(["20FAKE_201_PV"], L(2026, 10, 9), L(2026, 10, 10))], 10.0)[0][0]
+    assert shift != day
+    cols = dict(zip(("TagName", *SUMMARY_COLUMNS), shift))
+    assert cols["Minimum"] <= cols["Average"] <= cols["Maximum"] and cols["PercentGood"] == 100.0
+
+
+def test_twin_state_rows():
+    t = twin()
+    rows = t([state_sql(["20FAKE_210_RUN", "20FAKE_211_CLS"], L(2026, 10, 9), L(2026, 10, 10))], 10.0)[0]
+    run = {r[1]: r for r in rows if r[0] == "20FAKE_210_RUN"}
+    assert set(run) == {0.0, 1.0} and not [r for r in rows if r[0] == "20FAKE_211_CLS"]
+    assert sum(r[2] for r in run.values()) == 24 * 3_600_000                    # отсчёты [start, end)
+    assert run[1.0][3] == pytest.approx(75.0) and run[1.0][4] == 8                 # цикл 3 ч — 8 переходов в «1» за сутки
+
+
+def test_bench_tags_unchanged():                                                  # стенд отбора Д8 — как был
+    t = twin()
+    row = t([summary_sql(["20FAKE_104_PV"], L(2026, 10, 9), L(2026, 10, 10))], 10.0)[0][0]
+    again = t([summary_sql(["20FAKE_104_PV"], L(2026, 10, 1), L(2026, 10, 2))], 10.0)[0][0]
+    assert row == again and "16FAKE_109_PV" not in bench_whitelist()
+
+
+@pytest.mark.anyio
+async def test_twin_through_service(tmp_path):
+    s, _ = make_service(tmp_path, fake=twin(), whitelist=bench_whitelist())
+    r = await s.tag_series("ops", "http", ["20FAKE_201_PV"], period="last_8h", points=9)
+    assert r["status"] == "ok" and len(r["items"][0]["points"]) == 9
+    r = await s.calc_runtime("ops", "http", ["20FAKE_210_RUN", "20FAKE_211_CLS"], period="yesterday")
+    a, b = r["items"]
+    assert sum(st["hours"] for st in a["states"]) == pytest.approx(24.0) and b["status"] == "no_data"
