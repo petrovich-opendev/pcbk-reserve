@@ -1,9 +1,15 @@
 """Серверный слой в компоновке: строки сторожа, ручки здоровья, сеть выхода, секрет и список файлами."""
+import ast
 import json
 import re
 import time
+from pathlib import Path
+
+from conftest import wait_for
 
 CORE = "http://172.31.250.82:8000"
+CTL = "http://pcbk-sp-ctl:2375/v1.44"
+ZONES_PY = Path(__file__).resolve().parents[2] / "core" / "pcbk_core" / "zones.py"
 
 
 def row(data, cid):
@@ -16,7 +22,9 @@ def test_status_shows_core_alive_and_historian_down(stack):
 
 
 def test_core_health_routes_on_egress_address(stack):
-    assert stack.http_host("GET", CORE + "/healthz")[0] == 200
+    # в /healthz с Д5а и здоровье шлюза: первые секунды после подъёма стенда sp_ctl бывает down
+    # (охрана выхода ещё не знает адрес pcbk-sp-ctl, Ш10) — ждём, а не один запрос (Ш4)
+    wait_for(lambda: stack.http_host("GET", CORE + "/healthz")[0] == 200, timeout=60)
     code, body = stack.http_host("GET", CORE + "/healthz/data")
     assert code == 200 and json.loads(body)["ok"] is True
     # первая попытка каталога длится до срока входа (10 с): ждём её исход, а не порядок тестов
@@ -43,16 +51,17 @@ def test_egress_network_only_core(stack):
     assert n["Options"].get("com.docker.network.bridge.enable_ip_masquerade", "true") == "true"
     # двойник OpenRouter — только в тестовом стенде (compose.test.yaml)
     assert sorted(c["Name"] for c in n["Containers"].values()) == ["pcbk-core", "pcbk-test-openrouter"]
-    # двенадцать сетей: pcbk-front, pcbk-egress и десять сетей мест на .2 (Д4б-R23)
+    # тринадцать сетей: pcbk-front, pcbk-egress, pcbk-ctl (клиент sp-ctl, Д5-R31) и десять сетей мест на .2
     nets = stack.inspect("pcbk-core")["NetworkSettings"]["Networks"]
-    assert set(nets) == {"pcbk-front", "pcbk-egress", *STU_NETS} and nets["pcbk-egress"]["IPAddress"] == "172.31.250.82"
+    assert set(nets) == {"pcbk-front", "pcbk-egress", "pcbk-ctl", *STU_NETS} and \
+        nets["pcbk-egress"]["IPAddress"] == "172.31.250.82"
     assert {name: nets[name]["IPAddress"] for name in STU_NETS} == \
            {name: f"{stack.stu_net}.{n}.2" for n, name in enumerate(STU_NETS, 1)}
 
 
 def test_core_in_workplace_networks_on_dot2(stack):                         # Д4б-R23, по компоновке сервера
     nets = stack.prod_config()["services"]["core"]["networks"]
-    assert set(nets) == {"pcbk-front", "pcbk-egress", *STU_NETS}
+    assert set(nets) == {"pcbk-front", "pcbk-egress", "pcbk-ctl", *STU_NETS}
     assert {name: nets[name]["ipv4_address"] for name in STU_NETS} == \
            {name: f"{stack.stu_net}.{n}.2" for n, name in enumerate(STU_NETS, 1)}
     # тот же адрес, что у места в extra_hosts: место зовёт core по имени (под gVisor DNS нет)
@@ -91,14 +100,18 @@ def test_core_secret_and_list_are_readonly_files(stack):
     assert prod["pull_policy"] == "never"
     # двойник OpenRouter и частый опрос — только в compose.test.yaml; на сервере — настоящий OpenRouter
     assert not {"OPENROUTER_BASE_URL", "LLM_POLL_S"} & set(prod["environment"])
-    # секреты core — ровно эти пять файлов, ключи OpenRouter — среди них, а не в окружении
+    # секреты core — ровно эти пятнадцать файлов: ключи OpenRouter — среди них, а не в окружении; пароли мест
+    # (Д5а) знает только шлюз — секретами Compose student-NN-pw
     assert sorted(x["target"] for x in prod["secrets"]) == \
-        ["bdrv.env", "core-tokens", "llm-tokens", "openrouter-mgmt.key", "openrouter.key"]
+        ["bdrv.env", "core-tokens", "llm-tokens", "openrouter-mgmt.key", "openrouter.key",
+         *(f"student-{n:02d}.pw" for n in range(1, 11))]
+    assert {x["target"]: x["source"] for x in prod["secrets"] if x["target"].startswith("student-")} == \
+        {f"student-{n:02d}.pw": f"student-{n:02d}-pw" for n in range(1, 11)}
 
 
-def test_oneshot_alias_keeps_sp_ctl_controls(stack):               # настоящий pcbk-core уже работает
-    assert stack.http_as("pcbk-core", "pcbk-ctl", "GET", "http://pcbk-sp-ctl:2375/v1.44/_ping") == 200
-    assert stack.http_as("pcbk-intruder", "pcbk-ctl", "GET", "http://pcbk-sp-ctl:2375/v1.44/_ping") == 403
+def test_core_is_the_sp_ctl_client(stack):                         # Д5-R31: клиент sp-ctl — настоящий core
+    assert stack.http_from_core("GET", CTL + "/_ping") == 200
+    assert stack.http_as("pcbk-intruder", "pcbk-ctl", "GET", CTL + "/_ping") == 403
 
 
 def test_tool_over_egress_answers_and_journals(stack):
@@ -109,9 +122,9 @@ def test_tool_over_egress_answers_and_journals(stack):
 
 
 def test_core_state_volume_writable(stack):                                     # Review Focus 4
-    # в тестовом стенде bdrv.env целый — 2 направления: историан и OpenRouter (Д4а); bdrv.env не читается —
-    # было бы «1 направление», только OpenRouter (П3)
-    assert "охрана выхода: разрешено 2 направления" in stack.logs("pcbk-core")
+    # в тестовом стенде bdrv.env целый — 13 направлений: историан, OpenRouter (Д4а), pcbk-sp-ctl и десять мест
+    # на STU.N.3:4096 (Д5а); bdrv.env не читается — было бы 12, без историана (П3, Ш3)
+    assert "охрана выхода: разрешено 13 направлений" in stack.logs("pcbk-core")
     # core.db создаётся в начале lifespan роли (F23) — файл есть до первого вызова инструмента
     mounts = {m["Destination"]: m for m in stack.inspect("pcbk-core")["Mounts"]}
     assert mounts["/var/lib/pcbk-core"]["Type"] == "volume"
@@ -133,3 +146,25 @@ def test_stop_core_turns_row_red_historian_unknown(stack):
         assert row(data, "historian") == ("unknown", "служба данных не отвечает — свежесть неизвестна")
     finally:
         stack.start("pcbk-core")
+
+
+def _zones_nets() -> dict[str, tuple[str, ...]]:
+    """FRONT_NETS и ADMIN_NETS из текста zones.py (без импорта pcbk_core): литералы и «FRONT_NETS + (…)»."""
+    found: dict[str, tuple[str, ...]] = {}
+    for node in ast.parse(ZONES_PY.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+            if name not in ("FRONT_NETS", "ADMIN_NETS"):
+                continue
+            if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add) and isinstance(value.left, ast.Name):
+                found[name] = found[value.left.id] + ast.literal_eval(value.right)
+            else:
+                found[name] = ast.literal_eval(value)
+    return found
+
+
+def test_front_subnet_matches_compose(stack):                        # Ш15: зоны Д5-R31 — те же подсети, что в компоновке
+    zones = _zones_nets()
+    networks = stack.prod_config()["networks"]
+    assert networks["pcbk-front"]["ipam"]["config"][0]["subnet"] == zones["FRONT_NETS"][0]
+    assert networks["pcbk-egress"]["ipam"]["config"][0]["subnet"] == zones["ADMIN_NETS"][-1]

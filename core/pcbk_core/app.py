@@ -6,10 +6,11 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontext
 from typing import Protocol
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import iter_route_contexts
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Route, WebSocketRoute, compile_path
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -38,9 +39,10 @@ class Role(Protocol):
     def install(self, app: FastAPI) -> None:
         """Обработчики исключений и промежуточные звенья уровня приложения — только здесь.
 
-        Обработчик 422 и предел тела — не напрямую, а в реестр hooks_of(app) на свой префикс пути:
-        один обработчик RequestValidationError и одно звено BodyLimit на приложение ставит create_app.
-        Mount, Host и frontend() не ставятся ни здесь, ни в router(): create_app откажет.
+        Обработчики 422 и HTTPException и предел тела — не напрямую, а в реестр hooks_of(app) на свой префикс
+        пути: один обработчик RequestValidationError, один обработчик HTTPException и одно звено BodyLimit на
+        приложение ставит create_app. Mount, Host и frontend() не ставятся ни здесь, ни в router(): create_app
+        откажет.
         """
         ...
 
@@ -103,15 +105,28 @@ def _route_patterns(app: FastAPI) -> list[tuple[str, re.Pattern]]:
     return patterns
 
 
+def _bypasses_http_registry(key: object) -> bool:
+    """Ключ обработчика мимо реестра HTTPException: код ответа (int — Starlette зовёт его раньше обработчика
+    по классу) или подкласс HTTPException Starlette (FastAPI HTTPException и прочие — по MRO раньше общего)."""
+    if isinstance(key, int):
+        return True
+    return isinstance(key, type) and issubclass(key, StarletteHTTPException) and key is not StarletteHTTPException
+
+
 def _install_hooks(app: FastAPI) -> None:
-    """Один обработчик 422 и одно звено предела тела на приложение — по реестру ролей.
+    """Один обработчик 422, один обработчик HTTPException и одно звено предела тела на приложение — по реестру
+    ролей.
 
     Звено ставится последним: оно самое внешнее внутри ServerErrorMiddleware, и 413 выходит раньше
-    звеньев ролей. Обработчик 422 роли мимо реестра общий молча затёр бы — сборка отказывает.
+    звеньев ролей. Обработчик 422 или HTTPException роли мимо реестра общий молча затёр бы (Ш5) — сборка
+    отказывает. Обработчик по коду ответа (int) или по подклассу HTTPException тоже обошёл бы реестр.
     """
     hooks = hooks_of(app)
     if app.exception_handlers.get(RequestValidationError) is not request_validation_exception_handler:
         raise ValueError("обработчик 422 ставится через реестр hooks_of(app).validation, не напрямую")
+    if (app.exception_handlers.get(StarletteHTTPException) is not http_exception_handler
+            or any(_bypasses_http_registry(key) for key in app.exception_handlers)):
+        raise ValueError("обработчик HTTPException ставится через реестр hooks_of(app).http_exception, не напрямую")
 
     async def on_validation(request: Request, exc: RequestValidationError) -> Response:
         handler = hooks.handler_for(request.scope["path"])
@@ -119,7 +134,14 @@ def _install_hooks(app: FastAPI) -> None:
             return await request_validation_exception_handler(request, exc)
         return await handler(request, exc)
 
+    async def on_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+        handler = hooks.http_handler_for(request.scope["path"])
+        if handler is None:
+            return await http_exception_handler(request, exc)
+        return await handler(request, exc)
+
     app.add_exception_handler(RequestValidationError, on_validation)
+    app.add_exception_handler(StarletteHTTPException, on_http_exception)
     app.add_middleware(BodyLimit, hooks=hooks)
 
 

@@ -1,8 +1,16 @@
 # Прокси входа стенда. Образ nginx кладёт этот шаблон в conf.d внутри http{} —
-# здесь только server-блоки. Переменных окружения в шаблоне нет: envsubst
-# меняет только имена из окружения, а у edge своих переменных нет.
+# здесь server-блоки и то, что nginx принимает только на уровне http (map, limit_req_zone).
+# Переменных окружения в шаблоне нет: envsubst меняет только имена из окружения,
+# а у edge своих переменных нет.
 
-# 8443 — вход для людей: заглушка и страница состояния сторожа
+# вне server{}: сырой URI под /pcbk/api/ с кодированными точками и слэшами, «/.» или «//» — отказ до core
+map $request_uri $pcbk_bad_api_uri {
+    default 0;
+    "~(%2[eEfF]|%5[cC]|/\.|//)" 1;
+}
+limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;
+
+# 8443 — вход для людей: заглушка, страница входа, пути шлюза /pcbk/api/ и страница состояния сторожа
 server {
     listen 8443 ssl;
     http2 on;
@@ -13,10 +21,11 @@ server {
     ssl_certificate_key /etc/nginx/tls/key.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    # сторож разрешается в момент запроса: nginx стартует и без него
+    # сторож и core разрешаются в момент запроса: nginx стартует и без них
     resolver 127.0.0.11 valid=10s ipv6=off;
     resolver_timeout 3s;
     set $pcbk_watchdog pcbk-watchdog:8090;
+    set $pcbk_core pcbk-core:8000;
 
     root /usr/share/nginx/pcbk;
 
@@ -28,11 +37,44 @@ server {
     proxy_hide_header X-Content-Type-Options;
     proxy_hide_header Referrer-Policy;
 
+    # proxy_set_header — только здесь: location со своим proxy_set_header потерял бы все
     proxy_http_version 1.1;
     proxy_set_header Connection "";
+    proxy_set_header X-Forwarded-Host $host;        # хост для доменов удалений cookie (Д5-R25)
+    proxy_set_header X-Forwarded-For "";            # заголовки пересылки от клиента к core не доходят
+    proxy_set_header X-Real-IP "";
+    proxy_set_header Forwarded "";
     proxy_connect_timeout 3s;
     proxy_send_timeout 5s;
     proxy_read_timeout 5s;
+    proxy_buffer_size 32k;                          # набор удалений cookie — до 16 КиБ заголовков (Д5-R30)
+    proxy_buffers 8 32k;
+    proxy_busy_buffers_size 64k;
+
+    # ошибки самого nginx — JSON через внутренние location по URI, на уровне server: у строки с %00
+    # URI ещё нет (именованный location дал бы 500 HTML), TRACE отвергается до выбора location.
+    # location со своим error_page (страница состояния Д1) их не наследуют — и location под /pcbk/api/
+    # своих error_page не ставят, иначе потеряют эти.
+    error_page 400 /pcbk-errors/400.json;
+    error_page 405 /pcbk-errors/405.json;
+    error_page 413 /pcbk-errors/413.json;
+    error_page 414 /pcbk-errors/414.json;                 # длинный адрес
+    error_page 494 =400 /pcbk-errors/400.json;            # большие заголовки и cookie (cookie Dify на том же хосте)
+    error_page 429 /pcbk-errors/429.json;
+    error_page 502 503 504 =503 /pcbk-errors/503.json;    # «=503»: без него код остался бы 502 или 504
+
+    location = /pcbk-errors/400.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверный запрос"}}'; }
+    location = /pcbk-errors/405.json { internal; default_type application/json; return 405 '{"name":"MethodNotAllowed","data":{"message":"Неверный запрос"}}'; }
+    location = /pcbk-errors/413.json { internal; default_type application/json; return 413 '{"name":"PayloadTooLarge","data":{"message":"Запрос слишком большой"}}'; }
+    location = /pcbk-errors/414.json { internal; default_type application/json; return 414 '{"name":"URITooLong","data":{"message":"Адрес запроса слишком длинный"}}'; }
+    location = /pcbk-errors/429.json { internal; default_type application/json; return 429 '{"name":"TooManyAttempts","data":{"message":"Слишком много попыток входа — подождите"}}'; }
+    location = /pcbk-errors/503.json { internal; default_type application/json; return 503 '{"name":"Unavailable","data":{"message":"Серверный слой не отвечает"}}'; }
+
+    # р4: Host — ввод клиента (он же X-Forwarded-Host для core): имя из не больше шести меток [a-z0-9-]
+    # или адрес IPv4, иначе 400 JSON до core. rewrite, а не «return 400»: серверный rewrite повторяется
+    # при внутреннем переходе error_page, и вышла бы стандартная страница nginx
+    if ($host !~* "^[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63}){0,5}$") { rewrite ^ /pcbk-errors/host.json last; }
+    location = /pcbk-errors/host.json { internal; default_type application/json; return 400 '{"name":"BadRequest","data":{"message":"Неверное имя сервера"}}'; }
 
     location = / {
         charset utf-8;
@@ -61,6 +103,74 @@ server {
     location = /watchdog-down.html {
         internal;
         charset utf-8;
+    }
+
+    # страница входа — статика с CSP: скрипт и стили только файлами отсюда; у location со своим
+    # add_header три заголовка server-блока не наследуются — повторены
+    location = /login {
+        charset utf-8;
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        try_files /login.html =404;
+    }
+
+    location = /login.js {
+        charset utf-8;
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        try_files /login.js =404;
+    }
+
+    location = /login.css {
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        try_files /login.css =404;
+    }
+
+    # пути шлюза в core — только эти (Д5а); error_page, буферы, Connection "" и X-Forwarded-Host —
+    # от server: своих error_page, proxy_set_header и add_header здесь нет
+    location /pcbk/api/auth/ {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_login burst=20 nodelay;
+        limit_req_status 429;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    location = /pcbk/api/workplace {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    location = /pcbk/api/workplace/wake {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    # без косой черты — точные location: иначе auto_redirect даст 301 HTML
+    location = /pcbk/api      { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
+    location = /pcbk/api/auth { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
+    location = /pcbk/api/oc   { default_type application/json; return 403 '{"name":"Forbidden","data":{"message":"Вызов не разрешён"}}'; }
+
+    # прочее под /pcbk/api/ — 404 JSON; сюда же попадает /pcbk/api/auth/%2e%2e/… после нормализации
+    location /pcbk/api/ {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        return 404 '{"name":"NotFound","data":{"message":"не найдено"}}';
     }
 
     location / {

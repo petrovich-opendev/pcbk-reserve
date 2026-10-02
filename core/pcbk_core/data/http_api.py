@@ -20,7 +20,9 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, StringConstraints
+from starlette.types import Scope
 
+from .. import zones
 from ..hooks import DEFAULT_BODY_LIMIT, BodyLimit, safe_path, size_text  # noqa: F401 — реэкспорт Д3б
 from ..secrets import TokenTable
 from .periods import PRESETS
@@ -58,14 +60,22 @@ class TagPeriodArgs(BaseModel):
     end: str | None = None
 
 
-def bearer_caller(authorization: str | None, tokens: TokenTable) -> str | None:
-    """id вызывающего по заголовку «Authorization: Bearer <токен>»; нет, чужой или не Bearer — None."""
+def bearer_caller(authorization: str | None, tokens: TokenTable, *, scope: Scope) -> str | None:
+    """id вызывающего по заголовку «Authorization: Bearer <токен>»; нет, чужой или не Bearer — None.
+
+    Токен места student-NN — только из сети своего места или из ADMIN_NETS (Ш25, zones.caller_net_ok): из
+    чужой сети — None, и вызов идёт тем же путём 401, что чужой токен (без события). scope обязателен — все
+    места сверки токенов передают адрес источника.
+    """
     if not authorization:
         return None
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer":
         return None
-    return tokens.caller(token.strip())
+    caller = tokens.caller(token.strip())
+    if caller is None or not zones.caller_net_ok(scope, caller):
+        return None
+    return caller
 
 
 def unauthorized(path: str, channel: str) -> JSONResponse:
@@ -78,7 +88,7 @@ def data_router(role: "DataRole") -> APIRouter:
     router = APIRouter()
 
     def authorize(request: Request) -> tuple[str | None, JSONResponse | None]:
-        caller = bearer_caller(request.headers.get("authorization"), role.tokens)
+        caller = bearer_caller(request.headers.get("authorization"), role.tokens, scope=request.scope)
         if caller is None:
             return None, unauthorized(request.scope["path"], "http")
         return caller, None
@@ -180,7 +190,7 @@ def validation_handler(role: "DataRole"):
         tool = DATA_TOOLS.get(path)
         if tool is None:
             return await request_validation_exception_handler(request, exc)
-        caller = bearer_caller(request.headers.get("authorization"), role.tokens)
+        caller = bearer_caller(request.headers.get("authorization"), role.tokens, scope=request.scope)
         if caller is None:              # битый JSON без токена не пишет мусор в журнал событий
             return unauthorized(path, "http")
         requested = requested_from_body(exc.body)

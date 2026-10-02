@@ -29,6 +29,9 @@
    проверок); свои образы — `pcbk-reserve/watchdog:<день>`, `pcbk-reserve/core:<день>` и
    `pcbk-reserve/student:<день>` (собирать из чистого дерева, `git archive`). Сверка: слои
    `docker image inspect -f '{{json .RootFS.Layers}}'` совпадают.
+   **Образ — из ветки своего дня.** Образ для выкладки дня собирается из ветки или тега этого
+   дня (отдельный `git worktree` на её голове), а не из рабочего дерева более позднего дня:
+   иначе, например, под тегом `:d4b` на сервер уедет код Д5, а откатного образа Д4б не станет.
 2. `compose.yaml` и каталог `edge/` — в `/opt/pcbk-reserve` (`scp`; без
    удаления: `tls/`, `.env`, `secrets/`, `agents/` не трогаются). Перед
    копированием — на сервере копия для отката: `cp -p compose.yaml compose.yaml.<прошлый день>`
@@ -109,7 +112,8 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
 `docker compose up -d --no-build --force-recreate core`.
 
 `core` стоит в каждой сети места на `.2` (у мест — `core` в `extra_hosts`) с
-`net.ipv4.ip_forward=0`. Проверка: `docker inspect -f '{{len .NetworkSettings.Networks}}' pcbk-core` → `12`.
+`net.ipv4.ip_forward=0`. Проверка: `docker inspect -f '{{len .NetworkSettings.Networks}}' pcbk-core` → `13`
+(с Д5а — ещё `pcbk-ctl`: `core` — клиент `sp-ctl`).
 
 ### Пересоздание мест с сохранением томов
 

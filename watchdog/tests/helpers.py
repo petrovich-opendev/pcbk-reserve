@@ -59,6 +59,15 @@ def llm_obj(**kw):
     return {**base, **kw}
 
 
+def gw(age=5, **kw):
+    """Ответ /health/gateway (договор Д5а, 15 ключей): уборщик прошёл age с назад, всё в норме."""
+    return {"checked_at": (T0 - timedelta(seconds=age)).isoformat(), "config_error": None, "store_ok": True,
+            "sp_ctl": "ok", "running_n": 1, "ready_n": 1, "wake_ok_1h": 1, "wake_failed_1h": 0, "stop_failed_1h": 0,
+            "place_auth_failed_1h": 0, "logins_failed_1h": 0, "origin_refused_1h": 0, "login_busy_1h": 0,
+            "cookies_duplicate_1h": 0,
+            "drill": "", **kw}
+
+
 # /proc/meminfo для тестов: памяти с запасом; файл удаляется при выходе
 _fd, MEMINFO_FILE = tempfile.mkstemp(prefix="pcbk-meminfo-")
 with os.fdopen(_fd, "w") as _f:

@@ -1,0 +1,342 @@
+"""Учётные записи шлюза (Д5-R24, Д5-R28): scrypt, место и логин закреплены навсегда, сессии хешем, замок
+входа без оракула, хранилище без ввода-вывода в конструкторе, команда администратора."""
+import hashlib
+import io
+import os
+import re
+import sqlite3
+import threading
+from contextlib import closing
+
+import pytest
+
+from helpers import PW, FakeMono, fail_connect, full_disk, store
+from pcbk_core.gateway import accounts
+from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, UNKNOWN_KEYS, AccountStore, StoreError,
+                                        hash_password, verify_password)
+from pcbk_core.gateway.accounts import main as accounts_main
+
+
+def db_bytes(tmp_path) -> bytes:                                                        # WAL: все три файла
+    return b"".join(p.read_bytes() for p in tmp_path.glob("core.db*"))
+
+
+def test_constructor_does_no_io(tmp_path):                                              # договор Role
+    AccountStore(str(tmp_path / "нет" / "core.db"))
+    assert not (tmp_path / "нет").exists()
+    s = AccountStore(str(tmp_path / "нет" / "core.db"))
+    assert s.open() is False and s.last_error                                           # каталога нет — не бросает
+
+
+def test_password_hash_roundtrip_and_format():
+    h = hash_password("верный-пароль-1")
+    assert re.fullmatch(r"scrypt\$16384\$8\$1\$[0-9a-f]{32}\$[0-9a-f]{64}", h)
+    assert verify_password("верный-пароль-1", h) and not verify_password("неверный", h)
+    assert hash_password("x" * 8) != hash_password("x" * 8)                          # соль
+
+
+def test_secrets_at_rest(tmp_path):                                                     # Review Focus 5
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    tok = s.open_session("ivanov")
+    raw = db_bytes(tmp_path)                                                           # соединения закрыты после операций
+    assert tok.encode() not in raw and PW.encode("utf-8") not in raw
+    # положительный контроль побайтного скана (ревью А2, M4): записанное скан видит
+    assert hashlib.sha256(tok.encode()).hexdigest().encode() in raw and b"scrypt$16384$8$1$" in raw
+    con = sqlite3.connect(tmp_path / "core.db")                                        # положительный контроль
+    assert [r[0] for r in con.execute("SELECT token_sha FROM gw_sessions")] == [hashlib.sha256(tok.encode()).hexdigest()]
+    assert con.execute("SELECT pw_hash FROM gw_accounts").fetchone()[0].startswith("scrypt$16384$8$1$")
+    con.close()
+    raw = db_bytes(tmp_path)                                                           # после чужого чтения — снова
+    assert tok.encode() not in raw and PW.encode("utf-8") not in raw
+
+
+def test_add_rules(tmp_path):
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    for args in (("ivanov", "student", 4, PW), ("petrov", "student", 3, PW), ("petrov", "student", None, PW),
+                 ("teach", "teacher", 5, PW), ("Petrov", "student", 4, PW), ("petrov", "student", 11, PW),
+                 ("petrov", "student", 4, "1234567")):
+        with pytest.raises(ValueError) as e:
+            s.add(*args)
+        assert PW not in str(e.value)
+    s.disable("ivanov")
+    with pytest.raises(ValueError):
+        s.add("petrov", "student", 3, PW)                                              # отключение место не освобождает
+
+
+def test_place_bound_forever(tmp_path):                                                 # Review Focus 1
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    s.disable("ivanov"); s.remove("ivanov")
+    with pytest.raises(ValueError) as e:
+        s.add("petrov", "student", 3, PW)
+    assert "место 03 закреплено за учёткой ivanov" in str(e.value)
+    with pytest.raises(ValueError) as e:
+        s.add("ivanov", "student", 3, PW)                                              # надгробие логина
+    assert "логин ivanov был у студента места 03" in str(e.value)
+    assert s.add("ivanov", "student", 3, PW, same_person=True).place == 3
+    assert s.bindings() == [(3, "ivanov", True)]
+    with pytest.raises(ValueError):
+        s.release_place(3)                                                             # не пробная учётка
+    s.add("d5-probe-a", "student", 10, PW)
+    with pytest.raises(ValueError):
+        s.release_place(10)                                                            # пробная, но действует
+    s.disable("d5-probe-a"); s.release_place(10)
+    assert s.add("petrov", "student", 10, PW).place == 10
+
+
+def test_same_person_only_own_place(tmp_path):                                          # ревью А2, I1
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    s.disable("ivanov"); s.remove("ivanov")
+    for args in (("ivanov", "student", 4, PW), ("ivanov", "teacher", None, PW)):      # чужое место, роль teacher
+        with pytest.raises(ValueError) as e:
+            s.add(*args, same_person=True)
+        assert "логин ivanov закреплён за местом 03 — тот же человек возвращается только на своё место" in str(e.value)
+    assert s.list() == [] and s.bindings() == [(3, "ivanov", False)]                  # отказ ничего не записал
+    assert s.add("ivanov", "student", 3, PW, same_person=True).place == 3
+
+
+def test_bindings_account_by_login_and_place(tmp_path):                                # ревью А2, M5
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    con = sqlite3.connect(tmp_path / "core.db")
+    with con:                                                                          # учётка того же логина на другом месте
+        con.execute("UPDATE gw_accounts SET place = 4 WHERE login = 'ivanov'")
+    con.close()
+    assert s.bindings() == [(3, "ivanov", False)]
+
+
+def test_verify_and_sessions(tmp_path):
+    clock = FakeMono(1000.0)
+    s = store(tmp_path, clock=clock, ttl_s=43200)
+    s.add("ivanov", "student", 3, PW)
+    assert s.verify("ivanov", PW).place == 3
+    assert s.verify("ivanov", "x") is None and s.verify("nobody", "x") is None
+    tok = s.open_session("ivanov")
+    assert len(tok) >= 43 and s.session(tok).login == "ivanov"
+    clock.advance(43201)
+    assert s.session(tok) is None
+    tok = s.open_session("ivanov")
+    s.set_password("ivanov", "новый-пароль")
+    assert s.session(tok) is None                                                     # смена пароля закрывает сессии
+    tok = s.open_session("ivanov")
+    s.disable("ivanov")
+    assert s.session(tok) is None and s.verify("ivanov", "новый-пароль") is None
+
+
+def test_login_lock_no_oracle_persisted_and_unlocked(tmp_path):
+    clock = FakeMono(0.0)
+    s = store(tmp_path, clock=clock)
+    s.add("ivanov", "student", 3, PW)
+    for login in ("ivanov", "nobody"):
+        for _ in range(LOCK_FAILURES):
+            s.failure(login)
+    assert s.locked("ivanov") and s.locked("nobody")                                   # одинаково: нет оракула
+    assert store(tmp_path, clock=clock).locked("ivanov")                               # существующий — переживает перезапуск
+    s.unlock("ivanov")
+    assert not s.locked("ivanov")
+    for _ in range(LOCK_FAILURES):
+        s.failure("ivanov")
+    s.set_password("ivanov", "новый-пароль")
+    assert not s.locked("ivanov")
+    for i in range(UNKNOWN_KEYS + 50):
+        s.failure(f"nobody{i}")                                                        # память ограничена
+    assert len(s.unknown_failures) == UNKNOWN_KEYS
+    con = sqlite3.connect(tmp_path / "core.db")
+    assert con.execute("SELECT count(*) FROM gw_login_failures WHERE login LIKE 'nobody%'").fetchone()[0] == 0
+    for _ in range(LOCK_FAILURES):
+        s.failure("ivanov")
+    clock.advance(LOCK_WINDOW_S)
+    assert not s.locked("ivanov")
+
+
+def test_unknown_lock_survives_junk_flood(tmp_path):                                   # ревью А2, M2
+    clock = FakeMono(0.0)
+    s = store(tmp_path, clock=clock)
+    for _ in range(LOCK_FAILURES):
+        s.failure("victim")
+    for i in range(UNKNOWN_KEYS + 50):
+        s.failure(f"Junk-{i}")                                                         # не вид логина: только память
+    assert s.locked("victim") and len(s.unknown_failures) == UNKNOWN_KEYS             # вытеснены незапертые
+    clock.advance(LOCK_WINDOW_S)                                                       # замок истёк — вытесняется первым
+    s.failure("Junk-new")
+    assert not s.locked("victim") and len(s.unknown_failures) == UNKNOWN_KEYS
+    assert hashlib.sha256(b"victim").digest() not in s.unknown_failures                # ключ — sha256 логина
+    assert hashlib.sha256(b"Junk-51").digest() in s.unknown_failures                  # а не самый старый незапертый
+
+
+def scrypt_spy(monkeypatch) -> list[int]:
+    """Шпион на accounts._scrypt: список, куда каждый вызов кладёт 1 (зовут из потоков — append атомарен)."""
+    calls, real = [], accounts._scrypt
+
+    def spy(password, salt):
+        calls.append(1)
+        return real(password, salt)
+    monkeypatch.setattr(accounts, "_scrypt", spy)
+    return calls
+
+
+def test_verify_one_scrypt_in_every_case(tmp_path, monkeypatch):                      # итоговое ревью Д5а, I1 (R1)
+    """Выравнивание времени verify: ровно один scrypt на каждый вызов — неверный пароль, отключённая учётка с
+    верным, неизвестный логин верного вида и логин неверного вида (свой хеш или хеш-пустышка)."""
+    s = store(tmp_path)                                                                # open() посчитал пустышку
+    s.add("ivanov", "student", 3, PW)
+    s.add("petrov", "student", 4, PW)
+    s.disable("petrov")
+    calls = scrypt_spy(monkeypatch)
+    for login, pw in (("ivanov", "неверный-1"), ("petrov", PW), ("nobody7", PW), ("Не-Логин!", PW)):
+        calls.clear()
+        assert s.verify(login, pw) is None and len(calls) == 1, login
+    calls.clear()
+    assert s.verify("ivanov", PW) is not None and len(calls) == 1                     # положительный контроль
+
+
+def test_lock_counts_pending_stamps_once(tmp_path):                                   # итоговое ревью Д5а, А4-m1 (R7)
+    """Метки неудач, которые шлюз учёл, но ещё не записал (pending), считаются вместе с записанными; неудача,
+    видная и там и там (записали между чтениями), — один раз; метки вне окна — нет. Таблица и память — одинаково."""
+    clock = FakeMono(5000.0)
+    s = store(tmp_path, clock=clock)
+    s.add("ivanov", "student", 3, PW)
+    stamps = [4990.0 + i for i in range(LOCK_FAILURES)]
+    old = [5000.0 - LOCK_WINDOW_S - 1, 5000.0 - LOCK_WINDOW_S]                        # окно — строго позже
+    for name in ("ivanov", "nobody7", "Не-Логин!"):
+        for t in stamps[:3]:
+            s.failure(name, t)
+        assert not s.locked(name, stamps[:3] + old), name                              # 3, а не 6 и не 8
+        assert not s.locked(name, stamps[2:4]), name                                   # 4
+        assert s.locked(name, stamps[2:]), name                                        # 5
+    assert s.locked("ivanov") is False and s.locked("ivanov", ()) is False
+
+
+def test_store_errors_counted_without_paths(tmp_path, monkeypatch):
+    s = store(tmp_path)
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
+    with pytest.raises(StoreError) as e:
+        s.students()
+    assert str(tmp_path) not in str(e.value) and s.op_failures == 1
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root пишет и в файл 0444")
+def test_probe_sees_readonly_and_keeps_operation_failures(tmp_path):                   # Д5-R28, р4; без подмен
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    db = tmp_path / "core.db"
+    assert s.ping() is True and (s.probe_failures, s.op_failures) == (0, 0)
+    db.chmod(0o444); tmp_path.chmod(0o555)                                             # том только для чтения
+    try:
+        with pytest.raises(StoreError):
+            s.open_session("ivanov")                                                   # вход пишет — сбой
+        assert s.op_failures == 1
+        assert s.ping() is False and s.probe_failures == 1                             # SELECT 1 здесь прошёл бы
+    finally:
+        tmp_path.chmod(0o755); db.chmod(0o644)
+    assert s.ping() is True and (s.probe_failures, s.op_failures) == (0, 1)            # проба сбой операций не снимает
+    s.open_session("ivanov")
+    assert s.op_failures == 0                                                          # снимает удачная операция
+
+
+def test_full_disk_write_failure_outlives_reads(tmp_path):                           # итоговое ревью Д5а, M2 (R3)
+    """Переполненный диск: пульс ping() — настоящая запись с COMMIT и видит его; сбой записи операции не снимают
+    ни удачные чтения, ни удачный пульс — только удачная запись."""
+    s = store(tmp_path)
+    s.add("ivanov", "student", 3, PW)
+    with full_disk(s):
+        assert s.ping() is False and s.probe_failures == 1                             # INSERT + ROLLBACK прошёл бы
+        with pytest.raises(StoreError):
+            s.open_session("ivanov")                                                   # вход пишет — сбой
+        assert (s.write_failures, s.read_failures) == (1, 0)
+        assert s.verify("ivanov", PW) is not None and s.session("чужой") is None       # чтения идут
+        assert s.locked("ivanov") is False and s.op_failures == 1                      # и сбой записи не снимают
+    assert s.ping() is True and (s.probe_failures, s.op_failures) == (0, 1)            # пульс — тоже (Д5-R28)
+    s.close_session("чужой")                                                           # DELETE без строк — не запись
+    assert s.op_failures == 1
+    s.open_session("ivanov")
+    assert s.op_failures == 0                                                          # снимает удачная запись
+    with closing(sqlite3.connect(tmp_path / "core.db")) as db:
+        assert db.execute("SELECT count(*) FROM gw_heartbeat").fetchone()[0] == 1      # одна строка пульса
+
+
+def test_expired_session_delete_is_a_write(tmp_path):                                   # M-4
+    """Удаление истёкшей сессии в session() — операция записи: её сбой — сбой записи, который чтение не снимает;
+    удачное удаление снимает."""
+    clock = FakeMono(5000.0)
+    s = store(tmp_path, clock=clock, ttl_s=60.0)
+    s.add("ivanov", "student", 3, PW)
+    token = s.open_session("ivanov")
+    clock.advance(61)
+    with full_disk(s):
+        with pytest.raises(StoreError):
+            s.session(token)                                                           # чтение прошло, DELETE — нет
+        assert (s.write_failures, s.read_failures) == (1, 0)
+    assert s.session("чужой") is None and s.op_failures == 1                           # чтение сбой записи не снимает
+    assert s.session(token) is None and s.op_failures == 0                             # удаление прошло
+    with closing(sqlite3.connect(tmp_path / "core.db")) as db:
+        assert db.execute("SELECT count(*) FROM gw_sessions").fetchone()[0] == 0
+
+
+def test_read_failure_cleared_by_read(tmp_path, monkeypatch):                          # R3: сбой чтения — как прежде
+    s = store(tmp_path)
+    with monkeypatch.context() as m:
+        m.setattr(sqlite3, "connect", fail_connect)
+        with pytest.raises(StoreError):
+            s.students()
+    assert (s.read_failures, s.write_failures) == (1, 0)
+    s.students()
+    assert s.op_failures == 0
+
+
+def test_probe_sees_lock_and_missing_file(tmp_path, monkeypatch):                      # Д5-R28, р4
+    monkeypatch.setattr(accounts, "SQLITE_TIMEOUT_S", 0.1)
+    s = store(tmp_path)
+    other = sqlite3.connect(tmp_path / "core.db", isolation_level=None)
+    other.execute("BEGIN EXCLUSIVE")                                                   # блокировка дольше срока
+    assert s.ping() is False
+    other.execute("ROLLBACK"); other.close()
+    assert s.ping() is True
+    for f in tmp_path.glob("core.db*"):
+        f.unlink()
+    assert s.ping() is False and not (tmp_path / "core.db").exists()                   # mode=rw: пустую базу не создаёт
+
+
+def test_unknown_failures_thread_safe(tmp_path):                                       # Ш23
+    s, errors = store(tmp_path), []
+    def hammer(k):
+        try:
+            for i in range(2000):
+                s.failure(f"nobody-{k}-{i}"); s.locked(f"nobody-{k}-{i // 2}")
+        except Exception as e:                                                         # исключение потока pytest не видит
+            errors.append(type(e).__name__)
+    threads = [threading.Thread(target=hammer, args=(k,)) for k in range(8)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert errors == [] and len(s.unknown_failures) == UNKNOWN_KEYS
+
+
+def test_remove_only_disabled(tmp_path):
+    s = store(tmp_path)
+    s.add("teach", "teacher", None, PW)
+    with pytest.raises(ValueError):
+        s.remove("teach")
+    s.disable("teach"); s.remove("teach")
+    assert s.list() == []
+
+
+def test_cli(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
+    assert accounts_main(["add", "--login", "ivanov", "--role", "student", "--place", "3", "--generate"]) == 0
+    pw = capsys.readouterr().out.strip()
+    assert len(pw) == 12
+    monkeypatch.setattr("sys.stdin", io.StringIO("пароль-из-stdin\n"))
+    assert accounts_main(["add", "--login", "teach", "--role", "teacher"]) == 0
+    assert accounts_main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "ivanov\tstudent\t03\tактивна" in out and "teach\tteacher\t-\tактивна" in out
+    assert "место 03\tivanov\tучётка есть" in out and pw not in out and "scrypt" not in out
+    assert accounts_main(["disable", "--login", "ivanov"]) == 0
+    assert accounts_main(["add", "--login", "petrov", "--role", "student", "--place", "3", "--generate"]) == 1
+    err = capsys.readouterr()
+    assert "место 03 закреплено за учёткой ivanov" in err.err and err.out == ""
+    assert accounts_main(["release-place", "--place", "3", "--yes"]) == 1
+    assert accounts_main(["unlock", "--login", "ivanov"]) == 0

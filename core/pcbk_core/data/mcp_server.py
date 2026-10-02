@@ -29,6 +29,7 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .. import zones
 from .http_api import (UNAUTHORIZED, CatalogSearchArgs, TagNowArgs, TagPeriodArgs, bearer_caller, unauthorized,
                        validation_reason)
 from .periods import PRESETS
@@ -72,7 +73,7 @@ def _caller(ctx: Context, role: "DataRole") -> str | None:
         return None
     if request is None:
         return None
-    return bearer_caller(request.headers.get("authorization"), role.tokens)
+    return bearer_caller(request.headers.get("authorization"), role.tokens, scope=request.scope)
 
 
 def build_mcp(role: "DataRole") -> FastMCP:
@@ -138,7 +139,8 @@ def mcp_auth(app: ASGIApp, role: "DataRole") -> ASGIApp:
 
     Только http: веб-сокет закрывается (1008), прочие виды (lifespan) внутрь не идут — второй run()
     сессий SDK не даёт. Не POST — 405: GET открыл бы поток SSE, в который без сессий никто не пишет.
-    Нет или неверный Bearer — 401 {"detail": "нужен токен"} и строка журнала без токена, без события.
+    Нет или неверный Bearer (в том числе токен места из чужой сети, Ш25) — 401 {"detail": "нужен токен"} и
+    строка журнала без токена, без события.
     """
 
     async def guard(scope: Scope, receive: Receive, send: Send) -> None:
@@ -149,9 +151,12 @@ def mcp_auth(app: ASGIApp, role: "DataRole") -> ASGIApp:
         if scope["method"] != "POST":
             await JSONResponse(NOT_POST, status_code=405, headers={"Allow": "POST"})(scope, receive, send)
             return
-        if bearer_caller(Headers(scope=scope).get("authorization"), role.tokens) is None:
+        if bearer_caller(Headers(scope=scope).get("authorization"), role.tokens, scope=scope) is None:
             await unauthorized(scope.get("path", ""), "mcp")(scope, receive, send)
             return
+        # транспорт MCP — своё приложение Starlette: оно заменит scope["app"], и сверка сети токена в
+        # инструменте (_caller) не нашла бы STU_NET приложения core — кладём его в scope (Ш25)
+        scope[zones.STU_NET_KEY] = zones.stu_net(scope)
         await app(scope, receive, send)
 
     return guard

@@ -3,7 +3,7 @@
 FastAPI, uvicorn и httpx грузятся только в ветке сервера: проба здоровья раз в 30 с
 тянет лишь http.client. Охрана выхода ставится только в serve() — точке входа
 процесса: хук не снимается, а main() и build_roles тесты зовут в процессе pytest.
-Импорты pcbk_core.llm — только внутри функций (П8).
+Импорты pcbk_core.llm и pcbk_core.gateway — только внутри функций (П8, Ш9).
 """
 from __future__ import annotations
 
@@ -18,11 +18,15 @@ from .settings import Settings
 
 if TYPE_CHECKING:
     from .app import Role
+    from .gateway import GatewayRole
     from .llm import LlmRole
     from .secrets import BdrvConfig
-    from .settings import LlmSettings
+    from .settings import GatewaySettings, LlmSettings
 
 USAGE = "использование: python -m pcbk_core.main [--healthcheck]"
+# места Д2: {STU_NET}.N.3, сервер OpenCode на 4096 (как gateway.places — без его импорта: он тянет httpx)
+PLACES = range(1, 11)
+PLACE_PORT = 4096
 
 
 def _why(exc: Exception) -> str:
@@ -45,18 +49,23 @@ def read_bdrv(settings: Settings) -> tuple[BdrvConfig | None, OSError | ValueErr
         return None, exc.with_traceback(None)
 
 
-def egress_targets(llm: LlmSettings, cfg: BdrvConfig | None) -> list[tuple[str, int | None]]:
-    """Направления охраны выхода: историан (BDRV_HOST без экземпляра, BDRV_PORT; None — любой порт) и хост
-    OPENROUTER_BASE_URL (порт из адреса, иначе 443/80). cfg None (bdrv.env не читается) — только OpenRouter
-    (П3). Сигнатуру (llm, cfg) Д5 расширит до (llm, gw, cfg)."""
+def egress_targets(llm: LlmSettings, gw: GatewaySettings, cfg: BdrvConfig | None) -> list[tuple[str, int | None]]:
+    """Направления охраны выхода: историан (BDRV_HOST без экземпляра, BDRV_PORT; None — любой порт), хост
+    OPENROUTER_BASE_URL (порт из адреса, иначе 443/80), прокси сокета SP_CTL_URL (по имени — через кэш адресов
+    Д4а-R18) и места {STU_NET}.N.3:4096 литералами (Д5-R31): 13 направлений, без историана — 12. cfg None
+    (bdrv.env не читается) — без историана (П3)."""
     targets: list[tuple[str, int | None]] = [] if cfg is None else [(cfg.host.split("\\")[0], cfg.port)]
     url = urlsplit(llm.OPENROUTER_BASE_URL)
     targets.append((url.hostname or "", url.port or (443 if url.scheme == "https" else 80)))
+    sp_ctl = urlsplit(gw.SP_CTL_URL)
+    targets.append((sp_ctl.hostname or "", sp_ctl.port or 80))
+    targets += [(f"{gw.STU_NET}.{n}.3", PLACE_PORT) for n in PLACES]
     return targets
 
 
 def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> list[Role]:
-    """Роли процесса: «данные» и LLM-прокси (Д4а); env — окружение роли llm (None — os.environ), Д5 добавит шлюз.
+    """Роли процесса: «данные», LLM-прокси (Д4а) и шлюз (Д5а); env — окружение ролей llm и gateway (None —
+    os.environ).
 
     Нет файла белого списка — роль с пустым списком: /healthz/data отвечает 503
     с причиной, ворота не пускают ни одного имени. bdrv.env или белый список не
@@ -103,7 +112,7 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
 
     data = DataRole(settings, query, whitelist, config_error="; ".join(problems) or None,
                     tokens=tokens, tokens_error=tokens_error)
-    return [data, build_llm_role(settings, env)]
+    return [data, build_llm_role(settings, env), build_gateway_role(settings, env)]
 
 
 def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> LlmRole:
@@ -172,6 +181,38 @@ def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> 
     return role
 
 
+def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None) -> GatewayRole:
+    """Роль gateway по образцу build_llm_role (Ш9): GW_* с ошибкой — запасные настройки (gateway_settings) и
+    config_error «настройки шлюза: …» (имя поля и правило, без значения); процесс жив. Ни один конструктор
+    ничего не открывает: core.db — в lifespan роли, клиенты sp-ctl и мест — при первом запросе."""
+    from .gateway import GatewayRole
+    from .gateway.accounts import AccountStore
+    from .gateway.places import SpCtl, Workplaces
+    from .gateway.stats import GatewayStats
+
+    gw, problem = gateway_settings(env)
+    if problem is not None:
+        logging.getLogger("pcbk_core.main").error("шлюз: настройки: %s", problem)
+    stats = GatewayStats()
+    return GatewayRole(settings, gw, store=AccountStore(settings.DB_PATH, ttl_s=gw.GW_SESSION_TTL_S),
+                       workplaces=Workplaces(gw, SpCtl(gw.SP_CTL_URL), stats=stats), stats=stats,
+                       config_error=None if problem is None else f"настройки шлюза: {problem}")
+
+
+def gateway_settings(env: Mapping[str, str] | None = None) -> tuple[GatewaySettings, str | None]:
+    """GW_* для роли gateway и охраны выхода serve(): (настройки, None) или (запасные, текст первой ошибки).
+
+    Запасные — поля, прошедшие проверку по отдельности (GatewaySettings.valid_from_env): опечатка в GW_ORIGIN
+    не сбрасывает STU_NET и SP_CTL_URL к умолчаниям — сверка токенов мест и направления охраны остаются
+    настоящими (ревью А4, I2)."""
+    from .settings import GatewaySettings
+
+    try:
+        return GatewaySettings.from_env(env), None
+    except ValueError as exc:
+        return GatewaySettings.valid_from_env(env), str(exc)
+
+
 def healthcheck(settings: Settings) -> int:
     """Для HEALTHCHECK образа — живость процесса: 0 — /healthz/live ответил 200 (uvicorn жив), иначе 1.
 
@@ -189,9 +230,9 @@ def healthcheck(settings: Settings) -> int:
 
 
 def serve(settings: Settings) -> None:
-    """Точка входа службы: охрана выхода и поток обновления её адресов — до ролей. Плохой bdrv.env — только
-    OpenRouter (и петля), плохие LLM_* — OpenRouter по умолчанию; причины показывают config_error ролей,
-    процесс живёт (Д3а, I2)."""
+    """Точка входа службы: охрана выхода и поток обновления её адресов — до ролей. Плохой bdrv.env — без
+    историана, плохие LLM_* — OpenRouter по умолчанию, плохие GW_* — прошедшие проверку поля и умолчания; причины
+    показывают config_error ролей, процесс живёт (Д3а, I2)."""
     # до охраны (F14): pytds/login.py импортирует ctypes, а import ctypes под хуком на 3.14 падает
     import ctypes  # noqa: F401
     import httpx  # noqa: F401
@@ -208,8 +249,9 @@ def serve(settings: Settings) -> None:
         llm = LlmSettings.from_env()
     except ValueError:
         llm = LlmSettings()                 # причину покажет роль llm (build_roles)
-    install_guard(egress_targets(llm, read_bdrv(settings)[0]))
-    start_refresh()                         # адреса OpenRouter — в кэше до первого вызова (Д4а-R18)
+    gw, _ = gateway_settings()              # запасные при ошибке; причину покажет роль gateway (build_roles)
+    install_guard(egress_targets(llm, gw, read_bdrv(settings)[0]))
+    start_refresh()                         # адреса OpenRouter и sp-ctl — в кэше до первого вызова (Д4а-R18)
     roles = build_roles(settings)
     log.info("серверный слой слушает порт %s, роли: %s",
              settings.CORE_PORT, ", ".join(r.name for r in roles) or "нет")

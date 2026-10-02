@@ -8,7 +8,7 @@ from datetime import timedelta
 import pytest
 
 import pcbk_watchdog.main
-from helpers import (CHROME, SETTINGS, T0, chrome_dom, http_get, http_status, insp, llm_obj, now_utc,
+from helpers import (CHROME, SETTINGS, T0, chrome_dom, gw, http_get, http_status, insp, llm_obj, now_utc,
                      start_test_server)
 from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
@@ -263,7 +263,7 @@ def test_components_file_d4a():                    # было test_components_fi
 def test_components_file_d4b():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
-    assert ids[-4:] == ["core", "core-container", "historian", "llm"]
+    assert ids[-5:] == ["core", "core-container", "historian", "llm", "gateway"]
     cc = comps[ids.index("core-container")]
     assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
            ("container", "pcbk-core", False, "Серверный слой — контейнер")
@@ -271,6 +271,45 @@ def test_components_file_d4b():
     assert cc["unhealthy_detail"] == "процесс core не отвечает на проверку здоровья"
     assert len(cc["unhealthy_detail"]) <= 80
     assert [c["id"] for c in comps if "unhealthy_detail" in c] == ["core-container"]
+
+
+def test_components_file_d5a():
+    comps = load_components("components.json")
+    ids = [c["id"] for c in comps]
+    g = comps[ids.index("gateway")]
+    assert ids[-1] == "gateway"
+    assert (g["title"], g["kind"], g["url"]) == ("Шлюз и вход", "gateway", "http://pcbk-core:8000/health/gateway")
+
+
+def test_gw_stale_setting():
+    assert Settings.from_env({"GW_STALE_S": "20"}).GW_STALE_S == 20             # ручка учения
+    with pytest.raises(ValueError):
+        Settings.from_env({"GW_STALE_S": "0"})
+
+
+def test_gw_stale_default_and_bounds():
+    assert Settings().GW_STALE_S == 120
+    for bad in ({"GW_STALE_S": "-5"}, {"GW_STALE_S": "abc"}, {"GW_STALE_S": "1.5"}):
+        with pytest.raises(ValueError):
+            Settings.from_env(bad)
+    # как HIST_*: проверка шлюза — один HTTP-запрос, правило срока такта порог не затрагивает
+    assert Settings(GW_STALE_S=1).tick_budget_s == Settings().tick_budget_s
+
+
+def test_run_checks_gateway_kind(fake_core):
+    # вид gateway идёт через _check_one в check_gateway с порогом GW_STALE_S; note доходит до снимка
+    assert pcbk_watchdog.main.KINDS["gateway"] == ("url",)
+    assert "gateway" not in pcbk_watchdog.main.LOCAL_KINDS
+    fake_core.set_gateway(gw(age=30, running_n=3))
+    comps = [{"id": "gateway", "title": "Шлюз и вход", "kind": "gateway", "url": fake_core.base + "/health/gateway"}]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert [(c.component, c.title, c.state, c.detail, c.note) for c in checks] == [
+        ("gateway", "Шлюз и вход", "ok", "принимает вход", "работает мест: 3")]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), replace(SETTINGS, GW_STALE_S=20), T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "уборщик простоя молчит — места не засыпают")
+    comps[0]["url"] = "http://127.0.0.1:9/health/gateway"
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "шлюз не отвечает")
 
 
 def test_run_checks_passes_unhealthy_detail():                                  # ревью задачи 3, I1
@@ -333,6 +372,7 @@ def test_load_components_rejects_bad_config(tmp_path):
                 [{"id": "a", "title": "A", "kind": "absent"}, {"id": "a", "title": "B", "kind": "absent"}],
                 [{"id": "a", "title": "A", "kind": "historian"}],                      # нет url
                 [{"id": "a", "title": "A", "kind": "llm"}],                            # нет url
+                [{"id": "a", "title": "A", "kind": "gateway"}],                        # нет url
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": ""}],
                 [{"id": "a", "title": "A", "kind": "http", "url": "http://x/", "ok_detail": 1}],
                 [{"id": "a", "title": "A", "kind": "historian", "url": "http://x/", "ok_detail": "жив"}],

@@ -46,6 +46,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from .. import zones
 from ..data.http_api import bearer_caller
 from ..hooks import safe_path
 from .ledger import Usage
@@ -61,6 +62,8 @@ if TYPE_CHECKING:
 
 CHAT_PATH = "/llm/v1/chat/completions"
 HEALTH_PATH = "/health/llm"
+# поля счёта OpenRouter в /health/llm: только в ADMIN_NETS (pcbk-front, петля, pcbk-egress)
+ACCOUNT_KEYS = ("account_remaining_usd", "key_usage_usd", "key_spent_usd")
 CHAT_DEADLINE_S = 600.0         # 10 мин: 16 000 токенов ответа — при ≥ 27 токенов/с
 LEDGER_DURABLE_S = 2.0          # строка вызова на диске до OpenRouter (Д4а-R19)
 STREAM_SEND_GRACE_S = 5.0       # клиент не читает поток: после срока вызова и этого запаса перекачка снимается
@@ -464,7 +467,7 @@ class _Ask:
 
 
 async def chat(role: "LlmRole", request: Request) -> Response:
-    caller = bearer_caller(request.headers.get("authorization"), role.tokens)
+    caller = bearer_caller(request.headers.get("authorization"), role.tokens, scope=request.scope)
     if caller is None:          # вызывающий неизвестен: без строки журнала вызовов, строка процесса — без токена
         log.warning("outcome=unauthorized channel=llm path=%s", safe_path(request.scope["path"]))
         return refusal_response(role, "unauthorized", headers={"WWW-Authenticate": "Bearer"})
@@ -557,8 +560,13 @@ def llm_router(role: "LlmRole") -> APIRouter:
         return await chat(role, request)
 
     @router.get(HEALTH_PATH)
-    async def health_llm() -> JSONResponse:
-        # без токена: числа, коды и флаги — ни токенов, ни id вызывающих, ни текстов
-        return JSONResponse(role.health_json(role.wallclock()))
+    async def health_llm(request: Request) -> JSONResponse:
+        # без токена: числа, коды и флаги — ни токенов, ни id вызывающих, ни текстов; вне ADMIN_NETS (сети
+        # мест) — ещё и без счёта OpenRouter (Д4б-R23, Д5-R31)
+        body = role.health_json(role.wallclock())
+        if not zones.is_admin(request.scope):
+            for key in ACCOUNT_KEYS:
+                body.pop(key, None)
+        return JSONResponse(body)
 
     return router

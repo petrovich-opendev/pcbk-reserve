@@ -192,11 +192,12 @@ def raw_http():
 @pytest.fixture
 def fake_core():
     """Двойник ручек pcbk-core: /health/historian — set(obj) или set_raw(text),
-    /healthz/data — set_health(code, obj), /health/llm — set_llm(obj) или set_llm_raw(text);
-    прочие пути — 404."""
+    /healthz/data — set_health(code, obj), /health/llm — set_llm(obj) или set_llm_raw(text),
+    /health/gateway — set_gateway(obj) или set_gateway_raw(text); прочие пути — 404."""
     replies = {"/health/historian": (200, "application/json", b"{}"),
                "/healthz/data": (200, "application/json", b'{"ok": true, "detail": "ok"}'),
-               "/health/llm": (200, "application/json", b"{}")}
+               "/health/llm": (200, "application/json", b"{}"),
+               "/health/gateway": (200, "application/json", b"{}")}
 
     def as_json(obj) -> bytes:
         return json.dumps(obj, ensure_ascii=False).encode()   # как у FastAPI: UTF-8, не \u
@@ -223,7 +224,11 @@ def fake_core():
                 {"/healthz/data": (code, "application/json", as_json(obj))}),
             set_llm=lambda obj: replies.update({"/health/llm": (200, "application/json", as_json(obj))}),
             set_llm_raw=lambda text: replies.update(
-                {"/health/llm": (200, "text/plain; charset=utf-8", text.encode())}))
+                {"/health/llm": (200, "text/plain; charset=utf-8", text.encode())}),
+            set_gateway=lambda obj: replies.update(
+                {"/health/gateway": (200, "application/json", as_json(obj))}),
+            set_gateway_raw=lambda text: replies.update(
+                {"/health/gateway": (200, "text/plain; charset=utf-8", text.encode())}))
 
 
 @pytest.fixture

@@ -84,8 +84,8 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d4a остаётся на сервере для отката
-    image: pcbk-reserve/watchdog:d4b
+    # :d4b остаётся на сервере для отката
+    image: pcbk-reserve/watchdog:d5a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -116,6 +116,9 @@ services:
       HIST_WARN_S: ${HIST_WARN_S:-300}
       HIST_FAIL_S: ${HIST_FAIL_S:-900}
       HIST_STALE_S: ${HIST_STALE_S:-140}
+      # строка «Шлюз и вход» (Д5а): метка такта уборщика старше GW_STALE_S — «уборщик простоя молчит»;
+      # не меньше 4 × GW_REAPER_TICK_S у core
+      GW_STALE_S: ${GW_STALE_S:-120}
     volumes:
       # только сертификат: им сторож проверяет, что edge отдаёт именно его
       - type: bind
@@ -160,7 +163,7 @@ services:
           create_host_path: false
     networks: [pcbk-ro]
 
-  # серверному слою (с Д5) — inspect, start и stop только рабочих мест
+  # серверному слою (шлюзу, Д5а) — inspect, start и stop только рабочих мест
   sp-ctl:
     image: wollomatic/socket-proxy:1.13.1
     pull_policy: never
@@ -186,15 +189,16 @@ services:
     networks: [pcbk-ctl]
 
   # Серверный слой: роль «данные» (Д3а) — каталог тегов и свежесть историана, инструменты по
-  # токену и журнал событий (Д3б); роль llm (Д4а) — прокси к OpenRouter с бюджетом и журналом вызовов.
-  # Учётные данные историана, ключи OpenRouter и хеши токенов — только файлами-секретами, белый
-  # список — файлом только для чтения. В сеть выхода pcbk-egress — только он (Д3а-R2); в сети мест —
-  # на .2 (Д4б-R23: места ходят к /llm и /mcp по имени core из extra_hosts), pcbk-ctl — с Д5.
-  # Порт 8000 не публикуется.
+  # токену и журнал событий (Д3б); роль llm (Д4а) — прокси к OpenRouter с бюджетом и журналом вызовов;
+  # роль gateway (Д5а) — вход студентов и их места через sp-ctl (pcbk-ctl, Д5-R31).
+  # Учётные данные историана, ключи OpenRouter, хеши токенов и пароли мест — только файлами-секретами,
+  # белый список — файлом только для чтения. В сеть выхода pcbk-egress — только он (Д3а-R2); в сети мест —
+  # на .2 (Д4б-R23: места ходят к /llm и /mcp по имени core из extra_hosts). Ручки шлюза отвечают только
+  # на адресе core в pcbk-front (Д5-R31). Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d4a остаётся на сервере для отката
-    image: pcbk-reserve/core:d4b
+    # :d4b остаётся на сервере для отката
+    image: pcbk-reserve/core:d5a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -205,7 +209,7 @@ services:
     mem_limit: 512m                 # тела запросов к модели — до 1 МиБ, разбор JSON от десяти мест
     pids_limit: 128
     # TCP Fast Open выключен (Д3б-R6): TCP не уйдёт мимо connect, который проверяет охрана выхода в процессе.
-    # Пересылка выключена (Д4б-R23): core в двенадцати сетях не мост между местами и к сети выхода — второй
+    # Пересылка выключена (Д4б-R23): core в тринадцати сетях не мост между местами и к сети выхода — второй
     # слой; первый — у места нет маршрута по умолчанию (Д2). По умолчанию netns контейнера наследует 1 хоста
     sysctls: {net.ipv4.tcp_fastopen: "0", net.ipv4.ip_forward: "0"}
     restart: unless-stopped
@@ -223,6 +227,18 @@ services:
       DRILL_LLM: ${DRILL_LLM:-}
       LLM_OPS_SHARE_USD: ${LLM_OPS_SHARE_USD:-100}
       LLM_KEY_DEDICATED: ${LLM_KEY_DEDICATED:-on}
+      # шлюз (Д5а). STU_NET — те же сети мест, что ниже: по нему core сверяет токен места с его сетью
+      # (Ш25) и зовёт место на STU.N.3; без него при нестандартной подсети отказ получило бы каждое место
+      STU_NET: ${STU_NET:-172.31}
+      # публичный origin страницы входа https://<имя сертификата>:8443; пусто — запись проходит только
+      # с Sec-Fetch-Site: same-origin (его шлёт браузер), по Origin — никогда
+      GW_ORIGIN: ${GW_ORIGIN:-}
+      # простой места до сна и такт уборщика, с (такт — не больше половины простоя)
+      GW_IDLE_STOP_S: ${GW_IDLE_STOP_S:-1800}
+      GW_REAPER_TICK_S: ${GW_REAPER_TICK_S:-30}
+      # учения: freeze_reaper — уборщик замирает после первого такта, bad_place_pw — шлюз портит пароль
+      # места; пусто — нет
+      DRILL_GATEWAY: ${DRILL_GATEWAY:-}
     volumes:
       - {type: bind, source: "${DATA_DIR:?DATA_DIR не задан}/whitelist.txt", target: /app/data/whitelist.txt,
          read_only: true, bind: {create_host_path: false}}
@@ -234,9 +250,25 @@ services:
       - {source: llm-tokens, target: llm-tokens}
       - {source: openrouter-key, target: openrouter.key}
       - {source: openrouter-mgmt-key, target: openrouter-mgmt.key}
+      # пароли мест знает только шлюз (Д5а): Authorization к месту ставит он; новый файл —
+      # up -d --no-build --force-recreate core
+      - {source: student-01-pw, target: student-01.pw}
+      - {source: student-02-pw, target: student-02.pw}
+      - {source: student-03-pw, target: student-03.pw}
+      - {source: student-04-pw, target: student-04.pw}
+      - {source: student-05-pw, target: student-05.pw}
+      - {source: student-06-pw, target: student-06.pw}
+      - {source: student-07-pw, target: student-07.pw}
+      - {source: student-08-pw, target: student-08.pw}
+      - {source: student-09-pw, target: student-09.pw}
+      - {source: student-10-pw, target: student-10.pw}
+    # журнал с поворотом: строки шлюза и отказов пишутся на каждый вход — диск сервера не растёт без предела
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
     networks:
       pcbk-front: {}
       pcbk-egress: {ipv4_address: 172.31.250.82}
+      # клиент sp-ctl (Д5-R31): -allowfrom=pcbk-core разрешает имя в этой сети
+      pcbk-ctl: {}
       # сети мест: адрес .2 — тот, что у мест в extra_hosts (core:STU.N.2)
       pcbk-stu-01: {ipv4_address: "${STU_NET:-172.31}.1.2"}
       pcbk-stu-02: {ipv4_address: "${STU_NET:-172.31}.2.2"}
@@ -433,7 +465,7 @@ networks:
     ipam:
       config:
         - subnet: 172.31.250.48/28
-  # sp-ctl (с Д5 — и серверный слой)
+  # sp-ctl и серверный слой — его клиент (Д5а)
   pcbk-ctl:
     name: pcbk-ctl
     driver: bridge

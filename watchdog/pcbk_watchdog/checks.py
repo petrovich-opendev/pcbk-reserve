@@ -1,5 +1,5 @@
 """Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана,
-LLM-прокси и бюджет."""
+LLM-прокси и бюджет, шлюз и вход."""
 import http.client
 import io
 import json
@@ -96,6 +96,18 @@ USD_NOISE = 1e-9
 USD_TINY = Decimal("0.0001")
 # что пишет core в ledger_error (задача 6 Д4а): dropped — операция журнала брошена, write — запись не идёт
 LEDGER_ERRORS = frozenset({"dropped", "write"})
+
+# строка «Шлюз и вход» (задача А1 Д5а, Д5-R29); счётчики /health/gateway — за час в памяти core
+GW_DOWN_DETAIL = "шлюз не отвечает"
+GW_OFF_CONTRACT_DETAIL = "шлюз ответил не по договору"
+# столько неудачных пробуждений за час без единой удачи — места не поднимаются вовсе
+WAKE_FAILS_FAIL = 3
+# столько неверных паролей за час — предупреждение
+LOGIN_FAILS_WARN = 30
+# договор /health/gateway (задача А3 Д5а): sp_ctl — Literal["ok", "down", "unknown"];
+# drill — "" или режим DRILL_GATEWAY. Прочее — ответ не по договору
+GW_SP_CTL_STATES = frozenset({"ok", "down", "unknown"})
+GW_DRILL_MODES = frozenset({"freeze_reaper", "bad_place_pw"})
 
 
 @dataclass(frozen=True)
@@ -647,6 +659,139 @@ def check_llm(component: str, title: str, url: str, now: datetime,
         note = llm_note(parsed)
     except (KeyError, TypeError, ValueError, ArithmeticError):   # ArithmeticError — Overflow, Decimal
         return Check(component, title, "fail", LLM_OFF_CONTRACT_DETAIL)
+    return Check(component, title, state, detail, note)
+
+
+def _gw_count(obj: dict, key: str, *, optional: bool = False) -> int | None:
+    """Счётчик шлюза: целое не меньше нуля; optional — ключа нет, тогда None (ключи Д5б).
+
+    Свой, а не правка общего _count: договор LlmReply (Д4а) этим не меняется.
+    """
+    if optional and key not in obj:
+        return None
+    value = _count(obj, key)
+    if value < 0:
+        raise ValueError(f"{key} — меньше нуля")
+    return value
+
+
+@dataclass(frozen=True)
+class GatewayReply:
+    """Поля ответа /health/gateway, которые читает сторож; типы проверены при разборе.
+
+    Ключи Д5а обязательны. Ключи Д5б (refused_1h, streams, stream_broken_1h, upstream_failed_1h) —
+    нет: во время выкладки сторож может читать core :d5a; тогда они None.
+    """
+    checked_at: datetime | None
+    config_error: str | None
+    store_ok: bool
+    sp_ctl: str
+    running_n: int
+    ready_n: int
+    wake_ok_1h: int
+    wake_failed_1h: int
+    stop_failed_1h: int
+    place_auth_failed_1h: int
+    logins_failed_1h: int
+    origin_refused_1h: int
+    login_busy_1h: int
+    cookies_duplicate_1h: int
+    drill: str
+    refused_1h: int | None
+    streams: int | None
+    stream_broken_1h: int | None
+    upstream_failed_1h: int | None
+
+    @classmethod
+    def parse(cls, reply) -> "GatewayReply":
+        """Ответ не по договору — только ValueError (Ш8): не объект JSON, нет ключа Д5а, тип не тот,
+        счётчик меньше нуля, sp_ctl не из GW_SP_CTL_STATES, пустая причина config_error, drill не ""
+        и не из GW_DRILL_MODES."""
+        if not isinstance(reply, dict):
+            raise ValueError("ответ — не объект JSON")
+        try:
+            r = cls(
+                checked_at=_time(reply, "checked_at"),   # не ISO — ValueError из fromisoformat
+                config_error=_text(reply, "config_error", nullable=True),
+                store_ok=_flag(reply, "store_ok"), sp_ctl=_text(reply, "sp_ctl"),
+                running_n=_gw_count(reply, "running_n"), ready_n=_gw_count(reply, "ready_n"),
+                wake_ok_1h=_gw_count(reply, "wake_ok_1h"), wake_failed_1h=_gw_count(reply, "wake_failed_1h"),
+                stop_failed_1h=_gw_count(reply, "stop_failed_1h"),
+                place_auth_failed_1h=_gw_count(reply, "place_auth_failed_1h"),
+                logins_failed_1h=_gw_count(reply, "logins_failed_1h"),
+                origin_refused_1h=_gw_count(reply, "origin_refused_1h"),
+                login_busy_1h=_gw_count(reply, "login_busy_1h"),
+                cookies_duplicate_1h=_gw_count(reply, "cookies_duplicate_1h"),
+                drill=_text(reply, "drill"),
+                refused_1h=_gw_count(reply, "refused_1h", optional=True),
+                streams=_gw_count(reply, "streams", optional=True),
+                stream_broken_1h=_gw_count(reply, "stream_broken_1h", optional=True),
+                upstream_failed_1h=_gw_count(reply, "upstream_failed_1h", optional=True))
+        except (KeyError, TypeError) as e:
+            raise ValueError(f"ответ шлюза не по договору: {type(e).__name__} {e}") from e
+        if r.sp_ctl not in GW_SP_CTL_STATES:
+            raise ValueError("неизвестное состояние связи с sp-ctl")
+        if r.config_error is not None and not r.config_error.strip():
+            raise ValueError("ошибка настройки без причины")   # иначе строка «ошибка настройки:» без слов
+        if r.drill and r.drill not in GW_DRILL_MODES:
+            raise ValueError("неизвестный режим учений")
+        return r
+
+
+def gateway_verdict(r: GatewayReply, now: datetime, stale_s: int) -> tuple[State, str, str]:
+    """Первая подходящая строка таблицы задачи А1 Д5а: (состояние, detail, note без учений).
+
+    В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
+    """
+    if r.config_error is not None:
+        return "fail", _reason("ошибка настройки: " + r.config_error), ""
+    if not r.store_ok:
+        return "fail", "учётные записи недоступны", ""
+    if r.checked_at is None:
+        return "unknown", "уборщик простоя ещё не проходил", ""
+    if (now - r.checked_at).total_seconds() > stale_s:
+        return "fail", "уборщик простоя молчит — места не засыпают", ""
+    if r.sp_ctl == "down":
+        return "fail", "нет связи с прокси сокета — места не будятся", ""
+    if r.wake_failed_1h >= WAKE_FAILS_FAIL and r.wake_ok_1h == 0:
+        return "fail", "рабочие места не поднимаются", f"{r.wake_failed_1h} за час"
+    for count, detail in ((r.place_auth_failed_1h, "рабочее место не приняло пароль шлюза"),
+                          (r.cookies_duplicate_1h, "подброшена cookie сессии"),
+                          (r.origin_refused_1h, "вход отклоняется проверкой источника — проверьте GW_ORIGIN"),
+                          (r.login_busy_1h, "вход перегружен"),
+                          (r.wake_failed_1h, "рабочее место не поднялось по входу"),
+                          (r.stop_failed_1h, "уборщик не смог усыпить место")):
+        if count > 0:
+            return "warn", detail, f"{count} за час"
+    if r.logins_failed_1h >= LOGIN_FAILS_WARN:
+        return "warn", "много неверных паролей", f"{r.logins_failed_1h} за час"
+    return "ok", "принимает вход", f"работает мест: {r.running_n}"
+
+
+def check_gateway(component: str, title: str, url: str, now: datetime, stale_s: int,
+                  timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
+    """Шлюз и вход по ручке /health/gateway службы (только числа и тексты, без логинов и номеров мест).
+
+    Нет ответа, HTTP ≠ 200 или не JSON — «шлюз не отвечает»; JSON не по договору — свой текст (Ш8).
+    При учениях к note любой строки таблицы первым добавляется «учения: <режим>».
+    """
+    try:
+        status, body = _http_get(url, timeout, lambda code: code == 200)
+    except (OSError, http.client.HTTPException):
+        return Check(component, title, "fail", GW_DOWN_DETAIL)
+    if status != 200:
+        return Check(component, title, "fail", GW_DOWN_DETAIL)
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
+        return Check(component, title, "fail", GW_DOWN_DETAIL)
+    try:
+        parsed = GatewayReply.parse(reply)
+    except ValueError:
+        return Check(component, title, "fail", GW_OFF_CONTRACT_DETAIL)
+    state, detail, note = gateway_verdict(parsed, now, stale_s)
+    if parsed.drill:
+        note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
     return Check(component, title, state, detail, note)
 
 
