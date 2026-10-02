@@ -610,6 +610,37 @@ async def test_failing_expires_without_calls(svc):                              
     assert s.tools_stats()["failing"] == []
 
 
+async def test_failing_streak_reset_by_refusal_midway(svc):                      # ревью А1, M-1: «любой другой исход»
+    s, fake = svc
+    fake.fail = HistorianError("query", "x")
+    for _ in range(FAIL_STREAK - 1):
+        await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert (await s.tag_now("student-01", "http", ["20FAKE_404_PV"]))["status"] == "refused"      # без SQL — обнуляет
+    await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert [e.outcome for e in s.role.events.recent()][:2] == ["error", "refused"]
+    assert s.tools_stats()["failing"] == []                                       # R83: серия — снова с одной ошибки
+
+
+async def test_failing_sorted_by_name(svc):                                      # ревью А1, M-2: по алфавиту, не по порядку
+    s, fake = svc
+    fake.fail = HistorianError("query", "x")
+    for tool in ("tag_period", "tag_now"):                                        # порядок вставки дал бы обратный
+        for _ in range(FAIL_STREAK):
+            if tool == "tag_period":
+                await s.tag_period("student-01", "http", ["20FAKE_001_PV"], period="prev_shift")
+            else:
+                await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert s.tools_stats()["failing"] == ["tag_now", "tag_period"]
+
+
+async def test_drill_before_args_and_catalog(tmp_path):                          # ревью А1, M-3: сразу после частоты
+    s, fake = make_service(tmp_path, settings=replace(SETTINGS, DRILL_DATA="tool_error"))
+    for tags in (["20FAKE_404_PV"], [" "], []):                                  # отказ каталога и аргументов — не раньше
+        r = await s.tag_now("ops", "http", tags)
+        assert (r["status"], r["message"]) == ("error", ERROR_MESSAGE) and "items" not in r, tags
+    assert fake.calls == [] and s.role.events.recent()[0].summary == DRILL_SUMMARY
+
+
 async def test_drill_tool_error_no_sql(tmp_path):                                 # Review Focus 3
     s, fake = make_service(tmp_path, settings=replace(SETTINGS, DRILL_DATA="tool_error"))
     for _ in range(FAIL_STREAK):
