@@ -46,7 +46,8 @@ render_match — таблица Markdown с псевдонимами ТЕГ-n, �
 один match, прогон дошёл до конца плана.
 cases_from_agent — теги окна (I7): живые аналоговые из раздела «Теги узла» самого нового видимого агента места
 (до трёх), добор живыми из catalog_search("_pv", 50); тег состояния — живой дискретный из тегов агента, иначе из
-"_run", иначе из "_opn". probe_calc — проба форм окна (Д9-R93): только коды, без тегов и значений.
+"_run", иначе из "_opn". probe_calc — проба форм окна (Д9-R93): только коды, без тегов и значений. И там, и там тег
+без данных за период (элемент no_data) пропускается — берётся следующий живой (I-3 итогового ревью Д9б).
 """
 from __future__ import annotations
 
@@ -114,6 +115,10 @@ MAX_ANALOG = 3
 SEARCH_LIMIT = 50
 LOOKUP_LIMIT = 10
 PROBE_POINTS = 8
+# I-3 итогового ревью Д9б: «живой» — лишь ненулевое значение в Live; тег без истории за период (элемент no_data)
+# пропускается — у пробы и у случаев окна не больше DATA_SKIP_MAX таких тегов на вид, дальше проба «не решена»
+DATA_SKIP_MAX = 3
+CASE_DATA = {"analog": ("tag_period", {"period": "last_24h"}), "discrete": ("calc_runtime", {"period": "yesterday"})}
 GRID_SLACK_S = 1.0
 SUM_HOURS_SLACK = 0.01
 SPAN_DAY_HOURS = ("08:00", "12:00")
@@ -714,39 +719,65 @@ def _agent_tags(stand: Stand, place: int) -> list[str]:
     return node_tags(stand.agent_file(place, newest["name"]))
 
 
+def _no_data(stand: Stand, tool: str, tag: str, args: dict, sleep: Callable[[float], None]) -> bool:
+    """Элемент тега за период — no_data (истории нет); прочие отказы тег не меняют: их покажет прогон (service)."""
+    out = calc_patient(stand, tool, {"tags": [tag], **args}, sleep=sleep)
+    return _probe_item(out, tag)[0] == "no_data"
+
+
 def cases_from_agent(stand: Stand, source_place: int, *, sleep: Callable[[float], None] = time.sleep
-                     ) -> tuple[list[str], list[str], int]:
-    """Теги окна (I7): (аналоговые, состояния, сколько аналоговых — из агента). live и kind — из catalog_search по
-    имени тега; аналоговые — до трёх, добор из "_pv"; тег состояния — из агента, иначе "_run", иначе "_opn"."""
+                     ) -> tuple[list[str], list[str], int, int]:
+    """Теги окна (I7): (аналоговые, состояния, сколько аналоговых — из агента, сколько тегов пропущено без данных).
+    live и kind — из catalog_search по имени тега; аналоговые — до трёх, добор из "_pv"; тег состояния — из агента,
+    иначе "_run", иначе "_opn". Тег берётся, только если у него есть данные за период (I-3 итогового ревью Д9б:
+    аналоговый — tag_period за last_24h, состояния — calc_runtime за yesterday, элемент не no_data); тегов без данных —
+    не больше DATA_SKIP_MAX на вид."""
     found: dict[str, dict] = {}
     for tag in _agent_tags(stand, source_place):
         _, matches = _search(stand, tag, LOOKUP_LIMIT, sleep)
         hit = next((m for m in matches if str(m.get("tag", "")).upper() == tag.upper()), None)
         if hit is not None:
             found.setdefault(hit["tag"].upper(), hit)
-    analog = [m["tag"] for m in found.values() if _live(m, "analog")][:MAX_ANALOG]
-    from_agent = len(analog)
-    if len(analog) < MAX_ANALOG:
-        for m in _search(stand, "_pv", SEARCH_LIMIT, sleep)[1]:
-            if len(analog) >= MAX_ANALOG:
+    skipped: Counter = Counter()
+    checked: set[str] = set()
+
+    def with_data(kind: str, tags: Iterable[str], taken: list[str], need: int) -> list[str]:
+        tool, args = CASE_DATA[kind]
+        for tag in tags:
+            if len(taken) >= need or skipped[kind] >= DATA_SKIP_MAX:
                 break
-            if _live(m, "analog") and m["tag"].upper() not in {t.upper() for t in analog}:
-                analog.append(m["tag"])
-    discrete = [m["tag"] for m in found.values() if _live(m, "discrete")][:1]
+            if tag.upper() in checked:
+                continue
+            checked.add(tag.upper())
+            if _no_data(stand, tool, tag, args, sleep):
+                skipped[kind] += 1
+            else:
+                taken.append(tag)
+        return taken
+
+    def live(matches: Iterable[dict], kind: str) -> list[str]:
+        return [m["tag"] for m in matches if _live(m, kind)]
+
+    analog = with_data("analog", live(found.values(), "analog"), [], MAX_ANALOG)
+    from_agent = len(analog)
+    if len(analog) < MAX_ANALOG and skipped["analog"] < DATA_SKIP_MAX:
+        with_data("analog", live(_search(stand, "_pv", SEARCH_LIMIT, sleep)[1], "analog"), analog, MAX_ANALOG)
+    discrete = with_data("discrete", live(found.values(), "discrete"), [], 1)
     for query in ("_run", "_opn"):
-        if discrete:
+        if discrete or skipped["discrete"] >= DATA_SKIP_MAX:
             break
-        discrete = [m["tag"] for m in _search(stand, query, SEARCH_LIMIT, sleep)[1] if _live(m, "discrete")][:1]
-    return analog, discrete, from_agent
+        with_data("discrete", live(_search(stand, query, SEARCH_LIMIT, sleep)[1], "discrete"), discrete, 1)
+    return analog, discrete, from_agent, sum(skipped.values())
 
 
-def _first_live(stand: Stand, query: str, kind: str, sleep: Callable[[float], None]) -> tuple[str, str | None]:
-    """(код, тег): поиск отказал — его статус; живого тега нужного вида нет — no_tag (m-7)."""
+def _live_tags(stand: Stand, query: str, kind: str, sleep: Callable[[float], None]) -> tuple[str, list[str]]:
+    """(код, живые теги вида по порядку поиска): поиск отказал — его статус; живого тега нужного вида нет — no_tag
+    (m-7)."""
     status, matches = _search(stand, query, SEARCH_LIMIT, sleep)
     if status != "ok":
-        return status, None
-    tag = next((m["tag"] for m in matches if _live(m, kind)), None)
-    return ("ok", tag) if tag is not None else ("no_tag", None)
+        return status, []
+    tags = [m["tag"] for m in matches if _live(m, kind)]
+    return ("ok", tags) if tags else ("no_tag", [])
 
 
 def _probe_item(out: Any, tag: str) -> tuple[str | None, dict]:
@@ -795,24 +826,28 @@ def _runtime_code(out: dict, tag: str) -> str:
             f"sum_hours_ok={'да' if ok else 'нет'}")
 
 
+def _probe_one(stand: Stand, name: str, query: str, kind: str, tool: str, args: dict,
+               code: Callable[[dict, str], str], sleep: Callable[[float], None]) -> str:
+    """Код пробы инструмента: живые теги вида по порядку поиска, пока элемент — no_data (истории за период нет), не
+    больше DATA_SKIP_MAX вызовов; no_data у всех — «<name>: unresolved» (проба не решена, I-3 итогового ревью Д9б)."""
+    status, tags = _live_tags(stand, query, kind, sleep)
+    if not tags:
+        return f"{name}: {status}"
+    for tag in tags[:DATA_SKIP_MAX]:
+        out = calc_patient(stand, tool, {"tags": [tag], **args}, sleep=sleep)
+        if _probe_item(out, tag)[0] != "no_data":
+            return code(out, tag)
+    return f"{name}: unresolved"
+
+
 def probe_calc(stand: Stand, *, sleep: Callable[[float], None] = time.sleep) -> list[str]:
-    """Проба форм окна (Д9-R93): ряд last_8h на 8 точек по первому живому аналоговому из "_pv" и наработка за вчера
-    по первому живому тегу состояния из "_run". Только коды — тегов и значений нет."""
-    codes = []
-    tag_status, tag = _first_live(stand, "_pv", "analog", sleep)
-    if tag is None:
-        codes.append(f"series: {tag_status}")
-    else:
-        out = calc_patient(stand, "tag_series", {"tags": [tag], "period": "last_8h", "points": PROBE_POINTS},
-                           sleep=sleep)
-        codes.append(_series_code(out, tag))
-    tag_status, tag = _first_live(stand, "_run", "discrete", sleep)
-    if tag is None:
-        codes.append(f"runtime: {tag_status}")
-    else:
-        out = calc_patient(stand, "calc_runtime", {"tags": [tag], "period": "yesterday"}, sleep=sleep)
-        codes.append(_runtime_code(out, tag))
-    return codes
+    """Проба форм окна (Д9-R93): ряд last_8h на 8 точек по живому аналоговому из "_pv" и наработка за вчера по живому
+    тегу состояния из "_run" — первому с данными за период (до DATA_SKIP_MAX тегов; у всех no_data — unresolved).
+    Только коды — тегов и значений нет."""
+    return [_probe_one(stand, "series", "_pv", "analog", "tag_series", {"period": "last_8h", "points": PROBE_POINTS},
+                       _series_code, sleep),
+            _probe_one(stand, "runtime", "_run", "discrete", "calc_runtime", {"period": "yesterday"}, _runtime_code,
+                       sleep)]
 
 
 # --- конфиг окна и файл случаев ---

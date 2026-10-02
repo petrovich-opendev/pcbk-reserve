@@ -42,13 +42,15 @@ match-cases MCONFIG | match MCONFIG [--only basic] | probe-calc MCONFIG.
 «Агент = калькулятор» (Д9-R91, Д9-R93; MCONFIG — MatchConfig JSON, $JOB/pcbk-d9/live/match.config.json: stand,
 place, login, cases, out_dir, turn_timeout_s, source; пароль учётки — secrets/<login>.pw рядом со stand.json):
 - match-cases MCONFIG — случаи окна (cases_from_agent, I7) в файл cases (0600); печатает только «случаев N: аналоговых
-  a (из агента k), состояний d»;
+  a (из агента k), состояний d» и, если живые теги без данных за период пропущены (I-3 итога Д9б), «; без данных за
+  период пропущено m»;
 - match MCONFIG [--only basic] — прогон агента проверки на месте place по файлу cases; печатает итог render_match
   (псевдонимы ТЕГ-n, без тегов и чисел) и строку «успех: да | нет (коды)», пишет OUT/match.md и OUT/match.jsonl
   (0600). Код 0 — успех; 3 — не успех (match_failures: жёсткие, service, вид без match, прогон оборван до конца
   плана). --only basic — без видов profile_last_8h и runtime_yesterday (проба не прошла); режимов сухого прогона нет
   (I6);
-- probe-calc MCONFIG — проба форм окна: печатает только коды «series: …» и «runtime: …».
+- probe-calc MCONFIG — проба форм окна: печатает только коды «series: …» и «runtime: …» (unresolved — у живых тегов
+  вида нет данных за период: проба не решена).
 
 Коды main: 0 — успех, 2 — RunRefused, 3 — автотест match не успех, 1 — прочее. Ошибка печатается только классом
 исключения (и кодом RunRefused), без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без
@@ -326,10 +328,10 @@ def _match_cases(config: Path) -> int:
     mcfg = load_match_config(config)
     if mcfg.source_place is None:
         raise ValueError("конфиг: source — место-источник случаев не задано")
-    analog, discrete, from_agent = cases_from_agent(match_stand(mcfg), mcfg.source_place)
+    analog, discrete, from_agent, skipped = cases_from_agent(match_stand(mcfg), mcfg.source_place)
     write_case_tags(mcfg.cases, analog, discrete)
     print(f"случаев {case_count(analog, discrete)}: аналоговых {len(analog)} (из агента {from_agent}), "
-          f"состояний {len(discrete)}")
+          f"состояний {len(discrete)}" + (f"; без данных за период пропущено {skipped}" if skipped else ""))
     return 0 if analog or discrete else 1
 
 

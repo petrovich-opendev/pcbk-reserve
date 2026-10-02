@@ -2,6 +2,7 @@
 import json
 import os
 import stat
+import sys
 import time
 from datetime import date, datetime, timedelta
 
@@ -337,9 +338,9 @@ def test_probe_calc_uneven_and_sum_hours():                                     
 
 
 def test_cases_from_agent_live_and_topup(fake_stand, tmp_path, capsys, monkeypatch):    # Review Focus 3, I7
-    analog, discrete, from_agent = cases_from_agent(fake_stand, SOURCE)
+    analog, discrete, from_agent, skipped = cases_from_agent(fake_stand, SOURCE)
     assert analog == ["20FAKE_201_PV", "20FAKE_202_PV", "20FAKE_104_PV"]
-    assert discrete == ["20FAKE_210_RUN"] and from_agent == 1
+    assert discrete == ["20FAKE_210_RUN"] and (from_agent, skipped) == (1, 0)
     cfg = _write_config(tmp_path)
     _patch_cli(monkeypatch, fake_stand)
     from pcbk_bench.__main__ import main
@@ -354,9 +355,9 @@ def test_cases_from_agent_discrete_from_search():                               
     stand = FakeStand(matches=CATALOG + [{"tag": "20FAKE_211_OPN", "kind": "discrete", "live": True, "unit": ""}])
     stand.add_agent(SOURCE, "uzel-a")
     stand.agent_files = {(SOURCE, "uzel-a"): _agent_text(["20FAKE_104_PV"])}
-    analog, discrete, from_agent = cases_from_agent(stand, SOURCE)
-    assert (analog, discrete, from_agent) == (["20FAKE_104_PV", "20FAKE_201_PV", "20FAKE_202_PV"],
-                                              ["20FAKE_210_RUN"], 1)
+    analog, discrete, from_agent, skipped = cases_from_agent(stand, SOURCE)
+    assert (analog, discrete, from_agent, skipped) == (["20FAKE_104_PV", "20FAKE_201_PV", "20FAKE_202_PV"],
+                                                       ["20FAKE_210_RUN"], 1, 0)
     stand.matches = [m for m in stand.matches if m["tag"] != "20FAKE_210_RUN"]   # «_run» пуст — «_opn»
     assert cases_from_agent(stand, SOURCE)[1] == ["20FAKE_211_OPN"]
 
@@ -597,3 +598,58 @@ def test_cli_match_cap_refusals_are_not_success(fake_stand, tmp_path, capsys, mo
     out = capsys.readouterr().out
     assert "match 0; жёстких (неуспех 4) 0; service 0; нет данных 0; прочих 6" in out
     assert out.rstrip().endswith(", cut)")
+
+
+
+# --- I-3 итогового ревью: «живой» ≠ «с историей» ---
+
+NO_HISTORY = {"20FAKE_201_PV", "20FAKE_210_RUN"}                                  # живые, но истории за период нет
+CATALOG_I3 = CATALOG + [{"tag": "20FAKE_211_RUN", "kind": "discrete", "live": True, "unit": ""}]
+
+
+def _no_history(answer):
+    """Ответ калькулятора: у тега из NO_HISTORY элемент no_data (partial, без чисел), как у службы."""
+    def call(args):
+        tag = args["tags"][0]
+        if tag in NO_HISTORY:
+            return {"tool": "x", "status": "partial", "notes": [],
+                    "items": [{"tag": tag, "status": "no_data", "text": "за период данных нет"}]}
+        return answer(args)
+    return call
+
+
+def _stand_i3():
+    return FakeStand(matches=CATALOG_I3, calc_status={t: "no_data" for t in NO_HISTORY},
+                     calc_answers={"tag_series": _no_history(_series), "calc_runtime": _no_history(_runtime)})
+
+
+def test_probe_skips_live_tag_without_history():                                  # I-3
+    stand = _stand_i3()
+    assert probe_calc(stand) == ["series: ok rows=8/8 grid=even ends=yes",
+                                 "runtime: ok states=2 covered=100.0 sum_hours_ok=да"]
+    probed = [(tool, args["tags"][0]) for tool, args in stand.calc_calls if tool != "catalog_search"]
+    assert probed == [("tag_series", "20FAKE_201_PV"), ("tag_series", "20FAKE_202_PV"),
+                      ("calc_runtime", "20FAKE_210_RUN"), ("calc_runtime", "20FAKE_211_RUN")]
+
+
+def test_probe_no_history_anywhere_is_unresolved(monkeypatch):                    # I-3: «не решена», не «не прошла»
+    monkeypatch.setattr(sys.modules[__name__], "NO_HISTORY",
+                        {"20FAKE_201_PV", "20FAKE_202_PV", "20FAKE_104_PV", "20FAKE_210_RUN", "20FAKE_211_RUN"})
+    stand = _stand_i3()
+    assert probe_calc(stand) == ["series: unresolved", "runtime: unresolved"]
+    assert sum(1 for tool, _ in stand.calc_calls if tool == "tag_series") == 3   # не больше трёх тегов на вид
+
+
+def test_cases_skip_live_tags_without_history(tmp_path, capsys, monkeypatch):     # I-3: добор случаев
+    stand = _stand_i3()
+    stand.add_agent(SOURCE, "uzel")
+    stand.agent_files = {(SOURCE, "uzel"): _agent_text(["20FAKE_201_PV", "20FAKE_106_SP", "20FAKE_210_RUN"])}
+    assert cases_from_agent(stand, SOURCE) == (["20FAKE_202_PV", "20FAKE_104_PV"], ["20FAKE_211_RUN"], 0, 2)
+    checked = [args["tags"][0] for tool, args in stand.calc_calls if tool in ("tag_period", "calc_runtime")]
+    assert checked == ["20FAKE_201_PV", "20FAKE_202_PV", "20FAKE_104_PV", "20FAKE_210_RUN", "20FAKE_211_RUN"]
+    cfg = _write_config(tmp_path)
+    _patch_cli(monkeypatch, stand)
+    from pcbk_bench.__main__ import main
+    assert main(["match-cases", str(cfg)]) == 0
+    assert capsys.readouterr().out.strip() == ("случаев 13: аналоговых 2 (из агента 0), состояний 1; "
+                                               "без данных за период пропущено 2")
