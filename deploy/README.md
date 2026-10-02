@@ -104,18 +104,35 @@ mv -T chat chat.bad-<день> && mv -T chat.<прошлый день> chat
 
 ## Рабочие места (с Д2)
 
-1. Секреты — на сервере, в чат и git не попадают:
+1. Секреты, тома и каталоги агентов мест — на сервере; секреты в чат и git не попадают. С Д7а каталог агентов
+   (`AGENTS_DIR`) принадлежит uid 10003 (`pcbk-core`), корень — `0700`: с хоста в него не пишут (`install -d`
+   на `$AD` и `$AD/student-NN` дал бы EPERM), каталоги мест заводит `core`:
    ```bash
-   cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && AD=$(grep '^AGENTS_DIR=' .env | cut -d= -f2) &&
-   [ -n "$SD" ] && [ -n "$AD" ] && umask 077 && install -d -m 0700 "$SD" "$AD" &&
+   cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) &&
+   [ -n "$SD" ] && umask 077 && install -d -m 0700 "$SD" &&
    for n in $(seq -w 1 10); do
      for s in pw llm-token; do f=$SD/student-$n.$s
        [ -e "$f" ] || { openssl rand -hex 24 | tr -d '\n' > "$f"; chmod 0444 "$f"; }   # не перезаписывать
      done
-     install -d -m 0755 "$AD/student-$n"
      for k in state work; do docker volume create --label pcbk.role=student "pcbk-student-$n-$k" >/dev/null; done
+     docker exec -u 10003 pcbk-core install -d -m 0755 "/srv/agents/student-$n"
    done
+   docker exec pcbk-core sh -c 'stat -c "%u %a %n" /srv/agents /srv/agents/student-*'   # шаблон раскрывает core
    ```
+   Ожидается: `10003 700 /srv/agents` и `10003 755` у `student-01…10`.
+
+   **Первая выкладка на чистый сервер** (каталога агентов и `core` ещё нет) — прежние строки: в цикле выше
+   `install -d -m 0700 "$SD" "$AD"` (с `AD=$(grep '^AGENTS_DIR=' .env | cut -d= -f2)` и `[ -n "$AD" ]`) и
+   `install -d -m 0755 "$AD/student-$n"` вместо `docker exec`; затем — смена владельца каталога агентов. Её
+   делает одноразовый контейнер образа `core` от root — по сути `sudo`, поэтому только с «да» владельца; прежние
+   `uid:gid` и права — снимком в журнал дня, по нему откат (раздел «Откат», «Д7а — назад к Д6б»):
+   ```bash
+   stat -c '%u:%g %a %n' "$AD" "$AD"/student-*        # снимок — в журнал дня
+   docker run --rm --network none --user 0 -v "$AD:/a" --entrypoint sh pcbk-reserve/core:<день> \
+     -c 'chown 10003:10003 /a /a/student-* && chmod 0700 /a && chmod 0755 /a/student-* && install -d -o 10003 -g 10003 -m 0700 /a/quarantine /a/archive && ls -lan /a'
+   ```
+   Ожидается: `10003 10003` у корня, `student-01…10`, `quarantine` и `archive`. Дальше каталог с хоста не
+   читается: `stat`, `find` и `ls` — через `docker exec pcbk-core`.
 2. Места создаются, но не стартуют:
    `docker compose --profile students create --no-build $(printf 'student-%02d ' $(seq 1 10))`,
    затем `docker compose up -d --no-build watchdog` — в этом порядке, иначе
@@ -284,6 +301,35 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
   `CATALOG_DEADLINE_S`); по пробе 30.09 оставлены умолчания 300 / 900 / 140 /
   60. Метки `Live` историана опережают его часы примерно на 46 с — это
   нормально, служба считает возраст от роста метки.
+- **Инструменты (с Д3б)** — `catalog_search`, `tag_now`, `tag_period`: по HTTP — `POST /api/data/<инструмент>`,
+  по MCP — `POST /mcp` (`mcp==1.30.0`, Streamable HTTP без сессий, ответ JSON; `GET /mcp` — 405); с Д7а по MCP —
+  ещё `save_agent`. Обе оболочки — над одной службой, порядок: токен → ошибка настройки (HTTP 503, по MCP —
+  `status: unavailable`; историан не трогается) → инструмент. Порт 8000 `core` не публикуется, через `edge` эти
+  пути не отдаются (404): места ходят к `core` своей сетью, администратор — туннелем к адресу `core` в
+  `pcbk-egress`. Пределы на вызов: до 16 тегов, окно до 31 суток и до 24 тего-суток (у одного тега — 31), тело до
+  64 КиБ; 60 вызовов за 5 минут на вызывающего; кэш — закрытый период 1 ч, открытый 30 с, текущие значения 15 с.
+- **Токены службы данных (с Д3б)** — заголовок `Authorization: Bearer <токен>`. Хеши sha256 — в `core-tokens`
+  (строки «`<id> <sha256>`», `0444`), сами токены — файлы `<id>.data-token` (48 шестнадцатеричных знаков) только
+  на сервере. Токен администратора `ops.data-token` (`0400`) заводится один раз, в каталоге секретов:
+  `[ -e ops.data-token ] || { openssl rand -hex 24 | tr -d '\n' > ops.data-token; chmod 0400 ops.data-token; }`;
+  токены мест и сборка `core-tokens` — раздел «Токены данных мест и `core-tokens` (с Д4б)». Нет или неверный
+  токен — 401 и строка журнала без токена, без события; токен места принимается только из сети своего места
+  (и из сетей администратора). Нечитаемый `core-tokens` — всем 401, строка «Служба данных» — сбой «токены не
+  читаются — все вызовы получают 401».
+- **Журнал событий (с Д3б)** — таблица `agent_events` в `core.db` на томе `pcbk-core-data` (`/var/lib/pcbk-core`,
+  каталог `10003 750`); том не удалять. Событие — на каждый вызов, включая отказы, неверные аргументы и
+  служебные опросы (`caller=system`): `requested` — что просили, `tags` — имена после разбора, `sent` — что
+  ушло драйверу историана. Журнал доказывает белый список (Д3б, задача 8, шаг 5):
+  ```bash
+  docker exec pcbk-core python -c "import json,sqlite3; w={l.strip() for l in open('/app/data/whitelist.txt') if l.strip() and not l.startswith('#')}; rows=list(sqlite3.connect('/var/lib/pcbk-core/core.db').execute('select requested, sent from agent_events')); sent=[x for _,s in rows for x in json.loads(s)]; req=[x for r,_ in rows for x in json.loads(r)]; print(len(rows), len(sent), sum(x not in w for x in sent), sum(x not in w for x in req))"
+  ```
+  Ожидается `N S 0 R`: имён вне списка в `sent` — 0 (третье число); `/health/historian` — `gate.refused_unlisted: 0`.
+  Журнал не пишется (диск, права тома) — строка «Служба данных» — сбой «журнал событий не пишется: …», а
+  инструменты отвечают.
+- **Охрана выхода в процессе (с Д3б)** — аудит-хук Python пускает соединения только по разрешённым
+  направлениям; при старте `core` пишет «охрана выхода: разрешено N направлений» (Д3б — 1, Д4а — 2, с Д5а —
+  13). Это растяжка, а не песочница: на уровне сети из `pcbk-egress` открыт любой адрес (остаточный риск Д3а).
+  У `core` — `net.ipv4.tcp_fastopen=0`.
 - **Откат Д3а:** `docker compose rm -sf core`; `docker network rm pcbk-egress`;
   вернуть `compose.yaml.d2` (и `.env.d2`); `docker compose up -d --no-build watchdog`
   (образ `:d2`).
