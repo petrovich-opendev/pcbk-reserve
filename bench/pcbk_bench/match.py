@@ -61,7 +61,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -129,6 +129,7 @@ PERIOD_TEXT = {"prev_shift": "прошлая смена", "last_24h": "посл�
 _CODE = re.compile(r"[a-z_]{1,24}")
 _TAG = re.compile(r"[A-Za-z0-9_]{1,128}")
 _LOGIN = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+_LIST_TAG = re.compile(r"^\s*[-*•]\s*`([A-Za-z0-9_]{1,128})`")      # строка «- `тег` — …» раздела «Теги узла»
 # длина периода у hours_top (I-1 итогового ревью Д9б): длительность сразу после «за», «из» (и одного слова вроде
 # «вчерашние»), «период…», «сутк…» или «(» — «за вчера (24 ч)», «Данных за 24 часа нет», «из 24 ч» — не часы состояния
 _PERIOD_LEN = re.compile(r"(?:\b(?:за|из)(?:[ \t\u00a0]+(?:вчерашн|последн|прошедш|полн|все|весь)\w*)?|\bпериод\w*|"
@@ -672,13 +673,16 @@ class MatchRunner:
     # --- прогон ---
 
     def run(self) -> list[MatchResult]:
-        """Случаи по порядку; строка OUT/match.jsonl на случай; в stderr — только «случай k/N: <вердикт>»."""
+        """Случаи по порядку; строка OUT/match.jsonl на случай с меткой прогона run — время его начала (UTC, ISO):
+        повтор match в тот же OUT дописывает строки, и прогоны различимы (m-6 ревью Б1); в stderr — только «случай
+        k/N: <вердикт>»."""
         self.prepare()
+        run = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         results = []
         for k, case in enumerate(self.cases, 1):
             result = self._case(case)
             results.append(result)
-            _append_line(self.out / "match.jsonl", json.dumps(result.to_json(), ensure_ascii=False))
+            _append_line(self.out / "match.jsonl", json.dumps({"run": run, **result.to_json()}, ensure_ascii=False))
             print(f"случай {k}/{len(self.cases)}: {result.verdict}", file=sys.stderr, flush=True)
         return results
 
@@ -751,9 +755,9 @@ def _search(stand: Stand, query: str, limit: int, sleep: Callable[[float], None]
 
 
 def node_tags(agent_file: str) -> list[str]:
-    """Теги раздела «Теги узла» файла агента (шаблон v1: «## Теги узла (…)», затем строки «- `тег` — …»): первый тег
-    каждой строки списка до пустой строки или строки без тега; заголовок — последний (раздел службы — после
-    инструкции)."""
+    """Теги раздела «Теги узла» файла агента (шаблон v1: «## Теги узла (…)», затем строки «- `тег` — …»): тег строки
+    списка — имя в обратных кавычках (и без цифры, как допускает служба, m-7 ревью Б1), иначе первый токен вида тега;
+    до пустой строки или строки без тега; заголовок — последний (раздел службы — после инструкции)."""
     lines = agent_file.splitlines()
     head = None
     for i, line in enumerate(lines):
@@ -767,10 +771,13 @@ def node_tags(agent_file: str) -> list[str]:
             if tags:
                 break
             continue
-        m = TAG_IN_LINE_RE.search(line)
-        if m is None or not line.lstrip().startswith(("-", "*", "•")):
+        if not line.lstrip().startswith(("-", "*", "•")):
             break
-        tags.append(m.group(0))
+        quoted = _LIST_TAG.match(line)
+        m = TAG_IN_LINE_RE.search(line)
+        if quoted is None and m is None:
+            break
+        tags.append(quoted.group(1) if quoted is not None else m.group(0))
     return list(dict.fromkeys(tags))
 
 

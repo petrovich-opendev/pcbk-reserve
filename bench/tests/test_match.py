@@ -11,7 +11,7 @@ import pytest
 from fakes import FakeChat, FakeStand, twin_cards
 from pcbk_bench.gateway import WorkplaceNotReady
 from pcbk_bench.match import (BASIC_KINDS, CALC_AGENT, HARD, MatchResult, MatchRunner, build_cases, calc_agent_args,
-                              cases_from_agent, judge_case, match_failures, probe_calc, render_match)
+                              cases_from_agent, judge_case, match_failures, node_tags, probe_calc, render_match)
 from pcbk_bench.record import ToolCall, Turn
 
 TAG = "20FAKE_201_PV"
@@ -708,3 +708,23 @@ def test_closed_period_moved_between_turn_and_calc_is_note():                   
     assert calc.output["period"]["open"] is False                                 # калькулятор — уже смена 06–14
     r = judge_case(CASES["avg_prev_shift"], turn("Среднее 81,2.", call), calc.output)
     assert (r.verdict, r.notes) == ("match", ["calc_moved"])
+
+
+
+# --- итоговая доводка Д9б: Minor прогонщика и случаев окна (m-6, m-7 ревью Б1) ---
+
+def test_jsonl_lines_carry_run_label(tmp_path):                                   # m-6 ревью Б1
+    runner, chat, stand = match_runner(tmp_path)
+    try:
+        runner.run()
+        runner.run()                                                              # повтор в тот же OUT
+    finally:
+        runner.close()
+    lines = [json.loads(x) for x in (tmp_path / "out" / "match.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 4 and all(datetime.fromisoformat(x["run"]).tzinfo is not None for x in lines)
+    assert lines[0]["run"] == lines[1]["run"] != lines[2]["run"] == lines[3]["run"]
+
+
+def test_node_tags_take_backquoted_name_without_digits():                         # m-7 ревью Б1
+    text = _agent_text(["20FAKE_201_PV", "FAKE_SPEED_PV", "20FAKE_210_RUN"])
+    assert node_tags(text) == ["20FAKE_201_PV", "FAKE_SPEED_PV", "20FAKE_210_RUN"]
