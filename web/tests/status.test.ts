@@ -1,7 +1,7 @@
 // @vitest-environment node
 // Баннер состояния (Д6-R44, решение F7): уровень и текст по /status.json и опрос по часам браузера.
 import { afterEach, expect, test, vi } from "vitest";
-import { startStatusPolling, statusView, type StatusView } from "../src/status";
+import { startStatusPolling, statusView, TEACHER_ROW, TEACHER_STUDENT_FAIL, type StatusView } from "../src/status";
 import { T_STATUS_UNKNOWN } from "../src/texts";
 
 const st = (checks: object[], extra = {}) => ({ stale: false, stale_after_s: 30, checks, ...extra });
@@ -70,6 +70,25 @@ test("status_view_filters_and_levels", () => {
   expect(statusView(st([{ ...broken, detail: "каталог агентов недоступен — агенты не сохраняются" }]), "03"))
     .toEqual({ level: "fail", text: "Сбой: Агенты студентов" });
   expect(statusView(st([{ ...broken, component: "gateway", title: "Шлюз и вход" }]), "03").level).toBe("fail");
+});
+
+test("teacher_row_hidden_except_proxy_closed", () => {      // Д10-R106, I-3: строка кабинета — владельцу; студенту — только «прокси закрыт»
+  const t = (state: string, detail = "") => ({ ...c("teacher", "Кабинет преподавателя и доли", state), detail });
+  for (const row of [t("warn"), t("unknown"), t("fail", "журнал действий преподавателя не пишется — кабинет закрыт"),
+                     t("fail", "LLM-прокси считает доли не так, как сохранено")]) {
+    expect(statusView(st([row]), "03")).toEqual({ level: "ok", text: "Стенд работает" });
+  }
+  expect(statusView(st([t("fail", TEACHER_STUDENT_FAIL)]), "03"))
+    .toEqual({ level: "fail", text: "Сбой: Кабинет преподавателя и доли" });
+  expect(TEACHER_STUDENT_FAIL).toBe("доли бюджета не загружены — LLM-прокси закрыт для студентов");
+  // сверх брифа: id строки — как в components.json сторожа; прочие строки рядом видны как прежде; у преподавателя (без
+  // места) — так же
+  expect(TEACHER_ROW).toBe("teacher");
+  expect(statusView(st([t("unknown"), c("historian", "Историан БДРВ", "warn")]), "03"))
+    .toEqual({ level: "warn", text: "Внимание: Историан БДРВ" });
+  expect(statusView(st([t("fail", TEACHER_STUDENT_FAIL), c("edge", "Входной прокси", "fail")]), null))
+    .toEqual({ level: "fail", text: "Сбой: Кабинет преподавателя и доли, Входной прокси" });
+  expect(statusView(st([t("ok", "доли сходятся, журнал действий пишется")]), "03").level).toBe("ok");
 });
 
 // --- опрос: часы и таймеры — поддельные (vi.useFakeTimers), fetch — управляемый ---

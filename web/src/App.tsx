@@ -1,4 +1,4 @@
-// Страница чата (Д6-R39, R42, R44, R49). Фазы: загрузка → ошибка /me | преподаватель | предупреждение →
+// Страница чата (Д6-R39, R42, R44, R49). Фазы: загрузка → ошибка /me | преподаватель (кабинет) | предупреждение →
 // рабочее место → чат; из чата — «место спит» (кнопка «Разбудить», сам не будит: Д5-R27). Предупреждение при
 // первом входе стоит между /me и местом: пока студент не нажал «Понятно», место не будится и чат не монтируется.
 // Поля notice нет (core Д5) — как null (== null); номер без текста в NOTICES — ошибка без «Понятно» (Ф14).
@@ -18,21 +18,27 @@
 // монтируется при первом открытии и остаётся (форма и итог переживают переход в чат), снимается только с уходом из фаз
 // вкладок; у неё своя ErrorBoundary (m5) со своими текстами: сбой — отчёт ui_crash, «Перезапустить калькуляторы»
 // перемонтирует только её, чат не трогается.
-import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
+// Преподаватель (Д10-R106): фаза teacher рисует кабинет (TeacherPage) в своей ErrorBoundary с текстами кабинета; ни места
+// студента, ни чата, ни одного вызова /pcbk/api/oc; вызовы кабинета — teacherApi (по умолчанию createTeacherApi()).
+// Вкладок шапки у преподавателя в Д10а нет (они придут в Д10б).
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
 import { CalcPage, type CalcPageProps } from "./components/CalcPage";
 import { Chat, type ChatProps } from "./components/Chat";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Header, type View } from "./components/Header";
 import { NoticeScreen } from "./components/NoticeScreen";
+import { TeacherPage } from "./components/TeacherPage";
 import { WorkplaceScreen } from "./components/WorkplaceScreen";
 import { startStatusPolling } from "./status";
-import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TEACHER, T_UNKNOWN,
-         T_WAKE } from "./texts";
+import { createTeacherApi, type TeacherApi } from "./teacherApi";
+import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TCH_CRASH, T_TCH_RESTART,
+         T_UNKNOWN, T_WAKE } from "./texts";
 import { placeView, type Timers } from "./workplace";
 
 export interface AppProps {
   api: Api;
+  teacherApi?: TeacherApi;                                // кабинет преподавателя (Д10-R106); по умолчанию createTeacherApi()
   navigate(url: string): void;
   ChatImpl?: ComponentType<ChatProps>;
   CalcImpl?: ComponentType<CalcPageProps>;                // подмена вкладки «Калькуляторы» в тестах, как ChatImpl
@@ -78,6 +84,7 @@ export function App(p: AppProps) {
   const ChatImpl = p.ChatImpl ?? Chat;
   const CalcImpl = p.CalcImpl ?? CalcPage;
   const startPolling = p.startPolling ?? startStatusPolling;
+  const teacherApi = useMemo(() => p.teacherApi ?? createTeacherApi(), [p.teacherApi]);
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [who, setWho] = useState<Who | null>(null);
   const [attempt, setAttempt] = useState(0);            // «Повторить» после сбоя /me
@@ -144,7 +151,7 @@ export function App(p: AppProps) {
         return;
       }
       setWho(user);
-      if (user.role === "teacher") {                    // ни мест, ни чата, ни одного вызова /pcbk/api/oc
+      if (user.role === "teacher") {                    // кабинет: ни мест, ни чата, ни одного вызова /pcbk/api/oc
         setPhase({ kind: "teacher" });
         return;
       }
@@ -198,7 +205,11 @@ export function App(p: AppProps) {
       );
       break;
     case "teacher":
-      body = <p className="phase">{T_TEACHER}</p>;
+      body = (
+        <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_TCH_CRASH} restartText={T_TCH_RESTART}>
+          <TeacherPage api={teacherApi} onSignedOut={goLogin} pollMs={p.pollMs} timers={p.timers} />
+        </ErrorBoundary>
+      );
       break;
     case "notice": {
       const notice = phase.notice;

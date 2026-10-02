@@ -153,7 +153,7 @@ test("вход студента: форма, «Готовлю…», потом �
   assert.equal(h.pending(), 0);                                                      // и срок ожидания снят
 });
 
-test("уже вошедший студент сразу будит место; преподаватель — без места", async () => {
+test("уже вошедший студент сразу будит место; преподаватель — в кабинет", async () => {
   const stu = harness({
     "GET /pcbk/api/auth/me": [200, STU],
     "POST /pcbk/api/workplace/wake": [202, place("ready")],
@@ -166,7 +166,9 @@ test("уже вошедший студент сразу будит место; �
   const teach = harness({ "GET /pcbk/api/auth/me": [200, { login: "teach", role: "teacher", place: null }] });
   await teach.flush();
   assert.equal(teach.els.who.textContent, "Вы вошли как teach");
-  assert.equal(teach.els.state.textContent, "У преподавателя нет рабочего места");
+  assert.equal(teach.els.state.textContent, "Открываю кабинет преподавателя…");
+  assert.deepEqual(teach.navigations, [CHAT_URL]);
+  assert.equal(teach.els["to-chat"].hidden, false);
   assert.equal(teach.els.logout.hidden, false);
   assert.equal(teach.calls.length, 1);                                               // будить нечего
 });
@@ -349,7 +351,7 @@ test("ready_navigates_to_chat_once", async () => {
   assert.equal(ready.count("GET /pcbk/api/workplace"), 0);
 });
 
-test("teacher_never_navigates", async () => {
+test("teacher_goes_to_cabinet", async () => {                                     // Д10-R106, B-2: кабинет — страница чата
   const TEACH = { login: "teach", role: "teacher", place: null };
   const signedIn = harness({ "GET /pcbk/api/auth/me": [200, TEACH] });
   const fresh = harness({ "GET /pcbk/api/auth/me": meAfterLogin({ ...TEACH, notice: null }),
@@ -360,11 +362,20 @@ test("teacher_never_navigates", async () => {
   fresh.els["login-form"].fire("submit");
   for (const h of [signedIn, fresh]) {
     await h.advance(GIVE_UP_S * 1000);
-    assert.equal(h.els.state.textContent, "У преподавателя нет рабочего места");
-    assert.deepEqual(h.navigations, []);                                             // у преподавателя чата нет
-    assert.equal(h.els["to-chat"].hidden, true);
-    assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
+    assert.equal(h.els.state.textContent, "Открываю кабинет преподавателя…");
+    assert.deepEqual(h.navigations, [CHAT_URL]);                                      // ровно один переход
+    assert.equal(h.els["to-chat"].hidden, false);                                     // запасная ссылка
+    assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);                        // место преподавателю не будится
+    assert.equal(h.count("GET /pcbk/api/workplace"), 0);
   }
+  // сверх брифа: «Выйти» прячет запасную ссылку, как у студента
+  const out = harness({ "GET /pcbk/api/auth/me": [200, TEACH], "POST /pcbk/api/auth/logout": [200, {}] });
+  await out.flush();
+  out.els.logout.fire("click");
+  await out.flush();
+  assert.equal(out.els["to-chat"].hidden, true);
+  assert.equal(out.els.state.textContent, "Вы вышли");
+  assert.deepEqual(out.navigations, [CHAT_URL]);
 });
 
 // --- предупреждение при первом входе (Д6-R49, Review Focus 1 Д6б): вход не будит место до «Понятно» ------------

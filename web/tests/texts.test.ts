@@ -5,9 +5,11 @@ import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { CALC_QUERY_CHARS, CALC_SEARCH_LIMIT, CALC_TAG_CHARS, DEFAULT_FORM, MODE_CHOICES, PERIOD_CHOICES, POINT_CHOICES,
          SIMILAR_NOTE_CORE } from "../src/calc";
+import * as texts from "../src/texts";
 import { CALC_LABELS, MAX_TEXT, MAX_TITLE, NOTICES, STAND_WARNING, T_BUSY, T_CALC_BAD_RANGE, T_CALC_BUSY,
          T_CALC_CRASH, T_CALC_FIND, T_CALC_NO_TAG, T_CALC_PERIOD_LINE, T_CALC_RESTART, T_CALC_RUN, T_CALC_SIMILAR,
-         T_CALC_TITLE, T_DOWN, T_TAB_CALC, T_TAB_CHAT, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
+         T_CALC_TITLE, T_DOWN, T_TAB_CALC, T_TAB_CHAT, T_TCH_CRASH, T_TCH_READ_ONLY, T_TCH_RESTART, T_TCH_SHARES_DONE,
+         T_TCH_TITLE, T_TCH_WAKE, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
 
 test("stand_warning_same_as_login_page", () => {
   const html = readFileSync("../edge/static/login.html", "utf8");
@@ -91,4 +93,19 @@ test("calc_limits_and_similar_note_same_as_core", () => {
   expect(SIMILAR_NOTE_CORE).toBe(similar![1]);
   expect([T_CALC_SIMILAR, T_CALC_BAD_RANGE, CALC_LABELS.pointsPerTag])
     .toEqual(["Точного совпадения нет — вот похожие теги", "Конец своего периода — позже начала", "Точек на тег"]);
+});
+
+// --- Д10а: кабинет преподавателя (Д10-R106) ---
+
+test("teacher_texts", () => {
+  // заглушка Д6 «У преподавателя пока нет чата…» снята: у преподавателя — кабинет
+  expect(Object.hasOwn(texts, "T_TEACHER")).toBe(false);
+  expect([T_TCH_TITLE, T_TCH_READ_ONLY, T_TCH_WAKE, T_TCH_SHARES_DONE, T_TCH_CRASH, T_TCH_RESTART])
+    .toEqual(["Кабинет преподавателя", "Только чтение: писать в разговор студента нельзя", "Разбудить для просмотра",
+              "Доли обновлены", "Кабинет преподавателя столкнулся с ошибкой. Сбой отмечен для администратора.",
+              "Перезапустить кабинет"]);
+  // подписи действий журнала — ровно ACTIONS журнала действий Д10а (Д10-R99); Д10б добавит действия учёток
+  expect(Object.keys(texts.ACTION_LABELS).sort()).toEqual(["agent", "agents", "read", "sessions", "shares", "wake"]);
+  expect([texts.ACTION_LABELS.sessions, texts.ACTION_LABELS.read, texts.ACTION_LABELS.wake, texts.ACTION_LABELS.shares])
+    .toEqual(["открыл список разговоров", "прочитал разговор", "разбудил место", "перевёл долю"]);
 });

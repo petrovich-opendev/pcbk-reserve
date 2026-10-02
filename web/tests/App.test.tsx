@@ -1,5 +1,5 @@
-// Фазы чата (Д6-R39, R42, R44): вход, преподаватель, пробуждение места, «место спит», выход.
-// api и ChatImpl подменены; startPolling — заглушка, отдающая вид «ok»; опрос места — pollMs (M11).
+// Фазы чата (Д6-R39, R42, R44): вход, преподаватель (кабинет, Д10-R106), пробуждение места, «место спит», выход.
+// api, teacherApi и ChatImpl подменены; startPolling — заглушка, отдающая вид «ok»; опрос места — pollMs (M11).
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useEffect } from "react";
 import { expect, test, vi } from "vitest";
@@ -8,6 +8,7 @@ import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import type { startStatusPolling } from "../src/status";
 import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_NOTICE_UNKNOWN } from "../src/texts";
+import { OVERVIEW_READY_03, teacherApi } from "./teacherFixtures";
 
 type Answer = [number, unknown];
 type Answers = Answer | Answer[];
@@ -68,17 +69,29 @@ test("me_offline_shows_text_and_retry", async () => {
   expect(screen.getByRole("button", { name: "Повторить" })).toBeTruthy();
 });
 
-test("teacher_gets_no_chat_and_no_wake", async () => {
+test("teacher_gets_cabinet_and_no_wake", async () => {
   const a = api({ me: [200, { login: "t", role: "teacher", place: null }] });
+  const t = teacherApi({ overview: [200, OVERVIEW_READY_03] });
   const polling = vi.fn(okPolling);
-  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={polling} />);
-  expect(await screen.findByText(/У преподавателя пока нет чата/)).toBeTruthy();
+  render(<App api={a} teacherApi={t} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={polling} />);
+  expect(await screen.findByText("Кабинет преподавателя")).toBeTruthy();
   expect(a.wake).not.toHaveBeenCalled();
   expect(a.workplace).not.toHaveBeenCalled();
   expect(screen.queryByTestId("fake-chat")).toBeNull();
+  // сверх брифа: кабинет спросил обзор, шапка — как у всех, баннер без мест
+  await waitFor(() => expect(t.overview).toHaveBeenCalledTimes(1));
   expect(screen.getByText("Вы вошли как t")).toBeTruthy();
   await waitFor(() => expect(polling).toHaveBeenCalled());       // опрос стартует в эффекте шапки
   expect(polling.mock.calls.at(-1)![0].ownPlace).toBeNull();   // баннер без мест
+});
+
+test("teacher_cabinet_401_goes_to_login", async () => {           // Д10-R106: 401 любой ручки кабинета — на вход
+  const navigate = vi.fn();
+  render(<App api={api({ me: [200, { login: "t", role: "teacher", place: null }] })}
+              teacherApi={teacherApi({ overview: [401, { name: "Unauthorized" }] })} navigate={navigate} ChatImpl={FakeChat}
+              startPolling={okPolling} />);
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
+  expect(navigate).toHaveBeenCalledTimes(1);
 });
 
 test("student_wakes_place_then_chat", async () => {
@@ -390,12 +403,13 @@ test("tabs_on_workplace_and_asleep_screens", async () => {                      
 
 test("no_tabs_for_teacher_and_notice", async () => {
   const { unmount } = render(<App api={api({ me: [200, { login: "t", role: "teacher", place: null }] })}
+                                  teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })}
                                   navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
-  await screen.findByText(/У преподавателя пока нет чата/);
+  await screen.findByText("Кабинет преподавателя");
   expect(screen.queryByRole("button", { name: "Калькуляторы" })).toBeNull();
   unmount();
   render(<App api={api({ me: [200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }] })}
-              navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);          // m-12: фаза предупреждения
+              navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);          // m-12 Д9: фаза предупреждения
   await screen.findByRole("button", { name: "Понятно" });
   expect(screen.queryByRole("button", { name: "Калькуляторы" })).toBeNull();
 });

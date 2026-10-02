@@ -25,7 +25,6 @@ export const T_LOADING = "Чат загружается…";
 export const T_SIGNED_IN = (login: string): string => `Вы вошли как ${login}`;
 export const T_LOGOUT = "Выйти";
 export const T_RETRY = "Повторить";
-export const T_TEACHER = "У преподавателя пока нет чата — он появится в следующих выпусках стенда.";
 
 // --- предупреждение при первом входе (R49) ---
 // Номер редакции живёт в core (NOTICE accounts.py), текст — здесь. Новый текст — новый номер в обоих местах: иначе
@@ -189,3 +188,99 @@ export const T_STATUS_ROWS_UNKNOWN = "Состояние неизвестно"; 
 export const T_STATUS_UNKNOWN = "Состояние стенда неизвестно — сторож не отвечает";   // сама страница молчит
 export const T_STATUS_MORE = (n: number): string => ` и ещё ${n}`;
 export const T_STATUS_DETAILS = "Подробнее";           // ссылка на /status
+
+// --- кабинет преподавателя (Д10-R106): места и доли, разговоры и агенты студентов только на чтение, журнал действий ---
+// Отказы ручек кабинета (TEACHER_TEXTS шлюза, Д10-R100) и правил долей (Д10-R97) приходят в ответе и показываются
+// дословно (replyText) — здесь только свои строки страницы.
+export const T_TCH_TITLE = "Кабинет преподавателя";
+export const T_TCH_REFRESH = "Обновить";
+export const T_TCH_LOADING = "Загружаю…";
+export const T_TCH_BUDGET = (spent: string, total: string, allocated: string, free: string, ops: string): string =>
+  `Общий бюджет: потрачено ${spent} из ${total}; распределено по местам ${allocated}, свободно ${free}; отбор и проверки ${ops}`;
+export const T_TCH_NO_SHARES = "Доли бюджета недоступны — перевод закрыт";   // обзор без LLM-прокси или без долей (R101)
+export const T_TCH_NONE = "—";                         // нет числа (доли не загружены)
+export const T_TCH_BAD_PART = "Неверный номер места, разговора или имя агента";   // вызов не ушёл: часть пути не по шаблону
+// таблица мест
+export const T_TCH_PLACES = "Места студентов";
+export const TCH_COLUMNS = {
+  place: "Место", student: "Студент", state: "Состояние", share: "Доля", spent: "Потрачено", agents: "Агентов",
+} as const;
+export const T_TCH_FREE = "свободно";                  // у места нет закрепления (free, m-11)
+export const T_TCH_NO_ACCOUNT = "без учётки";           // закреплено за удалённым логином: учётки нет, но место не свободно
+export const T_TCH_MARK_DISABLED = "отключена";
+export const T_TCH_MARK_LOCKED = "замок";
+export const T_TCH_MARK_NOT_NOTICED = "не подтвердил предупреждение";
+export const T_TCH_OPEN = "Открыть";
+export const T_TCH_OPEN_LABEL = (nn: string): string => `Открыть место ${nn}`;
+// состояние места (workplaces.view, Д5): незнакомое — как пришло
+export const PLACE_STATE_LABELS: Readonly<Record<string, string>> = {
+  sleeping: "спит", starting: "просыпается", ready: "работает", failed: "сбой",
+};
+// открытое место: вкладки «Разговоры» и «Агенты»
+export const T_TCH_PLACE_TITLE = (nn: string, login: string): string => `Место ${nn} — ${login}`;
+export const T_TCH_PLACE_TABS = "Разговоры и агенты места";
+export const T_TCH_TAB_SESSIONS = "Разговоры";
+export const T_TCH_TAB_AGENTS = "Агенты";
+export const T_TCH_WAKE = "Разбудить для просмотра";
+export const T_TCH_RELOAD_LIST = "Обновить список";
+export const T_TCH_NO_SESSIONS = "Разговоров нет";
+export const T_TCH_ARCHIVED = "в архиве";
+// разговор студента (TeacherReader): только текст, ни полей, ни кнопок отправки
+export const T_TCH_READ_ONLY = "Только чтение: писать в разговор студента нельзя";
+export const T_TCH_STUDENT = "Студент";
+export const T_TCH_AGENT = (title: string): string => `Агент «${title}»`;
+export const T_TCH_AGENT_NONAME = "Агент";
+export const T_TCH_CLIPPED = "Разговор показан не целиком — он слишком длинный";
+export const T_TCH_NO_MESSAGES = "В разговоре нет сообщений";
+export const T_TCH_TOOL_UNKNOWN = "состояние неизвестно";
+// агенты места (TeacherAgents): карточки из учёта и текст файла
+export const T_TCH_NO_AGENTS = "Своих агентов у студента нет";
+export const T_TCH_SHOW_TEXT = "Показать инструкцию";
+export const T_TCH_HIDE_TEXT = "Скрыть инструкцию";
+export const TCH_AGENT_LABELS = {
+  node: "Узел", purpose: "Назначение", tools: "Инструменты", tags: "Теги", state: "Состояние",
+} as const;
+// состояния учёта агентов (AgentState, Д7-R60; архивных в ответе нет): незнакомое — как пришло
+export const AGENT_STATE_LABELS: Readonly<Record<string, string>> = {
+  saved: "сохранён — появится после перезагрузки места",
+  visible: "работает",
+  not_visible: "не появился в рабочем месте",
+  quarantined: "в карантине — файл не загрузился",
+};
+// доли бюджета на модель (TeacherShares)
+export const T_TCH_SHARES = "Доли бюджета на модель";
+export const T_TCH_FROM = "С места";
+export const T_TCH_TO = "На место";
+export const T_TCH_AMOUNT = "Сумма, $";
+export const T_TCH_PICK = "выберите место";
+export const T_TCH_MOVE = "Перевести";
+export const T_TCH_FLOOR = "Остановить место";
+export const T_TCH_FLOOR_HINT =
+  "«Остановить место» сводит долю места «С места» к уже оплаченному, разницу отдаёт месту «На место»: следующий вызов модели студента получит отказ «доля израсходована».";
+export const T_TCH_SHARES_DONE = "Доли обновлены";
+export const T_TCH_SAME_PLACE = "Выберите два разных места";
+export const T_TCH_ZERO = "Сумма должна быть больше нуля";
+export const T_TCH_BAD_AMOUNT = "Сумма — в долларах, не больше двух знаков после запятой";
+export const T_TCH_TAKE_MAX = (nn: string, money: string): string => `У места ${nn} можно взять не больше ${money}`;
+// журнал действий (TeacherJournal): последние строки, новые первыми
+export const T_TCH_JOURNAL = "Журнал действий";
+export const T_TCH_JOURNAL_RELOAD = "Обновить журнал";
+export const T_TCH_JOURNAL_EMPTY = "Записей пока нет";
+export const T_TCH_JOURNAL_PLACE = (nn: string): string => `место ${nn}`;
+export const T_TCH_JOURNAL_SHARE = (nn: string, from: string, to: string): string => `${nn}: ${from} → ${to}`;
+// подписи действий журнала (ACTIONS, Д10-R99); незнакомое — кодом как есть. Д10б добавит действия учёток
+export const ACTION_LABELS: Readonly<Record<string, string>> = {
+  sessions: "открыл список разговоров",
+  read: "прочитал разговор",
+  agents: "открыл список агентов",
+  agent: "прочитал инструкцию агента",
+  wake: "разбудил место",
+  shares: "перевёл долю",
+};
+// итоги строк журнала (OUTCOMES, Д10-R99)
+export const OUTCOME_LABELS: Readonly<Record<string, string>> = {
+  requested: "запрошено", ok: "выполнено", refused: "отказ", error: "ошибка", started: "начато",
+};
+// сбой отрисовки кабинета — своя граница ошибок, тексты — не чата (Д9 m-3)
+export const T_TCH_CRASH = "Кабинет преподавателя столкнулся с ошибкой. Сбой отмечен для администратора.";
+export const T_TCH_RESTART = "Перезапустить кабинет";
