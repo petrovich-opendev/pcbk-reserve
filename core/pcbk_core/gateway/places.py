@@ -35,6 +35,15 @@ GW_IDLE_STOP_S), паузу снимают удачная остановка, т
 Д7а (Д7-R58): крючок готовности on_ready(n) зовётся, когда место стало готовым — удачный _await_ready (пробуждение) и
 _restore (первый проход уборщика); исключение крючка — строка журнала, пробуждение не ломает. is_waking(n) — идёт ли
 задача пробуждения места (воркер перезагрузки такое место пропускает).
+
+Д7б (Д7-R59, задача А6): карантин кривого файла агента. Атрибут repair (его ставит GatewayRole — AgentReloads.repair).
+_await_ready на ответе 400 места отдаёт тело repair: quarantined — вид repaired (файл в карантине), и пробуждение один раз
+делает stop → start → _await_ready; второй repaired за пробуждение, image и capped — неудача config (место гаснет,
+PLACE_TEXTS["config"]); not_config — как прежде (срок пробуждения). Вид repaired наружу не выходит. restart(n) — после
+карантина воркером: «готово» снимается сразу, без await, и ставится задача пробуждения (как у wake, в _tasks) со stop
+в начале под замком места; broken=True (image, capped после dispose) — та же задача только гасит место и кончается
+неудачей config, без start: повторных dispose раз в RELOAD_RETRY_S нет, студент видит текст места.
+
 Прокси окружения не берутся (trust_env=False), перенаправлениям не следуют, cookie места не хранятся и месту не
 возвращаются (политика без разрешённых доменов, G3). Сроки попыток держит asyncio.timeout поверх срока
 httpx. Исключения httpx ловятся целиком (httpx.HTTPError, Ш11) и в журнал не пишутся: строки журнала — только
@@ -104,6 +113,7 @@ PLACE_TEXTS = {
     "place_auth": "Рабочее место не приняло пароль шлюза — сообщите администратору.",
     "crashed": "Рабочее место падает при запуске — сообщите преподавателю.",
     "timeout": "Рабочее место не ответило за отведённое время — попробуйте ещё раз или сообщите преподавателю.",
+    "config": "Настройка рабочего места сломана — сообщите администратору.",
 }
 
 PLACE_TIMEOUT = httpx.Timeout(connect=2, read=PLACE_READ_S, write=5, pool=5)
@@ -117,6 +127,8 @@ _FAILED = object()            # inspect такта не удался: место
 
 SpCtlKind = Literal["down", "missing", "refused"]
 PlaceState = Literal["sleeping", "starting", "ready", "failed"]
+# итог карантина (Д7-R59): объявлен здесь, reload берёт его отсюда — reload импортирует places (предпроверка Д7б, П2)
+RepairResult = Literal["quarantined", "image", "capped", "not_config"]
 
 
 def _place(n: object) -> int:
@@ -296,6 +308,11 @@ class Workplaces:
         self.ticks = 0
         # крючок готовности (Д7-R58): его ставит GatewayRole — AgentReloads.place_ready
         self.on_ready: Callable[[int], None] | None = None
+        # карантин кривого файла агента (Д7-R59): его ставит GatewayRole — AgentReloads.repair; None — 400 как прежде
+        self.repair: Callable[[int, bytes], Awaitable[RepairResult]] | None = None
+        # перезапуск (restart): место → "restart" (stop, затем пробуждение) или "config" (только stop, неудача config);
+        # его забирает ближайший _wake_locked места
+        self._restarts: dict[int, str] = {}
 
     # --- клиент мест ---
 
@@ -541,6 +558,27 @@ class Workplaces:
             await asyncio.shield(task)
         return self.view(n)
 
+    def restart(self, n: int, *, broken: bool = False) -> PlaceView:
+        """Перезапуск места после карантина (Д7-R59; зовёт воркер перезагрузки после отпуска замка места и до конца
+        ворот). Синхронно, без await (m7): «готово» снято до возврата — prompt_async, прошедший ворота после них, видит
+        is_ready ложным. Затем задача пробуждения места — как у wake, в _tasks (на этом держится довод у acquire воркера,
+        Note for А6): под замком места stop, потом обычное пробуждение. Пока она идёт, view — «Готовлю рабочее место…»,
+        а wake студента к ней присоединяется. broken=True — конфигурация сломана без карантина (image, capped): задача
+        только гасит место и кончается неудачей config — без start и без повторных dispose (предпроверка Д7б, П5 в).
+
+        Задача пробуждения уже есть (ждёт замок, пока его держал воркер) — новая не ставится: метку перезапуска заберёт
+        она. Не зовётся, пока у места идёт _wake_locked: тот держит замок места, а воркер зовёт restart, только отпустив
+        свой."""
+        n = _place(n)
+        self._unready(n)
+        if broken or self._restarts.get(n) != "config":       # «только погасить» сильнее перезапуска
+            self._restarts[n] = "config" if broken else "restart"
+        self._failed.pop(n, None)
+        log.warning("gw restart place=%02d mode=%s", n, self._restarts[n])
+        if not self._waking(n):
+            self._tasks[n] = asyncio.create_task(self._wake(n), name=f"gw-restart-{n:02d}")
+        return self.view(n)
+
     async def _wake(self, n: int) -> None:
         started = self._monotonic()
         try:
@@ -561,7 +599,16 @@ class Workplaces:
         log.warning("gw wake place=%02d result=failed kind=%s ms=%d", n, kind, ms)
 
     async def _wake_locked(self, n: int) -> str | None:
-        """Ход пробуждения под замком места; None — готово, иначе вид неудачи (ключ PLACE_TEXTS)."""
+        """Ход пробуждения под замком места; None — готово, иначе вид неудачи (ключ PLACE_TEXTS).
+
+        Метка перезапуска (restart) — сначала stop: "restart" — дальше обычное пробуждение, "config" — неудача config
+        без start. _await_ready отдал repaired (кривой файл агента в карантине, Д7-R59) — один раз за пробуждение
+        stop → start → _await_ready; второй repaired — неудача config: место не крутится по кругу."""
+        mode = self._restarts.pop(n, None)
+        if mode is not None:                             # stop пароля места не требует — до проверки пароля
+            kind = await self._restart_stop(n)
+            if kind is not None or mode == "config":
+                return kind or "config"
         try:
             self.basic(n)                                # пароль — до start: без него start не зовётся
         except PlacePasswordError:
@@ -579,24 +626,56 @@ class Workplaces:
             self._confirm(n)
             return None
         self._unready(n)
+        base, repaired = before.started_at, False
+        while True:
+            try:
+                code = await self.spctl.start(n)
+            except SpCtlError as exc:
+                return exc.kind
+            try:
+                kind = await self._await_ready(n, code, base)
+            except Exception as exc:                     # после start место не остаётся полуживым
+                log.warning("gw wake place=%02d error=%s", n, type(exc).__name__)
+                kind = "timeout"
+            if kind == "repaired":
+                if repaired:                             # второй кривой файл за одно пробуждение (m5)
+                    kind = "config"
+                else:
+                    repaired = True
+                    kind = await self._restart_stop(n)
+                    if kind is None:                     # погашено: start заново, «упало» — от нового StartedAt
+                        base = None
+                        continue
+                    return kind                          # stop не удался — уже учтено в _restart_stop
+            if kind is not None:
+                await self._stop_failed_wake(n)
+            return kind
+
+    async def _restart_stop(self, n: int) -> str | None:
+        """stop перед новым start (перезапуск, Д7-R59): «готово» снято до stop. None — место погашено (уходит из
+        running); иначе вид неудачи sp-ctl — как у _stop_failed_wake: stop_failed, место остаётся в running (оно
+        работает), уборщик повторит остановку после паузы."""
+        self._unready(n)
         try:
-            code = await self.spctl.start(n)
+            await self.spctl.stop(n)
         except SpCtlError as exc:
+            self.stats.event("stop_failed")
+            log.warning("gw stop place=%02d reason=restart result=failed", n)
+            self._mark_running(n)
+            self._stop_retry_later(n)
             return exc.kind
-        try:
-            kind = await self._await_ready(n, code, before.started_at)
-        except Exception as exc:                         # после start место не остаётся полуживым
-            log.warning("gw wake place=%02d error=%s", n, type(exc).__name__)
-            kind = "timeout"
-        if kind is not None:
-            await self._stop_failed_wake(n)
-        return kind
+        log.info("gw stop place=%02d reason=restart result=ok", n)
+        self._forget(n)
+        return None
 
     async def _await_ready(self, n: int, code: int, base: str | None) -> str | None:
         """После start: GET /agent до 200 — попытка READY_ATTEMPT_S, пауза READY_PAUSE_S, срок GW_WAKE_TIMEOUT_S.
 
         base — StartedAt, от которого судится «упало»: при 204 — из inspect сразу после start (холодный старт
         «упавшим» не считается), при 304 — из inspect до start. Не удалось узнать — первая удачная сверка.
+
+        400 — тело ответа отдаётся repair (Д7-R59), если он задан: quarantined — вид repaired (перезапуск решает
+        _wake_locked), image и capped — config; not_config — как прежде: inspect и срок. Сравнение — по строкам (П2).
         """
         if code == 204:
             try:
@@ -610,13 +689,20 @@ class Workplaces:
         deadline = self._monotonic() + self.gw.GW_WAKE_TIMEOUT_S
         while True:
             try:
-                status = (await self.request(n, "GET", "/agent", timeout=READY_ATTEMPT_S)).status_code
+                r = await self.request(n, "GET", "/agent", timeout=READY_ATTEMPT_S)
+                status, body = r.status_code, r.content
             except _NO_ANSWER:
-                status = 0
+                status, body = 0, b""
             if status == 200:
                 break
             if status == 401:
                 return "place_auth"
+            if status == 400 and self.repair is not None:
+                verdict = await self.repair(n, body)
+                if verdict == "quarantined":
+                    return "repaired"
+                if verdict in ("image", "capped"):
+                    return "config"
             try:
                 info = await self.spctl.inspect(n)
             except SpCtlError:

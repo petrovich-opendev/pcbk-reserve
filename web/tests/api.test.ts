@@ -13,9 +13,10 @@ const ok = () => Promise.resolve(new Response('{"state":"starting"}', { status: 
 test("api_paths_methods_and_init", async () => {
   const { seen, fetchImpl } = recorder(ok);
   const api = createApi(fetchImpl);
-  await api.me(); await api.logout(); await api.wake(); await api.workplace();
+  await api.me(); await api.logout(); await api.wake(); await api.workplace(); await api.agents();
   expect(seen.map((s) => `${s.init.method} ${s.path}`)).toEqual([
     "GET /pcbk/api/auth/me", "POST /pcbk/api/auth/logout", "POST /pcbk/api/workplace/wake", "GET /pcbk/api/workplace",
+    "GET /pcbk/api/agents",                                                        // Д7-R64: параметров у ручки нет
   ]);
   for (const { init } of seen) {
     expect(init.credentials).toBe("same-origin");                                  // cookie сессии своего сайта
@@ -69,4 +70,11 @@ test("report_posts_kind_and_swallows_errors", async () => {                     
   }
   const thrower: JsonFetch = () => { throw new Error("сломано"); };
   await expect(createApi(thrower).report("ui_crash")).resolves.toBeUndefined();
+});
+
+test("agents_reply_as_is", async () => {                                          // Д7-R65: 404 старого core — Reply, не исключение
+  const { fetchImpl } = recorder(() => Promise.resolve(new Response('{"name":"NotFound"}', { status: 404 })));
+  expect(await createApi(fetchImpl).agents()).toEqual({ status: 404, body: { name: "NotFound" } });
+  const net = recorder(() => Promise.reject(new TypeError("Failed to fetch")));
+  expect(await createApi(net.fetchImpl).agents()).toEqual({ status: 0, body: null });
 });

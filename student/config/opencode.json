@@ -12,6 +12,7 @@
     "explore": {"disable": true}
   },
   "permission": {
+    "*": "deny",
     "external_directory": "deny",
     "task": "deny",
     "webfetch": "deny",
@@ -19,7 +20,8 @@
       "*": "allow",
       "*.env": "deny",
       "*.env.*": "deny"
-    }
+    },
+    "pcbk_save_agent": "deny"
   },
   "provider": {
     "pcbk": {

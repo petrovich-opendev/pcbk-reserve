@@ -61,6 +61,15 @@ test("status_view_filters_and_levels", () => {
     .toEqual({ level: "unknown", text: "Состояние неизвестно: Агенты студентов" });
   expect(statusView(st([c("agents", "Агенты студентов", "warn"), c("student-03", "Рабочее место 03", "warn")]), "03"))
     .toEqual({ level: "warn", text: "Внимание: Рабочее место 03" });
+  // Д7б (А6): fail «настройка рабочего места сломана» (image_config, одно место) — только владельцу; прочие fail
+  // строки агентов (каталог, учёт, молчит) студенту видны, как прежде
+  const broken = { ...c("agents", "Агенты студентов", "fail"), detail: "настройка рабочего места сломана — место не поднимается" };
+  expect(statusView(st([broken]), "03")).toEqual({ level: "ok", text: "Стенд работает" });
+  expect(statusView(st([broken, c("student-03", "Рабочее место 03", "fail")]), "03"))
+    .toEqual({ level: "fail", text: "Сбой: Рабочее место 03" });
+  expect(statusView(st([{ ...broken, detail: "каталог агентов недоступен — агенты не сохраняются" }]), "03"))
+    .toEqual({ level: "fail", text: "Сбой: Агенты студентов" });
+  expect(statusView(st([{ ...broken, component: "gateway", title: "Шлюз и вход" }]), "03").level).toBe("fail");
 });
 
 // --- опрос: часы и таймеры — поддельные (vi.useFakeTimers), fetch — управляемый ---

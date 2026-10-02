@@ -13,11 +13,13 @@ health() и health_json() читают только память; ошибка �
 Отчёты браузеров (Д6б, Д6-R50) — web_router: POST /pcbk/api/web/report и GET /health/web; счётчики WebReports —
 в памяти роли (web_reports), окно — час.
 
-Агенты студентов (Д7а, Д7-R60) — agents_router: GET /health/agents (зона front, тот же обработчик отказов из реестра);
-счётчики AgentStats — общие с ролью «данные» (main.build_roles), без переданного объекта роль создаёт свой.
+Агенты студентов (Д7а, Д7-R60) — agents_router: GET /health/agents (зона front, тот же обработчик отказов из реестра) и
+«Мои агенты» GET /pcbk/api/agents (Д7б, Д7-R64: зона, настройка и сессия — у маршрута, m24); счётчики AgentStats —
+общие с ролью «данные» (main.build_roles), без переданного объекта роль создаёт свой.
 
 Перезагрузка агентов (Д7-R58, задача А5): свой AgentStore (agents) на тот же core.db, воркер reloads (AgentReloads) и
-крючок готовности workplaces.on_ready = reloads.place_ready. lifespan открывает учёт агентов в потоке; неудача — флаг
+крючок готовности workplaces.on_ready = reloads.place_ready; карантин при пробуждении (Д7-R59, задача А6 Д7б) —
+workplaces.repair = reloads.repair. lifespan открывает учёт агентов в потоке; неудача — флаг
 сбоя учёта воркера (строка «Агенты студентов»), не config_error (предпроверка П13): вход студентов от учёта агентов не
 зависит. Воркер — фоновая задача рядом с уборщиком, при config_error не стартует; остановка роли его снимает.
 
@@ -238,6 +240,7 @@ class GatewayRole(RoleBase):
         self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
                                     wallclock=wallclock, drill=gw.DRILL_AGENTS)
         workplaces.on_ready = self.reloads.place_ready
+        workplaces.repair = self.reloads.repair         # карантин кривого файла агента при пробуждении (Д7-R59)
         self._reaper: asyncio.Task | None = None
         self._reload_task: asyncio.Task | None = None
 
@@ -255,7 +258,8 @@ class GatewayRole(RoleBase):
         router.include_router(workplace_router(self), dependencies=guarded)
         router.include_router(proxy_router(self))       # front_only и configured — у самого роутера прокси
         router.include_router(web_router(self))         # зона и настройка — у маршрутов отчётов; до ловящего
-        router.include_router(agents_router(self))      # /health/agents (Д7а): зона — у маршрута; до ловящего
+        router.include_router(agents_router(self))      # /health/agents (Д7а) и /pcbk/api/agents (Д7б): зона и
+                                                        # настройка — у маршрутов (m24); до ловящего
 
         @router.get(HEALTH_PATH, dependencies=[Depends(front_only)])
         async def health_gateway() -> JSONResponse:

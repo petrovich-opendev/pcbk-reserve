@@ -15,7 +15,14 @@ pcbk-student-01…10; путь вне правил — 403, метод без п
 
 Д7а (задача А5): POST /instance/dispose — перезагрузка конфигурации места (dispose_calls, dispose_status, on_dispose,
 agents_after_dispose; см. FakePlaces).
+
+Д7б (задача А6): кривой файл агента — как OpenCode 1.18.33 (research/09, О3). bad_files[n] = (путь в месте, файл на
+диске теста): экземпляр места создаётся при первом запросе после start (FakeDocker.on_start → FakePlaces.started) и после
+удачного POST /instance/dispose; если файл в этот момент есть на диске, экземпляр сломан и на все ручки, кроме
+/global/health, отвечает 400 ConfigInvalidError с этим путём. Чинит его только следующий start без файла: ни dispose, ни
+удаление файла не чинят. Пароль места (401) проверяется раньше экземпляра (предпроверка Д7б, m23).
 """
+from pathlib import Path
 import asyncio
 import base64
 import gzip
@@ -41,6 +48,8 @@ BIG_CHUNK = 1024                                   # кусок большого
 PULSE_S = 0.05                                     # пульс потока "endless"
 # "silent" молчит столько, а не вечно: поломка, при которой шлюз тишину не видит, роняет тест, а не вешает прогон
 SILENT_S = 20.0
+# ошибка сломанного экземпляра места: steps: 0 во фронтматтере агента (OpenCode 1.18.33, PositiveInt; research/09, О3)
+BROKEN_ISSUES = [{"message": "Expected a positive integer", "path": ["steps"]}]
 _stamps = itertools.count(1)
 
 
@@ -70,7 +79,8 @@ class FakeDocker:
     как падающий контейнер при restart: unless-stopped — Running и Restarting. down — ConnectError (вызов не
     записывается: до прокси он не дошёл), hang — ReadTimeout (записывается). stop_delay — пауза внутри stop,
     контейнер на это время ещё Running. calls — (действие, место) по порядку прихода, ping — ("ping", 0);
-    stopped — места, остановленные удачно (204), по порядку.
+    stopped — места, остановленные удачно (204), по порядку. on_start(n) — после удачного start (204): новый процесс
+    места (Д7б, А6: FakePlaces.started).
     """
 
     def __init__(self, *, running=frozenset(), missing=frozenset(), exit_on_start=frozenset(),
@@ -84,6 +94,7 @@ class FakeDocker:
         self.hang = hang
         self.calls: list[tuple[str, int]] = []
         self._stopped: list[int] = []
+        self.on_start: Callable[[int], None] | None = None
         self.containers: dict[int, dict] = {
             n: {"exists": n not in missing, "running": n in running, "restarting": False, "restart_count": 0,
                 "started_at": _stamp() if n in running else NEVER_STARTED}
@@ -137,6 +148,8 @@ class FakeDocker:
             if c["running"]:
                 return httpx.Response(304)
             c.update(running=True, restarting=n in self.exit_on_start, restart_count=0, started_at=_stamp())
+            if self.on_start is not None:
+                self.on_start(n)
             return httpx.Response(204)
         if self.stop_status != 204:
             return _json(self.stop_status, {"message": "отказ"})
@@ -248,6 +261,10 @@ class FakePlaces:
     - POST /instance/dispose (Д7а) — dispose_calls[n] += 1; при dispose_status[n] — этот код и {"name": "Dispose"},
       иначе 200 true, место «перезагружено» и зовётся on_dispose(n) (если задан); после первого удачного dispose GET
       /agent места из agents_after_dispose отвечает списком agents_after_dispose[n] вместо agents[n];
+    - Д7б (А6): после проверки пароля — экземпляр места. Его создаёт первый запрос после started(n) (новый процесс) или
+      удачного dispose: если файл bad_files[n][1] есть на диске, экземпляр сломан. Сломанный отвечает на всё, кроме
+      GET /global/health, 400 ConfigInvalidError с путём bad_files[n][0] (BROKEN_ISSUES); dispose его не чинит (тоже 400),
+      чинит только started(n) без файла. Место, работающее с начала теста (run, ready_place), — с целым экземпляром;
     - прочее — 200 {}.
     agent_calls[n] — сколько раз звали /agent места n; active[n] — запросов к месту n в работе сейчас, max_active[n]
     — наибольшее их число (от записи запроса до ответа; у /event — до заголовков).
@@ -284,6 +301,21 @@ class FakePlaces:
         self.on_dispose: Callable[[int], None] | None = None
         self.agents_after_dispose: dict[int, list[dict]] = {}
         self._disposed: set[int] = set()                # места, где dispose уже удался
+        self.bad_files: dict[int, tuple[str, Path]] = {}
+        self._instance: dict[int, str | None] = {}      # "ok", "broken"; None — создаст первый запрос; нет — "ok"
+
+    def started(self, n: int) -> None:
+        """Новый процесс места (FakeDocker.on_start): экземпляр создаст первый запрос."""
+        self._instance[n] = None
+
+    def _instance_of(self, n: int) -> str:
+        """Экземпляр места: создаётся при первом запросе после started или dispose — сломан, если кривой файл места есть
+        на диске сейчас."""
+        state = self._instance.get(n, "ok")
+        if state is None:
+            bad = self.bad_files.get(n)
+            state = self._instance[n] = "broken" if bad is not None and bad[1].exists() else "ok"
+        return state
 
     async def _big_body(self, n: int, size: int):
         while size > 0:
@@ -320,6 +352,9 @@ class FakePlaces:
             return httpx.Response(status, headers={k: v for k, v in merged.items() if v is not None}, content=body)
         if self.wrong_pw or request.headers.get("authorization") != expected_basic(n):
             return _json(401, {"name": "Unauthorized"})
+        if request.url.path != "/global/health" and self._instance_of(n) == "broken":
+            return _json(400, {"name": "ConfigInvalidError",
+                               "data": {"path": self.bad_files[n][0], "issues": BROKEN_ISSUES}})
         if n in self.big:
             return httpx.Response(200, headers={"content-type": "application/json"},
                                   content=self._big_body(n, self.big[n]))
@@ -353,6 +388,7 @@ class FakePlaces:
             if n in self.dispose_status:
                 return _json(self.dispose_status[n], {"name": "Dispose"})
             self._disposed.add(n)
+            self._instance[n] = None                    # новый экземпляр — при следующем запросе
             if self.on_dispose is not None:
                 self.on_dispose(n)
             return _json(200, True)

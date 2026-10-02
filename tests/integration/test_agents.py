@@ -10,6 +10,11 @@ test_reload_after_slow_turn_keeps_answer, его берут следующие �
 
 Агенты модуля — синтетические, без тегов (save_args двойника OpenRouter); токен данных места — stdin команды в core,
 пароли и cookie — только в запросах (Secret). Время «idle → агент виден» тесты печатают (pytest -rP) для журнала Д7а.
+
+Д7б (А6): учение строки — кривой файл агента места 10 при пробуждении уходит в карантин, место поднимается, строка
+«Агенты студентов» желтеет; тест последним в модуле и сам возвращает строку в ok пересозданием core (раунд 2, I-н3).
+Д7б (Б4): «Мои агенты» — только своё место: test_foreign_agent_not_listed сверяет агентов места 10 учётками agt-a и
+agt-b (preflight П13 — учётки web-b на стенде нет, свободных мест не осталось).
 """
 import json
 import os
@@ -206,6 +211,17 @@ def test_foreign_place_refuses_agent(stack, users):                    # Review 
                   {"parts": [{"type": "text", "text": "x"}], "agent": "proverka-quiet"})[0] == 204
 
 
+def test_foreign_agent_not_listed(stack, users):                       # Review Focus Д7б 2; preflight П13
+    """«Мои агенты» (GET /pcbk/api/agents через edge) — только своё место: агенты места 10 видны agt-a (положительный
+    контроль) и не видны agt-b с места 02 — у него только встроенные. До архива агентов в finally фикстуры users."""
+    a, b = users
+    code, mine, _ = a.call("GET", "/pcbk/api/agents")
+    assert code == 200 and {x["name"]: x["state"] for x in mine["agents"]}["proverka-quiet"] == "ready"
+    code, theirs, _ = b.call("GET", "/pcbk/api/agents")
+    assert code == 200 and [x["name"] for x in theirs["agents"]] == ["pomoshnik", "konstruktor"]
+    assert theirs["own"] == 0 and mine["own"] >= 1
+
+
 def test_agents_row_ok(stack, users):                                  # m13: status.json — список checks
     row = row_of(stack.wait_status(lambda d: row_of(d, "agents")["state"] == "ok", 60), "agents")
     assert row["detail"] == "агенты сохраняются"
@@ -216,3 +232,26 @@ def test_agents_row_ok(stack, users):                                  # m13: st
             page.wait_text(r"Агенты студентов", 20); page.wait_text(r"агенты сохраняются", 20)
             page.eval(AGENTS_ROW_INTO_VIEW_JS)
             shot(page, "01-agents-row-ok.png")
+
+
+def test_bad_file_quarantined_on_wake(stack, users):                   # Review Focus Д7б 5, учение строки; последним
+    a, _ = users
+    stack.compose("stop", "student-10")
+    wait_for(lambda: a.call("GET", "/pcbk/api/workplace")[1]["state"] == "sleeping", 70)   # шлюз увидел остановку
+    stack.put_agent_file(10, "drill-bad", '---\ndescription: "x"\nsteps: 0\n---\nx\n')
+    assert a.wake_and_wait(120)["state"] == "ready"
+    assert "drill-bad" not in agents_of(stack, 10)
+    assert stack.sh("pcbk-core", "ls /srv/agents/quarantine/student-10")[1].startswith("drill-bad.md.")   # П6
+    row = row_of(stack.wait_status(lambda d: row_of(d, "agents")["state"] == "warn", 60), "agents")
+    assert row["detail"] == "файл агента сломал рабочее место — в карантине, место перезапущено"
+    if os.environ.get("PCBK_SHOTS"):                                    # m8: снимок строки — до пересоздания core;
+        with cdp.Browser() as browser:                                   # без PCBK_SHOTS тест от Chrome не зависит (m-4)
+            page = browser.page(isolated=True)
+            page.goto(f"{STAND_ORIGIN}/status")
+            page.wait_text(r"Агенты студентов", 20); page.wait_text(r"файл агента сломал рабочее место", 20)
+            page.eval(AGENTS_ROW_INTO_VIEW_JS)
+            shot(page, "01-agents-row-quarantine.png")
+            assert browser.handler_errors == [], browser.handler_errors
+    stack.recreate("core", {})                                           # I-н3: счётчики часа — в памяти core
+    row = row_of(stack.wait_status(lambda d: row_of(d, "agents")["state"] == "ok", 60), "agents")
+    assert row["detail"] == "агенты сохраняются"

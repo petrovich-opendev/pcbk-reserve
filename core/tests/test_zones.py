@@ -126,7 +126,8 @@ def test_gateway_needs_front_client_too(tmp_path):                              
     app, _ = make_gateway(tmp_path)
     big = {"content": b"x" * 70000, "headers": {"Origin": ORIGIN, "Content-Type": "application/json"}}
     with TestClient(app, base_url="http://172.31.250.34:8000", client=("172.31.6.3", 40000)) as place:
-        for path in ("/pcbk/api/auth/me", "/pcbk/api/workplace", "/health/gateway", "/health/web", "/health/agents"):
+        for path in ("/pcbk/api/auth/me", "/pcbk/api/workplace", "/pcbk/api/agents", "/health/gateway", "/health/web",
+                     "/health/agents"):                                          # /pcbk/api/agents — Д7б (Б2)
             r = place.get(path)
             assert (r.status_code, r.json()["name"]) == (404, "NotFound"), path
         r = place.post("/pcbk/api/auth/login", json={"login": "stu-03", "password": PW}, headers={"Origin": ORIGIN})
@@ -154,6 +155,7 @@ def test_gateway_needs_front_client_too(tmp_path):                              
         assert host.get("/health/gateway").status_code == 404                          # pcbk-egress — не front
         assert host.get("/health/web").status_code == 404
         assert host.get("/health/agents").status_code == 404
+        assert host.get("/pcbk/api/agents").status_code == 404                         # Д7б (Б2)
         assert host.post("/pcbk/api/web/report", json={"kind": "ui_crash"}).status_code == 404
         assert host.post("/pcbk/api/auth/notice", json={"notice": "teacher-reads-1"},
                          headers={"Origin": ORIGIN}).status_code == 404

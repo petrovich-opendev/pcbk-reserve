@@ -9,11 +9,13 @@ export const STAND_WARNING =
 
 export const MAX_TEXT = 20000;                          // поле ввода — MAX_TEXT правил шлюза Д5б (R42)
 
-// имена инструментов в строке вызова (R42); прочие — своим именем
+// имена инструментов в строке вызова (R42); прочие — своим именем. pcbk_save_agent — инструмент Конструктора (Д7б,
+// итоговая доводка, замечание Б4): системное имя студенту не показывается
 export const TOOL_LABELS: Readonly<Record<string, string>> = {
   pcbk_tag_now: "текущее значение",
   pcbk_tag_period: "сводка за период",
   pcbk_catalog_search: "поиск тегов",
+  pcbk_save_agent: "сохранение агента",
 };
 
 // --- шапка и фазы чата (R39) ---
@@ -68,6 +70,22 @@ export const T_RENAME_FIELD = "Новое имя разговора";
 export const T_RENAME_SAVE = "Сохранить";
 export const T_RENAME_CANCEL = "Отмена";
 export const T_RENAME_HINT = `Имя разговора — от 1 до ${MAX_TITLE} знаков`;
+
+// --- панель «Агенты» над списком разговоров и агент разговора (Д7-R65) ---
+// «Мои агенты» — так панель называет и Конструктор в ответе ok («… появится в списке „Мои агенты“ …», Д7-R63)
+export const T_AGENTS = "Агенты";
+export const T_MY_AGENTS = "Мои агенты";
+export const T_AGENTS_EMPTY = "Пока нет — соберите агента вместе с Конструктором";
+export const T_AGENT_PENDING = "появится после ответа Конструктора";      // state pending — кнопка неактивна
+export const T_AGENT_BROKEN = "не загрузился — сообщите преподавателю";   // state broken — кнопка неактивна
+export const T_AGENTS_DOWN = "Список агентов недоступен — чат работает с помощником по данным";   // ответ не 200
+export const T_AGENT_LINE = (title: string): string => `Агент: ${title}`;  // над полем ввода
+// названия встроенных агентов места — для строки «Агент: …», когда списка нет (404 старого core, сбой) или агента в нём
+// нет (доводка р1, m3); источник правды — ответ ручки (IMAGE_AGENTS шлюза, Д7-R64), эти — запасные и с ним совпадают
+export const BUILTIN_AGENT_TITLES: ReadonlyMap<string, string> = new Map([
+  ["pomoshnik", "Помощник по данным"],
+  ["konstruktor", "Конструктор агентов"],
+]);
 
 // --- молчание в браузере (R51): строка хода и сбой интерфейса; отчёт уходит администратору ---
 export const T_TURN_SILENT =

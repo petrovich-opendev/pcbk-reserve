@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from conftest import wait_for
+from secret import Secret
 from workplace import IMAGE, MOUNTS, STUB_PREFIX, WORKPLACE_ENV
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -281,10 +282,19 @@ def test_env_holds_only_own_secret(stack, running):
 def test_default_agent_is_pomoshnik(stack, running):                # Д6-R45: встроенные агенты выключены
     agents = json.loads(stack.oc(1, "GET", "/agent", 1)[1])
     primary = {a["name"] for a in agents if not a.get("hidden") and a.get("mode") != "subagent"}
-    assert primary == {"pomoshnik"}
+    assert primary == {"pomoshnik", "konstruktor"}                   # агенты образа (Д7-R63)
     p = next(a for a in agents if a["name"] == "pomoshnik")
     assert (p["native"], p["mode"]) == (False, "primary")
+    k = next(a for a in agents if a["name"] == "konstruktor")
+    assert (k["native"], k["mode"], k["steps"], k.get("model")) == (False, "primary", 12, None)   # модель стенда
     assert not {"build", "plan", "general", "explore"} & {a["name"] for a in agents}
+    code, body = stack.oc(1, "GET", "/config", 1)                    # в теле /config — токен места: ни в traceback
+    body = Secret(body)                                                # (аргументы json.loads), ни в --showlocals
+    try:                                                               # его нет
+        default = json.loads(body)["default_agent"]
+    except ValueError:
+        default = None
+    assert (code, default) == (200, "pomoshnik")
 
 
 def test_hung_workplace_row(stack, running):                       # Review Focus 3; последний в модуле

@@ -1,6 +1,7 @@
 import http.client
 import itertools
 import json
+import re
 import time
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
@@ -1381,3 +1382,38 @@ def test_agents_drill_goes_first_in_note(json_site):
            ("fail", "перезагрузка агентов молчит", "учения: freeze_reload")       # учение молчания — с пометкой
     assert agents_row(json_site, {**drill, "not_visible_1h": 3}) == \
            ("warn", "сохранённый агент не появился в рабочем месте", "учения: freeze_reload; 3 за час")
+
+
+# --- сверка с вебом (итоговая доводка Д7б, m-1): fail строки агентов, который баннер студентов не показывает ---
+
+REPO = Path(__file__).resolve().parents[2]
+COMPONENTS = json.loads((Path(__file__).resolve().parents[1] / "components.json").read_text("utf-8"))
+
+
+def web_owner_fails(status_ts: str) -> dict[str, str]:
+    """OWNER_FAILS из web/src/status.ts: пары ["строка", "detail"] внутри new Map([...]) — простым разбором (как сверка
+    BUILTIN_AGENT_TITLES в core)."""
+    block = re.search(r"const OWNER_FAILS\b[^=]*= new Map\(\[(.*?)\]\);", status_ts, re.S)
+    assert block is not None, "OWNER_FAILS не найден в web/src/status.ts"
+    pairs = re.findall(r'\[\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\]', block.group(1))
+    assert len(pairs) == block.group(1).count("["), "запись OWNER_FAILS не того вида"
+    return dict(pairs)
+
+
+def test_web_owner_fails_parser_self_check():                                     # положительный контроль разборщика
+    sample = ('const OWNER_FAILS: ReadonlyMap<string, string> = new Map([\n  ["a", "б — в"],\n  ["c", "д"],\n]);\n'
+              'const OTHER = new Map([["x", "y"]]);\n')
+    assert web_owner_fails(sample) == {"a": "б — в", "c": "д"}
+
+
+def test_web_owner_fails_match_agents_row():
+    """Веб прячет от студентов fail строки «Агенты студентов» по detail дословно: разойдутся тексты — красный баннер
+    одного сломанного места снова у всех десяти студентов. Сверяются detail таблицы Д7-R60 (image_config_1h) и id строки
+    вида agents в components.json."""
+    web = REPO / "web"
+    if not web.is_dir():
+        pytest.skip("в копии нет web/ — сверка с вебом идёт в копии с web")
+    state, detail, _ = agents_verdict(AgentsReply.parse({**BASE, "image_config_1h": 1}), NOW, 60)
+    ids = [c["id"] for c in COMPONENTS if c["kind"] == "agents"]
+    assert state == "fail" and ids == ["agents"]
+    assert web_owner_fails((web / "src/status.ts").read_text("utf-8")) == {"agents": detail}

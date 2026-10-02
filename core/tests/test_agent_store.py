@@ -425,3 +425,23 @@ def test_probe_write_sees_readonly_file(store):                           # I-1:
             if os.path.exists(f):
                 os.chmod(f, 0o644)
     store.probe_write()
+
+
+# --- Д7б, задача А6 (предпроверка Д7б, П5) ---
+
+def test_retry_after_quarantine_is_name_taken(store, draft):               # П5 а: не «already» про невидимого агента
+    store.save(3, draft, TEXT, NOW); store.quarantine(3, "sushka-bdm2.md", NOW)
+    with pytest.raises(NameTaken) as e:
+        store.save(3, draft, TEXT, NOW + timedelta(seconds=5))             # тот же черновик, тот же digest
+    assert e.value.existing == ("sushka-bdm2",)
+    assert not (store.place_dir(3) / "sushka-bdm2.md").exists() and store.list_place(3)[0].state == "quarantined"
+    store.set_state(3, "sushka-bdm2", "visible", NOW)                      # положительный контроль: живая видимая —
+    assert store.save(3, draft, TEXT, NOW + timedelta(seconds=9)) == "already"   # already, как прежде
+
+
+def test_mark_visible_keeps_quarantined(store, draft):                      # M12: место показывает имя — карантин
+    store.save(3, draft, TEXT, NOW); store.quarantine(3, "sushka-bdm2.md", NOW)   # остаётся карантином
+    store.save(3, replace(draft, name="davlenie"), TEXT, NOW)
+    store.mark_visible(3, ["sushka-bdm2", "davlenie"], NOW + timedelta(seconds=7))
+    rows = {r.name: (r.state, r.visible_at) for r in store.list_place(3)}
+    assert rows == {"sushka-bdm2": ("quarantined", None), "davlenie": ("visible", "2026-10-07T09:00:07+00:00")}

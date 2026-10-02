@@ -1,6 +1,7 @@
 """Headless Chrome по протоколу DevTools (CDP), только stdlib: запуск, вкладки, ввод, ожидания, сеть, CSP, снимки.
 
-Для браузерных тестов веб-чата (Д6а; список разговоров — rename_thread, open_thread, click_text_in — Д6б): фикстуры
+Для браузерных тестов веб-чата (Д6а; список разговоров — rename_thread, open_thread, click_text_in — Д6б; панель
+«Агенты» и агент разговора — click_agent, agent_line, ready_agents, texts, current_thread_id, reload — Д7б): фикстуры
 browser (на модуль) и page (на тест, вкладка закрывается) — в conftest.py. Все вкладки — сессии одного соединения с
 браузером (Target.attachToTarget, flatten). Клиент WebSocket — свой, по RFC 6455 в том объёме, что нужен CDP: только
 ws://127.0.0.1, текстовые кадры, длина до 64 бит.
@@ -385,6 +386,18 @@ class Page:
     def url(self) -> str:
         return self.eval("location.href")
 
+    def reload(self, timeout: float = 30) -> None:
+        """Перезагрузка документа, как F5 (Page.reload), и ожидание load нового документа — по loaderId, которого до
+        перезагрузки не было: load прежнего документа не засчитывается."""
+        with self._lock:
+            before = set(self._loaded)
+        self._call("Page.reload")
+
+        def loaded() -> bool:
+            with self._lock:
+                return bool(self._loaded - before)
+        self.wait(loaded, timeout, "загрузка документа после перезагрузки")
+
     def _focus(self, selector: str, timeout: float) -> None:
         self.wait_selector(selector, timeout)
         js = (f"(() => {{ const e = document.querySelector({json.dumps(selector)}); if (!e) return false; "
@@ -454,6 +467,44 @@ class Page:
     def open_thread(self, sid: str, timeout: float = 10) -> None:
         """Открыть разговор sid щелчком по его имени в списке (button.thread-open строки)."""
         self.click(f"{self.thread_row(sid)} button.thread-open", timeout)
+
+    def current_thread_id(self, timeout: float = 10) -> str:
+        """id открытого разговора OpenCode: data-session-id строки списка с data-active (ThreadListItemPrimitive.Root
+        главного разговора, Д6-R52). У нового разговора до первого вопроса строки с сессией нет — ждём до timeout."""
+        js = ("(() => { const e = document.querySelector('.thread-item[data-active=\"true\"][data-session-id]'); "
+              "return e ? e.dataset.sessionId : null; })()")
+        return self.wait(lambda: self.eval(js), timeout, "строка открытого разговора (data-active, data-session-id)")
+
+    # --- панель «Агенты» и агент разговора (Д7-R65; разметка — договор Б3 ↔ Б4, preflight П12) ---
+
+    AGENT_NAME = re.compile(r"[a-z][a-z0-9-]*")     # системное имя агента (NAME_RE службы) — без экранирования в CSS
+
+    def texts(self, selector: str) -> list[str]:
+        """Текст DOM (textContent без пробелов по краям) всех элементов selector — по порядку документа. Не innerText:
+        тот отдаёт текст после CSS text-transform (подзаголовок «Мои агенты» панели — прописными), а сверяются строки
+        веба, образа и ручки."""
+        js = f"[...document.querySelectorAll({json.dumps(selector)})].map((e) => e.textContent.trim())"
+        return self.eval(js) or []
+
+    def ready_agents(self) -> set[str]:
+        """Системные имена агентов панели, которых можно выбрать: button[data-agent] с data-state="ready"."""
+        js = ("[...document.querySelectorAll('.agents button[data-agent][data-state=\"ready\"]')]"
+              ".map((e) => e.dataset.agent)")
+        return set(self.eval(js) or [])
+
+    def agent_line(self) -> str:
+        """Строка «Агент: …» над полем ввода (div.agent-line) — агент, которому уйдёт ход; строки нет — пусто."""
+        return self._text(".agent-line").strip()
+
+    def click_agent(self, name: str, timeout: float = 10) -> None:
+        """Щелчок мышью по агенту панели по системному имени (button[data-agent]; только ready и доступный) и ожидание
+        выбора: у его кнопки aria-current — панель подсвечивает агента, которому уйдёт ход нового разговора."""
+        if not self.AGENT_NAME.fullmatch(name):
+            raise ValueError(f"имя агента: {name!r}")
+        button = f'.agents button[data-agent="{name}"]'
+        self.click(f'{button}[data-state="ready"]:not(:disabled)', timeout)
+        chosen = f"document.querySelector({json.dumps(button)})?.getAttribute('aria-current') === 'true'"
+        self.wait(lambda: self.eval(chosen), timeout, f"агент {name} выбран (aria-current)")
 
     def screenshot(self, path: str | Path) -> None:
         data = self._call("Page.captureScreenshot", {"format": "png"}, timeout=60)["data"]

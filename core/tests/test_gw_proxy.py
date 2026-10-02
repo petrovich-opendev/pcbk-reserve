@@ -127,11 +127,13 @@ def test_agent_only_nonnative_primary(gw):
     place.agents[3] = [{"name": "build", "native": True, "mode": "primary"},
                        {"name": "probe", "native": False, "mode": "primary"},
                        {"name": "helper", "native": False, "mode": "subagent"},
-                       {"name": "vague", "mode": "primary"}]                             # native не задан — нельзя
+                       {"name": "vague", "mode": "primary"},                             # native не задан — нельзя
+                       # итоговая доводка Д7б, I-1: mode all — агент без своих правил (битый YAML), Д5-R33 с поправкой
+                       {"name": "loose", "native": False, "mode": "all", "description": "x"}]
     body = lambda a: {"parts": [{"type": "text", "text": "x"}], "agent": a}
     assert c.post(f"/pcbk/api/oc/session/{SES}/prompt_async", json=body("probe"), headers=oc_headers()).status_code == 204
     assert place.requests[-1].json["agent"] == "probe"
-    for name in ("build", "plan", "helper", "vague", "nope"):
+    for name in ("build", "plan", "helper", "vague", "loose", "nope"):
         assert c.post(f"/pcbk/api/oc/session/{SES}/prompt_async", json=body(name), headers=oc_headers()).status_code == 400
 
 

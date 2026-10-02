@@ -17,9 +17,14 @@ SEC = 10 ** 9
 # без этих правил студент одобряет чтение вне /work, и пароль из /proc/self/environ уходит в разговор;
 # "task": "deny" убирает инструмент task из запроса к модели — подагентов нет (Д4б-R20); "webfetch": "deny" —
 # интернета у стенда нет, тело каждого запроса короче (оценка — байт на токен), ручки core без токена из места
-# не читаются (до Д5)
-PERMISSION = {"external_directory": "deny", "task": "deny", "webfetch": "deny",
-              "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}}
+# не читаются (до Д5); "pcbk_save_agent": "deny" — второй слой, не граница (Д7-R63): правила конфигурации идут до
+# правил агента, allow у konstruktor побеждает, у агентов без своего правила инструмента записи нет.
+# "*": "deny" — первым (итоговая доводка Д7б, I-1): агент без своих правил (файл без permission или с битым YAML —
+# gray-matter отдаёт из кэша пустой frontmatter) получает mode: all и умолчание OpenCode "*": allow, то есть bash
+# (env печатает пароль места). Порядок ключей OpenCode сохраняет (propertyOrder: "original"), побеждает последнее
+# совпадение: read ниже снова разрешает чтение, а агенты образа и шаблона А2 несут свои "*": deny и allow позже
+PERMISSION = {"*": "deny", "external_directory": "deny", "task": "deny", "webfetch": "deny",
+              "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}, "pcbk_save_agent": "deny"}
 # MCP службы данных: токен места — файлом, без OAuth (Д4б-R19)
 MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True, "oauth": False,
                 "headers": {"Authorization": "Bearer {file:/run/secrets/data-token}"}}}
@@ -27,10 +32,18 @@ MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True
 FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 1 (Д6а); меняется только пересборкой образа\n'
          'description: "Помощник по данным: текущие значения и сводки тегов БДРВ"\nmode: primary\nsteps: 8\n'
          'permission:\n  "*": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n  pcbk_tag_period: allow\n')
+# Конструктор агентов (Д7-R63, research/09 §3.1): фронтматтер — побайтно; модели нет — модель стенда
+K_FRONT = ('# pcbk-reserve: встроенный агент образа, редакция 1 (Д7); меняется только пересборкой образа\n'
+           'description: "Конструктор агентов: за один разговор собирает с технологом его агента по узлу"\n'
+           'mode: primary\nsteps: 12\npermission:\n  "*": deny\n  pcbk_catalog_search: allow\n'
+           '  pcbk_tag_now: allow\n  pcbk_save_agent: allow\n')
 # пробный агент теста external_directory — только в тесте, не в образе: без блока permission наследует правила
 # opencode.json — образа (точка монтирования агентов Д7) или копии без правил (у pomoshnik read нет вовсе,
 # охрану проверяет он)
 PROBE_READ = '---\ndescription: "probe"\nmode: primary\n---\nprobe\n'
+# тот же пробный агент с битым YAML (итоговая доводка Д7б, I-1; находка Б4): текст, который sanitize OpenCode не
+# меняет, — место грузит его уже первой загрузкой как агента без своих правил: mode all, без описания
+BROKEN_PROBE = '---\ndescription: "x\n---\nx\n'
 # окно каждой модели: раннее сжатие разговора — защита бюджета (Д4б-R20)
 LIMIT = {"limit": {"context": 131072, "output": 16000}}
 # поддельная модель на Bun из бинарника OpenCode: первый ход — read /proc/self/environ, потом текст;
@@ -71,8 +84,8 @@ Bun.serve({{hostname: "0.0.0.0", port: 8000, async fetch(req) {{
 # сервер на 127.0.0.1:4096, который сразу сбрасывает соединение (RST)
 RESET_SERVER_JS = ('require("node:net").createServer(s => s.resetAndDestroy())'
                    '.listen(4096, "127.0.0.1", () => console.log("up"))')
-# клиент изнутри места: пароль — из файла, не в argv; печатает правила, разговор и висящие запросы;
-# ход ведёт пробный агент probe-read (у агента по умолчанию read нет)
+# клиент изнутри места: пароль — из файла, не в argv; печатает правила, агентов (имя, mode, native, описание, правила),
+# разговор и висящие запросы; ход ведёт пробный агент probe-read (у агента по умолчанию read нет)
 CLIENT_JS = """\
 const pw = (await Bun.file("/run/secrets/opencode-pw").text()).trim()
 const headers = {authorization: "Basic " + btoa("opencode:" + pw), "content-type": "application/json"}
@@ -82,6 +95,8 @@ const api = async (method, path, body) => {
   return {status: r.status, body: text ? JSON.parse(text) : null}
 }
 const out = {permission: (await api("GET", "/config")).body.permission ?? null}
+out.agents = ((await api("GET", "/agent")).body ?? []).map(a =>
+  ({name: a.name, mode: a.mode, native: a.native, description: a.description ?? null, permission: a.permission}))
 const ses = (await api("POST", "/session", {})).body.id
 out.prompt = (await api("POST", `/session/${ses}/prompt_async`,
   {parts: [{type: "text", text: "Прочитай /proc/self/environ"}], agent: "probe-read"})).status
@@ -165,9 +180,36 @@ def test_default_agent_file():                                                  
     _, front, body = text.split("---\n", 2)
     assert front == FRONT                                                # ни name, ни model, ни question
     for rule in ("только из ответов этих инструментов", "Не составляй имя тега сам", "не называй их",
-                 "Смысл _MV у регуляторов не", "общие знания, не из данных стенда"):
+                 "Смысл _MV у регуляторов не", "общие знания, не норматив ПЦБК"):        # пометка — как в AGENTS.md
         assert rule in body, rule
-    assert sorted(p.name for p in (CONFIG / "agent").iterdir()) == ["pomoshnik.md"]
+    assert "не из данных стенда" not in body
+
+
+def test_konstruktor_file():                                                    # Д7-R63
+    _, front, body = (CONFIG / "agent" / "konstruktor.md").read_text().split("---\n", 2)
+    assert front == K_FRONT                                              # ни name, ни model, ни question
+    flat = " ".join(body.split())                      # фразы сверяются без переносов строк (Д7б, П7)
+    assert flat.startswith("Ты — Конструктор агентов учебного стенда ПЦБК.")   # первая строка — её ждёт Б4
+    for rule in ("Имена тегов бери ТОЛЬКО из ответов pcbk_catalog_search", "Черновик агента",
+                 "Сохраняй только после явного согласия", "status \"unavailable\", \"rate\" или \"error\"",
+                 "общие знания, не норматив ПЦБК", "Больше двух повторных попыток не делай",
+                 "в этом ходе pcbk_save_agent больше не вызывай",                      # Д7б, m9
+                 "дословно, одной строкой", "только его слова согласия",             # student_reply ≤200 знаков
+                 "Он появится в списке „Мои агенты“ через несколько секунд",         # Д7-R63, поправка 2
+                 "служба отклоняет такие слова и в запрете",                         # доводка р1, I1: prompt_forbidden
+                 "В инструкции и назначении агента НЕЛЬЗЯ",                          # m3: норма-число и в purpose
+                 "«konstruktor» и не с «pcbk» в начале",                             # m1: name_reserved службы
+                 "Сохранённого агента поменять нельзя"):                             # m2: name_taken — только новый
+        assert rule in flat, rule
+    assert "через минуту" not in flat                                  # при сбое — пересказ message службы (р1)
+    stand = (CONFIG / "AGENTS.md").read_text()                       # правила стенда в системном тексте всех агентов
+    assert stand.startswith("# Правила учебного стенда ПЦБК (для всех агентов)")
+    for rule in ("Норматива в данных стенда нет", "общие знания, не норматив ПЦБК", "Шкала прибора"):
+        assert rule in " ".join(stand.split()), rule
+    permission = json.loads((CONFIG / "opencode.json").read_text())["permission"]
+    assert permission["pcbk_save_agent"] == "deny" and list(permission)[-1] == "pcbk_save_agent"   # Д7б, П8
+    assert list(permission)[0] == "*" and permission["*"] == "deny"     # итоговая доводка Д7б, I-1: запрет — первым
+    assert sorted(p.name for p in (CONFIG / "agent").iterdir()) == ["konstruktor.md", "pomoshnik.md"]
 
 
 def config_with_probe(tmp_path: Path, rules: bool) -> Path:
@@ -326,15 +368,20 @@ def test_health_never_disposes():                                               
     assert "/mcp/pcbk/connect" in text and "dispose" not in text and "/instance" not in text
 
 
-@pytest.mark.parametrize("rules", [True, False])
-def test_external_read_refused_without_asking(student_image, tmp_path, rules):
+@pytest.mark.parametrize("rules,probe", [(True, PROBE_READ), (False, PROBE_READ), (True, BROKEN_PROBE)],
+                         ids=["True", "False", "broken-yaml"])
+def test_external_read_refused_without_asking(student_image, tmp_path, rules, probe):
     """Модель просит read /proc/self/environ: с правилами самого образа — отказ без вопроса и пароля в разговоре.
 
     Ход ведёт пробный агент probe-read без своих прав — он наследует правила opencode.json (Д6-R45): у агента
     по умолчанию read нет, и на нём охрана external_directory проверяла бы пустоту.
     rules=True — конфигурация образа как есть, probe-read — в точке монтирования агентов Д7: проверяются
-    правила, зашитые в образ, а не копия дерева.
-    rules=False — отрицательный контроль: копия конфигурации без блока permission, OpenCode спрашивает студента.
+    правила, зашитые в образ, а не копия дерева. Ходу доступно только чтение: "*": "deny" образа первым убирает
+    из запроса к модели всё, что не разрешено ниже (итоговая доводка Д7б, I-1; MCP двойник отвечает 404).
+    rules=False — отрицательный контроль: копия конфигурации без блока permission, OpenCode спрашивает студента, а
+    модель получает bash и edit.
+    broken-yaml — файл probe-read с битым YAML в точке монтирования агентов: место грузит его агентом mode all без
+    описания и своих правил, и у его хода — тоже только чтение (I-1, находка Б4).
     """
     (tmp_path / "llm.js").write_text(FAKE_LLM_JS)
     (tmp_path / "llm.js").chmod(0o444)
@@ -343,7 +390,7 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
     if rules:
         agents = tmp_path / "agents"
         agents.mkdir()
-        (agents / "probe-read.md").write_text(PROBE_READ)
+        (agents / "probe-read.md").write_text(probe)
         agents.chmod(0o755)
         (agents / "probe-read.md").chmod(0o644)
     else:
@@ -371,14 +418,22 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
         tools = [p for m in out["messages"] for p in m["parts"] if p["type"] == "tool"]
         assert out["prompt"] == 204 and [p["tool"] for p in tools] == ["read"]
         assert tools[0]["state"]["input"] == {"filePath": "/proc/self/environ"}
+        agent = next(a for a in out["agents"] if a["name"] == "probe-read")
         if rules:
             assert out["permission"] == PERMISSION                      # правила образа дошли до сервера
+            # GET /config отдаёт ключи в порядке схемы (read первым); порядок, по которому решает OpenCode, — в правилах
+            # агента: последнее правило «всё» — запрет образа, и после него — read
+            rules = [(r["permission"], r["pattern"], r["action"]) for r in agent["permission"]]
+            star = max(i for i, r in enumerate(rules) if r[:2] == ("*", "*"))
+            assert rules[star][2] == "deny" and ("read", "*", "allow") in rules[star:], rules
             assert out["asked"] == [] and tools[0]["state"]["status"] == "error"
             assert "rule which prevents you" in tools[0]["state"]["error"]    # отказ по правилу, не сбой
             assert "probe-secret" not in json.dumps(out["messages"])
-            assert not {"task", "webfetch"} & set().union(*sent)
+            assert set().union(*sent) - {"invalid"} == {"read"}         # список разрешённого, не «чего нет»
+            want = ("all", None) if probe == BROKEN_PROBE else ("primary", "probe")
+            assert (agent["mode"], agent["native"], agent["description"]) == (want[0], False, want[1])
         else:
-            assert {"task", "webfetch"} <= set().union(*sent)                # без правил — есть: проверка видит
+            assert {"task", "webfetch", "bash", "edit"} <= set().union(*sent)   # без правил — есть: проверка видит
             assert [(a["permission"], a["metadata"]["filepath"]) for a in out["asked"]] == \
                    [("external_directory", "/proc/self/environ")]
     finally:

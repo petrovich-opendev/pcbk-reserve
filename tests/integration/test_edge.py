@@ -1,4 +1,5 @@
-"""Прокси входа 8443 и сторож в компоновке: страница, своя страница при смерти сторожа, сети, статика чата."""
+"""Прокси входа 8443 и сторож в компоновке: страница, своя страница при смерти сторожа, сети, статика чата; «Мои
+агенты» (Д7б)."""
 import hashlib
 import json
 import re
@@ -27,10 +28,10 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d7a", "pcbk-core": "pcbk-reserve/core:d7a",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d7a", "pcbk-core": "pcbk-reserve/core:d7b",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
-          "pcbk-student-01": "pcbk-reserve/student:d6a"}
+          "pcbk-student-01": "pcbk-reserve/student:d7b"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 # CSP страницы чата — строка Global Constraints Д6 (Д6-R41)
 CHAT_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "
@@ -214,6 +215,29 @@ def test_edge_routes_web_report(stack):                                     # Д
     codes = [gw.call("POST", "/pcbk/api/web/report", {"kind": "turn_silent"})[:2] for _ in range(20)]
     assert {c for c, _ in codes} == {401, 503}, [c for c, _ in codes]
     assert {b["name"] for c, b in codes if c == 503} == {"WorkplaceBusy"}
+
+
+def test_edge_routes_my_agents(stack):                                     # Д7б, Д7-R64; preflight П13
+    """«Мои агенты» через edge: без cookie — 401 JSON шлюза (тело и текст шлюза, а не страница edge); преподаватель (без
+    места) — 403 JSON с текстом R64; «//» в сыром пути — 400 edge до core. Ответ 200 с cookie студента — в test_web
+    (web-a): своей учётки студента у модуля нет — свободных мест на стенде нет (П13)."""
+    gw = stack.gw_client()                                                  # без сессии, Origin стенда
+    code, body, h = gw.call("GET", "/pcbk/api/agents")
+    assert (code, body, h["content-type"]) == \
+        (401, {"name": "Unauthorized", "data": {"message": "Нужно войти"}}, "application/json"), (code, body)
+    code, body, h = gw.call("GET", "/pcbk/api//agents")                    # сырой путь — как у прочих ручек
+    assert (code, body["name"], h["content-type"]) == (400, "BadRequest", "application/json"), (code, body)
+    password = Secret(secrets.token_urlsafe(12))
+    stack.add_account("edge-t", "teacher", None, password)
+    t = stack.gw_client()
+    t.login("edge-t", password)
+    try:
+        code, body, h = t.call("GET", "/pcbk/api/agents")
+        assert (code, body, h["content-type"]) == \
+            (403, {"name": "Forbidden", "data": {"message": "Агенты студентов для преподавателя — в следующих выпусках "
+                                                            "стенда"}}, "application/json"), (code, body)
+    finally:
+        t.logout()
 
 
 def test_edge_limits_me_and_notice_by_cookie_or_address(stack):            # итоговая доводка Д6б, m2; preflight Н17

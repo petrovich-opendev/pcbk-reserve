@@ -13,7 +13,7 @@ type Answer = [number, unknown];
 type Answers = Answer | Answer[];
 
 // Ответы по ручкам: один ответ — на каждый вызов, список — по очереди (последний повторяется).
-function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: Answers; ackNotice?: Answers }) {
+function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: Answers; ackNotice?: Answers; agents?: Answers }) {
   const queue = (a: Answers | undefined): (() => Promise<Reply>) => {
     const list: Answer[] = a === undefined ? [[500, null]] : typeof a[0] === "number" ? [a as Answer] : a as Answer[];
     let i = 0;
@@ -29,6 +29,7 @@ function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: An
     wake: vi.fn(queue(o.wake)),
     logout: vi.fn(queue(o.logout ?? [200, { ok: true }])),
     ackNotice: vi.fn(queue(o.ackNotice)),
+    agents: vi.fn(queue(o.agents)),
     report: vi.fn(async (_kind: string) => {}),
   } satisfies Api;
 }
@@ -335,4 +336,22 @@ test("notice_ack_button_disabled_while_in_flight", async () => {                
   expect(button.disabled).toBe(true);
   answers[1]!({ status: 204, body: "" });
   expect(await screen.findByTestId("fake-chat")).toBeTruthy();
+});
+
+// --- Д7б: список агентов (Д7-R65, preflight П10, П11) ---
+
+test("chat_gets_agents_loader", async () => {
+  // App отдаёт чату загрузчик списка — api.agents (GET /pcbk/api/agents); сам App его не зовёт
+  let loader: ChatProps["loadAgents"];
+  const Spy = (p: ChatProps) => {
+    loader = p.loadAgents;
+    return <div data-testid="fake-chat" />;
+  };
+  const list = { agents: [], own: 0, limit: 20 };
+  const a = api({ me: student, workplace: [200, { state: "ready" }], agents: [200, list] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={Spy} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  expect(a.agents).not.toHaveBeenCalled();
+  expect(await loader!()).toEqual({ status: 200, body: list });
+  expect(a.agents).toHaveBeenCalledTimes(1);
 });

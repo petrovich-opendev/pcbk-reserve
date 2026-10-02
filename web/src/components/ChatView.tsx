@@ -1,8 +1,10 @@
 // Разговор — только отображение (Д6-R41, R42): runtime приходит в пропсах, сети здесь нет.
 // Примитивы — без Radix-меню и всплывающих окон (они вставляют <style>, а CSP его запрещает): ThreadPrimitive,
 // ComposerPrimitive (Root, Input, Send, Cancel), MessagePrimitive (Parts, Error), ErrorPrimitive.Message.
-// Кнопки — «Отправить» и «Стоп» (и список разговоров слева от Chat — sidebar, Д6-R52); ни вложений, ни правки,
-// ни повтора, ни копирования, ни ветвления — такие вызовы шлюз отверг бы (Review Focus 4).
+// Кнопки — «Отправить» и «Стоп» (и слева от Chat — sidebar: панель «Агенты» Д7-R65 и список разговоров Д6-R52); ни
+// вложений, ни правки, ни повтора, ни копирования, ни ветвления — такие вызовы шлюз отверг бы (Review Focus 4).
+// Над полем ввода — строка «Агент: …» (Д7-R65, div.agent-line — договор с Б4, preflight П12); роли status у неё нет:
+// строка потока остаётся единственной.
 import {
   AssistantRuntimeProvider, ComposerPrimitive, ErrorPrimitive, MessagePrimitive, ThreadPrimitive,
   type AssistantRuntime,
@@ -17,7 +19,8 @@ export interface ChatViewProps {
   error?: string;               // ошибка последнего действия (explainError)
   pending?: ReactNode;          // висящие разрешения и вопросы агента
   silentLine?: string;          // «Ответа нет уже 3 минуты…» (R51)
-  sidebar?: ReactNode;          // список разговоров слева и «Новый разговор» (R52)
+  sidebar?: ReactNode;          // панель «Агенты», список разговоров слева и «Новый разговор» (R52, Д7-R65)
+  agentLine?: string;           // «Агент: <название>» — агент, которому уйдёт ход (Д7-R65)
 }
 
 const Nothing = () => null;
@@ -66,6 +69,7 @@ export function ChatView(p: ChatViewProps) {
           {p.silentLine && <p className="silent-line" role="status">{p.silentLine}</p>}
           {p.streamLine && <p className="stream-line" role="status">{p.streamLine}</p>}
           {p.error && <p className="error-line" role="alert">{p.error}</p>}
+          {p.agentLine && <div className="agent-line">{p.agentLine}</div>}
           <ComposerPrimitive.Root className="composer">
             <ComposerPrimitive.Input className="composer-input" name="question" aria-label={T_INPUT} placeholder={T_INPUT}
                                      maxLength={MAX_TEXT} minRows={2} maxRows={10} autoFocus addAttachmentOnPaste={false} />
