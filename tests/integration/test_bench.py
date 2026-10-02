@@ -24,6 +24,13 @@ core в его finally сбрасывает окно частоты ops (60 за
 БДРВ»), по событиям самих вызовов, без SQL; вкладка = служба — POST /pcbk/api/calc/<tool> учёткой места 05 через edge и
 шлюз равен POST /api/data/<tool> токеном ops на тех же аргументах (кроме cache), события вкладки — канал web; вкладка
 «Калькуляторы» в браузере — поиск тега, профиль с графиком, наработка. Снимки d9a-01…03 — PCBK_SHOTS.
+
+Д9б (Б2) — автотест «агент = калькулятор» на двойниках (Д9-R91, R92), перед сверкой уборки — после тестов Д9а: учение
+сбросило окно частоты ops, а 19 случаев на место дают 39 вызовов ops (asof и сверка) — окно не упирается в rate.
+Места 05 (honest) и 07 (off_by_one): агент проверки bench-calc, 19 случаев bench/match.twin.json через edge, шлюз и
+OpenCode места, сверка калькулятором ops, агент — в архив. Честная — match все, «среднее + 1» поймана ровно на 6
+случаях avg_prev_shift и avg_span. Таблица render_match — без тегов, снимок twin-match.png — PCBK_SHOTS; строка
+«Д9б журнал: …» — счёт вердиктов по местам.
 """
 import json
 import re
@@ -34,11 +41,12 @@ import pytest
 
 import cdp
 from benchstand import BenchHarness, agents_left
-from conftest import CORE_URL, login_to_chat, row_of, shot, wait_for
+from conftest import CORE_URL, REPO, login_to_chat, row_of, shot, wait_for
 from pcbk_bench.cards import CHECK_GOOD, cards_check
 from pcbk_bench.checks import check_run
 from pcbk_bench.judge import (Packet, assert_packet_clean, build_vocab, check_verdicts, collect_verdicts, controls_ok,
                               pack_batches, stage_judges)
+from pcbk_bench.match import build_cases, hist_today, render_match
 from pcbk_bench.record import RunKey
 from pcbk_bench.runner import NOTE_CALC_RATE, load_tag_units
 from pcbk_bench.scenarios import SCENARIO_IDS
@@ -285,6 +293,32 @@ def test_calc_page_in_browser(bench):                                           
         page.wait_text(r"работает \(по суффиксу\)", 30)
         shot(page, "d9a-02-runtime.png")
         assert browser.handler_errors == [] and page.console_errors() == []
+
+
+# --- Д9б (Б2): «агент = калькулятор» на двойниках; после Д9а — окно частоты ops сброшено учением (шапка модуля) ---
+
+def test_match_twin(bench):                                                       # Review Focus 5
+    twin = json.loads((REPO / "bench/match.twin.json").read_text(encoding="utf-8"))
+    cases = build_cases(twin["analog"], twin["discrete"], hist_today(bench.stand, twin["analog"][0]))
+    assert len(cases) == 19
+    got = {}
+    for place in (5, 7):                                                          # honest, off_by_one
+        runner = bench.match_runner(place, cases, bench.tmp / f"match-{place:02d}")
+        try:
+            runner.prepare()
+            got[place] = {r.case: r for r in runner.run()}
+        finally:
+            runner.close()
+    assert {r.verdict for r in got[5].values()} == {"match"}, {c: r.verdict for c, r in got[5].items()}
+    avg = {c.id for c in cases if c.kind in ("avg_prev_shift", "avg_span")}
+    assert len(avg) == 6 and {c for c, r in got[7].items() if r.hard} == avg
+    assert all(got[7][c].verdict == "mismatch" for c in avg)
+    assert "bench-calc" not in agents_left(bench.stack, {5: None, 7: None})       # агент проверки — в архиве
+    md = render_match(list(got[5].values()), cases)
+    assert "20FAKE" not in md
+    bench.page_shot(md, "twin-match.png")
+    print(f"Д9б журнал: место 05 — {Counter(r.verdict for r in got[5].values())}; "
+          f"место 07 — {Counter(r.verdict for r in got[7].values())}")
 
 
 def test_bench_cleanup_restores(bench):                                          # последним в модуле

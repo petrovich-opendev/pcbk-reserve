@@ -15,12 +15,14 @@ import json
 import re
 import sys
 import urllib.error
+from collections import Counter
 from datetime import datetime, timezone
+from decimal import Decimal                                                       # m-10 критики р2
 
 import pytest
 from fastapi.testclient import TestClient
 
-from fake_bench import PERSONAS, bench_answer
+from fake_bench import PERSONAS, _fmt, bench_answer
 from fake_openrouter import PROVIDER_NAMES, provider_of
 from helpers import LLM_TOKEN, REPO, SES, TOKEN, auth, chat_body, make_app, make_llm_app, wait_until
 from pcbk_core.agents.draft import check_draft, render_agent_file
@@ -254,12 +256,114 @@ def test_reminder_only_user_message_is_not_a_turn():                            
     assert tool_of(bench_answer(data, PERSONAS)[0]) == "pcbk_tag_now"
 
 
+# --- Д9б (Б2): агент проверки «агент = калькулятор» — ряд, наработка, размах (Д9-R92) ---
+
+TOOLS5 = ["pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period", "pcbk_tag_series", "pcbk_calc_runtime"]
+HONEST = {"z-ai/glm-5.3": "honest"}
+
+
+def ask(question: str) -> dict:
+    return body("z-ai/glm-5.3", TOOLS5, [user(question)])
+
+
+@pytest.mark.parametrize("question,tool,args", [
+    ("Какой размах по 20FAKE_201_PV за вчера?", "pcbk_tag_period", {"tags": ["20FAKE_201_PV"], "period": "yesterday"}),
+    ("Как менялся 20FAKE_201_PV за последние 8 часов: какое значение в начале и в конце?", "pcbk_tag_series",
+     {"tags": ["20FAKE_201_PV"], "period": "last_8h", "points": 24}),
+    ("Какая наработка по 20FAKE_210_RUN за вчера: сколько часов в каждом состоянии?", "pcbk_calc_runtime",
+     {"tags": ["20FAKE_210_RUN"], "period": "yesterday"}),
+    ("Какие минимум и максимум по 20FAKE_201_PV за последние сутки?", "pcbk_tag_period",
+     {"tags": ["20FAKE_201_PV"], "period": "last_24h"}),
+])
+def test_honest_picks_tool_and_period(question, tool, args):
+    msg, finish = bench_answer(ask(question), HONEST)
+    call = msg["tool_calls"][0]["function"]
+    assert (finish, call["name"], json.loads(call["arguments"])) == ("tool_calls", tool, args)
+
+
+def test_honest_series_and_runtime_answers_from_output():
+    series = {"status": "ok", "items": [{"tag": "20FAKE_201_PV", "status": "ok", "unit": "м/мин",
+              "profile": {"first": 600.5, "first_time": "2026-10-10T04:00:00+05:00", "last": 612.25,
+                          "last_time": "2026-10-10T12:00:00+05:00", "change": 11.75}}]}
+    args = {"tags": ["20FAKE_201_PV"], "period": "last_8h", "points": 24}
+    b = add(ask("Как менялся 20FAKE_201_PV за последние 8 часов?"),
+            *_called("pcbk_tag_series", args, series, "call-r1"))
+    msg, finish = bench_answer(b, HONEST)
+    assert finish == "stop" and all(x in msg["content"] for x in ("600,5", "612,25", "11,75"))
+    runtime = {"status": "ok", "items": [{"tag": "20FAKE_210_RUN", "status": "ok", "states": [
+        {"value": 1, "label": "работает (по суффиксу)", "hours": 18.0, "percent": 75.0, "count": 8},
+        {"value": 0, "label": "стоит (по суффиксу)", "hours": 6.0, "percent": 25.0, "count": 8}]}]}
+    args = {"tags": ["20FAKE_210_RUN"], "period": "yesterday"}
+    b = add(ask("Какая наработка по 20FAKE_210_RUN за вчера?"), *_called("pcbk_calc_runtime", args, runtime, "call-r2"))
+    msg, _ = bench_answer(b, HONEST)
+    c = msg["content"]                                                            # числа — через _fmt двойника
+    assert "работает (по суффиксу): " + _fmt(Decimal("18.0")) + " ч" in c and "переходов 8" in c
+
+
+# сверх брифа
+
+def test_answer_formats_r92_and_off_by_one_only_in_period():
+    """Строки ответов — по Д9-R92 дословно; «среднее + 1» — только в сводке tag_period: ряд и наработка у
+    off_by_one — те же, что у честной; размах сводки у off_by_one верный."""
+    series = {"status": "ok", "items": [{"tag": "20FAKE_201_PV", "status": "ok", "unit": "м/мин",
+              "profile": {"first": 600.5, "first_time": "2026-10-10T04:00:00+05:00", "last": 612.25,
+                          "last_time": "2026-10-10T12:00:00+05:00", "change": 11.75}}]}
+    runtime = {"status": "ok", "items": [{"tag": "20FAKE_210_RUN", "status": "ok", "states": [
+        {"value": 1, "label": "работает (по суффиксу)", "hours": 18.0, "percent": 75.0, "count": 8},
+        {"value": None, "label": "нет данных", "hours": 0.5, "percent": 2.08, "count": 1}]}]}
+    both = {"z-ai/glm-5.3": "honest", "google/gemini-3.8-flash": "off_by_one"}
+    texts = {}
+    for model in both:
+        b = add(body(model, TOOLS5, [user("Как менялся 20FAKE_201_PV за последние 8 часов?")]),
+                *_called("pcbk_tag_series", {"tags": ["20FAKE_201_PV"], "period": "last_8h", "points": 24}, series,
+                         "call-r3"))
+        r = add(body(model, TOOLS5, [user("Какая наработка по 20FAKE_210_RUN за вчера?")]),
+                *_called("pcbk_calc_runtime", {"tags": ["20FAKE_210_RUN"], "period": "yesterday"}, runtime, "call-r4"))
+        texts[model] = (bench_answer(b, both)[0]["content"], bench_answer(r, both)[0]["content"])
+    assert texts["z-ai/glm-5.3"] == texts["google/gemini-3.8-flash"]
+    assert texts["z-ai/glm-5.3"][0] == ("20FAKE_201_PV: в начале периода 600,5 м/мин (04:00:00), в конце 612,25 м/мин "
+                                        "(12:00:00), изменение 11,75.")
+    assert texts["z-ai/glm-5.3"][1] == ("работает (по суффиксу): 18,0 ч (75,0 % периода), переходов 8.\n"
+                                        "нет данных: 0,5 ч (2,08 % периода), переходов 1.")
+    out = {"tool": "tag_period", "status": "ok",
+           "period": {"start": "2026-10-02T06:00:00+05:00", "end": "2026-10-02T14:00:00+05:00", "preset": "prev_shift",
+                      "open": False},
+           "items": [{"tag": "20FAKE_101_PV", "status": "ok", "unit": "°C", "avg": 127.9, "min": 125.1, "max": 131.6,
+                      "range": 6.5}]}
+    period = _called("pcbk_tag_period", {"tags": ["20FAKE_101_PV"], "period": "prev_shift"}, out, "call-p2")
+    q = "Какое среднее по 20FAKE_101_PV за прошлую смену?"
+    honest = bench_answer(body("z-ai/glm-5.3", TOOLS5, [user(q), *period]), both)[0]["content"]
+    off = bench_answer(body("google/gemini-3.8-flash", TOOLS5, [user(q), *period]), both)[0]["content"]
+    assert honest == ("Среднее за прошлую смену по 20FAKE_101_PV — 127,9 °C; минимум 125,1 °C, максимум 131,6 °C "
+                      "(с 06:00 до 14:00), размах 6,5 °C.")
+    assert off == honest.replace("127,9", "128,9")                                # размах — из вывода, верный
+
+
+def test_new_rules_only_with_their_tools():
+    """Правила ряда и наработки срабатывают, только если инструмент есть в tools: агент стенда отбора Д8 (три
+    инструмента) их не зовёт; «18 часов» — не «8 часов»."""
+    runtime_q = "Какая наработка по 20FAKE_210_RUN за вчера: сколько часов в каждом состоянии?"
+    msg, _ = bench_answer(body("z-ai/glm-5.3", DATA, [user(runtime_q)]), HONEST)
+    assert (tool_of(msg), args_of(msg)) == ("pcbk_tag_period", {"tags": ["20FAKE_210_RUN"], "period": "yesterday"})
+    msg, _ = bench_answer(body("z-ai/glm-5.3", DATA, [user("Как менялся 20FAKE_201_PV за последние 8 часов?")]), HONEST)
+    assert tool_of(msg) == "pcbk_tag_now"
+    msg, _ = bench_answer(ask("Какое среднее по 20FAKE_201_PV за последние 18 часов?"), HONEST)
+    assert args_of(msg) == {"tags": ["20FAKE_201_PV"], "period": "prev_shift"}
+    msg, _ = bench_answer(ask("Что сейчас по 20FAKE_201_PV?"), HONEST)
+    assert (tool_of(msg), args_of(msg)) == ("pcbk_tag_now", {"tags": ["20FAKE_201_PV"]})
+    msg, _ = bench_answer(ask("Какое среднее по 20FAKE_201_PV за текущую смену?"), HONEST)       # m-13
+    assert args_of(msg)["period"] == "current_shift"
+    msg, _ = bench_answer(ask("Какое среднее по 20FAKE_201_PV 01.10.2026 с 08:00 до 12:00?"), HONEST)
+    assert args_of(msg) == {"tags": ["20FAKE_201_PV"], "start": "2026-10-01T08:00:00", "end": "2026-10-01T12:00:00"}
+
+
 # --- персоны против проверок стенда отбора А4 ---
 
 sys.path.append(str(REPO / "bench"))           # pcbk_bench — только stdlib; в конец пути: имена core/tests сильнее
 
 AGENT_NOW = datetime(2026, 10, 2, 7, tzinfo=timezone.utc)
-SIM_PATHS = {"pcbk_catalog_search": "catalog_search", "pcbk_tag_now": "tag_now", "pcbk_tag_period": "tag_period"}
+SIM_PATHS = {"pcbk_catalog_search": "catalog_search", "pcbk_tag_now": "tag_now", "pcbk_tag_period": "tag_period",
+             "pcbk_tag_series": "tag_series", "pcbk_calc_runtime": "calc_runtime"}           # ряд и наработка — Д9б
 SIM_STEPS = 8                                   # предел шагов агента (steps у агентов стенда)
 
 
@@ -361,3 +465,49 @@ def test_personas_against_bench_checks(tmp_path, model):
         assert v["B2"].hard == ("number_mismatch",) and v["B2"].passed is False
     if persona == "eager_saver":
         assert all("saved_without_consent" in v[s].hard for s in ("A1", "A2", "A3", "A4"))
+
+
+# --- Д9б (Б2): персоны против автотеста «агент = калькулятор» без Docker ---
+
+class _CalcStand:
+    """Stand автотеста для hist_today и сверки: калькулятор — та же служба на двойнике историана."""
+
+    def __init__(self, client: TestClient):
+        self.client = client
+
+    def calc(self, tool: str, args: dict) -> dict:
+        return self.client.post(f"/api/data/{tool}", json=args, headers={"Authorization": f"Bearer {TOKEN}"}).json()
+
+
+@pytest.mark.parametrize("model", ["z-ai/glm-5.3", "google/gemini-3.8-flash"])
+def test_personas_against_match_twin(tmp_path, model):
+    """Как test_match_twin интеграции (Б2), но без Docker: 19 случаев bench/match.twin.json по ответам персоны и
+    службы на двойнике историана, вердикты judge_case. Честная — match все; «среднее + 1» — жёсткие ровно
+    avg_prev_shift и avg_span трёх аналоговых тегов (mismatch), прочие — match."""
+    from pcbk_bench.match import build_cases, calc_agent_args, case_call, hist_today, judge_case
+    from pcbk_bench.stand import calc_patient
+
+    def no_sleep(_: float) -> None:
+        raise AssertionError("калькулятор ответил rate: случаев больше окна частоты")
+
+    twin = json.loads((REPO / "bench" / "match.twin.json").read_text(encoding="utf-8"))
+    app, role = make_app(tmp_path, fake=TwinHistorian.from_fixture(BENCH_FIXTURE), whitelist=bench_whitelist())
+    got = {}
+    with TestClient(app) as c:
+        wait_until(lambda: role.catalog.loaded)
+        stand = _CalcStand(c)
+        cases = build_cases(twin["analog"], twin["discrete"], hist_today(stand, twin["analog"][0], sleep=no_sleep))
+        tools = ["pcbk_" + t for t in calc_agent_args(cases)["tools"]]
+        for case in cases:
+            turn = _Sim(c, role, model).turn([], tools, case.question, session=f"ses-{case.id}")
+            call = case_call(case, turn)
+            calc = calc_patient(stand, case.tool, dict(call.input), sleep=no_sleep) if call is not None else None
+            got[case.id] = judge_case(case, turn, calc)
+    verdicts = {k: (r.verdict, *r.notes) for k, r in got.items()}
+    avg = {c.id for c in cases if c.kind in ("avg_prev_shift", "avg_span")}
+    assert len(cases) == 19 and len(avg) == 6
+    if PERSONAS[model] == "honest":
+        assert Counter(r.verdict for r in got.values()) == {"match": 19}, verdicts
+    else:
+        assert {k for k, r in got.items() if r.hard} == avg, verdicts
+        assert Counter(r.verdict for r in got.values()) == {"match": 13, "mismatch": 6}, verdicts
