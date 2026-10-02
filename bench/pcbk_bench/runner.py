@@ -66,7 +66,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .cards import CardSet, bench_agent_args
+from .cards import ALLOWED_TOOLS, CardSet, bench_agent_args
 from .config import BenchConfig
 from .gateway import GatewayChat, GatewayError
 from .numbers import TAG_TOKEN_RE
@@ -82,7 +82,9 @@ MONEY_CODES = frozenset({"pcbk_money_out", "pcbk_key_limit", "pcbk_budget_spent"
 CAP_CODE = "pcbk_run_spent"
 RUN_SPENT_TEXT = "Потолок прогона отбора модели исчерпан"           # LLM_MESSAGES["run_spent"]
 MODEL_CODES = frozenset({"pcbk_turn_limit"})                         # отказ прокси по вине модели — не стенд
-TOOL_NAMES = frozenset({"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period", "pcbk_save_agent"})
+# имена инструментов службы — не коды отказа прокси: из ALLOWED_TOOLS (тот же источник, что у check_run; с Д9а — и ряд
+# с наработкой, Д9-R89), без своей копии списка
+TOOL_NAMES = frozenset({f"pcbk_{tool}" for tool in ALLOWED_TOOLS} | {"pcbk_save_agent"})
 RUN_WINDOW_S = 130 * 60
 OWNER_WINDOW_S = 165 * 60
 KEEPALIVE_S = 600.0

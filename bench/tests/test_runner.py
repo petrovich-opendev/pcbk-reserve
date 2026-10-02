@@ -801,6 +801,13 @@ def test_turn_code(error, code):
     assert turn_code(error) == code
 
 
+@pytest.mark.parametrize("tool", ["pcbk_tag_series", "pcbk_calc_runtime"])
+def test_turn_code_new_tools_like_tag_now(tool):                                 # Д9-R89, доводка А6: не stand_error
+    error = f"APIError: tool {tool} failed"
+    assert turn_code(error) == turn_code("APIError: tool pcbk_tag_now failed") is None
+    assert turn_code(error + " [pcbk_upstream_down]") == "stand_error"          # контроль: код прокси рядом — сбой стенда
+
+
 def test_parse_turn_text_response_body_code():
     error = {"name": "APIError", "data": {"message": "x", "responseBody": "plain pcbk_money_out text"}}
     turn = parse_turn([_msg("user", []), _msg("assistant", [], error=error)], 0, "q")

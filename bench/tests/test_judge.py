@@ -20,7 +20,7 @@ from pcbk_bench.judge import (CONST_TOKENS, MASKS, PERIOD_PRESETS, REAL_DATA_CON
                               controls_ok, describe, mask_vocab, pack_batches, parse_verdict, passed_by_judge,
                               stage_judges, task_template, transcript_calls, vocab_from)
 from pcbk_bench.record import parse_turn
-from pcbk_bench.runner import RunRefused
+from pcbk_bench.runner import TOOL_NAMES, RunRefused
 from pcbk_bench.scenarios import BY_ID, JUDGE_ITEMS_CREATE
 from pcbk_bench.secret import Secret
 from pcbk_bench.stand import DATA_TOOLS
@@ -95,6 +95,13 @@ def test_allowed_tools_match_core():                                            
     draft = _module(REPO / "core" / "pcbk_core" / "agents" / "draft.py")
     assert ALLOWED_TOOLS == draft.AGENT_TOOLS == DATA_TOOLS
     assert "tag_series" in REFUSAL_TEXTS["tool_not_allowed"] and "calc_runtime" in REFUSAL_TEXTS["tools_useless"]
+
+
+def test_runner_tool_names_match_core():                                         # доводка А6: прогонщик — те же имена
+    from pcbk_bench.checks import _TOOL_NAMES
+    draft = _module(REPO / "core" / "pcbk_core" / "agents" / "draft.py")
+    want = {f"pcbk_{tool}" for tool in draft.AGENT_TOOLS} | {"pcbk_save_agent"}
+    assert TOOL_NAMES == _TOOL_NAMES == want and {"pcbk_tag_series", "pcbk_calc_runtime"} <= TOOL_NAMES
 
 
 def test_exact_match_shares_output_alias():                                      # I-р3-1
@@ -256,7 +263,8 @@ def test_parse_turn_drops_reasoning():                                          
 def test_packet_file_is_readable_json(tmp_path):                                 # m24: кириллица без \\u, отступы
     batches = pack_batches(tmp_path, [rec("B1", answer="Сейчас 3,42 бар", tools=[now_call("20FAKE_104_PV", 3.42)])],
                            cards(), [], seed="d8-test")
-    f = next(batches[0].glob("*.json"))
+    # пакет прогона, не контрольный J1–J4: порядок glob не задан (доводка А6 — тест падал примерно в 1 из 4 прогонов)
+    f = next(f for f in sorted(batches[0].glob("*.json")) if not pid_is_control(tmp_path, f.stem))
     text = f.read_text(encoding="utf-8")
     assert "Сейчас Ч-" in text and "\\u04" not in text and text.startswith("{\n ")
     p = Packet.from_file(f)
