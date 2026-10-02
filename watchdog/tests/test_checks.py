@@ -878,7 +878,10 @@ def test_llm_run_note_place_and_rounding():
     assert llm_note(LlmReply.parse(full)) == ("расход $900.00 из $1000 · отбор и проверки $1.50"
                                               " · прогон d8-1008: $79.99 из $80, вызовов за 10 мин: 37"
                                               " · доля больше 80 %: 3 · на счёте $250.00")   # не «$80.00 из $80»
-    for cap, shown in ((5.0, "$5.00"), (9.99, "$9.99"), (10.0, "$10"), (0.002, "$0.0020")):
+    odd = LlmReply.parse(llm_obj(run={**RUN, "cap_usd": 80.5, "spent_usd": 80.4}))      # доводка р1, m1
+    assert "прогон d8-1008: $80.40 из $80.50, " in llm_note(odd)                   # не «из $80»
+    for cap, shown in ((5.0, "$5.00"), (9.99, "$9.99"), (10.0, "$10"), (0.002, "$0.0020"), (10.5, "$10.50"),
+                       (80, "$80")):
         r = LlmReply.parse(llm_obj(run={**RUN, "cap_usd": cap, "spent_usd": 0.0}))
         assert f"прогон d8-1008: $0.00 из {shown}, " in llm_note(r), cap
     assert "прогон" not in llm_note(LlmReply.parse(llm_obj()))

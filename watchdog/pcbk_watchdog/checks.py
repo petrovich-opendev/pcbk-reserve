@@ -103,7 +103,7 @@ RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
 LLM_RUN_SILENT_S = 300
 RUN_CAP_DETAIL = "потолок прогона отбора исчерпан — вызовы прогона получают отказ"
 RUN_SILENT_DETAIL = "прогон отбора молчит — к модели давно никто не обращался"
-# потолок прогона меньше этого, $ — в note с центами ($5.00), иначе целым, как бюджет ($80)
+# потолок прогона меньше этого, $, или не целый — в note с центами ($5.00, $80.50), иначе целым, как бюджет ($80)
 RUN_CAP_CENTS_BELOW_USD = 10.0
 
 # строка «Шлюз и вход» (задача А1 Д5а, Д5-R29); счётчики /health/gateway — за час в памяти core
@@ -663,7 +663,8 @@ def llm_note(r: LlmReply) -> str:
         parts.append(f"отбор и проверки {fmt_usd(r.ops_usd)}")
     if r.run is not None:
         run = r.run
-        cap = fmt_usd(run.cap_usd) if run.cap_usd < RUN_CAP_CENTS_BELOW_USD else fmt_total(run.cap_usd)
+        whole = run.cap_usd >= RUN_CAP_CENTS_BELOW_USD and float(run.cap_usd).is_integer()
+        cap = fmt_total(run.cap_usd) if whole else fmt_usd(run.cap_usd)   # 80.50 — «из $80.50», не «из $80»
         # округление расхода не переходит потолка: «$80.00 из $80» — только при исчерпанном потолке
         parts.append(f"прогон {run.id}: {fmt_usd(run.spent_usd, keep=(run.cap_usd,))} из {cap}, "
                      f"вызовов за 10 мин: {run.calls_10m}")

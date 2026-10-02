@@ -27,7 +27,7 @@ from ..hooks import hooks_of
 from ..secrets import TokenTable
 from ..settings import LlmSettings, Settings
 from .api import CHAT_DEADLINE_S, LEDGER_DURABLE_S, LlmCall, llm_router, too_large_body
-from .ledger import LEDGER_CHECK_S, OPS, Budget, Ledger, RunSpec, run_spec
+from .ledger import LEDGER_CHECK_S, OPS, Budget, Ledger, LedgerWriteLost, RunSpec, run_spec
 from .models import select_models
 from .state import FAIL_STATES, UpstreamState
 from .turns import TurnLimiter
@@ -49,7 +49,9 @@ STUDENT = re.compile(r"student-[0-9]+")
 RUN_BASE_KEY = "run_base_usd:{id}:{caller}"
 RUN_WINDOW_S = 600
 RUN_BASE_ERROR = "прогон: точка отсчёта не записана"
-RUN_PENDING_ERROR = "прогон: у мест прогона есть вызовы без цены"
+# точка отсчёта — на диске до первого вызова: flush повторяется до этого срока, с, потом config_error (доводка р1, m5)
+RUN_BASE_DURABLE_S = 10.0
+RUN_BASE_RETRY_S = 0.25
 
 log = logging.getLogger("pcbk_core.llm")
 
@@ -70,8 +72,9 @@ class LlmRole(RoleBase):
     фоновых циклов, кроме проверки журнала, нет. tokens_error — llm-tokens не прочитан (П23).
 
     Прогон отбора (Д8-R69): run — RunSpec или None; run_calls — монотонные метки begin_call вызывающих прогона за
-    RUN_WINDOW_S, last_run_call_mono — последняя из них, started_mono — запуск роли (тишина без вызовов — от него).
-    LLM_RUN_* с ошибкой (настройки без from_env) — config_error: закрыто при сомнении."""
+    RUN_WINDOW_S, last_run_call_mono — последняя из них, started_mono — запуск роли (тишина без вызовов — от него);
+    run_base_durable_s — срок записи точки отсчёта. LLM_RUN_* с ошибкой (настройки без from_env) — config_error:
+    закрыто при сомнении."""
 
     name = "llm"
 
@@ -104,6 +107,7 @@ class LlmRole(RoleBase):
         self.run_calls: deque[float] = deque()
         self.last_run_call_mono: float | None = None
         self.started_mono = monotonic()
+        self.run_base_durable_s = RUN_BASE_DURABLE_S
         # хост OpenRouter, как его разрешает охрана выхода (egress_targets): живость адресов — только по нему
         self.egress_name = urlsplit(llm.OPENROUTER_BASE_URL).hostname
         self.budget = Budget(ledger, total_usd=llm.LLM_TOTAL_USD, share_usd=llm.LLM_SHARE_USD,
@@ -312,38 +316,55 @@ class LlmRole(RoleBase):
 
     # --- прогон отбора (Д8-R69) ---
 
-    def ensure_run_base(self) -> None:
-        """Точки отсчёта прогона в llm_meta: у вызывающего прогона без ключа RUN_BASE_KEY — его расход сейчас, затем
-        flush до LEDGER_DURABLE_S. Записанная точка не меняется: перезапуск core продолжает тот же прогон, новый id —
-        новая точка. Вызывающий без точки с идущими или ждущими цены вызовами — config_error RUN_PENDING_ERROR, и ни
-        одна точка не ставится (оценка, ставшая ценой ниже, дала бы прогону даровой запас). Запись не легла —
-        config_error RUN_BASE_ERROR. Зовёт lifespan в потоке сразу после открытия журнала, до первого вызова."""
+    def ensure_run_base(self) -> tuple[dict[str, float], str | None]:
+        """Точки отсчёта прогона в llm_meta — в потоке, сразу после открытия журнала, до первого вызова; роль не
+        меняет: точки и ошибку присваивает lifespan в цикле событий (доводка р1, m4).
+
+        У вызывающего прогона без ключа RUN_BASE_KEY точка — оплаченное им сейчас (Ledger.settled: цены и
+        окончательные оценки, без идущих и ждущих цены вызовов). Цена идущих и ждущих вызовов войдёт в прогон —
+        завышение в безопасную сторону, а отказа нет: вызов без цены у места на старте не закрывает прокси (доводка
+        р1, I1 — отступление от Д8-R69). Записанная точка не меняется: перезапуск core продолжает тот же прогон, новый
+        id — новая точка. Новые точки ложатся на диск с повтором flush до run_base_durable_s; не легли —
+        RUN_BASE_ERROR. Возврат — (точки по вызывающим, ошибка или None)."""
         run = self.run
         if run is None:
-            return
+            return {}, None
         led = self.ledger
         keys = {caller: RUN_BASE_KEY.format(id=run.id, caller=caller) for caller in sorted(run.callers)}
         missing = [caller for caller, key in keys.items() if led.meta_get(key) is None]
-        error = None
-        if any(led.has_open_or_pending_of(caller) for caller in missing):
-            error = RUN_PENDING_ERROR
-        elif missing:
-            for caller in missing:
-                led.meta_set(keys[caller], led.spent(caller))
+        unpriced = sum(1 for caller in missing if led.has_open_or_pending_of(caller))
+        if unpriced:
+            log.warning("LLM-прокси: прогон %s: у мест прогона без точки отсчёта есть вызовы без цены (%d) — их цена "
+                        "войдёт в прогон", run.id, unpriced)
+        for caller in missing:
+            led.meta_set(keys[caller], led.settled(caller))
+        error = self._flush_run_base(run) if missing else None
+        bases = {caller: base for caller, key in keys.items() if (base := led.meta_get(key)) is not None}
+        if error is None:
+            log.info("LLM-прокси: прогон %s: потолок $%g, вызывающих %d, новых точек отсчёта %d", run.id,
+                     run.cap_usd, len(run.callers), len(missing))
+        return bases, error
+
+    def _flush_run_base(self, run: RunSpec) -> str | None:
+        """flush журнала с повтором до run_base_durable_s (писатель повторяет сбой SQLite); брошенная операция
+        (LedgerWriteLost) или закрытый журнал — сразу RUN_BASE_ERROR. Часы — настоящие: это ожидание диска."""
+        led = self.ledger
+        deadline = time.monotonic() + self.run_base_durable_s
+        while True:
             try:
                 if not led.opened:              # журнал закрыт: flush() без очереди вернулся бы сразу
-                    raise TimeoutError("журнал вызовов закрыт")
-                led.flush(LEDGER_DURABLE_S)
-            except TimeoutError as exc:         # и LedgerWriteLost
-                log.error("LLM-прокси: прогон %s: точка отсчёта не записана (%s)", run.id, type(exc).__name__)
-                error = RUN_BASE_ERROR
-        self.budget.run_base = {caller: base for caller, key in keys.items()
-                                if (base := led.meta_get(key)) is not None}
-        if error is not None:
-            self.config_error = f"{self.config_error}; {error}" if self.config_error else error
-            return
-        log.info("LLM-прокси: прогон %s: потолок $%g, вызывающих %d, новых точек отсчёта %d", run.id, run.cap_usd,
-                 len(run.callers), len(missing))
+                    raise LedgerWriteLost("журнал вызовов закрыт")
+                led.flush(max(0.0, min(LEDGER_DURABLE_S, deadline - time.monotonic())))
+                return None
+            except LedgerWriteLost as exc:      # дыра в файле держится до нового open(): повтор не поможет
+                why = type(exc).__name__
+            except TimeoutError as exc:
+                why = type(exc).__name__
+                if time.monotonic() + RUN_BASE_RETRY_S < deadline:
+                    time.sleep(RUN_BASE_RETRY_S)
+                    continue
+            log.error("LLM-прокси: прогон %s: точка отсчёта не записана (%s)", run.id, why)
+            return RUN_BASE_ERROR
 
     # --- опрос OpenRouter ---
 
@@ -430,10 +451,13 @@ class LlmRole(RoleBase):
             why = f"журнал вызовов не открылся: {self.ledger.last_error}"
             self.config_error = f"{self.config_error}; {why}" if self.config_error else why
         try:                                # точка отсчёта прогона — до первого вызова и до дозапроса цен
-            await asyncio.to_thread(self.ensure_run_base)
+            bases, error = await asyncio.to_thread(self.ensure_run_base)
         except Exception as exc:            # закрыто при сомнении; в журнал — только класс
             log.error("LLM-прокси: точка отсчёта прогона не поставлена (%s)", type(exc).__name__)
-            self.config_error = f"{self.config_error}; {RUN_BASE_ERROR}" if self.config_error else RUN_BASE_ERROR
+            bases, error = {}, RUN_BASE_ERROR
+        self.budget.run_base = bases        # состояние роли — в цикле событий (m4)
+        if error is not None:
+            self.config_error = f"{self.config_error}; {error}" if self.config_error else error
         llm = self.llm
         log.info("LLM-прокси: моделей %d, доля $%g, бюджет $%g", len(self.models), llm.LLM_SHARE_USD,
                  llm.LLM_TOTAL_USD)

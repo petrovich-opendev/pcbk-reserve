@@ -712,6 +712,13 @@ class Ledger:
         with self._lock:
             return self._mem.spent(caller)
 
+    def settled(self, caller: str) -> float:
+        """Оплаченное вызывающим: пришедшие цены и окончательные оценки (unknown, lost) — без идущих и ждущих цены
+        вызовов. Точка отсчёта прогона (Д8-R69, доводка р1): будущая цена идущих и ждущих войдёт в прогон."""
+        with self._lock:
+            m = self._mem
+            return m.priced.get(caller, 0.0) + m.estimated.get(caller, 0.0)
+
     def estimated(self, caller: str | None = None) -> float:
         """Часть spent, которая стоит оценкой."""
         with self._lock:
@@ -769,7 +776,8 @@ class Budget:
     """Доли вызывающих, общий бюджет и потолок прогона отбора (Д8-R69). Оценку нового вызова проверка не
     прибавляет (Д4а-R13).
 
-    run_base — точки отсчёта прогона по вызывающим (llm_meta, ставит LlmRole.ensure_run_base до первого вызова).
+    run_base — точки отсчёта прогона по вызывающим (llm_meta, ставит lifespan роли по LlmRole.ensure_run_base до
+    первого вызова).
     """
 
     def __init__(self, ledger: Ledger, *, total_usd: float, share_usd: float, ops_share_usd: float,
