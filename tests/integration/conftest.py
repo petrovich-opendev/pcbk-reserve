@@ -37,6 +37,10 @@ REPO = Path(__file__).resolve().parents[2]
 # двойник OpenRouter (core/tests/fake_openrouter.py, только stdlib) — и модулем тестов: save_args (Д7а, П7). В конец
 # пути: имена модулей интеграции (conftest, test_*) не перекрываются модулями core/tests
 sys.path.append(str(REPO / "core" / "tests"))
+# стенд отбора (pcbk_bench, только stdlib) и строки сторожа (pcbk_watchdog.checks: RUN_*_DETAIL) — Д8а, m-н3; тоже в
+# конец пути. twin_historian отсюда не импортируется (тянет pytds и pcbk_core): числа — из bench-historian.json
+sys.path.append(str(REPO / "bench"))
+sys.path.append(str(REPO / "watchdog"))
 PROJECT = "pcbk-test"
 HOST, PORT = "127.0.0.1", 18443
 LOCK = REPO / "deploy" / "images.lock"
@@ -71,6 +75,9 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
 # белый список стенда — одно синтетическое имя
 TEST_WHITELIST = ("20FAKE_001_PV",)
+# фикстура двойника историана стенда отбора (Д8-R75) и её белый список: все теги каталога, кроме вне списка (C2)
+BENCH_HISTORIAN = REPO / "core" / "tests" / "data" / "bench-historian.json"
+BENCH_OUTSIDE_PREFIX = "16FAKE_"
 # токен службы данных ops (Д3б): не 48 шестнадцатеричных знаков — шаблон проверки на секреты его не ловит;
 # токены мест — student-NN.data-token из make_test_places; в core-tokens — только их sha256
 TEST_OPS_DATA_TOKEN = "test-data-token-ops"
@@ -403,6 +410,27 @@ def make_test_core_data(secrets_dir: Path, data_dir: Path) -> None:
         f.chmod(0o444)
 
 
+def bench_whitelist_tags() -> list[str]:
+    """Белый список стенда отбора — по правилу двойника (twin_historian.bench_whitelist) из bench-historian.json: все
+    теги каталога, кроме 16FAKE_*. Модуль двойника здесь не импортируется (pytds, pcbk_core)."""
+    catalog = json.loads(BENCH_HISTORIAN.read_text(encoding="utf-8"))["catalog"]
+    return sorted(row["TagName"] for row in catalog if not row["TagName"].startswith(BENCH_OUTSIDE_PREFIX))
+
+
+def bench_data(tmp: Path) -> Path:
+    """Каталог DATA_DIR стенда отбора (как make_test_core_data): tmp/bench-data 0700 и whitelist.txt 0444 с белым
+    списком двойника; путь каталога — для DATA_DIR при пересоздании core."""
+    data_dir = tmp / "bench-data"
+    data_dir.mkdir(mode=0o700, exist_ok=True)
+    data_dir.chmod(0o700)
+    f = data_dir / "whitelist.txt"
+    if f.exists():
+        f.chmod(0o644)
+    f.write_text("\n".join(bench_whitelist_tags()) + "\n", encoding="utf-8")
+    f.chmod(0o444)
+    return data_dir
+
+
 def make_test_llm(secrets_dir: Path) -> None:
     """Как на сервере, файлы 0444 в каталоге секретов: ключи OpenRouter (заглушки двойника), токен ops и
     llm-tokens — хеши токенов мест (student-NN.llm-token, их пишет make_test_places) и ops."""
@@ -675,6 +703,17 @@ class Stack:
         rows = [line for line in out.splitlines() if line.split("\t", 1)[0] == login]
         assert len(rows) == 1, f"accounts list: строк учётки {login} — {len(rows)}"
         return rows[0]
+
+    def account_rows(self, login: str) -> list[str]:
+        """Все строки login в выводе `accounts list`: строка учётки (логин — первый столбец) и строка закрепления
+        места («место NN\\t<логин>\\t…»). Учётки нет и место за ней не закреплено — [] (I-н1)."""
+        out = self.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "list")
+        rows = []
+        for line in out.splitlines():
+            cols = line.split("\t")
+            if cols[0] == login or (cols[0].startswith("место ") and len(cols) > 1 and cols[1] == login):
+                rows.append(line)
+        return rows
 
     def gw_health(self) -> dict:
         """/health/gateway серверного слоя изнутри pcbk-watchdog — из pcbk-front, как его читает сторож (preflight

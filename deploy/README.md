@@ -296,6 +296,140 @@ gray-matter) место загружает агентом без своих пр
 - **Файлы карантина — данные студентов.** `archive` их не трогает, `release-place` они не держат. Удалить — только по
   решению владельца: `docker exec -u 10003 pcbk-core rm /srv/agents/quarantine/student-NN/<файл>`.
 
+## Прогон отбора модели (с Д8)
+
+Отбор — 3–4 модели-кандидата, по одной на место отбора (по умолчанию 07–10): на время окна у каждого места своя
+модель по умолчанию, а прогонщик `python -m pcbk_bench` (`bench/`, только машина разработчика) ведёт разговоры через
+`edge` и шлюз учётками `d8-probe-bench-NN`. Деньги OpenRouter — только в окне владельца, только через LLM-прокси и под
+потолком прогона `LLM_RUN_*`. Команды `accounts` и `agents.admin` — через `docker exec pcbk-core python -m …`; `NN` —
+номер места, `N` — он же без нуля; `OUT` — каталог прогона на машине разработчика (`$JOB/pcbk-d8/live/out`).
+`/health/llm` на сервере — `curl -s http://172.31.250.82:8000/health/llm` (адрес `core` в `pcbk-egress`).
+
+**Предпосылки** (только чтение):
+- в `.env` пусты `LLM_RUN_ID`, `LLM_RUN_USD`, `LLM_RUN_CALLERS`, `GW_IDLE_STOP_S` и `DRILL_LLM` — как в «Аварийной
+  уборке», шаг 1;
+- `/health/llm` → `pending: 0` (вызовы без цены). Не 0 у мест отбора — ничего не делать: точка отсчёта прогона
+  ставится по оплаченному, и цена этих вызовов войдёт в расход прогона (центы, в безопасную сторону);
+- строки «LLM-прокси и бюджет» и «Память сервера» — норма, в строке «Агенты студентов» — «ждут перезагрузки: 0»;
+- места отбора свободны: в `accounts list` нет строк `место NN` этих мест, места спят
+  (`docker ps -a --filter label=pcbk.role=student --format '{{.Names}} {{.State}}'`);
+- прежний расход каждого места отбора — не больше $20: доля места — $100, а прогону нужно до $35 на модель. Расход
+  мест по журналу вызовов:
+  ```bash
+  docker exec pcbk-core python -c 'import sqlite3, sys
+  c = sqlite3.connect("file:/var/lib/pcbk-core/core.db?mode=ro", uri=True)
+  q = "SELECT caller, ROUND(SUM(COALESCE(cost, cost_est)), 2) FROM llm_calls WHERE caller IN (%s) GROUP BY caller"
+  for row in c.execute(q % ",".join("?" * len(sys.argv[1:])), sys.argv[1:]): print(*row)' \
+    student-07 student-08 student-09 student-10
+  ```
+- `key_usage_usd` из `/health/llm` — в журнал дня: точка сверки расхода после окна.
+
+**Режим отбора** — сначала `core`, потом места:
+1. `.env`: `LLM_RUN_ID=d8-<ДДММ>`, `LLM_RUN_USD=80`, `LLM_RUN_CALLERS=student-07,student-08,student-09,student-10`
+   (только места отбора), `GW_IDLE_STOP_S=10800` (места не засыпают в окне); затем
+   `docker compose up -d --no-build --force-recreate core`. Проверка: `/health/llm` → `run` с этим `id`, `callers` —
+   число мест, `spent_usd` — `0`; в строке «LLM-прокси и бюджет» — «прогон d8-ДДММ: $0.00 из $80, вызовов за 10 мин:
+   0». Ошибка в `LLM_RUN_*` (не все три, опечатка в месте, потолок больше общего бюджета) — ошибка настройки и отказ
+   всем вызовам `/llm/`: исправить `.env` и пересоздать `core`.
+2. Места с переопределением модели. Файл — `python -m pcbk_bench override <конфиг прогона>` на машине разработчика
+   (JSON, он же YAML: у мест конфига только `OPENCODE_CONFIG_CONTENT` = `{"model": "<провайдер>/<модель>"}`) → на
+   сервер в `~/pcbk-d8/compose.bench.yaml` (каталог `0700`, файл `0600`; в git его нет). Затем
+   `docker compose -f compose.yaml -f ~/pcbk-d8/compose.bench.yaml --profile students up -d --no-build --force-recreate student-07 student-08 student-09 student-10`
+   — тома мест не трогаются. Дождаться `mcp=connected` у каждого места (до 90 с после старта):
+   `docker inspect -f '{{json .State.Health.Log}}' pcbk-student-NN` — последняя запись `200 mcp=connected`. Модель
+   места прогонщик сверяет сам: `GET /config` места — до прогона, модель строк журнала прокси — в каждом прогоне.
+3. Учётки — только логины `d8-probe-bench-NN` (`PROBE_LOGIN`: только их место потом освобождается):
+   `ssh <сервер> docker exec -i pcbk-core python -m pcbk_core.gateway.accounts add --login d8-probe-bench-NN --role student --place N < $JOB/pcbk-d8/secrets/d8-probe-bench-NN.pw`
+   — пароль одной строкой из файла (`openssl rand -hex 24`, `0600`, только на машине разработчика).
+4. Пуск — `python -m pcbk_bench run <конфиг>` в фоне (в конфиге `window_start` — начало окна с поясом). Раз в 10
+   минут — `python -m pcbk_bench status OUT --stale-s 120` (0 — идёт или закончен, 1 — молчит или завис, 2 —
+   остановлен или пауза) и строка страницы.
+
+**Пока идёт прогон:**
+- Потолок держит прокси: сверх `LLM_RUN_USD` вызовы мест прогона получают 402 «Потолок прогона отбора модели исчерпан
+  — модель не отвечает. Сообщите преподавателю.», строка — «внимание» «потолок прогона отбора исчерпан — вызовы
+  прогона получают отказ». Перерасход — не больше цены вызовов, начатых до того, как расход дошёл до потолка: до трёх
+  на место (ход, заголовок, повтор). Прочих вызывающих потолок не трогает.
+- «Прогон отбора молчит — к модели давно никто не обращался» («внимание») — к моделям прогона не обращались дольше
+  `LLM_RUN_SILENT_S` (300 с). Бывает и при живом прогоне: метка вызова ставится в его начале, и один вызов модели
+  дольше 300 с даёт ту же строку. Её видит только владелец на странице, прогонщик по ней не останавливается; сверка —
+  `status OUT`: код 0 и свежий `last_turn_at` в `OUT/progress.json` — прогон жив.
+- Перезапуск `core` с тем же `LLM_RUN_ID` продолжает прогон: точка отсчёта лежит на диске (`llm_meta`).
+- **Места и `LLM_RUN_ID` посреди прогона не менять** без нового потолка: новый id или новый вызывающий — новая точка
+  отсчёта, расход прежнего прогона в новый не входит, и потолок $80 дал бы ещё $80. Если менять — `LLM_RUN_USD` =
+  остаток: прежний потолок минус `run.spent_usd`.
+
+**Поднять потолок на паузе** — `status` с кодом 2 и причиной `projection`: прогноз после повтора 1 больше потолка без
+запаса. Процедура Д8-R74:
+1. новое «да» владельца;
+2. `LLM_RUN_USD` в `.env` — новый потолок, не больше `LLM_TOTAL_USD`;
+3. `docker compose up -d --no-build --force-recreate core` с тем же `LLM_RUN_ID` — точка отсчёта сохраняется;
+4. тот же потолок — `cap_usd` в конфиге прогона;
+5. ожидание `mcp=connected` у мест (как в шаге 2 режима);
+6. `projection_ack: true` в конфиг и запуск тем же `OUT`: возобновление пропускает сделанные прогоны и паузу на
+   барьере 1 не повторяет.
+
+Иначе — снять повтор 3 (`reps` в конфиге), `projection_ack: true` и возобновить.
+
+**Повторный отбор после выбора** (через две недели и позже): списки моделей образа места после выбора не меняются
+(меняются только `"model"` и `LLM_MODELS`), ссылки кандидатов годны. На время прогона `LLM_MODELS` в `.env` — пусто
+(все кандидаты), `core` пересоздан; после уборки — снова выбранная модель и пересоздание `core`.
+
+**Уборка после окна.** Порядок — как в тестовом стенде (`tests/integration/benchstand.py`, `BenchHarness.cleanup`):
+агенты уходят в архив, пока места работают, — перезагрузку после архива делает только работающее место, у спящего
+метка висит до пробуждения. Любой шаг можно повторить.
+1. Прогонщик не идёт: `python -m pcbk_bench status OUT` — не `running`, и `flock -n OUT/.lock true` → код `0`.
+2. Учётки — `accounts disable --login d8-probe-bench-NN` первыми: сессии закрыты, новый агент не сохранится.
+3. Агенты мест — в архив, пока места работают: `agents.admin archive --place N --yes` у каждого места отбора. Дождаться
+   в строке «Агенты студентов» «ждут перезагрузки: 0»; `agents.admin list --place N` — строк агентов нет, последняя
+   строка «расхождений нет».
+4. Места без переопределения: `docker stop pcbk-student-07 pcbk-student-08 pcbk-student-09 pcbk-student-10`, затем
+   `docker compose --profile students create --force-recreate --no-build student-07 student-08 student-09 student-10`
+   — без `-f ~/pcbk-d8/compose.bench.yaml`; тома остаются, места спят.
+5. `accounts remove --login d8-probe-bench-NN --yes`, затем `accounts release-place --place N --yes`.
+6. В `.env` — пусто у `LLM_RUN_ID`, `LLM_RUN_USD`, `LLM_RUN_CALLERS` и `GW_IDLE_STOP_S`; затем
+   `docker compose up -d --no-build --force-recreate core`.
+7. Разговоры отбора — после окна, без владельца (денег и данных наружу это не даёт), по журналу `OUT/sessions.log`
+   (строки `<id>\t<NN>\tstart|end`), **одним вызовом на место**:
+   - id места — на машине разработчика: `awk -F'\t' '$2=="NN" && $3=="start" {print $1}' OUT/sessions.log | sort -u`;
+   - на сервере: `docker start pcbk-student-NN`, дождаться `healthy`, затем один одноразовый `curl` в сети места с
+     паролем места файлом — все адреса `DELETE` подряд (`200` — удалён, `404` — разговора уже нет), и
+     `docker stop pcbk-student-NN`:
+     ```bash
+     cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && STU=$(grep '^STU_NET=' .env | cut -d= -f2) &&
+     N=7 && NN=07 && IDS="<id> <id> …" && [ -n "$SD" ] &&
+     docker run --rm --pull never --runtime=runsc --network pcbk-stu-$NN --read-only --cap-drop ALL \
+       --security-opt no-new-privileges:true -v "$SD/student-$NN.pw:/pw:ro" curlimages/curl:8.16.0 \
+       -s -m 120 --variable PW@/pw --expand-user 'opencode:{{PW}}' -X DELETE -w ' %{http_code}\n' \
+       $(for i in $IDS; do echo "http://${STU:-172.31}.$N.3:4096/session/$i"; done)
+     ```
+   - строки конца: id без строки `end` — дописать `<id>\t<NN>\tend` в `OUT/sessions.log` (возобновление с этим `OUT`
+     их больше не прерывает).
+8. Проверка: `/health/llm` → `run: null`; в `accounts list` нет `d8-probe-*` и строк `место NN` мест отбора; у мест
+   нет `OPENCODE_CONFIG_CONTENT`; `agents.admin list --place N` — строк агентов нет; в `.env` `LLM_RUN_*` и
+   `GW_IDLE_STOP_S` пусты. Итог — строкой в журнал дня.
+
+## Аварийная уборка режима отбора (с Д8)
+
+Когда окно оборвалось или день кончился без уборки. Проверка — первым шагом утра Б0, первым шагом второго окна (Д8б′)
+и первым шагом утра Д9.
+1. **Проверка** (только чтение):
+   - в `.env` **пусты** `LLM_RUN_ID`, `LLM_RUN_USD`, `LLM_RUN_CALLERS`, `GW_IDLE_STOP_S` и `DRILL_LLM` — важно
+     значение, а не строка: `grep -E '^(LLM_RUN_ID|LLM_RUN_USD|LLM_RUN_CALLERS|GW_IDLE_STOP_S|DRILL_LLM)=.' .env` —
+     ни одной строки;
+   - у мест нет `OPENCODE_CONFIG_CONTENT`:
+     `for n in $(seq -w 1 10); do docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' pcbk-student-$n | grep -q '^OPENCODE_CONFIG_CONTENT=' && echo "место $n"; done`
+     — пусто;
+   - в `accounts list` нет `d8-probe-*` — ни строк учёток, ни строк `место NN`:
+     `docker exec pcbk-core python -m pcbk_core.gateway.accounts list | grep -c 'd8-probe-'` → `0`;
+   - `/health/llm` → `run: null`:
+     `curl -s http://172.31.250.82:8000/health/llm | python3 -c 'import json, sys; print(json.load(sys.stdin)["run"])'`
+     → `None`.
+2. **Нашлось** — сначала остановить прогонщик: `kill <pid>` по pid из `OUT/.lock`, затем `flock -n OUT/.lock true` →
+   код `0` (замок свободен); дальше — «Уборка после окна» выше, с шага 2. `DRILL_LLM` — пусто и пересоздание `core`
+   (учения без денег идут только под присмотром).
+3. Итог проверки — строкой в журнал дня: «режим отбора не найден» или что нашлось и что убрано.
+
 ## Что открывается наружу
 
 - Порт **8443** контейнера `edge` — Docker публикует его **в обход ufw**.
