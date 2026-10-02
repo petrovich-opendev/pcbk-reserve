@@ -1,9 +1,10 @@
 // Вкладка «Калькуляторы» (Д9-R88): те же инструменты службы данных, что у агентов, через шлюз POST /pcbk/api/calc/<tool>
 // (Д9-R87). При открытии ничего не спрашивает — только по кнопкам «Найти тег» и «Посчитать». Числа — значения ответа
-// службы как есть (fmtNum: ru-RU, не больше 3 знаков); под числами всегда — период с поясом, источник, вид среднего и
-// заметки дословно. Отказ службы — её message, элемент не ok — его text; 401 — конец сессии (onSignedOut), прочие не
-// 200 — replyText. Разметка — договор с интеграцией А7: поля #calc-query, #calc-tag, #calc-mode, #calc-period,
-// #calc-from, #calc-to, #calc-points, список .calc-matches, график svg.profile, итог section.calc-result.
+// службы как есть (fmtNum: ru-RU, не больше 3 знаков, малое ненулевое — 3 значащие цифры, не «0»; нет значения — «—»);
+// под числами всегда — период с поясом, источник, вид среднего и заметки дословно. Отказ службы — её message, элемент
+// не ok — его text; 401 — конец сессии (onSignedOut), прочие не 200 — replyText. Разметка — договор с интеграцией А7:
+// поля #calc-query, #calc-tag, #calc-mode, #calc-period, #calc-from, #calc-to, #calc-points, список .calc-matches,
+// график svg.profile, итог section.calc-result.
 // Стили — только классы chat.css: атрибутов style нет (CSP style-src 'self').
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { replyText, type Api, type CalcTool, type Reply } from "../api";

@@ -29,8 +29,16 @@ test("build_request_now_ignores_period", () => {
 test("fmt_num_ru", () => {                                                       // в «1 250,457» — U+00A0, как у Intl ru-RU
   expect([fmtNum(12.4), fmtNum(1250.4567), fmtNum(-3), fmtNum(0), fmtNum(null), fmtNum("12")])
     .toEqual(["12,4", "1 250,457", "-3", "0", "—", "—"]);
-  expect([fmtNum(Number.NaN), fmtNum(Number.POSITIVE_INFINITY), fmtNum(undefined), fmtNum(-0.0004)])
-    .toEqual(["—", "—", "—", "0"]);                                              // «-0» от округления не пишется
+  expect([fmtNum(Number.NaN), fmtNum(Number.POSITIVE_INFINITY), fmtNum(undefined), fmtNum(-0)])
+    .toEqual(["—", "—", "—", "0"]);                                              // «-0» не пишется
+});
+
+test("fmt_num_small_nonzero_never_zero", () => {                                 // доводка р1: решение контроллера по m-6
+  // ненулевое число не показывается как «0» (нет ложного числа): округление до 3 знаков дало бы ноль — 3 значащие цифры
+  expect([fmtNum(0.0004), fmtNum(0.000123), fmtNum(0.00012345), fmtNum(-0.0004), fmtNum(1e-9)])
+    .toEqual(["0,0004", "0,000123", "0,000123", "-0,0004", "0,000000001"]);
+  expect([fmtNum(0.0005), fmtNum(0.0012345), fmtNum(-0.0012), fmtNum(12.0004)])   // округление не до нуля — по-прежнему 3 знака
+    .toEqual(["0,001", "0,001", "-0,001", "12"]);
 });
 
 test("profile_segments_break_on_null", () => {

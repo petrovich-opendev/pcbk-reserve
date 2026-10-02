@@ -168,3 +168,52 @@ test("calc_page_no_style_attributes", async () => {                             
   expect(document.querySelector("section.calc-result")).not.toBeNull();
   expect(document.querySelectorAll("[style]").length).toBe(0);
 });
+
+// --- доводка р1 (ревью А5): нет значения — «—», не ноль; заметки элемента; отказ и 401 поиска тега ---
+
+test("calc_page_missing_values_dash_not_zero", async () => {                     // I-1: неуспех 2 дня — ложного числа нет
+  // у элемента ok поле null, NaN, строкой или его нет вовсе (А2 назвала бы поле иначе) — «—», не «0»; заметки — дословно
+  const QUALITY = "доля достоверных 90 % — ниже 99 %";
+  const COVERAGE = "данные покрывают 97,5 % периода — часы состояний в сумме меньше периода";
+  const api = calcApi({
+    tag_period: [200, { ...PERIOD_OK, items: [{ tag: "20FAKE_001_PV", status: "ok", unit: "л/час", avg: null, min: "10",
+                                                 max: Number.NaN, percent_good: null, quality_note: QUALITY }] }],
+    tag_series: [200, { ...SERIES_OK, items: [{ tag: "20FAKE_001_PV", status: "ok", unit: "л/час" }] }],
+    calc_runtime: [200, { ...RUNTIME_OK, items: [{ tag: "25FAKE_007_CLS", status: "ok", covered_percent: null, coverage_note: COVERAGE,
+                                                   states: [{ value: 1, label: "закрыт (по суффиксу)", hours: null, percent: "75" }] }] }],
+  });
+  const nums = () => [...document.querySelectorAll("section.calc-result .calc-num")].map((e) => e.textContent);
+  render(<CalcPage api={api} onSignedOut={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(await screen.findByText(QUALITY)).toBeTruthy();
+  expect(nums()).toEqual(["—", "—", "—", "—", "—"]);                              // среднее, минимум, максимум, размах, доля
+
+  fireEvent.change(screen.getByLabelText("Режим"), { target: { value: "profile" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  await screen.findByText("В начале");
+  expect(nums()).toEqual(["—", "—", "—", "—", "—"]);                              // профиля нет — ни одного числа
+  expect(document.querySelectorAll("svg.profile polyline, svg.profile circle").length).toBe(0);
+
+  fireEvent.change(screen.getByLabelText("Режим"), { target: { value: "runtime" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  const row = (await screen.findByText("закрыт (по суффиксу)")).closest("tr")!;
+  expect([...row.querySelectorAll("td")].map((td) => td.textContent)).toEqual(["закрыт (по суффиксу)", "—", "—", "—"]);
+  expect(screen.getByText(COVERAGE)).toBeTruthy();
+  expect(screen.queryByText(/^Данные покрывают/)).toBeNull();                      // покрытия нет — строки с числом нет
+});
+
+test("calc_page_search_refusal_and_signed_out", async () => {                    // I-2: Review Focus 4, учение А8 (R90 п. 4)
+  const onSignedOut = vi.fn();
+  const api = calcApi({ catalog_search: [[200, { tool: "catalog_search", status: "error", message: "сбой службы данных — вызов записан в журнал",
+                                                 notes: [] }],
+                                         [401, { name: "Unauthorized" }]] });
+  render(<CalcPage api={api} onSignedOut={onSignedOut} />);
+  fireEvent.change(screen.getByLabelText("Слова для поиска"), { target: { value: "тест" } });
+  fireEvent.click(screen.getByRole("button", { name: "Найти тег" }));
+  expect(await screen.findByText("сбой службы данных — вызов записан в журнал")).toBeTruthy();
+  expect(onSignedOut).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Найти тег" }));
+  await waitFor(() => expect(onSignedOut).toHaveBeenCalledTimes(1));
+  expect(api.calc.mock.calls).toEqual([["catalog_search", { query: "тест", limit: 20 }], ["catalog_search", { query: "тест", limit: 20 }]]);
+});

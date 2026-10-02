@@ -1,5 +1,6 @@
 // Чистые помощники вкладки «Калькуляторы» (Д9-R88): форма → запрос шлюза, числа ru-RU, время историана, ломаные
-// профиля. Вкладка считает не сама: числа — значения службы как есть, только в формате ru-RU (не больше 3 знаков).
+// профиля. Вкладка считает не сама: числа — значения службы как есть, только в формате ru-RU (не больше 3 знаков; малое
+// ненулевое — 3 значащие цифры, а не «0»).
 import type { CalcTool } from "./api";
 import { CALC_LABELS } from "./texts";
 
@@ -57,13 +58,16 @@ export function buildRequest(form: CalcForm): { tool: CalcTool; args: Record<str
 const isNum = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
 
 const NUMBER = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 3 });
+const SMALL = new Intl.NumberFormat("ru-RU", { maximumSignificantDigits: 3 });
 
-// число службы → ru-RU, не больше 3 знаков после запятой; не число (null, строка, NaN) — «—». «-0» от округления
-// крошечного отрицательного (изменение 12,5 − 12,5000001) пишется «0»
+// число службы → ru-RU, не больше 3 знаков после запятой; не число (null, строка, NaN) — «—». Ненулевое число никогда не
+// пишется «0» (доводка р1, решение контроллера: нет ложного числа важнее буквы «не больше 3 знаков»): если округление
+// до 3 знаков дало ноль, — 3 значащие цифры (0,0004 → «0,0004», 0,000123 → «0,000123»). Ноль и «-0» — «0»
 export function fmtNum(x: unknown): string {
   if (!isNum(x)) return "—";
+  if (x === 0) return "0";
   const text = NUMBER.format(x);
-  return text === "-0" ? "0" : text;
+  return text === "0" || text === "-0" ? SMALL.format(x) : text;
 }
 
 const ISO_LOCAL = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/;
