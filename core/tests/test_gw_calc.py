@@ -4,6 +4,7 @@
 настройка → сессия → источник → инструмент → преподаватель → служба → тело → аргументы. Служба — make_service на
 двойнике историана (core.db службы — в tmp_path, I1), шлюз — make_gateway(tmp_path / "gw", calc=svc): у них разные
 core.db."""
+import asyncio
 import re
 
 import pytest
@@ -113,6 +114,27 @@ def test_calc_route_body_not_object(gwc):                                       
         assert (r.status_code, r.json()) == (400, {"name": "BadRequest",
                                                    "data": {"message": GW_MESSAGES["bad_body"]}}), raw
     assert len(gwc.svc.role.events.recent()) == before
+
+
+def test_calc_route_own_period_and_limit_same_as_service(gwc):    # ревью А7, I-2 и А4, m-2: свой период и limit
+    """Свой закрытый период (start, end), точки ряда и limit поиска доходят до службы как есть: ответ шлюза (кроме
+    cache) равен ответу службы на тех же аргументах; перестановка start и end или потерянный limit — красный."""
+    s = gwc.as_("stu-03")
+    own = {"start": "2026-10-01T04:00", "end": "2026-10-01T10:00"}
+    svc, caller = gwc.svc, "student-03"
+    cases = (("tag_period", {**BODY, **own}, lambda: svc.tag_period(caller, "http", BODY["tags"], None, **own)),
+             ("tag_series", {**BODY, **own, "points": 5},
+              lambda: svc.tag_series(caller, "http", BODY["tags"], None, **own, points=5)),
+             ("calc_runtime", {"tags": ["25FAKE_007_CLS"], **own},
+              lambda: svc.calc_runtime(caller, "http", ["25FAKE_007_CLS"], None, **own)),
+             ("catalog_search", {"query": "FAKE", "limit": 2}, lambda: svc.catalog_search(caller, "http", "FAKE", 2)))
+    drop = lambda d: {k: v for k, v in d.items() if k != "cache"}
+    for tool, body, direct in cases:
+        page = post(s, tool, body).json()
+        assert page["status"] == "ok", (tool, page)
+        assert drop(page) == drop(asyncio.run(direct())), tool
+    assert len(page["matches"]) == 2 and page["total"] > 2                       # limit дошёл, а не умолчание
+    assert gwc.svc.role.events.recent()[1].channel == "web"
 
 
 def test_calc_route_bad_args_refused_with_web_event(gwc):        # R87, шаг 9: тело не идёт ни в ответ, ни в журнал
