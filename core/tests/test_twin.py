@@ -2,19 +2,21 @@
 import asyncio
 import os
 import re
+import statistics
 import subprocess
 import sys
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from helpers import CORE_DIR, LLM_ENV, REPO, SETTINGS, TOKEN, make_app, make_service, wait_until
-from pcbk_core.data.sql import SUMMARY_COLUMNS, catalog_sql, clock_sql, series_sql, state_sql, summary_sql
+from pcbk_core.data.sql import (SUMMARY_COLUMNS, catalog_sql, clock_sql, live_all_sql, live_sql, series_sql, state_sql,
+                                summary_sql)
 from pcbk_core.main import build_roles
 from twin_core import install_twin
-from twin_historian import BENCH_FIXTURE, TZ, TwinHistorian, analog_value, bench_whitelist
+from twin_historian import BENCH_FIXTURE, TZ, TwinHistorian, analog_value, bench_whitelist, state_value
 
 
 def test_twin_catalog_has_bench_cases():
@@ -161,3 +163,46 @@ async def test_twin_through_service(tmp_path):
     r = await s.calc_runtime("ops", "http", ["20FAKE_210_RUN", "20FAKE_211_CLS"], period="yesterday")
     a, b = r["items"]
     assert sum(st["hours"] for st in a["states"]) == pytest.approx(24.0) and b["status"] == "no_data"
+
+
+# --- доводка р1 (ревью А3, I-1): числа сводки и живого значения по сигналу ---
+
+def _signal_summary(sig, start: datetime, end: datetime) -> dict[str, float]:
+    """Ожидание сводки по Д9-R86 своим счётом: отсчёты через 60 с на [start, end), время историана — через TZ."""
+    t, t1, values = start.replace(tzinfo=TZ).timestamp(), end.replace(tzinfo=TZ).timestamp(), []
+    while t < t1:
+        values.append(analog_value(sig, t))
+        t += 60
+    return {"Minimum": min(values), "Maximum": max(values), "Average": statistics.fmean(values),
+            "StdDev": statistics.pstdev(values)}
+
+
+def test_twin_summary_matches_signal():
+    t = TwinHistorian.from_fixture(now=lambda: NOW + timedelta(seconds=30))
+    sig = t.signals["20FAKE_201_PV"]
+    cols = {}
+    # смена 06–14 09.10, сутки 09.10 и период, обрезанный «сейчас», с концом на :30
+    for start, end in ((L(2026, 10, 9, 6), L(2026, 10, 9, 14)), (L(2026, 10, 9), L(2026, 10, 10)),
+                       (L(2026, 10, 10), L(2026, 10, 10, 12, 0, 30))):
+        row = t([summary_sql(["20FAKE_201_PV"], start, end)], 10.0)[0][0]
+        got = cols[start, end] = dict(zip(("TagName", *SUMMARY_COLUMNS), row))
+        want = _signal_summary(sig, start, end)
+        assert {k: got[k] for k in want} == {k: pytest.approx(v) for k, v in want.items()}
+        assert got["PercentGood"] == 100.0
+    shift = cols[L(2026, 10, 9, 6), L(2026, 10, 9, 14)]["Average"]
+    day = cols[L(2026, 10, 9), L(2026, 10, 10)]["Average"]
+    assert abs(shift - day) > 1                                                    # 603,60 против 600,00
+
+
+def test_twin_live_signal():
+    t = twin()
+    at = NOW.timestamp() - 20                                                     # «сейчас − 20 с»
+    rows = {r[0]: r for r in t([live_sql(["20FAKE_201_PV", "20FAKE_210_RUN", "20FAKE_211_CLS"])], 10.0)[0]}
+    assert set(rows) == {"20FAKE_201_PV", "20FAKE_210_RUN"}                       # у 211 сигнала нет — строки нет
+    assert {r[1] for r in rows.values()} == {L(2026, 10, 10, 11, 59, 40)}
+    assert rows["20FAKE_201_PV"][2] == pytest.approx(analog_value(t.signals["20FAKE_201_PV"], at))
+    assert rows["20FAKE_210_RUN"][2] == state_value(t.signals["20FAKE_210_RUN"], at)
+    assert {r[3] for r in rows.values()} == {0}
+    names = {r[0] for r in t([live_all_sql()], 10.0)[0]}
+    assert {"20FAKE_201_PV", "20FAKE_202_PV", "20FAKE_210_RUN"} <= names           # признак «живой» в каталоге
+    assert not names & {"20FAKE_211_CLS", "20FAKE_107_PV"}
