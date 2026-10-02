@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
+from .checks import (HTTP_OK_DETAIL, LLM_RUN_SILENT_S, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
                      check_agents, check_container, check_gateway, check_historian, check_http, check_llm,
                      check_memory, check_tls, check_web, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
@@ -72,6 +72,9 @@ class Settings:
     # проход воркера перезагрузки агентов старше этого, с — «перезагрузка агентов молчит» (Д7-R60): метка ставится
     # раз в такт RELOAD_TICK_S = 2 с и перед каждым местом прохода (Д7-R58, раунд 1, m3)
     AGENTS_STALE_S: int = 60
+    # прогон отбора модели (Д8-R69): к модели прогона не обращались дольше этого, с — «прогон отбора молчит»;
+    # учения тишины ставят меньше
+    LLM_RUN_SILENT_S: int = LLM_RUN_SILENT_S
 
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:
@@ -94,6 +97,9 @@ class Settings:
         # AGENTS_STALE_S — так же: проверка агентов — один HTTP-запрос
         if self.AGENTS_STALE_S <= 0:
             raise ValueError("AGENTS_STALE_S должен быть больше нуля")
+        # LLM_RUN_SILENT_S — так же: порог строки «LLM-прокси и бюджет», один HTTP-запрос
+        if self.LLM_RUN_SILENT_S <= 0:
+            raise ValueError("LLM_RUN_SILENT_S должен быть больше нуля")
 
     @property
     def tz(self) -> ZoneInfo:
@@ -193,7 +199,8 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
                                settings.HIST_FAIL_S, settings.HIST_STALE_S,
                                timeout=NET_CHECK_TIMEOUT_S)
     if kind == "llm":
-        return check_llm(cid, title, comp["url"], now, timeout=NET_CHECK_TIMEOUT_S)
+        return check_llm(cid, title, comp["url"], now, timeout=NET_CHECK_TIMEOUT_S,
+                         run_silent_s=settings.LLM_RUN_SILENT_S)
     if kind == "gateway":
         return check_gateway(cid, title, comp["url"], now, settings.GW_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "web":

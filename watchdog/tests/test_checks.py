@@ -17,7 +17,9 @@ from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_K
                                   LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, Check, GatewayReply, _http_get,
                                   check_container, check_gateway,
                                   check_historian, check_http, check_llm, check_memory, check_tls, check_web,
-                                  fmt_total, fmt_usd, not_installed, tls_verdict)
+                                  fmt_total, fmt_usd, not_installed, tls_verdict,
+                                  LLM_RUN_SILENT_S, RUN_CAP_DETAIL, RUN_KEYS, RUN_SILENT_DETAIL, LlmReply,
+                                  llm_note, llm_verdict)
 from pcbk_watchdog import checks as checks_module
 from pcbk_watchdog.journal import Journal
 
@@ -785,11 +787,16 @@ def test_llm_junction_with_real_health_json(fake_core):                         
             "working": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · по ключу OpenRouter $0.0024"
                         " · отбор и проверки $0.0012 · на счёте $30.00"),
             "drill_402": ("fail", "на счёте OpenRouter кончились деньги (учения)",
-                          "расход $0.00 из $1000 · по ключу OpenRouter $0.00 · на счёте $30.00 · учения DRILL_LLM=402")}
+                          "расход $0.00 из $1000 · по ключу OpenRouter $0.00 · на счёте $30.00 · учения DRILL_LLM=402"),
+            # Д8а: LLM_RUN_* заданы (d8-test, $1, student-01 и ops), два вызова
+            "run_active": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · по ключу OpenRouter $0.0024"
+                           " · отбор и проверки $0.0012 · прогон d8-test: $0.0024 из $1.00, вызовов за 10 мин: 2"
+                           " · на счёте $30.00")}
     assert set(samples) == set(want)
     for name, obj in samples.items():
-        # помощник тестов сторожа держит тот же договор, что и настоящий ответ: 30 ключей и вложенные
-        assert set(obj) == set(llm_obj()) and len(obj) == 30, name
+        # помощник тестов сторожа держит тот же договор, что и настоящий ответ: 31 ключ и вложенные
+        assert set(obj) == set(llm_obj()) and len(obj) == 31, name
+        assert obj["run"] is None or set(obj["run"]) == RUN_KEYS, name
         assert (set(obj["upstream"]), set(obj["egress"]), set(obj["shares"])) == \
                ({"state", "text", "since"}, {"alive", "last_ok_age_s"}, {"over_80", "spent"}), name
         at = datetime.fromisoformat(obj["checked_at"]) if obj["checked_at"] else T0
@@ -797,6 +804,98 @@ def test_llm_junction_with_real_health_json(fake_core):                         
         r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", at + timedelta(seconds=5),
                       timeout=0.5)
         assert (r.state, r.detail, r.note) == want[name], name
+
+
+# --- прогон отбора модели в строке «LLM-прокси и бюджет» (задача А1 Д8а, Д8-R69) ---
+
+RUN = {"id": "d8-1008", "cap_usd": 80.0, "spent_usd": 12.4, "callers": 4, "calls_10m": 37, "idle_s": 3.0}
+
+
+def test_llm_run_note():
+    assert "прогон d8-1008: $12.40 из $80, вызовов за 10 мин: 37" in llm_note(LlmReply.parse(llm_obj(run=RUN)))
+    small = {**RUN, "cap_usd": 1.0, "spent_usd": 0.0, "calls_10m": 0}
+    assert "прогон d8-1008: $0.00 из $1.00" in llm_note(LlmReply.parse(llm_obj(run=small)))
+
+
+@pytest.mark.parametrize("patch,want", [
+    ({}, "ok"),
+    ({"spent_usd": 80.0}, ("warn", RUN_CAP_DETAIL)),
+    ({"idle_s": 301.0}, ("warn", RUN_SILENT_DETAIL)),
+])
+def test_llm_run_verdicts(patch, want):                                           # Review Focus 3
+    state, detail = llm_verdict(LlmReply.parse(llm_obj(run={**RUN, **patch})), T0, 300.0)
+    assert (state if want == "ok" else (state, detail)) == want
+
+
+def test_llm_run_silence_threshold_param():
+    r = LlmReply.parse(llm_obj(run={**RUN, "idle_s": 11.0}))
+    assert llm_verdict(r, T0, 10.0) == ("warn", RUN_SILENT_DETAIL) and llm_verdict(r, T0, 300.0)[0] == "ok"
+
+
+@pytest.mark.parametrize("bad", [{**RUN, "extra": 1}, {k: v for k, v in RUN.items() if k != "idle_s"},
+                                 {**RUN, "cap_usd": 0}, {**RUN, "calls_10m": -1}, []])
+def test_llm_run_off_contract(bad):
+    with pytest.raises((ValueError, TypeError, KeyError)):
+        LlmReply.parse(llm_obj(run=bad))
+
+
+def test_llm_without_run_key_is_none():                                           # core :d7b во время выкладки
+    obj = llm_obj()
+    del obj["run"]
+    assert LlmReply.parse(obj).run is None
+
+
+# сверх брифа
+
+def test_llm_run_rows_order():                                       # Д8-R69: после fail и unknown, до errors
+    silent, capped = {**RUN, "idle_s": 999.0}, {**RUN, "spent_usd": 80.0, "idle_s": 999.0}
+    cases = [
+        # учения 402 и сбои — раньше строк прогона (учение Д8-R77, шаг 2)
+        (llm_obj(drill="402", run=silent, upstream=up("money_out", "на счёте OpenRouter кончились деньги (учения)")),
+         ("fail", "на счёте OpenRouter кончились деньги (учения)")),
+        (llm_obj(config_error="прогон: точка отсчёта не записана", run=capped),
+         ("fail", "ошибка настройки: прогон: точка отсчёта не записана")),
+        (spent(1000.0, run=capped), ("fail", "бюджет $1000 исчерпан — модель не отвечает")),
+        (llm_obj(checked_at=None, run=silent), ("unknown", "OpenRouter ещё не опрашивался")),
+        (llm_obj(checked_at=(T0 - timedelta(seconds=LLM_STALE_S + 1)).isoformat(), run=silent),
+         ("unknown", "LLM-прокси давно не опрашивал OpenRouter")),
+        # потолок раньше тишины; оба — раньше errors, счёта, провайдера и полос бюджета
+        (llm_obj(run=capped), ("warn", RUN_CAP_DETAIL)),
+        (llm_obj(run=silent, upstream=up("errors", "OpenRouter отвечает с ошибками")), ("warn", RUN_SILENT_DETAIL)),
+        (spent(960.0, run=silent, account_remaining_usd=1.0, provider_mismatch_24h=2), ("warn", RUN_SILENT_DETAIL)),
+        (spent(960.0, run={**RUN, "spent_usd": 79.99}), ("warn", "израсходовано больше 95 % бюджета")),
+        (llm_obj(run={**RUN, "idle_s": 300.0}), ("ok", "OpenRouter отвечает")),       # ровно порог — ещё не «дольше»
+    ]
+    for obj, want in cases:
+        assert llm_verdict(LlmReply.parse(obj), T0, 300.0) == want, obj
+    assert LLM_RUN_SILENT_S == 300
+    assert llm_verdict(LlmReply.parse(llm_obj(run={**RUN, "idle_s": 300.5})), T0) == ("warn", RUN_SILENT_DETAIL)
+
+
+def test_llm_run_note_place_and_rounding():
+    full = spent(900.0, ops_usd=1.5, shares={"over_80": 3, "spent": 0}, account_remaining_usd=250.0,
+                 run={**RUN, "spent_usd": 79.996})
+    assert llm_note(LlmReply.parse(full)) == ("расход $900.00 из $1000 · отбор и проверки $1.50"
+                                              " · прогон d8-1008: $79.99 из $80, вызовов за 10 мин: 37"
+                                              " · доля больше 80 %: 3 · на счёте $250.00")   # не «$80.00 из $80»
+    for cap, shown in ((5.0, "$5.00"), (9.99, "$9.99"), (10.0, "$10"), (0.002, "$0.0020")):
+        r = LlmReply.parse(llm_obj(run={**RUN, "cap_usd": cap, "spent_usd": 0.0}))
+        assert f"прогон d8-1008: $0.00 из {shown}, " in llm_note(r), cap
+    assert "прогон" not in llm_note(LlmReply.parse(llm_obj()))
+
+
+def test_llm_run_through_check(fake_core):                                        # тот же договор по HTTP
+    fake_core.set_llm(llm_obj(run={**RUN, "idle_s": 11.0}))
+    url = fake_core.base + "/health/llm"
+    r = check_llm("llm", "LLM-прокси и бюджет", url, T0, timeout=0.5, run_silent_s=10)
+    assert (r.state, r.detail) == ("warn", RUN_SILENT_DETAIL) and "вызовов за 10 мин: 37" in r.note
+    assert check_llm("llm", "LLM-прокси и бюджет", url, T0, timeout=0.5).state == "ok"   # умолчание — 300 с
+    for bad in ({**RUN, "id": "D8"}, {**RUN, "id": ""}, {**RUN, "id": 5}, {**RUN, "callers": True},
+                {**RUN, "spent_usd": "1"}, {**RUN, "idle_s": float("nan")}, {**RUN, "spent_usd": -0.01},
+                {**RUN, "callers": 1.0}, "run"):
+        fake_core.set_llm(llm_obj(run=bad))
+        r = check_llm("llm", "LLM-прокси и бюджет", url, T0, timeout=0.5)
+        assert (r.state, r.detail, r.note) == ("fail", "LLM-прокси ответил не по договору", ""), bad
 
 
 # строка «Шлюз и вход» (задача А1 Д5а); gw — ответ /health/gateway из helpers

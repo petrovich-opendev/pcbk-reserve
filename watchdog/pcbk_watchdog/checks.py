@@ -96,6 +96,15 @@ USD_NOISE = 1e-9
 USD_TINY = Decimal("0.0001")
 # что пишет core в ledger_error (задача 6 Д4а): dropped — операция журнала брошена, write — запись не идёт
 LEDGER_ERRORS = frozenset({"dropped", "write"})
+# прогон отбора модели (Д8-R69): блок run ответа /health/llm — null или ровно эти ключи; id — как LLM_RUN_ID core
+RUN_KEYS = frozenset({"id", "cap_usd", "spent_usd", "callers", "calls_10m", "idle_s"})
+RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
+# к модели прогона не обращались дольше этого, с — «прогон отбора молчит» (умолчание Settings.LLM_RUN_SILENT_S)
+LLM_RUN_SILENT_S = 300
+RUN_CAP_DETAIL = "потолок прогона отбора исчерпан — вызовы прогона получают отказ"
+RUN_SILENT_DETAIL = "прогон отбора молчит — к модели давно никто не обращался"
+# потолок прогона меньше этого, $ — в note с центами ($5.00), иначе целым, как бюджет ($80)
+RUN_CAP_CENTS_BELOW_USD = 10.0
 
 # строка «Шлюз и вход» (задача А1 Д5а, Д5-R29); счётчики /health/gateway — за час в памяти core
 GW_DOWN_DETAIL = "шлюз не отвечает"
@@ -535,8 +544,40 @@ def _part(obj, key: str) -> dict:
 
 
 @dataclass(frozen=True)
+class RunInfo:
+    """Блок run ответа /health/llm (Д8-R69): прогон отбора модели — потолок, расход, вызовы за 10 мин, тишина."""
+    id: str
+    cap_usd: float
+    spent_usd: float
+    callers: int
+    calls_10m: int
+    idle_s: float
+
+    @classmethod
+    def parse(cls, obj) -> "RunInfo | None":
+        """null — прогона нет; объект — ровно RUN_KEYS, числа не меньше нуля, потолок больше нуля; иначе
+        ValueError, TypeError или KeyError."""
+        if obj is None:
+            return None
+        if not isinstance(obj, dict):
+            raise TypeError("run — не объект JSON")
+        if set(obj) != RUN_KEYS:
+            raise ValueError("run: ключи не по договору")
+        run = cls(id=_text(obj, "id"), cap_usd=_usd(obj, "cap_usd"), spent_usd=_usd(obj, "spent_usd"),
+                  callers=_count(obj, "callers"), calls_10m=_count(obj, "calls_10m"), idle_s=_usd(obj, "idle_s"))
+        if not RUN_ID_RE.fullmatch(run.id):
+            raise ValueError("run: id не по договору")
+        if min(run.spent_usd, run.callers, run.calls_10m, run.idle_s) < 0:
+            raise ValueError("run: число меньше нуля")
+        if run.cap_usd <= 0:
+            raise ValueError("run: потолок не больше нуля")
+        return run
+
+
+@dataclass(frozen=True)
 class LlmReply:
-    """Поля ответа /health/llm, которые читает сторож; типы проверены при разборе."""
+    """Поля ответа /health/llm, которые читает сторож; типы проверены при разборе. run — прогон отбора (Д8а):
+    ключа нет (core старше сторожа во время выкладки) или null — None."""
     checked_at: datetime | None
     stopped: bool
     config_error: str | None
@@ -565,6 +606,7 @@ class LlmReply:
     egress_alive: bool | None
     egress_last_ok_age_s: float | None
     refresh_started_age_s: float | None
+    run: RunInfo | None = None
 
     @classmethod
     def parse(cls, reply) -> "LlmReply":
@@ -590,7 +632,8 @@ class LlmReply:
             account_remaining_usd=_usd(reply, "account_remaining_usd", nullable=True),
             egress_alive=_flag(egress, "alive", nullable=True),
             egress_last_ok_age_s=_usd(egress, "last_ok_age_s", nullable=True),
-            refresh_started_age_s=_usd(reply, "refresh_started_age_s", nullable=True))
+            refresh_started_age_s=_usd(reply, "refresh_started_age_s", nullable=True),
+            run=RunInfo.parse(reply.get("run")))
         if r.upstream_state not in UPSTREAM_STATES:
             raise ValueError("неизвестное состояние OpenRouter")
         if not r.upstream_text.strip():
@@ -618,6 +661,12 @@ def llm_note(r: LlmReply) -> str:
         parts.append(f"по ключу OpenRouter {fmt_usd(r.key_spent_usd)}")
     if r.ops_usd > 0:
         parts.append(f"отбор и проверки {fmt_usd(r.ops_usd)}")
+    if r.run is not None:
+        run = r.run
+        cap = fmt_usd(run.cap_usd) if run.cap_usd < RUN_CAP_CENTS_BELOW_USD else fmt_total(run.cap_usd)
+        # округление расхода не переходит потолка: «$80.00 из $80» — только при исчерпанном потолке
+        parts.append(f"прогон {run.id}: {fmt_usd(run.spent_usd, keep=(run.cap_usd,))} из {cap}, "
+                     f"вызовов за 10 мин: {run.calls_10m}")
     if r.over_80 > 0:
         parts.append(f"доля больше 80 %: {r.over_80}")
     if r.shares_spent > 0:
@@ -631,11 +680,12 @@ def llm_note(r: LlmReply) -> str:
     return " · ".join(parts)
 
 
-def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
-    """Первая подходящая строка таблицы задачи 7 Д4а: сбои, «неизвестно», деньги мимо учёта
-    и провайдер, полосы бюджета — последними, чтобы полоса после $500 не прятала остальное.
+def llm_verdict(r: LlmReply, now: datetime, run_silent_s: float = LLM_RUN_SILENT_S) -> tuple[State, str]:
+    """Первая подходящая строка таблицы задачи 7 Д4а: сбои, «неизвестно», прогон отбора (Д8-R69), деньги мимо
+    учёта и провайдер, полосы бюджета — последними, чтобы полоса после $500 не прятала остальное.
 
-    В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
+    Строки прогона — после fail и unknown (учения 402 и сбой OpenRouter их перекрывают), до errors: исчерпанный
+    потолок, затем тишина дольше run_silent_s. В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
     """
     upstream_text = _reason(r.upstream_text)
     if r.stopped:
@@ -666,6 +716,11 @@ def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
         return "unknown", "OpenRouter ещё ни разу не ответил на опрос"
     if (now - r.checked_at).total_seconds() > LLM_STALE_S:
         return "unknown", "LLM-прокси давно не опрашивал OpenRouter"
+    if r.run is not None:
+        if r.run.spent_usd >= r.run.cap_usd:
+            return "warn", RUN_CAP_DETAIL
+        if r.run.idle_s > run_silent_s:
+            return "warn", RUN_SILENT_DETAIL
     if r.upstream_state == "errors":
         return "warn", upstream_text
     if r.account_remaining_usd is not None and r.account_remaining_usd < ACCOUNT_WARN_USD:
@@ -691,8 +746,9 @@ def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
 
 
 def check_llm(component: str, title: str, url: str, now: datetime,
-              timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
-    """LLM-прокси и бюджет по ручке /health/llm службы; сама служба OpenRouter заново не опрашивает."""
+              timeout: float = NET_CHECK_TIMEOUT_S, run_silent_s: float = LLM_RUN_SILENT_S) -> Check:
+    """LLM-прокси и бюджет по ручке /health/llm службы; сама служба OpenRouter заново не опрашивает. run_silent_s —
+    порог «прогон отбора молчит» (Settings.LLM_RUN_SILENT_S)."""
     try:
         status, body = _http_get(url, timeout, lambda code: code == 200)
     except (OSError, http.client.HTTPException):
@@ -705,7 +761,7 @@ def check_llm(component: str, title: str, url: str, now: datetime,
         return Check(component, title, "fail", LLM_DOWN_DETAIL)
     try:
         parsed = LlmReply.parse(reply)
-        state, detail = llm_verdict(parsed, now)
+        state, detail = llm_verdict(parsed, now, run_silent_s)
         note = llm_note(parsed)
     except (KeyError, TypeError, ValueError, ArithmeticError):   # ArithmeticError — Overflow, Decimal
         return Check(component, title, "fail", LLM_OFF_CONTRACT_DETAIL)

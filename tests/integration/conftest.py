@@ -61,6 +61,8 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY", "GW_STALE_S",
                         # срок молчания воркера перезагрузки агентов у сторожа и учения агентов у core (Д7а)
                         "AGENTS_STALE_S", "DRILL_AGENTS",
+                        # прогон отбора модели у core и порог «прогон отбора молчит» у сторожа (Д8а)
+                        "LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS", "LLM_RUN_SILENT_S",
                         # статика edge тестового стенда со сборкой чата (Д6а): compose.test.yaml, «:?»
                         "PCBK_TEST_STATIC"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка

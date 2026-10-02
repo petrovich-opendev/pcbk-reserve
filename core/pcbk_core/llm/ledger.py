@@ -43,6 +43,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
+from ..settings import LlmSettings, run_parts
+
 log = logging.getLogger("pcbk_core.llm.ledger")
 
 LEDGER_CHECK_S = 30.0          # период фоновой проверки записи
@@ -56,7 +58,7 @@ COUNTERS_WINDOW = timedelta(hours=24)
 WRITER_NAME = "pcbk-ledger-writer"
 OPS = "ops"
 
-Refusal = Literal["budget_spent", "share_spent"]
+Refusal = Literal["budget_spent", "run_spent", "share_spent"]
 STATUSES = ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lost", "unknown")
 CLOSED_STATUSES = tuple(s for s in STATUSES if s != "open")   # закрытая строка open быть не может
 COST_SOURCES = ("stream", "body", "generation", "pending", "unknown", "none")
@@ -724,6 +726,12 @@ class Ledger:
         with self._lock:
             return bool(self._mem.open or self._mem.pending)
 
+    def has_open_or_pending_of(self, caller: str) -> bool:
+        """Идущие или ждущие дозапроса цены вызовы одного вызывающего (точка отсчёта прогона, Д8-R69)."""
+        with self._lock:
+            m = self._mem
+            return any(r.caller == caller for rows in (m.open, m.pending) for r in rows.values())
+
     def totals(self, now: datetime) -> dict:
         """Итоги для health_json — только из памяти: зовётся в цикле событий."""
         now = _aware(now)
@@ -742,16 +750,46 @@ class Ledger:
             }
 
 
+@dataclass(frozen=True)
+class RunSpec:
+    """Прогон отбора модели (Д8-R69): id, потолок, $, и вызывающие под ним."""
+
+    id: str
+    cap_usd: float
+    callers: frozenset[str]
+
+
+def run_spec(llm: LlmSettings) -> RunSpec | None:
+    """Прогон из настроек (settings.run_parts): None — прогона нет; ошибка в LLM_RUN_* — ValueError без значения."""
+    parts = run_parts(llm)
+    return None if parts is None else RunSpec(*parts)
+
+
 class Budget:
-    """Доли вызывающих и общий бюджет. Оценку нового вызова проверка не прибавляет (Д4а-R13)."""
+    """Доли вызывающих, общий бюджет и потолок прогона отбора (Д8-R69). Оценку нового вызова проверка не
+    прибавляет (Д4а-R13).
+
+    run_base — точки отсчёта прогона по вызывающим (llm_meta, ставит LlmRole.ensure_run_base до первого вызова).
+    """
 
     def __init__(self, ledger: Ledger, *, total_usd: float, share_usd: float, ops_share_usd: float,
-                 key_spent: Callable[[], float | None] = lambda: None):
+                 key_spent: Callable[[], float | None] = lambda: None, run: RunSpec | None = None):
         self.ledger = ledger
         self.total_usd = total_usd
         self.share_usd = share_usd
         self.ops_share_usd = ops_share_usd
         self.key_spent = key_spent
+        self.run = run
+        self.run_base: dict[str, float] = {}
+
+    def run_spent(self) -> float:
+        """Потрачено прогоном: Σ max(0, spent(c) − base[c]) по вызывающим прогона. spent уже держит резервы идущих
+        вызовов и оценки вызовов без цены (Д4а-R13). Точки нет — отсчёт от нуля: при сомнении расход больше, а не
+        меньше. Прогона нет — 0."""
+        run = self.run
+        if run is None:
+            return 0.0
+        return sum((max(0.0, self.ledger.spent(c) - self.run_base.get(c, 0.0)) for c in sorted(run.callers)), 0.0)
 
     def share_of(self, caller: str) -> float:
         """ops_share_usd для ops, иначе share_usd. Перераспределение долей — Д10."""
@@ -766,9 +804,12 @@ class Budget:
         return max(self.ledger.spent() - self.ledger.reserved_open(), self.key_spent() or 0.0)
 
     def refusal(self, caller: str) -> Refusal | None:
-        """Сначала общий бюджет, потом доля вызывающего."""
+        """Сначала общий бюджет, потом потолок прогона (только вызывающим прогона), потом доля вызывающего."""
         if self.total_spent() >= self.total_usd:
             return "budget_spent"
+        run = self.run
+        if run is not None and caller in run.callers and self.run_spent() >= run.cap_usd:
+            return "run_spent"
         if self.ledger.spent(caller) >= self.share_of(caller):
             return "share_spent"
         return None

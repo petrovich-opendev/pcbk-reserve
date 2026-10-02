@@ -327,6 +327,28 @@ def test_agents_stale_setting():                                               #
     assert Settings(AGENTS_STALE_S=1).tick_budget_s == Settings().tick_budget_s
 
 
+def test_run_silent_setting():                                                  # задача А1 Д8а
+    assert Settings().LLM_RUN_SILENT_S == 300
+    assert Settings.from_env({"LLM_RUN_SILENT_S": "10"}).LLM_RUN_SILENT_S == 10
+    for bad in ({"LLM_RUN_SILENT_S": "0"}, {"LLM_RUN_SILENT_S": "abc"}, {"LLM_RUN_SILENT_S": "1.5"}):
+        with pytest.raises(ValueError):
+            Settings.from_env(bad)
+
+
+def test_run_checks_llm_passes_run_silent(fake_core):                            # сверх брифа: _check_one → check_llm
+    fake_core.set_llm(llm_obj(run={"id": "d8-drill", "cap_usd": 1.0, "spent_usd": 0.0, "callers": 1,
+                                   "calls_10m": 0, "idle_s": 11.0}))
+    comps = [{"id": "llm", "title": "LLM-прокси и бюджет", "kind": "llm", "url": fake_core.base + "/health/llm"}]
+    reader = DockerReader("http://127.0.0.1:9", 0.5)
+    note = "расход $12.35 из $1000 · прогон d8-drill: $0.00 из $1.00, вызовов за 10 мин: 0"
+    quick = replace(SETTINGS, LLM_RUN_SILENT_S=10)
+    assert [(c.state, c.detail, c.note) for c in run_checks(comps, reader, quick, T0)] == \
+        [("warn", "прогон отбора молчит — к модели давно никто не обращался", note)]
+    assert [(c.state, c.note) for c in run_checks(comps, reader, SETTINGS, T0)] == [("ok", note)]
+    with pytest.raises(ValueError):
+        replace(SETTINGS, LLM_RUN_SILENT_S=-1)
+
+
 def test_run_checks_agents_kind(json_site):
     # вид agents идёт через _check_one в check_agents с порогом AGENTS_STALE_S; note доходит до снимка
     assert pcbk_watchdog.main.KINDS["agents"] == ("url",)

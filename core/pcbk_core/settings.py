@@ -79,6 +79,39 @@ _LLM_FLOAT_MIN = {"LLM_POLL_S": 5.0}
 _LLM_CHOICES = (("LLM_KEY_DEDICATED", LLM_KEY_MODES), ("LLM_STATE", LLM_STATES), ("DRILL_LLM", DRILL_LLM_MODES))
 # пути к файлам секретов роли llm: без проверок, их берёт и запасная настройка при ошибке в LLM_*
 _LLM_FILE_FIELDS = ("OPENROUTER_KEY_FILE", "OPENROUTER_MGMT_KEY_FILE", "LLM_TOKENS_FILE")
+# прогон отбора модели (Д8-R69): id прогона и вызывающие под его потолком; ops — для ботов Д11
+RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
+RUN_CALLER_RE = re.compile(r"student-(0[1-9]|10)|ops")
+
+
+def parse_run_callers(raw: str) -> frozenset[str]:
+    """LLM_RUN_CALLERS (m11): через запятую, пробелы по краям срезаются; каждый — RUN_CALLER_RE, без повторов и
+    пустых. Ошибка — ValueError с именем переменной, без значения (текст идёт в config_error и на страницу)."""
+    items = [item.strip() for item in raw.split(",")]
+    if not all(RUN_CALLER_RE.fullmatch(item) for item in items):
+        raise ValueError("LLM_RUN_CALLERS: только student-01…student-10 и ops")
+    if len(set(items)) != len(items):
+        raise ValueError("LLM_RUN_CALLERS: вызывающий повторяется")
+    return frozenset(items)
+
+
+def run_parts(llm: "LlmSettings") -> tuple[str, float, frozenset[str]] | None:
+    """Прогон отбора (Д8-R69) из настроек: None — прогона нет (все три LLM_RUN_* пусты), иначе (id, потолок,
+    вызывающие). Задаются все три или ни одного; потолок — больше нуля и не больше LLM_TOTAL_USD. Ошибка —
+    ValueError, текст начинается с LLM_RUN_ и значения не содержит. Зовут from_env и ledger.run_spec: настройки
+    тестов строятся replace без from_env, а роль проверяет их сама — закрыто при сомнении."""
+    given = (llm.LLM_RUN_ID != "", llm.LLM_RUN_USD != 0, llm.LLM_RUN_CALLERS != "")
+    if not any(given):
+        return None
+    if not all(given):
+        raise ValueError("LLM_RUN_*: нужны все три переменные или ни одной")
+    if not RUN_ID_RE.fullmatch(llm.LLM_RUN_ID):
+        raise ValueError("LLM_RUN_ID: только a-z, 0-9 и дефис, до 32 знаков")
+    cap = llm.LLM_RUN_USD
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not (
+            math.isfinite(cap) and 0 < cap <= llm.LLM_TOTAL_USD):
+        raise ValueError("LLM_RUN_USD: больше нуля, не больше LLM_TOTAL_USD")
+    return llm.LLM_RUN_ID, float(cap), parse_run_callers(llm.LLM_RUN_CALLERS)
 
 
 @dataclass(frozen=True)
@@ -101,6 +134,10 @@ class LlmSettings:
     LLM_KEY_DEDICATED: str = "on"           # ключ только у резервного контура: сверка с /key
     LLM_STATE: str = "on"                   # stopped — выключатель администратора
     DRILL_LLM: str = ""                     # 402 — учение «кончились деньги» без OpenRouter
+    # прогон отбора модели (Д8-R69): все три или ни одного; потолок — поверх долей и общего бюджета
+    LLM_RUN_ID: str = ""                    # RUN_ID_RE; новый id — новая точка отсчёта
+    LLM_RUN_USD: float = 0.0                # потолок прогона, $: больше нуля и не больше LLM_TOTAL_USD
+    LLM_RUN_CALLERS: str = ""               # места прогона через запятую (RUN_CALLER_RE)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "LlmSettings":
@@ -146,6 +183,7 @@ class LlmSettings:
             select_models(llm.LLM_MODELS)
         except ValueError as exc:           # «LLM_MODELS: неизвестная модель «имя»» — имя не повторяется
             raise ValueError(re.sub(r"«[^»]*»", "«…»", str(exc))) from None
+        run_parts(llm)                      # LLM_RUN_*: все три или ни одного (Д8-R69)
         return llm
 
     @classmethod

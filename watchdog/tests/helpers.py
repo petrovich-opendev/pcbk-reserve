@@ -47,7 +47,8 @@ def insp(running=False, oom=False, code=0, restarts=0, restarting=False, paused=
 
 
 def llm_obj(**kw):
-    """Ответ /health/llm (договор задачи 6 Д4а, 30 ключей — сверяет тест стыка): всё в норме, расход $12.3456."""
+    """Ответ /health/llm (договор задачи 6 Д4а и run Д8а, 31 ключ — сверяет тест стыка): всё в норме, расход
+    $12.3456, прогона отбора нет."""
     base = {"checked_at": (T0 - timedelta(seconds=10)).isoformat(), "config_error": None, "tokens_error": None,
             "stopped": False, "key": "ok",
             "mgmt_key": "missing", "drill": "", "ledger_ok": True, "ledger_error": None,
@@ -57,7 +58,7 @@ def llm_obj(**kw):
             "pending": 0, "pending_stuck": 0, "cost_unknown_24h": 0, "provider_mismatch_24h": 0,
             "account_remaining_usd": None, "models": ["z-ai/glm-5.3"],
             "ledger_queue": 0, "ledger_fresh": False, "ledger_reset": False,
-            "egress": {"alive": True, "last_ok_age_s": 12.0}, "refresh_started_age_s": 3600.0}
+            "egress": {"alive": True, "last_ok_age_s": 12.0}, "refresh_started_age_s": 3600.0, "run": None}
     return {**base, **kw}
 
 
