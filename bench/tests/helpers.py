@@ -274,3 +274,85 @@ def honest_a_record(sid: str, bridge_answer: str = "Сейчас 3,42 бар (20
     return RunRecord(key=RunKey(place, sid, 1), model="pcbk/z-ai/glm-5.3", status="done", turns=turns,
                      sessions=["ses_a", "ses_bridge"], saved=saved, agent_file=agent_file_text(), visible_delay_s=3.0,
                      bridge=br, calc={}, llm_rows=[], notes=[], saw_draft=bot.saw_draft)
+
+
+# --- Б2: строки журнала прокси, строки таблицы, вердикты судьи (m1, П8) ---
+from dataclasses import dataclass  # noqa: E402 — helpers дополняются только в конец
+
+
+def row(*, step: int = 1, cost: float | None = 0.0, cost_est: float | None = None, cost_source: str = "stream",
+        status: str = "ok", session: str = "ses_b1", ts: str | None = None, provider: str | None = "fireworks",
+        model: str = "z-ai/glm-5.3", prompt_tokens: int = 1000, cached_tokens: int = 0,
+        reasoning_tokens: int = 0) -> dict:
+    """Строка llm_calls (столбцы ledger.py) для RunRecord.llm_rows; cost_est по умолчанию — cost (или 0)."""
+    return {"ts": ts, "caller": "student-07", "session": session, "model": model, "step": step, "status": status,
+            "code": "ok" if status == "ok" else status, "http_status": 200, "provider": provider, "cost": cost,
+            "cost_est": cost_est if cost_est is not None else (cost or 0.0), "cost_source": cost_source,
+            "prompt_tokens": prompt_tokens, "completion_tokens": 100, "cached_tokens": cached_tokens,
+            "cache_write_tokens": 0, "reasoning_tokens": reasoning_tokens, "duration_ms": 1000}
+
+
+def mrow(model: str, **kw):
+    """ModelRow таблицы: planned=32, judged=32, A 8/8 из 8, оценка 4,0 и прогноз на 5 000 ходов $100 по умолчанию."""
+    from pcbk_bench.table import ModelRow
+
+    base = dict(model=model, planned=32, judged=32, create_planned=8, create_judged=8, create_passed=8, quality=4.0,
+                f5000=100.0)
+    base.update(kw)
+    return ModelRow(**base)
+
+
+@dataclass(frozen=True)
+class FakeVerdict:
+    """Вердикт судьи в форме judge.Verdict (Б1): scores, hard, why, status."""
+    scores: dict
+    hard: dict
+    why: str = ""
+    status: str = "ok"
+
+
+@dataclass
+class FakeReport:
+    """Разбор вердиктов в форме judge.VerdictReport (Б1) с картой runs: packet_id → прогон (П8)."""
+    ok: dict
+    missing: list
+    invalid: list
+    refused: list
+    runs: dict
+
+
+def clean_verdict(sid: str, score: int = 4, **hard: bool) -> FakeVerdict:
+    """Чистый вердикт сценария: все пункты судьи — score, жёсткие ложны (вне A saved_prompt_bad — null)."""
+    flags = {"invented_norm": False, "numbers_not_from_tools": False,
+             "saved_prompt_bad": False if BY_ID[sid].group == "create" else None}
+    flags.update(hard)
+    return FakeVerdict(scores={k: score for k in BY_ID[sid].judge_items}, hard=flags)
+
+
+def run_ref(r: RunRecord) -> str:
+    """Id прогона в карте пакетов (П8): «<model>|<place>|<scenario>|<rep>»."""
+    return f"{r.model}|{r.key.place}|{r.key.scenario}|{r.key.rep}"
+
+
+def packet_id(i: int) -> str:
+    """12 строчных латинских букв без цифр, как у пакетов Б1."""
+    return "".join(chr(97 + (i // 26 ** k) % 26) for k in range(12))
+
+
+def verdicts(*recs: RunRecord, verdict: FakeVerdict | None = None, score: int = 4, missing=(), invalid=(),
+             refused=()) -> FakeReport:
+    """Вердикты по записям (П8): каждой — пакет; по умолчанию чистый вердикт её сценария; записи из missing,
+    invalid и refused — без вердикта, в своём списке."""
+    rep = FakeReport(ok={}, missing=[], invalid=[], refused=[], runs={})
+    for i, r in enumerate(recs):
+        pid = packet_id(i)
+        rep.runs[pid] = run_ref(r)
+        if any(r is x for x in missing):
+            rep.missing.append(pid)
+        elif any(r is x for x in invalid):
+            rep.invalid.append(pid)
+        elif any(r is x for x in refused):
+            rep.refused.append(pid)
+        else:
+            rep.ok[pid] = verdict if verdict is not None else clean_verdict(r.key.scenario, score)
+    return rep
