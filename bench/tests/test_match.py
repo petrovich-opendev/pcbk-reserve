@@ -483,3 +483,34 @@ def test_cli_match_only_basic(fake_stand, tmp_path, capsys, monkeypatch):
     assert main(["match", str(cfg), "--only", "basic"]) == 0
     out = capsys.readouterr().out
     assert "случаев 5" in out and "profile_last_8h" not in out and "runtime_yesterday" not in out
+
+
+# --- итоговая доводка Д9б ---
+
+def runtime_call(states, hours=24.0):
+    """Вывод calc_runtime за вчера (закрытый период) по тегу состояния случая."""
+    return ToolCall("pcbk_calc_runtime", {"tags": ["20FAKE_210_RUN"], "period": "yesterday"},
+                    {"status": "ok", "period": {"preset": "yesterday", "start": PERIODS["yesterday"][0],
+                                                "end": PERIODS["yesterday"][1], "open": False},
+                     "items": [{"tag": "20FAKE_210_RUN", "status": "ok", "states": states, "covered_percent": 100.0,
+                                "period_hours": hours}]}, "completed")
+
+
+FULL_DAY = [{"value": 1, "label": "работает (по суффиксу)", "hours": 24.0, "percent": 100.0, "count": 0}]
+
+
+@pytest.mark.parametrize("text", ["Данных за 24 часа нет.", "За вчера (24 ч): работал 20 ч, стоял 4 ч.",
+                                  "Вчера за сутки (24 часа) машина работала 22,5 ч, стояла 1,5 ч.",
+                                  "Из 24 ч периода: работа — 18 ч, останов — 6 ч.",
+                                  "Данных за вчерашние 24 часа нет."])
+def test_period_length_is_not_state_hours(text):                                       # I-1 итогового ревью
+    run = runtime_call(FULL_DAY)
+    r = judge_case(CASES["runtime_yesterday"], turn(text, run), run.output)
+    assert r.verdict != "match" and r.verdict in ("mismatch", "no_number"), (text, r.verdict)
+
+
+@pytest.mark.parametrize("text", ["Работает: 24 ч (100 % периода), переходов 0.",
+                                  "работает (по суффиксу): 24 ч (100 % периода), переходов 0."])
+def test_full_day_state_hours_match(text):                                              # I-1: положительный контроль
+    run = runtime_call(FULL_DAY)
+    assert judge_case(CASES["runtime_yesterday"], turn(text, run), run.output).verdict == "match"

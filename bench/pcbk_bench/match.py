@@ -122,6 +122,11 @@ PERIOD_TEXT = {"prev_shift": "прошлая смена", "last_24h": "посл�
 _CODE = re.compile(r"[a-z_]{1,24}")
 _TAG = re.compile(r"[A-Za-z0-9_]{1,128}")
 _LOGIN = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+# длина периода у hours_top (I-1 итогового ревью Д9б): длительность сразу после «за», «из» (и одного слова вроде
+# «вчерашние»), «период…», «сутк…» или «(» — «за вчера (24 ч)», «Данных за 24 часа нет», «из 24 ч» — не часы состояния
+_PERIOD_LEN = re.compile(r"(?:\b(?:за|из)(?:[ \t ]+(?:вчерашн|последн|прошедш|полн|все|весь)\w*)?|\bпериод\w*|"
+                         r"\bсутк\w*|\()[ \t ]*$", re.IGNORECASE)
+PERIOD_LEN_WINDOW = 40
 
 
 @dataclass(frozen=True)
@@ -307,13 +312,20 @@ def period_ok(case: Case, call: ToolCall) -> bool:
 
 def _quantities(text: str, case: Case, unit: Any = None) -> list[Shown]:
     """Числа величин ответа: parse_numbers без неизмеряемых; процент — величина у тега с единицей «%», часы «ч» —
-    величина hours_top."""
+    величина hours_top, кроме длины периода (_PERIOD_LEN: «за вчера (24 ч)», «Данных за 24 часа нет»)."""
     kinds: set[str | None] = {None}
     if isinstance(unit, str) and unit.strip() == "%":
         kinds.add("percent")
     if "hours_top" in case.keys:
         kinds.add("duration")
-    return [s for s in parse_numbers(text) if non_measure_kind(text, s) in kinds]
+    out = []
+    for s in parse_numbers(text):
+        kind = non_measure_kind(text, s)
+        if kind not in kinds or (kind == "duration"
+                                 and _PERIOD_LEN.search(text, max(0, s.start - PERIOD_LEN_WINDOW), s.start)):
+            continue
+        out.append(s)
+    return out
 
 
 def _key_shown(text: str, key: str, value: Any, pool: list[Shown]) -> bool:
