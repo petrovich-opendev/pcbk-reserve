@@ -1,7 +1,7 @@
 // Проверка собранной статики под строгий CSP и опись сборки (Д6-R40, preflight M1, M6).
 // Фикстура пишет каталог сборки во временный путь; дерево репозитория не трогается.
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, expect, test } from "vitest";
@@ -23,6 +23,7 @@ type Fx = {
 const BUILD = "test-0123456789ab";
 const JS = "assets/index-A1b2c3.js";
 const CSS = "assets/index-D4e5f6.css";
+const BOOT = '<script src="/chat/boot.js"></script>';                  // загрузчик Д6б (Д6-R51) — как пишет Vite
 const CLEAN: Fx = {
   html: [
     "<!doctype html>",
@@ -30,6 +31,7 @@ const CLEAN: Fx = {
     "<head>",
     '<meta charset="utf-8">',
     `<meta name="pcbk-build" content="${BUILD}">`,
+    BOOT,
     `<script type="module" crossorigin src="/chat/${JS}"></script>`,
     `<link rel="stylesheet" crossorigin href="/chat/${CSS}">`,
     "</head>",
@@ -47,7 +49,7 @@ const sha256 = (body: string) => createHash("sha256").update(body).digest("hex")
 
 function fixture(f: Fx): string {
   const dir = mkdtempSync(join(root, "dist-"));
-  const files: Record<string, string> = { [JS]: f.js, [CSS]: f.css ?? "body{margin:0}" };
+  const files: Record<string, string> = { [JS]: f.js, [CSS]: f.css ?? "body{margin:0}", "boot.js": "/* boot */" };
   for (const p of f.more ?? []) files[p] = `/* ${p} */`;
   if (f.extraFile) files[f.extraFile] = f.extraBody ?? "extra";
   writeFileSync(join(dir, "index.html"), f.html);
@@ -190,6 +192,26 @@ test("check_dist_warns_on_boot_js", () => {                                     
                               expect.stringMatching(/^boot\.js: .*unsafe-eval.*eval\( ×1/)]);
 });
 
+// Д6б (Д6-R51, preflight Ф15): загрузчик /chat/boot.js — ровно один классический <script src> без type, async,
+// defer и nomodule (итоговая доводка Д6б, Б1-m3: nomodule браузер класса не исполняет); любой другой <script src> не
+// модулем — ошибка. Без загрузчика отчёт boot_failed пропал бы молча
+test("check_dist_requires_one_classic_boot", () => {
+  const real = readFileSync("public/boot.js", "utf8");                                 // настоящий загрузчик
+  const r = checkDist(fixture({ ...CLEAN, extraFile: "boot.js", extraBody: real, listExtraInManifest: true }));
+  expect([r.errors, r.warnings]).toEqual([[], []]);
+  const html = (tag: string) => CLEAN.html.replace(BOOT, tag);
+  for (const tag of ["", BOOT + BOOT, '<script type="module" src="/chat/boot.js"></script>',
+                     '<script type="text/javascript" src="/chat/boot.js"></script>',
+                     '<script src="/chat/boot.js" defer></script>', '<script async src="/chat/boot.js"></script>',
+                     '<script nomodule src="/chat/boot.js"></script>', '<script src="/chat/boot.js" NOMODULE></script>',
+                     '<script type="Module" src="/chat/boot.js"></script>' + BOOT])  // модуль с тем же файлом — лишний
+    expect(checkDist(fixture({ ...CLEAN, html: html(tag) })).errors, tag)
+      .toEqual([expect.stringMatching(/загрузчик \/chat\/boot\.js/)]);
+  for (const tag of [`<script src="/chat/${JS}"></script>`, `<script type="text/javascript" src="/chat/${JS}"></script>`])
+    expect(checkDist(fixture({ ...CLEAN, html: html(BOOT + tag) })).errors, tag)
+      .toEqual([expect.stringMatching(/<script>.*не модуль/)]);
+});
+
 // Ограда emptyOutDir (vite.config.ts): сборка не стирает каталог, который не похож на прежнюю сборку чата
 test("build_refuses_foreign_out_dir", () => {
   const out = mkdtempSync(join(root, "out-"));
@@ -221,9 +243,9 @@ test("check_dist_matches_watchdog_contract", () => {
   expect(checkDist(dots).errors).toContainEqual(expect.stringMatching(/опись: путь "assets\/\.\."/));
   const far = CLEAN.html.replace("<head>", `<head><!--${"x".repeat(64 * 1024)}-->`);   // сторож читает первые 64 КиБ
   expect(checkDist(fixture({ ...CLEAN, html: far })).errors).toContainEqual(expect.stringMatching(/метка сборки дальше первых 64 КиБ/));
-  const more = Array.from({ length: 6 }, (_, i) => `assets/chunk-${i}.js`);           // 2 + 6 = 8 файлов — предел
+  const more = Array.from({ length: 5 }, (_, i) => `assets/chunk-${i}.js`);           // 3 + 5 = 8 файлов — предел
   expect(checkDist(fixture({ ...CLEAN, more })).errors).toEqual([]);
-  expect(checkDist(fixture({ ...CLEAN, more, extraFile: "boot.js", listExtraInManifest: true })).errors)
+  expect(checkDist(fixture({ ...CLEAN, more, extraFile: "assets/extra.js", listExtraInManifest: true })).errors)
     .toContainEqual(expect.stringMatching(/опис.*больше 8/));                           // 9 записей: сторож отверг бы
 });
 

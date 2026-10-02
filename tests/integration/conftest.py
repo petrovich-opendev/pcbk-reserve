@@ -537,6 +537,14 @@ class Stack:
               "--login", login], input=Secret(password + "\n"))
         return password
 
+    def accounts_list_row(self, login: str) -> str:
+        """Строка учётки login в выводе `accounts list` команды администратора (столбцы через табуляцию: логин, роль,
+        место, состояние, предупреждён — да/нет, у преподавателя «-»). Нет такой строки — AssertionError."""
+        out = self.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "list")
+        rows = [line for line in out.splitlines() if line.split("\t", 1)[0] == login]
+        assert len(rows) == 1, f"accounts list: строк учётки {login} — {len(rows)}"
+        return rows[0]
+
     def gw_health(self) -> dict:
         """/health/gateway серверного слоя изнутри pcbk-watchdog — из pcbk-front, как его читает сторож (preflight
         M14: тело даёт body_from_watchdog, http_front — только код)."""

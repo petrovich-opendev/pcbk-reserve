@@ -12,7 +12,7 @@ import pytest
 
 from helpers import PW, FakeMono, fail_connect, full_disk, store
 from pcbk_core.gateway import accounts
-from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, MAX_SESSIONS_PER_LOGIN, UNKNOWN_KEYS,
+from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, MAX_SESSIONS_PER_LOGIN, NOTICE, UNKNOWN_KEYS,
                                         AccountStore, StoreError, hash_password, verify_password)
 from pcbk_core.gateway.accounts import main as accounts_main
 
@@ -368,3 +368,135 @@ def test_cli(tmp_path, capsys, monkeypatch):
     assert "место 03 закреплено за учёткой ivanov" in err.err and err.out == ""
     assert accounts_main(["release-place", "--place", "3", "--yes"]) == 1
     assert accounts_main(["unlock", "--login", "ivanov"]) == 0
+
+
+# --- предупреждение при первом входе (Д6б, Д6-R49) ---
+
+# схема core.db Д5 (Д5а–Д5б) — копия _SCHEMA Д5, без gw_notices: база выкладки Д5 открывается как есть
+D5_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS gw_accounts (
+        login TEXT PRIMARY KEY,
+        role TEXT NOT NULL CHECK (role IN ('student', 'teacher')),
+        place INTEGER,
+        pw_hash TEXT NOT NULL,
+        disabled INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )""",
+    ("CREATE UNIQUE INDEX IF NOT EXISTS gw_accounts_active_place ON gw_accounts (place)"
+     " WHERE disabled = 0 AND place IS NOT NULL"),
+    """CREATE TABLE IF NOT EXISTS gw_places (
+        place INTEGER PRIMARY KEY,
+        login TEXT NOT NULL,
+        since TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS gw_sessions (
+        token_sha TEXT PRIMARY KEY,
+        login TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        expires_at REAL NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS gw_sessions_login ON gw_sessions (login)",
+    """CREATE TABLE IF NOT EXISTS gw_login_failures (
+        login TEXT NOT NULL,
+        at REAL NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS gw_login_failures_login ON gw_login_failures (login, at)",
+    """CREATE TABLE IF NOT EXISTS gw_heartbeat (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        at REAL NOT NULL
+    )""",
+)
+
+
+def make_d5_db(path) -> None:
+    """core.db, как её оставил core Д5: таблицы Д5, учётка stu-03 (место 3, пароль PW) с закреплением места."""
+    with closing(sqlite3.connect(path)) as db:
+        for statement in D5_SCHEMA:
+            db.execute(statement)
+        db.execute("INSERT INTO gw_accounts (login, role, place, pw_hash, disabled, created_at)"
+                   " VALUES ('stu-03', 'student', 3, ?, 0, '2026-10-05T07:00:00+00:00')", (hash_password(PW),))
+        db.execute("INSERT INTO gw_places (place, login, since) VALUES (3, 'stu-03', '2026-10-05T07:00:00+00:00')")
+        db.commit()
+
+
+def tables(path) -> set[str]:
+    with closing(sqlite3.connect(path)) as db:
+        return {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+
+def notice_rows(path) -> list[tuple]:
+    with closing(sqlite3.connect(path)) as db:
+        return db.execute("SELECT login, notice FROM gw_notices ORDER BY login, notice").fetchall()
+
+
+def test_store_opens_d5_db(tmp_path):                                                    # Review Focus 5 Д6б
+    db = tmp_path / "core.db"; make_d5_db(db)
+    assert "gw_notices" not in tables(db) and "gw_accounts" in tables(db)                # положительный контроль: база Д5
+    store = AccountStore(str(db)); assert store.open(), store.last_error
+    assert "gw_notices" in tables(db)
+    assert store.verify("stu-03", PW) is not None                                         # учётка Д5 жива, gw_accounts не тронута
+    assert store.notice_acked("stu-03", NOTICE) is False
+    assert store.ack_notice("stu-03", NOTICE) is True                                     # первое — записано
+    assert store.ack_notice("stu-03", NOTICE) is False                                    # повтор — без ошибки и записи
+    assert store.notice_acked("stu-03", NOTICE) and not store.notice_acked("stu-03", "teacher-reads-2")
+    assert notice_rows(db) == [("stu-03", NOTICE)]                                        # повтор строку не множит
+    assert NOTICE == "teacher-reads-1"
+
+
+def test_ack_notice_needs_active_account(tmp_path):                                     # подтверждение — только своей учётки
+    s = store(tmp_path)
+    s.add("stu-03", "student", 3, PW); s.add("stu-05", "student", 5, PW)
+    for login in ("nobody7", "stu-05"):
+        if login == "stu-05":
+            s.disable("stu-05")
+        with pytest.raises(ValueError, match="учётки нет или она отключена"):
+            s.ack_notice(login, NOTICE)
+    for login, notice in (("Не-Логин!", NOTICE), ("stu-03", ""), ("stu-03", 1)):
+        with pytest.raises(ValueError):
+            s.ack_notice(login, notice)
+    assert notice_rows(tmp_path / "core.db") == []
+    assert not s.notice_acked("nobody7", NOTICE) and not s.notice_acked("Не-Логин!", NOTICE)
+    s.ack_notice("stu-03", NOTICE)                                                        # положительный контроль
+    assert notice_rows(tmp_path / "core.db") == [("stu-03", NOTICE)]
+
+
+def test_notice_store_errors(tmp_path, monkeypatch):                                    # сбой — StoreError, счётчики как у операций
+    s = store(tmp_path)
+    s.add("stu-03", "student", 3, PW)
+    with full_disk(s):
+        with pytest.raises(StoreError) as e:
+            s.ack_notice("stu-03", NOTICE)
+        assert s.write_failures == 1 and "core.db" not in str(e.value)
+        assert s.notice_acked("stu-03", NOTICE) is False                                  # чтение на полном диске идёт
+    s.ack_notice("stu-03", NOTICE)
+    assert s.write_failures == 0 and s.notice_acked("stu-03", NOTICE)
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
+    with pytest.raises(StoreError):
+        s.notice_acked("stu-03", NOTICE)
+    assert s.read_failures == 1
+
+
+def test_list_shows_notice_column(tmp_path, capsys, monkeypatch):                       # «да»/«нет» у студентов, «-» у преподавателя
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
+    s = store(tmp_path)
+    s.add("stu-03", "student", 3, PW); s.add("stu-05", "student", 5, PW); s.add("teach", "teacher", None, PW)
+    s.ack_notice("stu-05", NOTICE)
+    s.ack_notice("stu-03", "teacher-reads-0")                                             # прежняя редакция — не в счёт
+    s.ack_notice("teach", NOTICE)
+    assert accounts_main(["list"]) == 0
+    rows = [line.split("\t") for line in capsys.readouterr().out.splitlines() if not line.startswith("место ")]
+    assert rows == [["stu-03", "student", "03", "активна", "нет"],
+                    ["stu-05", "student", "05", "активна", "да"],
+                    ["teach", "teacher", "-", "активна", "-"]]
+
+
+def test_remove_clears_notices(tmp_path):                                                # раунд 2, Minor 6
+    s = store(tmp_path)
+    s.add("d6-probe-n", "student", 9, PW); s.add("stu-03", "student", 3, PW)
+    s.ack_notice("d6-probe-n", NOTICE); s.ack_notice("stu-03", NOTICE)
+    assert s.notice_acked("d6-probe-n", NOTICE)                                           # положительный контроль
+    s.disable("d6-probe-n"); s.remove("d6-probe-n")
+    assert s.notice_acked("d6-probe-n", NOTICE) is False
+    assert notice_rows(tmp_path / "core.db") == [("stu-03", NOTICE)]                      # чужие строки на месте
+    s.add("d6-probe-n", "student", 9, PW, same_person=True)                               # новая учётка с тем же логином —
+    assert s.notice_acked("d6-probe-n", NOTICE) is False                                  # спросит снова

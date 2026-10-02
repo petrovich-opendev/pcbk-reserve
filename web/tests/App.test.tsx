@@ -7,13 +7,13 @@ import { App } from "../src/App";
 import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import type { startStatusPolling } from "../src/status";
-import { STAND_WARNING } from "../src/texts";
+import { STAND_WARNING, T_NOTICE_UNKNOWN } from "../src/texts";
 
 type Answer = [number, unknown];
 type Answers = Answer | Answer[];
 
 // Ответы по ручкам: один ответ — на каждый вызов, список — по очереди (последний повторяется).
-function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: Answers }) {
+function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: Answers; ackNotice?: Answers }) {
   const queue = (a: Answers | undefined): (() => Promise<Reply>) => {
     const list: Answer[] = a === undefined ? [[500, null]] : typeof a[0] === "number" ? [a as Answer] : a as Answer[];
     let i = 0;
@@ -28,6 +28,8 @@ function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: An
     workplace: vi.fn(queue(o.workplace)),
     wake: vi.fn(queue(o.wake)),
     logout: vi.fn(queue(o.logout ?? [200, { ok: true }])),
+    ackNotice: vi.fn(queue(o.ackNotice)),
+    report: vi.fn(async (_kind: string) => {}),
   } satisfies Api;
 }
 
@@ -224,4 +226,113 @@ test("banner_polling_stops_on_unmount", async () => {
   expect(stop).not.toHaveBeenCalled();
   unmount();
   expect(stop).toHaveBeenCalledTimes(polling.mock.calls.length);  // каждый запуск опроса остановлен
+});
+
+// --- предупреждение при первом входе (Д6-R49, Review Focus 1 Д6б) ---
+
+const NOTICE_TEXT = /Преподаватель видит ваши разговоры/;
+
+test("notice_blocks_chat_until_ack", async () => {
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }]], ackNotice: [204, null],
+                  workplace: [[200, { state: "ready" }]] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  expect(await screen.findByText(NOTICE_TEXT)).toBeTruthy();
+  expect(a.wake).not.toHaveBeenCalled(); expect(a.workplace).not.toHaveBeenCalled(); expect(screen.queryByTestId("fake-chat")).toBeNull();
+  expect(screen.getByText("Вы вошли как s")).toBeTruthy();                       // шапка с «Выйти» — и до подтверждения
+  fireEvent.click(screen.getByRole("button", { name: "Понятно" }));
+  await screen.findByTestId("fake-chat"); expect(a.ackNotice).toHaveBeenCalledWith("teacher-reads-1");
+  expect(a.ackNotice).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText(NOTICE_TEXT)).toBeNull();
+});
+
+test("old_core_without_notice_field_goes_on", async () => {                      // раунд 2, Minor 5
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03" }]], workplace: [[200, { state: "ready" }]] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat"); expect(a.ackNotice).not.toHaveBeenCalled();
+  const b = api({ me: [[200, { login: "s", role: "student", place: "03", notice: null }]], workplace: [[200, { state: "ready" }]] });
+  render(<App api={b} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await waitFor(() => expect(screen.getAllByTestId("fake-chat")).toHaveLength(2));   // подтверждено — сразу дальше
+  expect(b.ackNotice).not.toHaveBeenCalled();
+});
+
+test("notice_ack_failure_keeps_screen", async () => {                            // раунд 2, Minor 5: 404 старого core
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }]],
+                  ackNotice: [[404, { name: "NotFound", data: { message: "Не найдено" } }], [0, null], [204, null]],
+                  workplace: [[200, { state: "sleeping" }], [200, { state: "ready" }]], wake: [202, { state: "starting" }] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} pollMs={POLL_MS} />);
+  await screen.findByText(NOTICE_TEXT);
+  fireEvent.click(screen.getByRole("button", { name: "Понятно" }));
+  expect(await screen.findByText("Не найдено")).toBeTruthy();                    // экран остаётся с текстом ошибки
+  expect(screen.getByText(NOTICE_TEXT)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Понятно" }));
+  expect(await screen.findByText("Серверный слой не отвечает")).toBeTruthy();    // сеть
+  expect(a.wake).not.toHaveBeenCalled(); expect(a.workplace).not.toHaveBeenCalled(); expect(screen.queryByTestId("fake-chat")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Понятно" }));
+  expect(await screen.findByTestId("fake-chat")).toBeTruthy();                   // подтвердили — будим место, потом чат
+  expect(a.ackNotice).toHaveBeenCalledTimes(3); expect(a.wake).toHaveBeenCalledTimes(1);
+});
+
+test("notice_ack_signed_out_goes_to_login", async () => {
+  const navigate = vi.fn();
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }]],
+                  ackNotice: [401, { name: "Unauthorized", data: { message: "Нужно войти" } }] });
+  render(<App api={a} navigate={navigate} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText(NOTICE_TEXT);
+  fireEvent.click(screen.getByRole("button", { name: "Понятно" }));
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
+  expect(a.workplace).not.toHaveBeenCalled();
+});
+
+test("unknown_notice_is_not_acked", async () => {                                // preflight Ф14: номер без текста не подтверждается
+  for (const notice of ["teacher-reads-2", "toString", 7]) {
+    const a = api({ me: [[200, { login: "s", role: "student", place: "03", notice }]] });
+    const { unmount } = render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+    expect(await screen.findByText(T_NOTICE_UNKNOWN)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Понятно" })).toBeNull();
+    expect(screen.queryByText(NOTICE_TEXT)).toBeNull();
+    expect(a.ackNotice).not.toHaveBeenCalled(); expect(a.wake).not.toHaveBeenCalled(); expect(a.workplace).not.toHaveBeenCalled();
+    unmount();
+  }
+});
+
+test("logout_from_notice_does_not_open_chat", async () => {                       // «Выйти», пока подтверждение в пути
+  const navigate = vi.fn();
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }]],
+                  workplace: [[200, { state: "ready" }]] });
+  let answer: (r: Reply) => void = () => {};
+  a.ackNotice.mockImplementation(() => new Promise<Reply>((resolve) => { answer = resolve; }));
+  render(<App api={a} navigate={navigate} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText(NOTICE_TEXT);
+  fireEvent.click(screen.getByRole("button", { name: "Понятно" }));
+  await waitFor(() => expect(a.ackNotice).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", { name: "Выйти" }));
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
+  answer({ status: 204, body: "" });
+  await new Promise((r) => setTimeout(r, 50));
+  expect(a.workplace).not.toHaveBeenCalled(); expect(screen.queryByTestId("fake-chat")).toBeNull();
+});
+
+test("notice_ack_button_disabled_while_in_flight", async () => {                  // итоговая доводка Д6б, Б2-m1
+  // пока подтверждение в пути, «Понятно» выключена: второе нажатие не уходит; отказ — кнопка снова доступна
+  const a = api({ me: [[200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }]],
+                  workplace: [[200, { state: "ready" }]] });
+  const answers: ((r: Reply) => void)[] = [];
+  a.ackNotice.mockImplementation(() => new Promise<Reply>((resolve) => { answers.push(resolve); }));
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText(NOTICE_TEXT);
+  const button = screen.getByRole("button", { name: "Понятно" }) as HTMLButtonElement;
+  expect(button.disabled).toBe(false);
+  fireEvent.click(button);
+  await waitFor(() => expect(button.disabled).toBe(true));
+  fireEvent.click(button);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(a.ackNotice).toHaveBeenCalledTimes(1);                                  // второе не ушло
+  answers[0]!({ status: 503, body: { name: "Unavailable", data: { message: "Учётные записи недоступны — повторите позже" } } });
+  expect(await screen.findByText("Учётные записи недоступны — повторите позже")).toBeTruthy();
+  expect(button.disabled).toBe(false);                                            // отказ — можно нажать снова
+  fireEvent.click(button);
+  await waitFor(() => expect(a.ackNotice).toHaveBeenCalledTimes(2));
+  expect(button.disabled).toBe(true);
+  answers[1]!({ status: 204, body: "" });
+  expect(await screen.findByTestId("fake-chat")).toBeTruthy();
 });

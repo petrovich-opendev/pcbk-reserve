@@ -106,10 +106,13 @@ function harness(routes) {
 const NEED_LOGIN = [401, { name: "Unauthorized", data: { message: "Нужно войти" } }];
 const STU = { login: "stu-03", role: "student", place: "03" };
 const place = (state, detail = "") => ({ place: "03", state, detail });
+// /me: первый вопрос страницы — без сессии, после входа (Д6б) — учётка; ответ входа предупреждения не несёт
+const meAfterLogin = (account) => (n) => (n === 1 ? NEED_LOGIN : [200, account]);
+const NOTICE = "teacher-reads-1";
 
 test("вход студента: форма, «Готовлю…», потом «готово»", async () => {
   const h = harness({
-    "GET /pcbk/api/auth/me": NEED_LOGIN,
+    "GET /pcbk/api/auth/me": meAfterLogin(STU),
     "POST /pcbk/api/auth/login": [200, STU],
     "POST /pcbk/api/workplace/wake": [202, place("starting")],
     "GET /pcbk/api/workplace": (n) => [200, place(n < 2 ? "starting" : "ready")],
@@ -136,6 +139,8 @@ test("вход студента: форма, «Готовлю…», потом �
   assert.equal(h.els.logout.hidden, false);
   assert.equal(h.els.state.textContent, "Готовлю рабочее место…");
   assert.equal(h.count("POST /pcbk/api/workplace/wake"), 1);
+  assert.deepEqual(h.calls.map((c) => c.key), ["GET /pcbk/api/auth/me", "POST /pcbk/api/auth/login",
+                                               "GET /pcbk/api/auth/me", "POST /pcbk/api/workplace/wake"]);   // будит после /me
   for (const c of h.calls) assert.equal(c.init.credentials, "same-origin", c.key);
 
   await h.advance(1000);
@@ -308,7 +313,7 @@ test("ответ, пришедший после выхода или срока, 
 test("ready_navigates_to_chat_once", async () => {
   assert.equal(CHAT_URL, "/chat/");
   const h = harness({
-    "GET /pcbk/api/auth/me": NEED_LOGIN,
+    "GET /pcbk/api/auth/me": meAfterLogin(STU),
     "POST /pcbk/api/auth/login": [200, STU],
     "POST /pcbk/api/workplace/wake": [202, place("starting")],
     "GET /pcbk/api/workplace": (n) => [200, place(n < 2 ? "starting" : "ready")],
@@ -347,7 +352,8 @@ test("ready_navigates_to_chat_once", async () => {
 test("teacher_never_navigates", async () => {
   const TEACH = { login: "teach", role: "teacher", place: null };
   const signedIn = harness({ "GET /pcbk/api/auth/me": [200, TEACH] });
-  const fresh = harness({ "GET /pcbk/api/auth/me": NEED_LOGIN, "POST /pcbk/api/auth/login": [200, TEACH] });
+  const fresh = harness({ "GET /pcbk/api/auth/me": meAfterLogin({ ...TEACH, notice: null }),
+                          "POST /pcbk/api/auth/login": [200, TEACH] });
   await fresh.flush();
   fresh.els.login.value = "teach";
   fresh.els.password.value = "<test-pw>";
@@ -359,6 +365,117 @@ test("teacher_never_navigates", async () => {
     assert.equal(h.els["to-chat"].hidden, true);
     assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
   }
+});
+
+// --- предупреждение при первом входе (Д6-R49, Review Focus 1 Д6б): вход не будит место до «Понятно» ------------
+
+async function submitLogin(h) {
+  await h.flush();
+  h.els.login.value = "stu-03";
+  h.els.password.value = "<test-pw>";
+  h.els["login-form"].fire("submit");
+  await h.flush();
+}
+
+test("login_does_not_wake_before_notice", async () => {
+  const h = harness({
+    "GET /pcbk/api/auth/me": meAfterLogin({ ...STU, notice: NOTICE }),
+    "POST /pcbk/api/auth/login": [200, STU],                                         // ответ входа — без notice
+    "POST /pcbk/api/workplace/wake": [202, place("starting")],
+  });
+  await submitLogin(h);
+  assert.deepEqual(h.navigations, [CHAT_URL]);                                       // предупреждение — в чате
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
+  assert.equal(h.count("GET /pcbk/api/auth/me"), 2);
+  assert.equal(h.els["to-chat"].hidden, false);                                      // запасная ссылка «Открыть чат»
+  assert.equal(h.els["login-form"].hidden, true);
+  assert.equal(h.els.who.textContent, "Вы вошли как stu-03");
+  assert.equal(h.els.logout.hidden, false);
+  await h.advance(GIVE_UP_S * 1000);
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);                         // и потом не будит
+  assert.deepEqual(h.navigations, [CHAT_URL]);
+  assert.equal(h.pending(), 0);
+
+  const odd = harness({                                                              // незнакомое значение — тоже чат решает
+    "GET /pcbk/api/auth/me": meAfterLogin({ ...STU, notice: 7 }),
+    "POST /pcbk/api/auth/login": [200, STU],
+  });
+  await submitLogin(odd);
+  assert.deepEqual(odd.navigations, [CHAT_URL]);
+  assert.equal(odd.count("POST /pcbk/api/workplace/wake"), 0);
+});
+
+test("open_session_with_notice_goes_to_chat", async () => {
+  const h = harness({ "GET /pcbk/api/auth/me": [200, { ...STU, notice: NOTICE }] });
+  await h.advance(GIVE_UP_S * 1000);
+  assert.deepEqual(h.navigations, [CHAT_URL]);
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0);
+  assert.equal(h.calls.length, 1);                                                   // /me уже прочитан — второй не нужен
+  assert.equal(h.els["login-form"].hidden, true);
+  assert.equal(h.els["to-chat"].hidden, false);
+
+  const acked = harness({                                                            // подтверждено (null) — как в Д6а
+    "GET /pcbk/api/auth/me": [200, { ...STU, notice: null }],
+    "POST /pcbk/api/workplace/wake": [200, place("ready")],
+  });
+  await acked.flush();
+  assert.equal(acked.count("POST /pcbk/api/workplace/wake"), 1);
+  assert.equal(acked.els.state.textContent, "Рабочее место готово");
+  assert.deepEqual(acked.navigations, [CHAT_URL]);
+});
+
+test("me_failure_after_login_does_not_wake", async () => {                           // раунд 2, В4
+  const STORE = [503, { name: "Unavailable", data: { message: "Учётные записи недоступны — повторите позже" } }];
+  for (const [answer, text] of [[STORE, "Учётные записи недоступны — повторите позже"], [[0], "Серверный слой не отвечает"],
+                                [[502, "<html>"], "Серверный слой не отвечает"]]) {
+    const h = harness({
+      "GET /pcbk/api/auth/me": (n) => (n === 1 ? NEED_LOGIN : answer),
+      "POST /pcbk/api/auth/login": [200, STU],
+      "POST /pcbk/api/workplace/wake": [202, place("starting")],
+    });
+    await submitLogin(h);
+    assert.equal(h.els.state.textContent, text, text);
+    assert.equal(h.els.state.attrs["data-kind"], "fail");
+    assert.equal(h.els["to-chat"].hidden, false);                                    // решит чат своим «Повторить»
+    assert.equal(h.els["login-form"].hidden, true);                                  // вход удался — сессия есть
+    assert.equal(h.els.who.textContent, "Вы вошли как stu-03");
+    assert.equal(h.els.logout.hidden, false);
+    await h.advance(GIVE_UP_S * 1000);
+    assert.equal(h.count("POST /pcbk/api/workplace/wake"), 0, text);
+    assert.deepEqual(h.navigations, []);
+    assert.equal(h.pending(), 0);
+  }
+
+  const gone = harness({                                                             // Н5: /me после входа 401 — форма, не ссылка
+    "GET /pcbk/api/auth/me": NEED_LOGIN,
+    "POST /pcbk/api/auth/login": [200, STU],
+  });
+  await submitLogin(gone);
+  assert.equal(gone.els["login-form"].hidden, false);
+  assert.equal(gone.els["to-chat"].hidden, true);
+  assert.equal(gone.els.state.textContent, "Нужно войти");
+  assert.equal(gone.count("POST /pcbk/api/workplace/wake"), 0);
+});
+
+test("login_form_busy_until_me_answers", async () => {                               // второй вход, пока /me в пути, не уходит
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const h = harness({
+    "GET /pcbk/api/auth/me": (n) => (n === 1 ? NEED_LOGIN : held),
+    "POST /pcbk/api/auth/login": [200, STU],
+    "POST /pcbk/api/workplace/wake": [200, place("ready")],
+  });
+  await submitLogin(h);
+  assert.equal(h.els.submit.disabled, true);
+  h.els.password.value = "<test-pw>";
+  h.els["login-form"].fire("submit");
+  await h.flush();
+  assert.equal(h.count("POST /pcbk/api/auth/login"), 1);
+  release([200, STU]);
+  await h.flush();
+  assert.equal(h.els.submit.disabled, false);
+  assert.equal(h.count("POST /pcbk/api/workplace/wake"), 1);                         // notice нет (старый core) — как в Д6а
+  assert.deepEqual(h.navigations, [CHAT_URL]);
 });
 
 // --- статика: CSP без встроенного, без внешних ресурсов, без хранилищ --------------------------
@@ -399,9 +516,28 @@ test("index.html: ссылки «Войти» на /login и «Чат» на /ch
 
 // --- шаблон edge: то, что без nginx -t видно по тексту (сам nginx -t — задача А6) --------------
 
+// комментарий nginx — от «#» в начале слова вне кавычек до конца строки: скобки в нём разборщик не считает
+// (итоговая доводка Д6б, Б4-m5). Комментарий заменяется пробелами — смещения и номера строк те же
+function stripComments(conf) {
+  return conf.split("\n").map((line) => {
+    let quote = null;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = null;
+      } else if (ch === "'" || ch === '"') quote = ch;
+      else if (ch === "#" && (i === 0 || /[\s;{}]/.test(line[i - 1]))) return line.slice(0, i) + " ".repeat(line.length - i);
+    }
+    return line;
+  }).join("\n");
+}
+
 // location с модификатором (= или ^~) и портом своего server: server-блоки идут подряд на верхнем уровне, так что
-// location принадлежит последнему server перед ним. Регулярных location (~, ~*) в шаблоне нет — разборщик их не видит
-function locations(conf) {
+// location принадлежит последнему server перед ним. Регулярных location (~, ~*) в шаблоне нет — разборщик их не видит.
+// Тела — без комментариев
+function locations(raw) {
+  const conf = stripComments(raw);
   const servers = [...conf.matchAll(/^server\s*\{/gm)].map((m) => ({
     at: m.index, port: Number(/^\s*listen\s+(\d+)/m.exec(conf.slice(m.index))[1]),
   }));
@@ -422,6 +558,17 @@ function locations(conf) {
   }
   return out;
 }
+
+test("разборщик шаблона: скобки и кавычки в комментариях не в счёт", () => {   // Б4-m5, положительный контроль
+  const conf = 'server {\n    listen 8443;\n    # чужое { в комментарии\n' +
+               '    location = /a { # ещё { и }\n        return 200 \'{"a":"#не комментарий"}\';  # хвост }\n    }\n' +
+               '    location ^~ /b/ { return 204; }\n}\n';
+  const locs = locations(conf);
+  assert.deepEqual(locs.map((l) => [l.mod, l.path, l.port]), [["=", "/a", 8443], ["^~", "/b/", 8443]]);
+  assert.equal(locs[0].body.trim(), 'return 200 \'{"a":"#не комментарий"}\';');          // «#» в кавычках — текст
+  assert.equal(locs[1].body.trim(), "return 204;");
+  assert.equal(stripComments(conf).length, conf.length);
+});
 
 test("шаблон edge: ошибки JSON на уровне server, пути шлюза, страница входа", () => {
   const conf = read("../pcbk.conf.template");
@@ -500,16 +647,51 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.match(l.body, new RegExp(`try_files /login\\.${path === "/login" ? "html" : path.split(".")[1]} =404;`), path);
   }
 
-  const proxied = ["/pcbk/api/auth/", "/pcbk/api/workplace", "/pcbk/api/workplace/wake"];
+  const proxied = ["/pcbk/api/auth/", "/pcbk/api/auth/me", "/pcbk/api/auth/notice", "/pcbk/api/workplace",
+                   "/pcbk/api/workplace/wake"];
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
+  const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
   assert.equal(passes.length, conf.match(/proxy_pass\b/g).length);                     // каждый proxy_pass — внутри location
   assert.equal(new Set(passes.map(([path]) => path)).size, passes.length);              // по одному на location
   assert.deepEqual(Object.fromEntries(passes), {                                        // в core — только пути шлюза
     "/status": "http://$pcbk_watchdog", "/status.js": "http://$pcbk_watchdog", "/status.json": "http://$pcbk_watchdog",
-    ...Object.fromEntries([...proxied, ...oc].map((path) => [path, "http://$pcbk_core"])),
+    ...Object.fromEntries([...proxied, ...oc, report].map((path) => [path, "http://$pcbk_core"])),
   });
+  // отчёты браузеров (Д6-R50): частота — по cookie сессии (карта Б5, без cookie — корзина «-»), а не по IP: весь класс
+  // бывает за одним адресом; отказ предела — 509 → busy.json (503 WorkplaceBusy), как у прочих пределов Д5б (Н2);
+  // тело — до 1 КиБ (core сам режет до 256 Б), срок — 10 с
+  assert.ok(conf.includes("limit_req_zone $pcbk_oc_session zone=pcbk_web:1m rate=1r/s;"));
+  assert.equal(conf.match(/zone=pcbk_web:/g).length, 1);
+  assert.equal(loc(report).exact, true);
+  {
+    const b = loc(report).body;
+    for (const line of ["proxy_pass http://$pcbk_core;", "if ($pcbk_bad_api_uri) { return 400",
+                        "limit_req zone=pcbk_web burst=10 nodelay;", "limit_req_log_level warn;",
+                        "client_max_body_size 1k;", "proxy_read_timeout 10s;"])
+      assert.ok(b.includes(line), `${report}: ${line}`);
+    assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], report);   // не 429 входа
+    assert.doesNotMatch(b, /zone=pcbk_login|zone=pcbk_oc|zone=pcbk_place|limit_conn/, report);           // своя зона
+  }
   assert.equal(loc("/pcbk/api/auth/").exact, false);
+  // «кто я» и подтверждение (итоговая доводка Д6б, m2; Н17): своя зона, а не корзина входа — класс за одним NAT не
+  // делит её с /me. Ключ — cookie сессии своего вида, без неё — адрес клиента: общей корзины «-» нет (первый /me
+  // страницы входа идёт без cookie, класс открывает её разом); запас 40 — класс из 30 за одним адресом.
+  // Отказ — 509 → busy.json, как у ручек места
+  assert.ok(conf.includes('map $cookie_pcbk_session $pcbk_me_key {\n    default $binary_remote_addr;\n' +
+                          '    "~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;\n}'));
+  assert.ok(conf.includes("limit_req_zone $pcbk_me_key zone=pcbk_auth_session:1m rate=5r/s;"));
+  assert.equal(conf.match(/zone=pcbk_auth_session:/g).length, 1);
+  assert.equal(conf.match(/\$pcbk_me_key\b/g).length, 2);                            // карта и зона — больше нигде
+  for (const path of ["/pcbk/api/auth/me", "/pcbk/api/auth/notice"]) {
+    const b = loc(path).body;
+    assert.equal(loc(path).exact, true, path);
+    assert.ok(b.includes("limit_req zone=pcbk_auth_session burst=40 nodelay;"), path);
+    assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], path);   // не 429 входа
+    assert.ok(b.includes("limit_req_log_level warn;"), path);
+    assert.doesNotMatch(b, /zone=pcbk_login|zone=pcbk_oc|zone=pcbk_place|zone=pcbk_web|limit_conn/, path);
+  }
+  assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/pcbk/api/auth/")).length, 3);   // вход и выход — по IP
   assert.equal(loc("/pcbk/api/workplace").exact, true);
   assert.equal(loc("/pcbk/api/workplace/wake").exact, true);
   for (const path of proxied) {
@@ -592,19 +774,26 @@ test("шаблон edge: чат на 8443 — свой CSP, кэш и сжати
   const page = one(8443, "=", "/chat/");
   const assets = one(8443, "^~", "/chat/assets/");
   const other = one(8443, "^~", "/chat/");                                              // 404 прочего под /chat/
+  const boot = one(8443, "=", "/chat/boot.js");                                         // загрузчик Д6б (Д6-R51)
   // CSP R41 и заголовки server — у всех ответов /chat*: и у перенаправления, и у 404 (итоговое ревью Д6а, P3)
-  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["/chat/assets/", assets], ["^~ /chat/", other]]) {
+  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["/chat/assets/", assets], ["^~ /chat/", other],
+                           ["/chat/boot.js", boot]]) {
     assert.ok(b.includes(`add_header Content-Security-Policy "${CHAT_CSP}" always;`), name);
     assert.ok(b.includes('add_header X-Content-Type-Options "nosniff" always;'), name);   // server-заголовки не наследуются
     assert.ok(b.includes('add_header Referrer-Policy "no-referrer" always;'), name);
     assert.equal(b.match(/add_header Cache-Control /g)?.length, 1, name);
+    assert.equal(b.match(/add_header /g)?.length, 4, name);                             // и ничего сверх четырёх
     assert.doesNotMatch(b, /unsafe-|data:|blob:|proxy_pass/, name);
   }
-  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["^~ /chat/", other]])
+  for (const [name, b] of [["/chat", redirect], ["/chat/", page], ["^~ /chat/", other], ["/chat/boot.js", boot]])
     assert.ok(b.includes('add_header Cache-Control "no-store" always;'), name);
   assert.match(page, /charset utf-8;/);
   assert.match(page, /try_files \/chat\/index\.html =404;/);
   assert.doesNotMatch(page, /gzip/);
+  // загрузчик — имя без хеша: no-store своей location, а не год из assets/; в нём русский текст сбоя — charset
+  assert.match(boot, /charset utf-8;/);
+  assert.match(boot, /try_files \/chat\/boot\.js =404;/);
+  assert.doesNotMatch(boot, /gzip|pcbk_asset_cache|immutable/);
   for (const line of ["add_header Cache-Control $pcbk_asset_cache always;", "gzip on;",
                       "gzip_types application/javascript text/javascript text/css;", "gzip_vary on;", "try_files $uri =404;"])
     assert.ok(assets.includes(line), line);
@@ -615,12 +804,12 @@ test("шаблон edge: чат на 8443 — свой CSP, кэш и сжати
   assert.match(one(8443, "^~", "/chat/"),                                              // build.json и прочее — не на 8443,
                /types \{ \}\s*default_type "text\/plain; charset=utf-8";\s*return 404 /);  // тип — не по расширению
   assert.match(one(8443, "=", "/favicon.ico"), /return 204;/);                         // решение по А4: без 404 иконки
-  assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/chat")).length, 4);
+  assert.equal(locs.filter((l) => l.port === 8443 && l.path.startsWith("/chat")).length, 5);
 
   // карта CSP /pcbk/api/ (Д5б) /chat/ не накрывает: иначе default-src 'none' второй строкой заголовка
   const api = new RegExp(/map \$uri \$pcbk_api_csp \{\n\s*default "";\n\s*"~([^"]+)"/.exec(conf)[1]);
   assert.ok(api.test("/pcbk/api/oc/session") && api.test("/pcbk-errors/503.json"));   // положительный контроль
-  for (const path of ["/chat", "/chat/", "/chat/assets/index-abc.js", "/chat/build.json", "/favicon.ico"])
+  for (const path of ["/chat", "/chat/", "/chat/assets/index-abc.js", "/chat/boot.js", "/chat/build.json", "/favicon.ico"])
     assert.equal(api.test(path), false, path);
 
   // 8080 (А1, Д6-R46): страница и опись для сторожа — тот же корень, без TLS

@@ -2,6 +2,7 @@
 пределах бюджета, запись только со своей страницы, scrypt в очереди, место — только по учётке, ручки — только с
 pcbk-front. Места и sp-ctl — двойники задачи А3."""
 import asyncio
+import json
 import re
 import sqlite3
 import threading
@@ -15,7 +16,8 @@ from starlette.requests import Request
 from starlette.routing import Match
 
 from helpers import ORIGIN, PW, FakeMono, full_disk, login, make_gateway, serve_app, wait_until, wait_until_async
-from pcbk_core.gateway import LoginGate, accounts
+from pcbk_core.gateway import LoginGate, accounts, api
+from pcbk_core.gateway.accounts import NOTICE, StoreError
 from pcbk_core.gateway.api import (COOKIE_HEADERS_BUDGET, COOKIE_PATH_MAX_LEN, GW_MESSAGES, LOGIN_PARALLEL,
                                    LOGIN_QUEUE, MAX_SESSION_COOKIES, catch_all_router, clear_cookies)
 
@@ -547,3 +549,101 @@ async def test_unrecorded_stamp_expires_with_lock_window():                     
     assert len(gate.pending_of(b"k")) == 1                                             # незаписанная осталась
     mono.advance(900.0)
     assert gate.pending_of(b"k") == () and gate.pending == {}                          # вышла из окна
+
+
+# --- предупреждение при первом входе (Д6б, Д6-R49) ---
+# Учётки — встроенные make_gateway (stu-03, stu-05, teach); клиент с with — один, прочие — без with (preflight Ф1).
+
+NOTICE_PATH = "/pcbk/api/auth/notice"
+
+
+def ack(c, body, origin: str | None = ORIGIN) -> httpx.Response:
+    """POST подтверждения; body — объект (JSON) или сырые байты; origin None — без Origin."""
+    headers = {"Content-Type": "application/json", **({"Origin": origin} if origin is not None else {})}
+    return c.post(NOTICE_PATH, content=body if isinstance(body, bytes) else json.dumps(body), headers=headers)
+
+
+def me(c) -> dict:
+    r = c.get("/pcbk/api/auth/me")
+    assert r.status_code == 200, r.status_code
+    return r.json()
+
+
+def test_notice_ack_rules(tmp_path, gwlog):                                              # Review Focus 1 Д6б
+    app, role = make_gateway(tmp_path)
+    with TestClient(app, base_url=BASE) as s:
+        s5, t, anon = (TestClient(app, base_url=BASE) for _ in range(3))
+        assert {login(c, name).status_code for c, name in ((s, "stu-03"), (s5, "stu-05"), (t, "teach"))} == {200}
+        assert me(s) == {"login": "stu-03", "role": "student", "place": "03", "notice": NOTICE}
+        assert s.get(NOTICE_PATH).status_code == 404                                    # GET не подтверждает
+        assert ack(s, {"notice": NOTICE}, origin="https://evil").status_code == 403
+        assert ack(s, {"notice": NOTICE}, origin=None).status_code == 403              # ни Origin, ни Sec-Fetch-Site
+        assert role.stats.count_1h("origin_refused") == 2                              # чужой источник со входом — как wake
+        for body in ({"notice": "other"}, {"notice": "teacher-reads-2"}, {"notice": NOTICE, "login": "stu-05"},
+                     {"notice": 1}, {"notice": None}, [NOTICE], {}, NOTICE,
+                     b'{"notice":"other","notice":"teacher-reads-1"}', b"{bad", b""):
+            r = ack(s, body)
+            assert (r.status_code, r.json()) == (400, {"name": "BadRequest", "data": {"message": "Неверный запрос"}}), body
+        for origin in (ORIGIN, "https://evil", None):                                   # Ф10: сессия раньше источника
+            r = ack(anon, {"notice": NOTICE}, origin=origin)
+            assert (r.status_code, r.json()["name"]) == (401, "Unauthorized"), origin
+        assert role.stats.count_1h("origin_refused") == 2                              # аноним строку сторожа не красит
+        assert me(s)["notice"] == NOTICE                                                # отказы ничего не записали
+        r = ack(s, {"notice": NOTICE})
+        assert (r.status_code, r.content) == (204, b"")
+        assert ack(s, {"notice": NOTICE}).status_code == 204                            # повтор — тоже 204
+        assert me(s)["notice"] is None
+        assert me(s5)["notice"] == NOTICE                                               # подтверждение stu-03 — не за stu-05
+        assert me(t) == {"login": "teach", "role": "teacher", "place": None, "notice": None}   # у преподавателя — нет
+        assert role.store.notice_acked("stu-03", NOTICE) and not role.store.notice_acked("stu-05", NOTICE)
+        assert role.workplaces.view(3).state == "sleeping"                              # подтверждение места не будит
+        assert not [call for call in role.fake_docker.calls if call[0] == "start"]
+    text = gwlog.text
+    assert text.count("gw notice ack login=stu-03 notice=teacher-reads-1") == 1       # положительный контроль журнала;
+    assert text.count("gw notice ack") == 1                                            # повтор и отказы — без строки (Б2-m2)
+    assert "gw origin refused path=/pcbk/api/auth/notice n=1 since_s=0" in text
+
+
+def test_me_notice_store_failure_is_503(tmp_path, monkeypatch):                         # сбой базы на чтении — как у сессии
+    app, role = make_gateway(tmp_path)
+
+    def raising(*a, **k):
+        raise StoreError("учётные записи: OperationalError")
+    with TestClient(app, base_url=BASE) as s:
+        t = TestClient(app, base_url=BASE)
+        assert login(s, "stu-03").status_code == 200 and login(t, "teach").status_code == 200
+        assert s.get("/pcbk/api/auth/me").status_code == 200                           # положительный контроль
+        monkeypatch.setattr(role.store, "notice_acked", raising)
+        r = s.get("/pcbk/api/auth/me")
+        assert (r.status_code, r.json()) == (503, {"name": "Unavailable", "data": {"message": GW_MESSAGES["store"]}})
+        assert me(t)["notice"] is None                                                  # у преподавателя предупреждения нет — и чтения
+        monkeypatch.setattr(role.store, "ack_notice", raising)
+        r = ack(s, {"notice": NOTICE})
+        assert (r.status_code, r.json()["name"]) == (503, "Unavailable")
+
+
+def test_notice_ack_after_account_disabled_is_401(tmp_path, monkeypatch):               # учётку отключили между сессией и записью
+    app, role = make_gateway(tmp_path)
+    with TestClient(app, base_url=BASE) as s:
+        assert login(s, "stu-03").status_code == 200
+        real = role.store.ack_notice
+
+        def disable_then_ack(name, notice):
+            role.store.disable(name)                                                    # администратор успел раньше
+            return real(name, notice)
+        monkeypatch.setattr(role.store, "ack_notice", disable_then_ack)
+        r = ack(s, {"notice": NOTICE})
+        assert (r.status_code, r.json()["name"]) == (401, "Unauthorized")
+    assert not role.store.notice_acked("stu-03", NOTICE)
+
+
+def test_new_notice_edition_asks_again(tmp_path, monkeypatch):                          # Review Focus 1 Д6б, п. 4
+    app, _ = make_gateway(tmp_path)
+    with TestClient(app, base_url=BASE) as s:
+        assert login(s, "stu-03").status_code == 200
+        assert ack(s, {"notice": NOTICE}).status_code == 204 and me(s)["notice"] is None
+        monkeypatch.setattr(api, "NOTICE", "teacher-reads-2")                          # новая редакция текста — новый номер
+        assert me(s)["notice"] == "teacher-reads-2"
+        assert ack(s, {"notice": NOTICE}).status_code == 400                            # прежняя редакция не подтверждает новую
+        assert ack(s, {"notice": "teacher-reads-2"}).status_code == 204
+        assert me(s)["notice"] is None

@@ -16,6 +16,7 @@ from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD
                                   check_container, check_gateway,
                                   check_historian, check_http, check_llm, check_memory, check_tls, check_web,
                                   fmt_total, fmt_usd, not_installed, tls_verdict)
+from pcbk_watchdog import checks as checks_module
 from pcbk_watchdog.journal import Journal
 
 MEMINFO = "MemTotal: 16384000 kB\nMemAvailable: {} kB\n"
@@ -1153,3 +1154,63 @@ def test_web_manifest_rows_and_body_stall(web_site, raw_http):             # с�
     # тело страницы оборвал срок: это «не отвечает» (строка «срок» таблицы), а не «нет метки сборки»
     r, took = timed(check_web, "web", "Веб-чат", raw_http(headers_then_stall) + "/chat/", timeout=SOCK_S)
     assert row(r) == ("fail", "не отвечает", "") and took < BOUND_S
+
+
+# --- строка «Веб-чат» с отчётами браузеров (задача Б1 Д6б, Д6-R50); /health/web — fake_core.set_web (preflight Ф2) ---
+
+WEB_ZERO = {"boot_failed_1h": 0, "ui_crash_1h": 0, "turn_silent_1h": 0, "stream_down_1h": 0}
+NO_REPORTS = ("ok", "страница чата отдаётся", "сборка abc123; отчёты браузеров недоступны")
+
+
+def test_web_report_lines(web_site, fake_core):
+    root, url = web_site; put_build(root); u = fake_core.base + "/health/web"
+    zero = WEB_ZERO
+    for reply, want in (({**zero, "boot_failed_1h": 1, "ui_crash_1h": 1}, ("warn", "чат не запускается в браузере", "1 за час")),
+                        ({**zero, "ui_crash_1h": 1, "turn_silent_1h": 2}, ("warn", "чат падает в браузере", "1 за час")),
+                        ({**zero, "turn_silent_1h": 2, "stream_down_1h": 3}, ("warn", "ответ модели не пришёл вовремя", "2 за час")),
+                        ({**zero, "stream_down_1h": 3}, ("warn", "браузеры теряют связь с сервером", "3 за час")),
+                        (zero, ("ok", "страница чата отдаётся", "сборка abc123"))):
+        fake_core.set_web(200, reply)
+        assert row(check_web("web", "Веб-чат", url, reports_url=u)) == want, reply
+    assert row(check_web("web", "Веб-чат", url)) == ("ok", "страница чата отдаётся", "сборка abc123")   # без reports_url — как Д6а
+
+
+def test_web_row_without_reports(web_site, fake_core, raw_http):                    # Review Focus 5
+    root, url = web_site; put_build(root); u = fake_core.base + "/health/web"
+    assert row(check_web("web", "Веб-чат", url, reports_url=u)) == NO_REPORTS         # core :d6a — ручки нет (404 текстом)
+    for status, body in ((404, {"name": "NotFound"}), (200, {"ui_crash_1h": "x"}), (200, {"extra": 1}),
+                         (503, WEB_ZERO), (200, [WEB_ZERO]), (200, {**WEB_ZERO, "extra": 1}),
+                         (200, {**WEB_ZERO, "ui_crash_1h": -1}), (200, {**WEB_ZERO, "ui_crash_1h": True}),
+                         (200, {**WEB_ZERO, "ui_crash_1h": 1.0}), (200, {k: v for k, v in WEB_ZERO.items() if k != "stream_down_1h"})):
+        fake_core.set_web(status, body)
+        assert row(check_web("web", "Веб-чат", url, reports_url=u)) == NO_REPORTS, (status, body)
+    assert row(check_web("web", "Веб-чат", url, reports_url="http://127.0.0.1:9/health/web")) == NO_REPORTS   # нет связи
+    r, took = timed(check_web, "web", "Веб-чат", url, timeout=SOCK_S, reports_url=raw_http(headers_then_stall) + "/health/web")
+    assert row(r) == NO_REPORTS and took < BOUND_S                                    # тело отчётов оборвал срок
+    fake_core.set_web(200, {**WEB_ZERO, "boot_failed_1h": 4})
+    (root / "chat/index.html").unlink()                                               # статика важнее отчётов
+    assert row(check_web("web", "Веб-чат", url, reports_url=u))[0] == "fail"
+
+
+def test_web_reports_keep_check_deadline(web_site, fake_core):                       # раунд 1 Important 3, раунд 2 В1
+    root, url = web_site; put_build(root)
+    fake_core.set_web(200, WEB_ZERO, delay_s=10)                                      # /health/web тянет 10 с
+    t0 = time.monotonic()
+    r = check_web("web", "Веб-чат", url, timeout=3.0, reports_url=fake_core.base + "/health/web")
+    assert time.monotonic() - t0 < 2 * 3.0 + 0.5                                     # статика и отчёты — в одном сроке
+    assert row(r) == NO_REPORTS
+
+
+def test_web_reports_share_static_deadline(web_site, fake_core, monkeypatch):      # сверх брифа: срок именно общий
+    """Страница тянет 0,8 с: со своим сроком у запроса отчётов проверка шла бы 0,8 + 2 × 1 с, с общим — 2 с."""
+    root, url = web_site; put_build(root)
+    fake_core.set_web(200, WEB_ZERO, delay_s=10)
+    real = checks_module._http_get
+
+    def slow_page(target, *args, **kw):
+        if target == url:
+            time.sleep(0.8)
+        return real(target, *args, **kw)
+    monkeypatch.setattr(checks_module, "_http_get", slow_page)
+    r, took = timed(check_web, "web", "Веб-чат", url, timeout=1.0, reports_url=fake_core.base + "/health/web")
+    assert row(r) == NO_REPORTS and took < 2 * 1.0 + 0.4

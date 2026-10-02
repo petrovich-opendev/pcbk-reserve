@@ -7,7 +7,7 @@
     "node": "22.x"
   },
   "scripts": {
-    "test": "vitest run",
+    "test": "vitest run && node --test tests/*.test.mjs",
     "build": "tsc --noEmit -p . && vite build && node scripts/check-dist.mjs ${PCBK_WEB_OUT:-../edge/static/chat}"
   },
   "overrides": {

@@ -41,3 +41,32 @@ test("call_json_network_and_html", async () => {
   const cut = recorder(() => Promise.resolve(new Response(new ReadableStream({ start(c) { c.error(new TypeError("reset")); } }), { status: 200 })));
   expect(await callJson("GET", "/pcbk/api/workplace", undefined, cut.fetchImpl)).toEqual({ status: 0, body: null });  // обрыв тела — как сеть
 });
+
+test("ack_notice_posts_exact_body", async () => {                                // Д6-R49: тело ровно {"notice": N}
+  const { seen, fetchImpl } = recorder(() => Promise.resolve(new Response(null, { status: 204 })));
+  const r = await createApi(fetchImpl).ackNotice("teacher-reads-1");
+  expect(r.status).toBe(204);
+  expect(seen.map((s) => `${s.init.method} ${s.path}`)).toEqual(["POST /pcbk/api/auth/notice"]);
+  expect(seen[0].init.credentials).toBe("same-origin");
+  expect(seen[0].init.headers).toEqual({ Accept: "application/json", "Content-Type": "application/json" });
+  expect(seen[0].init.body).toBe('{"notice":"teacher-reads-1"}');
+});
+
+test("report_posts_kind_and_swallows_errors", async () => {                       // Д6-R50, R51: тело ровно {"kind": K}
+  const { seen, fetchImpl } = recorder(() => Promise.resolve(new Response(null, { status: 204 })));
+  await expect(createApi(fetchImpl).report("turn_silent")).resolves.toBeUndefined();
+  expect(seen.map((s) => `${s.init.method} ${s.path}`)).toEqual(["POST /pcbk/api/web/report"]);
+  expect(seen[0].init.credentials).toBe("same-origin");
+  expect(seen[0].init.headers).toEqual({ Accept: "application/json", "Content-Type": "application/json" });
+  expect(seen[0].init.body).toBe('{"kind":"turn_silent"}');
+  // ответ не читается и не повторяется: 404 старого core, 429, сеть, даже исключение fetch — тихо и один раз
+  for (const respond of [() => Promise.resolve(new Response('{"name":"NotFound"}', { status: 404 })),
+                         () => Promise.resolve(new Response("<html>", { status: 429 })),
+                         () => Promise.reject(new TypeError("Failed to fetch"))]) {
+    const r = recorder(respond);
+    await expect(createApi(r.fetchImpl).report("stream_down")).resolves.toBeUndefined();
+    expect(r.seen).toHaveLength(1);
+  }
+  const thrower: JsonFetch = () => { throw new Error("сломано"); };
+  await expect(createApi(thrower).report("ui_crash")).resolves.toBeUndefined();
+});

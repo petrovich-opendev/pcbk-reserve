@@ -13,7 +13,11 @@
   логины — только в памяти (UNKNOWN_KEYS ключей под threading.Lock, ключ — sha256 логина): замок
   для всех одинаков, перебор чужих логинов не растит базу и память. При переполнении вытесняется
   самый старый незапертый ключ (истёкший замок — тоже незапертый), действующие замки — последними:
-  поток мусорных логинов замок не смывает (ревью А2, M2).
+  поток мусорных логинов замок не смывает (ревью А2, M2);
+- gw_notices (Д6б, Д6-R49) — подтверждённые предупреждения: (логин, номер редакции NOTICE, время первого
+  подтверждения). Таблица новая и отдельная (CREATE TABLE IF NOT EXISTS), gw_accounts не переделывается: core.db Д5
+  открывается как есть. Новая редакция текста — новый NOTICE, и студент подтверждает снова. remove стирает строки
+  логина: учётка, заведённая заново с тем же логином, видит предупреждение снова.
 
 Договор Role: конструктор только запоминает; файл, WAL и таблицы — open() (роль зовёт её через
 asyncio.to_thread в начале lifespan). Соединение — на каждую операцию, операции идут из потоков.
@@ -63,6 +67,9 @@ UNKNOWN_KEYS = 10000
 SQLITE_TIMEOUT_S = 2.0
 
 ROLES = ("student", "teacher")
+# номер редакции предупреждения при первом входе (Д6-R49): текст — в вебе (web/src/texts.ts, карта номер → текст);
+# новый текст — новый номер, иначе студент «подтвердил бы» текст, которого не видел (тест texts.test.ts сверяет)
+NOTICE = "teacher-reads-1"
 SESSION_TOKEN_BYTES = 32           # secrets.token_urlsafe(32) — 43 знака
 MAX_SESSIONS_PER_LOGIN = 3         # живых сессий на учётку (N2): 3 × 10 запросов edge — меньше половины общих 64
 GENERATED_PW_BYTES = 9             # --generate: secrets.token_urlsafe(9) — 12 знаков
@@ -110,6 +117,13 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS gw_heartbeat (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         at REAL NOT NULL
+    )""",
+    # предупреждение при первом входе (Д6б): своя таблица, база Д5 открывается без переделки
+    """CREATE TABLE IF NOT EXISTS gw_notices (
+        login TEXT NOT NULL,
+        notice TEXT NOT NULL,
+        acked_at REAL NOT NULL,
+        PRIMARY KEY (login, notice)
     )""",
 )
 _ACCOUNT = "SELECT login, role, place, disabled, pw_hash FROM gw_accounts WHERE login = ?"
@@ -173,6 +187,11 @@ def _check_password(password: object) -> None:
         raise ValueError(f"пароль короче {PASSWORD_MIN} знаков")
     if len(password) > PASSWORD_MAX:
         raise ValueError(f"пароль длиннее {PASSWORD_MAX} знаков")
+
+
+def _check_notice(notice: object) -> None:
+    if not isinstance(notice, str) or not notice:
+        raise ValueError("номер предупреждения: нужна непустая строка")
 
 
 def _nn(place: int | None) -> str:
@@ -426,7 +445,8 @@ class AccountStore:
             db.execute("COMMIT")
 
     def remove(self, login: str) -> None:
-        """Удаляет только отключённую учётку; gw_places не трогает — логин остаётся за местом (надгробие)."""
+        """Удаляет только отключённую учётку; gw_places не трогает — логин остаётся за местом (надгробие).
+        Подтверждения предупреждений логина стираются: новая учётка с тем же логином спросит снова (раунд 2, Minor 6)."""
         _check_login(login)
         with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -438,6 +458,7 @@ class AccountStore:
             db.execute("DELETE FROM gw_accounts WHERE login = ?", (login,))
             db.execute("DELETE FROM gw_sessions WHERE login = ?", (login,))
             db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
+            db.execute("DELETE FROM gw_notices WHERE login = ?", (login,))
             db.execute("COMMIT")
 
     def release_place(self, place: int) -> None:
@@ -473,6 +494,33 @@ class AccountStore:
         """Действующих учёток студентов."""
         with self._op() as db:
             return db.execute("SELECT count(*) FROM gw_accounts WHERE role = 'student' AND disabled = 0").fetchone()[0]
+
+    # --- предупреждение при первом входе (Д6-R49) ---
+
+    def notice_acked(self, login: str, notice: str) -> bool:
+        """Подтвердил ли логин предупреждение этой редакции. Логин или номер не того вида — False без базы;
+        сбой SQLite — StoreError (сбой чтения)."""
+        if not isinstance(login, str) or LOGIN_RE.fullmatch(login) is None or not isinstance(notice, str) or not notice:
+            return False
+        with self._op() as db:
+            return db.execute("SELECT 1 FROM gw_notices WHERE login = ? AND notice = ?",
+                              (login, notice)).fetchone() is not None
+
+    def ack_notice(self, login: str, notice: str) -> bool:
+        """Подтверждение предупреждения notice действующей учёткой login. True — первое подтверждение (строка
+        записана), False — повтор: ничего не меняется, время первого подтверждения остаётся (итоговая доводка Д6б,
+        Б2-m2: строку журнала шлюз пишет только на первое). Нет учётки или она отключена — ValueError: строки без
+        учётки не копятся. Сбой SQLite — StoreError (сбой записи)."""
+        _check_login(login)
+        _check_notice(notice)
+        with self._op(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM gw_accounts WHERE login = ? AND disabled = 0", (login,)).fetchone() is None:
+                raise ValueError("учётки нет или она отключена")
+            written = db.execute("INSERT INTO gw_notices (login, notice, acked_at) VALUES (?, ?, ?)"
+                                 " ON CONFLICT (login, notice) DO NOTHING", (login, notice, self.clock())).rowcount
+            db.execute("COMMIT")
+            return written == 1
 
     # --- вход и сессии ---
 
@@ -672,7 +720,8 @@ def _parser() -> argparse.ArgumentParser:
     release = sub.add_parser("release-place", help="освободить место пробной учётки после disable")
     release.add_argument("--place", required=True, type=int)
     release.add_argument("--yes", action="store_true")
-    sub.add_parser("list", help="учётки и закрепления мест, без хешей")
+    sub.add_parser("list", help="учётки (последний столбец — предупреждён: да/нет, у преподавателя «-») и закрепления"
+                                " мест, без хешей")
     return p
 
 
@@ -722,7 +771,9 @@ def _run(store: AccountStore, args: argparse.Namespace) -> int:
         store.release_place(args.place)
     elif command == "list":
         for a in store.list():
-            print(f"{a.login}\t{a.role}\t{_nn(a.place)}\t{'отключена' if a.disabled else 'активна'}")
+            # последний столбец — «предупреждён» (Д6-R49): да/нет у студента, у преподавателя предупреждения нет
+            noticed = "-" if a.role != "student" else "да" if store.notice_acked(a.login, NOTICE) else "нет"
+            print(f"{a.login}\t{a.role}\t{_nn(a.place)}\t{'отключена' if a.disabled else 'активна'}\t{noticed}")
         for place, login, has in store.bindings():
             print(f"место {_nn(place)}\t{login}\t{'учётка есть' if has else 'удалена'}")
     return 0

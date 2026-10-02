@@ -2,7 +2,10 @@
 import hashlib
 import json
 import re
+import secrets
 import time
+
+from secret import Secret
 
 DECLARED_ENV = {                   # наши переменные сверх переменных базового образа — ровно эти
     "pcbk-watchdog": {"LISTEN_PORT", "TICK_S", "STALE_AFTER_S", "DISPLAY_TZ", "DOCKER_URL",
@@ -22,7 +25,7 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d6a", "pcbk-core": "pcbk-reserve/core:d6a",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d6b", "pcbk-core": "pcbk-reserve/core:d6b",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d6a"}
@@ -183,3 +186,58 @@ def test_edge_serves_chat_under_csp(stack):                                # Д6
     assert (code, h["cache-control"]) == (204, "no-store")                 # решение по А4: иконки нет — не 404
     assert stack.http_from_watchdog("GET", "http://pcbk-edge:8080/chat/build.json") == 200   # из сети сторожа (M13)
 
+
+def test_edge_serves_boot_js_no_store(stack):                               # Д6-R51: загрузчик без хеша — без кэша
+    build = json.loads((stack.static_dir / "chat/build.json").read_text(encoding="utf-8"))
+    assert "boot.js" in build["files"]                                     # в описи — иначе сверять не с чем
+    code, raw, h = stack.https_full("/chat/boot.js", headers={"Accept-Encoding": "gzip"})
+    assert (code, h["content-security-policy"], h["cache-control"], h["x-content-type-options"], h["referrer-policy"]) \
+        == (200, CHAT_CSP, "no-store", "nosniff", "no-referrer")
+    assert h["content-type"] == "application/javascript; charset=utf-8"    # русский текст сбоя — charset
+    assert h.get("content-encoding") is None                               # как есть, без gzip ассетов
+    assert hashlib.sha256(raw.encode("utf-8")).hexdigest() == build["files"]["boot.js"]
+
+
+def test_edge_routes_web_report(stack):                                     # Д6-R50: отчёты браузеров через edge
+    gw = stack.gw_client()                                                  # без сессии, Origin стенда
+    code, body, h = gw.call("POST", "/pcbk/api/web/report", {"kind": "turn_silent"})
+    assert (code, body["name"], h["content-type"]) == (401, "Unauthorized", "application/json"), (code, body)
+    code, body, h = gw.call("POST", "/pcbk/api/web/report", {"kind": "x" * 2048})   # тело 2 КиБ — до core не дошло
+    assert (code, body["name"], h["content-type"]) == (413, "PayloadTooLarge", "application/json"), (code, body)
+    code, body, h = gw.call("POST", "/pcbk/api/web/other", {"kind": "turn_silent"})
+    assert (code, body["name"], h["content-type"]) == (404, "NotFound", "application/json"), (code, body)
+    code, body, _ = gw.call("POST", "/pcbk/api/web//report", {"kind": "turn_silent"})   # сырой путь — как у прочих
+    assert (code, body["name"]) == (400, "BadRequest"), (code, body)
+    # предел частоты (корзина «-» без cookie, 1 r/s, запас 10): отказ — 509 → busy.json, 503 WorkplaceBusy, не 429
+    codes = [gw.call("POST", "/pcbk/api/web/report", {"kind": "turn_silent"})[:2] for _ in range(20)]
+    assert {c for c, _ in codes} == {401, 503}, [c for c, _ in codes]
+    assert {b["name"] for c, b in codes if c == 503} == {"WorkplaceBusy"}
+
+
+def test_edge_limits_me_and_notice_by_cookie_or_address(stack):            # итоговая доводка Д6б, m2; preflight Н17
+    """«Кто я» и подтверждение предупреждения — своя зона: ключ — cookie сессии своего вида, без неё — адрес клиента
+    (общей корзины «-» нет). 30 запросов /me без cookie с одного адреса (класс открыл страницу входа) укладываются в
+    предел адреса; дальше — 503 WorkplaceBusy, а не 429 входа; запросы с cookie в это время — своя корзина. Корзину
+    входа по IP эти ручки не тратят: выход с того же адреса — ответ шлюза (выход, а не вход: неудачный вход растил бы
+    счётчики строки «Шлюз и вход» общего стенда)."""
+    gw = stack.gw_client()                                                  # без сессии, Origin стенда
+    cookie = {"Cookie": Secret(f"pcbk_session={secrets.token_urlsafe(32)}")}   # своего вида, сессии нет — 401 шлюза
+    codes = [gw.call("GET", "/pcbk/api/auth/me")[0] for _ in range(30)]
+    assert set(codes) == {401}, codes                                       # класс за одним адресом — в пределе
+    bare, own = [], []
+    for i in range(60):                     # адрес исчерпан, а cookie — своя корзина (её 20 запросов — в запасе 40)
+        bare.append(gw.call("GET", "/pcbk/api/auth/me")[:2])
+        if i % 3 == 2:
+            own.append(gw.call("GET", "/pcbk/api/auth/me", headers=cookie)[:2])
+    assert {c for c, _ in bare} == {401, 503}, [c for c, _ in bare]
+    assert {b["name"] for c, b in bare if c == 503} == {"WorkplaceBusy"}
+    assert {(c, b["name"]) for c, b in own} == {(401, "Unauthorized")}, [c for c, _ in own]
+    assert any(bare[i][0] == 503 for i in range(2, 60, 3))                  # cookie прошла там, где адрес уже отказывал
+    notice = [gw.call("POST", "/pcbk/api/auth/notice", {"notice": "teacher-reads-1"})[:2] for _ in range(20)]
+    assert 503 in {c for c, _ in notice} and {c for c, _ in notice} <= {401, 503}, [c for c, _ in notice]   # та же зона
+    code, body, _ = gw.call("POST", "/pcbk/api/auth/notice", {"notice": "teacher-reads-1"}, headers=cookie)
+    assert (code, body["name"]) == (401, "Unauthorized")
+    code, body, _ = gw.call("POST", "/pcbk/api/auth/logout")
+    assert (code, body) == (200, {}), (code, body)                          # корзина входа по IP не тронута
+    assert 'by zone "pcbk_auth_session"' in stack.logs("pcbk-edge")        # отказы — этой зоны, а не входа
+    time.sleep(10)      # корзина адреса опустеет (запас 40, 5 r/s): следующие модули открывают /login без cookie

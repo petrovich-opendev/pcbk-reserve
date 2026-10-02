@@ -276,42 +276,58 @@ def raw_http():
 def fake_core():
     """Двойник ручек pcbk-core: /health/historian — set(obj) или set_raw(text),
     /healthz/data — set_health(code, obj), /health/llm — set_llm(obj) или set_llm_raw(text),
-    /health/gateway — set_gateway(obj) или set_gateway_raw(text); прочие пути — 404."""
+    /health/gateway — set_gateway(obj) или set_gateway_raw(text), /health/web (Д6б) — set_web(code, obj, delay_s)
+    (до заголовков — задержка delay_s; в конце теста ожидание прерывается); прочие пути — 404."""
     replies = {"/health/historian": (200, "application/json", b"{}"),
                "/healthz/data": (200, "application/json", b'{"ok": true, "detail": "ok"}'),
                "/health/llm": (200, "application/json", b"{}"),
                "/health/gateway": (200, "application/json", b"{}")}
+    delays: dict[str, float] = {}
+    stop = threading.Event()
 
     def as_json(obj) -> bytes:
         return json.dumps(obj, ensure_ascii=False).encode()   # как у FastAPI: UTF-8, не \u
 
+    def set_web(code: int, obj, delay_s: float = 0.0) -> None:
+        replies["/health/web"] = (code, "application/json", as_json(obj))
+        delays["/health/web"] = delay_s
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            delay = delays.get(self.path, 0.0)
+            if delay and stop.wait(delay):
+                return               # конец теста: не ждать задержку и не писать в закрытый сокет
             code, ctype, body = replies.get(self.path, (404, "text/plain", b"not found"))
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass                 # проверка уже ушла по сроку и закрыла соединение
 
         def log_message(self, *args):
             pass
 
     with serve_http(Handler) as base:
-        yield SimpleNamespace(
-            base=base, url=base + "/health/historian",
-            set=lambda obj: replies.update({"/health/historian": (200, "application/json", as_json(obj))}),
-            set_raw=lambda text: replies.update(
-                {"/health/historian": (200, "text/plain; charset=utf-8", text.encode())}),
-            set_health=lambda code, obj: replies.update(
-                {"/healthz/data": (code, "application/json", as_json(obj))}),
-            set_llm=lambda obj: replies.update({"/health/llm": (200, "application/json", as_json(obj))}),
-            set_llm_raw=lambda text: replies.update(
-                {"/health/llm": (200, "text/plain; charset=utf-8", text.encode())}),
-            set_gateway=lambda obj: replies.update(
-                {"/health/gateway": (200, "application/json", as_json(obj))}),
-            set_gateway_raw=lambda text: replies.update(
-                {"/health/gateway": (200, "text/plain; charset=utf-8", text.encode())}))
+        try:
+            yield SimpleNamespace(
+                base=base, url=base + "/health/historian", set_web=set_web,
+                set=lambda obj: replies.update({"/health/historian": (200, "application/json", as_json(obj))}),
+                set_raw=lambda text: replies.update(
+                    {"/health/historian": (200, "text/plain; charset=utf-8", text.encode())}),
+                set_health=lambda code, obj: replies.update(
+                    {"/healthz/data": (code, "application/json", as_json(obj))}),
+                set_llm=lambda obj: replies.update({"/health/llm": (200, "application/json", as_json(obj))}),
+                set_llm_raw=lambda text: replies.update(
+                    {"/health/llm": (200, "text/plain; charset=utf-8", text.encode())}),
+                set_gateway=lambda obj: replies.update(
+                    {"/health/gateway": (200, "application/json", as_json(obj))}),
+                set_gateway_raw=lambda text: replies.update(
+                    {"/health/gateway": (200, "text/plain; charset=utf-8", text.encode())}))
+        finally:
+            stop.set()
 
 
 @pytest.fixture

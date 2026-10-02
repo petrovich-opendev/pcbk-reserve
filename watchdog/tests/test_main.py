@@ -283,7 +283,8 @@ def test_components_file_d5a():
 
 def test_components_have_web_row():
     comps = load_components("components.json")
-    assert comps[-1] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/"}
+    assert comps[-1] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
+                         "reports_url": "http://pcbk-core:8000/health/web"}                # Д6б: отчёты браузеров
 
 
 def test_run_checks_web_kind(web_site):                                        # M2 предпроверки Д6а
@@ -299,6 +300,15 @@ def test_run_checks_web_kind(web_site):                                        #
     comps[0]["url"] = "http://127.0.0.1:9/chat/"
     checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
     assert (checks[0].state, checks[0].detail) == ("fail", "не отвечает")
+
+
+def test_run_checks_web_reports_url(web_site, fake_core):                       # Д6б: reports_url доходит до check_web
+    root, url = web_site
+    put_build(root)
+    fake_core.set_web(200, {"boot_failed_1h": 0, "ui_crash_1h": 2, "turn_silent_1h": 0, "stream_down_1h": 0})
+    comps = [{"id": "web", "title": "Веб-чат", "kind": "web", "url": url, "reports_url": fake_core.base + "/health/web"}]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert [(c.state, c.detail, c.note) for c in checks] == [("warn", "чат падает в браузере", "2 за час")]
 
 
 def test_gw_stale_setting():
@@ -404,7 +414,13 @@ def test_load_components_rejects_bad_config(tmp_path):
                 [{"id": "a", "title": "A", "kind": "container", "container": "pcbk-core", "sleeping_ok": False,
                   "unhealthy_detail": 1}],
                 [{"id": "a", "title": "A", "kind": "container", "container": "pcbk-core", "sleeping_ok": False,
-                  "unhealthy_detail": "ж" * 81}]):
+                  "unhealthy_detail": "ж" * 81}],
+                # Д6б (preflight Н10): reports_url — строка http:// с хостом и только у вида web
+                [{"id": "a", "title": "A", "kind": "web", "url": "http://x/chat/", "reports_url": 1}],
+                [{"id": "a", "title": "A", "kind": "web", "url": "http://x/chat/", "reports_url": "https://x/health/web"}],
+                [{"id": "a", "title": "A", "kind": "web", "url": "http://x/chat/", "reports_url": "http:///health/web"}],
+                [{"id": "a", "title": "A", "kind": "web", "url": "http://x/chat/", "reports_url": ""}],
+                [{"id": "a", "title": "A", "kind": "gateway", "url": "http://x/", "reports_url": "http://x/health/web"}]):
         path = tmp_path / "c.json"
         path.write_text(json.dumps(bad))
         with pytest.raises(ValueError):

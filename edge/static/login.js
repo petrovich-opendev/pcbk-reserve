@@ -1,4 +1,6 @@
 // Страница входа: вход, пробуждение рабочего места и ожидание его готовности.
+// Предупреждение при первом входе (Д6-R49) показывает чат: пока /me несёт notice, страница входа место не будит и
+// сразу ведёт в чат. Ответ входа предупреждения не несёт — после входа страница спрашивает /me.
 // Чистые функции — для тестов (node --test edge/tests/*.test.mjs); DOM подключается только в браузере.
 // Ни пароль, ни сессия нигде не хранятся: cookie сессии — HttpOnly, её ставит и стирает шлюз.
 
@@ -7,6 +9,7 @@ const POLL_MS = 1000;               // опрос готовности — ра�
 
 const PREPARING = 'Готовлю рабочее место…';
 const NO_ANSWER = 'Серверный слой не отвечает';
+const OPENING_CHAT = 'Открываю чат…';
 
 // ответ места ({state, detail}) → текст строки состояния; poll — спрашивать ли дальше
 export function viewFor(reply) {
@@ -117,13 +120,41 @@ export function startPage({ doc, fetchImpl,
     say(text, kind);
   }
 
-  function showSignedIn(account) {
+  function showWho(account) {
     form.hidden = true;
     who.textContent = meView(200, account).text;
     who.hidden = false;
     logout.hidden = false;
+  }
+
+  // account — ответ /me: у студента с notice != null (не подтвердил; поле есть только с Д6б) — в чат без пробуждения,
+  // предупреждение покажет чат; null или поля нет (core Д5) — как в Д6а
+  function showSignedIn(account) {
+    showWho(account);
     if (account.role === 'teacher') say('У преподавателя нет рабочего места');
+    else if (account.notice != null) toNotice();
     else wake();
+  }
+
+  function toNotice() {
+    stopWaiting();
+    say(OPENING_CHAT, 'wait');
+    toChat.hidden = false;                               // запасная ссылка, если переход не случился
+    navigate(CHAT_URL);
+  }
+
+  // после удачного входа: предупреждение знает только /me. Нет ответа или он не по договору — текст и ссылка
+  // «Открыть чат», место не будим: решит чат своим экраном «Повторить» (раунд 2, В4); 401 — снова форма (Н5)
+  async function afterLogin(account) {
+    const r = await call('GET', '/pcbk/api/auth/me');
+    if (r.status === 401) showForm(loginError(r.status, r.body));
+    else if (meView(r.status, r.body).form === false) showSignedIn(r.body);
+    else {
+      stopWaiting();
+      showWho(account);
+      say(loginError(r.status, r.body), 'fail');
+      toChat.hidden = false;
+    }
   }
 
   function showPlace(my, reply) {
@@ -187,10 +218,10 @@ export function startPage({ doc, fetchImpl,
     passwordInput.value = '';                            // пароль не остаётся в поле
     say('Вхожу…', 'wait');
     const r = await call('POST', '/pcbk/api/auth/login', { login, password });
+    if (r.status === 200 && meView(r.status, r.body).form === false) await afterLogin(r.body);   // форма занята до ответа /me
+    else say(loginError(r.status, r.body), 'fail');
     busy = false;
     submit.disabled = false;
-    if (r.status === 200 && meView(r.status, r.body).form === false) showSignedIn(r.body);
-    else say(loginError(r.status, r.body), 'fail');
   });
 
   logout.addEventListener('click', async () => {
