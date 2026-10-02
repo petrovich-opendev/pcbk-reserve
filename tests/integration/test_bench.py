@@ -11,6 +11,7 @@
 08 eager_saver. Денег и историана нет: OpenRouter — двойник, историан — twin_historian в core (bench-historian.json).
 Строки «А6 журнал: …» (pytest -rP) — время модуля, итоги прогонов по персонам, вызовы калькулятора ops.
 """
+import json
 import time
 from collections import Counter
 
@@ -103,18 +104,30 @@ def test_bench_twin_run(bench):
 
 def test_bench_cap_stops_and_page_warns(bench):                                  # m8
     bench.recreate_core(run_id="d8-cap", cap=0.01)
-    assert bench.runner_for(bench.tmp / "cap", run_id="d8-cap", cap_usd=0.01, stop_margin_usd=0).run() == "cap"
+    out = bench.tmp / "cap"
+    assert bench.runner_for(out, run_id="d8-cap", cap_usd=0.01, stop_margin_usd=0).run() == "cap"
     assert bench.refusals("pcbk_run_spent") >= 1
+    # после стопа — ни одного нового прогона: у места не больше одного прогона — первого плана, и не done; 402 получил
+    # хотя бы один (место, чей ход кончился до 402 соседа, до следующей реплики видит жёсткую остановку — interrupted)
+    recs = bench.records(out)
+    keys = [r.key for r in recs]
+    assert len(keys) == len(set(keys)) and set(keys) <= {RunKey(n, SCENARIO_IDS[0], 1) for n in PLACES}
+    statuses = {r.status for r in recs}
+    assert "capped" in statuses and statuses <= {"capped", "interrupted"}
+    end = json.loads((out / "health_end.json").read_text(encoding="utf-8"))["run"]
+    assert json.loads((out / "progress.json").read_text(encoding="utf-8"))["run_spent_usd"] == end["spent_usd"] > 0
     bench.stack.wait_status(lambda s: row_of(s, "llm")["detail"] == RUN_CAP_DETAIL, 30)
     run = bench.stack.llm_health()["run"]
     assert run["id"] == "d8-cap" and run["spent_usd"] >= run["cap_usd"]
     assert run["spent_usd"] <= run["cap_usd"] + 4 * 3 * FAKE_CALL_USD                # до трёх на место
     print(f"А6 журнал: потолок $0.01 — потрачено ${run['spent_usd']:.4f}, отказов pcbk_run_spent "
-          f"{bench.refusals('pcbk_run_spent')}")
+          f"{bench.refusals('pcbk_run_spent')}, прогонов {len(recs)}: {dict(Counter(r.status for r in recs))}")
     bench.shot("twin-01-run-cap.png")
 
 
 def test_bench_cleanup_restores(bench):                                          # последним в модуле
+    """Зависит от предыдущих тестов модуля (принято): уборка сверяется после их прогонов, а счётчик калькулятора ops
+    (calc_calls > 0) набран прогонами test_bench_twin_run. Отдельно, без них, этот тест не гонять."""
     bench.cleanup()
     listing = bench.stack.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "list")
     for n in PLACES:                                                                # m-н18: все места
