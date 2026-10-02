@@ -121,7 +121,7 @@ def _places(raw: object, refs: frozenset[str]) -> dict[int, str]:
         if not isinstance(ref, str) or ref not in refs:
             raise ValueError("конфиг: places — модель не из opencode.json места (pcbk/… или pcbk-or/…)")
         out[n] = ref
-    if len(set(out.values())) != len(out):
+    if len({ref.split("/", 1)[1] for ref in out.values()}) != len(out):      # и через pcbk, и через pcbk-or (р1 Б2)
         raise ValueError("конфиг: places — одна модель на двух местах")
     return dict(sorted(out.items()))
 

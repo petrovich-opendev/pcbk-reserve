@@ -10,7 +10,8 @@
   controls и refused. Прогон пакета — «<model>|<place>|<scenario>|<rep>» или {"model", "scenario", "rep"[, "place"]};
   вид отказа сканера — map.json["refused"] ({packet_id: "secret"|"data"} или [{"packet_id", "kind"}]);
 - план (П9) — planned_counts(cfg): модель → число ключей плана по группам; без плана — полный план REPS (8/12/12);
-- остаток бюджета — OUT/health_end.json (снимок /health/llm в конце прогона, А5).
+- остаток бюджета — OUT/health_end.json (снимок /health/llm в конце прогона, А5): total_usd минус больший из
+  key_spent_usd и spent_usd; снимка нет — таблица строится, L берётся верхней границей $800 с пометкой в шапке.
 
 Что считается:
 - не прогнано — каждая попытка со статусом не done, и запись done, у которой автомат первым дал код сбоя стенда
@@ -18,12 +19,14 @@
 - оценено — последняя запись ключа (m12): done, без сбоя стенда, вердикт судьи со статусом ok. Не оценено (not_judged):
   вердикт пропал или кривой (judge_failed), отказ сканера (judge_refused_secret/_data; вид неизвестен —
   judge_refused), иной статус вердикта, нет пакета в карте (no_packet), нет карточки сценария (no_card);
-- прошёл — оценён, автомат не провалил (passed не False) и судья доволен (judge_passed — правило passed_by_judge
-  Д8-R78: все оценки ≥ 3, invented_norm и saved_prompt_bad ложны);
+- прошёл — оценён, автомат не провалил (passed не False) и судья доволен (judge.passed_by_judge Б1, Д8-R78: все
+  оценки ≥ 3, invented_norm и saved_prompt_bad ложны);
 - жёсткие (hard) — автомат (AutoVerdict.hard) у каждой попытки, в том числе не прогнанной (П10), и судья
-  (invented_norm, saved_prompt_bad) у оценённых; create_hard — то же у группы A (m9);
+  (invented_norm, saved_prompt_bad) у последней done-записи ключа с вердиктом ok — и при сбое стенда (доводка р1,
+  I1: в качество и доли такая запись не идёт); create_hard — то же у группы A (m9);
 - мягкие (soft) — foreign_number автомата и numbers_not_from_tools судьи (I-р3-2); number_missing — провал без жёсткого;
-- цена хода — Σ цены строк llm_calls всех попыток группы / Σ ходов (реплик студента; мост — тоже ход); заголовок
+- цена хода — Σ цены строк llm_calls всех попыток группы / Σ ходов (реплик студента; мост — тоже ход) тех сессий,
+  у которых есть строки журнала (priced_turns, доводка р1 I2; исключённые ходы — в шапке); заголовок
   разговора (step 0) входит; строка без пришедшей цены — по cost_est (сумма — estimated_usd, «по оценке»); отказ
   прокси (status refused) стоит 0, но ход считается. Цена строки — как ledger.charge (row_charge);
 - p90 цены хода (m22) — по ценам отдельных ходов: строка llm_calls относится к ходу своей записи по времени (сессии
@@ -47,7 +50,7 @@ import math
 import statistics
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -56,6 +59,7 @@ from typing import Any
 from .cards import CardSet, load_cards
 from .checks import HARD_CODES, STAND_CODES, AutoVerdict, check_run
 from .config import PROVIDERS, BenchConfig, load_config
+from .judge import check_verdicts, controls_ok, passed_by_judge
 from .record import RunRecord, Turn
 from .runner import load_records, load_tag_units, plan_runs
 from .scenarios import BY_ID, REPS, SCENARIO_IDS
@@ -110,7 +114,8 @@ class ModelRow:
       (foreign_number, numbers_not_from_tools);
     - quality — средняя оценка судьи по всем пунктам оценённых; quality_groups — по группам;
     - cost — цена хода по группам: create, number, trap и data (B и C вместе), $; turn — смесь; p90_turn — p90 цены
-      хода; estimated_usd — сколько из цены строк взято по оценке (cost_est); turns — ходов во всех попытках;
+      хода; estimated_usd — сколько из цены строк взято по оценке (cost_est); turns — ходов в цене хода (сессии со
+      строками журнала, priced_turns); turns_excluded — ходов без строк журнала, исключённых из цены (I2);
     - reasoning_per_turn — токенов рассуждения на ход; cache_share — доля входа из кэша (cached / prompt);
     - f2500, f5000 — прогноз на 2 500 и 5 000 ходов, student — доля студента за 2 месяца (500 ходов), $;
     - time_median_s, time_p90_s — время хода, справочно;
@@ -137,6 +142,7 @@ class ModelRow:
     p90_turn: float | None = None
     estimated_usd: float = 0.0
     turns: int = 0
+    turns_excluded: int = 0
     reasoning_per_turn: float | None = None
     cache_share: float | None = None
     f2500: float | None = None
@@ -181,6 +187,19 @@ def _turns(rec: RunRecord) -> list[Turn]:
     return list(rec.turns) + ([rec.bridge] if rec.bridge is not None else [])
 
 
+def priced_turns(rec: RunRecord) -> list[Turn]:
+    """Ходы, которые идут в цену хода (доводка р1, I2): только ходы сессий, у которых есть строки журнала прокси.
+    Сессия хода — sessions[0] у разговора (B/C и Конструктор A), sessions[-1] у моста; без sessions — ни одного хода
+    (запись исключается из цены целиком). Иначе ход без строк (сбой стенда до вызова LLM) занижал бы цену хода."""
+    if not rec.sessions:
+        return []
+    seen = {r.get("session") for r in rec.llm_rows}
+    out = list(rec.turns) if rec.sessions[0] in seen else []
+    if rec.bridge is not None and rec.sessions[-1] in seen:
+        out.append(rec.bridge)
+    return out
+
+
 def _ts(value: Any) -> float | None:
     if not isinstance(value, str):
         return None
@@ -192,8 +211,8 @@ def _ts(value: Any) -> float | None:
 
 
 def _per_turn(rec: RunRecord) -> list[float]:
-    """Цена каждого хода записи (m22, см. шапку модуля)."""
-    turns = sorted(_turns(rec), key=lambda t: t.started)
+    """Цена каждого хода записи (m22, см. шапку модуля) — по ходам priced_turns."""
+    turns = sorted(priced_turns(rec), key=lambda t: t.started)
     if not turns:
         return []
     out = [0.0] * len(turns)
@@ -222,7 +241,8 @@ def _p90(values: list[float]) -> float | None:
 # --- цена хода и прогноз ---
 
 def turn_costs(recs: list[RunRecord]) -> dict[str, float | None]:
-    """Цена хода: create (A), number (B), trap (C), data (B и C) — Σ цены строк / Σ ходов; группа без ходов — None."""
+    """Цена хода: create (A), number (B), trap (C), data (B и C) — Σ цены строк / Σ ходов сессий со строками журнала
+    (priced_turns); группа без таких ходов — None."""
     cost: dict[str, float] = defaultdict(float)
     turns: Counter = Counter()
     for r in recs:
@@ -230,7 +250,7 @@ def turn_costs(recs: list[RunRecord]) -> dict[str, float | None]:
         if sc is None:
             continue
         cost[sc.group] += sum(row_charge(x)[0] for x in r.llm_rows)
-        turns[sc.group] += len(_turns(r))
+        turns[sc.group] += len(priced_turns(r))
 
     def per(groups: tuple[str, ...]) -> float | None:
         n = sum(turns[g] for g in groups)
@@ -256,18 +276,20 @@ def read_health_end(out: Path) -> dict:
 
 
 def spent_of(health: Mapping[str, Any]) -> tuple[float, str]:
-    """Расход для остатка: key_spent_usd (по ключу, "key"); null — spent_usd журнала прокси ("proxy", m-р4-8)."""
+    """Расход для остатка — больший из key_spent_usd (по ключу, "key") и spent_usd журнала прокси ("proxy"); ключа нет
+    (null, m-р4-8) — журнал прокси. Нет обоих — ValueError."""
     key = _num(health.get("key_spent_usd"))
-    if key is not None:
-        return key, "key"
     proxy = _num(health.get("spent_usd"))
-    if proxy is not None:
-        return proxy, "proxy"
-    raise ValueError("health_end.json: нет ни key_spent_usd, ни spent_usd")
+    if key is None and proxy is None:
+        raise ValueError("health_end.json: нет ни key_spent_usd, ни spent_usd")
+    if proxy is None or (key is not None and key >= proxy):
+        return float(key), "key"
+    return proxy, "proxy"
 
 
 def budget_left(out: Path) -> float:
-    """Остаток бюджета по OUT/health_end.json: total_usd снимка (нет — $1 000, m11) минус расход (spent_of)."""
+    """Остаток бюджета по OUT/health_end.json: total_usd снимка (нет — $1 000, m11) минус расход (spent_of: больший
+    из расхода по ключу и по журналу прокси)."""
     health = read_health_end(out)
     spent, _ = spent_of(health)
     total = _num(health.get("total_usd"))
@@ -288,7 +310,10 @@ def _full_plan() -> dict[str, int]:
 
 def planned_counts(cfg: BenchConfig) -> dict[str, dict[str, int]]:
     """Модель (без провайдера) → число ключей plan_runs(cfg) её места по группам (П9; фильтр scenarios — тоже)."""
-    out = {model_name(ref): {g: 0 for g in GROUPS} for _, ref in sorted(cfg.places.items())}
+    names = [model_name(ref) for _, ref in sorted(cfg.places.items())]
+    if len(set(names)) != len(names):
+        raise ValueError("план: одна модель на двух местах (pcbk и pcbk-or) — в таблице не различить")
+    out = {name: {g: 0 for g in GROUPS} for name in names}
     for k in plan_runs(cfg):
         out[model_name(cfg.places[k.place])][BY_ID[k.scenario].group] += 1
     return out
@@ -338,13 +363,14 @@ def _packet_runs(verdicts: Any, packet_map: Mapping | None) -> dict[str, _Ref]:
     return out
 
 
-def _refused_kinds(packet_map: Mapping | None) -> dict[str, str]:
+def _refused_kinds(verdicts: Any, packet_map: Mapping | None) -> dict[str, str]:
+    """Вид отказа сканера: карта пакетов, а чего в ней нет — VerdictReport.refused_kind (m6)."""
     raw = (packet_map or {}).get("refused")
-    pairs: Iterable = ()
+    pairs: list = list((getattr(verdicts, "refused_kind", None) or {}).items())
     if isinstance(raw, Mapping):
-        pairs = raw.items()
+        pairs += list(raw.items())
     elif isinstance(raw, list):
-        pairs = [(x.get("packet_id"), x.get("kind")) for x in raw if isinstance(x, Mapping)]
+        pairs += [(x.get("packet_id"), x.get("kind")) for x in raw if isinstance(x, Mapping)]
     out = {}
     for pid, kind in pairs:
         if isinstance(pid, str) and isinstance(kind, str) and kind:
@@ -359,7 +385,7 @@ def _judge_index(verdicts: Any, packet_map: Mapping | None) -> tuple[dict, dict]
     """(место, сценарий, повтор) → (модель, статус, вердикт); пакеты без места — (модель, сценарий, повтор) → …"""
     ok = getattr(verdicts, "ok", None) or {}
     refused = set(getattr(verdicts, "refused", None) or ())
-    kinds = _refused_kinds(packet_map)
+    kinds = _refused_kinds(verdicts, packet_map)
     by_place: dict[tuple, _Judge] = {}
     by_model: dict[tuple, _Judge] = {}
     for pid, (model, place, sid, rep) in _packet_runs(verdicts, packet_map).items():
@@ -386,14 +412,6 @@ def _judge_of(rec: RunRecord, by_place: dict, by_model: dict) -> tuple[str, Any]
     if entry is not None:
         return entry[1], entry[2]
     return "no_packet", None
-
-
-def judge_passed(v: Any) -> bool:
-    """Правило passed_by_judge (Д8-R78): все оценки ≥ 3, invented_norm и saved_prompt_bad ложны."""
-    scores = getattr(v, "scores", None) or {}
-    hard = getattr(v, "hard", None) or {}
-    return bool(scores) and all(_num(s) is not None and s >= 3 for s in scores.values()) and \
-        not any(hard.get(c) for c in JUDGE_HARD)
 
 
 # --- строки моделей ---
@@ -447,33 +465,37 @@ def _row(name: str, plan: tuple[dict[str, int], int], recs: list[RunRecord], car
     for r in latest.values():                            # оценка — по последней записи ключа (m12)
         av = autos[id(r)]
         group = BY_ID[r.key.scenario].group
-        if r.status != "done" or (av is not None and av.fails and av.fails[0] in STAND_CODES):
+        if r.status != "done":
             continue
+        status, v = _judge_of(r, *index)
+        if status == "ok" and v is not None:             # находки судьи — и у записи со сбоем стенда (р1, I1)
+            vh = getattr(v, "hard", None) or {}
+            for code in JUDGE_HARD:
+                if vh.get(code):
+                    hard[code] += 1
+                    if group == "create":
+                        create_hard[code] += 1
+            if vh.get(JUDGE_SOFT):
+                soft[JUDGE_SOFT] += 1
+        if av is not None and av.fails and av.fails[0] in STAND_CODES:
+            continue                                     # сбой стенда: не в качество, доли и judged (П10)
         if av is None:
             not_judged["no_card"] += 1
             continue
         if "bot_no_draft" in av.fails:
             bot_no_draft += 1
-        status, v = _judge_of(r, *index)
         if status != "ok" or v is None:
             not_judged[status] += 1
             continue
         judged[group] += 1
         scores[group] += [float(s) for s in (getattr(v, "scores", None) or {}).values() if _num(s) is not None]
-        vh = getattr(v, "hard", None) or {}
-        for code in JUDGE_HARD:
-            if vh.get(code):
-                hard[code] += 1
-                if group == "create":
-                    create_hard[code] += 1
-        if vh.get(JUDGE_SOFT):
-            soft[JUDGE_SOFT] += 1
-        if av.passed is not False and judge_passed(v):
+        if av.passed is not False and passed_by_judge(v):
             passed[group] += 1
 
     costs = turn_costs(recs)
     rows = [x for r in recs for x in r.llm_rows]
-    n_turns = sum(len(_turns(r)) for r in recs)
+    n_turns = sum(len(priced_turns(r)) for r in recs)
+    excluded = sum(len(_turns(r)) for r in recs) - n_turns
     prompt = sum(_num(x.get("prompt_tokens")) or 0.0 for x in rows)
     cached = sum(_num(x.get("cached_tokens")) or 0.0 for x in rows)
     reasoning = sum(_num(x.get("reasoning_tokens")) or 0.0 for x in rows)
@@ -490,7 +512,7 @@ def _row(name: str, plan: tuple[dict[str, int], int], recs: list[RunRecord], car
         create_hard=dict(create_hard), soft=dict(soft), quality=_mean([s for g in GROUPS for s in scores[g]]),
         quality_groups={g: m for g in GROUPS if (m := _mean(scores[g])) is not None}, cost=costs,
         turn=f["turn"] if f else None, p90_turn=_p90([c for r in recs for c in _per_turn(r)]),
-        estimated_usd=sum(a for a, est in map(row_charge, rows) if est), turns=n_turns,
+        estimated_usd=sum(a for a, est in map(row_charge, rows) if est), turns=n_turns, turns_excluded=excluded,
         reasoning_per_turn=reasoning / n_turns if n_turns else None, cache_share=cached / prompt if prompt else None,
         f2500=f["2500"] if f else None, f5000=f["5000"] if f else None, student=f["student"] if f else None,
         time_median_s=statistics.median(durations) if durations else None, time_p90_s=_p90(durations), notes=notes)
@@ -505,11 +527,14 @@ def aggregate(recs: list[RunRecord], cards: CardSet, verdicts: Any, tag_units: M
     for ref, value in (planned or {}).items():
         plans[model_name(ref)] = _plan_of(value)
     by_model: dict[str, list[RunRecord]] = defaultdict(list)
+    refs: dict[str, str] = {}
     for r in recs:
         if r.key.scenario not in BY_ID:
             log.warning("таблица: запись неизвестного сценария — пропущена")
             continue
         name = model_name(r.model)
+        if refs.setdefault(name, r.model) != r.model:
+            raise ValueError("таблица: одна модель через два провайдера мест — в таблице не различить")
         if name not in plans:
             plans[name] = _plan_of(_full_plan())
         by_model[name].append(r)
@@ -596,7 +621,7 @@ def _score(x: float | None) -> str:
     return "—" if x is None else _dec(x, 2)
 
 
-def _header(meta: Mapping[str, Any]) -> list[str]:
+def _header(meta: Mapping[str, Any], rows: list[ModelRow]) -> list[str]:
     reps = meta.get("reps") if isinstance(meta.get("reps"), Mapping) else None
     reps_text = ", ".join(f"{LETTER[g]}×{reps[g]}" for g in GROUPS if g in reps) if reps else "—"
     if meta.get("scenarios"):
@@ -607,8 +632,12 @@ def _header(meta: Mapping[str, Any]) -> list[str]:
     left = _num(meta.get("budget_left"))
     source = "по ключу" if meta.get("budget_source") == "key" else "остаток по журналу прокси"
     budget = (f"остаток бюджета {_usd(left)} ({source}); предел прогноза L = {_usd(limit_usd(left))} "
-              f"(min($800, остаток − $50))" if left is not None else "остаток бюджета — нет снимка /health/llm")
-    key = _usd(meta.get("key_spent_usd")) if _num(meta.get("key_spent_usd")) is not None else "нет данных"
+              f"(min($800, остаток − $50))" if left is not None else
+              f"остаток бюджета — нет снимка /health/llm (OUT/health_end.json): предел прогноза взят верхней "
+              f"границей L = {_usd(LIMIT_USD)}, остаток не проверен — решает владелец")
+
+    def total(key: str) -> str:
+        return _usd(meta.get(key)) if _num(meta.get(key)) is not None else "нет данных"
     w = _num(meta.get("w"))
     lines = [
         f"- Дата: {meta.get('date', '—')}; прогон `{meta.get('run_id', '—')}`; "
@@ -616,8 +645,8 @@ def _header(meta: Mapping[str, Any]) -> list[str]:
         f"- Судья: субагенты Opus 5.5 по подписке; пачек — {meta.get('judge_batches', '—')}, повторных заходов — "
         f"{'—' if retries is None else retries}; {data}; по числам жёстко — только автомат, судья — мягкий сигнал.",
         f"- Повторы: {reps_text}.",
-        f"- Расход прогона: по журналу прокси {_usd(meta.get('spent_usd'))} (потолок {_usd(meta.get('cap_usd'))}); "
-        f"по ключу {key}.",
+        f"- Расход прогона по журналу прокси: {total('spent_usd')} (потолок {_usd(meta.get('cap_usd'))}). Расход ключа "
+        f"за всё время: {total('key_spent_usd')}; журнала прокси за всё время: {total('proxy_spent_usd')}.",
         f"- {budget[0].upper()}{budget[1:]}.",
         f"- Вес Конструктора w = {'—' if w is None else _dec(w, 2)}: цена хода c = w × c_A + (1 − w) × c_BC; прогноз — "
         f"c × 2 500 и c × 5 000 ходов, доля студента за 2 месяца — c × 500.",
@@ -631,6 +660,11 @@ def _header(meta: Mapping[str, Any]) -> list[str]:
     else:
         lines.append("- Контроль судьи J1–J4: нет данных — решает владелец.")
     lines.append("- Доля A — верхняя оценка успеха 1 со сценарным студентом.")
+    excluded = [(r.model, r.turns_excluded) for r in rows if r.turns_excluded]
+    if excluded:
+        per = "; ".join(f"`{m}` — {n}" for m, n in excluded)
+        lines.append(f"- Ходов без строк журнала прокси (исключены из цены хода): {sum(n for _, n in excluded)} "
+                     f"({per}).")
     if _num(meta.get("pending")):
         lines.append(f"- Строк журнала прокси с ценой в ожидании (pending): {int(meta['pending'])} — "
                      "их цена по оценке.")
@@ -661,7 +695,8 @@ def render_markdown(rows: list[ModelRow], meta: Mapping[str, Any]) -> str:
         verdicts = recommend(rows, float(meta["budget_left"]))
     else:
         verdicts = ["—"] * len(rows)
-    out = [f"# Таблица отбора модели — прогон {meta.get('run_id', '—')}", "", *_header(meta), "", *RULE_TEXT, ""]
+    out = [f"# Таблица отбора модели — прогон {meta.get('run_id', '—')}", "", *_header(meta, rows), "", *RULE_TEXT,
+           ""]
     out += ["## Качество", "",
             "| Модель | Точка | Прошло A | Прошло B | Прошло C | Всего | Не прогнано | Не оценено | bot_no_draft "
             "| invented_norm | number_mismatch | saved_without_consent | saved_after_change | saved_prompt_bad "
@@ -714,8 +749,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _judge_api():
-    """check_verdicts и controls_ok судьи (Б1) — ленивым импортом."""
-    from .judge import check_verdicts, controls_ok
+    """check_verdicts и controls_ok судьи (Б1); отдельной функцией — для подмены в тестах CLI."""
     return check_verdicts, controls_ok
 
 
@@ -746,10 +780,16 @@ def build(cfg: BenchConfig, w: float = CONSTRUCTOR_SHARE, judge_retries: int | N
     pmap = load_packet_map(out)
     rows = aggregate(load_records(out), load_cards(cfg.cards), report, load_tag_units(out),
                      planned=planned_counts(cfg), packet_map=pmap, w=w)
-    health = read_health_end(out)
-    _, source = spent_of(health)
-    left = budget_left(out)
-    verdicts = recommend(rows, left)
+    try:
+        health: dict = read_health_end(out)
+    except FileNotFoundError:
+        health = {}                                      # снимка нет — L верхней границей, пометка в шапке
+    if health:
+        _, source = spent_of(health)
+        left: float | None = budget_left(out)
+    else:
+        source, left = None, None
+    verdicts = recommend(rows, TOTAL_USD if left is None else left)
     cmap = pmap.get("controls")
     controls = {str(k): v for k, v in controls_ok(report, cmap).items()} if isinstance(cmap, Mapping) and cmap else {}
     run = health.get("run") if isinstance(health.get("run"), Mapping) else {}
@@ -757,18 +797,20 @@ def build(cfg: BenchConfig, w: float = CONSTRUCTOR_SHARE, judge_retries: int | N
                  for r, v in zip(rows, verdicts))
     meta = {"run_id": cfg.run_id, "date": _run_date(out), "prices": _prices(cfg),
             "judge_batches": sum(1 for p in (out / "judge").glob("batch-*") if p.is_dir()),
-            "judge_retries": judge_retries, "real_data": (out / "judge" / "real-data-consent.txt").exists(),
+            "judge_retries": judge_retries, "real_data": pmap.get("real_data") is True,
             "reps": dict(cfg.reps), "scenarios": list(cfg.scenarios) if cfg.scenarios else None,
             "cap_usd": _num(run.get("cap_usd")) or cfg.cap_usd, "spent_usd": _num(run.get("spent_usd")),
-            "key_spent_usd": _num(health.get("key_spent_usd")), "budget_left": left, "budget_source": source,
-            "limit_usd": limit_usd(left), "w": w, "controls": controls, "pending": health.get("pending"),
+            "key_spent_usd": _num(health.get("key_spent_usd")), "proxy_spent_usd": _num(health.get("spent_usd")),
+            "budget_left": left, "budget_source": source, "limit_usd": LIMIT_USD if left is None else limit_usd(left),
+            "w": w, "controls": controls, "pending": health.get("pending"),
             "judge_family": family, "verdicts": verdicts}
     return rows, meta
 
 
 def main(argv: list[str] | None = None) -> int:
     """table CONFIG [--constructor-share W] [--judge-retries N]: Markdown — в stdout, всё — в OUT/table.json. Первое
-    слово «table» (если его передал верх CLI) пропускается. Коды: 0 — успех, 1 — ошибка (только класс, без текста)."""
+    слово «table» (если его передал верх CLI) пропускается. Коды: 0 — успех, 1 — ошибка (только класс, без текста);
+    KeyboardInterrupt не глотается."""
     args_list = list(sys.argv[1:] if argv is None else argv)
     if args_list[:1] == ["table"]:
         args_list = args_list[1:]
@@ -790,11 +832,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except SystemExit as exc:                  # --help
         return exc.code if isinstance(exc.code, int) else 1
-    except BaseException as exc:               # noqa: BLE001 — верх CLI: только класс, без текста (m-р4-16)
+    except Exception as exc:                   # noqa: BLE001 — верх CLI: только класс, без текста (m-р4-16)
         print(type(exc).__name__, file=sys.stderr)
         return 1
 
 
 __all__ = ["CONSTRUCTOR_SHARE", "ModelRow", "NO_FIT", "OPENCODE_JSON", "aggregate", "budget_left", "build", "forecast",
-           "judge_passed", "limit_usd", "load_packet_map", "main", "model_name", "planned_counts", "read_health_end",
+           "limit_usd", "load_packet_map", "main", "model_name", "planned_counts", "read_health_end",
            "recommend", "render_markdown", "row_charge", "spent_of", "turn_costs"]

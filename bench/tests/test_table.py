@@ -4,6 +4,7 @@ import re
 
 import pytest
 
+import fakes
 from fakes import M1, M2, M3, write_config
 from helpers import (FakeVerdict, cards, clean_verdict, mrow, now_call, period_call, period_item, rec, row,
                      run_ref, verdicts)
@@ -12,6 +13,8 @@ from pcbk_bench.config import load_config
 from pcbk_bench.runner import load_tag_units, plan_runs
 from pcbk_bench.table import (NO_FIT, aggregate, budget_left, forecast, load_packet_map, planned_counts, recommend,
                               render_markdown, turn_costs)
+
+A_SES = ["ses_a1", "ses_br"]                                                        # разговор A и мост
 
 OC = table.OPENCODE_JSON
 
@@ -26,8 +29,10 @@ def test_turn_cost_counts_title_and_estimates():                                
 
 
 def test_turn_cost_refused_free_bridge_is_turn_estimate_marked():                 # Д8-R79: отказ — 0, мост — ход
-    r = rec("A1", save_after=0, llm_rows=[row(cost=0.03), row(cost=None, cost_est=0.01, cost_source="pending"),
-                                          row(status="refused", cost=None, cost_est=0.02, cost_source="unknown")])
+    r = rec("A1", save_after=0, sessions=A_SES,
+            llm_rows=[row(cost=0.03, session="ses_a1"), row(cost=None, cost_est=0.01, cost_source="pending",
+                                                            session="ses_br"),
+                      row(status="refused", cost=None, cost_est=0.02, cost_source="unknown", session="ses_a1")])
     assert r.bridge is not None and len(r.turns) == 1
     assert turn_costs([r])["create"] == pytest.approx(0.02)                          # (0,03 + 0,01) / 2 хода
     got = aggregate([r], cards(), verdicts(r))[0]
@@ -40,6 +45,20 @@ def test_turn_cost_all_attempts_count():                                        
     assert turn_costs([a, b])["data"] == pytest.approx(0.05)
 
 
+def test_turns_without_journal_rows_not_in_cost():                                # р1, I2: прогноз не занижен
+    ok = rec("B1", turns=2, llm_rows=[row(cost=0.05), row(cost=0.05)])
+    broken = rec("B1", turns=2, rep=2, status="stand_error", sessions=["ses_x"])     # ходы без строк журнала
+    assert turn_costs([ok, broken])["data"] == pytest.approx(0.05)
+    got = aggregate([ok, broken], cards(), verdicts(ok))[0]
+    assert (got.turns, got.turns_excluded, got.cost["number"]) == (2, 2, pytest.approx(0.05))
+    assert "Ходов без строк журнала прокси (исключены из цены хода): 2" in render_markdown([got], {"run_id": "x"})
+    a = rec("A1", save_after=0, sessions=A_SES, llm_rows=[row(cost=0.1, session="ses_a1")])   # у моста строк нет
+    assert turn_costs([a])["create"] == pytest.approx(0.1)
+    bare = rec("B1", llm_rows=[row(cost=0.1)])
+    bare.sessions = []                                                              # без сессий — запись целиком
+    assert turn_costs([bare])["data"] is None
+
+
 def test_forecast_mix():
     f = forecast(c_create=0.10, c_data=0.02, w=0.1)
     assert f["turn"] == pytest.approx(0.028) and f["5000"] == pytest.approx(140.0) and f["student"] == pytest.approx(14.0)
@@ -47,12 +66,14 @@ def test_forecast_mix():
 
 
 def test_aggregate_forecast_from_rows():                                          # смесь A и B/C по журналу
-    a = rec("A1", save_after=0, llm_rows=[row(cost=0.2)])                           # 2 хода (с мостом) — 0,1
+    a = rec("A1", save_after=0, sessions=A_SES,                                     # 2 хода (с мостом) — 0,1
+            llm_rows=[row(cost=0.1, session="ses_a1"), row(cost=0.1, session="ses_br")])
     b = rec("B1", llm_rows=[row(cost=0.02)])
-    got = aggregate([a, b], cards(), verdicts(a, b), w=0.1)[0]
+    got = aggregate([a, b], cards(), verdicts(a, b))[0]                             # w по умолчанию — 0,1
     assert got.turn == pytest.approx(0.028) and got.f5000 == pytest.approx(140.0)
     assert got.f2500 == pytest.approx(70.0) and got.student == pytest.approx(14.0)
     assert aggregate([b], cards(), verdicts(b))[0].f5000 is None                    # нет ходов A — прогноза нет
+    assert aggregate([a, b], cards(), verdicts(a, b), w=0.5)[0].turn == pytest.approx(0.06)
 
 
 def test_p90_turn_cost_by_session_time_window():                                  # m22
@@ -95,6 +116,40 @@ def test_stand_failure_not_judged_but_hard_counted(tmp_path):                   
     got = aggregate([b2, c4], cards(), verdicts(b2, c4), {"20FAKE_107_PV": "°C"})[0]
     assert got.not_run == {"stand_error": 1, "capped": 1} and got.judged == 0
     assert got.groups["number"]["passed"] == 0 and got.hard["number_mismatch"] == 1
+
+
+def test_judge_finding_kept_on_stand_failure():                                  # р1, I1
+    b2 = rec("B2", answer="Среднее за прошлую смену 127,9 °C", tools=[period_call("20FAKE_101_PV", avg=127.9)],
+             calc={"tag_period": period_item("20FAKE_101_PV", avg=125.0)})          # калькулятор не сошёлся
+    rep = verdicts(b2, verdict=clean_verdict("B2", invented_norm=True, numbers_not_from_tools=True))
+    got = aggregate([b2], cards(), rep)[0]
+    assert got.not_run == {"stand_error": 1} and got.judged == 0 and got.quality is None
+    assert got.hard["invented_norm"] == 1 and got.soft["numbers_not_from_tools"] == 1
+    assert recommend([got], 900) == ["не рекомендую: неуспех 2/4"]
+
+
+def test_latest_timeout_with_verdict_not_judged():                               # р1, m2: оценка — последняя запись
+    r1 = rec("B1", answer="Сейчас 3,42 бар", tools=[now_call("20FAKE_104_PV", 3.42)])
+    r2 = rec("B1", status="timeout")
+    got = aggregate([r1, r2], cards(), verdicts(r1))[0]
+    assert (got.judged, got.not_run, got.not_judged) == (0, {"timeout": 1}, {})
+
+
+def test_one_model_two_providers_refused(tmp_path):                              # р1, m1
+    gem, gem_or = "pcbk/google/gemini-3.8-flash", "pcbk-or/google/gemini-3.8-flash"
+    with pytest.raises(ValueError):
+        planned_counts(fakes.cfg(places={7: gem, 8: gem_or}))
+    with pytest.raises(ValueError):
+        aggregate([rec("B1", model=gem), rec("B1", model=gem_or, place=8)], cards(), verdicts())
+    with pytest.raises(ValueError):
+        load_config(write_config(tmp_path, places={"7": gem, "8": gem_or}), OC)
+
+
+def test_refused_kind_from_report():                                              # р1, m6
+    r = rec("B1")
+    rep = verdicts(r, refused=(r,))
+    rep.refused_kind = {next(iter(rep.runs)): "data"}
+    assert aggregate([r], cards(), rep)[0].not_judged == {"judge_refused_data": 1}
 
 
 def test_aggregate_uses_tag_units_file(tmp_path):                                 # I-р4-4, П11
@@ -271,6 +326,13 @@ def test_budget_left_null_key(tmp_path):                                        
     assert budget_left(tmp_path) == pytest.approx(929.5)
 
 
+def test_budget_left_takes_larger_spend(tmp_path):                               # р1, m3
+    (tmp_path / "health_end.json").write_text(json.dumps({"key_spent_usd": 61.2, "spent_usd": 70.5}))
+    assert budget_left(tmp_path) == pytest.approx(929.5)
+    (tmp_path / "health_end.json").write_text(json.dumps({"key_spent_usd": 80.0, "spent_usd": 70.5}))
+    assert budget_left(tmp_path) == pytest.approx(920.0)
+
+
 def test_budget_left_total_from_health(tmp_path):                                 # m11
     (tmp_path / "health_end.json").write_text(json.dumps({"key_spent_usd": 61.2, "total_usd": 900.0}))
     assert budget_left(tmp_path) == pytest.approx(838.8)
@@ -281,26 +343,63 @@ def test_budget_left_total_from_health(tmp_path):                               
 
 # --- CLI ---
 
-def test_table_main_writes_json_and_prints_markdown(tmp_path, capsys, monkeypatch):   # П7: CONFIG, а не OUT
+def _stand_out(tmp_path, monkeypatch, *, health: bool = True, real_data: bool = False):
+    """Конфиг и OUT двух моделей; карта пакетов — в виде Б1 (packets с местом); судья — подставной."""
     config = write_config(tmp_path, places={"7": M1, "8": M3})
     out = tmp_path / "out"
     out.mkdir()
     a = rec("A1", save_after=0, llm_rows=[row(cost=0.2)])
     b = rec("B1", answer="Сейчас 3,42 бар", tools=[now_call("20FAKE_104_PV", 3.42)], llm_rows=[row(cost=0.02)])
     (out / "runs.jsonl").write_text("".join(json.dumps(r.to_json(), ensure_ascii=False) + "\n" for r in (a, b)))
-    (out / "health_end.json").write_text(json.dumps({"key_spent_usd": 12.5, "spent_usd": 3.0,
-                                                     "run": {"id": "d8-test", "spent_usd": 2.0}}))
+    if health:
+        (out / "health_end.json").write_text(json.dumps({"key_spent_usd": 12.5, "spent_usd": 3.0,
+                                                         "run": {"id": "d8-test", "spent_usd": 2.0}}))
     rep = verdicts(a, b)
+    packets = {pid: dict(zip(("model", "place", "scenario", "rep"), ref.split("|"))) for pid, ref in rep.runs.items()}
     (out / "judge").mkdir()
-    (out / "judge" / "map.json").write_text(json.dumps({"runs": rep.runs, "controls": {}, "refused": []}))
+    (out / "judge" / "map.json").write_text(json.dumps({"packets": packets, "controls": {"zzzzzzzzzzzz": "J1#1"},
+                                                        "refused": {}, "real_data": real_data}))
+    (out / "judge" / "real-data-consent.txt").write_text("согласие")              # файл есть, флага в карте нет
+    rep.runs = {}                                                                   # связь — только из карты
     monkeypatch.setattr(table, "_judge_api", lambda: (lambda o: rep, lambda r, m: {"J1": True}))
+    return config, out
+
+
+def test_table_main_writes_json_and_prints_markdown(tmp_path, capsys, monkeypatch):   # П7: CONFIG, а не OUT
+    config, out = _stand_out(tmp_path, monkeypatch)
     assert table.main(["table", str(config), "--constructor-share", "0.1"]) == 0
     md = capsys.readouterr().out
     assert "| Модель |" in md and "z-ai/glm-5.3" in md and "google/gemini-3.8-flash" in md
+    assert "Расход ключа за всё время: $12,50" in md and "пакеты без цифр" in md     # р1, m4 и m5
     saved = json.loads((out / "table.json").read_text())
     assert [r["model"] for r in saved["rows"]] == ["z-ai/glm-5.3", "google/gemini-3.8-flash"]
-    assert saved["rows"][0]["planned"] == 32 and saved["verdicts"] == ["данных мало", "данных мало"]
+    assert saved["rows"][0]["planned"] == 32 and saved["rows"][0]["judged"] == 2
+    assert saved["verdicts"] == ["данных мало", "данных мало"]
     assert saved["meta"]["budget_left"] == pytest.approx(987.5) and saved["meta"]["budget_source"] == "key"
+
+
+def test_table_main_real_data_from_map(tmp_path, capsys, monkeypatch):           # р1, m5: признак — из карты Б1
+    config, _ = _stand_out(tmp_path, monkeypatch, real_data=True)
+    assert table.main([str(config)]) == 0
+    assert "по «да» владельца" in capsys.readouterr().out
+
+
+def test_table_main_without_health_end(tmp_path, capsys, monkeypatch):           # р1, m8: снимка нет — не падать
+    config, out = _stand_out(tmp_path, monkeypatch, health=False)
+    assert table.main([str(config)]) == 0
+    assert "нет снимка /health/llm" in capsys.readouterr().out
+    assert json.loads((out / "table.json").read_text())["meta"]["budget_left"] is None
+
+
+def test_table_main_lets_keyboard_interrupt_through(tmp_path, monkeypatch):      # р1, m8
+    config, _ = _stand_out(tmp_path, monkeypatch)
+
+    def stop():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(table, "_judge_api", stop)
+    with pytest.raises(KeyboardInterrupt):
+        table.main([str(config)])
 
 
 def test_table_main_errors_without_text(tmp_path, capsys):
