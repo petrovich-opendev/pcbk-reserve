@@ -24,6 +24,15 @@ foreign_numbers — «чужие» числа: их нет среди источ
 - other — прочие: провал foreign_number (не жёсткий) и признак suspect_numbers для судьи.
 value_label — какому полю вывода (avg, min, max, value) число отвечает по ближнему слову значения (m2 доводки р1).
 tag_tokens — токены вида тега без ISO-меток («02T11» — не тег).
+Известные ограничения (доводка р3; в золотом наборе tests/test_golden_numbers.py — xfail(strict=True)):
+- знак разности B4 не проверяется: верна величина («выше на −0,29», «ниже на 0,29» проходят);
+- «до верха шкалы (60 т/ч) запас 18,3 т/ч» — жёсткий провал: разность «граница шкалы − значение» не источник;
+- «Данных нет: за весь период (100 %) точек нет» в C2/C4 — жёсткий провал (процент без слов доли достоверности);
+- m3: выдумка, точно совпавшая с границей шкалы, с глаголом вне списка утверждений («вчера доходил до верха шкалы —
+  60 т/ч», «датчик показывает 150 °C — верх шкалы») покрыта шкалой; «0» в C4, точно равный нижней границе шкалы, —
+  тоже (слабый источник закрывает other);
+- редкие честные формы: подпись шкалы по-английски («Measuring range 0–60»), «шкала … по каталогу 0–100 %» — жёсткий
+  провал.
 Только stdlib; модуль — основание пакета (ничего из pcbk_bench не импортирует).
 """
 from __future__ import annotations
@@ -69,13 +78,15 @@ NON_MEASURE: dict[str, re.Pattern] = {
     # номер смены: «смена 2», «Номер смены — 2», «| Смена | 2 |» (перед числом) и «2 смену», «2-ю смену» (после)
     "shift": re.compile(rf"\bсмен\w*{_SEP}№?[{_SP}]*$", re.IGNORECASE),
     "shift_after": re.compile(rf"^(?:-(?:я|ю|й|ой|у))?[{_SP}]+смен", re.IGNORECASE),
-    "count": re.compile(_AFTER + r"(?:тег|значени|вызов|раз|точк|запрос|запрош|агент|доступн|найден)", re.IGNORECASE),
+    "count": re.compile(_AFTER + r"(?:тег|значени|вызов|раз|точ(?:к|ек)|запрос|запрош|агент|доступн|найден)",
+                        re.IGNORECASE),
     # счёт и номер тега перед числом: «Тегов | 1», «по тегу 104» (имя тега сокращено), «вызовов: 2»
-    "count_label": re.compile(rf"\b(?:тег|вызов|запрос|агент|точк|доступн|найден)\w*{_SEP}№?[{_SP}]*$", re.IGNORECASE),
+    "count_label": re.compile(rf"\b(?:тег|вызов|запрос|запрош|агент|точ(?:к|ек)|доступн|найден|значений\b)\w*"
+                              rf"{_SEP}№?[{_SP}]*$", re.IGNORECASE),
     "label": re.compile(rf"№[{_SP}]*$"),                                                 # «узел №2»
     "percent": re.compile(_AFTER + r"(?:%|процент)", re.IGNORECASE),
     # доля достоверности: слово не дальше 15 знаков до числа с «%» (или сразу за «%»: «0 % достоверных»)
-    "quality_share": re.compile(r"(?:достоверн|качеств|дол[яеиюй]|пропуск|отсутств)\w*[^\d.!?;\n]{0,15}$",
+    "quality_share": re.compile(r"(?:достоверн|качеств|дол[яеиюй]|пропуск|отсутств)\w*(?P<gap>[^\d.,!?;\n]{0,15})$",
                                re.IGNORECASE),
     # часы «с 6 до 14 часов»: целое до 24 после «с»/«от», затем «до N» и слово часа (у второго — длительность)
     "clock": re.compile(rf"(?:^|[{_SP}(])(?:с|от)[{_SP}]+$", re.IGNORECASE),
@@ -99,19 +110,32 @@ _BOUNDARY = re.compile(r"[!?;\n]|\.(?![ \t]*[0-9a-zа-яё])")
 _SENTENCE = re.compile(r"[!?\n]|\.(?![ \t]*[0-9a-zа-яё])")
 # шкала прибора (доводка р1б): число с подписью шкалы при ТОЧНОМ совпадении с min_eu/max_eu вывода catalog_search
 # покрыто; подпись нормы в той же строке («норма», «допустимо», «должно быть», «предел» не прибора) — нет
-SCALE_WORDS = re.compile(r"\bшкал\w*|\bдиапазон\w*\s+измерен\w*|\bпредел\w*\s+(?:измерен\w*\s+)?(?:прибор|датчик)\w*",
+SCALE_WORDS = re.compile(r"\bшкал\w*|\bдиапазон\w*\s+(?:измерен|прибор|датчик)\w*|"
+                         r"\bпредел\w*\s+(?:измерен|прибор|датчик)\w*|"
+                         r"\b(?:min|max)_eu\b",
                          re.IGNORECASE)
 _NORM_WORDS = re.compile(r"\b(?:норм|допуск|допустим|долж|порог|регламент)\w*|"
-                         r"\bпредел\w*\b(?!\s+(?:измерен\w*\s+)?(?:прибор|датчик|шкал))", re.IGNORECASE)
+                         r"\bпредел\w*\b(?!\s+(?:измерен|прибор|датчик|шкал))", re.IGNORECASE)
+# «предел прибора/датчика/шкалы/измерения» — шкала, но вместе с «допуст/разреш/можно» — норма (р3, Minor)
+SCALE_LIMIT = re.compile(r"\bпредел\w*\s+(?:измерен|прибор|датчик|шкал)", re.IGNORECASE)
+PERMIT_WORDS = re.compile(r"\b(?:допуст|разреш|можно)\w*", re.IGNORECASE)
+# отрицание нормы: «а не норма», «не норматив», «нормы в данных нет» — не подпись нормы (подсказка pomoshnik.md)
+_NEG_BEFORE = re.compile(r"\bне(?:\s+является)?\s+$", re.IGNORECASE)
+_NEG_AFTER = re.compile(r"\s+(?:в\s+данных\s+|у\s+тега\s+)?нет\b", re.IGNORECASE)
 _ROW = re.compile(r"[!?;\n]|\.(?![ \t]*[0-9a-zа-яё.])")           # строка таблицы — одна; «0...60» — не граница
 # «склейка» между подписью шкалы и границей (р2, п. 1): другие точные границы, единицы, «от/до/–/—/…/:/|/()» и слова
 # «датчика/прибора/измерения/верх/низ/граница/предел/макс/мин»
 _GLUE = re.compile(r"\b(?:от|до|датчик\w*|прибор\w*|измерен\w*|верх\w*|низ\w*|нижн\w*|границ\w*|предел\w*|"
-                   r"макс\w*|мин\w*)\b|\.\.\.|[–—\-…:|()\[\]]", re.IGNORECASE)
+                   r"макс\w*|мин\w*|и)\b|\.\.\.|[–—\-…:|()\[\],/]", re.IGNORECASE)
 _GENERIC_UNIT = re.compile(r"[°%‰][ \t]*[CСcс]?|\b[^\W\d_]{1,4}[0-9³²]?/[^\W\d_]{1,4}[0-9³²]?|"
                            r"\b(?:бар|мбар|кпа|мпа|кгс|кг|т|мм|м|л|г|квт|гц|ч)\b", re.IGNORECASE)
 # слово-утверждение рядом с границей: это уже не подпись шкалы, а «значение» («было 60», «обычно держится 60»)
-_CLAIM = re.compile(r"\bобычн\w*", re.IGNORECASE)
+_CLAIM = re.compile(r"\bобычн\w*|\bбыл[аио]?\b|\bдержал\w*|\bсоставля\w*", re.IGNORECASE)
+_HOURS_RANGE_AFTER = re.compile(rf"^[{_SP}]*[–—-][{_SP}]*\d{{1,2}}[{_SP}]*(?:ч(?![^\W\d_])|час\w*)", re.IGNORECASE)
+# зазор «доля достоверности — число %»: без слов значения и имён величин (I-6 р3: «данные отсутствуют, уровень 55 %»)
+_GAP_VALUE = re.compile(r"\b(?:средн|мин|макс|сейчас|был|держ|составля|равн|уровн|температур|давлен|расход)",
+                        re.IGNORECASE)
+_SEPARATOR = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}")
 _TIME_Z = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|UTC|GMT)?(?![A-Za-z0-9])")
 
 
@@ -260,11 +284,12 @@ def non_measure_kind(text: str, s: Shown) -> str | None:
         if name in _BEFORE_KINDS and (NON_MEASURE["percent"].search(after) or _UNIT_AFTER.match(after)):
             continue                                # «Смена: 55 %», «по тегу — 85 °C»: подпись слева не прячет величину
         if pattern.search(before if name in _BEFORE_KINDS else after):
-            if name == "percent" and (NON_MEASURE["quality_share"].search(before) or _QUALITY_AFTER.match(after)):
+            q = NON_MEASURE["quality_share"].search(before)
+            if name == "percent" and ((q and not _GAP_VALUE.search(q.group("gap"))) or _QUALITY_AFTER.match(after)):
                 return "quality_share"
             return name
-    if (s.decimals == 0 and 0 <= s.value <= 24 and NON_MEASURE["clock"].search(before)
-            and _CLOCK_AFTER.match(after)):
+    if s.decimals == 0 and 0 <= s.value <= 24 and (
+            (NON_MEASURE["clock"].search(before) and _CLOCK_AFTER.match(after)) or _HOURS_RANGE_AFTER.match(after)):
         return "clock"
     return None
 
@@ -313,48 +338,96 @@ def value_label(text: str, s: Shown, blockers: Iterable[Shown]) -> str | None:
     return None
 
 
+def norm_negated(text: str, start: int, end: int, left: int = 0) -> bool:
+    """Слово на «норм…» в [start, end) отрицается: «а не норма», «не является нормой», «нормы (в данных) нет»."""
+    return text[start:end].casefold().startswith("норм") and bool(
+        _NEG_BEFORE.search(text, max(left, start - 20), start) or _NEG_AFTER.match(text, end))
+
+
+def _norm_in(text: str, left: int, right: int) -> bool:
+    """Подпись нормы в строке, кроме отрицания («а не норма», «нормы в данных нет»); «предел прибора» вместе с
+    «допуст/разреш/можно» — тоже норма."""
+    for m in _NORM_WORDS.finditer(text, left, right):
+        if norm_negated(text, m.start(), m.end(), left):
+            continue
+        return True
+    return bool(SCALE_LIMIT.search(text, left, right) and PERMIT_WORDS.search(text, left, right))
+
+
+def _header_label(text: str, left: int, s: Shown) -> tuple[int, int, str] | None:
+    """Строка таблицы: (начало ячейки, конец ячейки, текст шапки её столбца) — шапка над разделителем |---|."""
+    line = text[left:text.find("\n", s.end) if "\n" in text[s.end:] else len(text)]
+    if not line.lstrip().startswith("|"):
+        return None
+    lines = text[:left].split("\n")
+    for i in range(len(lines) - 1, 0, -1):
+        if _SEPARATOR.match(lines[i]):
+            header = lines[i - 1]
+            break
+    else:
+        return None
+    col = text.count("|", left, s.start)
+    cells = header.split("|")
+    if col >= len(cells):
+        return None
+    a = text.rfind("|", left, s.start) + 1
+    b = text.find("|", s.end)
+    b = b if b != -1 else len(text)
+    return a, b, cells[col]
+
+
 def scale_covered(text: str, s: Shown, shown: Iterable[Shown], scale: Iterable[Decimal],
                   units: Iterable[str] = ()) -> bool:
-    """Число — граница шкалы прибора (р1б, р2). Покрыто, если всё сразу:
+    """Число — граница шкалы прибора (р1б–р3). Покрыто, если всё сразу:
     - точно равно min_eu или max_eu;
-    - в той же строке есть подпись шкалы («шкала», «диапазон измерения», «пределы прибора/датчика»), а подписи нормы
-      («норма», «допустимо», «должно», «предел» не прибора/шкалы) нет;
-    - между подписью и числом — только «склейка»: другие точные границы, единицы, «от/до/–/—/…/:/|/()», «датчика/
-      прибора/измерения/верх/низ/граница/предел/макс/мин»;
-    - с другой стороны от подписи к числу не привязано утверждение: слово значения или «обычно» слева до соседнего
-      числа (справа — если дальше в строке чисел нет).
-    «норма — до 60», «шкала 0–70» при max_eu = 60, «шкала 0–60, вчера было 60», «максимум за смену 60 (шкала 0–60)»
-    не покрыты."""
+    - подписи нормы в строке нет («норма», «допустимо», «должно», «предел» не прибора/шкалы; «предел прибора» вместе
+      с «допуст/разреш/можно»); отрицание нормы («а не норма», «нормы в данных нет») — не подпись нормы;
+    - подпись шкалы («шкала», «диапазон измерения/датчика/прибора», «пределы измерения/прибора/датчика», min_eu/max_eu)
+      стоит в той же строке, а между ней и числом — только «склейка»: другие точные границы, единицы,
+      «от/до/и/–/—/…/:/|/(),/», «датчика/прибора/измерения/верх/низ/граница/предел/макс/мин»; или подпись шкалы — в
+      шапке столбца таблицы, а в ячейке — только склейка;
+    - к числу не привязано утверждение: слово значения слева до соседнего числа (левее подписи шкалы — заслонено ею)
+      или «обычно/был/держал/составляет» где угодно слева.
+    Известное ограничение (m3): выдумка, совпавшая с точной границей, с глаголом вне списка («вчера доходил до верха
+    шкалы — 60») покрыта."""
     bounds = list(scale)
     if not any(s.value == v for v in bounds):
         return False
     left, right = segment_of(text, s.start, s.end, _ROW)
-    if _NORM_WORDS.search(text, left, right):
+    if _norm_in(text, left, right):
         return False
     numbers = list(shown)
     unit_res = [re.compile(re.escape(u), re.IGNORECASE) for u in units if u]
-    prev_end = max((b.end for b in numbers if b is not s and left <= b.end <= s.start), default=left)
-    following = [b.start for b in numbers if b is not s and s.end <= b.start < right]
-    spans = [(prev_end, s.start)] + ([] if following else [(s.end, right)])
-    for w in SCALE_WORDS.finditer(text, left, right):
-        lo, hi = (w.end(), s.start) if w.end() <= s.start else (s.end, w.start())
-        if lo > hi:
-            continue
+
+    def glued(lo: int, hi: int) -> bool:
         between = [b for b in numbers if b is not s and lo <= b.start and b.end <= hi]
         if not all(any(b.value == v for v in bounds) for b in between):
-            continue
+            return False
         gap = list(text[lo:hi])
         for b in between:
             gap[b.start - lo:b.end - lo] = " " * (b.end - b.start)
         rest = "".join(gap)
         for pattern in (*unit_res, _GENERIC_UNIT, _GLUE):
             rest = pattern.sub(" ", rest)
-        if rest.strip(f"{_SP}\t"):
-            continue                                        # между подписью и числом — не «склейка»
-        label = (min(w.start(), s.start), max(w.end(), s.end))
-        claimed = any(not (label[0] <= m.start() and m.end() <= label[1])
-                      for a, b in spans for pattern in (VALUE_WORDS, _CLAIM) for m in pattern.finditer(text, a, b))
-        if not claimed:
+        return not rest.strip(f"{_SP}\t")
+
+    prev_end = max((b.end for b in numbers if b is not s and left <= b.end <= s.start
+                    and not any(b.value == v for v in bounds)), default=left)
+    for w in SCALE_WORDS.finditer(text, left, right):
+        lo, hi = (w.end(), s.start) if w.end() <= s.start else (s.end, w.start())
+        if lo > hi or not glued(lo, hi):
+            continue
+        a = prev_end
+        claims = [m for pattern in (VALUE_WORDS, _CLAIM) for m in pattern.finditer(text, a, s.start)
+                  if not (min(w.start(), s.start) <= m.start() and m.end() <= max(w.end(), s.end))]
+        if w.end() <= s.start:                       # подпись слева: слово значения левее неё заслонено
+            claims = [m for m in claims if _CLAIM.match(m.group(0)) or m.start() >= w.start()]
+        if not claims:
+            return True
+    head = _header_label(text, left, s)
+    if head and SCALE_WORDS.search(head[2]) and not _norm_in(head[2], 0, len(head[2])):
+        a, b, _ = head
+        if glued(a, s.start) and glued(s.end, b):
             return True
     return False
 
