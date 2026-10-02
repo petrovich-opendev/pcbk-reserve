@@ -558,6 +558,29 @@ async def test_failing_streak_per_tool(svc):                                    
     assert s.tools_stats()["failing"] == []
 
 
+async def test_failing_streak_counts_timeout_and_unavailable(tmp_path):         # Д9-R83: молчание, не только падение
+    for code, outcome in (("timeout", "timeout"), ("connect", "unavailable")):
+        d = tmp_path / code
+        d.mkdir()
+        s, fake = make_service(d)
+        fake.fail = HistorianError(code, "x")
+        for _ in range(FAIL_STREAK):
+            await s.tag_now("student-01", "web", ["20FAKE_001_PV"])
+            s.role.gate.clear_pause()                     # пауза людей после сроков подряд — не мешает серии
+        assert [e.outcome for e in s.role.events.recent()] == [outcome] * FAIL_STREAK
+        assert s.tools_stats()["failing"] == ["tag_now"], code
+
+
+async def test_failing_streak_mixed_outcomes(svc):                               # ревью А1, I-1: смесь — одна серия
+    s, fake = svc
+    for code in ("query", "timeout", "connect"):
+        fake.fail = HistorianError(code, "x")
+        await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+        s.role.gate.clear_pause()
+    assert [e.outcome for e in s.role.events.recent()] == ["unavailable", "timeout", "error"]
+    assert s.tools_stats()["failing"] == ["tag_now"]
+
+
 async def test_refusals_do_not_count_as_failing(svc):
     s, _ = svc
     for _ in range(FAIL_STREAK + 1):
