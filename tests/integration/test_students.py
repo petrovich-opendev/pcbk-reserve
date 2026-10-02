@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import wait_for
 from workplace import IMAGE, MOUNTS, STUB_PREFIX, WORKPLACE_ENV
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -71,9 +72,10 @@ def test_each_workplace_uses_own_objects(stack):                   # Review Focu
         s = cfg["services"][f"student-{nn}"]
         assert s["container_name"] == f"pcbk-student-{nn}"
         assert sorted((x["source"], x["target"]) for x in s["secrets"]) == \
-               [(f"student-{nn}-llm", "llm-token"), (f"student-{nn}-pw", "opencode-pw")]
-        assert (cfg["secrets"][f"student-{nn}-pw"]["file"], cfg["secrets"][f"student-{nn}-llm"]["file"]) == \
-               (str(stack.secrets_dir / f"student-{nn}.pw"), str(stack.secrets_dir / f"student-{nn}.llm-token"))
+               [(f"student-{nn}-data", "data-token"), (f"student-{nn}-llm", "llm-token"),
+                (f"student-{nn}-pw", "opencode-pw")]
+        assert [cfg["secrets"][f"student-{nn}-{k}"]["file"] for k in ("pw", "llm", "data")] == \
+               [str(stack.secrets_dir / f"student-{nn}.{k}") for k in ("pw", "llm-token", "data-token")]
         assert {v["target"]: v["source"] for v in s["volumes"]} == {
             "/var/lib/opencode": f"pcbk-student-{nn}-state", "/work": f"pcbk-student-{nn}-work",
             "/etc/pcbk-opencode/opencode/agents": str(stack.agents_dir(n))}
@@ -87,7 +89,8 @@ def test_each_workplace_uses_own_objects(stack):                   # Review Focu
         assert set(c["NetworkSettings"]["Networks"]) == {f"pcbk-stu-{nn}"}
         assert [tuple(re.split(r"[:=]", h, maxsplit=1)) for h in c["HostConfig"]["ExtraHosts"]] == \
                [("core", f"{stu}.{n}.2")]
-        assert len(c["Mounts"]) == 5 and all(f"student-{nn}" in m["Source"] for m in c["Mounts"])
+        # шесть источников: пароль, токены LLM и данных, агенты, два тома — все свои
+        assert len(c["Mounts"]) == 6 and all(f"student-{nn}" in m["Source"] for m in c["Mounts"])
 
 
 def test_sp_ctl_really_starts_and_stops_student(stack):
@@ -113,7 +116,7 @@ def test_student_hardening(stack, running):                        # Review Focu
     assert (hc["PidMode"], hc["IpcMode"], hc["Devices"] or [], hc["PortBindings"] or {}) == ("", "private", [], {})
     assert hc["RestartPolicy"]["Name"] == "unless-stopped"
     assert {m["Destination"] for m in c["Mounts"]} == MOUNTS and set(hc["Tmpfs"]) == {"/tmp"}
-    assert stack.sh("pcbk-student-01", "ls -A /run/secrets")[1].split() == ["llm-token", "opencode-pw"]
+    assert stack.sh("pcbk-student-01", "ls -A /run/secrets")[1].split() == ["data-token", "llm-token", "opencode-pw"]
     pid = stack.opencode_pid("pcbk-student-01")
     status = dict(line.split(":", 1) for line in
                   stack.sh("pcbk-student-01", f"cat /proc/{pid}/status")[1].splitlines() if ":" in line)
@@ -248,14 +251,17 @@ def test_no_route_anywhere(stack, running):
 
 
 def test_password_not_visible_to_watchdog(stack, running):
-    stack.wait_healthy("pcbk-student-01", timeout=60)              # в Health.Log уже есть вывод проверки
+    # первые записи после старта бывают mcp=unknown (ленивый подъём MCP): ждём подключённый MCP
+    wait_for(lambda: "mcp=connected" in stack.health_output("pcbk-student-01"), timeout=90)
     body = stack.body_from_watchdog(RO + "/containers/pcbk-student-01/json")
     log = json.loads(body)["State"]["Health"]["Log"]
-    assert all(re.fullmatch(r"\d{3}\n?", e["Output"]) for e in log) and log[-1]["Output"].strip() == "200"
+    assert all(re.fullmatch(r"\d{3}( mcp=[a-z_]+)?\n?", e["Output"]) for e in log)
+    assert log[-1]["Output"].strip() == "200 mcp=connected"
     r = stack._docker("logs", "pcbk-student-01")
     logs = r.stdout + r.stderr
     # булевы — до assert: при сбое pytest печатает только их, а не тело inspect или журнал
-    leaked = any(secret in text for secret in (stack.password(1), stack.llm_token(1)) for text in (body, logs))
+    leaked = any(secret in text for secret in (stack.password(1), stack.llm_token(1), stack.data_token(1))
+                 for text in (body, logs))
     env_name = "OPENCODE_SERVER_PASSWORD" in body
     assert (leaked, env_name) == (False, False)
 
@@ -268,7 +274,9 @@ def test_env_holds_only_own_secret(stack, running):
     assert extra == {"OPENCODE_SERVER_PASSWORD"}, sorted(extra)      # печатаются только имена
     values = {v for _, v in pairs}
     own = stack.password(1) in values
-    foreign = bool(values & ({stack.password(n) for n in range(2, 11)} | {stack.llm_token(1)}))
+    # чужие пароли и токены данных, свои токены LLM и данных — только файлами, не в окружении
+    foreign = bool(values & ({stack.password(n) for n in range(2, 11)} | {stack.data_token(n) for n in range(1, 11)}
+                             | {stack.llm_token(1)}))
     assert (own, foreign) == (True, False)
 
 

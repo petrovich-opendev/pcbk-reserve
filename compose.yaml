@@ -1,6 +1,6 @@
 # Стенд: прокси входа, сторож и две копии прокси сокета (Д1), десять рабочих мест (Д2,
-# профиль students), серверный слой (Д3а, инструменты — Д3б, LLM-прокси — Д4а). Переменные — из
-# .env выкладки (deploy/env.example).
+# профиль students), серверный слой (Д3а, инструменты — Д3б, LLM-прокси — Д4а, в сетях мест — Д4б).
+# Переменные — из .env выкладки (deploy/env.example).
 # Сторонние образы — только по тегу из deploy/images.lock, без pull.
 # Наружу публикуется только 8443 контейнера edge; docker.sock — только у sp-ro и sp-ctl;
 # сеть выхода pcbk-egress — только у core.
@@ -11,10 +11,11 @@ name: pcbk-reserve
 # общее для десяти мест. Только runsc: runc — лишь в compose.test.yaml.
 # Профиль students: команды выкладки без имён служб места не поднимают — их создают
 # create и будит серверный слой (с Д5) или администратор.
-# Секции build нет: образ один на десять мест, собирается локально и едет docker save/load.
-# healthcheck не задаётся: работает проверка образа (GET /agent, печатает только код).
+# Секции build нет: образ один на десять мест, собирается локально и едет docker save/load;
+# :d2 остаётся на сервере для отката.
+# healthcheck не задаётся: работает проверка образа (GET /agent и слово MCP: «200 mcp=connected»).
 x-student: &student
-  image: pcbk-reserve/student:d2
+  image: pcbk-reserve/student:d4
   pull_policy: never
   runtime: runsc
   profiles: [students]
@@ -83,8 +84,8 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d3a остаётся на сервере для отката
-    image: pcbk-reserve/watchdog:d4a
+    # :d4a остаётся на сервере для отката
+    image: pcbk-reserve/watchdog:d4b
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -134,7 +135,7 @@ services:
   # с Command (у Dify там пароли), а строку запроса с фильтром прокси не проверяет.
   # :ro на сокете от записи в Docker не защищает — защищает только фильтр.
 
-  # сторожу — только чтение: ping и inspect рабочих мест и sp-ctl
+  # сторожу — только чтение: ping и inspect рабочих мест, sp-ctl и core (Д4б: строка контейнера core)
   sp-ro:
     image: wollomatic/socket-proxy:1.13.1
     pull_policy: never
@@ -149,7 +150,7 @@ services:
     command:
       - '-listenip=0.0.0.0'
       - '-allowfrom=pcbk-watchdog'
-      - '-allowGET=(/v1\.[0-9]+)?/(_ping|containers/pcbk-(student-(0[1-9]|10)|sp-ctl)/json)'
+      - '-allowGET=(/v1\.[0-9]+)?/(_ping|containers/pcbk-(student-(0[1-9]|10)|sp-ctl|core)/json)'
     volumes:
       - type: bind
         source: /var/run/docker.sock
@@ -187,12 +188,13 @@ services:
   # Серверный слой: роль «данные» (Д3а) — каталог тегов и свежесть историана, инструменты по
   # токену и журнал событий (Д3б); роль llm (Д4а) — прокси к OpenRouter с бюджетом и журналом вызовов.
   # Учётные данные историана, ключи OpenRouter и хеши токенов — только файлами-секретами, белый
-  # список — файлом только для чтения. В сеть выхода pcbk-egress — только он (Д3а-R2); сети мест
-  # и pcbk-ctl — с Д4б и Д5. Порт 8000 не публикуется.
+  # список — файлом только для чтения. В сеть выхода pcbk-egress — только он (Д3а-R2); в сети мест —
+  # на .2 (Д4б-R23: места ходят к /llm и /mcp по имени core из extra_hosts), pcbk-ctl — с Д5.
+  # Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d3b остаётся на сервере для отката
-    image: pcbk-reserve/core:d4a
+    # :d4a остаётся на сервере для отката
+    image: pcbk-reserve/core:d4b
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -202,8 +204,10 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 512m                 # тела запросов к модели — до 1 МиБ, разбор JSON от десяти мест
     pids_limit: 128
-    # TCP Fast Open выключен (Д3б-R6): TCP не уйдёт мимо connect, который проверяет охрана выхода в процессе
-    sysctls: {net.ipv4.tcp_fastopen: "0"}
+    # TCP Fast Open выключен (Д3б-R6): TCP не уйдёт мимо connect, который проверяет охрана выхода в процессе.
+    # Пересылка выключена (Д4б-R23): core в двенадцати сетях не мост между местами и к сети выхода — второй
+    # слой; первый — у места нет маршрута по умолчанию (Д2). По умолчанию netns контейнера наследует 1 хоста
+    sysctls: {net.ipv4.tcp_fastopen: "0", net.ipv4.ip_forward: "0"}
     restart: unless-stopped
     environment:                    # только несекретное
       CORE_PORT: "8000"
@@ -233,9 +237,21 @@ services:
     networks:
       pcbk-front: {}
       pcbk-egress: {ipv4_address: 172.31.250.82}
+      # сети мест: адрес .2 — тот, что у мест в extra_hosts (core:STU.N.2)
+      pcbk-stu-01: {ipv4_address: "${STU_NET:-172.31}.1.2"}
+      pcbk-stu-02: {ipv4_address: "${STU_NET:-172.31}.2.2"}
+      pcbk-stu-03: {ipv4_address: "${STU_NET:-172.31}.3.2"}
+      pcbk-stu-04: {ipv4_address: "${STU_NET:-172.31}.4.2"}
+      pcbk-stu-05: {ipv4_address: "${STU_NET:-172.31}.5.2"}
+      pcbk-stu-06: {ipv4_address: "${STU_NET:-172.31}.6.2"}
+      pcbk-stu-07: {ipv4_address: "${STU_NET:-172.31}.7.2"}
+      pcbk-stu-08: {ipv4_address: "${STU_NET:-172.31}.8.2"}
+      pcbk-stu-09: {ipv4_address: "${STU_NET:-172.31}.9.2"}
+      pcbk-stu-10: {ipv4_address: "${STU_NET:-172.31}.10.2"}
 
   # Рабочие места 01…10: только своя сеть (место .3, серверный слой .2 через extra_hosts —
-  # под gVisor DNS Docker не работает), свои тома, агенты и секреты; портов нет.
+  # под gVisor DNS Docker не работает), свои тома, агенты и секреты (пароль OpenCode, токены LLM и
+  # данных — Д4б); портов нет.
   # Блоки 02–10 — копия 01 с точностью до номера (тест test_student_hardening).
   student-01:
     <<: *student
@@ -250,6 +266,7 @@ services:
     secrets:
       - {source: student-01-pw, target: opencode-pw}
       - {source: student-01-llm, target: llm-token}
+      - {source: student-01-data, target: data-token}
 
   student-02:
     <<: *student
@@ -264,6 +281,7 @@ services:
     secrets:
       - {source: student-02-pw, target: opencode-pw}
       - {source: student-02-llm, target: llm-token}
+      - {source: student-02-data, target: data-token}
 
   student-03:
     <<: *student
@@ -278,6 +296,7 @@ services:
     secrets:
       - {source: student-03-pw, target: opencode-pw}
       - {source: student-03-llm, target: llm-token}
+      - {source: student-03-data, target: data-token}
 
   student-04:
     <<: *student
@@ -292,6 +311,7 @@ services:
     secrets:
       - {source: student-04-pw, target: opencode-pw}
       - {source: student-04-llm, target: llm-token}
+      - {source: student-04-data, target: data-token}
 
   student-05:
     <<: *student
@@ -306,6 +326,7 @@ services:
     secrets:
       - {source: student-05-pw, target: opencode-pw}
       - {source: student-05-llm, target: llm-token}
+      - {source: student-05-data, target: data-token}
 
   student-06:
     <<: *student
@@ -320,6 +341,7 @@ services:
     secrets:
       - {source: student-06-pw, target: opencode-pw}
       - {source: student-06-llm, target: llm-token}
+      - {source: student-06-data, target: data-token}
 
   student-07:
     <<: *student
@@ -334,6 +356,7 @@ services:
     secrets:
       - {source: student-07-pw, target: opencode-pw}
       - {source: student-07-llm, target: llm-token}
+      - {source: student-07-data, target: data-token}
 
   student-08:
     <<: *student
@@ -348,6 +371,7 @@ services:
     secrets:
       - {source: student-08-pw, target: opencode-pw}
       - {source: student-08-llm, target: llm-token}
+      - {source: student-08-data, target: data-token}
 
   student-09:
     <<: *student
@@ -362,6 +386,7 @@ services:
     secrets:
       - {source: student-09-pw, target: opencode-pw}
       - {source: student-09-llm, target: llm-token}
+      - {source: student-09-data, target: data-token}
 
   student-10:
     <<: *student
@@ -376,6 +401,7 @@ services:
     secrets:
       - {source: student-10-pw, target: opencode-pw}
       - {source: student-10-llm, target: llm-token}
+      - {source: student-10-data, target: data-token}
 
 networks:
   # только edge — ради публикации 8443; без маскарада: наружу edge не ходит
@@ -518,13 +544,14 @@ volumes:
   pcbk-student-10-state: {name: pcbk-student-10-state, external: true}
   pcbk-student-10-work: {name: pcbk-student-10-work, external: true}
 
-# пароль сервера OpenCode и токен LLM мест — только файлами (в Config.Env их нет);
-# 48 шестнадцатеричных знаков без перевода строки, порождаются на сервере
+# пароль сервера OpenCode, токены LLM и данных мест — только файлами (в Config.Env их нет);
+# 48 шестнадцатеричных знаков без перевода строки, порождаются на сервере и не перезаписываются
 secrets:
   # учётные данные историана (BDRV_*): копия файла Dify, install -m 0444 в SECRETS_DIR (0700)
   bdrv-env: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/bdrv.env"}
-  # хеши токенов вызывающих службы данных: строки «<id> <sha256>», файл 0444; сами токены
-  # <id>.data-token (48 шестнадцатеричных знаков, 0400) — только на сервере
+  # хеши токенов вызывающих службы данных: строки «<id> <sha256>», файл 0444 — ops и десять мест; сами
+  # токены <id>.data-token (48 шестнадцатеричных знаков) — только на сервере; токены мест (0444) — ещё и
+  # секретами мест (Д4б). Новый core-tokens — up -d --no-build --force-recreate core
   core-tokens: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/core-tokens"}
   # LLM-прокси (Д4а): хеши токенов LLM мест и ops (формат core-tokens, файл 0444) — отдельная таблица;
   # ключи OpenRouter (0444, кладёт владелец): основной и управления (пустой файл — «ключа нет»).
@@ -534,21 +561,31 @@ secrets:
   openrouter-mgmt-key: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/openrouter-mgmt.key"}
   student-01-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.pw"}
   student-01-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.llm-token"}
+  student-01-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-01.data-token"}
   student-02-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-02.pw"}
   student-02-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-02.llm-token"}
+  student-02-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-02.data-token"}
   student-03-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-03.pw"}
   student-03-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-03.llm-token"}
+  student-03-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-03.data-token"}
   student-04-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-04.pw"}
   student-04-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-04.llm-token"}
+  student-04-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-04.data-token"}
   student-05-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-05.pw"}
   student-05-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-05.llm-token"}
+  student-05-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-05.data-token"}
   student-06-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-06.pw"}
   student-06-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-06.llm-token"}
+  student-06-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-06.data-token"}
   student-07-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-07.pw"}
   student-07-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-07.llm-token"}
+  student-07-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-07.data-token"}
   student-08-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-08.pw"}
   student-08-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-08.llm-token"}
+  student-08-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-08.data-token"}
   student-09-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-09.pw"}
   student-09-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-09.llm-token"}
+  student-09-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-09.data-token"}
   student-10-pw: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-10.pw"}
   student-10-llm: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-10.llm-token"}
+  student-10-data: {file: "${SECRETS_DIR:?SECRETS_DIR не задан}/student-10.data-token"}

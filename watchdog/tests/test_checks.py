@@ -108,6 +108,97 @@ def test_health_silence_is_fail():                                            # 
     assert restarted.state == "ok"
 
 
+# Д4б, задача 3: MCP места по выводу проверки здоровья образа :d4 («200 mcp=<слово>»)
+
+def test_mcp_state_from_health_output():                                       # Review Focus 1
+    seen = {out: stu(insp(running=True, health="healthy", output=out))
+            for out in ("200 mcp=connected\n", "200 mcp=failed\n", "200\n", "200 mcp=unknown\n")}
+    assert [c.state for c in seen.values()] == ["ok", "warn", "ok", "ok"]
+    assert seen["200 mcp=failed\n"].detail == "нет связи со службой данных (MCP)"
+
+
+def test_mcp_unknown_five_in_a_row_is_warn():                                   # раунд 1: молчание MCP; К30
+    old = stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5))          # старейшая — T0 − 130 с
+    start = stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5, log_step_s=2))   # старт: T0 − 18 с
+    four = stu(insp(running=True, health="healthy", log=["200 mcp=connected\n"] + ["200 mcp=unknown\n"] * 4))
+    assert (old.state, old.detail, start.state, four.state) == ("warn", "состояние MCP не читается", "ok", "ok")
+
+
+# сверх брифа: слова, последняя запись, место строк в таблице, граница 120 с
+
+def test_mcp_words_and_last_entry_only():
+    down = ("warn", "нет связи со службой данных (MCP)")
+    cases = [(dict(output="200 mcp=disabled\n"), ("ok", "работает")),               # MCP выключен в настройке
+             (dict(output="200 mcp=needs_auth\n"), down),
+             (dict(output="200 mcp=failed"), down),                                   # без перевода строки
+             (dict(output="200 xmcp=failed\n"), ("ok", "работает")),                  # не слово mcp=
+             (dict(output="200 mcp=Failed\n"), ("ok", "работает")),                   # слово — только [a-z_]
+             (dict(output="200 mcp=\n"), ("ok", "работает")),
+             (dict(log=["200 mcp=failed\n", "200 mcp=connected\n"]), ("ok", "работает")),   # новые — последними
+             (dict(log=["200 mcp=connected\n", "200 mcp=failed\n"]), down),
+             (dict(log=["200 mcp=failed\n", "200\n"]), ("ok", "работает"))]          # последняя — образ :d2
+    for kw, want in cases:
+        r = stu(insp(running=True, health="healthy", **kw))
+        assert (r.state, r.detail) == want, kw
+
+
+def test_mcp_rows_only_for_healthy_and_after_unhealthy():
+    failed = dict(running=True, output="200 mcp=failed\n")
+    assert stu(insp(health="unhealthy", **failed)).detail == "OpenCode не отвечает"          # строка выше
+    assert stu(insp(health="starting", **failed)).detail == "работает"                        # только healthy
+    loop = stu(insp(health="healthy", restarts=3, started=T0 - timedelta(seconds=20), **failed))
+    assert loop.detail == "падает в цикле (перезапуски подряд)"
+    assert stu(insp(health="healthy", last_end=T0 - timedelta(minutes=5), **failed)).detail == \
+           "проверка здоровья молчит"
+    fresh = stu(insp(health="healthy", restarts=1, started=T0 - timedelta(minutes=3), **failed))
+    assert (fresh.state, fresh.detail) == ("warn", "нет связи со службой данных (MCP)")   # выше «перезапущен»
+    unknown = dict(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5)
+    fresh = stu(insp(restarts=1, started=T0 - timedelta(minutes=3), **unknown))
+    assert (fresh.state, fresh.detail) == ("warn", "состояние MCP не читается")
+    assert stu(insp(code=0, health="healthy", output="200 mcp=failed\n")).detail == "спит"
+
+
+def test_mcp_unknown_needs_five_and_120_s():
+    unknown = ["200 mcp=unknown\n"]
+    edge = stu(insp(running=True, health="healthy", log=unknown * 5, log_step_s=27.5))      # ровно 120 с — ещё норма
+    past = stu(insp(running=True, health="healthy", log=unknown * 5, log_step_s=27.6))      # 120,4 с
+    four = stu(insp(running=True, health="healthy", log=unknown * 4, log_step_s=60))        # четыре записи
+    bare = stu(insp(running=True, health="healthy", log=["200\n"] + unknown * 4))           # одна без слова
+    assert [(c.state, c.detail) for c in (edge, past, four, bare)] == [
+        ("ok", "работает"), ("warn", "состояние MCP не читается"), ("ok", "работает"), ("ok", "работает")]
+
+
+def test_mcp_details_constant_and_short(tmp_path):
+    rows = [stu(insp(running=True, health="healthy", output=f"200 mcp={w}\n")) for w in ("failed", "needs_auth")]
+    rows += [stu(insp(running=True, health="healthy", log=["200 mcp=unknown\n"] * 5, log_step_s=s)) for s in (30, 60)]
+    assert all(len(r.detail) <= 80 for r in rows)
+    journal = Journal(str(tmp_path / "journal.db"))
+    assert sum(len(journal.record([r], T0 + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 2
+
+
+# доводка по ревью задачи 3
+
+def test_unhealthy_detail_per_component():                                     # I1
+    core = check_container("core-container", "Серверный слой — контейнер", insp(running=True, health="unhealthy"),
+                           sleeping_ok=False, now=T0, unhealthy_detail="процесс core не отвечает на проверку здоровья")
+    assert (core.state, core.detail) == ("fail", "процесс core не отвечает на проверку здоровья")
+    assert stu(insp(running=True, health="unhealthy")).detail == "OpenCode не отвечает"      # по умолчанию — текст Д2
+
+
+def test_mcp_rows_ignore_log_of_previous_run():                                 # M1: журнал прошлого запуска
+    woke = T0 - timedelta(seconds=8)
+    unknown = stu(insp(running=True, health="healthy", started=woke, last_end=T0 - timedelta(seconds=2),
+                       log=["200 mcp=unknown\n"] * 5))            # четыре старые (до T0 − 122 с) и одна новая
+    failed = stu(insp(running=True, health="healthy", started=woke, last_end=T0 - timedelta(seconds=60),
+                      log=["200 mcp=failed\n"]))                   # новых записей ещё нет
+    assert [(c.state, c.detail) for c in (unknown, failed)] == [("ok", "работает")] * 2
+    mixed = stu(insp(running=True, health="healthy", started=woke, last_end=T0 - timedelta(seconds=2),
+                     log=["200 mcp=failed\n", "200 mcp=connected\n"]))   # старая failed, новая connected
+    assert mixed.detail == "работает"
+    at_start = stu(insp(running=True, health="healthy", started=woke, last_end=woke, log=["200 mcp=failed\n"]))
+    assert at_start.detail == "нет связи со службой данных (MCP)"          # End ровно в момент старта — этот запуск
+
+
 def test_paused_is_fail():
     r = check_container("sp-ctl", "Прокси сокета серверного слоя", insp(running=True, paused=True),
                         sleeping_ok=False, now=T0)
@@ -233,6 +324,55 @@ def test_historian_core_down_or_garbage_is_unknown(fake_core):
     assert (r.state, r.detail) == ("unknown", "служба данных не отвечает — свежесть неизвестна")
     fake_core.set_raw("не json")
     assert check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5).state == "unknown"
+
+
+# Д4б, задача 1: нагрузка историана и ошибки инструментов (Д4б-R22)
+
+def test_historian_load_rows(fake_core):
+    gate = {"user_paused": False, "p95_ms": 100}
+    cases = [(fresh(10, gate={**gate, "user_paused": True}),
+              ("warn", "запросы людей к историану на паузе после сроков подряд", "")),
+             (fresh(10, gate={**gate, "p95_ms": 6200}), ("warn", "историан отвечает медленно: p95 больше 5 с", "")),
+             (fresh(10, gate=gate, tools={"recent": 50, "errors": 12}), ("warn", "инструменты отвечают ошибкой", "12 из 50")),
+             (fresh(10, gate=gate, tools={"recent": 5, "errors": 5}), ("ok", "последняя метка 10 с назад", "")),
+             (fresh(10), ("ok", "последняя метка 10 с назад", ""))]             # служба :d4a — без новых полей
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want
+
+
+# сверх брифа: место в таблице, пороги, поля :d4a и ответ не по договору
+
+def test_historian_load_rows_order_and_edges(fake_core):
+    gate = {"user_paused": False, "p95_ms": None, "sent_names_total": 3}
+    tools = {"recent": 10, "errors": 2}
+    old_gate = {"sent_names_total": 0, "refused_unlisted": 0, "in_flight": {"user": 0, "background": 0},
+                "auth_latched": False}
+    cases = [(fresh(400, gate={**gate, "user_paused": True}), ("warn", "последняя метка старше 300 с", "")),
+             (fresh(10, gate={**gate, "user_paused": True, "p95_ms": 9000}, tools=tools, catalog_age_s=200000.0),
+              ("warn", "запросы людей к историану на паузе после сроков подряд", "")),
+             (fresh(10, gate={**gate, "p95_ms": 9000}, tools=tools),
+              ("warn", "историан отвечает медленно: p95 больше 5 с", "")),
+             (fresh(10, gate=gate, tools=tools, catalog_age_s=200000.0),
+              ("warn", "инструменты отвечают ошибкой", "2 из 10")),                # ровно 20 % при 10 вызовах
+             (fresh(10, gate=gate, tools={"recent": 15, "errors": 3}),
+              ("warn", "инструменты отвечают ошибкой", "3 из 15")),
+             (fresh(10, gate={**gate, "p95_ms": 5000}, tools={"recent": 10, "errors": 1}),
+              ("ok", "последняя метка 10 с назад", "")),                          # p95 ровно 5 с — ещё не медленно
+             (fresh(10, gate={**gate, "p95_ms": 5000}, tools={"recent": 9, "errors": 9}),
+              ("ok", "последняя метка 10 с назад", "")),                          # меньше 10 вызовов — не судим
+             (fresh(10, gate=old_gate, catalog_age_s=200000.0), ("warn", "каталог тегов старше двух суток", "")),
+             (fresh(10, gate=old_gate), ("ok", "последняя метка 10 с назад", ""))]
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+        assert len(r.detail) <= 80
+    for obj in (fresh(10, gate=[]), fresh(10, gate={"user_paused": "да"}), fresh(10, gate={"p95_ms": "6200"}),
+                fresh(10, gate={"p95_ms": float("nan")}), fresh(10, gate={"p95_ms": True}), fresh(10, tools=[]),
+                fresh(10, tools={"recent": 50}), fresh(10, tools={"recent": 50, "errors": 60}),
+                fresh(10, tools={"recent": 50.0, "errors": 12}), fresh(10, tools={"recent": 50, "errors": -1})):
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail) == OFF_CONTRACT, obj
 
 
 DOWN = ("unknown", "служба данных не отвечает — свежесть неизвестна")

@@ -15,7 +15,8 @@ from pcbk_core.data.gate import GateRefused, GateResult, SlidingWindow
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.periods import Period
 from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, ERROR_MESSAGE, ITEM_TEXTS, MESSAGES, NO_LAST_NOTE,
-                                    OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE, SOURCE_LIVE, SOURCE_SUMMARY, STD_KIND)
+                                    OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE, SOURCE_LIVE, SOURCE_SUMMARY, STD_KIND,
+                                    TOOL_WINDOW)
 from pcbk_core.data.sql import HAS_LAST, SUMMARY_COLUMNS, clock_sql, live_sql
 from pcbk_core.logs import setup_logging
 
@@ -495,3 +496,44 @@ async def test_refusal_events_are_written_off_loop(svc, tmp_path, monkeypatch): 
     await s.refuse_args("student-01", "http", "tag_now", ["x"], "tags: нужен список")
     await broken.service.config_unavailable("student-01", "http", "tag_now", ["x"])
     assert len(threads) == 2 and threading.get_ident() not in threads           # SQLite — не в потоке цикла
+
+
+# Д4б, задача 1: ошибки инструментов на странице (Д4б-R22, К7) и returned в событиях поиска
+
+
+async def test_tools_stats_window(svc):
+    s, fake = svc
+    fake.fail = HistorianError("connect", "x")
+    for n in range(1, 4):
+        await s.tag_now(f"student-0{n}", "http", ["20FAKE_004_PV"])
+        s.role.gate.clear_pause()
+    fake.fail = None
+    await s.tag_now("student-09", "mcp", ["20FAKE_001_PV"])
+    assert s.tools_stats() == {"recent": 4, "errors": 3}
+
+
+async def test_catalog_search_event_has_returned(svc):
+    s, _ = svc
+    await s.catalog_search("student-01", "http", "расход массы")
+    assert s.role.events.recent()[0].returned == ("20FAKE_001_PV", "20FAKE_002_SP")
+
+
+# сверх брифа: окно — последние 50 вызовов в памяти, служебные опросы не в счёт, SQLite не читается (К7)
+
+
+async def test_tools_stats_last_fifty_from_memory(svc, monkeypatch):
+    s, fake = svc
+    for _ in range(TOOL_WINDOW + 5):
+        await s.refuse_args("student-01", "mcp", "tag_now", ["x"], "tags: нужен список")
+    await s.role.poll_freshness()                                               # событие system — не инструмент
+    fake.fail = HistorianError("timeout", "долго")
+    await s.tag_now("student-02", "http", ["20FAKE_001_PV"])
+    r = await s.tag_now("student-03", "http", ["20FAKE_404_PV"])                # отказ без SQL — не ошибка
+    assert r["status"] == "refused" and s.role.events.count("system") == 1
+
+    def no_sqlite(*args, **kwargs):
+        raise AssertionError("tools_stats не читает журнал событий")
+
+    monkeypatch.setattr(s.role.events, "recent", no_sqlite)
+    monkeypatch.setattr(s.role.events, "count", no_sqlite)
+    assert s.tools_stats() == {"recent": TOOL_WINDOW, "errors": 1}

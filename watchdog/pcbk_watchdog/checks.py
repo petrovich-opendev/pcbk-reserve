@@ -27,6 +27,18 @@ CRASH_LOOP_DETAIL = "падает в цикле (перезапуски подр
 HEALTH_SILENCE = timedelta(minutes=2)
 HEALTH_SILENT_DETAIL = "проверка здоровья молчит"
 UNHEALTHY_DETAIL = "OpenCode не отвечает"
+# MCP места (Д4б): проверка здоровья образа :d4 печатает «200 mcp=<слово>», образ :d2 — только код
+MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
+# слова, при которых связь не потеряна: unknown — ответ /mcp не прочитан, disabled — MCP выключен
+MCP_NOT_DOWN = frozenset({"connected", "unknown", "disabled"})
+MCP_DOWN_DETAIL = "нет связи со службой данных (MCP)"
+# столько записей Health.Log хранит Docker; все с mcp=unknown и старейшая кончилась раньше
+# MCP_UNKNOWN_S назад — «внимание». На старте (start-interval 2 с, ленивый подъём MCP под gVisor)
+# пять unknown набираются за 10 с — это норма (К30). Записи прошлого запуска (End раньше StartedAt)
+# строки MCP не считают: Docker хранит журнал и через сон места
+HEALTH_LOG_KEEP = 5
+MCP_UNKNOWN_S = 120
+MCP_UNKNOWN_DETAIL = "состояние MCP не читается"
 # пути каталога выкладки в State.Error (секреты мест) на страницу не выводим
 HOST_PATH = re.compile(r"/opt/pcbk-reserve[^\s\"':]*")
 # рабочее место спит: вышло само, SIGKILL или SIGTERM
@@ -48,6 +60,14 @@ HTTP_OK_DETAIL = "отвечает"
 CATALOG_MAX_AGE_S = 172800
 CORE_DOWN_DETAIL = "служба данных не отвечает — свежесть неизвестна"
 OFF_CONTRACT_DETAIL = "служба данных ответила не по договору — свежесть неизвестна"
+# нагрузка историана и ошибки инструментов (Д4б-R22): поля gate и tools ответа службы Д4б
+SLOW_P95_MS = 5000
+TOOL_ERRORS_SHARE = 0.2
+TOOL_ERRORS_MIN_CALLS = 10
+USER_PAUSED_DETAIL = "запросы людей к историану на паузе после сроков подряд"
+# порог — из SLOW_P95_MS: при его смене текст не соврёт (5000 → «5 с», 5500 → «5,5 с»)
+SLOW_P95_DETAIL = f"историан отвечает медленно: p95 больше {format(SLOW_P95_MS / 1000, 'g').replace('.', ',')} с"
+TOOL_ERRORS_DETAIL = "инструменты отвечают ошибкой"
 
 # строка «LLM-прокси и бюджет» (задача 7 Д4а)
 LLM_DOWN_DETAIL = "LLM-прокси не отвечает"
@@ -112,8 +132,12 @@ def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Ch
 
 
 def check_container(component: str, title: str, inspect: dict | None, *,
-                    sleeping_ok: bool, now: datetime) -> Check:
-    """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1 и задачи 2 Д2."""
+                    sleeping_ok: bool, now: datetime, unhealthy_detail: str = UNHEALTHY_DETAIL) -> Check:
+    """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1, задачи 2 Д2 и задачи 3 Д4б.
+
+    unhealthy_detail — текст строки при Health.Status unhealthy: по умолчанию — про OpenCode места,
+    у контейнеров с другой проверкой здоровья (core) — свой из components.json.
+    """
     def result(state: State, detail: str) -> Check:
         return Check(component, title, state, detail)
 
@@ -138,7 +162,11 @@ def check_container(component: str, title: str, inspect: dict | None, *,
             if now - max([started, *ends]) > HEALTH_SILENCE:
                 return result("fail", HEALTH_SILENT_DETAIL)
             if health.get("Status") == "unhealthy":
-                return result("fail", UNHEALTHY_DETAIL)
+                return result("fail", unhealthy_detail)
+            if health.get("Status") == "healthy":
+                mcp = _mcp_detail(health.get("Log") or [], started, now)
+                if mcp is not None:
+                    return result("warn", mcp)
         if restarts > 0 and recent:
             # время — в поясе now и с явным смещением
             at = started.astimezone(now.tzinfo).strftime("%H:%M UTC%:z")
@@ -157,6 +185,30 @@ def check_container(component: str, title: str, inspect: dict | None, *,
     if sleeping_ok and code in SLEEP_EXIT_CODES:
         return result("ok", "спит")
     return result("fail", f"остановлен, код {code}")
+
+
+def _mcp_word(entry: dict) -> str | None:
+    found = MCP_WORD.search(entry.get("Output") or "")
+    return found.group(1) if found else None
+
+
+def _mcp_detail(log: list[dict], started: datetime, now: datetime) -> str | None:
+    """Строки MCP места (Д4б) по Health.Log, где Docker пишет новые записи последними.
+
+    Считаются только записи этого запуска (End не раньше StartedAt): журнал прошлого запуска не даёт
+    «внимания» сразу после пробуждения. Решает слово mcp= последней из них; вывода без слова
+    (образ :d2) строки не касаются.
+    """
+    run = [e for e in log if datetime.fromisoformat(e["End"]) >= started][-HEALTH_LOG_KEEP:]
+    words = [_mcp_word(e) for e in run]
+    if not words or words[-1] is None:
+        return None
+    if words[-1] not in MCP_NOT_DOWN:
+        return MCP_DOWN_DETAIL
+    if (len(words) == HEALTH_LOG_KEEP and set(words) == {"unknown"}
+            and now - datetime.fromisoformat(run[0]["End"]) > timedelta(seconds=MCP_UNKNOWN_S)):
+        return MCP_UNKNOWN_DETAIL
+    return None
 
 
 def _reason(text: str) -> str:
@@ -253,9 +305,42 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
+    """Строки нагрузки историана (задача 1 Д4б): пауза людей, медленный p95, ошибки инструментов.
+
+    Нет ключа tools или новых полей gate (служба :d4a) — строка не срабатывает; поле не того вида —
+    TypeError или ValueError (ответ не по договору). «k из N» — в note: detail постоянный.
+    """
+    gate = reply.get("gate")
+    if gate is not None:
+        if not isinstance(gate, dict):
+            raise TypeError("gate — не объект JSON")
+        paused = gate.get("user_paused")
+        if paused is not None and not isinstance(paused, bool):
+            raise TypeError("gate.user_paused — не логическое")
+        if paused:
+            return "warn", USER_PAUSED_DETAIL, ""
+        p95 = gate.get("p95_ms")
+        if p95 is not None and not (_is_number(p95) and math.isfinite(p95)):
+            raise TypeError("gate.p95_ms — не конечное число")
+        if p95 is not None and p95 > SLOW_P95_MS:
+            return "warn", SLOW_P95_DETAIL, ""
+    tools = reply.get("tools")
+    if tools is not None:
+        if not isinstance(tools, dict):
+            raise TypeError("tools — не объект JSON")
+        recent, errors = _count(tools, "recent"), _count(tools, "errors")
+        if not 0 <= errors <= recent:
+            raise ValueError("tools: число ошибок вне 0…recent")
+        if recent >= TOOL_ERRORS_MIN_CALLS and errors / recent >= TOOL_ERRORS_SHARE:
+            return "warn", TOOL_ERRORS_DETAIL, f"{errors} из {recent}"
+    return None
+
+
 def historian_verdict(reply, now: datetime, warn_s: int, fail_s: int,
-                      stale_s: int) -> tuple[State, str]:
-    """Вердикт по ответу /health/historian; первая подходящая строка таблицы задачи 6 Д3а.
+                      stale_s: int) -> tuple[State, str, str]:
+    """Вердикт по ответу /health/historian: (состояние, detail, note); первая подходящая строка таблицы
+    задачи 6 Д3а со строками нагрузки задачи 1 Д4б перед каталогом.
 
     Ответ не по договору — ValueError, TypeError, KeyError или OverflowError.
     """
@@ -263,31 +348,34 @@ def historian_verdict(reply, now: datetime, warn_s: int, fail_s: int,
         raise TypeError("ответ — не объект JSON")
     checked_raw = reply["checked_at"]
     if checked_raw is None:
-        return "unknown", "служба ещё не опрашивала историан"
+        return "unknown", "служба ещё не опрашивала историан", ""
     if not isinstance(checked_raw, str):
         raise TypeError("checked_at — не строка")
     checked_at = datetime.fromisoformat(checked_raw)
     if checked_at.tzinfo is None:
         checked_at = checked_at.replace(tzinfo=timezone.utc)   # договор — ISO UTC
     if (now - checked_at).total_seconds() > stale_s:
-        return "unknown", "служба давно не опрашивала историан"
+        return "unknown", "служба давно не опрашивала историан", ""
     if reply.get("error"):
         text = reply.get("error_text")
-        return "fail", _reason(text if isinstance(text, str) and text.strip() else str(reply["error"]))
+        return "fail", _reason(text if isinstance(text, str) and text.strip() else str(reply["error"])), ""
     age = reply["age_s"]
     if not _is_number(age):
         raise TypeError("age_s — не число")
     # в warn/fail текст постоянный: иначе журнал пишет событие каждый такт
     if age >= fail_s:
-        return "fail", f"последняя метка старше {fail_s} с"
+        return "fail", f"последняя метка старше {fail_s} с", ""
     if age >= warn_s:
-        return "warn", f"последняя метка старше {warn_s} с"
+        return "warn", f"последняя метка старше {warn_s} с", ""
+    load = _load_verdict(reply)
+    if load is not None:
+        return load
     catalog_age = reply.get("catalog_age_s")
     if catalog_age is not None and not _is_number(catalog_age):
         raise TypeError("catalog_age_s — не число")
     if catalog_age is not None and catalog_age > CATALOG_MAX_AGE_S:
-        return "warn", "каталог тегов старше двух суток"
-    return "ok", f"последняя метка {round(age)} с назад"
+        return "warn", "каталог тегов старше двух суток", ""
+    return "ok", f"последняя метка {round(age)} с назад", ""
 
 
 def check_historian(component: str, title: str, url: str, now: datetime, warn_s: int, fail_s: int,
@@ -304,10 +392,10 @@ def check_historian(component: str, title: str, url: str, now: datetime, warn_s:
     except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
         return Check(component, title, "unknown", CORE_DOWN_DETAIL)
     try:
-        state, detail = historian_verdict(reply, now, warn_s, fail_s, stale_s)
+        state, detail, note = historian_verdict(reply, now, warn_s, fail_s, stale_s)
     except (KeyError, TypeError, ValueError, OverflowError):   # OverflowError — age_s = -Infinity
         return Check(component, title, "unknown", OFF_CONTRACT_DETAIL)
-    return Check(component, title, state, detail)
+    return Check(component, title, state, detail, note)
 
 
 def fmt_usd(x: float, keep: Iterable[float] = ()) -> str:

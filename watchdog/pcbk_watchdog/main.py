@@ -14,8 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, Check, check_container, check_historian,
-                     check_http, check_llm, check_memory, check_tls, not_installed)
+from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
+                     check_container, check_historian, check_http, check_llm, check_memory, check_tls,
+                     not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
 from .page import Snapshot, is_stale, render_html, status_json
@@ -140,6 +141,11 @@ def load_components(path: str) -> list[dict]:
         if "ok_detail" in c and (kind != "http" or not isinstance(c["ok_detail"], str)
                                  or not c["ok_detail"].strip()):
             raise ValueError(f"components: ok_detail у {c['id']!r} — только непустая строка вида http")
+        if "unhealthy_detail" in c and (kind != "container" or not isinstance(c["unhealthy_detail"], str)
+                                        or not c["unhealthy_detail"].strip()
+                                        or len(c["unhealthy_detail"]) > REASON_CHARS):
+            raise ValueError(f"components: unhealthy_detail у {c['id']!r} — только непустая строка "
+                             f"до {REASON_CHARS} знаков вида container")
     return comps
 
 
@@ -177,7 +183,8 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
         return Check(cid, title, "ok", "отвечает")
     if kind == "container":
         return check_container(cid, title, docker.inspect(comp["container"]),
-                               sleeping_ok=comp["sleeping_ok"], now=now)
+                               sleeping_ok=comp["sleeping_ok"], now=now,
+                               unhealthy_detail=comp.get("unhealthy_detail", UNHEALTHY_DETAIL))
     if kind == "absent":
         return not_installed(cid, title)
     raise ValueError(f"неизвестный вид проверки: {kind!r}")

@@ -21,20 +21,26 @@ def now_utc() -> datetime:
 
 def insp(running=False, oom=False, code=0, restarts=0, restarting=False, paused=False,
          error="", started=T0 - timedelta(hours=1), health: str | None = None,
-         last_end: datetime | None = T0 - timedelta(seconds=10)):
+         last_end: datetime | None = T0 - timedelta(seconds=10), output: str = "200\n",
+         log: list[str] | None = None, log_step_s: float = 30):
     """Ответ Docker inspect в объёме, который читает сторож.
 
     health — State.Health.Status; last_end — конец последней проверки здоровья,
-    None — журнал проверок пуст.
+    None — журнал проверок пуст. output — вывод единственной записи журнала; log — весь
+    Health.Log списком выводов, новые — последними: End последней — last_end, у каждой
+    предыдущей — на log_step_s раньше.
     """
     state = {"Running": running, "Paused": paused, "OOMKilled": oom, "ExitCode": code,
              "Restarting": restarting, "Error": error, "StartedAt": started.isoformat()}
     if health is not None:
-        log = [] if last_end is None else [
-            {"Start": (last_end - timedelta(seconds=1)).isoformat(), "End": last_end.isoformat(),
-             "ExitCode": 0 if health == "healthy" else 1, "Output": "200\n"}]
+        outputs = [] if last_end is None else [output] if log is None else log
+        entries = []
+        for back, out in enumerate(reversed(outputs)):
+            end = last_end - timedelta(seconds=back * log_step_s)
+            entries.insert(0, {"Start": (end - timedelta(seconds=1)).isoformat(), "End": end.isoformat(),
+                               "ExitCode": 0 if health == "healthy" else 1, "Output": out})
         state["Health"] = {"Status": health, "FailingStreak": 3 if health == "unhealthy" else 0,
-                           "Log": log}
+                           "Log": entries}
     return {"State": state, "RestartCount": restarts}
 
 

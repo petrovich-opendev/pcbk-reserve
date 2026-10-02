@@ -93,6 +93,20 @@ def test_health_and_routes(tmp_path):
         assert c.get("/healthz/data").json()["ok"] is True
 
 
+def test_health_historian_shows_tools_and_gate_load(tmp_path):                # Д4б, задача 1 (сверх брифа)
+    role, _ = make_role(db_dir=tmp_path)
+    with TestClient(create_app(SETTINGS, [role])) as c:
+        wait_until(lambda: role.catalog.loaded)
+        r = c.post("/api/data/tag_now", json={"tags": ["20FAKE_001_PV"]}, headers={"Authorization": f"Bearer {TOKEN}"})
+        assert r.json()["status"] == "ok"
+        r = c.get("/health/historian")
+    j = r.json()
+    assert j["tools"] == {"recent": 1, "errors": 0}                          # фоновые опросы — не инструменты
+    assert {k: j["gate"][k] for k in ("p95_ms", "timeouts_5m", "busy_5m", "user_paused")} == \
+           {"p95_ms": None, "timeouts_5m": 0, "busy_5m": 0, "user_paused": False}
+    assert not any(n in r.text for n in WHITELIST)
+
+
 # --- сверх брифа ---
 
 def poll_calls(fake) -> int:

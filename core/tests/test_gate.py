@@ -7,9 +7,11 @@ import anyio
 import pytds
 import pytest
 
-from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian, RecordingConnect
+from fakes import CLOCK_ROWS, LIVE_ROWS, WHITELIST, FakeHistorian, RecordingConnect
 from helpers import FakeMono
-from pcbk_core.data.gate import AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
+from pcbk_core.data.gate import (AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, P95_MIN_CALLS, PAUSE_AFTER_TIMEOUTS,
+                                 STATS_WINDOW_S, USER_PAUSE_S, GateRefused, GateResult, HistorianGate,
+                                 SlidingWindow)
 from pcbk_core.data.historian import HistorianError, tds_query
 from pcbk_core.secrets import BdrvConfig
 from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, lit_dt, live_all_sql, live_sql, summary_sql
@@ -233,7 +235,8 @@ async def test_driver_errors_carry_sent_and_log_no_detail(capfd, restore_logging
     assert "FAKEUSER" not in err and "16FAKE" not in err
     assert "msg_no=18456" in err and "ворота: SQL вне белого списка — отказ без SQL" in err
     assert g.stats() == {"sent_names_total": 2, "refused_unlisted": 1,
-                         "in_flight": {"user": 0, "background": 0}, "auth_latched": True}
+                         "in_flight": {"user": 0, "background": 0}, "auth_latched": True,
+                         "p95_ms": None, "timeouts_5m": 0, "busy_5m": 0, "user_paused": False}
 
 
 def test_sliding_window_forgets_old_calls():
@@ -356,3 +359,239 @@ async def test_gate_refuses_summary_with_non_ascii_digits():                   #
             await g.run([bad])
         assert e.value.code == "unlisted"
     assert fake.calls == [] and g.stats()["refused_unlisted"] == 2
+
+
+# Д4б, задача 1: нагрузка историана — p95 и пауза полосы людей после сроков подряд (Д4б-R22, К8)
+
+async def test_three_timeouts_pause_user_lane_not_background():
+    mono = FakeMono(1000.0)
+    fake = FakeHistorian(fail=HistorianError("timeout", "долго"))
+    g = gate(fake, monotonic=mono)
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == sent and g.stats()["user_paused"] is True
+    fake.fail = None
+    await g.run([clock_sql()], lane="background")                              # фон на паузе не стоит
+    mono.advance(USER_PAUSE_S)
+    await g.run([Q])
+    assert g.stats()["user_paused"] is False and len(fake.calls) == sent + 2
+
+
+async def test_p95_needs_five_calls():
+    g = gate(FakeHistorian(delay_s=0.05))
+    for _ in range(4):
+        await g.run([Q])
+    assert g.stats()["p95_ms"] is None
+    await g.run([Q])
+    assert 40 <= g.stats()["p95_ms"] <= 1000
+
+
+# сверх брифа: пауза — после белого списка, счёт за окно, «подряд» и полоса, ожидание места в p95
+
+
+async def test_pause_keeps_unlisted_and_counts_in_window():                    # К8
+    mono = FakeMono(1000.0)
+    fake = FakeHistorian(fail=HistorianError("timeout", "долго"))
+    g = gate(fake, monotonic=mono)
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+    with pytest.raises(GateRefused) as e:
+        await g.run([live_sql(["16FAKE_009_PV"])])                         # вне списка — unlisted и на паузе
+    assert e.value.code == "unlisted"
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == PAUSE_AFTER_TIMEOUTS
+    s = g.stats()
+    assert (s["timeouts_5m"], s["busy_5m"], s["user_paused"], s["p95_ms"]) == (3, 1, True, None)  # дошли 3 из 5
+    mono.advance(STATS_WINDOW_S)                                           # окно ушло: ни сроков, ни p95
+    s = g.stats()
+    assert (s["timeouts_5m"], s["busy_5m"], s["user_paused"], s["p95_ms"]) == (0, 0, False, None)
+
+
+async def test_timeouts_must_be_in_a_row_on_user_lane():
+    mono = FakeMono(1000.0)
+    fake = FakeHistorian(fail=HistorianError("timeout", "долго"))
+    g = gate(fake, monotonic=mono)
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        with pytest.raises(HistorianError):
+            await g.run([clock_sql()], lane="background")                  # фон паузы не знает
+    assert (g.stats()["user_paused"], g.stats()["timeouts_5m"]) == (False, 0)
+    timeout, query = fake.fail, HistorianError("query", "x")
+    for fail in (timeout, timeout, None, timeout, timeout, query, timeout, timeout):
+        fake.fail = fail                                                   # удача и ошибка обнуляют счёт
+        try:
+            await g.run([Q])
+        except HistorianError:
+            pass
+    assert g.stats()["user_paused"] is False and g.stats()["timeouts_5m"] == 6
+    fake.fail = timeout
+    with pytest.raises(HistorianError):
+        await g.run([Q])                                                   # третий подряд
+    assert g.stats()["user_paused"] is True
+
+
+async def test_p95_counts_wait_for_slot():                                     # К8: это видит студент
+    fake = FakeHistorian(delay_s=0.1)
+    g = await warmed(fake, user_slots=1)
+    await asyncio.gather(*(g.run([Q]) for _ in range(P95_MIN_CALLS)))      # по одному: последний ждал 0,4 с
+    assert g.stats()["p95_ms"] >= 450
+
+
+# решения контроллера по вопросам задачи 1: счёт сроков и p95 — только по вызовам, дошедшим до драйвера
+
+
+async def test_busy_refusals_between_timeouts_do_not_prevent_pause():
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=1)
+    fake.delay_s, fake.fail = 0.5, HistorianError("timeout", "долго")
+    order: list[str] = []
+
+    async def holder():                                  # держит место 0,5 с и получает срок от драйвера
+        with pytest.raises(HistorianError) as e:
+            await g.run([Q])
+        order.append(e.value.code)
+
+    async def late():                                    # не дождался места: busy без SQL между сроками
+        await anyio.sleep(0.05)
+        with pytest.raises(GateRefused) as e:
+            await g.run([Q], deadline_s=0.3)
+        order.append(e.value.code)
+
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        assert g.stats()["user_paused"] is False
+        await asyncio.gather(holder(), late())
+    assert order == ["busy", "timeout"] * PAUSE_AFTER_TIMEOUTS
+    s = g.stats()
+    assert (s["user_paused"], s["timeouts_5m"], s["busy_5m"]) == (True, 3, 3)
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == sent
+
+
+async def test_p95_only_calls_that_reached_driver():
+    fake = FakeHistorian(delay_s=0.1)
+    g = gate(fake)
+    for _ in range(P95_MIN_CALLS - 1):
+        await g.run([Q])
+    for _ in range(100):                                 # мгновенные отказы без SQL
+        with pytest.raises(GateRefused):
+            await g.run([live_sql(["16FAKE_009_PV"])])
+    assert g.stats()["p95_ms"] is None                   # до драйвера дошли только четыре
+    await g.run([Q])
+    assert g.stats()["p95_ms"] >= 90                     # сто отказов по 0 мс его не тянут вниз
+
+
+# доводка по ревью задачи 1: ждущий места после третьего срока не входит (I1), завис историан — срок ворот (M3)
+
+
+@pytest.mark.parametrize("hung", [False, True], ids=["driver_timeout", "gate_deadline"])
+async def test_caller_waiting_for_slot_at_third_timeout_gets_busy(hung):        # I1
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=1)
+    fake.fail = HistorianError("timeout", "долго")
+    for _ in range(PAUSE_AFTER_TIMEOUTS - 1):
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+    # третий срок: его отдаёт сам драйвер через 0,3 с или ставят ворота (0,5 с), пока драйвер висит 1 с
+    fake.delay_s, fake.fail = (1.0, None) if hung else (0.3, fake.fail)
+    third = asyncio.ensure_future(g.run([Q], deadline_s=0.5 if hung else None))
+    await anyio.sleep(0.05)
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])                                 # ждёт места, пока его держит третий
+    assert e.value.code == "busy" and len(fake.calls) == sent
+    with pytest.raises(HistorianError) as e:
+        await third
+    assert e.value.code == "timeout" and g.stats()["user_paused"] is True
+
+
+async def test_hung_historian_deadline_timeouts_count_toward_pause():         # M3
+    fake = FakeHistorian()
+    g = await warmed(fake, user_slots=PAUSE_AFTER_TIMEOUTS)
+    fake.delay_s = 1.0                                   # драйвер дольше срока: срок ставят сами ворота
+    for _ in range(PAUSE_AFTER_TIMEOUTS):
+        t = time.monotonic()
+        with pytest.raises(HistorianError) as e:
+            await g.run([Q], deadline_s=0.3)
+        assert e.value.code == "timeout" and time.monotonic() - t < 0.6
+    s = g.stats()
+    assert (s["user_paused"], s["timeouts_5m"], s["in_flight"]["user"]) == (True, PAUSE_AFTER_TIMEOUTS,
+                                                                           PAUSE_AFTER_TIMEOUTS)
+    sent = len(fake.calls)
+    with pytest.raises(GateRefused) as e:
+        await g.run([Q])
+    assert e.value.code == "busy" and len(fake.calls) == sent
+
+
+# доводка по ревью задачи 1, раунд 2: драйвер отвечает ровно к сроку — исход считается один раз, удача не теряется
+
+
+def at_deadline(fake: FakeHistorian, state: dict):
+    """QueryFn: пока state["hang"] — спит ровно свой срок (как чтение pytds с settimeout(остаток)) и отдаёт
+    state["fail"] или ответ двойника; иначе сразу отвечает двойник."""
+    def driver(statements, timeout):
+        if state["hang"]:
+            time.sleep(timeout)
+            if state["fail"] is not None:
+                raise state["fail"]
+        return fake(statements, timeout)
+    return driver
+
+
+async def test_driver_timeout_at_deadline_counts_once():                       # N1
+    mono = FakeMono(1000.0)
+    state = {"hang": False, "fail": HistorianError("timeout", "чтение")}
+    g = HistorianGate(at_deadline(FakeHistorian(), state), allowed=WHITELIST, deadline_s=0.3, monotonic=mono)
+    await g.run([clock_sql()], lane="background")
+    state["hang"] = True
+    for _ in range(2):                                   # два раунда: после паузы снова нужны три срока
+        for _ in range(PAUSE_AFTER_TIMEOUTS - 1):
+            with pytest.raises(HistorianError) as e:
+                await g.run([Q])
+            assert e.value.code == "timeout"
+            await anyio.sleep(0.02)                      # драйвер вернулся, место отпущено
+        assert g.stats()["user_paused"] is False
+        with pytest.raises(HistorianError):
+            await g.run([Q])
+        assert g.stats()["user_paused"] is True
+        mono.advance(USER_PAUSE_S)
+        await anyio.sleep(0.02)
+    assert g.stats()["timeouts_5m"] == 2 * PAUSE_AFTER_TIMEOUTS
+
+
+@pytest.mark.parametrize("outcome", ["ok", "timeout"])
+async def test_outcome_delivered_at_deadline_is_the_calls_outcome(outcome):   # N1, гонка — наверняка
+    """Цикл событий занят через срок: исход драйвера (_finish) и таймер срока ворот — в одном обороте цикла,
+    _finish первым. Так идёт гонка «ровно к сроку», и её исход не зависит от планировщика."""
+    fake = FakeHistorian()
+    state = {"hang": False, "fail": HistorianError("timeout", "чтение") if outcome == "timeout" else None}
+
+    def driver(statements, timeout):
+        if state["hang"]:
+            time.sleep(timeout - 0.05)                   # вернётся за 0,05 с до срока, пока цикл занят
+            if state["fail"] is not None:
+                raise state["fail"]
+        return fake(statements, timeout)
+
+    g = HistorianGate(driver, allowed=WHITELIST, deadline_s=0.3)
+    await g.run([clock_sql()], lane="background")
+    state["hang"] = True
+
+    async def busy_loop():
+        await anyio.sleep(0.2)
+        time.sleep(0.2)                                  # цикл занят 0,2–0,4 с: срок ворот (0,3 с) — внутри
+
+    for _ in range(PAUSE_AFTER_TIMEOUTS - 1 if outcome == "timeout" else 1):
+        call, _ = await asyncio.gather(g.run([Q]), busy_loop(), return_exceptions=True)
+        if outcome == "ok":
+            assert isinstance(call, GateResult) and call.rows == [[LIVE_ROWS[0]]]   # удача к сроку не теряется
+            assert call.sent == ("20FAKE_001_PV",) and g.stats()["timeouts_5m"] == 0
+        else:
+            assert isinstance(call, HistorianError) and call.code == "timeout" and call.sent == ("20FAKE_001_PV",)
+    assert g.stats()["user_paused"] is False             # два срока драйвера ровно к сроку — не пауза

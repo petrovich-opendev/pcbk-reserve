@@ -9,20 +9,34 @@ from pathlib import Path
 
 import pytest
 
-from workplace import IMAGE, ONESHOT_LABEL, STUB_PREFIX, WORKPLACE_ENV
+from workplace import IMAGE, MODELS, ONESHOT_LABEL, OR_MODELS, STUB_PREFIX, WORKPLACE_ENV
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "student" / "config"
 SEC = 10 ** 9
-# без этих правил студент одобряет чтение вне /work, и пароль из /proc/self/environ уходит в разговор
-PERMISSION = {"external_directory": "deny", "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}}
-# поддельная модель на Bun из бинарника OpenCode: первый ход — read /proc/self/environ, потом текст
+# без этих правил студент одобряет чтение вне /work, и пароль из /proc/self/environ уходит в разговор;
+# "task": "deny" убирает инструмент task из запроса к модели — подагентов нет (Д4б-R20); "webfetch": "deny" —
+# интернета у стенда нет, тело каждого запроса короче (оценка — байт на токен), ручки core без токена из места
+# не читаются (до Д5)
+PERMISSION = {"external_directory": "deny", "task": "deny", "webfetch": "deny",
+              "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}}
+# MCP службы данных: токен места — файлом, без OAuth (Д4б-R19)
+MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True, "oauth": False,
+                "headers": {"Authorization": "Bearer {file:/run/secrets/data-token}"}}}
+# окно каждой модели: раннее сжатие разговора — защита бюджета (Д4б-R20)
+LIMIT = {"limit": {"context": 131072, "output": 16000}}
+# поддельная модель на Bun из бинарника OpenCode: первый ход — read /proc/self/environ, потом текст;
+# имена инструментов каждого запроса с инструментами — строкой «tools [...]» в свой журнал;
+# вне /llm/ — 404: иначе она отвечала бы и на /mcp, OpenCode ждал бы MCP свои 30 с (DEFAULT_TIMEOUT,
+# mcp/index.ts:38) и только потом звал модель, а срок CLIENT_JS — 20 с; с 404 MCP сразу failed
 FAKE_LLM_JS = """\
 const chunk = (delta, finish) => "data: " + JSON.stringify({id: "c1", object: "chat.completion.chunk",
   created: 0, model: "stub", choices: [{index: 0, delta, finish_reason: finish}],
   ...(finish ? {usage: {prompt_tokens: 1, completion_tokens: 1, total_tokens: 2}} : {})}) + "\\n\\n"
 Bun.serve({hostname: "0.0.0.0", port: 8000, async fetch(req) {
+  if (!new URL(req.url).pathname.startsWith("/llm/")) return new Response("", {status: 404})
   const body = await req.json().catch(() => ({}))
+  if ((body.tools || []).length) console.log("tools " + JSON.stringify(body.tools.map(t => t.function?.name)))
   const call = (body.tools || []).some(t => t.function?.name === "read")
     && !(body.messages || []).some(m => m.role === "tool")
   const delta = call
@@ -36,6 +50,15 @@ Bun.serve({hostname: "0.0.0.0", port: 8000, async fetch(req) {
   return new Response(chunk(delta, null) + chunk({}, call ? "tool_calls" : "stop") + "data: [DONE]\\n\\n",
     {headers: {"content-type": "text/event-stream"}})
 }})
+"""
+# двойник core, который держит /mcp HOLD_MCP_S с, потом 404: ленивый подъём MCP места дольше секунды, что ждёт
+# GET /mcp проверки здоровья (ветка unknown); два транспорта OpenCode (StreamableHTTP, затем SSE) — вдвое дольше
+HOLD_MCP_S = 8
+HOLD_MCP_JS = f"""\
+Bun.serve({{hostname: "0.0.0.0", port: 8000, async fetch(req) {{
+  if (new URL(req.url).pathname === "/mcp") await Bun.sleep({HOLD_MCP_S * 1000})
+  return new Response("", {{status: 404}})
+}}}})
 """
 # сервер на 127.0.0.1:4096, который сразу сбрасывает соединение (RST)
 RESET_SERVER_JS = ('require("node:net").createServer(s => s.resetAndDestroy())'
@@ -76,16 +99,42 @@ def ok(r: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
     return r
 
 
+def run_place(tmp_path: Path, network: str, config: Path | None = None) -> str:
+    """Место с OpenCode, как в компоновке: пароль, токены LLM и данных — файлами, tmpfs; id контейнера.
+
+    Без файла data-token ссылка {file:…} в заголовке MCP делает конфигурацию неверной (Д2-решение 2).
+    config — свой каталог конфигурации поверх образа (файлы 0644, каталоги 0755).
+    """
+    for name, value in (("pw", "probe-secret"), ("llm", "probe-token"), ("data", "probe-data-token")):
+        (tmp_path / name).write_text(value)
+        (tmp_path / name).chmod(0o444)
+    args = ["--read-only", "--network", network, "--label", ONESHOT_LABEL,
+            "--tmpfs", "/tmp:exec,mode=1777", "--tmpfs", "/var/lib/opencode:exec,uid=10001,gid=10001",
+            "--tmpfs", "/work:uid=10001,gid=10001",
+            "-v", f"{tmp_path / 'pw'}:/run/secrets/opencode-pw:ro",
+            "-v", f"{tmp_path / 'llm'}:/run/secrets/llm-token:ro",
+            "-v", f"{tmp_path / 'data'}:/run/secrets/data-token:ro"]
+    if config is not None:
+        args += ["-v", f"{config}:/etc/pcbk-opencode/opencode:ro"]
+    return ok(docker("run", "-d", *args, IMAGE)).stdout.strip()
+
+
 def test_config_files():
     cfg = json.loads((CONFIG / "opencode.json").read_text())
-    assert set(cfg) == {"autoupdate", "share", "snapshot", "enabled_providers", "model", "permission", "provider"}
-    assert (cfg["autoupdate"], cfg["share"], cfg["snapshot"], cfg["enabled_providers"], cfg["model"]) == \
-           (False, "disabled", False, ["pcbk"], "pcbk/stub")
-    assert cfg["permission"] == PERMISSION
+    assert set(cfg) == {"autoupdate", "share", "snapshot", "enabled_providers", "model", "permission", "provider",
+                        "mcp"}
+    assert (cfg["autoupdate"], cfg["share"], cfg["snapshot"]) == (False, "disabled", False)
+    assert (cfg["enabled_providers"], cfg["model"], cfg["permission"], cfg["mcp"]) == \
+           (["pcbk", "pcbk-or"], "pcbk/z-ai/glm-5.3", PERMISSION, MCP)
     assert list(cfg["permission"]["read"]) == ["*", "*.env", "*.env.*"]    # побеждает последнее совпадение
-    pcbk = cfg["provider"]["pcbk"]
-    assert (pcbk["npm"], list(pcbk["models"])) == ("@ai-sdk/openai-compatible", ["stub"])
-    assert pcbk["options"] == {"baseURL": "http://core:8000/llm/v1", "apiKey": "{file:/run/secrets/llm-token}"}
+    assert set(cfg["provider"]) == {"pcbk", "pcbk-or"}
+    for pid, npm, names in (("pcbk", "@ai-sdk/openai-compatible", MODELS),
+                            ("pcbk-or", "@openrouter/ai-sdk-provider", OR_MODELS)):
+        p = cfg["provider"][pid]
+        assert set(p) == {"npm", "options", "models"}, pid
+        assert (p["npm"], list(p["models"])) == (npm, names)
+        assert p["options"] == {"baseURL": "http://core:8000/llm/v1", "apiKey": "{file:/run/secrets/llm-token}"}
+        assert all(m == LIMIT for m in p["models"].values()), pid
     assert (CONFIG / ".gitignore").read_bytes() == b""
     assert subprocess.run(["git", "check-ignore", "-q", "student/config/.gitignore"], cwd=ROOT).returncode == 1
     tools = sorted((CONFIG / "tools").iterdir())
@@ -156,30 +205,86 @@ def test_no_setuid_binaries(student_image):
 
 @pytest.mark.parametrize("broken", [False, True])
 def test_health_needs_working_instance(student_image, tmp_path, broken):         # Review Focus 3
-    for name, value in (("pw", "probe-secret"), ("llm", "probe-token")):
-        (tmp_path / name).write_text(value)
-        (tmp_path / name).chmod(0o444)
-    args = ["--read-only", "--network", "none", "--label", ONESHOT_LABEL,
-            "--tmpfs", "/tmp:exec,mode=1777", "--tmpfs", "/var/lib/opencode:exec,uid=10001,gid=10001",
-            "--tmpfs", "/work:uid=10001,gid=10001",
-            "-v", f"{tmp_path / 'pw'}:/run/secrets/opencode-pw:ro",
-            "-v", f"{tmp_path / 'llm'}:/run/secrets/llm-token:ro"]
+    cfg = None
     if broken:                          # конфигурация без .gitignore — как образ из неполного клона
         cfg = tmp_path / "config"
         shutil.copytree(CONFIG, cfg, ignore=shutil.ignore_patterns(".gitignore"))
         for p in [cfg, *cfg.rglob("*")]:
             p.chmod(0o755 if p.is_dir() else 0o644)
-        args += ["-v", f"{cfg}:/etc/pcbk-opencode/opencode:ro"]
-    cid = ok(docker("run", "-d", *args, IMAGE)).stdout.strip()
+    cid = run_place(tmp_path, network="none", config=cfg)
     try:
         codes, deadline = [], time.monotonic() + 30
-        while codes[-1:] != ["200"] and time.monotonic() < deadline:
+        while not (codes and codes[-1].startswith("200")) and time.monotonic() < deadline:
             codes.append(docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.strip())
             time.sleep(1)
-        assert all(re.fullmatch(r"\d{3}", c) for c in codes)
-        assert (codes[-1] == "200") is (not broken)     # /global/health здесь дал бы 200 и сломанному
+        assert all(re.fullmatch(r"\d{3}( mcp=[a-z_]+)?", c) for c in codes)
+        assert codes[-1].startswith("200") is (not broken)     # /global/health здесь дал бы 200 и сломанному
     finally:
         docker("rm", "-f", cid)
+
+
+def test_health_reports_mcp_without_core(student_image, tmp_path):             # Review Focus 1
+    """core недоступен: код и слово MCP — «200 mcp=failed»; переподключение — не чаще раза в 60 с."""
+    cid = run_place(tmp_path, network="none")
+    try:
+        outs, deadline = [], time.monotonic() + 45
+        while "200 mcp=failed" not in outs and time.monotonic() < deadline:
+            outs.append(docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.strip())
+            time.sleep(2)
+        assert "200 mcp=failed" in outs and all(re.fullmatch(r"000|\d{3}|200 mcp=[a-z_]+", o) for o in outs), outs
+        def mark() -> str:                                      # время метки попытки connect, с
+            return docker("exec", cid, "stat", "-c", "%Y", "/tmp/pcbk-mcp-retry").stdout.strip()
+
+        first = mark()
+        assert first.isdigit()                                  # попытка connect была — метка есть
+        r = docker("exec", cid, "/usr/local/bin/pcbk-health")
+        assert (r.returncode, r.stdout, r.stderr) == (0, "200 mcp=failed\n", "")    # ни пароля, ни ошибок bash
+        assert mark() == first                                  # не чаще раза в 60 с
+        # граница — «не меньше 50 с»: 48 с — рано (запас на секунду между exec), 50 с — новая попытка;
+        # метка на час в будущем (часы шагнули назад) — старая, иначе попыток не было бы час
+        now = int(ok(docker("exec", cid, "date", "+%s")).stdout)
+        for age, retried in ((48, False), (50, True), (-3600, True)):
+            ok(docker("exec", cid, "touch", "-d", f"@{now - age}", "/tmp/pcbk-mcp-retry"))
+            assert docker("exec", cid, "/usr/local/bin/pcbk-health").stdout == "200 mcp=failed\n"
+            assert (mark() != str(now - age)) is retried, age
+    finally:
+        docker("rm", "-f", cid)
+
+
+def test_health_reports_unknown_while_mcp_starts(student_image, tmp_path):      # Д4б-R18, ветка unknown
+    """core держит /mcp дольше секунды: GET /mcp ждёт ленивого подъёма MCP — «200 mcp=unknown»; core ответил
+    404 — «200 mcp=failed». Слово unknown — только пока MCP поднимается, а не вместо ответа."""
+    (tmp_path / "core.js").write_text(HOLD_MCP_JS)
+    (tmp_path / "core.js").chmod(0o444)
+    net = f"pcbk-test-mcp-{uuid.uuid4().hex[:8]}"
+    cids = []
+    assert docker("network", "create", "--internal", "--label", ONESHOT_LABEL, net).returncode == 0
+    try:
+        cids.append(ok(docker("run", "-d", "--network", net, "--network-alias", "core", "--label", ONESHOT_LABEL,
+                              "--read-only", "--no-healthcheck", "--tmpfs", "/tmp:exec,mode=1777",
+                              "-e", "BUN_BE_BUN=1", "-v", f"{tmp_path / 'core.js'}:/fake/core.js:ro",
+                              "--entrypoint", "/usr/local/bin/opencode", IMAGE, "/fake/core.js")).stdout.strip())
+        cid = run_place(tmp_path, network=net)
+        cids.append(cid)
+        outs, deadline = [], time.monotonic() + 4 * HOLD_MCP_S + 30
+        while "200 mcp=failed" not in outs and time.monotonic() < deadline:
+            outs.append(docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.strip())
+            time.sleep(1)
+        assert all(re.fullmatch(r"\d{3}( mcp=[a-z_]+)?", o) for o in outs), outs
+        words = [o for o in outs if o.startswith("200")]
+        # сначала unknown (MCP ещё поднимается), потом failed; между ними ничего другого
+        assert words and words[0] == "200 mcp=unknown" and words[-1] == "200 mcp=failed", outs
+        assert set(words) == {"200 mcp=unknown", "200 mcp=failed"}, outs
+    finally:
+        if cids:
+            docker("rm", "-f", *cids)
+        docker("network", "rm", net)
+
+
+def test_health_never_disposes():                                               # Review Focus 1; Д4б-R18
+    """Переподключает только connect одного MCP: пересоздание экземпляра порвало бы /event и ход."""
+    text = (ROOT / "student" / "pcbk-health").read_text()
+    assert "/mcp/pcbk/connect" in text and "dispose" not in text and "/instance" not in text
 
 
 @pytest.mark.parametrize("rules", [True, False])
@@ -188,15 +293,10 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
 
     rules=False — отрицательный контроль: конфигурация без блока permission, OpenCode спрашивает студента.
     """
-    for name, value in (("pw", "probe-secret"), ("llm", "probe-token"), ("llm.js", FAKE_LLM_JS)):
-        (tmp_path / name).write_text(value)
-        (tmp_path / name).chmod(0o444)
+    (tmp_path / "llm.js").write_text(FAKE_LLM_JS)
+    (tmp_path / "llm.js").chmod(0o444)
     net = f"pcbk-test-llm-{uuid.uuid4().hex[:8]}"
-    place = ["--read-only", "--network", net, "--label", ONESHOT_LABEL,
-             "--tmpfs", "/tmp:exec,mode=1777", "--tmpfs", "/var/lib/opencode:exec,uid=10001,gid=10001",
-             "--tmpfs", "/work:uid=10001,gid=10001",
-             "-v", f"{tmp_path / 'pw'}:/run/secrets/opencode-pw:ro",
-             "-v", f"{tmp_path / 'llm'}:/run/secrets/llm-token:ro"]
+    cfg = None
     if not rules:
         cfg = tmp_path / "config"
         shutil.copytree(CONFIG, cfg)
@@ -205,7 +305,6 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
         (cfg / "opencode.json").write_text(json.dumps(data))
         for p in [cfg, *cfg.rglob("*")]:
             p.chmod(0o755 if p.is_dir() else 0o644)
-        place += ["-v", f"{cfg}:/etc/pcbk-opencode/opencode:ro"]
     cids = []
     assert docker("network", "create", "--internal", "--label", ONESHOT_LABEL, net).returncode == 0
     try:
@@ -214,14 +313,18 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
                               "--read-only", "--no-healthcheck", "--tmpfs", "/tmp:exec,mode=1777",
                               "-e", "BUN_BE_BUN=1", "-v", f"{tmp_path / 'llm.js'}:/fake/llm.js:ro",
                               "--entrypoint", "/usr/local/bin/opencode", IMAGE, "/fake/llm.js")).stdout.strip())
-        cid = ok(docker("run", "-d", *place, IMAGE)).stdout.strip()
+        cid = run_place(tmp_path, network=net, config=cfg)
         cids.append(cid)
         deadline = time.monotonic() + 30
-        while docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.strip() != "200":
+        while not docker("exec", cid, "/usr/local/bin/pcbk-health").stdout.startswith("200"):
             assert time.monotonic() < deadline, "место не ответило 200 за 30 с"
             time.sleep(1)
         r = ok(docker("exec", "-e", "BUN_BE_BUN=1", cid, "/usr/local/bin/opencode", "-e", CLIENT_JS, timeout=60))
         out = json.loads(r.stdout)
+        # инструменты в запросах к модели: запрет по правилу с шаблоном * убирает их из запроса
+        sent = [json.loads(line[len("tools "):]) for line in ok(docker("logs", cids[0])).stdout.splitlines()
+                if line.startswith("tools ")]
+        assert sent and all("read" in names for names in sent)         # журнал модели прочитан
         tools = [p for m in out["messages"] for p in m["parts"] if p["type"] == "tool"]
         assert out["prompt"] == 204 and [p["tool"] for p in tools] == ["read"]
         assert tools[0]["state"]["input"] == {"filePath": "/proc/self/environ"}
@@ -230,7 +333,9 @@ def test_external_read_refused_without_asking(student_image, tmp_path, rules):
             assert out["asked"] == [] and tools[0]["state"]["status"] == "error"
             assert "rule which prevents you" in tools[0]["state"]["error"]    # отказ по правилу, не сбой
             assert "probe-secret" not in json.dumps(out["messages"])
+            assert not {"task", "webfetch"} & set().union(*sent)
         else:
+            assert {"task", "webfetch"} <= set().union(*sent)                # без правил — есть: проверка видит
             assert [(a["permission"], a["metadata"]["filepath"]) for a in out["asked"]] == \
                    [("external_directory", "/proc/self/environ")]
     finally:

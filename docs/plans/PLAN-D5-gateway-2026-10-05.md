@@ -107,6 +107,12 @@ research/07):
   несёт ни сессии, ни агента (research/09 §6.2), шлюзу его взять неоткуда.
 - **Д3б «в Д5 — ещё и шлюз»** (переподключение MCP) → снято: его делает
   проверка здоровья места (Д4б-R18).
+- **Д3б, заметка для Д4б/Д5** (Ш15): `/mcp`, `/llm`, `/api/data` на адресе
+  `core` в `pcbk-egress` остаются под токенами (на нём держатся тесты
+  `http_host`); экран сети — Д12; версия Docker сервера — А0, шаг 3.
+- **Д4б, ревью задачи 4, minor 5 и 11** (Ш25): «доп. нули» — нули А6 в
+  `test_place_reaches_only_core`; «сверка адреса источника» — токен места
+  только из его сети (Д5-R31, задача А4).
 
 **Разрез Д5 на два дня.** После двух раундов критики строка Д5 одним днём
 стоит около 23 ч по плановой шкале. Порог «одного дня» по прецеденту тогда — 15,1 ч
@@ -124,11 +130,84 @@ research/07):
   и чужие id. Владелец видит прогон автотестов на сервере (опасные вызовы —
   403, чужой id — 404 без данных) и журнал отказов со снимком страницы.
 
-С двумя выкладками и двумя закрытиями выходит **15,75 + 13,0 ч** (после
-раунда 4). Обе половины больше 11,5 ч, но меньше Д4а в нынешней редакции
-(19,05 ч, черта — после 15,0 ч). Как Д4а, каждая остаётся одним днём с
+С двумя выкладками и двумя закрытиями выходит **17,5 + 13,75 ч** (после
+раунда 4 и предпроверки против кода Д3–Д4б). Обе половины больше 11,5 ч, но
+меньше Д4а в нынешней редакции (19,05 ч, черта — после 15,0 ч). Как Д4а, каждая остаётся одним днём с
 чертой отсечения и порогом темпа (шапки половин). По живому темпу, худшая доля
-0,30 плановой шкалы, это около 4,7 и 3,9 ч.
+0,30 плановой шкалы, это около 5,3 и 4,1 ч.
+
+## Изменения по предпроверке (Д3–Д4б как построены)
+
+Предпроверка сверила план с кодом цепочки `d3a` → `d3b` → `d4a` → `d4b`
+(HEAD `1c02e8d`): 25 находок, 2 блокирующие
+(`.superpowers/sdd/PLAN-D5-gateway-2026-10-05/preflight.md`). Контроллер принял
+решения Ш1–Ш24 как предложены, по Ш25 выбрал вариант (а). Строка — «находка →
+что изменилось».
+
+**Блокирующие**
+- **Ш1 — база ветки.** `main` — Д2, дни Д3а–Д4б не влиты → ветка
+  `d5a/entry-workplaces` — от головы `d4b/workplaces-llm` (`1c02e8d` или
+  позже), код А1–А6 — по цепочке. А0, шаги 2 и 4 — сейчас (шаг 2 сделала
+  предпроверка); шаги 1 и 3 и А7–А9 — после `platform-d4b` и выкладки Д4б.
+  Слияние — с перебазированием на `main` и повтором прогона А6, шаг 4. Д5б —
+  от головы `d5a`, Б0 и Б6–Б8 — после `platform-d5a` (шапки половин, А0, А9,
+  Б0, Б8).
+- **Ш2 — теги образов.** Красный прогон А6 пересобрал бы откатный
+  `core:d4b` кодом Д5 до выкладки Д4б → первая правка А6 (шаг 0) — теги
+  `:d5a` в `compose.yaml` и `IMAGES`, в Б5 — `:d5b`. До неё — ни сборок, ни
+  интеграционных прогонов, в том числе у ревьюеров. ID откатных образов — до
+  и после каждого прогона. Образы выкладок прежних дней — из своей ветки
+  через `git worktree` (Global Constraints, README).
+
+**Остальные (23, все приняты)**
+- Ш3 — тесты прежних дней, которые А4 делает красными, правятся в А4:
+  `test_skeleton.py:317` (роли), `test_llm_role.py:478–483, 885`
+  (`egress_targets` срезом), `test_egress.py:218–219` (13/12 направлений,
+  `SP_CTL_URL` на петлю — без DNS).
+- Ш4 — А6: секреты `core` 5 → 15, оба равенства набора сетей,
+  `/healthz` ждётся до 60 с, порядок `test_status_json_overall_ok` после
+  `test_gateway`.
+- Ш5 — `_install_hooks` отказывает прямому обработчику `HTTPException`, как
+  422; тест `test_role_own_http_exception_handler_is_refused`.
+- Ш6 — `test_uvicorn_scope_server_is_ip`: проба отвечает на `lifespan`.
+- Ш7 — два новых теста `/health/llm` — на `fake_or`, без сети.
+- Ш8 — А1: разбор ответа по образцу `LlmReply.parse`, строка «шлюз ответил
+  не по договору», ключи Д5б необязательные.
+- Ш9 — тексты `ValueError` без значения, `build_gateway_role` с импортом
+  внутри, `aclose()` под `try`.
+- Ш10 — пока `sp_ctl == "down"`, такт через ≤ 5 с (`next_tick_s()`); тест А3.
+- Ш11 — любая `httpx.HTTPError` и `OSError` → 503 `WorkplaceNotReady`, в
+  журнал только класс; в потоке — `closed_by=place`; тест с
+  `RemoteProtocolError`.
+- Ш12 — имя агента по шаблону `[A-Za-z0-9._-]{1,64}`, не эхом.
+- Ш13 — `time.archived: null` идёт месту как есть; живой тест Б5; хвост Д6.
+- Ш14 — `/config/providers` в `FORBIDDEN` и в тесте конфигурации.
+- Ш15 — строка о `pcbk-egress` (токены, экран Д12); версия Docker ≥ 28 в
+  А0; сверка подсети `pcbk-egress` тестом.
+- Ш16 — Global Constraints о местах модулей интеграции; фикстуры гасят места
+  в `finally`.
+- Ш17 — довод R31 о `webfetch` — «защита в глубину».
+- Ш18 — форма `note` учений — строкой в README.
+- Ш19 — темп для правила деления до закрытия Д4б — промежуточный (0,31), в
+  А0, шаг 4.
+- Ш20 — итоговые доводки Д3б/Д4а — до А4 или после Д5 одним коммитом;
+  коммиты по путям.
+- Ш21 — у каждого нуля `test_place_reaches_only_core` — свой положительный
+  контроль `stack.probe`.
+- Ш22 — `body_limit("/pcbk/api/", 64 КиБ, refusal=)` в А4: 413 вида OpenCode
+  и мимо `edge`.
+- Ш23 — счётчик неизвестных логинов под `threading.Lock`; тест 8 потоков.
+- Ш24 — `SECRETS_DIR` из `.env` в `mkforms`, А0, А8, Б7.
+- **Ш25 — токен места только из его сети** (решение контроллера: вариант
+  (а), защита в глубину). `bearer_caller(…, *, scope)`: токен `student-NN`
+  из сети другого места (`scope["client"]` вне `{STU_NET}.N.0/28` и вне
+  `ADMIN_NETS`) → 401, как чужой токен, без события; тест
+  `test_place_token_only_from_its_network` (Д5-R31, А4).
+
+**Часы:** Д5а 15,75 → 17,5 ч (А1 +0,25, А2 +0,25, А3 +0,25, А4 +0,75 из них
+Ш25 0,25, А6 +0,25), Д5б 13,0 → 13,75 ч (Б2, Б3, Б5 по +0,25). По доле 0,30 —
+около 5,3 и 4,1 ч; черта Д5а — конец седьмого часа (А0–А6 = 14,0 ч), Д5б —
+5,5 ч (Б0–Б5 = 10,75 ч). Обе половины меньше Д4а (19,05 ч).
 
 ## Изменения по критике, раунд 4
 
@@ -186,7 +265,8 @@ research/07):
 5. Рецепт `forms-X` при пропавшем файле молча брал пароль предыдущего файла,
    и все контроли были зелёными → функция `mkforms`:
    - `pw` сбрасывается на каждом файле;
-   - пути только абсолютные (`/opt/pcbk-reserve/secrets/student-NN.pw`);
+   - пути только абсолютные (`"$SD/student-NN.pw"`, где `SD` — `SECRETS_DIR`
+     из `.env`, решение предпроверки Ш24);
    - нет файла или он пуст — код 1, цепочка через `&&` останавливается;
    - пятый контроль: первая строка `forms-X` совпадает с источником, все
      `forms-*` различны.
@@ -503,8 +583,9 @@ research/07):
 Строки для раздела «Отклонения» `docs/PLAN-platform-2026-09-29.md` — дорожную
 карту правит контролёр при утверждении плана, закрытия дней её не трогают:
 
-* **Шлюз и вход — два дня (Д5а и Д5б):** по плановой шкале около 25 ч одним
-  днём после четырёх раундов критики (Д5а — 15,75 ч, Д5б — 13,0 ч). Д5а — вход,
+* **Шлюз и вход — два дня (Д5а и Д5б):** по плановой шкале около 27 ч одним
+  днём после четырёх раундов критики и предпроверки (Д5а — 17,5 ч, Д5б —
+  13,75 ч). Д5а — вход,
   учётные записи и закрепление мест, место по учётной записи, подъём и сон
   мест, зоны адресов, строка сторожа; Д5б — белый список вызовов OpenCode,
   поток SSE, автотесты шлюза. Всего 15 дней, нумерация Д6–Д12 прежняя.
@@ -671,7 +752,8 @@ research/07):
     [ "$(head -n1 "$out")" = "$(head -n1 "$f")" ] && echo "forms-$2: совпало с источником" \
       || { echo "forms-$2: не совпало с источником" >&2; return 1; }
   }
-  mkforms "$HOME/pcbk-d5/probe-a.pw" a && mkforms /opt/pcbk-reserve/secrets/student-10.pw 10 && …
+  SD=$(/usr/bin/grep '^SECRETS_DIR=' /opt/pcbk-reserve/.env | cut -d= -f2) && [ -n "$SD" ]   # каталог секретов — из .env (Ш24)
+  mkforms "$HOME/pcbk-d5/probe-a.pw" a && mkforms "$SD/student-10.pw" 10 && …
   ```
 
   Файлы — одной цепочкой через `&&`: пропавший файл (р4: прежний рецепт при
@@ -726,9 +808,18 @@ research/07):
   - Страница входа — `node --test edge/tests/*.test.mjs`.
   - Интеграционные — `uv run --python 3.12 --with pytest pytest -q tests/integration`.
 
-  **Модули интеграции не держат места друг друга**: `test_entry` — места 1,
-  3, 4, 5; `test_gateway` — 6, 7, 8. Места 2, 9, 10 — прежним дням и живым
-  пробам.
+  **Модули интеграции идут по очереди, и каждый гасит свои места к концу**
+  (в том числе в `finally` фикстур; Ш16): `test_entry` — места 1, 3, 4, 5;
+  `test_gateway` — 6, 7, 8. Модули прежних дней берут 01, 02, 03 и 10 —
+  пересечение безвредно только поэтому. Учётки `test_entry`/`test_gateway` в
+  `core.db` стенда прежним модулям не мешают: к шлюзу они не ходят.
+- **Теги образов раньше сборки (Ш2).** Первая правка А6 — теги `core` и
+  сторожа `:d5a` в `compose.yaml` и `IMAGES` (в Б5 — `:d5b`); до неё в Д5 нет
+  ни `docker compose build`, ни интеграционных прогонов, в том числе у
+  ревьюеров. ID откатных образов (`:d3a`, `:d4a`, `:d4b`, в Д5б и `:d5a`;
+  `student:d4` — по содержимому) снимаются до и после каждого
+  интеграционного прогона. Образы для выкладок прежних дней собираются из
+  своей ветки (`git worktree`), не из дерева Д5.
 
 ---
 
@@ -742,9 +833,21 @@ research/07):
 «прокси сокета остановлен», «уборщик простоя замер» и «место не приняло
 пароль шлюза» красят строку «Шлюз и вход».
 
-**Предпосылка.** Д4б влит в `main` с тегом `platform-d4b` (или его хвосты
-закрываются в задаче А0). На сервере `core :d4b` — в сетях мест на `.2`,
-места `:d4` спят. Ветка дня — `d5a/entry-workplaces` от `main` после тега.
+**Предпосылка (Ш1, решение контроллера по предпроверке).** Дни Д3а–Д4б не
+влиты: `main` — Д2, цепочка `d3a` → `d3b` → `d4a` → `d4b` ждёт окон
+владельца. Поэтому:
+- ветка дня `d5a/entry-workplaces` — от головы `d4b/workplaces-llm`
+  (`1c02e8d` или позже, если до старта на `d4b` лягут хвосты 0б или
+  итоговые доводки);
+- код А1–А6 идёт по этой цепочке, без сервера;
+- А0, шаги 2 и 4 — сейчас (шаг 2 уже сделала предпроверка, Г1);
+  шаги 1 и 3 и задачи А7–А9 — после `platform-d4b` и выкладки Д4б (на
+  сервере `core :d4b` в сетях мест на `.2`, места `:d4` спят);
+- слияние Д5а в `main` — после `platform-d4b`, с перебазированием на `main`
+  и повтором прогона А6, шаг 4;
+- итоговые доводки Д3б и Д4а (`app.py`, `test_hooks.py`, `checks.py`) — до
+  А4 или после Д5 одним коммитом; коммиты Д5 — только `git commit --
+  <пути>` (Ш20).
 
 **Влезает ли в день — оценка по часам.** Задачи последовательны. В часы задач
 с кодом входят 15 минут на ревью и правки. Шкала плановая, по ставкам Д1–Д4.
@@ -752,23 +855,23 @@ research/07):
 | Задача | Часы | Где |
 |---|---|---|
 | А0. Хвосты Д4б; утро: сверка имён и сигнатур, предпроверки сервера, замер полного прогона | 0,25–0,5 | локально, сервер |
-| А1. Сторож: вид `gateway`, строка «Шлюз и вход» | 1,25 | локально |
-| А2. Учётные записи, закрепление мест, надгробия, сессии, замок, команда администратора | 2,25 | локально |
-| А3. Места: прокси сокета, замок места, пробуждение, готовность, уборщик | 2,0 | локально |
-| А4. Роль `gateway`: настройки, `config_error`, зоны адресов, вход, cookie, scrypt, охрана выхода | 2,75 | локально |
+| А1. Сторож: вид `gateway`, строка «Шлюз и вход» | 1,5 | локально |
+| А2. Учётные записи, закрепление мест, надгробия, сессии, замок, команда администратора | 2,5 | локально |
+| А3. Места: прокси сокета, замок места, пробуждение, готовность, уборщик | 2,25 | локально |
+| А4. Роль `gateway`: настройки, `config_error`, зоны адресов, вход, cookie, scrypt, охрана выхода, токен места по сети | 3,5 | локально |
 | А5. Страница входа и `edge` | 1,25 | локально |
-| А6. Компоновка и интеграционные тесты | 2,5 | локально |
+| А6. Компоновка и интеграционные тесты | 2,75 | локально |
 | А7. Выкладка | 0,75 | сервер |
 | А8. Живые проверки и учения | 1,5 | сервер |
 | А9. Закрытие дня | 1,25 | — |
-| **Критический путь** | **15,75** при хвостах 0,25 | |
+| **Критический путь** | **17,5** при хвостах 0,25 | |
 
 **Принятое основание «один день»** — как в Д4а:
 - живой темп по git (`docs/checks/D4a.md`, способ Д4а: дата автора `%aI`,
   код до черты): Д1 — 0,24 плановой шкалы, Д2 — 0,14, Д3а — 0,24–0,30,
   Д3б — 0,25 (с ревью 0,32); худшая доля Д1–Д3а — 0,30. Строки «темп кода
   до черты» Д4а и Д4б — если будут к началу дня;
-- при 0,30 Д5а — около 4,7 ч;
+- при 0,30 Д5а — около 5,3 ч;
 - полный интеграционный прогон к Д5 растёт: А0 замеряет настенное время
   последнего прогона Д4б, а Д5а добавляет около 9 минут ожиданий (учения
   `test_entry`).
@@ -782,9 +885,9 @@ research/07):
 
 Владелец получает строку с числами.
 
-**Черта отсечения — конец шестого часа** плюс превышение хвостов Д4б над
-0,25 ч. К черте зелёны задачи А0–А6: по плановой шкале 12,25 ч, по доле 0,30
-— ≈3,7 ч. Черта ловит темп хуже ≈0,49 (6 / 12,25) — это и есть порог деления
+**Черта отсечения — конец седьмого часа** плюс превышение хвостов Д4б над
+0,25 ч. К черте зелёны задачи А0–А6: по плановой шкале 14,0 ч, по доле 0,30
+— ≈4,2 ч. Черта ловит темп хуже 0,5 (7 / 14,0) — это и есть порог деления
 дня 0,5 (р4: прежняя черта в двенадцать часов срабатывала бы только при
 темпе хуже 1,0). По ходу дня прогресс сверяется с темпом: после коммита
 каждой задачи кода — `pace` Д4а от коммита А1 до текущего, делённое на
@@ -1155,8 +1258,10 @@ GET под `/pcbk/api/oc/` (в том числе поток `/event`) получ
 - Ручки шлюза (`/pcbk/api/*`) и `/health/gateway` вне `FRONT_NETS` — 404 JSON
   «Не найдено»: вход из места и перебор паролей в обход `limit_req` закрыты.
 - `/health/llm` вне `ADMIN_NETS` отдаётся без `account_remaining_usd`,
-  `key_usage_usd`, `key_spent_usd` (правка `llm/api.py` Д4а). Агент места с
-  `webfetch` остатка счёта не узнает. Сторож (`pcbk-front`), туннель
+  `key_usage_usd`, `key_spent_usd` (правка `llm/api.py` Д4а). Это защита в
+  глубину (Ш17): в образе места `:d4` `webfetch` и `task` закрыты, но агенты
+  Д7 со своими `permission` могут их открыть, а `core` на `.2` видят и
+  процессы места. Сторож (`pcbk-front`), туннель
   администратора к адресу в `pcbk-egress` и `stack.llm_health()` видят поля
   по-прежнему.
 - Подсеть `pcbk-front` в `zones.py` сверяется с `compose.yaml` тестом.
@@ -1173,6 +1278,31 @@ GET под `/pcbk/api/oc/` (в том числе поток `/event`) получ
   остаётся для отрицательных контролей и отказывает на пару `pcbk-core` /
   `pcbk-ctl`.
 - `ip_forward=0` (Д4б-R23) не даёт `core` стать мостом из места к `sp-ctl`.
+- **Токен места — только из его сети** (Ш25, решение контроллера; minor 11
+  ревью задачи 4 Д4б). Служба данных (`/api/data`, `/mcp`) и LLM-прокси
+  (`/llm/`) принимают токен вызывающего `student-NN`, только если
+  `scope["client"]` (адрес источника) лежит в `{STU_NET}.N.0/28` — сети
+  этого места — или в `ADMIN_NETS` (хост и тесты `http_host`, проба на
+  петле). Из сети другого места — 401 тем же ответом и той же строкой
+  журнала, что чужой токен, без события в журнале событий и учёте. Прочие
+  вызывающие (`ops`) не меняются. Адрес не IP (клиент тестов в процессе,
+  `testclient`) — сверка не делается: uvicorn кладёт в `scope["client"]`
+  адрес IP, это проверяет тест. Выигрыш — при утечке токена: украденный
+  токен места 01 не работает из места 02. Проверка — в `bearer_caller`
+  (Д3б) с обязательным `scope=`, через который идут все пять мест сверки
+  токенов.
+- **`pcbk-egress` — зона администратора, пока сеть не открыта извне** (Ш15,
+  заметка Д3б для Д5). `/mcp`, `/llm`, `/api/data` на адресе `core` в
+  `pcbk-egress` остаются под токенами (на нём держатся тесты `http_host`);
+  экран сети — Д12. А0, шаг 3 сверяет версию Docker сервера (≥ 28): на
+  более старом возможна прямая маршрутизация в `pcbk-egress` извне, и тогда
+  `ADMIN_NETS` до Д12 — без неё.
+- **Первый отказ охраны выхода к `sp-ctl` не красит строку на полминуты**
+  (Ш10). Имя `pcbk-sp-ctl` поток адресов разрешает раз в 30 с; если при
+  старте `core` или после пересоздания прокси адреса ещё нет в кэше, первый
+  `ping` получает `EgressDenied`. Пока `sp_ctl == "down"`, следующий такт —
+  через `min(5, GW_REAPER_TICK_S)` с (только `ping`), дальше обычный шаг.
+  Правила охраны выхода не меняются.
 - У `core` — `logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}`:
   строки шлюза не забивают диск сервера.
 
@@ -1201,7 +1331,8 @@ GET под `/pcbk/api/oc/` (в том числе поток `/event`) получ
    `test_junk_cookie_pair_not_counted`; задача А6, `test_place_sees_no_gateway`,
    `test_edge_passes_only_gateway_paths`, `test_duplicate_cookies_through_edge`,
    `test_bad_host_refused_by_edge_and_bounded_in_core` (`RestartCount` `core`
-   не изменился).
+   не изменился); токен места из чужой сети — задача А4,
+   `test_place_token_only_from_its_network` (Ш25).
 3. **Простой и уборщик:** вход во время остановки даёт ложный сбой или
    «готово» у погасшего места; опрос держит место; уборщик гасит место
    посреди хода или сразу после действия студента; уборщик молча умер.
@@ -1288,10 +1419,12 @@ docs/checks/D5a.md, docs/checks/D5a/*.png
 **Files:**
 - Create: `docs/checks/D5a.md`
 
-- [ ] **Step 1: Хвосты Д4б.** Всё, что черта Д4б перенесла сюда: второй раунд
-  критика, слияние и тег `platform-d4b`, перенесённое окно владельца.
-  Expected: у каждого хвоста вердикт в `docs/checks/D4b.md`; ветка
-  `d5a/entry-workplaces` — от `main` после тега.
+- [ ] **Step 1: Хвосты Д4б — после `platform-d4b`** (Ш1). Всё, что черта Д4б
+  перенесла сюда: второй раунд критика, слияние и тег `platform-d4b`,
+  перенесённое окно владельца. До тега шаг пропускается; ветка
+  `d5a/entry-workplaces` уже идёт от головы `d4b`. Expected: у каждого
+  хвоста вердикт в `docs/checks/D4b.md`; `git merge-base --is-ancestor
+  1c02e8d d5a/entry-workplaces` → код 0.
 - [ ] **Step 2: Сверка имён и сигнатур с кодом Д3–Д4.** План написан до этого
   кода. Сверяются:
   - `git grep -n -E 'def create_app|class RoleBase|def hooks_of|def body_limit|def install_egress_guard|test_egress_targets_include_openrouter|DB_PATH|class FakeMono|note:|def recreate|def http_host|def llm_health|def logs|def wait_for|def wait_until|def serve_app|def converse|def pause|KINDS|def check_llm|test_components_file_d4b|fake-openrouter|pcbk-core-data|config_error' -- core watchdog tests compose*.yaml`;
@@ -1311,19 +1444,32 @@ docs/checks/D5a.md, docs/checks/D5a/*.png
   Expected: все имена и сигнатуры из разделов Interfaces на месте. Если
   что-то расходится — правка плана одним коммитом до задачи А1 («План Д5:
   имена по коду Д4»).
-- [ ] **Step 3: Предпроверки сервера (только чтение).** На сервере (`cd /opt/pcbk-reserve`):
-  `docker compose ps --format '{{.Name}} {{.State}}'; docker ps -a --filter label=pcbk.role=student --format '{{.State}}' | sort | uniq -c; docker inspect -f '{{.State.Health.Status}} {{len .NetworkSettings.Networks}}' pcbk-core; /usr/bin/grep -c '^GW_' .env; ls secrets/student-*.pw | wc -l; /usr/bin/grep -rlE 'location[^{]*/pcbk' /opt/dify/docker/nginx/ 2>/dev/null | wc -l; curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(sorted((c["component"], c["state"]) for c in json.load(sys.stdin)["checks"]))' > ~/pcbk-d5a-rows.txt; docker ps --format '{{.Names}} {{.Status}}' > ~/pcbk-d5a-before.txt`.
+- [ ] **Step 3: Предпроверки сервера (только чтение) — после выкладки Д4б**
+  (Ш1). На сервере (`cd /opt/pcbk-reserve`), каталог секретов — из `.env`,
+  как в README Д4б (Ш24): `SD=$(/usr/bin/grep '^SECRETS_DIR=' .env | cut -d= -f2) && [ -n "$SD" ]`, затем
+  `docker version --format '{{.Server.Version}}'; docker compose ps --format '{{.Name}} {{.State}}'; docker ps -a --filter label=pcbk.role=student --format '{{.State}}' | sort | uniq -c; docker inspect -f '{{.State.Health.Status}} {{len .NetworkSettings.Networks}}' pcbk-core; /usr/bin/grep -c '^GW_' .env; ls "$SD"/student-*.pw | wc -l; /usr/bin/grep -rlE 'location[^{]*/pcbk' /opt/dify/docker/nginx/ 2>/dev/null | wc -l; curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(sorted((c["component"], c["state"]) for c in json.load(sys.stdin)["checks"]))' > ~/pcbk-d5a-rows.txt; docker ps --format '{{.Names}} {{.Status}}' > ~/pcbk-d5a-before.txt`.
   Expected:
+  - Docker сервера ≥ 28 (Ш15). Иначе — строка владельцу, и `ADMIN_NETS` до
+    Д12 — без `pcbk-egress` (правка `zones.py` одним коммитом):
+    администратор читает `/health/llm` через `docker exec` на петлю. На
+    Docker < 28 возможна прямая маршрутизация в `pcbk-egress` извне;
   - `sp-ctl` работает, десять мест не `running`;
   - `core` `healthy` в 12 сетях;
   - `GW_*` в `.env` нет (0), файлов паролей мест — 10;
   - у nginx Dify нет путей `/pcbk` (0) — префикс шлюза свободен;
   - снимок строк страницы (`~/pcbk-d5a-rows.txt`) — база для «как до
     выкладки».
-- [ ] **Step 4: Замер полного прогона.** Настенное время последнего полного
-  интеграционного прогона Д4б (из его журнала или повтором) — в
-  `docs/checks/D5a.md`. Expected: число минут записано; к нему Д5а добавляет
-  около 9 минут.
+- [ ] **Step 4: Замер полного прогона и темп.** В `docs/checks/D5a.md`:
+  - настенное время последнего полного интеграционного прогона Д4б — 13:48,
+    91 passed (отчёт задачи 4 Д4б; доводка гоняла только два модуля, 8:54).
+    К нему Д5а добавляет около 9 минут;
+  - темп для правила деления (Ш19): пока Д4б не закрыт, строки «темп кода до
+    черты» у Д4а и Д4б нет, и правило читает промежуточный темп Д4б тем же
+    способом: `pace "$(at 70b6297)" "$(at 02bc03e)" 5.55` (задачи 1–4 Д4б) —
+    по предпроверке 1,70 ч, доля **0,31**, деления нет. Строка — с
+    пометкой «до закрытия Д4б».
+
+  Expected: обе строки записаны; доля ≤ 0,5.
 - [ ] **Step 5: Commit** (после проверки на секреты) —
   `git add docs/checks/D5a.md && git commit -m "Д5а: утро — хвосты Д4б, имена и сигнатуры сверены, стенд Д4б жив, префикс /pcbk свободен"`.
 
@@ -1343,11 +1489,18 @@ docs/checks/D5a.md, docs/checks/D5a/*.png
   прочие его проверки остаются)
 
 **Interfaces:**
-- Consumes: `Check` (с `note` — Д4а), `_http_get`, `_json_object`,
-  `NET_CHECK_TIMEOUT_S`, `KINDS`, `_check_one`, `Settings`, `fake_core` —
-  Д1–Д4б.
+- Consumes: `Check` (с `note` — Д4а), `_http_get`, `LlmReply.parse` (образец
+  разбора; `_json_object` у сторожа нет — Ш8), `NET_CHECK_TIMEOUT_S`, `KINDS`,
+  `_check_one`, `Settings`, `fake_core` — Д1–Д4б.
 - Produces:
   - `WAKE_FAILS_FAIL = 3`, `LOGIN_FAILS_WARN = 30`, `REASON_CHARS` (Д3а — 80);
+  - `GW_OFF_CONTRACT_DETAIL = "шлюз ответил не по договору"`;
+  - `GatewayReply.parse(reply) -> GatewayReply` — по образцу `LlmReply.parse`
+    (Ш8): JSON не объект, нет ключа Д5а или тип не тот (`store_ok` не
+    `bool`, счётчики `_1h`/`_n` не целые, `checked_at` не строка и не `null`)
+    → `ValueError`. Ключи Д5б (`refused_1h`, `streams`, `stream_broken_1h`,
+    `upstream_failed_1h`) — необязательные: ответ `core :d5a` во время
+    выкладки;
   - `check_gateway(component: str, title: str, url: str, now: datetime, stale_s: int, timeout: float = NET_CHECK_TIMEOUT_S) -> Check`
     — таблица ниже, первая подходящая сверху; `http.client`, без
     перенаправлений;
@@ -1363,6 +1516,7 @@ docs/checks/D5a.md, docs/checks/D5a/*.png
 | Ответ `/health/gateway` | Итог | `note` |
 |---|---|---|
 | нет соединения, таймаут, HTTP ≠ 200, не JSON | `fail` «шлюз не отвечает» | — |
+| JSON, но не по договору (`GatewayReply.parse` → `ValueError`) | `fail` «шлюз ответил не по договору» | — |
 | `config_error` не `null` | `fail` «ошибка настройки: {config_error}» (до 80 знаков; причина между тактами не меняется) | — |
 | `store_ok == false` | `fail` «учётные записи недоступны» | — |
 | `checked_at` — `null` | `unknown` «уборщик простоя ещё не проходил» | — |
@@ -1425,6 +1579,11 @@ def test_gateway_unreachable_or_garbage_is_fail(fake_core):
     fake_core.set_gateway_raw("не json")
     r = check_gateway("gateway", "Шлюз и вход", fake_core.base + "/health/gateway", T0, 120, timeout=0.5)
     assert (r.state, r.detail) == ("fail", "шлюз не отвечает")
+    bad = gw(); del bad["store_ok"]
+    for obj in (bad, gw(store_ok="да"), gw(running_n="1"), [1, 2]):                   # Ш8: не KeyError, а внятная строка
+        fake_core.set_gateway(obj)
+        r = check_gateway("gateway", "Шлюз и вход", fake_core.base + "/health/gateway", T0, 120, timeout=0.5)
+        assert (r.state, r.detail) == ("fail", "шлюз ответил не по договору"), obj
 
 # watchdog/tests/test_main.py
 def test_components_file_d5a():
@@ -1519,7 +1678,12 @@ def test_gw_stale_setting():
       трогает;
     - `locked(login) -> bool`, `failure(login)`, `unlock(login)`. Для
       существующих логинов — таблица, для прочих — `OrderedDict` в памяти на
-      `UNKNOWN_KEYS` ключей (вытесняется самый старый).
+      `UNKNOWN_KEYS` ключей (вытесняется самый старый) **под
+      `threading.Lock`** (Ш23: операции идут из пула потоков, как счётчики
+      `EventLog`/`Ledger`);
+    - scrypt и прочие долгие шаги — вне открытой транзакции записи: `core.db`
+      делят журнал событий Д3б (запись ждёт блокировку ≤ 0,5 с) и учёт Д4а
+      (Г14 предпроверки).
   - `main(argv: list[str] | None = None) -> int` —
     `python -m pcbk_core.gateway.accounts`:
     - `add --login L --role student|teacher [--place N] [--generate] [--same-person]`;
@@ -1683,6 +1847,19 @@ def test_probe_sees_lock_and_missing_file(tmp_path, monkeypatch):               
         f.unlink()
     assert s.ping() is False and not (tmp_path / "core.db").exists()                   # mode=rw: пустую базу не создаёт
 
+def test_unknown_failures_thread_safe(tmp_path):                                       # Ш23
+    s, errors = store(tmp_path), []
+    def hammer(k):
+        try:
+            for i in range(2000):
+                s.failure(f"nobody-{k}-{i}"); s.locked(f"nobody-{k}-{i // 2}")
+        except Exception as e:                                                         # исключение потока pytest не видит
+            errors.append(type(e).__name__)
+    threads = [threading.Thread(target=hammer, args=(k,)) for k in range(8)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert errors == [] and len(s.unknown_failures) == UNKNOWN_KEYS
+
 def test_remove_only_disabled(tmp_path):
     s = store(tmp_path)
     s.add("teach", "teacher", None, PW)
@@ -1808,6 +1985,10 @@ PLACE_TEXTS = {
       прохода обновляются `checked_at` (часы стены, для JSON),
       `last_tick_mono` (для `health()` роли) и `ticks`. До первого прохода
       `last_tick_mono` — время создания `Workplaces` по монотонным часам;
+    - `next_tick_s() -> float` — пауза до следующего такта: пока
+      `sp_ctl == "down"` — `min(5, GW_REAPER_TICK_S)`, иначе
+      `GW_REAPER_TICK_S` (Ш10: первый отказ охраны выхода к ещё не
+      разрешённому имени `pcbk-sp-ctl` не красит строку на полминуты);
     - `sp_ctl: Literal["ok", "down", "unknown"]`, `checked_at: datetime | None`,
       `running: set[int]`.
 
@@ -1970,6 +2151,15 @@ async def test_hung_sp_ctl_short_tick(tmp_path):
     assert w.sp_ctl == "down" and w.checked_at is not None
     assert [c for c in w.docker.calls if c[0] == "inspect"] == []
 
+async def test_next_tick_short_while_sp_ctl_down(tmp_path):                          # Ш10
+    docker = FakeDocker(running={1}, down=True)
+    w = make_places(tmp_path, docker)
+    await w.tick()
+    assert w.sp_ctl == "down" and w.next_tick_s() == 5.0                               # GW_REAPER_TICK_S = 30
+    docker.down = False                                                                # адрес появился в кэше охраны
+    await w.tick()
+    assert w.sp_ctl == "ok" and w.next_tick_s() == 30.0
+
 async def test_stop_failure_counted(tmp_path):
     w = make_places(tmp_path, FakeDocker(running={6}, stop_status=500), GW_IDLE_STOP_S=60.0)
     await w.tick(); w.mono.advance(61); await w.tick()
@@ -2005,12 +2195,27 @@ def test_place_name_checked():
   - `core/tests/helpers.py`: `BDRV_CFG`, `ORIGIN`, `gateway_role`,
     `make_gateway`, `login`; `make_app` и `make_llm_app` Д3б/Д4а ставят
     `app.state.zone_names_ok = True`;
-  - `core/tests/test_llm_role.py` (Д4а: `test_egress_targets_include_openrouter`
-    зовёт `egress_targets(LLM_SETTINGS, GW_SETTINGS, cfg)` и сверяет `[:2]`);
+  - `core/pcbk_core/data/http_api.py` (Д3б: `bearer_caller(…, *, scope)` —
+    токен места только из его сети, Ш25) и все пять его вызовов
+    (`data/http_api.py:81, 183`, `data/mcp_server.py:75, 152`,
+    `llm/api.py:467`);
   - `core/tests/conftest.py`: фикстура `gwlog` (строки журнала по F13).
+  - **тесты прежних дней, которые А4 делает красными (Ш3)** — правятся здесь
+    же, иначе шаг 4 не зелёный:
+    - `test_skeleton.py:317` — `set(roles) == {"data", "llm", "gateway"}`;
+    - `test_llm_role.py:478–483` (`test_egress_targets_include_openrouter`) и
+      `:885` — новая сигнатура `egress_targets(llm, gw, cfg)`, сверка срезом
+      `[:2]` и `[:1]` вместо точного равенства;
+    - `test_egress.py:218–219` (`test_serve_installs_guard_and_stays_up`) —
+      строки «разрешено 13 направлений» и «разрешено 12 направлений»; в
+      окружение теста — `SP_CTL_URL=http://127.0.0.1:<закрытый порт>` и
+      `STU_NET` по умолчанию: тесты не ходят в DNS (П3 Д4а), а имя
+      `pcbk-sp-ctl` поток адресов разрешал бы до 5 с;
+    - прочие вызовы `bearer_caller` в тестах Д3б/Д4а — с `scope=`.
 - Test: `core/tests/test_gw_api.py` (`pytestmark = pytest.mark.anyio`),
   `core/tests/test_gw_role.py`, `core/tests/test_zones.py`,
-  `core/tests/test_hooks.py` (+2), `core/tests/test_llm_role.py` (+1)
+  `core/tests/test_hooks.py` (+3), `core/tests/test_llm_role.py` (+1),
+  `core/tests/test_http.py` (+1, Ш25)
 
 **Interfaces:**
 - Consumes: задачи А2–А3; `RoleBase`, `create_app`, `hooks_of` (Д3а/Д4а);
@@ -2020,7 +2225,10 @@ def test_place_name_checked():
 - Produces (`settings.py`) — `GatewaySettings.from_env(env=None) -> GatewaySettings`
   со своими проверками (как `LlmSettings` Д4а: поля шлюза не входят в
   `Settings`, их ошибка не роняет `main()`). Пустое — умолчание, ошибка —
-  `ValueError` с именем поля:
+  `ValueError` с именем поля и правилом, **без сырого значения** (решение
+  Д4а, Ш9: опечатка, путь или токен в `GW_ORIGIN` не должны уйти на страницу
+  состояния и в ответ 503). `settings.py` не импортирует `httpx` и
+  `fastapi` (П8 Д4а):
 
 | Поле | По умолчанию | Проверка |
 |---|---|---|
@@ -2038,23 +2246,41 @@ def test_place_name_checked():
   - `FRONT_NETS`, `ADMIN_NETS` — по Д5-R31;
   - `dest_in(scope, nets) -> bool`:
     - `scope["server"]` = `None` → `False`;
+    - берётся `scope["server"][0]` (у uvicorn — кортеж, у `TestClient`
+      Starlette — список);
     - адрес → входит ли в одну из сетей;
     - имя вместо адреса → `True`, только если у приложения
       (`scope["app"].state`) стоит `zone_names_ok = True`; иначе `False` и
       одна строка журнала за процесс «адрес назначения — не IP: считаю
       чужим»;
-  - `is_front(scope)`, `is_admin(scope)`.
+  - `is_front(scope)`, `is_admin(scope)`;
+  - `caller_net_ok(scope, caller: str) -> bool` (Ш25): вызывающий не
+    `student-NN` → `True`; адрес `scope["client"][0]` не IP или `client` =
+    `None` → `True` (клиент тестов в процессе); иначе `True`, только если
+    адрес в `{STU_NET}.N.0/28` (N — из имени) или в `ADMIN_NETS`. `STU_NET`
+    — `scope["app"].state.pcbk_stu_net` (ставит `install` шлюза), без него
+    `172.31`, как в `compose.yaml`.
+- Produces (`data/http_api.py`, Д3б — правка): `bearer_caller(authorization,
+  tokens, *, scope) -> str | None` — после сверки токена
+  `zones.caller_net_ok(scope, caller)`; `False` → `None`, и вызов идёт тем же
+  путём 401, что чужой токен (без события). `scope` обязателен: пять вызовов
+  не забудут его молча.
 - Produces (`hooks.py`, Д4а — дополнение):
   - `HttpExceptionHandler = Callable[[Request, StarletteHTTPException], Awaitable[Response]]`;
   - `AppHooks.http_exception(prefix: str, handler: HttpExceptionHandler) -> None`
     — повтор префикса → `ValueError`, как у `validation` и `body_limit`;
   - `AppHooks.http_handler_for(path: str) -> HttpExceptionHandler | None` — по
     самому длинному подходящему префиксу.
-- Produces (`app.py`, Д4а — дополнение): после `install(app)` всех ролей
-  `create_app` ставит один `app.add_exception_handler(StarletteHTTPException, …)`
-  рядом с единственным обработчиком 422. Он зовёт `http_handler_for(path)`,
-  иначе `fastapi.exception_handlers.http_exception_handler`. Роли сами
-  `add_exception_handler` и `add_middleware` не зовут (правило Д4а).
+- Produces (`app.py`, Д4а — дополнение `_install_hooks`): после
+  `install(app)` всех ролей `create_app` ставит один
+  `app.add_exception_handler(StarletteHTTPException, …)` рядом с единственным
+  обработчиком 422. Он зовёт `http_handler_for(request.scope["path"])`, иначе
+  `fastapi.exception_handlers.http_exception_handler`. Роли сами
+  `add_exception_handler` и `add_middleware` не зовут (правило Д4а), и это
+  проверяется механически, как у 422 (Ш5): если после `install` ролей
+  `app.exception_handlers[StarletteHTTPException]` — не
+  `fastapi.exception_handlers.http_exception_handler`, сборка бросает
+  `ValueError("обработчик HTTPException ставится через реестр hooks_of(app).http_exception, не напрямую")`.
 - Produces (`llm/api.py`, Д4а): `GET /health/llm` — при
   `not zones.is_admin(request.scope)` из ответа убираются
   `account_remaining_usd`, `key_usage_usd`, `key_spent_usd`.
@@ -2166,9 +2392,13 @@ GW_MESSAGES = {
     `hooks_of(app).http_exception("/health/gateway", handler)` (отказ
     `front_only` там тоже JSON вида OpenCode), где `handler`
     отдаёт `gw_error` с тем же кодом (404 → `NotFound`, 405 →
-    `MethodNotAllowed`, прочее — по таблице имён `gw_error`). В Д5б сюда же
-    добавляется `hooks_of(app).body_limit("/pcbk/api/oc/", …)`. Обработчика
-    422 шлюзу не нужно: тела он разбирает сам, без моделей pydantic;
+    `MethodNotAllowed`, прочее — по таблице имён `gw_error`). Ещё
+    `hooks_of(app).body_limit("/pcbk/api/", 65536, refusal=lambda n: {"name": "PayloadTooLarge", "data": {"message": "Запрос слишком большой"}})`
+    (Ш22: иначе мимо `edge` 413 было бы `{"detail": …}`); в Д5б — более
+    длинный префикс `/pcbk/api/oc/` (выбор по самому длинному). Ещё
+    `app.state.pcbk_stu_net = gw.STU_NET` для сверки сети токенов (Ш25).
+    Обработчика 422 шлюзу не нужно: тела он разбирает сам, без моделей
+    pydantic;
   - `health()` — без ввода-вывода, первое подходящее:
     - `config_error` → `(False, "ошибка настройки: " + config_error[:60])`;
     - `store.probe_failures > 0` или `store.op_failures > 0` →
@@ -2204,18 +2434,22 @@ GW_MESSAGES = {
        1. строка журнала «шлюз: учётных записей студентов N, простой до сна
           1800 с» (`students()` в потоке; `StoreError` → та же строка с `?`
           вместо N); при учениях — «УЧЕНИЯ: DRILL_GATEWAY=…»;
-       2. первый `tick()` сразу, дальше раз в `GW_REAPER_TICK_S`; каждый
+       2. первый `tick()` сразу, дальше через `workplaces.next_tick_s()`
+          (`GW_REAPER_TICK_S`, при `sp_ctl == "down"` — до 5 с, Ш10); каждый
           такт — ещё `store.ping()` в потоке;
        3. исключение такта (и первого) — строка «такт уборщика: <класс
           ошибки>», цикл живёт. При `freeze_reaper` — только первый такт;
-    5. на выходе — отмена задачи и `aclose()`.
+    5. на выходе — отмена задачи и `aclose()` клиентов, каждый под `try` со
+       строкой `log.warning`, как у роли `llm` (Ш9).
 - Produces (`main.py`):
   - `egress_targets(llm: LlmSettings, gw: GatewaySettings, cfg: BdrvConfig | None)` —
     к направлениям Д4а добавляются `(хост SP_CTL_URL, порт)` и
     `(f"{STU_NET}.{n}.3", 4096)` для n = 1…10; строка журнала «охрана выхода:
     разрешено 13 направлений» (12 без историана);
   - `build_roles(settings, env=None)` (сигнатура Д4а, П6) добавляет роль
-    шлюза (по образцу ролей Д3а/Д4а: ошибка — причина, процесс жив):
+    шлюза через `build_gateway_role(settings, env)` рядом с
+    `build_llm_role`; `import pcbk_core.gateway` — внутри функции (П8 Д4а,
+    Ш9). По образцу ролей Д3а/Д4а: ошибка — причина, процесс жив:
     - `GatewaySettings.from_env(env)` — из того же `env`, что `LlmSettings`
       (тесты не читают окружение и `/run/secrets`), под `try`; `ValueError`
       → `GatewaySettings()` и причина «настройки шлюза: <текст>»;
@@ -2343,6 +2577,8 @@ def test_errors_are_opencode_json_without_www_authenticate(tmp_path):
             assert login(c, "stu-03", pw="неверный-1").status_code == 401
         r = login(c, "stu-03")
         assert (r.status_code, r.json()["name"]) == (429, "TooManyAttempts")
+        r = c.post("/pcbk/api/auth/login", content=b"x" * 70000, headers={"Origin": ORIGIN, "Content-Type": "application/json"})
+        assert (r.status_code, r.json()["name"]) == (413, "PayloadTooLarge")          # Ш22: и мимо edge — вид OpenCode
 
 async def test_login_scrypt_bounded(tmp_path, monkeypatch):                             # Review Focus 5 Д5а (память)
     app, role = make_gateway(tmp_path)
@@ -2422,16 +2658,21 @@ def test_hostname_fails_closed_without_opt_in(tmp_path):                        
         assert c.get("/pcbk/api/auth/me").status_code == 404
         assert c.get("/health/gateway").status_code == 404
 
-def test_uvicorn_scope_server_is_ip():                                                  # решение контролёра р2
+def test_uvicorn_scope_server_is_ip():                                                  # решение контролёра р2; Ш6, Ш25
     seen = {}
     async def probe(scope, receive, send):
-        seen["server"] = scope["server"]
+        if scope["type"] == "lifespan":                                                # serve_app — lifespan="on"
+            while (msg := await receive())["type"] != "lifespan.shutdown":
+                await send({"type": "lifespan.startup.complete"})
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        seen["server"], seen["client"] = scope["server"], scope["client"]
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
     with serve_app(probe) as url:
         httpx.get(url + "/")
-    host, _port = seen["server"]
-    assert ipaddress.ip_address(host).is_loopback                                      # адрес, а не имя
+    for key in ("server", "client"):
+        assert ipaddress.ip_address(seen[key][0]).is_loopback, key                     # адрес, а не имя
 
 # core/tests/test_gw_role.py
 def test_settings_gateway_validation():
@@ -2443,6 +2684,9 @@ def test_settings_gateway_validation():
         with pytest.raises(ValueError):
             GatewaySettings.from_env(bad)
     assert Settings.from_env({"GW_ORIGIN": "http://x"})                                # Settings поля шлюза не знает
+    with pytest.raises(ValueError) as e:
+        GatewaySettings.from_env({"GW_ORIGIN": "https://x/tok-SECRET"})
+    assert "GW_ORIGIN" in str(e.value) and "SECRET" not in str(e.value)                # Ш9: без сырого значения
 
 def test_gateway_settings_error_keeps_core(tmp_path):                                   # блокер р2; Review Focus 4
     settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
@@ -2549,8 +2793,8 @@ def test_freeze_reaper_drill_stops_ticks(tmp_path):                             
         assert c.get("/healthz/gateway").json() == {"ok": False, "detail": "уборщик простоя молчит"}
 
 # core/tests/test_llm_role.py (+)
-def test_health_llm_redacted_off_admin(tmp_path):                                       # Д4б-R23
-    app, _ = make_llm_app(tmp_path)
+def test_health_llm_redacted_off_admin(tmp_path, fake_or):                              # Д4б-R23
+    app, _ = make_llm_app(tmp_path, fake_or)                                           # П3: без сети (Ш7)
     money = {"account_remaining_usd", "key_usage_usd", "key_spent_usd"}
     for base, full in (("http://172.31.6.2:8000", False), ("http://172.31.250.82:8000", True),
                        ("http://172.31.250.34:8000", True)):
@@ -2567,6 +2811,26 @@ def test_http_exception_dispatch_by_prefix():
     with pytest.raises(ValueError):
         h.http_exception("/pcbk/api/", HANDLER_B)
 
+def test_role_own_http_exception_handler_is_refused():                                 # Ш5: как у 422
+    class Bypass(DummyRole):
+        def install(self, app):
+            app.add_exception_handler(StarletteHTTPException, lambda request, exc: None)
+    with pytest.raises(ValueError, match="реестр"):
+        create_app(SETTINGS, [Bypass("llm", (True, "ок"))])
+
+# core/tests/test_http.py (+) — Ш25, защита в глубину
+def test_place_token_only_from_its_network(tmp_path):
+    app, role = make_app(tmp_path)
+    auth, body = {"Authorization": f"Bearer {TOKEN}"}, {"tags": ["20FAKE_001_PV"]}   # токен student-01
+    for client, code in ((("172.31.1.3", 40000), 200), (("172.31.2.3", 40000), 401),  # своё место / чужое
+                         (("172.31.250.81", 40000), 200), (("10.9.9.9", 40000), 401)):  # хост в pcbk-egress / прочие
+        with TestClient(app, client=client) as c:                                      # адрес источника — scope["client"]
+            wait_until(lambda: role.catalog.loaded)
+            before = len(role.events.recent(channel="http"))
+            assert c.post("/api/data/tag_now", json=body, headers=auth).status_code == code, client
+            if code == 401:
+                assert len(role.events.recent(channel="http")) == before              # как чужой токен — без события
+
 def shape(r):
     try:
         body = r.json()
@@ -2574,10 +2838,11 @@ def shape(r):
         return r.status_code, r.headers.get("content-type"), r.text
     return r.status_code, r.headers.get("content-type"), sorted(body) if isinstance(body, dict) else type(body).__name__
 
-def test_error_shapes_unchanged_with_gateway(tmp_path):                                  # чужие ответы не тронуты
+def test_error_shapes_unchanged_with_gateway(tmp_path, fake_or):                         # чужие ответы не тронуты
     def responses(extra):
         (tmp_path / f"d{len(extra)}").mkdir()                                          # make_app каталог не создаёт
-        app, _ = make_app(tmp_path / f"d{len(extra)}", extra_roles=[make_llm_role(tmp_path / f"l{len(extra)}"), *extra])
+        llm = make_llm_role(tmp_path / f"l{len(extra)}", fake_or)                     # П3: без сети (Ш7)
+        app, _ = make_app(tmp_path / f"d{len(extra)}", extra_roles=[llm, *extra])
         with TestClient(app) as c:
             return [shape(r) for r in (
                 c.post("/api/data/tag_now", json={"tags": "не список"}, headers={"Authorization": f"Bearer {TOKEN}"}),
@@ -2865,23 +3130,61 @@ test("ответ /me", () => {
       `test_core_is_the_sp_ctl_client`
       (`http_from_core("GET", CTL + "/_ping") == 200`,
       `http_as("pcbk-intruder", "pcbk-ctl", …) == 403`);
-    - у `pcbk-core` 13 сетей;
+    - у `pcbk-core` 13 сетей: **оба** равенства набора сетей
+      (`test_core.py:48` — живой `inspect`, `:55` — `prod_config`) получают
+      `pcbk-ctl` (Ш4);
+    - секреты `core` (`test_core.py:94–96`): к пяти (`bdrv.env`,
+      `core-tokens`, `llm-tokens`, `openrouter-mgmt.key`, `openrouter.key`)
+      добавляются `student-01.pw` … `student-10.pw` — всего 15 (Ш4);
+    - `test_core_health_routes_on_egress_address` — `/healthz` 200 ждётся
+      через `wait_for` до 60 с, а не одним запросом: в нём теперь и здоровье
+      шлюза, а первые секунды после подъёма стенда `sp_ctl` может быть
+      `down` (Ш4, Ш10);
+    - `test_socket_proxy.py::test_status_json_overall_ok` идёт после
+      `test_gateway`, чей последний тест пересоздаёт `core` (счётчики сброшены)
+      — зависимость порядка записана в его docstring (Ш4);
     - строка Д4а «охрана выхода: разрешено 2 направления» → «разрешено 13
       направлений»;
     - новый `test_front_subnet_matches_compose`:
       `prod_config()["networks"]["pcbk-front"]["ipam"]["config"][0]["subnet"] == zones.FRONT_NETS[0]`
-      (строка сверяется текстом, без импорта `pcbk_core`);
+      и то же для `pcbk-egress` против `ADMIN_NETS[-1]` (Ш15; строки
+      сверяются текстом, без импорта `pcbk_core`);
   - `test_conversation.py::test_place_reaches_only_core` — в список нулей
     добавляются адреса `pcbk-sp-ctl` и `pcbk-core` в `pcbk-ctl` на 2375 и
     8000, а также (р4) адрес `pcbk-core` в `pcbk-front` на 8000 и адрес
     `pcbk-edge` в `pcbk-front` на 8443 — оба из `stack.inspect`, адреса
     динамические. Зона `front` открывает ручки шлюза всему, что пришло на
     адрес `core` в `pcbk-front`, и держится на том, что у места туда нет
-    маршрута. Положительный контроль — из `pcbk-front`:
-    `stack.http_front("GET", "/healthz")` → 200;
+    маршрута. У каждого нуля — свой положительный контроль тем же адресом и
+    портом из своей сети, как у нулей Д4б (Ш21):
+    `stack.probe("pcbk-ctl", <адрес sp-ctl>, 2375) == 1`,
+    `stack.probe("pcbk-front", <адрес core в pcbk-front>, 8000) == 1`,
+    `stack.probe("pcbk-front", <адрес edge в pcbk-front>, 8443) == 1`;
   - `test_edge.py`: `IMAGES` — `core` и сторож `:d5a`;
     `DECLARED_ENV["pcbk-core"]` + `STU_NET`, `GW_ORIGIN`, `GW_IDLE_STOP_S`,
     `GW_REAPER_TICK_S`, `DRILL_GATEWAY`; у сторожа + `GW_STALE_S`.
+- Модули идут по очереди, и каждый гасит свои места к концу, в том числе в
+  `finally` фикстур (Ш16): `test_entry` (01, 03, 04, 05) пересекается с
+  модулями прежних дней (01, 02, 03, 10) и безвреден только так.
+
+- [ ] **Step 0: Теги образов — первой правкой, до любой сборки (Ш2).**
+  Д4б ещё не выложен, и `Stack.up()` делает `compose up --build`: прогон с
+  тегами `:d4b` пересобрал бы откатный образ Д4б кодом Д5, и выкладка Д4б
+  увезла бы на сервер Д5.
+  1. До этого шага в Д5 нет ни `docker compose build`, ни интеграционных
+     прогонов — в том числе у ревьюеров А1–А5 (строка в их брифах).
+  2. ID образов снимаются: `docker image inspect -f '{{.Id}}' pcbk-reserve/core:d3a pcbk-reserve/core:d4a pcbk-reserve/core:d4b pcbk-reserve/watchdog:d3a pcbk-reserve/watchdog:d4a pcbk-reserve/watchdog:d4b > "$JOB"/images-before.txt`
+     и `student:d4` по содержимому (как в отчёте задачи 4 Д4б).
+  3. `compose.yaml`: у `core` и `watchdog` — `image: …:d5a`;
+     `test_edge.py`: `IMAGES` — `:d5a`. Коммит
+     `git commit -m "Д5а: теги образов core и сторожа :d5a до первой сборки" -- compose.yaml tests/integration/test_edge.py`.
+  4. После **каждого** интеграционного прогона Д5 — тот же `inspect` в
+     `images-after.txt`, `diff` пуст.
+
+  Образы для выкладок Д3а…Д4б собираются из своей ветки или тега (отдельный
+  `git worktree` на её голове), а не из дерева `d5a` — строка в README
+  («Выкладка: образ — из ветки своего дня») и в брифы выкладок.
+  Expected: коммит тегов — первый коммит А6; `diff` ID — пусто.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3129,7 +3432,9 @@ def test_core_down_login_json_503(stack, accounts):
     `GW_*` — строка «ошибка настройки», служба данных работает;
   - простой и уборщик: места, поднятые вручную, засыпают через 30 минут после
     того, как их увидел уборщик;
-  - учения `DRILL_GATEWAY`;
+  - учения `DRILL_GATEWAY` (в `note` строки — «учения: freeze_reaper»; у
+    LLM-прокси форма другая — «учения DRILL_LLM=402»; выравнивание — итоговой
+    доводкой одним коммитом, Ш18);
   - откат Д5а (шаг 3).
 - Modify: `deploy/README.md` — раздел Д2 «Новый студент», пункт «Смена
   студента в слоте 01–10» заменяется:
@@ -3222,7 +3527,7 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
   и то же для `d5-probe-t --role teacher`. Файлы `.cred` (логин и пароль)
   собираются на сервере в `~/pcbk-d5/` и `scp` уходят в `$JOB` с правами
   `0600`. Файлы видов секретов — `mkforms` Global Constraints одной
-  цепочкой: `mkforms "$HOME/pcbk-d5/probe-a.pw" a && mkforms "$HOME/pcbk-d5/probe-t.pw" t && mkforms /opt/pcbk-reserve/secrets/student-10.pw 10`.
+  цепочкой после `SD` из `.env` (Ш24): `mkforms "$HOME/pcbk-d5/probe-a.pw" a && mkforms "$HOME/pcbk-d5/probe-t.pw" t && mkforms "$SD/student-10.pw" 10`.
   Expected: `list` показывает две учётки; `stat -c '%a' ~/pcbk-d5/*` → `600`;
   цепочка — код `0` и три «совпало с источником»; у каждого `forms-*` —
   `/usr/bin/grep -c '^$'` → `0`; уникальных первых строк — `3`; пароли на
@@ -3388,7 +3693,10 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
   Петля — до нуля блокеров, число раундов владелец не ограничил (29.09, «Не
   лимитирую LOOP»). Если черта сработала — второй раунд, слияние и тег уходят
   в задачу Б0.
-- [ ] **Step 3: Слияние.** В `main`, тег `platform-d5a`. Перед пушем:
+- [ ] **Step 3: Слияние — после `platform-d4b` (Ш1).** Ветка
+  `d5a/entry-workplaces` перебазируется на `main` с тегом `platform-d4b`,
+  прогон А6, шаг 4 повторяется (с ID образов до и после, Ш2), затем слияние в
+  `main` и тег `platform-d5a`. Перед пушем:
   - проверка на секреты по ветке, с положительными контролями шаблонов cookie
     и `scrypt`;
   - `git ls-files | /usr/bin/grep -cE '(\.cred|\.pw|core\.db|core-tokens|llm-tokens|\.(llm-token|data-token)|openrouter.*\.key)$'` → `0`.
@@ -3402,8 +3710,8 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
   `at`/`msg`/`pace` Д4а (задача 0, шаг 1a: дата автора `%aI` — её не меняет
   перебазирование):
   - темп кода до черты —
-    `pace "$(msg 'Сторож: вид gateway')" "$(msg 'Вход и места в компоновке')" 10.75`
-    (коммиты задач А1 и А6, между ними задачи А2–А6 — 10,75 ч по шкале). Эту
+    `pace "$(msg 'Сторож: вид gateway')" "$(msg 'Вход и места в компоновке')" 12.25`
+    (коммиты задач А1 и А6, между ними задачи А2–А6 — 12,25 ч по шкале). Эту
     строку читает правило деления Д5б;
   - полное время дня — от `%aI` первого коммита ветки до тега
     `platform-d5a`, справочно (в него входят окна и петля критика); плюс
@@ -3425,8 +3733,10 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
 теряются. Владелец видит прогон автотестов шлюза на сервере и журнал отказов;
 строка «Шлюз и вход» показывает отказы, обрывы потока и немые места.
 
-**Предпосылка.** Д5а влит в `main` с тегом `platform-d5a` (или хвосты — в
-задаче Б0). Ветка дня — `d5b/gateway-whitelist`.
+**Предпосылка (Ш1).** Ветка дня `d5b/gateway-whitelist` — от головы
+`d5a/entry-workplaces` (по цепочке, как Д5а от `d4b`). Код Б1–Б5 идёт без
+сервера; Б0 и Б6–Б8 — после `platform-d5a` и выкладки Д5а. Слияние Д5б — после
+`platform-d5a`, с перебазированием на `main` и повтором прогона Б5, шаг 4.
 
 **Влезает ли в день — оценка по часам.**
 
@@ -3434,22 +3744,22 @@ Chrome с `--remote-debugging-port` под CDP на Node ≥ 22 (встроен�
 |---|---|---|
 | Б0. Хвосты Д5а; утро: предпроверки сервера | 0,5 | сервер |
 | Б1. Счётчики прокси и строки сторожа (наблюдение до функций) | 0,75 | локально |
-| Б2. Правила белого списка и сборка тел | 1,5 | локально |
-| Б3. Прокси вызовов `/pcbk/api/oc/*` | 2,0 | локально |
+| Б2. Правила белого списка и сборка тел | 1,75 | локально |
+| Б3. Прокси вызовов `/pcbk/api/oc/*` | 2,25 | локально |
 | Б4. Поток `/event` | 1,75 | локально |
-| Б5. `edge`, общая таблица случаев, интеграционные и живые автотесты | 3,5 | локально |
+| Б5. `edge`, общая таблица случаев, интеграционные и живые автотесты | 3,75 | локально |
 | Б6. Выкладка | 0,5 | сервер |
 | Б7. Живой прогон автотестов, учение, журнал отказов | 1,25 | сервер |
 | Б8. Закрытие дня | 1,25 | — |
-| **Критический путь** | **13,0** | |
+| **Критический путь** | **13,75** | |
 
-Основание «один день» — как в Д5а (при 0,30 — около 3,9 ч). Если «темп кода
+Основание «один день» — как в Д5а (при 0,30 — около 4,1 ч). Если «темп кода
 до черты» Д5а (А9, шаг 4, первая строка) хуже 0,5, Д5б до начала дня
 делится: Б0–Б6 и шаги 1–3 Б7 — первый день, остальное — второй.
 
-**Черта отсечения — конец пятого часа** плюс превышение хвостов Д5а над
-0,5 ч. К черте зелёны задачи Б0–Б5: по плановой шкале 10,0 ч, по доле 0,30 —
-≈3,0 ч. Черта ловит темп хуже 0,5 (5 / 10,0). По ходу — та же сверка
+**Черта отсечения — 5,5 ч от начала дня** плюс превышение хвостов Д5а над
+0,5 ч. К черте зелёны задачи Б0–Б5: по плановой шкале 10,75 ч, по доле 0,30
+— ≈3,2 ч. Черта ловит темп хуже ≈0,51 (5,5 / 10,75). По ходу — та же сверка
 `pace` от коммита Б1 после каждой задачи кода. После черты порядок жёсткий:
 Б6 → Б7 → Б8.
 - **Б5 не зелёна к черте.** Выкладки нет. Видимый результат — прогон
@@ -3689,10 +3999,11 @@ docs/checks/D5b.md, docs/checks/D5b/*.png
 **Files:**
 - Create: `docs/checks/D5b.md`
 
-- [ ] **Step 1:** Всё, что черта Д5а перенесла сюда: второй раунд критика,
-  слияние и тег `platform-d5a`, чистый клон. Expected: вердикты в
-  `docs/checks/D5a.md`; ветка `d5b/gateway-whitelist` — от `main` после тега.
-- [ ] **Step 2: Предпроверки сервера (только чтение).**
+- [ ] **Step 1 — после `platform-d5a` (Ш1):** всё, что черта Д5а перенесла
+  сюда: второй раунд критика, слияние и тег `platform-d5a`, чистый клон.
+  Expected: вердикты в `docs/checks/D5a.md`; ветка `d5b/gateway-whitelist`
+  перебазирована на `main` после тега, прогон Б5, шаг 4 — повторён.
+- [ ] **Step 2: Предпроверки сервера (только чтение) — после выкладки Д5а.**
   `docker inspect -f '{{.State.Health.Status}} {{len .NetworkSettings.Networks}}' pcbk-core; docker exec pcbk-core python -m pcbk_core.gateway.accounts list | /usr/bin/grep -c probe; docker exec pcbk-core python -m pcbk_core.gateway.accounts list | /usr/bin/grep -c -E '^место (09|10)[[:space:]]'; docker ps -a --filter label=pcbk.role=student --format '{{.State}}' | sort | uniq -c; curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(sorted((c["component"], c["state"]) for c in json.load(sys.stdin)["checks"]))' > ~/pcbk-d5b-rows.txt; docker ps --format '{{.Names}} {{.Status}}' > ~/pcbk-d5b-before.txt`.
   Expected:
   - `core :d5a` `healthy` в 13 сетях;
@@ -3827,9 +4138,13 @@ def test_health_json_has_proxy_counters_and_stream_cap(tmp_path):
   - `filter_query(rule: Rule, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]`
     — только ключи правила и значения `true`/`false`, по одному разу, в
     исходном порядке.
+  - `AGENT_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")`;
   - `build_prompt(body: Any) -> dict` — ровно
     `{"parts": [{"type": "text", "text": …}, …]}` плюс `"agent"`, если он
-    строка (сверку агента делает прокси). Ошибки — `Refused(400, "BadRequest", <текст>, "bad_part" | "bad_body")`:
+    строка и целиком проходит `AGENT_NAME` (Ш12: ввод клиента не эхом —
+    иначе строка до 512 КиБ вернулась бы в тексте отказа `agent`); не прошла
+    — 400 `bad_body` постоянным текстом. Сверку агента с местом делает прокси;
+    в строку `gw refused` имя агента не пишется. Ошибки — `Refused(400, "BadRequest", <текст>, "bad_part" | "bad_body")`:
     - тело не объект или частей нет;
     - частей больше 20;
     - часть не объект или тип не `text` (среди них `file` с любым адресом,
@@ -3837,7 +4152,10 @@ def test_health_json_has_proxy_counters_and_stream_cap(tmp_path):
     - текст не строка, пустой или длиннее 20 000.
   - `build_update(body) -> dict` — `title` (строка 1–200) и/или `time.archived`
     (целое ≥ 0 или `null`) → `{"title"?: …, "time"?: {"archived": …}}`; пусто
-    → 400.
+    → 400. `null` шлюз пропускает как есть (Ш13): схема места 1.18.33
+    (`ArchivedTimestamp = Schema.Finite`) его не принимает, и 400 даёт само
+    место — пересборка честная, OpenCode шлюз не чинит. Живой тест Б5
+    записывает код места; кнопка «из архива» — хвост Д6.
   - `build_perm_reply(body) -> dict` — `{"reply": "once" | "reject"}`;
     `always` и прочее → 400.
   - `build_answers(body) -> dict` — `{"answers": [[str, …], …]}` в пределах;
@@ -3909,9 +4227,12 @@ def test_build_prompt():                                                        
         with pytest.raises(Refused) as e:
             build_prompt({"parts": [part]})
         assert e.value.status == 400, part
-    for body in ({}, {"parts": []}, {"parts": [{"type": "text", "text": "x"}] * 21}, [], "x"):
-        with pytest.raises(Refused):
+    for body in ({}, {"parts": []}, {"parts": [{"type": "text", "text": "x"}] * 21}, [], "x",
+                 {"parts": [{"type": "text", "text": "x"}], "agent": "a" * 65},              # Ш12: имя агента — по шаблону
+                 {"parts": [{"type": "text", "text": "x"}], "agent": "про бу"}):
+        with pytest.raises(Refused) as e:
             build_prompt(body)
+        assert "a" * 65 not in e.value.message
 
 def test_build_update_perm_answers():
     assert build_update({"title": "Новое", "permission": [{"permission": "*", "action": "allow"}], "metadata": {}}) == \
@@ -4000,7 +4321,7 @@ PROXY_MESSAGES = {
     | Ответ места | Ответ браузеру |
     |---|---|
     | 401 | 502 `BadGateway` `place_auth` + `stats.event("place_auth_failed")` |
-    | `httpx.ConnectError`, `TimeoutException`, срок хода | 503 `WorkplaceNotReady` `no_answer` + `mark_unready(n)` + `stats.event("upstream_failed")` |
+    | любая `httpx.HTTPError` (`ConnectError`, `TimeoutException`, `RemoteProtocolError`, `ReadError`, `WriteError` …), `OSError`, срок хода | 503 `WorkplaceNotReady` `no_answer` + `mark_unready(n)` + `stats.event("upstream_failed")` (Ш11: иначе исключение вышло бы из обработчика — 500 не вида OpenCode, а `logs.py` дописал бы текст исключения в журнал) |
     | тело больше `UPSTREAM_MAX_BYTES` | 502 `too_big` |
     | иначе | тот же код; тело как есть; из заголовков только `Content-Type` |
 
@@ -4087,6 +4408,11 @@ def test_place_exception_not_logging_basic(gw, gwlog):                          
     assert role.stats.count_1h("upstream_failed") == 1 and not role.workplaces.is_ready(3)
     b64 = basic.split()[1]
     assert b64 not in gwlog.text and "ConnectError" in gwlog.text
+    role.workplaces.set_ready_for_tests(3)
+    place.raise_for[3] = httpx.RemoteProtocolError(f"место упало посреди ответа {basic}")   # Ш11
+    r = c.get("/pcbk/api/oc/session/status")
+    assert (r.status_code, r.json()["name"]) == (503, "WorkplaceNotReady")            # не 500 и не HTML
+    assert b64 not in gwlog.text and "RemoteProtocolError" in gwlog.text
 
 def test_proxy_deadline(gw, monkeypatch):                                                # Review Focus 5
     c, role, place = gw
@@ -4225,7 +4551,9 @@ def test_not_ready_logged_once_per_minute(gw, gwlog):
     Устройство генератора:
     - задача-читатель гонит `filter_sse(aiter_raw)` в
       `asyncio.Queue(maxsize=STREAM_QUEUE_MAX)` (конец — метка `None`, ошибка —
-      метка с видом `oversize` или `timeout`);
+      метка с видом `oversize` или `timeout`); любая `httpx.HTTPError` и
+      `OSError` посреди потока — конец с `closed_by=place`, в журнал только
+      класс (Ш11);
     - генератор ждёт `asyncio.wait_for(queue.get(), stream_recheck_s)`. На
       каждом событии и каждом сроке он зовёт `store.session(token)` (в
       потоке): `None` → конец (`closed_by=session`);
@@ -4471,7 +4799,9 @@ cookie идёт заголовком.
     При импорте — `assert not set(TWINS) & set(ALLOWED)`;
   - `FORBIDDEN: list[tuple[str, str, dict | None]]` — через `edge` 403
     `Forbidden` «Вызов не разрешён» (метод, путь, тело):
-    - `("GET", "/pcbk/api/oc/config")`, `("PATCH", "/pcbk/api/oc/config")`;
+    - `("GET", "/pcbk/api/oc/config")`, `("PATCH", "/pcbk/api/oc/config")`,
+      `("GET", "/pcbk/api/oc/config/providers")` (Ш14: там подставленный
+      `apiKey` из `{file:/run/secrets/llm-token}`);
     - `("GET", "/pcbk/api/oc/global/config")`, `("GET", "/pcbk/api/oc/global/health")`,
       `("GET", "/pcbk/api/oc/global/event")`, `("POST", "/pcbk/api/oc/global/upgrade")`;
     - `("GET", "/pcbk/api/oc/api/fs/read/hostname?location[directory]=/etc")`,
@@ -4517,6 +4847,13 @@ cookie идёт заголовком.
     отвечает сам `edge` (`/pcbk/api/oc` без косой черты).
 - Produces (`test_gateway_live.py`) — код ниже.
 
+- [ ] **Step 0: Теги `:d5b` — первой правкой, до любой сборки (Ш2).** Как
+  А6, шаг 0: ID `:d3a`…`:d5a` до и после каждого прогона, `compose.yaml` и
+  `IMAGES` — `:d5b`, коммит
+  `git commit -m "Д5б: теги образов core и сторожа :d5b до первой сборки" -- compose.yaml tests/integration/test_edge.py`.
+  До него в Д5б — ни сборок, ни интеграционных прогонов (и у ревьюеров
+  Б1–Б4). Expected: откатный `:d5a` не пересобран (`diff` ID пуст).
+
 - [ ] **Step 1: Write the failing tests**
 
 ```python
@@ -4559,9 +4896,17 @@ def test_forbidden_forward_nothing(stack, users):                               
 
 def test_config_blocked_but_live_in_place(stack, users):
     a, _ = users
-    assert stack.oc(6, "GET", "/config", 6)[0] == 200                                   # ручка жива — отказ осмысленный
-    code, body, _ = a.call("GET", "/pcbk/api/oc/config")
-    assert code == 403 and stack.llm_token(6) not in json.dumps(body)
+    for path in ("/config", "/config/providers"):                                        # Ш14
+        assert stack.oc(6, "GET", path, 6)[0] == 200, path                              # ручка жива — отказ осмысленный
+        code, body, _ = a.call("GET", "/pcbk/api/oc" + path)
+        assert code == 403 and stack.llm_token(6) not in json.dumps(body) and stack.data_token(6) not in json.dumps(body), path
+
+def test_archived_null_goes_to_place(stack, users):                                     # Ш13: 400 — от места, не от шлюза
+    a, _ = users
+    sid = a.call("POST", "/pcbk/api/oc/session")[1]["id"]
+    code, _, _ = a.call("PATCH", f"/pcbk/api/oc/session/{sid}", {"time": {"archived": None}})
+    assert f"rule=session_update status={code}" in stack.logs("pcbk-core")             # переслано месту
+    print(f"archived=null → код места {code}")                                         # в журнал Д5б и хвост Д6
 
 def test_session_fields_stripped(stack, users):                                         # Review Focus 2
     a, _ = users
@@ -4846,8 +5191,8 @@ def test_live_expected_refusals():                                              
   владельца, проверено в Б0) — способом А8, шаг 1; `.cred` — в `$JOB` (`0600`). Файлы
   видов секретов — `mkforms` Global Constraints одной цепочкой с
   абсолютными путями: `forms-a` и `forms-b` из `$HOME/pcbk-d5/probe-*.pw`,
-  `forms-09` и `forms-10` из `/opt/pcbk-reserve/secrets/student-09.pw` и
-  `student-10.pw`. Expected: код `0`, четыре «совпало с источником»; у
+  `forms-09` и `forms-10` из `"$SD/student-09.pw"` и `"$SD/student-10.pw"`
+  (`SD` — `SECRETS_DIR` из `.env`, Ш24). Expected: код `0`, четыре «совпало с источником»; у
   каждого `[ -s … ]` и `/usr/bin/grep -c '^$'` → `0`; уникальных первых строк
   — `4`. Места 09 и 10 спят.
 - [ ] **Step 2: Учения LLM без денег.**
@@ -4965,7 +5310,9 @@ def test_live_expected_refusals():                                              
     - на 429 `streams` — «закройте лишние вкладки»;
     - какие `Origin` и `Sec-Fetch-Site` шлёт настоящий браузер и держится ли
       поток по HTTP/2 [?];
-    - `default_agent` и отключение встроенных агентов (research/09 §9 п. 3).
+    - `default_agent` и отключение встроенных агентов (research/09 §9 п. 3);
+    - кнопка «из архива» в OpenCode 1.18.33 не работает: `time.archived:
+      null` схема места не принимает (итог живого теста Б5) — скрыть (Ш13).
 - [ ] **Step 2: Критик** (Opus 5.5). Блокер — пункт «Блокер дня» дорожной
   карты:
   - через шлюз достижимы оболочка, файлы, конфигурация, `/api/*`, терминал
@@ -4977,8 +5324,10 @@ def test_live_expected_refusals():                                              
 
   Петля — до нуля блокеров, число раундов владелец не ограничил (29.09, «Не
   лимитирую LOOP»).
-- [ ] **Step 3: Слияние.** В `main`, тег `platform-d5b` (как Д3 и Д4 — без
-  общего `platform-d5`). Перед пушем:
+- [ ] **Step 3: Слияние — после `platform-d5a` (Ш1).** Перебазирование
+  `d5b/gateway-whitelist` на `main`, повтор прогона Б5, шаг 4 (с ID образов,
+  Ш2), затем слияние в `main` и тег `platform-d5b` (как Д3 и Д4 — без общего
+  `platform-d5`). Перед пушем:
   - проверка на секреты по ветке;
   - `git ls-files | /usr/bin/grep -cE '(\.cred|\.pw|core\.db|core-tokens|llm-tokens|\.(llm-token|data-token)|openrouter.*\.key|live-.*\.txt)$'` → `0`.
 
@@ -4990,8 +5339,8 @@ def test_live_expected_refusals():                                              
 - [ ] **Step 4: План и факт.** Две строки в `docs/checks/D5b.md`, помощники
   Д4а:
   - темп кода до черты —
-    `pace "$(msg 'Шлюз: счётчики отказов')" "$(msg 'Шлюз к OpenCode в компоновке')" 8.75`
-    (коммиты задач Б1 и Б5, между ними Б2–Б5 — 8,75 ч по шкале);
+    `pace "$(msg 'Шлюз: счётчики отказов')" "$(msg 'Шлюз к OpenCode в компоновке')" 9.5`
+    (коммиты задач Б1 и Б5, между ними Б2–Б5 — 9,5 ч по шкале);
   - полное время дня — от `%aI` первого коммита ветки до тега
     `platform-d5b`, справочно.
 - [ ] **Step 5: Владельцу** — «Д5 готов»: итог прогона автотестов (N случаев,

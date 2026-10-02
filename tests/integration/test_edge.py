@@ -9,17 +9,18 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S"},
     "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
                   "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
-                  # только тестовый стенд (compose.test.yaml): двойник OpenRouter и частый опрос
-                  "OPENROUTER_BASE_URL", "LLM_POLL_S"},
+                  # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
+                  # бюджет (учение «бюджет стенда израсходован», Д4б)
+                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD"},
     "pcbk-edge": set(),
     "pcbk-sp-ro": set(),
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d4a", "pcbk-core": "pcbk-reserve/core:d4a",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d4b", "pcbk-core": "pcbk-reserve/core:d4b",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
-          "pcbk-student-01": "pcbk-reserve/student:d2"}
+          "pcbk-student-01": "pcbk-reserve/student:d4"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 
 

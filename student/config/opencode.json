@@ -2,10 +2,12 @@
   "autoupdate": false,
   "share": "disabled",
   "snapshot": false,
-  "enabled_providers": ["pcbk"],
-  "model": "pcbk/stub",
+  "enabled_providers": ["pcbk", "pcbk-or"],
+  "model": "pcbk/z-ai/glm-5.3",
   "permission": {
     "external_directory": "deny",
+    "task": "deny",
+    "webfetch": "deny",
     "read": {
       "*": "allow",
       "*.env": "deny",
@@ -20,7 +22,35 @@
         "apiKey": "{file:/run/secrets/llm-token}"
       },
       "models": {
-        "stub": {}
+        "z-ai/glm-5.3": {"limit": {"context": 131072, "output": 16000}},
+        "deepseek/deepseek-v4.1-flash": {"limit": {"context": 131072, "output": 16000}},
+        "google/gemini-3.8-flash": {"limit": {"context": 131072, "output": 16000}},
+        "openai/gpt-6-sol": {"limit": {"context": 131072, "output": 16000}},
+        "z-ai/glm-5.3-flash": {"limit": {"context": 131072, "output": 16000}},
+        "openai/gpt-6-luna": {"limit": {"context": 131072, "output": 16000}},
+        "anthropic/claude-sonnet-5.5": {"limit": {"context": 131072, "output": 16000}}
+      }
+    },
+    "pcbk-or": {
+      "npm": "@openrouter/ai-sdk-provider",
+      "options": {
+        "baseURL": "http://core:8000/llm/v1",
+        "apiKey": "{file:/run/secrets/llm-token}"
+      },
+      "models": {
+        "google/gemini-3.8-flash": {"limit": {"context": 131072, "output": 16000}},
+        "anthropic/claude-sonnet-5.5": {"limit": {"context": 131072, "output": 16000}}
+      }
+    }
+  },
+  "mcp": {
+    "pcbk": {
+      "type": "remote",
+      "url": "http://core:8000/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {file:/run/secrets/data-token}"
       }
     }
   }
