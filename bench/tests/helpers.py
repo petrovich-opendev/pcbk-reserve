@@ -356,3 +356,59 @@ def verdicts(*recs: RunRecord, verdict: FakeVerdict | None = None, score: int = 
         else:
             rep.ok[pid] = verdict if verdict is not None else clean_verdict(r.key.scenario, score)
     return rep
+
+
+# --- Б1: пакеты судьи (импорт pcbk_bench.judge — лениво: helpers импортируется и без него) ---
+import json as _json  # noqa: E402 — helpers дополняются только в конец
+
+from pcbk_bench.scenarios import JUDGE_ITEMS_DATA as _ITEMS_DATA  # noqa: E402
+
+# чистый вердикт пакета B/C (пункты JUDGE_ITEMS_DATA): все оценки 4, жёсткие ложны, вне A saved_prompt_bad — null
+CLEAN_VERDICT = {"scores": {k: 4 for k in _ITEMS_DATA},
+                 "hard": {"invented_norm": False, "numbers_not_from_tools": False, "saved_prompt_bad": None},
+                 "why": "ответ по данным инструмента"}
+
+
+@functools.cache
+def _twin_vocab() -> frozenset[str]:
+    """Словарь каталога двойника (П3): описания core/tests/data/bench-historian.json и узлы карточек двойника —
+    тем же vocab_from, что build_vocab."""
+    from pcbk_bench.judge import vocab_from
+
+    data = _json.loads((REPO / "core" / "tests" / "data" / "bench-historian.json").read_text(encoding="utf-8"))
+    cs = cards()
+    return vocab_from([t["Description"] for t in data["catalog"] if isinstance(t.get("Description"), str)],
+                      [c.node for c in cs.cards.values() if c.node] + [cs.bench_node])
+
+
+def __getattr__(name: str):                     # VOCAB — лениво (PEP 562): from helpers import VOCAB
+    if name == "VOCAB":
+        return _twin_vocab()
+    raise AttributeError(name)
+
+
+def pid_is_control(out: Path, pid: str) -> bool:
+    """Пакет — контрольный (J1–J4) по карте OUT/judge/map.json."""
+    return pid in _json.loads((Path(out) / "judge" / "map.json").read_text(encoding="utf-8"))["controls"]
+
+
+def agent_text(p) -> str:
+    """Текст последней реплики агента в пакете."""
+    said = [e for e in _json.loads(p.text)["transcript"] if e.get("role") == "агент"]
+    return said[-1]["text"] if said else ""
+
+
+def packet_with(agent: str, scenario: str = "B1"):
+    """Пакет сценария (по умолчанию B1), где последняя реплика агента — agent как есть, без масок: для сканера."""
+    from pcbk_bench.judge import Packet, build_packet
+
+    p = build_packet(rec(scenario, answer="Готово."), BY_ID[scenario], card(scenario), _twin_vocab())
+    fields = _json.loads(_json.dumps(p.fields, ensure_ascii=False))
+    [e for e in fields["transcript"] if e.get("role") == "агент"][-1]["text"] = agent
+    return Packet.of(p.packet_id, fields)
+
+
+def transcript_line(tool: str, input: dict) -> str:
+    """Строка транскрипта субагента Claude Code (JSONL) с одним вызовом инструмента."""
+    return _json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_01", "name": tool, "input": input}]}}, ensure_ascii=False)
