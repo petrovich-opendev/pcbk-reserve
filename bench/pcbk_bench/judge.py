@@ -18,8 +18,9 @@ saved_prompt (A: сохранённая инструкция), auto_flags (по�
 
 Пачки (pack_batches) → OUT/judge/batch-NN/<packet_id>.json и карта OUT/judge/map.json (судья её не видит, П8):
 {"packets": {packet_id: {"model", "place", "scenario", "rep"}}, "controls": {packet_id: "Jn#1"|"Jn#2"},
-"refused": {packet_id: "secret"|"data"}, "batches": {"batch-NN": [packet_id, …]}, "seed", "real_data"}. В packets —
-и отказанные (таблица сопоставляет их прогонам), контрольных там нет; model — как в RunRecord.
+"refused": {packet_id: "secret"|"data"}, "batches": {"batch-NN": [packet_id, …]}, "seed", "salt", "real_data"}. В
+packets — и отказанные (таблица сопоставляет их прогонам), контрольных там нет; model — как в RunRecord; salt — соль
+id пакетов (m12).
 
 Каталог судей (stage_judges) — <root>/judge-<run_id>/: JUDGE.md, копии пачек, пустые verdicts/<batch>/ и задания
 tasks/<batch>.txt с абсолютными путями. Сверка транскриптов (audit_transcripts) — по списку разрешений: Read —
@@ -35,6 +36,7 @@ import math
 import os
 import re
 import shutil
+import unicodedata
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
@@ -59,15 +61,20 @@ PACKET_ID_RE = re.compile(r"[a-z]{12}")
 
 # --- постоянные ---
 
-_MODEL_LATIN = ("glm", "zhipu", r"z\.ai", "deepseek", "gemini", "google", "gpt", "openai", "chatgpt", "codex",
-                "claude", "anthropic", "sonnet", "opus", "sol", "luna", "flash", "mimo", "xiaomi", "fireworks", "azure",
-                "vertex", "together")
-_MODEL_CYRILLIC = ("глм", "чжипу", "дипсик", "джемини", "гемини", "гугл", "джипити", "чатгпт", "опенаи", "клод",
-                   "антропик", "сонет", "опус")
+# имена моделей и провайдеров финалистов и запасных research/08 §8 (z-ai/glm-5.3, deepseek/deepseek-v4.1-flash,
+# google/gemini-3.8-flash, openai/gpt-6-sol; glm-5.3-flash, gpt-6-luna, anthropic/claude-sonnet-5.5) и их точек
+# (fireworks, together, google-vertex, azure, z-ai; InferenceNet, Novita, DeepInfra, Bedrock — §3); склеенные и
+# вендорские написания (m1 итоговой доводки Д8б): ChatGLM, ZhipuAI, GPT4o
+_MODEL_LATIN = ("chatglm", "glm", "zhipuai", "zhipu", r"z[-.]ai", "deepseek", "gemini", "google", "chatgpt", "gpt",
+                "openai", "codex", "claude", "anthropic", "sonnet", "opus", "sol", "luna", "flash", "mimo", "xiaomi",
+                "fireworks", "azure", "vertex", "together", "inferencenet", "novita", "deepinfra", "bedrock")
+_MODEL_CYRILLIC = ("чатглм", "глм", "чжипу", "дипсик", "джемини", "гемини", "гугл", "чатгпт", "джипити", "гпт",
+                   "опенаи", "клод", "антропик", "сонет", "опус", "ксяоми", "сяоми")
 MODEL_WORDS: tuple[str, ...] = _MODEL_LATIN + _MODEL_CYRILLIC
-# слово модели по границам слова (кириллица — с окончанием до 3 букв: «Клода») и хвост версии «-5.3», « 3.8»
+# слово модели по границам слова (кириллица — с окончанием до 3 букв: «Клода») и хвост версии: «-5.3», « 3.8», «4o»,
+# «-v4.1» (m1: необязательные «v» и до трёх латинских букв после номера)
 _MODEL_RE = re.compile(r"(?<![\w])(?:(?:" + "|".join(_MODEL_LATIN) + r")|(?:" + "|".join(_MODEL_CYRILLIC) +
-                       r")[а-яё]{0,3})(?:[-\s]?\d+(?:\.\d+)*(?![\d,]))?(?!\w)", re.IGNORECASE)
+                       r")[а-яё]{0,3})(?:[-\s]?v?\d+(?:\.\d+)*(?![\d,])[a-z]{0,3})?(?!\w)", re.IGNORECASE)
 
 # классы величин: упорядоченный список (класс, корень) — первый подходящий (m-р3-18)
 QUANTITY_CLASSES: tuple[tuple[str, str], ...] = (
@@ -88,10 +95,12 @@ QUANTITY_CLASSES: tuple[tuple[str, str], ...] = (
     ("состояние (дискретный)", r"состояни|дискрет"),
 )
 _CLASS_RES = tuple((name, re.compile(root, re.IGNORECASE)) for name, root in QUANTITY_CLASSES)
-# единицы (Д8-R78; m3: ⊇ единиц numbers._UNIT_AFTER)
+# единицы (Д8-R78; m3: ⊇ единиц numbers._UNIT_AFTER; m9 итоговой доводки Д8б: плотность, концентрация, скорость,
+# суточная выработка, pH)
 UNITS: tuple[str, ...] = ("°C", "бар", "мбар", "кПа", "МПа", "Па", "кгс/см2", "кгс", "т/ч", "кг/ч", "м3/ч", "л/ч",
                           "л/мин", "%", "‰", "г/м2", "об/мин", "об", "А", "мА", "кВт", "МВт", "Вт", "Гц", "мм", "м",
-                          "м/мин", "м3", "м³", "кг", "т", "л", "г", "ед", "шт", "мин", "ч")
+                          "м/мин", "м3", "м³", "кг", "т", "л", "г", "ед", "шт", "мин", "ч", "кг/м3", "мг/дм3", "м/с",
+                          "г/л", "т/сут", "pH")
 UNKNOWN_UNIT = "ед."
 # корни, которые словарь каталога не берёт: корни классов, единицы, служебные слова описаний
 GENERIC_WORDS: frozenset[str] = frozenset({
@@ -382,14 +391,13 @@ class _VocabIndex:
 
 
 def _constant_words() -> frozenset[str]:
+    """Слова постоянных текстов пакета (сценарии, отказы, реплики бота, служебные слова, маски) — их словарь каталога
+    не берёт. JUDGE.md сюда не входит (m6 итоговой доводки Д8б): его слова, совпавшие со словами описаний и узлов,
+    маскируются, — предметное слово в тексте для судьи не открывает его в пакетах."""
     texts = [s.what + " " + s.pass_if + " " + s.label for s in SCENARIOS]
     texts += list(REFUSAL_TEXTS.values()) + [CONSENT, FALLBACK, NAME_REPLY, NOT_LISTED, DRAFT_HEAD, DRAFT_ASK,
                                              DRAFT_RULE, _SERVICE_TEXT] + [name for name, _ in QUANTITY_CLASSES]
     texts += list(REFUSAL_TEXTS) + list(PERIOD_PRESETS) + list(MASKS) + list(SOURCE_KINDS)
-    try:
-        texts.append(JUDGE_MD.read_text(encoding="utf-8"))
-    except OSError:
-        pass
     return frozenset(_norm_word(w) for t in texts for w in _WORD_RE.findall(t))
 
 
@@ -444,12 +452,30 @@ def build_vocab(records: list[RunRecord], cards: CardSet) -> frozenset[str]:
 
 
 _ALIAS_WORDS = frozenset({"ч", "тег", "узел", "имя"})
-_MASK_TOKEN = re.compile(r"\[(?:скрыто|модель)\]|⟨[^⟨⟩]*⟩|(?:Ч|ТЕГ|УЗЕЛ|ИМЯ)-\d+(?!\d)|[A-Za-zА-Яа-яЁё]+(?:-\d+)?")
+_ALIAS_HEADS = ("УЗЕЛ", "ТЕГ", "ИМЯ", "Ч")
+_MASK_WORD = r"(?:Ч|ТЕГ|УЗЕЛ|ИМЯ)-\d+(?!\d)|[A-Za-zА-Яа-яЁё]+(?:-\d+)?"
+_MASK_TOKEN = re.compile(r"\[(?:скрыто|модель)\]|" + _MASK_WORD)                     # без настоящих данных
+_MASK_TOKEN_REAL = re.compile(r"\[(?:скрыто|модель)\]|⟨[^⟨⟩]*⟩|" + _MASK_WORD)     # метки ⟨…⟩ — только с ними (m4)
 
 
-def mask_vocab(text: str, vocab: frozenset[str]) -> str:
-    """Слова словаря по основе → «[скрыто]»; сокращения — вместе с номером («БДМ-3»). Псевдонимы (Ч-n, ТЕГ-n,
-    УЗЕЛ-n, ИМЯ-n), маски и метки ⟨…⟩ не трогаются."""
+def _glued(word: str, num: str) -> tuple[str, str] | None:
+    """Слово, склеенное с головой псевдонима («БДМЧ-1» из «БДМ3а», «PMТЕГ-2», m5): (префикс, голова) или None."""
+    if not num:
+        return None
+    for head in _ALIAS_HEADS:
+        if word.endswith(head) and len(word) > len(head):
+            return word[:-len(head)], head
+    return None
+
+
+def _hidden_word(word: str, index: _VocabIndex) -> bool:
+    return _norm_word(word) in index.abbr or index.hit(word)
+
+
+def mask_vocab(text: str, vocab: frozenset[str], *, real_data: bool = False) -> str:
+    """Слова словаря по основе → «[скрыто]»; сокращения — вместе с номером («БДМ-3»); слово, склеенное с головой
+    псевдонима («БДМЧ-1»), — по префиксу: «[скрыто]Ч-1» (m5). Псевдонимы (Ч-n, ТЕГ-n, УЗЕЛ-n, ИМЯ-n) и маски не
+    трогаются; метки ⟨…⟩ — только при real_data (без настоящих данных слова в них маскируются, m4)."""
     index = _VocabIndex(vocab)
 
     def sub(m: re.Match) -> str:
@@ -457,18 +483,25 @@ def mask_vocab(text: str, vocab: frozenset[str]) -> str:
         if token.startswith(("[", "⟨")) or re.fullmatch(r"(?:Ч|ТЕГ|УЗЕЛ|ИМЯ)-\d+", token):
             return token
         word, _, num = token.partition("-")
+        glued = _glued(word, num)
+        if glued is not None and _hidden_word(glued[0], index):
+            return f"{HIDDEN}{glued[1]}-{num}"
         if _norm_word(word) in index.abbr:
             return HIDDEN
         return (HIDDEN + (f"-{num}" if num else "")) if index.hit(word) else token
-    return _MASK_TOKEN.sub(sub, text)
+    return (_MASK_TOKEN_REAL if real_data else _MASK_TOKEN).sub(sub, text)
 
 
 def _vocab_hit(text: str, index: _VocabIndex) -> bool:
+    """Слово словаря в тексте (сканер, только без настоящих данных): по основе, сокращение, префикс слова, склеенного
+    с головой псевдонима (m5); метки ⟨…⟩ не защищены (m4)."""
     for m in _MASK_TOKEN.finditer(text):
         token = m.group(0)
-        if token.startswith(("[", "⟨")) or re.fullmatch(r"(?:Ч|ТЕГ|УЗЕЛ|ИМЯ)-\d+", token):
+        if token.startswith("[") or re.fullmatch(r"(?:Ч|ТЕГ|УЗЕЛ|ИМЯ)-\d+", token):
             continue
-        if index.hit(token.partition("-")[0]):
+        word, _, num = token.partition("-")
+        glued = _glued(word, num)
+        if index.hit(word) or (glued is not None and _hidden_word(glued[0], index)):
             return True
     return False
 
@@ -494,7 +527,10 @@ _UNIT_NEXT = re.compile(r"[  ]*(?:[°%‰]|[A-Za-zА-Яа-яЁё]{1,4}\d?/|(?:�
 _RANGE_GAP = re.compile(r"\s*(?:[–—-]|\.\.\.?|…)\s*")
 _BOUND_BEFORE = re.compile(r"(?:(?<![\w])(?:от|до|выше|ниже|свыше|менее|более|больше|меньше|не\s+(?:выше|ниже|более|"
                            r"менее|больше|меньше|превыша\w*))|[<>≤≥])\s*$", re.IGNORECASE)
-_NAME_LINE = re.compile(r"Имя\s+для\s+системы\s*:\s*[*_`«\"]*([A-Za-z][A-Za-z0-9_-]{1,63})", re.IGNORECASE)
+# имя агента в тексте Конструктора: «Имя для системы: x» — и с разметкой и тире между меткой и именем («**Имя для
+# системы:** `x`», «Имя для системы — x»), «Предлагаю имя x» (m2 итоговой доводки Д8б)
+_NAME_LINE = re.compile(r"(?:Имя\s+для\s+системы|Предлагаю\s+(?:системное\s+)?имя)[\s*_`«»\"'„“”]*(?:[:—–-]"
+                        r"[\s*_`«»\"'„“”]*)?([A-Za-z][A-Za-z0-9_-]{1,63})", re.IGNORECASE)
 _CODE_RE = re.compile(r"[a-z_]{1,40}")
 _KEY_RE = re.compile(r"[A-Za-z_]{1,40}")
 _VALUE_FIELDS = ("value", "avg", "min", "max", "last", "range", "std", "percent_good")
@@ -807,9 +843,10 @@ class _Tok:
     shown: Shown | None = None
 
 
-def _protected(text: str, keep: Iterable[str]) -> list[tuple[int, int]]:
+def _protected(text: str, keep: Iterable[str], marks: bool = True) -> list[tuple[int, int]]:
     spans = [(m.start(), m.end()) for m in _ALIAS_RE.finditer(text)]
-    spans += [(m.start(), m.end()) for m in _MARK_RE.finditer(text)]
+    if marks:                                       # метки ⟨…⟩ — только с настоящими данными (m4)
+        spans += [(m.start(), m.end()) for m in _MARK_RE.finditer(text)]
     for tok in keep:
         for m in re.finditer(r"(?<![\w/])" + re.escape(tok) + r"(?![\w/])", text):
             spans.append((m.start(), m.end()))
@@ -820,9 +857,10 @@ def _free(spans: list[tuple[int, int]], a: int, b: int) -> bool:
     return all(b <= s or a >= e for s, e in spans)
 
 
-def _number_tokens(text: str, keep: Iterable[str]) -> list[_Tok]:
-    """Свой разбор (I-р4-1): ISO-метки, даты, время → числа parse_numbers (диапазон, знак) → прочие группы цифр."""
-    taken = _protected(text, keep)
+def _number_tokens(text: str, keep: Iterable[str], marks: bool = True) -> list[_Tok]:
+    """Свой разбор (I-р4-1): ISO-метки, даты, время → числа parse_numbers (диапазон, знак) → прочие группы цифр.
+    marks — метки ⟨…⟩ не разбираются (только с настоящими данными, m4)."""
+    taken = _protected(text, keep, marks)
     toks: list[_Tok] = []
     for kind, pattern in (("stamp", _ISO_RE), ("date", _DATE_RE), ("time", _TIME_RE)):
         for m in pattern.finditer(text):
@@ -874,16 +912,16 @@ class _Numbers:
         self.keyed: dict[tuple, str] = {}
         self.student_nums = {s.value for t in student_texts for s in parse_numbers(t)}
         self.question_nums = {s.value for t in scenario_texts for s in parse_numbers(t)}
-        self.student_times = [p for t in student_texts for p in self._times(t)]
-        self.question_times = [p for t in scenario_texts for p in self._times(t)]
+        self.student_times = [p for t in student_texts for p in self._times(t, real_data)]
+        self.question_times = [p for t in scenario_texts for p in self._times(t, real_data)]
         self.period_times = [p for v in (period or {}).values() if isinstance(v, str)
                              for p in [_stamp_parts(v)] if p]
         self.found: dict[str, list[str]] = {"suspect_norm": [], "suspect_numbers": []}
 
     @staticmethod
-    def _times(text: str) -> list[dict[str, int]]:
+    def _times(text: str, marks: bool) -> list[dict[str, int]]:
         out = []
-        for t in _number_tokens(text, ()):
+        for t in _number_tokens(text, (), marks):
             if t.kind in ("stamp", "date", "ddmm", "time"):
                 p = _token_parts(t.kind, text[t.start:t.end])
                 if p:
@@ -1031,7 +1069,7 @@ class _Numbers:
         norm_spans = set(norm)
         parts: list[str] = []
         pos = 0
-        for t in _number_tokens(text, keep):
+        for t in _number_tokens(text, keep, self.real):
             shown = text[t.start:t.end]
             if t.kind in ("stamp", "date", "ddmm", "time"):
                 name = self._time(t.kind, shown)
@@ -1135,9 +1173,16 @@ def alias_numbers(fields: dict, outputs: list[dict], student_texts: list[str], s
     return new, nums.as_json()
 
 
+def _free_period(key: str, value: object) -> bool:
+    """Свободный period вызова (не код периода службы): ключ постоянный, а текст — нет; маскируется словарём и
+    сверяется сканером (m4)."""
+    return key == "period" and isinstance(value, str) and value not in PERIOD_PRESETS
+
+
 def _mask_strings(obj: Any, vocab: frozenset[str], skip: frozenset[str] = frozenset({"problems"}) | CONST_KEYS) -> Any:
     if isinstance(obj, dict):
-        return {k: (v if k in skip else _mask_strings(v, vocab, skip)) for k, v in obj.items()}
+        return {k: (v if k in skip and not _free_period(k, v) else _mask_strings(v, vocab, skip))
+                for k, v in obj.items()}
     if isinstance(obj, list):
         return [_mask_strings(v, vocab, skip) for v in obj]
     if isinstance(obj, str):
@@ -1205,6 +1250,48 @@ def build_packet(rec: RunRecord, sc: Scenario, card: Card, vocab: frozenset[str]
 
 # --- сканер ---
 
+# числа словами (m3 итоговой доводки Д8б): количественное числительное (или их цепочка через «и») рядом с единицей или
+# с «целых/десятых/сотых/тысячных» — «три и четыре десятых», «сто двадцать восемь градусов», «девяносто семь
+# процентов». Время и длительность (час, минута, секунда) — не величина и не ловятся. Текст сверяется в нижнем
+# регистре с «ё» → «е».
+_NUMERAL_WORDS = (
+    "ноль", "нуля", "нулю", "нулем", "один", "одна", "одно", "одного", "одной", "одному", "одним", "одну", "два", "две",
+    "двух", "двум", "двумя", "три", "трех", "трем", "тремя", "четыре", "четырех", "четырем", "четырьмя", "пять",
+    "пяти", "пятью", "шесть", "шести", "шестью", "семь", "семи", "семью", "восемь", "восьми", "восемью", "восьмью",
+    "девять", "девяти", "девятью", "десять", "десяти", "десятью", "одиннадцать", "одиннадцати", "двенадцать",
+    "двенадцати", "тринадцать", "тринадцати", "четырнадцать", "четырнадцати", "пятнадцать", "пятнадцати",
+    "шестнадцать", "шестнадцати", "семнадцать", "семнадцати", "восемнадцать", "восемнадцати", "девятнадцать",
+    "девятнадцати", "двадцать", "двадцати", "тридцать", "тридцати", "сорок", "сорока", "пятьдесят", "пятидесяти",
+    "шестьдесят", "шестидесяти", "семьдесят", "семидесяти", "восемьдесят", "восьмидесяти", "девяносто", "девяноста",
+    "сто", "ста", "двести", "двухсот", "триста", "трехсот", "четыреста", "четырехсот", "пятьсот", "пятисот",
+    "шестьсот", "шестисот", "семьсот", "семисот", "восемьсот", "восьмисот", "девятьсот", "девятисот", "тысяча",
+    "тысячи", "тысяч", "тысячу", "тысячей", "полтора", "полторы", "полутора", "половина", "половину", "половины",
+    "треть", "трети", "четверть", "четверти")
+_FRACTION_WORDS = ("целых", "целая", "целой", "целую", "десятых", "десятая", "десятой", "десятую", "сотых", "сотая",
+                   "сотой", "сотую", "тысячных", "тысячная", "тысячной", "тысячную")
+# основы единиц словами (с любым окончанием); «бар» и «куб» — только с окончаниями единицы: «барабан», «кубик» — не она
+_UNIT_WORD_STEMS = ("бар(?:а|ов|ам|ами|ах)?(?![а-я])", "миллибар", "градус", "паскал", "килопаскал", "мегапаскал",
+                    "атмосфер", "процент", "промилл", "тонн", "килограмм", "грамм", "миллиграмм", "литр", "кубометр",
+                    "кубическ", "куб(?:а|ов|ам|ами|ах)?(?![а-я])", "метр", "миллиметр", "сантиметр", "ампер",
+                    "миллиампер", "вольт", "ватт", "киловатт", "мегаватт", "герц", "оборот", "единиц", "штук")
+_NUMERAL = r"(?:" + "|".join(sorted(_NUMERAL_WORDS, key=len, reverse=True)) + r")"
+_NUMBER_WORDS_RE = re.compile(
+    r"(?<![а-яa-z])" + _NUMERAL + r"(?:\s+(?:и\s+)?" + _NUMERAL + r")*(?![а-яa-z])\s*(?:(?:" +
+    "|".join(_FRACTION_WORDS) + r")(?![а-я])|(?:" + "|".join(_UNIT_WORD_STEMS) + r")[а-я]*|[°%‰]|(?:мбар|кпа|мпа|"
+    r"кгс|кг|м3|м³|мм|квт|мвт|вт|гц|ма|ед|шт)(?![а-яa-z])|[а-яa-z]{1,4}[0-9³²]?/)")
+# цифры не из Nd (m3): надстрочные «²³⁴», дроби «½», цифры в кружках, римские знаки (категории No и Nl); «²» и «³»
+# сразу за буквой единицы («м³», «м²») — единица, а не цифра
+_UNIT_POWER_RE = re.compile(r"(?<=[A-Za-zА-Яа-яЁё])[²³](?!\w)")
+
+
+def _other_number(text: str) -> bool:
+    return any(unicodedata.category(ch) in ("No", "Nl") for ch in _UNIT_POWER_RE.sub(" ", text))
+
+
+def _number_words(text: str) -> bool:
+    return bool(_NUMBER_WORDS_RE.search(text.casefold().replace("ё", "е")))
+
+
 _HEX_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{32,}(?![0-9A-Fa-f])")
 _IPV4_RE = re.compile(r"\d+\.\d+\.\d+\.\d+")
 _SERVICE_RE = re.compile(r"Bearer\s|BDRV_")
@@ -1237,8 +1324,9 @@ _ALLOWED_BY_CTX = {
 def assert_packet_clean(packet: Packet, secrets: Iterable[object], vocab: frozenset[str], nodes: Iterable[str], *,
                         real_data: bool = False) -> None:
     """Сканер до записи (Д8-R78): секреты и служебные токены → SecretInPacket; цифра вне Ч-n/ТЕГ-n/УЗЕЛ-n/ИМЯ-n и
-    CONST_TOKENS своего поля, тег, узел, слово словаря (кроме постоянного поля scenario), имя модели → DataInPacket.
-    Тексты исключений — только вид находки."""
+    CONST_TOKENS своего поля, цифра не из Nd (надстрочные, дроби «½», кроме «²³» единицы), число словами рядом с
+    единицей или «целых/десятых» (вне scenario, без real_data; m3), тег, узел, слово словаря (кроме постоянного поля
+    scenario), имя модели → DataInPacket. Тексты исключений — только вид находки."""
     text = packet.text
     for s in secrets:
         value = str(s)
@@ -1262,8 +1350,10 @@ def assert_packet_clean(packet: Packet, secrets: Iterable[object], vocab: frozen
             plain = _MARK_RE.sub(" ", value) if real_data else value
             plain = _ALIAS_RE.sub(" ", plain)
             allowed = _ALLOWED_BY_CTX[ctx]
-            if any(tok not in allowed for tok in _digit_tokens(plain)):
+            if any(tok not in allowed for tok in _digit_tokens(plain)) or _other_number(plain):
                 raise DataInPacket("цифры")
+            if not real_data and key != "scenario" and ctx != "meta" and _number_words(plain):
+                raise DataInPacket("число словами")
             if TAG_TOKEN_RE.search(_ISO_RE.sub(" ", plain)):
                 raise DataInPacket("тег")
             if _MODEL_RE.search(value):
@@ -1272,7 +1362,8 @@ def assert_packet_clean(packet: Packet, secrets: Iterable[object], vocab: frozen
                 continue
             if any(p.search(value) for p in node_res):
                 raise DataInPacket("узел")
-            if not real_data and ctx != "meta" and parent not in CONST_KEYS and _vocab_hit(value, index):
+            const = parent in CONST_KEYS and not _free_period(parent, value)
+            if not real_data and ctx != "meta" and not const and _vocab_hit(value, index):
                 raise DataInPacket("слово каталога")
 
 
@@ -1341,14 +1432,29 @@ def _write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
+def _salt_of(judge: Path, seed: str) -> str:
+    """Соль id пакетов (m12): из прежней карты того же seed (повторная упаковка даёт те же id), иначе — новая."""
+    try:
+        old = json.loads((judge / "map.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        old = None
+    if isinstance(old, dict) and old.get("seed") == seed and isinstance(old.get("salt"), str) and old["salt"]:
+        return old["salt"]
+    return os.urandom(16).hex()
+
+
 def pack_batches(out: Path, records: list[RunRecord], cards: CardSet, secrets: Iterable[object], size: int = 12,
-                 seed: str = "", real_data: bool = False, tag_units: Mapping[str, str] | None = None) -> list[Path]:
+                 seed: str = "", real_data: bool = False, tag_units: Mapping[str, str] | None = None,
+                 salt: str | None = None) -> list[Path]:
     """Пакеты по записям (только done, последняя запись ключа — m12) и J1–J4 → OUT/judge/batch-NN/<id>.json и
     карта OUT/judge/map.json. Сканер — до записи: отказанный пакет не пишется, в карте — вид отказа. real_data — только
-    с файлом согласия OUT/judge/real-data-consent.txt, иначе RunRefused("consent")."""
+    с файлом согласия OUT/judge/real-data-consent.txt, иначе RunRefused("consent"). id пакета — от соли карты (salt;
+    нет — из прежней карты того же seed или новая случайная, m12): по run_id и именам моделей id не пересчитать, и
+    контрольный пакет по id не узнать."""
     judge = Path(out) / "judge"
     if real_data:
         _check_consent(judge)
+    salt = salt or _salt_of(judge, seed)
     units = load_tag_units(Path(out)) if tag_units is None else dict(tag_units)
     secret_list = [s for s in secrets if str(s)]
     recs = judged_records(records)
@@ -1359,7 +1465,7 @@ def pack_batches(out: Path, records: list[RunRecord], cards: CardSet, secrets: I
     def new_id(base: str) -> str:
         n = 0
         while True:
-            pid = _letters(f"{seed}|{base}|{n}")
+            pid = _letters(f"{salt}|{seed}|{base}|{n}")
             if pid not in used:
                 used.add(pid)
                 return pid
@@ -1413,7 +1519,7 @@ def pack_batches(out: Path, records: list[RunRecord], cards: CardSet, secrets: I
         batch_map[bdir.name] = pids
         paths.append(bdir)
     _write_json(judge / "map.json", {"packets": runs, "controls": controls, "refused": refused,
-                                     "batches": batch_map, "seed": seed, "real_data": real_data})
+                                     "batches": batch_map, "seed": seed, "salt": salt, "real_data": real_data})
     log.info("судья: пакетов %d, контрольных %d, отказано %d, пачек %d", len(live), len(controls), len(refused),
              len(paths))
     return paths
@@ -1442,10 +1548,10 @@ def render_task(stage: Path, batch: str, pids: Iterable[str]) -> str:
 
 def stage_judges(out: Path, run_id: str, root: Path, only: Collection[str] | None = None) -> Path:
     """Каталог судей <root>/judge-<run_id>/: JUDGE.md, копии пачек, пустые verdicts/<batch>/, задания
-    tasks/<batch>.txt (абсолютные пути). Карты, разговоров, конфига и карточек там нет. only — второй заход (m7):
-    задания только по этим пакетам; задания пачек без них удаляются."""
+    tasks/<batch>.txt (абсолютные пути: root приводится к абсолютному, m8). Карты, разговоров, конфига и карточек там
+    нет. only — второй заход (m7): задания только по этим пакетам; задания пачек без них удаляются."""
     judge = Path(out) / "judge"
-    stage = Path(root) / f"judge-{run_id}"
+    stage = Path(root).resolve() / f"judge-{run_id}"
     (stage / "tasks").mkdir(parents=True, exist_ok=True)
     shutil.copyfile(JUDGE_MD, stage / "JUDGE.md")
     for bdir in sorted(p for p in judge.glob("batch-*") if p.is_dir()):
@@ -1469,9 +1575,36 @@ def stage_judges(out: Path, run_id: str, root: Path, only: Collection[str] | Non
     return stage
 
 
+_RAW_FIELD = re.compile(r'"(file_path|path|command)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _unparsed_input(inp: dict) -> dict:
+    """Вход вызова, который харнесс не разобрал (m7: {"__unparsedToolInput": {"raw": "<JSON>", "len": n}}): raw как
+    JSON-объект, иначе поля file_path, path и command из текста raw — только если поле встретилось ровно один раз;
+    иначе {} (вызов без пути и команды — нарушение у сверки)."""
+    raw = inp.get("__unparsedToolInput")
+    raw = raw.get("raw") if isinstance(raw, dict) else raw
+    if not isinstance(raw, str):
+        return {}
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        obj = None
+    if isinstance(obj, dict):
+        return obj
+    found: dict[str, list[str]] = {}
+    for m in _RAW_FIELD.finditer(raw):
+        try:
+            found.setdefault(m.group(1), []).append(json.loads(f'"{m.group(2)}"'))
+        except ValueError:
+            found.setdefault(m.group(1), []).append("")
+    return {k: v[0] for k, v in found.items() if len(v) == 1 and v[0]}
+
+
 def transcript_calls(path: Path) -> list[dict]:
     """Вызовы инструментов субагента из его транскрипта JSONL (m-р4-14): tool_use в message.content —
-    {"tool", "path"} (input.file_path / path) или {"tool", "command"}; без пути и команды — path None."""
+    {"tool", "path"} (input.file_path / path) или {"tool", "command"}; без пути и команды — path None. Вход, который
+    харнесс не разобрал (__unparsedToolInput), — поля из его raw (_unparsed_input, m7)."""
     out: list[dict] = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         try:
@@ -1487,6 +1620,8 @@ def transcript_calls(path: Path) -> list[dict]:
                 continue
             name = str(part.get("name") or "")
             inp = part.get("input") if isinstance(part.get("input"), dict) else {}
+            if "__unparsedToolInput" in inp:
+                inp = _unparsed_input(inp)
             p = inp.get("file_path") if isinstance(inp.get("file_path"), str) else inp.get("path")
             if isinstance(p, str):
                 out.append({"tool": name, "path": p})

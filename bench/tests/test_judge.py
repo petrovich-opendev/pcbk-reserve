@@ -621,3 +621,171 @@ def test_cli_judge_commands(tmp_path, capsys):                                  
     assert main(["judge-audit", str(stage), "--batch", "batch-01", "--transcript", str(transcript)]) == 1
     assert "runs.jsonl" not in capsys.readouterr().out
     assert main(["judge-pack", str(config), "--real-data"]) == 2                     # без согласия — RunRefused
+
+
+# --- итоговая доводка Д8б: Parked Б1 (m1–m10, m12) ---
+
+def _finalist_tokens() -> list[str]:
+    """Имена моделей и точек в блоке финалистов и запасных research/08 §8 (в обратных кавычках)."""
+    text = (REPO / "docs" / "research" / "08-model-candidates.md").read_text(encoding="utf-8")
+    start = text.index("## 8. Финалисты")
+    block = text[start:text.index("**Проверка совместимости", start)]
+    return [t for t in re.findall(r"`([^`\n]+)`", block) if not t.startswith("@")]
+
+
+def test_model_words_cover_finalists():                                          # m1: сверка с research/08 §8
+    from pcbk_bench.judge import blind
+    tokens = _finalist_tokens()
+    assert {"z-ai/glm-5.3", "openai/gpt-6-sol", "anthropic/claude-sonnet-5.5", "azure"} <= set(tokens)
+    for t in tokens:                                                                # остаётся лишь «global» точки
+        assert re.sub(r"\[модель\]|[-/.\d\s]", "", blind(t)) in ("", "global"), t
+
+
+def test_model_words_vendor_spellings():                                         # m1: склеенные и вендорские
+    from pcbk_bench.judge import blind
+    for raw in ("ChatGLM", "ZhipuAI", "GPT4o", "gpt-4o-mini", "«Flash»", "сяоми", "Ксяоми", "гпт-4", "Z-AI",
+                "DeepSeek-V4.1", "InferenceNet"):
+        assert not re.search(r"(?i)glm|zhipu|gpt|flash|сяоми|гпт|z-ai|deepseek|v4|inference", blind(raw)), raw
+    p = build_packet(rec("B1", answer="Я — ChatGLM от ZhipuAI, почти GPT4o; Ксяоми — нет"), BY_ID["B1"], card("B1"),
+                     VOCAB)
+    assert not re.search(r"(?i)glm|zhipu|gpt|сяоми", p.text)
+    for bad in ("я ChatGLM", "я — GPT4o", "это ксяоми", "я гпт"):
+        with pytest.raises(DataInPacket):
+            assert_packet_clean(packet_with(agent=bad), [], VOCAB, [])
+    assert blind("Сейчас 3,42 бар; GLM 5,3 бар") == "Сейчас 3,42 бар; [модель] 5,3 бар"   # число с запятой — не версия
+
+
+@pytest.mark.parametrize("said", ["Черновик\n**Имя для системы:** `sushka-bdm3`\nСохранить так?",
+                                  "Черновик\n**Имя для системы**: sushka-bdm3\nСохранить так?",
+                                  "Черновик\nИмя для системы — «sushka-bdm3»\nСохранить так?",
+                                  "Предлагаю имя sushka-bdm3. Сохранить?"])
+def test_agent_name_with_markup_and_dash(said):                                  # m2
+    r = rec("A1", agent_said=[said], save_after=0,
+            save_answers=[{"status": "refused", "problems": [{"code": "name_taken", "text": "занято"}]}])
+    p = build_packet(r, BY_ID["A1"], card("A1"), VOCAB)
+    assert "sushka" not in p.text and "bdm" not in p.text and re.search(r"ИМЯ-\d", agent_text(p))
+
+
+def test_scanner_refuses_number_words_and_other_digits():                        # m3
+    for bad in ("сейчас три и четыре десятых бара", "три целых четыре десятых", "сто двадцать восемь градусов",
+                "достоверных девяносто семь процентов", "полтора бара", "пять кПа", "сейчас ½ бара", "сейчас ³,⁴²",
+                "давление Ⅳ", "м³⁴ в час"):
+        with pytest.raises(DataInPacket):
+            assert_packet_clean(packet_with(agent=bad), [], VOCAB, [])
+    for ok in ("сейчас Ч-1 бар, расход Ч-2 м³/ч, ТЕГ-1", "три тега и два барабана", "с восьми до шестнадцати часов",
+               "один инструмент, две минуты", "Ч-1 кгс/см2"):                     # контроль: не числа значений
+        assert_packet_clean(packet_with(agent=ok), [], VOCAB, [])
+    p = build_packet(rec("B1", answer="Сейчас 3,42 бар, расход 12 м³/ч", tools=[now_call("20FAKE_104_PV", 3.42)]),
+                     BY_ID["B1"], card("B1"), VOCAB)
+    assert_packet_clean(p, [], VOCAB, [])                                           # честный пакет — не отказ
+    fields = json.loads(json.dumps(p.fields, ensure_ascii=False))
+    fields["scenario"]["pass_if"] += " Например, «три бара»."                       # постоянное поле — не сверяется
+    assert_packet_clean(Packet.of(p.packet_id, fields), [], VOCAB, [])
+
+
+def test_free_period_and_marks_masked_without_real_data():                       # m4
+    r = rec("B2", answer="Среднее ⟨3,42⟩ бар по ⟨коллектору⟩",
+            tools=[period_call("20FAKE_101_PV", avg=127.9, period="смена на коллекторе")])
+    p = build_packet(r, BY_ID["B2"], card("B2"), VOCAB)
+    assert "коллектор" not in p.text and "3,42" not in p.text
+    args = next(e for e in p.fields["transcript"] if e["role"] == "инструмент")["args"]
+    assert args["period"] == "смена на [скрыто]"
+    assert_packet_clean(p, [], VOCAB, [])
+    with pytest.raises(DataInPacket):                                               # сканер: метка не прячет слово
+        assert_packet_clean(packet_with(agent="по ⟨коллектору⟩"), [], VOCAB, [])
+    fields = json.loads(json.dumps(packet_with(agent="ок").fields, ensure_ascii=False))
+    fields["transcript"].append({"role": "инструмент", "tool": "tag_period", "args": {"period": "смена на коллекторе"},
+                                 "output": {"status": "ok"}})
+    with pytest.raises(DataInPacket):                                               # свободный period — не постоянный
+        assert_packet_clean(Packet.of("abcdefghijkl", fields), [], VOCAB, [])
+    fields["transcript"][-1]["args"]["period"] = "prev_shift"
+    assert_packet_clean(Packet.of("abcdefghijkl", fields), [], VOCAB, [])
+
+
+def test_abbreviation_glued_before_alias():                                      # m5, m10: слой _abbr_re
+    vocab = vocab_from(["Давление пара БДМ-3"], []) | VOCAB
+    assert mask_vocab("на БДМЧ-1а и PMТЕГ-2", vocab | {"pm"}) == "на [скрыто]Ч-1а и [скрыто]ТЕГ-2"
+    for said in ("на БДМ3а давление 3,42 бар", "на бдм3 давление 3,42 бар", "на БДМ_3 давление 3,42 бар"):
+        p = build_packet(rec("B1", answer=said, tools=[now_call("20FAKE_104_PV", 3.42)]), BY_ID["B1"], card("B1"),
+                         vocab)
+        assert not re.search(r"(?i)бдм", p.text), said
+        assert_packet_clean(p, [], vocab, [])
+    with pytest.raises(DataInPacket):
+        assert_packet_clean(packet_with(agent="на БДМЧ-1 давление"), [], vocab, [])
+    p = build_packet(rec("B1", answer="на бдм3 давление 3,42 бар", tools=[now_call("20FAKE_104_PV", 3.42)]),
+                     BY_ID["B1"], card("B1"), vocab)
+    assert agent_text(p).startswith("на [скрыто] давление Ч-")                     # слой _abbr_re: номер — с кодом
+
+
+def test_judge_md_words_not_subtracted_from_vocab():                             # m6
+    from pcbk_bench.judge import JUDGE_MD
+    assert "участка" in JUDGE_MD.read_text(encoding="utf-8")
+    assert "участка" in vocab_from(["Давление пара участка"], [])                   # слово JUDGE.md — в словаре
+    assert "Ч-1 [скрыто]" in mask_vocab("Ч-1 участка", vocab_from(["Давление пара участка"], []))
+
+
+def test_transcript_unparsed_input(tmp_path):                                    # m7: __unparsedToolInput
+    stage = tmp_path / "judge-d8"
+    (stage / "batch-01").mkdir(parents=True)
+    (stage / "batch-01" / "abcdefghijkl.json").write_text("{}")
+    good = str(stage / "batch-01" / "abcdefghijkl.json")
+    whole = json.dumps({"file_path": good, "limit": 10})
+    lines = [transcript_line("Read", {"__unparsedToolInput": {"raw": whole, "len": len(whole)}}),
+             transcript_line("Read", {"__unparsedToolInput": {"raw": whole[:-8], "len": len(whole)}}),     # обрезан
+             transcript_line("Read", {"__unparsedToolInput": {"raw": '{"file_path": "/etc/passwd", "file_path": "'
+                                                                      + good + '"', "len": 9}}),
+             transcript_line("Read", {"__unparsedToolInput": {"raw": "{не JSON", "len": 8}}),
+             transcript_line("Bash", {"__unparsedToolInput": {"raw": '{"command": "cat /etc/passwd', "len": 9}})]
+    path = tmp_path / "agent.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    calls = transcript_calls(path)
+    assert calls[:2] == [{"tool": "Read", "path": good}] * 2
+    assert calls[2]["path"] is None and calls[3]["path"] is None                    # два пути или ни одного — нет
+    assert audit_transcripts(calls, stage, "batch-01") == ["Read: без пути", "Read: без пути",
+                                                           "Bash: инструмент вне списка"]
+
+
+def test_stage_judges_relative_root_resolved(tmp_path, monkeypatch):             # m8
+    out = tmp_path / "out"
+    pack_batches(out, [rec("B1")], cards(), [], seed="d8-test")
+    monkeypatch.chdir(tmp_path)
+    stage = stage_judges(out, "d8-test", root=Path("job"))
+    assert stage.is_absolute() and stage == tmp_path / "job" / "judge-d8-test"
+    task = (stage / "tasks" / "batch-01.txt").read_text()
+    paths = [line[2:] for line in task.splitlines() if line.startswith("- ")]
+    assert paths and all(Path(x).is_absolute() for x in paths) and str(stage / "JUDGE.md") in task
+
+
+def test_units_extended():                                                       # m9
+    from pcbk_bench.judge import UNITS, canonical_unit
+    assert {"кг/м3", "мг/дм3", "м/с", "г/л", "т/сут", "pH"} <= set(UNITS)
+    assert [canonical_unit(u) for u in ("кг/м³", "МГ/ДМ3", "PH", "т/сут")] == ["кг/м3", "мг/дм3", "pH", "т/сут"]
+    assert describe("Плотность", "кг/м³") == "величина, кг/м3"
+    assert_packet_clean(packet_with(agent="плотность Ч-1 кг/м3, Ч-2 мг/дм3, Ч-3 м/с"), [], VOCAB, [])
+
+
+def test_scanner_single_digit_and_hard_extra_key():                              # m10: выжившие мутанты Б1
+    for bad in ("сейчас 7 бар", "7"):
+        with pytest.raises(DataInPacket):
+            assert_packet_clean(packet_with(agent=bad), [], VOCAB, [])
+    items = BY_ID["B1"].judge_items
+    extra = {**CLEAN_VERDICT, "hard": {**CLEAN_VERDICT["hard"], "made_up": False}}
+    with pytest.raises(ValueError):
+        parse_verdict(json.dumps(extra), items)
+
+
+def test_packet_ids_salted(tmp_path):                                            # m12: соль id в карте
+    from pcbk_bench.judge import _letters, run_ref
+    r = rec("B1", answer="Сейчас 3,42 бар", tools=[now_call("20FAKE_104_PV", 3.42)])
+    pack_batches(tmp_path / "a", [r], cards(), [], seed="d8-test")
+    first = json.loads((tmp_path / "a" / "judge" / "map.json").read_text())
+    assert len(first["salt"]) == 32
+    unsalted = {_letters(f"d8-test|{run_ref(r)}|0")} | {_letters(f"d8-test|J{i}#{c}|0") for i in range(1, 5)
+                                                         for c in (1, 2)}
+    assert not unsalted & (set(first["packets"]) | set(first["controls"]))          # по run_id и модели не пересчитать
+    pack_batches(tmp_path / "a", [r], cards(), [], seed="d8-test")                  # повторная упаковка — те же id
+    again = json.loads((tmp_path / "a" / "judge" / "map.json").read_text())
+    assert again["salt"] == first["salt"] and again["packets"] == first["packets"]
+    pack_batches(tmp_path / "b", [r], cards(), [], seed="d8-test")                  # другой OUT — другая соль
+    other = json.loads((tmp_path / "b" / "judge" / "map.json").read_text())
+    assert other["salt"] != first["salt"] and set(other["packets"]) != set(first["packets"])
