@@ -1,5 +1,6 @@
-"""MCP службы данных: catalog_search, tag_now, tag_period — вторая тонкая оболочка над той же DataService;
-save_agent (Д7а, Д7-R57) — только здесь, без HTTP-ручки: тонкая оболочка над SaveAgent роли.
+"""MCP службы данных: catalog_search, tag_now, tag_period и калькуляторы tag_series, calc_runtime (Д9-R85) — вторая
+тонкая оболочка над той же DataService; save_agent (Д7а, Д7-R57) — только здесь, без HTTP-ручки: тонкая оболочка над
+SaveAgent роли.
 
 mcp 1.30.0 (FastMCP), Streamable HTTP без сессий (stateless), ответ JSON, точный маршрут /mcp.
 
@@ -14,7 +15,8 @@ mcp 1.30.0 (FastMCP), Streamable HTTP без сессий (stateless), отве�
 
 Аннотации аргументов свободные (Any): иначе строку вместо списка, пустой вызов, неизвестный период и
 17 тегов FastMCP отверг бы по-английски до функции, без события. Схему для модели задаёт
-json_schema_extra. null равен «не задан»: модели шлют null вместо пропуска необязательного поля.
+json_schema_extra (у tag_series — свои пределы тегов и точек: SeriesTags, Points). null равен «не задан»:
+модели шлют null вместо пропуска необязательного поля.
 Строку с JSON внутри FastMCP разбирает сам, до функции: '["A"]' станет списком, 'null' — «не задан».
 
 save_agent: токен — тем же mcp_auth; ошибку настройки, частоту, «только место студента» и проверку черновика делает
@@ -36,12 +38,12 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import zones
-from .http_api import (UNAUTHORIZED, CatalogSearchArgs, TagNowArgs, TagPeriodArgs, bearer_caller, unauthorized,
-                       validation_reason)
+from .http_api import (UNAUTHORIZED, CalcRuntimeArgs, CatalogSearchArgs, TagNowArgs, TagPeriodArgs, TagSeriesArgs,
+                       bearer_caller, unauthorized, validation_reason)
 from .periods import PRESETS
 from .save_agent import SAVE_DESCRIPTION, SAVE_PROPERTIES, SAVE_REQUIRED
 from .service import QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
-from .sql import MAX_NAMES
+from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
 if TYPE_CHECKING:
     from . import DataRole
@@ -59,6 +61,15 @@ TOOL_DESCRIPTIONS = {
                   "среднее, минимум, максимум, размах, σ — посчитаны историаном по сырым данным. Период — "
                   "готовый (period) или начало и конец (start, end, ISO 8601). В ответе сказано, какое это "
                   "среднее, в каком поясе время и что смены 06/14/22 — допущение.",
+    "tag_series": "Ряд значений тегов БДРВ за период — профиль (до 4 тегов, на тег до 96 точек, всего до 288; окно до "
+                  "31 суток, бюджет 24 тего-суток): значения на равномерной сетке историана и по каждому тегу начало, "
+                  "конец, изменение, минимум и максимум сетки с моментами. Всплески короче шага не видны: истинные "
+                  "минимум, максимум и среднее даёт tag_period. Период — готовый (period) или начало и конец (start, "
+                  "end, ISO 8601).",
+    "calc_runtime": "Наработка по тегам состояний БДРВ (до 16 тегов, окно до 31 суток, бюджет 24 тего-суток): часы и "
+                    "доля периода в каждом состоянии и число переходов — по сырым данным историана. Смысл 1 зависит "
+                    "от окончания тега (_RUN 1 — работает, _CLS 1 — закрыт): в ответе есть подпись. Аналоговые теги "
+                    "не считаются.",
     "save_agent": SAVE_DESCRIPTION,         # одно место правды — save_agent.py (research/09 §4.1, дословно)
 }
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
@@ -67,6 +78,11 @@ SAVE_ANNOTATIONS = ToolAnnotations(readOnlyHint=False, destructiveHint=False, id
 
 Tags = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "string", "maxLength": TAG_CHARS},
                                                "minItems": 1, "maxItems": MAX_NAMES})]
+SeriesTags = Annotated[Any, Field(json_schema_extra={"type": "array",
+                                                     "items": {"type": "string", "maxLength": TAG_CHARS},
+                                                     "minItems": 1, "maxItems": SERIES_MAX_TAGS})]
+Points = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": SERIES_MIN_POINTS,
+                                                 "maximum": SERIES_MAX_POINTS})]
 Preset = Annotated[Any, Field(json_schema_extra={"type": "string", "enum": list(PRESETS)})]
 IsoTime = Annotated[Any, Field(json_schema_extra={"type": "string"})]
 Query = Annotated[Any, Field(json_schema_extra={"type": "string", "minLength": 1, "maxLength": QUERY_CHARS})]
@@ -95,7 +111,7 @@ def _caller(ctx: Context, role: "DataRole") -> str | None:
 
 
 def build_mcp(role: "DataRole") -> FastMCP:
-    """Сервер MCP роли: три инструмента только для чтения (служба — role.service в момент вызова) и save_agent
+    """Сервер MCP роли: пять инструментов только для чтения (служба — role.service в момент вызова) и save_agent
     (role.save_agent, Д7-R57).
 
     log_level="WARNING": без корневого обработчика (setup_logging его ставит) FastMCP настроил бы корень
@@ -149,6 +165,22 @@ def build_mcp(role: "DataRole") -> FastMCP:
                           {"tags": tags, "period": period, "start": start, "end": end},
                           lambda caller, a: role.service.tag_period(caller, "mcp", a.tags, a.period, a.start,
                                                                     a.end))
+
+    @mcp.tool(name="tag_series", description=TOOL_DESCRIPTIONS["tag_series"], annotations=READ_ONLY)
+    async def tag_series(ctx: Context, tags: SeriesTags = None, period: Preset = None, start: IsoTime = None,
+                         end: IsoTime = None, points: Points = SERIES_DEFAULT_POINTS) -> dict[str, Any]:
+        return await call(ctx, "tag_series", tags, TagSeriesArgs,
+                          {"tags": tags, "period": period, "start": start, "end": end, "points": points},
+                          lambda caller, a: role.service.tag_series(caller, "mcp", a.tags, a.period, a.start, a.end,
+                                                                    a.points))
+
+    @mcp.tool(name="calc_runtime", description=TOOL_DESCRIPTIONS["calc_runtime"], annotations=READ_ONLY)
+    async def calc_runtime(ctx: Context, tags: Tags = None, period: Preset = None, start: IsoTime = None,
+                           end: IsoTime = None) -> dict[str, Any]:
+        return await call(ctx, "calc_runtime", tags, CalcRuntimeArgs,
+                          {"tags": tags, "period": period, "start": start, "end": end},
+                          lambda caller, a: role.service.calc_runtime(caller, "mcp", a.tags, a.period, a.start,
+                                                                      a.end))
 
     @mcp.tool(name="save_agent", description=TOOL_DESCRIPTIONS["save_agent"], annotations=SAVE_ANNOTATIONS)
     async def save_agent(ctx: Context, name: AgentName = None, title: AgentTitle = None, node: AgentNode = None,

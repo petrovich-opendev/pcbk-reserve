@@ -1,8 +1,8 @@
 """Кэш ответов и single-flight.
 
-Срок записи: текущие значения — TTL_NOW_S; период — TTL_OPEN_S, пока он ещё
-идёт (is_open из periods.py — то же правило, что у заметки «период ещё
-идёт», F21), иначе TTL_CLOSED_S. «Сейчас» округляется вниз до NOW_ROUND_S
+Срок записи: текущие значения — TTL_NOW_S; период (сводка, ряд, наработка) —
+TTL_OPEN_S, пока он ещё идёт (is_open из periods.py — то же правило, что у
+заметки «период ещё идёт», F21), иначе TTL_CLOSED_S. «Сейчас» округляется вниз до NOW_ROUND_S
 (round_now), так повторные вызовы получают один ключ. Ошибки и отказы в кэш
 не кладутся — это решает вызывающий. Всё — в одном цикле событий, без замков.
 """
@@ -26,26 +26,31 @@ TTL_CLOSED_S = 3600
 NOW_ROUND_S = ROUND_S            # 30 с — одно число с periods.round_now
 MAX_ENTRIES = 256
 
-Tool = Literal["tag_now", "tag_period"]
+Tool = Literal["tag_now", "tag_period", "tag_series", "calc_runtime"]
+# инструменты за период: срок записи — по концу периода
+_PERIOD_TOOLS = frozenset({"tag_period", "tag_series", "calc_runtime"})
 V = TypeVar("V")
 T = TypeVar("T")
 
 
 def ttl_for(tool: Tool, end: datetime | None, now: datetime) -> float:
-    """Срок записи в секундах; у tag_period end обязателен."""
+    """Срок записи в секундах; у инструментов за период (tag_period, tag_series, calc_runtime) end обязателен."""
     if tool == "tag_now":
         return TTL_NOW_S
-    if tool == "tag_period":
+    if tool in _PERIOD_TOOLS:
         if end is None:
-            raise ValueError("у tag_period нужен конец периода")
+            raise ValueError(f"у {tool} нужен конец периода")
         return TTL_OPEN_S if is_open(end, now) else TTL_CLOSED_S
     raise ValueError(f"неизвестный инструмент {tool!r}")
 
 
-def cache_key(tool: str, tags: Iterable[str], start: datetime | None, end: datetime | None) -> str:
-    """sha256 от инструмента, отсортированных тегов и границ периода: порядок тегов не важен."""
+def cache_key(tool: str, tags: Iterable[str], start: datetime | None, end: datetime | None, extra: str = "") -> str:
+    """sha256 от инструмента, отсортированных тегов, границ периода и extra (у tag_series — число точек): порядок
+    тегов не важен. Пустой extra в ключ не входит — ключи tag_now и tag_period прежние."""
     parts = [tool, sorted(tags), None if start is None else start.isoformat(),
              None if end is None else end.isoformat()]
+    if extra:
+        parts.append(extra)
     return hashlib.sha256(json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 

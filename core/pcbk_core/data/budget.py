@@ -2,7 +2,8 @@
 
 Тего-сутки — число тегов × длина окна в сутках; окно короче часа считается
 за час. Предел вызовов на вызывающего — PER_CALLER_LIMIT за окно ворот
-(SlidingWindow Д3а, 5 минут).
+(SlidingWindow Д3а, 5 минут). Точки ряда (Д9-R84) — теги × точки за вызов,
+не больше max_points; проверяются после окна и тего-суток.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -47,4 +48,12 @@ def check_budget(n: int, start: datetime, end: datetime, limits: Limits = LIMITS
         cost = f"{cost_tag_days(n, start, end, limits):.2f}".replace(".", ",")
         return (f"запрос стоит {cost} тего-суток при пределе {limits.max_tag_days:g} "
                 f"(для одного тега — {limits.single_tag_days:g}): сократите период или число тегов")
+    return None
+
+
+def check_points(n: int, points: int, limits: Limits = LIMITS) -> str | None:
+    """Текст отказа, если точек ряда за вызов (n тегов × points) больше limits.max_points, иначе None."""
+    if n * points > limits.max_points:
+        return (f"за один вызов — не больше {limits.max_points} точек ряда (теги × точки): "
+                "сократите число тегов или точек")
     return None

@@ -1,4 +1,5 @@
-"""MCP службы данных: те же три инструмента, что HTTP, поверх одной DataService; save_agent (Д7а) — только MCP.
+"""MCP службы данных: те же пять инструментов, что HTTP (с Д9а и калькуляторы), поверх одной DataService; save_agent
+(Д7а) — только MCP.
 
 Токен → ошибка настройки → аргументы → служба; /mcp — точный маршрут, GET — 405, Host любой.
 """
@@ -43,8 +44,9 @@ def raw(url, method="POST", body=INIT, **headers):
 async def test_mcp_lists_tools(core_server):
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
         tools = {t.name: t for t in (await s.list_tools()).tools}
-    assert set(tools) == {"catalog_search", "tag_now", "tag_period", "save_agent"}
-    assert all(tools[name].annotations.readOnlyHint is True for name in ("catalog_search", "tag_now", "tag_period"))
+    assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "save_agent"}
+    assert all(tools[name].annotations.readOnlyHint is True
+               for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime"))
     saver = tools["save_agent"]
     assert (saver.annotations.readOnlyHint, saver.annotations.destructiveHint, saver.annotations.idempotentHint,
             saver.annotations.openWorldHint) == (False, False, True, False)                  # Д7-R57
@@ -62,6 +64,10 @@ async def test_mcp_lists_tools(core_server):
     tags = tools["tag_now"].inputSchema["properties"]["tags"]
     assert (tags["type"], tags["maxItems"], tags["items"]["maxLength"]) == ("array", 16, 128)
     assert tools["tag_now"].description == TOOL_DESCRIPTIONS["tag_now"]
+    assert tools["tag_series"].description == TOOL_DESCRIPTIONS["tag_series"]                    # Д9а, А2
+    assert tools["calc_runtime"].description == TOOL_DESCRIPTIONS["calc_runtime"]
+    series = tools["tag_series"].inputSchema["properties"]
+    assert (series["points"]["maximum"], series["tags"]["maxItems"]) == (96, 4)
 
 
 @pytest.mark.anyio
@@ -324,3 +330,48 @@ async def test_mcp_has_no_resources_or_prompts(core_server):                  # 
         assert (await s.list_resource_templates()).resourceTemplates == []
         assert (await s.list_prompts()).prompts == []
         assert {t.name for t in (await s.list_tools()).tools} >= {"tag_now", "tag_period", "catalog_search"}
+
+
+# Д9а, задача А2: калькуляторы по MCP — ответ службы, схема для модели, тексты (Д9-R85)
+
+
+@pytest.mark.anyio
+async def test_mcp_calculators_answer_from_service(core_server):
+    series_args = {"tags": ["20FAKE_001_PV"], "period": "last_8h", "points": 3}
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        tools = {t.name: t for t in (await s.list_tools()).tools}
+        series = (await s.call_tool("tag_series", series_args)).structuredContent
+        runtime = (await s.call_tool("calc_runtime", {"tags": ["25FAKE_007_CLS"], "period": "yesterday",
+                                                      "start": None, "end": None})).structuredContent
+        default = (await s.call_tool("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h",
+                                                    "points": None})).structuredContent
+        bad = (await s.call_tool("tag_series", {**series_args, "points": 97})).structuredContent
+        five = (await s.call_tool("tag_series", {"tags": [f"20FAKE_00{i}_PV" for i in range(5)],
+                                                 "period": "last_8h"})).structuredContent
+    _, body = http_post(core_server.url + "/api/data/tag_series", series_args, TOKEN)
+    drop = lambda d: {k: v for k, v in d.items() if k != "cache"}
+    assert series["status"] == "ok" and drop(series) == drop(json.loads(body))          # одна служба
+    assert series["items"][0]["profile"]["change"] == 2.5 and runtime["items"][0]["states"][0]["hours"] == 18.0
+    assert (default["status"], default["points"]) == ("ok", 24)                          # null — «не задан»
+    assert bad["message"] == "неверные аргументы: points: не больше 96"
+    assert five["message"] == "неверные аргументы: tags: не больше 4 элементов"
+    events = core_server.role.events.recent(channel="mcp")
+    assert [(e.tool, e.outcome) for e in events[:2]] == [("tag_series", "refused")] * 2
+    assert {e.caller for e in events} == {"student-01"}
+    props = tools["tag_series"].inputSchema["properties"]
+    assert (props["points"]["type"], props["points"]["minimum"], props["points"]["maximum"],
+            props["points"]["default"]) == ("integer", 2, 96, 24)
+    assert (props["tags"]["minItems"], props["tags"]["items"]["maxLength"]) == (1, 128)
+    assert props["period"]["enum"] == list(PRESETS) and props["start"]["type"] == "string"
+    runtime_props = tools["calc_runtime"].inputSchema["properties"]
+    assert runtime_props["tags"]["maxItems"] == 16 and set(runtime_props) == {"tags", "period", "start", "end"}
+    assert all(tools[n].annotations.openWorldHint is False for n in ("tag_series", "calc_runtime"))
+    assert TOOL_DESCRIPTIONS["tag_series"] == (
+        "Ряд значений тегов БДРВ за период — профиль (до 4 тегов, на тег до 96 точек, всего до 288; окно до 31 суток, "
+        "бюджет 24 тего-суток): значения на равномерной сетке историана и по каждому тегу начало, конец, изменение, "
+        "минимум и максимум сетки с моментами. Всплески короче шага не видны: истинные минимум, максимум и среднее "
+        "даёт tag_period. Период — готовый (period) или начало и конец (start, end, ISO 8601).")
+    assert TOOL_DESCRIPTIONS["calc_runtime"] == (
+        "Наработка по тегам состояний БДРВ (до 16 тегов, окно до 31 суток, бюджет 24 тего-суток): часы и доля "
+        "периода в каждом состоянии и число переходов — по сырым данным историана. Смысл 1 зависит от окончания "
+        "тега (_RUN 1 — работает, _CLS 1 — закрыт): в ответе есть подпись. Аналоговые теги не считаются.")

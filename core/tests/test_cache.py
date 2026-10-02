@@ -1,11 +1,13 @@
 """Кэш ответов: срок по виду периода, «сейчас» вниз до 30 с, вытеснение четверти, single-flight."""
 import asyncio
+import hashlib
+import json
 from datetime import datetime, timedelta
 
 import anyio
 import pytest
 
-from pcbk_core.data.cache import SingleFlight, TTLCache, cache_key, round_now, ttl_for
+from pcbk_core.data.cache import TTL_CLOSED_S, TTL_OPEN_S, SingleFlight, TTLCache, cache_key, round_now, ttl_for
 from pcbk_core.data.historian import HistorianError
 
 
@@ -67,3 +69,28 @@ async def test_single_flight_leader_cancel_keeps_work_for_others():
     assert await asyncio.gather(*followers) == [("r", True)] * 3 and len(calls) == 1
     with pytest.raises(asyncio.CancelledError):
         await leader
+
+
+# Д9а, задача А2: ключ ряда несёт число точек, срок калькуляторов — как у сводки (Д9-R84)
+
+
+def test_cache_key_extra_and_new_tools():
+    a = cache_key("tag_series", ["X_1"], datetime(2026, 1, 1), datetime(2026, 1, 2), extra="24")
+    assert a != cache_key("tag_series", ["X_1"], datetime(2026, 1, 1), datetime(2026, 1, 2), extra="48")
+    assert ttl_for("calc_runtime", datetime(2026, 1, 1), datetime(2026, 1, 2)) == TTL_CLOSED_S
+
+
+# сверх брифа: без extra ключ прежний; срок ряда и наработки открытого периода — как у tag_period
+
+
+def test_cache_key_without_extra_unchanged_and_open_ttl():
+    start, end = datetime(2026, 1, 1), datetime(2026, 1, 2)
+    assert cache_key("tag_period", ["X_1"], start, end) == cache_key("tag_period", ["X_1"], start, end, extra="")
+    d3b = json.dumps(["tag_period", ["X_1"], start.isoformat(), end.isoformat()], separators=(",", ":"))
+    assert cache_key("tag_period", ["X_1"], start, end) == hashlib.sha256(d3b.encode()).hexdigest()   # ключ Д3б
+    for tool in ("tag_series", "calc_runtime"):
+        assert ttl_for(tool, end, end + timedelta(seconds=299)) == TTL_OPEN_S
+        with pytest.raises(ValueError):
+            ttl_for(tool, None, end)
+    assert cache_key("tag_series", ["X_1"], start, end, extra="24") != cache_key("calc_runtime", ["X_1"], start, end,
+                                                                                 extra="24")

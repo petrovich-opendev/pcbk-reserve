@@ -210,3 +210,60 @@ async def test_place_token_network_checked_on_mcp_and_llm(tmp_path, fake_or):   
                 r = await c.post("/llm/v1/chat/completions", json=chat_body(),
                                  headers={"Authorization": f"Bearer {LLM_TOKEN}"})
                 assert (r.status_code != 401) is ok, client
+
+
+# Д9а, задача А2: калькуляторы по HTTP (Д9-R85)
+
+
+def test_http_series_and_runtime(tmp_path):
+    app, role = make_app(tmp_path)
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app) as c:
+        wait_until(lambda: role.catalog.loaded)
+        r = c.post("/api/data/tag_series", json={"tags": ["20FAKE_001_PV"], "period": "last_8h", "points": 3},
+                   headers=auth)
+        assert r.status_code == 200 and r.json()["tool"] == "tag_series"
+        r = c.post("/api/data/calc_runtime", json={"tags": ["25FAKE_007_CLS"], "period": "yesterday"}, headers=auth)
+        assert r.status_code == 200 and r.json()["items"][0]["states"]
+        r = c.post("/api/data/tag_series", json={"tags": ["20FAKE_001_PV"], "points": 1, "period": "last_8h"},
+                   headers=auth)
+        assert r.status_code == 422 and r.json()["status"] == "refused" and "points" in r.json()["message"]
+
+
+# сверх брифа: пределы моделей, 422 с событием, точки по умолчанию, ошибка настройки — 503
+
+
+def test_http_calculator_models(tmp_path):
+    app, role = make_app(tmp_path)
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    cases = [("tag_series", {"tags": [f"20FAKE_00{i}_PV" for i in range(5)], "period": "last_8h"},
+              "tags: не больше 4 элементов"),
+             ("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h", "points": 97}, "points: не больше 96"),
+             ("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h", "points": "много"},
+              "points: нужно целое число"),
+             ("calc_runtime", {"tags": [f"25FAKE_{i:03d}_CLS" for i in range(17)], "period": "yesterday"},
+              "tags: не больше 16 элементов"),
+             ("calc_runtime", {"tags": ["25FAKE_007_CLS"], "period": "last_year"}, "period: неизвестное значение")]
+    with TestClient(app) as c:
+        wait_until(lambda: role.catalog.loaded)
+        for tool, body, reason in cases:
+            r = c.post(f"/api/data/{tool}", json=body, headers=auth)
+            assert (r.status_code, r.json()["message"]) == (422, "неверные аргументы: " + reason), body
+            e = role.events.recent(channel="http")[0]
+            assert (e.tool, e.outcome, e.sent, e.caller) == (tool, "refused", (), "student-01")
+        r = c.post("/api/data/tag_series", json={"tags": ["20FAKE_001_PV"], "period": "last_8h"}, headers=auth)
+        assert (r.status_code, r.json()["points"], r.json()["status"]) == (200, 24, "ok")
+        unauthorized = c.post("/api/data/calc_runtime", json={"tags": ["25FAKE_007_CLS"], "period": "yesterday"})
+        assert unauthorized.status_code == 401
+
+
+def test_http_calculators_config_error_is_503(tmp_path):
+    role, fake = make_role(db_dir=tmp_path, config_error=CONFIG_ERRORS["whitelist_unreadable"])
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    with TestClient(create_app(SETTINGS, [role])) as c:
+        for tool, body in (("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h"}),
+                           ("calc_runtime", {"tags": ["25FAKE_007_CLS"], "period": "yesterday"}),
+                           ("tag_series", {"tags": ["20FAKE_001_PV"], "points": 1})):
+            r = c.post(f"/api/data/{tool}", json=body, headers=auth)
+            assert (r.status_code, r.json()["status"], r.json()["tool"]) == (503, "unavailable", tool), body
+    assert fake.calls == []

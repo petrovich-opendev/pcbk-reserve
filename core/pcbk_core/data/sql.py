@@ -14,6 +14,10 @@ tagname»), а второй LIKE отвергает. Поэтому здесь �
 WW_CONSTANTS; ворота пускают их через allowed_literal. Её SQL и форма
 строятся из одних констант пробы (SummaryShape) — правка DATE_FMT,
 PIN_INTERPOLATION или HAS_LAST меняет и то, и другое.
+
+Ряд (series_sql, Д9-R84) — AnalogHistory на равномерной сетке: литерал 'Cyclic' из WW_CONSTANTS и число точек
+SERIES_MIN_POINTS…SERIES_MAX_POINTS без кавычек; форма пускает ровно эти числа. Наработка (state_sql, Д9-R85) —
+StateSummaryHistory одной корзиной, как сводка. ORDER BY нет ни там, ни там: порядок задаёт служба.
 """
 import re
 from collections.abc import Sequence
@@ -81,8 +85,10 @@ _NAME_LIST = rf"\({_NAME_LITERAL}(?:, {_NAME_LITERAL}){{0,{MAX_NAMES - 1}}}\)"
 
 BASE_SUMMARY_COLUMNS = ("Minimum", "Maximum", "Average", "StdDev", "PercentGood")
 LAST_COLUMNS = ("Last", "LastDateTime")
+# режим выборки ряда (Д9-R84): равномерная сетка историана
+SERIES_MODE = "Cyclic"
 # значения ww-столбцов, которые ворота пускают литералом (закрытый набор)
-WW_CONSTANTS = frozenset({"STAIRSTEP"})
+WW_CONSTANTS = frozenset({"STAIRSTEP", SERIES_MODE})
 
 
 @dataclass(frozen=True)
@@ -179,6 +185,61 @@ def allowed_literal(text: str, shape: SummaryShape = SHAPE) -> bool:
         return False
 
 
+# --- ряд на сетке и наработка (Д9) ---
+
+SERIES_MAX_TAGS = 4
+SERIES_MIN_POINTS = 2
+SERIES_MAX_POINTS = 96
+SERIES_DEFAULT_POINTS = 24
+SERIES_COLUMNS = ("DateTime", "Value", "Quality")
+STATE_COLUMNS = ("vValue", "StateTimeTotal", "StateTimePercent", "StateCount")
+
+# части ряда и наработки — общие у SQL и формы
+_SERIES_HEAD = "SELECT TagName, " + ", ".join(SERIES_COLUMNS) + " FROM AnalogHistory WHERE TagName IN "
+_SERIES_START = " AND DateTime >= "
+_SERIES_END = " AND DateTime <= "
+_SERIES_GRID = f" AND wwRetrievalMode = '{SERIES_MODE}' AND wwCycleCount = "
+_STATE_HEAD = "SELECT TagName, " + ", ".join(STATE_COLUMNS) + " FROM StateSummaryHistory WHERE TagName IN "
+# число точек в форме — ровно десятичная запись одного из чисел SERIES_MIN_POINTS…SERIES_MAX_POINTS
+_POINTS_FORM = "(?:" + "|".join(str(n) for n in range(SERIES_MAX_POINTS, SERIES_MIN_POINTS - 1, -1)) + ")"
+
+
+def _names_sql(names: Sequence[str], most: int) -> str:
+    if isinstance(names, str) or not 0 < len(names) <= most:
+        raise ValueError(f"нужно от 1 до {most} имён тегов")
+    return "(" + ", ".join(lit_name(n) for n in names) + ")"
+
+
+def series_sql(names: Sequence[str], start: datetime, end: datetime, points: int) -> str:
+    """Ряд AnalogHistory за [start, end] на равномерной сетке из points точек на тег; время — местное, без пояса.
+
+    Тегов — не больше SERIES_MAX_TAGS, точек — целое SERIES_MIN_POINTS…SERIES_MAX_POINTS (не bool и не строка):
+    число идёт в SQL без кавычек, иначе — ValueError.
+    """
+    if isinstance(points, bool) or not isinstance(points, int) or not SERIES_MIN_POINTS <= points <= SERIES_MAX_POINTS:
+        raise ValueError(f"точек ряда — целое от {SERIES_MIN_POINTS} до {SERIES_MAX_POINTS}")
+    return (_SERIES_HEAD + _names_sql(names, SERIES_MAX_TAGS) + _SERIES_START + lit_dt(start) + _SERIES_END
+            + lit_dt(end) + _SERIES_GRID + str(points))
+
+
+def state_sql(names: Sequence[str], start: datetime, end: datetime) -> str:
+    """Наработка StateSummaryHistory за [start, end] одной корзиной (wwCycleCount = 1); время — местное, без пояса."""
+    return (_STATE_HEAD + _names_sql(names, MAX_NAMES) + _SUMMARY_START + lit_dt(start) + _SUMMARY_END + lit_dt(end)
+            + _SUMMARY_CYCLES)
+
+
+def _series_form() -> re.Pattern[str]:
+    date = _date_form(DATE_FMT)
+    return re.compile(re.escape(_SERIES_HEAD) + _NAME_LIST + re.escape(_SERIES_START) + date + re.escape(_SERIES_END)
+                      + date + re.escape(_SERIES_GRID) + _POINTS_FORM, re.ASCII)
+
+
+def _state_form() -> re.Pattern[str]:
+    date = _date_form(DATE_FMT)
+    return re.compile(re.escape(_STATE_HEAD) + _NAME_LIST + re.escape(_SUMMARY_START) + date
+                      + re.escape(_SUMMARY_END) + date + re.escape(_SUMMARY_CYCLES), re.ASCII)
+
+
 # формы всех инструкций службы; сверка — fullmatch
 TEMPLATE_FORMS: dict[str, re.Pattern[str]] = {
     "clock": re.compile(re.escape(clock_sql())),
@@ -186,6 +247,8 @@ TEMPLATE_FORMS: dict[str, re.Pattern[str]] = {
     "live_all": re.compile(re.escape(live_all_sql())),
     "live": re.compile(re.escape(_LIVE_HEAD) + _NAME_LIST),
     "summary": summary_form(),
+    "series": _series_form(),
+    "state": _state_form(),
 }
 
 
