@@ -1123,3 +1123,35 @@ def test_calc_rate_respects_run_deadline():                                     
     r = runner(stand=stand, clock=clock.mono, sleep=clock.sleep)
     answer = r._calc("tag_now", {"tags": ["20FAKE_104_PV"]}, deadline=clock.mono() + 40.0)
     assert answer["status"] == "rate" and len(stand.calc_calls) == 3                 # 0, 15, 30 с; 45 с — за сроком
+
+
+@pytest.mark.parametrize("event", ["_hard", "_interrupt"])
+def test_calc_rate_no_pause_after_stop(event):                                   # итоговая доводка Д8б, Minor 2
+    stand = FakeStand(calc_rate=10_000)
+    sleeps: list[float] = []
+    r = runner(stand=stand, sleep=sleeps.append)
+    getattr(r, event).set()                                                         # жёсткая остановка или сигнал
+    answer = r._calc("tag_now", {"tags": ["20FAKE_104_PV"]})
+    assert answer["status"] == "rate" and len(stand.calc_calls) == 1 and sleeps == []
+
+
+def test_calc_patient_checks_stop_before_each_pause():                           # остановка посреди ожидания окна
+    from pcbk_bench.stand import CALC_RATE_PAUSE_S, calc_patient
+    stand = FakeStand(calc_rate=10_000)
+    sleeps: list[float] = []
+    answer = calc_patient(stand, "tag_now", {"tags": ["20FAKE_104_PV"]}, sleep=sleeps.append,
+                          stop=lambda: len(sleeps) >= 2)
+    assert answer["status"] == "rate" and sleeps == [CALC_RATE_PAUSE_S] * 2 and len(stand.calc_calls) == 3
+
+
+def test_calc_failure_noted_with_constant():                                     # сбой калькулятора — заметка-константа
+    from pcbk_bench.runner import NOTE_CALC_FAIL
+
+    class Broken(FakeStand):
+        def calc(self, tool, args):
+            if tool == "catalog_search":
+                return super().calc(tool, args)
+            raise RuntimeError("20FAKE_104_PV 3.42")
+    rec = runner(stand=Broken()).run_one(RunKey(7, "B1", 1))
+    assert rec.status == "done" and [n for n in rec.notes if n.startswith(NOTE_CALC_FAIL)] == [
+        f"{NOTE_CALC_FAIL} RuntimeError"]

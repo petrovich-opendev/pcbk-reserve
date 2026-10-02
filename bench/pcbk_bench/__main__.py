@@ -1,7 +1,7 @@
 """CLI стенда отбора (Д8-R74, П4, m-р4-16): python -m pcbk_bench override CONFIG | run CONFIG | status OUT
 [--stale-s N] | judge-pack CONFIG [--real-data] | judge-stage CONFIG [--only-missing] [--root DIR] | judge-audit STAGE
 --batch batch-NN --transcript PATH [--discard] | judge-collect CONFIG [--batch batch-NN …] [--root DIR] | judge-check
-CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG.
+CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG | cards-audit CONFIG --transcript PATH.
 
 - override CONFIG — файл переопределения мест (render_override) в stdout;
 - run CONFIG — прогон: load_config → window_start (без него или позже сейчас + 5 мин — RunRefused("window_start")
@@ -29,8 +29,13 @@ CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG.
   ('{"tags": ["…"]}'); в stdout — ответ службы как есть (JSON). Только для субагента карточек (bench/cards/WRITER.md):
   контроллер его не зовёт;
 - cards-check CONFIG — коды формы карточек конфига и статусы калькулятора (cards_check), по строке: годно — ровно
-  «C2: unlisted» и «C4: no_data», код 0; иначе код 1. Карточки не того вида — код «cards_form». Значений, тегов и
-  текстов в выводе нет.
+  «C2: unlisted» и «C4: no_data», код 0; иначе код 1. Карточки не того вида — одна строка «cards_form:<место>»
+  (cards.CardsFormError.where: «<id>.<поле>», «bench_tags» …; файла нет или иной сбой — «cards_form»). Ожидание окна
+  частоты калькулятора — строка «калькулятор: rate — пауза» в stderr на каждую паузу. Значений, тегов и текстов в
+  выводе нет;
+- cards-audit CONFIG --transcript PATH — сверка транскрипта субагента карточек по списку разрешений WRITER.md
+  (cards.audit_cards): печатает только нарушения (инструмент и вид), код 1 при нарушениях. Команда — из того же
+  дерева, откуда субагент читал WRITER.md: образец и задание сверяются по путям этого дерева.
 
 Коды main: 0 — успех, 2 — RunRefused, 1 — прочее. Ошибка печатается только классом исключения (и кодом RunRefused),
 без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без разговоров и тегов) — в stderr.
@@ -46,10 +51,11 @@ import argparse
 import json
 import logging
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .cards import CHECK_GOOD, cards_check, load_cards
+from .cards import CHECK_GOOD, CardsFormError, audit_cards, cards_check, load_cards
 from .config import BenchConfig, load_config
 from .gateway import GatewayChat
 from .override import render_override
@@ -104,6 +110,9 @@ def _parser() -> argparse.ArgumentParser:
     calc.add_argument("tool", choices=DATA_TOOLS)
     calc.add_argument("args")
     sub.add_parser("cards-check", help="коды формы карточек и статусы калькулятора").add_argument("config", type=Path)
+    cards_audit = sub.add_parser("cards-audit", help="сверка транскрипта субагента карточек по списку разрешений")
+    cards_audit.add_argument("config", type=Path)
+    cards_audit.add_argument("--transcript", type=Path, required=True)
     return p
 
 
@@ -228,18 +237,40 @@ def _calc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rate_pause(seconds: float) -> None:
+    """Пауза калькулятора на rate у cards-check: строка в stderr (контроллер видит, что команда ждёт окно частоты)."""
+    print("калькулятор: rate — пауза", file=sys.stderr, flush=True)
+    time.sleep(seconds)
+
+
 def _cards_check(config: Path) -> int:
-    """cards-check CONFIG: коды по строке (cards_check); годно — ровно CHECK_GOOD, код 0; иначе код 1."""
+    """cards-check CONFIG: коды по строке (cards_check); годно — ровно CHECK_GOOD, код 0; иначе код 1. Вид карточек
+    не тот — «cards_form:<место>» (без значений); иной сбой чтения — «cards_form»."""
     cfg = load_config(config, OPENCODE_JSON)
     try:
         cs = load_cards(cfg.cards)
-    except (ValueError, OSError, TypeError):
-        print("cards_form")                       # вид карточек не тот: текст ошибки не печатается
+    except CardsFormError as exc:
+        print(f"cards_form:{exc.where}")          # место без значений: текст ошибки не печатается
         return 1
-    codes = cards_check(cs, server_stand(cfg))
+    except (ValueError, OSError, TypeError):
+        print("cards_form")
+        return 1
+    codes = cards_check(cs, server_stand(cfg), sleep=_rate_pause)
     for code in codes:
         print(code)
     return 0 if tuple(codes) == CHECK_GOOD else 1
+
+
+def _cards_audit(args: argparse.Namespace) -> int:
+    """cards-audit CONFIG --transcript PATH: нарушения списка разрешений субагента карточек по строке и их число."""
+    from . import judge                       # лениво: разбор транскрипта и служебные инструменты харнесса
+
+    cfg = load_config(args.config, OPENCODE_JSON)
+    problems = audit_cards(judge.transcript_calls(args.transcript), args.config, cfg.cards, judge.HARNESS_TOOLS)
+    for line in problems:
+        print(line)
+    print(f"нарушений: {len(problems)}")
+    return 1 if problems else 0
 
 
 def _run(config: Path) -> int:
@@ -277,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
             return _calc(args)
         if args.command == "cards-check":
             return _cards_check(args.config)
+        if args.command == "cards-audit":
+            return _cards_audit(args)
         return _run(args.config)
     except RunRefused as exc:
         print(f"RunRefused: {exc.code}", file=sys.stderr)

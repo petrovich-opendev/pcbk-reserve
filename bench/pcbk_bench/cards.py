@@ -15,7 +15,10 @@
 - B3: expect_tag — тег, к которому вопрос без имени должен привести, clarify — одно уточнение словами;
 - C1, C3: opening.
 load_cards сверяет только вид (типы, ключи, согласие в on_draft); полноту и коды формы — check_cards (Б3). Тексты
-ValueError — без значений карточек: в них только id сценария и имя поля.
+ValueError — без значений карточек: в них только id сценария и имя поля. Ошибка вида — CardsFormError (ValueError) с
+местом where без значений: «<id>.<поле>», «<id>» (карточка не объект), «<id>.fields» (неизвестные поля карточки),
+«bench_node», «bench_tags», «cards», «json», «keys» (ключи верхнего уровня), «cards.ids» (неизвестные сценарии) —
+его печатает cards-check кодом cards_form:<место> (итоговая доводка Д8б).
 
 Проверка карточек окна (Б3, Д8-R80, I-р4-6): check_cards(cs) — коды формы без значений: missing:<id> (нет карточки),
 field:<id>.<поле> (нет обязательного поля; у B1, B2, B4, C2, C4 — тега нет в opening; в полях, которые бот или скрипт
@@ -25,6 +28,14 @@ field:<id>.<поле> (нет обязательного поля; у B1, B2, B4
 годно; иначе «C2: listed», «C4: has_data» или код службы (unknown, discrete, refused, rate …) — отказ карточек.
 Калькулятор — calc_patient (rate — пауза и повтор на всё окно частоты, m14). Значений, тегов и текстов в кодах нет.
 
+Сверка транскрипта субагента карточек (audit_cards, итоговая доводка Д8б, по образцу judge.audit_transcripts) — по
+списку разрешений bench/cards/WRITER.md: Read — WRITER.md и образец bench/cards.twin.json этого дерева и свой файл
+карточек (cards конфига, live/cards.json); Write — только файл карточек; Bash — только команда калькулятора
+calc_command_ok: «[cd <абсолютный каталог> &&] [PYTHONPATH=…] [uv run [--python V] [-q] [--no-project]] python -m
+pcbk_bench calc <CONFIG> <TOOL> '<ARGS>'» — CONFIG абсолютный и тот же, TOOL — инструмент данных, ARGS — JSON-объект,
+без «$», «`», переводов строки и прочих операторов оболочки; служебные инструменты харнесса (harness); прочее —
+нарушение. Путь с «..» — нарушение до нормализации, относительный — нарушение, затем сравнение по os.path.realpath.
+
 Card.bench_tags (сверх брифа) load_cards заполняет у всех карточек тегами заготовленного агента: check_run берёт
 единицы этих тегов в правило чисел у сценариев агента bench (I-р4-4), а сигнатура check_run(rec, card, tag_units)
 CardSet не получает. CardSet.aliases — постоянные псевдонимы тегов и узлов карточек (ТЕГ-n, УЗЕЛ-n) по порядку
@@ -33,16 +44,18 @@ CardSet не получает. CardSet.aliases — постоянные псев
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 
 from .numbers import TAG_TOKEN_RE, tag_tokens
 from .scenarios import BENCH_AGENT, SCENARIO_IDS
-from .stand import Stand, calc_patient
+from .stand import DATA_TOOLS, Stand, calc_patient
 from .student import CONSENT, CONSENT_RE
 
 # AGENT_TOOLS Д7 (core/pcbk_core/agents/draft.py) — значением, не импортом: bench только на stdlib
@@ -104,47 +117,57 @@ _SPOKEN = ("opening", "node", "goal", "pick", "bridge", "clarify", "on_draft", "
 _CARD_KEYS = frozenset(f.name for f in fields(Card)) - {"scenario", "bench_tags"}
 
 
+class CardsFormError(ValueError):
+    """Вид файла карточек не тот: текст — без значений; where — место без значений («<id>.<поле>», «bench_tags» …)."""
+
+    def __init__(self, text: str, where: str):
+        super().__init__(text)
+        self.where = where
+
+
 def _card(sid: str, raw: object, bench_tags: tuple[str, ...]) -> Card:
     if not isinstance(raw, dict):
-        raise ValueError(f"карточка {sid}: нужен объект")
+        raise CardsFormError(f"карточка {sid}: нужен объект", sid)
     extra = set(raw) - _CARD_KEYS
     if extra:
-        raise ValueError(f"карточка {sid}: неизвестные поля ({len(extra)})")
+        raise CardsFormError(f"карточка {sid}: неизвестные поля ({len(extra)})", f"{sid}.fields")
     values: dict[str, object] = {}
     for name in _STR_FIELDS:
         if name in raw:
             if not isinstance(raw[name], str):
-                raise ValueError(f"карточка {sid}: поле {name} — строка")
+                raise CardsFormError(f"карточка {sid}: поле {name} — строка", f"{sid}.{name}")
             values[name] = raw[name]
     if not isinstance(raw.get("opening"), str) or not raw["opening"].strip():
-        raise ValueError(f"карточка {sid}: нет opening")
+        raise CardsFormError(f"карточка {sid}: нет opening", f"{sid}.opening")
     for name in _LIST_FIELDS:
         if name in raw:
             items = raw[name]
             if not isinstance(items, list) or not all(isinstance(i, str) and i.strip() for i in items):
-                raise ValueError(f"карточка {sid}: поле {name} — список непустых строк")
+                raise CardsFormError(f"карточка {sid}: поле {name} — список непустых строк", f"{sid}.{name}")
             values[name] = tuple(items)
     for name in _TAG_FIELDS:
         if name in raw:
             if raw[name] is not None and not isinstance(raw[name], str):
-                raise ValueError(f"карточка {sid}: поле {name} — строка или null")
+                raise CardsFormError(f"карточка {sid}: поле {name} — строка или null", f"{sid}.{name}")
             values[name] = raw[name]
     if "period" in raw and raw["period"] is not None:
         period = raw["period"]
+        where = f"{sid}.period"
         if not isinstance(period, dict) or set(period) != {"start", "end"} or not all(
                 isinstance(v, str) for v in period.values()):
-            raise ValueError(f"карточка {sid}: period — {{start, end}}")
+            raise CardsFormError(f"карточка {sid}: period — {{start, end}}", where)
         try:
             start, end = datetime.fromisoformat(period["start"]), datetime.fromisoformat(period["end"])
         except ValueError:
-            raise ValueError(f"карточка {sid}: period — ISO 8601") from None
+            raise CardsFormError(f"карточка {sid}: period — ISO 8601", where) from None
         if (start.tzinfo is None) != (end.tzinfo is None) or start >= end:
-            raise ValueError(f"карточка {sid}: period — начало раньше конца, пояс у обоих или ни у одного")
+            raise CardsFormError(f"карточка {sid}: period — начало раньше конца, пояс у обоих или ни у одного", where)
         values["period"] = dict(period)
     for name in _SPOKEN:                     # П8, I-4 доводки р1: согласие бот добавляет сам и только на черновик
         said = values.get(name, ())
         if any(CONSENT_RE.match(line) for line in ((said,) if isinstance(said, str) else said)):
-            raise ValueError(f"карточка {sid}: поле {name} похоже на согласие — его произносит бот")
+            raise CardsFormError(f"карточка {sid}: поле {name} похоже на согласие — его произносит бот",
+                                 f"{sid}.{name}")
     return Card(scenario=sid, bench_tags=bench_tags, **values)
 
 
@@ -171,19 +194,19 @@ def load_cards(path: Path) -> CardSet:
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"карточки: не JSON (строка {exc.lineno})") from None
+        raise CardsFormError(f"карточки: не JSON (строка {exc.lineno})", "json") from None
     if not isinstance(raw, dict) or set(raw) != {"bench_node", "bench_tags", "cards"}:
-        raise ValueError("карточки: ключи верхнего уровня — bench_node, bench_tags, cards")
+        raise CardsFormError("карточки: ключи верхнего уровня — bench_node, bench_tags, cards", "keys")
     node, tags, cards = raw["bench_node"], raw["bench_tags"], raw["cards"]
     if not isinstance(node, str) or not node.strip():
-        raise ValueError("карточки: bench_node — непустая строка")
+        raise CardsFormError("карточки: bench_node — непустая строка", "bench_node")
     if not isinstance(tags, list) or not all(isinstance(t, str) and t for t in tags) or len(set(tags)) != len(tags):
-        raise ValueError("карточки: bench_tags — список разных непустых строк")
+        raise CardsFormError("карточки: bench_tags — список разных непустых строк", "bench_tags")
     if not isinstance(cards, dict):
-        raise ValueError("карточки: cards — объект")
+        raise CardsFormError("карточки: cards — объект", "cards")
     unknown = [sid for sid in cards if sid not in SCENARIO_IDS]
     if unknown:
-        raise ValueError(f"карточки: неизвестные сценарии ({len(unknown)})")
+        raise CardsFormError(f"карточки: неизвестные сценарии ({len(unknown)})", "cards.ids")
     bench_tags = tuple(tags)
     out = {sid: _card(sid, cards[sid], bench_tags) for sid in SCENARIO_IDS if sid in cards}
     return CardSet(cards=out, bench_node=node, bench_tags=bench_tags, aliases=_aliases(node, bench_tags, out))
@@ -305,3 +328,87 @@ def cards_check(cs: CardSet, stand: Stand, *, sleep: Callable[[float], None] = t
             continue
         codes.append(f"{sid}: {_status(answer, tag, good, data)}")
     return codes
+
+
+# --- сверка транскрипта субагента карточек (итоговая доводка Д8б) ---
+
+CARDS_DIR = Path(__file__).resolve().parents[1] / "cards"
+WRITER_MD = CARDS_DIR / "WRITER.md"
+TWIN_CARDS = Path(__file__).resolve().parents[1] / "cards.twin.json"
+_SHELL_BAD = re.compile(r"[`$\n\r]")
+_SHELL_OPS = frozenset("();<>|&")
+_PYTHON = re.compile(r"(?:/[^\s]*/)?python(?:3(?:\.\d+)?)?")
+_UV_FLAGS = frozenset({"-q", "--quiet", "--no-project"})
+_UV_VALUE = frozenset({"--python", "-p"})
+
+
+def _no_dots(path: str) -> bool:
+    return os.path.isabs(path) and ".." not in Path(path).parts
+
+
+def calc_command_ok(command: str, config: Path) -> bool:
+    """Команда Bash — калькулятор CLI и только он (вид — в шапке модуля); config — путь конфига прогона."""
+    if not isinstance(command, str) or _SHELL_BAD.search(command):
+        return False
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return False
+    ops = [i for i, t in enumerate(tokens) if t and set(t) <= _SHELL_OPS]
+    if ops:
+        if ops != [2] or tokens[0] != "cd" or tokens[2] != "&&" or not _no_dots(tokens[1]):
+            return False
+        tokens = tokens[3:]
+    while tokens and re.fullmatch(r"PYTHONPATH=\S*", tokens[0]):
+        tokens = tokens[1:]
+    if tokens[:2] == ["uv", "run"]:
+        tokens = tokens[2:]
+        while tokens and tokens[0].startswith("-"):
+            flag = tokens[0]
+            if flag in _UV_FLAGS or re.fullmatch(r"--python=[\w.]+", flag):
+                tokens = tokens[1:]
+            elif flag in _UV_VALUE and len(tokens) > 1 and re.fullmatch(r"[\w.]+", tokens[1]):
+                tokens = tokens[2:]
+            else:
+                return False
+    if len(tokens) != 7 or not _PYTHON.fullmatch(tokens[0]) or tokens[1:4] != ["-m", "pcbk_bench", "calc"]:
+        return False
+    cfg, tool, args = tokens[4:]
+    if not _no_dots(cfg) or os.path.realpath(cfg) != os.path.realpath(config) or tool not in DATA_TOOLS:
+        return False
+    try:
+        return isinstance(json.loads(args), dict)
+    except ValueError:
+        return False
+
+
+def audit_cards(calls: Iterable[dict], config: Path, cards_file: Path, harness: Collection[str]) -> list[str]:
+    """Нарушения списка разрешений субагента карточек — по одной строке на вызов, без путей, команд и значений
+    (calls — judge.transcript_calls). Разрешено: Read — WRITER.md, образец формата и файл карточек; Write — файл
+    карточек; Bash — calc_command_ok; служебные harness."""
+    own = os.path.realpath(cards_file)
+    read_ok = {os.path.realpath(WRITER_MD), os.path.realpath(TWIN_CARDS), own}
+    out: list[str] = []
+    for c in calls:
+        tool = re.sub(r"[^\w-]", "?", str(c.get("tool") or "?"))[:80]
+        if tool in harness:
+            continue
+        if tool == "Bash":
+            if not calc_command_ok(c.get("command"), config):
+                out.append("Bash: команда вне списка")
+            continue
+        if tool not in ("Read", "Write"):
+            out.append(f"{tool}: инструмент вне списка")
+            continue
+        path = c.get("path")
+        if not isinstance(path, str) or not path:
+            out.append(f"{tool}: без пути")
+        elif ".." in Path(path).parts:
+            out.append(f"{tool}: путь с ..")
+        elif not os.path.isabs(path):
+            out.append(f"{tool}: относительный путь")
+        elif os.path.realpath(path) not in (read_ok if tool == "Read" else {own}):
+            out.append(f"{tool}: вне списка")
+    return out

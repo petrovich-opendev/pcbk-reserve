@@ -421,3 +421,30 @@ def test_calc_rate_counted_as_calculator_unavailable():                         
     assert "калькулятор недоступен" in md and "1 прогонов (`z-ai/glm-5.3` — 1)" in md
     assert "калькулятор недоступен" not in render_markdown([aggregate([checked], cards(), verdicts(checked))[0]],
                                                            {"run_id": "x"})
+
+
+def test_calc_failure_counted_as_calculator_unavailable():                       # итоговая доводка Д8б, Minor 1
+    from pcbk_bench.runner import NOTE_CALC_FAIL
+    failed = rec("B1", answer="Сейчас 3,42 бар.", tools=[now_call("20FAKE_104_PV", 3.42)])
+    failed.notes.append(f"{NOTE_CALC_FAIL} StandError")
+    other = rec("B1", rep=2, answer="Сейчас 3,42 бар.", tools=[now_call("20FAKE_104_PV", 3.42)])
+    other.notes.append("архив: сбой StandError")                                    # иная заметка — не калькулятор
+    got = aggregate([failed, other], cards(), verdicts(failed, other))[0]
+    assert got.calc_skipped == 1
+    assert "калькулятор недоступен: rate после пауз на всё окно частоты или сбой" in render_markdown([got],
+                                                                                                     {"run_id": "x"})
+
+
+def test_table_header_counts_unread_card_units(tmp_path, capsys, monkeypatch):   # Minor 1: _read_units не молчит
+    from pcbk_bench.runner import card_tags
+    config, out = _stand_out(tmp_path, monkeypatch)
+    tags = card_tags(cards())
+    (out / "tag_units.json").write_text(json.dumps({t.lower(): "°C" for t in tags[2:]}))   # регистр не важен
+    assert table.main([str(config)]) == 0
+    md = capsys.readouterr().out
+    assert f"Единиц тегов карточек нет в OUT/tag_units.json у 2 из {len(tags)}" in md
+    assert not re.search(r"FAKE|_PV", md.split("## Правило")[0])                   # в шапке — только счёт
+    assert json.loads((out / "table.json").read_text())["meta"]["units_missing"] == {"missing": 2, "total": len(tags)}
+    (out / "tag_units.json").write_text(json.dumps({t: "°C" for t in tags}))
+    assert table.main([str(config)]) == 0
+    assert "Единиц тегов карточек нет" not in capsys.readouterr().out

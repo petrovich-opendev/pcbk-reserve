@@ -26,7 +26,10 @@
   I1: в качество и доли такая запись не идёт); create_hard — то же у группы A (m9);
 - мягкие (soft) — foreign_number автомата и numbers_not_from_tools судьи (I-р3-2); number_missing — провал без жёсткого;
 - калькулятор недоступен (calc_skipped, Б3) — последняя done-запись ключа, у которой калькулятор ответил rate и после
-  пауз на всё окно частоты (заметка прогонщика NOTE_CALC_RATE): вторая сверка не сделана — строкой в шапке;
+  пауз на всё окно частоты (заметка прогонщика NOTE_CALC_RATE) или упал (заметка NOTE_CALC_FAIL, итоговая доводка
+  Д8б): вторая сверка не сделана — строкой в шапке; там же — число тегов карточек (runner.card_tags), чьих единиц нет
+  в OUT/tag_units.json (подготовка не прочитала их из каталога или у тега нет единицы: правило чисел берёт их единицы
+  только из выводов хода);
 - цена хода — Σ цены строк llm_calls всех попыток группы / Σ ходов (реплик студента; мост — тоже ход) тех сессий,
   у которых есть строки журнала (priced_turns, доводка р1 I2; исключённые ходы — в шапке); заголовок
   разговора (step 0) входит; строка без пришедшей цены — по cost_est (сумма — estimated_usd, «по оценке»); отказ
@@ -63,7 +66,7 @@ from .checks import HARD_CODES, STAND_CODES, AutoVerdict, check_run
 from .config import PROVIDERS, BenchConfig, load_config
 from .judge import check_verdicts, controls_ok, passed_by_judge
 from .record import RunRecord, Turn
-from .runner import load_records, load_tag_units, plan_runs
+from .runner import NOTE_CALC_FAIL, card_tags, load_records, load_tag_units, plan_runs
 from .scenarios import BY_ID, REPS, SCENARIO_IDS
 
 log = logging.getLogger("pcbk_bench.table")
@@ -113,7 +116,7 @@ class ModelRow:
       (judge_failed, judge_refused_secret, judge_refused_data, judge_refused, no_packet, no_card);
     - bot_no_draft — прогонов A, где бот так и не увидел черновика;
     - calc_skipped — прогонов (последняя done-запись ключа), где сверка калькулятором не сделана: ответ rate и после
-      пауз на всё окно частоты (калькулятор недоступен, Б3); в шапке Markdown — строкой;
+      пауз на всё окно частоты или сбой калькулятора (калькулятор недоступен, Б3); в шапке Markdown — строкой;
     - hard — жёсткие провалы поштучно (автомат и судья), create_hard — они же у A; soft — мягкие сигналы
       (foreign_number, numbers_not_from_tools);
     - quality — средняя оценка судьи по всем пунктам оценённых; quality_groups — по группам;
@@ -473,8 +476,9 @@ def _row(name: str, plan: tuple[dict[str, int], int], recs: list[RunRecord], car
         group = BY_ID[r.key.scenario].group
         if r.status != "done":
             continue
-        if any(isinstance(e, Mapping) and e.get("status") == "rate" for e in r.calc.values()):
-            calc_skipped += 1                            # калькулятор недоступен: сверка не сделана (Б3)
+        if any(isinstance(e, Mapping) and e.get("status") == "rate" for e in r.calc.values()) or any(
+                isinstance(n, str) and n.startswith(NOTE_CALC_FAIL) for n in r.notes):
+            calc_skipped += 1                            # калькулятор недоступен (rate или сбой): сверка не сделана
         status, v = _judge_of(r, *index)
         if status == "ok" and v is not None:             # находки судьи — и у записи со сбоем стенда (р1, I1)
             vh = getattr(v, "hard", None) or {}
@@ -678,7 +682,13 @@ def _header(meta: Mapping[str, Any], rows: list[ModelRow]) -> list[str]:
     if skipped:
         per = "; ".join(f"`{m}` — {n}" for m, n in skipped)
         lines.append(f"- Сверка калькулятором не сделана (калькулятор недоступен: rate после пауз на всё окно "
-                     f"частоты): {sum(n for _, n in skipped)} прогонов ({per}).")
+                     f"частоты или сбой): {sum(n for _, n in skipped)} прогонов ({per}).")
+    units = meta.get("units_missing") if isinstance(meta.get("units_missing"), Mapping) else None
+    if units and units.get("missing"):
+        lines.append(f"- Единиц тегов карточек нет в OUT/tag_units.json у {units['missing']} из "
+                     f"{units.get('total', '—')} (подготовка не прочитала их из каталога — калькулятор недоступен — "
+                     f"или у тега нет единицы): правило чисел автомата берёт единицы этих тегов только из выводов "
+                     f"хода.")
     if _num(meta.get("pending")):
         lines.append(f"- Строк журнала прокси с ценой в ожидании (pending): {int(meta['pending'])} — "
                      "их цена по оценке.")
@@ -792,8 +802,12 @@ def build(cfg: BenchConfig, w: float = CONSTRUCTOR_SHARE, judge_retries: int | N
     check_verdicts, controls_ok = _judge_api()
     report = check_verdicts(out)
     pmap = load_packet_map(out)
-    rows = aggregate(load_records(out), load_cards(cfg.cards), report, load_tag_units(out),
-                     planned=planned_counts(cfg), packet_map=pmap, w=w)
+    cards = load_cards(cfg.cards)
+    units = load_tag_units(out)
+    rows = aggregate(load_records(out), cards, report, units, planned=planned_counts(cfg), packet_map=pmap, w=w)
+    read = {str(k).upper() for k in units}
+    tags = card_tags(cards)
+    units_missing = {"missing": sum(1 for t in tags if t.upper() not in read), "total": len(tags)}
     try:
         health: dict = read_health_end(out)
     except FileNotFoundError:
@@ -816,7 +830,7 @@ def build(cfg: BenchConfig, w: float = CONSTRUCTOR_SHARE, judge_retries: int | N
             "cap_usd": _num(run.get("cap_usd")) or cfg.cap_usd, "spent_usd": _num(run.get("spent_usd")),
             "key_spent_usd": _num(health.get("key_spent_usd")), "proxy_spent_usd": _num(health.get("spent_usd")),
             "budget_left": left, "budget_source": source, "limit_usd": LIMIT_USD if left is None else limit_usd(left),
-            "w": w, "controls": controls, "pending": health.get("pending"),
+            "w": w, "controls": controls, "pending": health.get("pending"), "units_missing": units_missing,
             "judge_family": family, "verdicts": verdicts}
     return rows, meta
 

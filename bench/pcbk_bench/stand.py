@@ -121,13 +121,17 @@ CALC_TRIES = 1 + math.ceil(CALC_RATE_WINDOW_S / CALC_RATE_PAUSE_S)
 
 
 def calc_patient(stand: Stand, tool: str, args: dict, *, sleep: Callable[[float], None],
-                 clock: Callable[[], float] | None = None, deadline: float | None = None) -> dict:
+                 clock: Callable[[], float] | None = None, deadline: float | None = None,
+                 stop: Callable[[], bool] | None = None) -> dict:
     """Калькулятор (stand.calc) с паузой и повтором на ответ rate: до CALC_TRIES попыток через CALC_RATE_PAUSE_S, не
-    позже deadline по clock. Ответ rate после всех попыток возвращается как есть — его учитывает вызывающий."""
+    позже deadline по clock; перед каждой паузой — stop() (остановка прогонщика: жёсткая или сигнал, итоговая доводка
+    Д8б): истина — пауз больше нет. Ответ rate после всех попыток возвращается как есть — его учитывает вызывающий."""
     answer = stand.calc(tool, args)
     tries = 1
     while isinstance(answer, dict) and answer.get("status") == "rate" and tries < CALC_TRIES:
         if deadline is not None and clock is not None and clock() + CALC_RATE_PAUSE_S > deadline:
+            break
+        if stop is not None and stop():
             break
         sleep(CALC_RATE_PAUSE_S)
         answer = stand.calc(tool, args)

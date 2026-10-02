@@ -13,16 +13,18 @@ heartbeat_s атомарно переписывает OUT/progress.json; П7) �
 и ensure_ready каждого места → abort сессий из OUT/sessions.log без строки конца через своё место (П5; 404 — «уже
 нет») → пустой /session/status у каждого места (≤ IDLE_WAIT_S, иначе place_busy: чужой прогонщик с другим OUT, р1
 m4) → модель места (GET /config) → единицы тегов карточек (OUT/tag_units.json) → архив чужих агентов места →
-bench-uzel и его ready (только если в плане есть его сценарии: фильтр scenarios конфига, П14). Любое расхождение — RunRefused с кодом; замок и пульс снимаются (close()). run() зовёт
-prepare() сам, если его не звали; close() — в finally у run().
+bench-uzel и его ready (только если в плане есть его сценарии: фильтр scenarios конфига, П14). Любое расхождение —
+RunRefused с кодом; замок и пульс снимаются (close()). run() зовёт prepare() сам, если его не звали; close() — в
+finally у run().
 
 Прогон (run_one): пробуждение места (ensure_ready: GET /workplace, не ready — wake и ожидание ready, затем
 mcp=connected), разговор со сценарным ботом или скриптом (ScriptedStudent), у A — после удачного save_agent ожидание
 ready нового агента, мост к нему в новой сессии и архив всех агентов места, кроме bench-uzel, при любом статусе (и
 сохранённых уже после abort, m-р4-3), с ожиданием их ухода из «Мои агенты» — внутри срока прогона. Затем калькулятор
 по аргументам последних вызовов tag_now и tag_period хода (статус rate — пауза и повтор на всё окно частоты службы,
-calc_patient; rate и после него — заметка NOTE_CALC_RATE, сверка не молчит, Б3) и строки журнала прокси: у каждой
-сессии с законченным ходом (и у моста) есть строки, их model — модель места, иначе stand_error (Д8-R71, р1 m6).
+calc_patient; после жёсткой остановки или сигнала — без пауз; rate и после него — заметка NOTE_CALC_RATE, сбой —
+NOTE_CALC_FAIL: сверка не молчит, Б3) и строки журнала прокси: у каждой сессии с законченным ходом (и у моста) есть
+строки, их model — модель места, иначе stand_error (Д8-R71, р1 m6).
 
 Сроки (m-р4-5): ожидание хода — min(turn_timeout_s, срок прогона − сейчас), у A срок разговора — без
 archive_reserve_s. Срок — abort сессии через шлюз, статус timeout; срок, вышедший между ходами, — timeout без новой
@@ -100,8 +102,18 @@ ROWS_RETRY_S = 2.0
 POLL_S = 1.0
 BARRIER_TICK_S = 0.05
 NOTE_CALC_RATE = "калькулятор: rate — сверка не сделана"     # заметка записи; таблица считает такие прогоны
+NOTE_CALC_FAIL = "калькулятор: сбой"     # начало заметки о сбое калькулятора (+ класс); таблица считает и такие
 AGENTS = {"bench": BENCH_AGENT, "konstruktor": "konstruktor", "pomoshnik": "pomoshnik"}
 _PCBK_CODE = re.compile(r"\bpcbk_[a-z_]+\b")
+
+
+def card_tags(cards: CardSet) -> list[str]:
+    """Теги карточек, единицы которых прогонщик читает из каталога (_read_units): теги заготовленного агента, затем
+    tag, expect_tag и pick карточек — только вида тега, без повторов."""
+    tags: list[str] = list(cards.bench_tags)
+    for c in cards.cards.values():
+        tags += [t for t in (c.tag, c.expect_tag, c.pick) if t and TAG_TOKEN_RE.fullmatch(t)]
+    return list(dict.fromkeys(tags))
 
 
 class RunRefused(Exception):
@@ -504,17 +516,11 @@ class Runner:
             self._journal(sid, targets[0], "end")
             log.info("возобновление: сессия прошлого запуска прервана (место %02d)", targets[0])
 
-    def _card_tags(self) -> list[str]:
-        tags: list[str] = list(self.cards.bench_tags)
-        for c in self.cards.cards.values():
-            tags += [t for t in (c.tag, c.expect_tag, c.pick) if t and TAG_TOKEN_RE.fullmatch(t)]
-        return list(dict.fromkeys(tags))
-
     def _read_units(self) -> None:
         """Единицы тегов карточек из каталога (catalog_search токеном ops) → tag_units и OUT/tag_units.json; при
         возобновлении — только недостающие (m10)."""
         units = dict(self.tag_units)
-        for tag in self._card_tags():
+        for tag in card_tags(self.cards):
             if tag in units:
                 continue
             answer = self._calc("catalog_search", {"query": tag, "limit": 10})
@@ -962,8 +968,10 @@ class Runner:
             log.warning("место %02d: архив агентов не прошёл (%s)", place, type(exc).__name__)
 
     def _calc(self, tool: str, args: dict, deadline: float | None = None) -> dict:
-        """Калькулятор: rate — пауза и повтор на всё окно частоты службы (calc_patient), не позже deadline."""
-        return calc_patient(self.stand, tool, args, sleep=self.sleep, clock=self.clock, deadline=deadline)
+        """Калькулятор: rate — пауза и повтор на всё окно частоты службы (calc_patient), не позже deadline; после
+        жёсткой остановки или сигнала пауз больше нет (итоговая доводка Д8б)."""
+        return calc_patient(self.stand, tool, args, sleep=self.sleep, clock=self.clock, deadline=deadline,
+                            stop=lambda: self._hard.is_set() or self._interrupt.is_set())
 
     def _calc_all(self, rec: RunRecord, deadline: float) -> None:
         """Сверка калькулятором по аргументам последнего вызова tag_now и tag_period разговора (и моста)."""
@@ -976,7 +984,7 @@ class Runner:
             try:
                 rec.calc[tool] = self._calc(tool, dict(calls[-1].input), deadline)
             except Exception as exc:
-                rec.notes.append(f"калькулятор: сбой {type(exc).__name__}")
+                rec.notes.append(f"{NOTE_CALC_FAIL} {type(exc).__name__}")
                 continue
             if rec.calc[tool].get("status") == "rate":       # окно частоты не освободилось до срока: не молча (Б3)
                 rec.notes.append(NOTE_CALC_RATE)
@@ -1187,5 +1195,5 @@ class Runner:
             self.close()
 
 
-__all__ = ["PlaceNotReady", "RunRefused", "Runner", "STOP_REASONS", "load_records", "load_tag_units", "plan_runs",
-           "status_main", "turn_code", "write_progress"]
+__all__ = ["NOTE_CALC_FAIL", "NOTE_CALC_RATE", "PlaceNotReady", "RunRefused", "Runner", "STOP_REASONS", "card_tags",
+           "load_records", "load_tag_units", "plan_runs", "status_main", "turn_code", "write_progress"]

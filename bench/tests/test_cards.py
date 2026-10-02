@@ -99,8 +99,8 @@ def test_cli_cards_check_prints_codes(tmp_path, monkeypatch, capsys):           
     (broken / "cards.json").write_text(json.dumps({"bench_node": "Узел", "bench_tags": ["20FAKE_101_PV"],
                                                    "cards": {"B1": {"opening": "x", "tag": 7}}}), encoding="utf-8")
     assert cli.main(["cards-check", str(write_config(broken, cards="cards.json"))]) == 1
-    out = capsys.readouterr()
-    assert out.out.splitlines() == ["cards_form"] and "B1" not in out.out + out.err
+    out = capsys.readouterr()                                                      # место — без значений (доводка Д8б)
+    assert out.out.splitlines() == ["cards_form:B1.tag"] and "7" not in out.out + out.err and out.err == ""
 
 
 def test_cli_cards_check_output_has_codes_only(tmp_path, monkeypatch, capsys):   # тегов и значений нет
@@ -153,3 +153,158 @@ def test_writer_has_no_data():                                                  
 @pytest.mark.parametrize("sid", SCENARIO_IDS)
 def test_twin_cards_pass_form_per_scenario(sid):                                 # образец формата — годный
     assert not [c for c in check_cards(cards()) if sid in c]
+
+
+# --- итоговая доводка Д8б: место cards_form, строка паузы rate, задание C4, сверка транскрипта субагента карточек ---
+
+def _cards_file(tmp_path, mutate) -> str:
+    cs = json.loads((REPO / "bench" / "cards.twin.json").read_text(encoding="utf-8"))
+    mutate(cs)
+    (tmp_path / "cards.json").write_text(json.dumps(cs, ensure_ascii=False) if isinstance(cs, dict) else cs,
+                                         encoding="utf-8")
+    return str(write_config(tmp_path, cards="cards.json"))
+
+
+@pytest.mark.parametrize("mutate, code", [
+    (lambda cs: cs.update(extra=1), "keys"),
+    (lambda cs: cs.update(bench_tags=["20FAKE_101_PV", "20FAKE_101_PV"]), "bench_tags"),
+    (lambda cs: cs.update(bench_node=" "), "bench_node"),
+    (lambda cs: cs.update(cards=[]), "cards"),
+    (lambda cs: cs["cards"].update(D9={"opening": "x"}), "cards.ids"),
+    (lambda cs: cs["cards"].update(B2="текст"), "B2"),
+    (lambda cs: cs["cards"]["A1"].update(note="x"), "A1.fields"),
+    (lambda cs: cs["cards"]["B3"].update(opening=""), "B3.opening"),
+    (lambda cs: cs["cards"]["A2"].update(on_draft=["да, сохраняй"]), "A2.on_draft"),
+    (lambda cs: cs["cards"]["A4"].update(requests="одна строка"), "A4.requests"),
+    (lambda cs: cs["cards"]["C4"].update(period={"start": "2005-03-03T16:00:00", "end": "2005-03-03T08:00:00"}),
+     "C4.period"),
+    (lambda cs: cs["cards"]["C2"].update(tag=["16FAKE_109_PV"]), "C2.tag"),
+])
+def test_cli_cards_form_place(tmp_path, monkeypatch, capsys, mutate, code):      # Minor 3: место без значений
+    config = _cards_file(tmp_path, mutate)
+    monkeypatch.setattr(cli, "server_stand", lambda cfg: FakeStand(calc_status=TWIN_STATUS))
+    assert cli.main(["cards-check", config]) == 1
+    out = capsys.readouterr()
+    assert out.out.splitlines() == [f"cards_form:{code}"] and out.err == ""
+    assert not re.search(r"FAKE|_PV|сохраняй|текст|2005", out.out)
+
+
+def test_cli_cards_form_not_json_and_missing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "server_stand", lambda cfg: FakeStand(calc_status=TWIN_STATUS))
+    (tmp_path / "cards.json").write_text("{не JSON", encoding="utf-8")
+    assert cli.main(["cards-check", str(write_config(tmp_path, cards="cards.json"))]) == 1
+    assert capsys.readouterr().out.splitlines() == ["cards_form:json"]
+    assert cli.main(["cards-check", str(write_config(tmp_path, cards="нет.json"))]) == 1
+    assert capsys.readouterr().out.splitlines() == ["cards_form"]
+
+
+def test_cli_cards_check_rate_pause_line(tmp_path, monkeypatch, capsys):         # Minor 3: ожидание окна — видно
+    slept: list[float] = []
+    monkeypatch.setattr(cli, "server_stand", lambda cfg: FakeStand(calc_rate=2, calc_status=TWIN_STATUS))
+    monkeypatch.setattr(cli.time, "sleep", slept.append)
+    assert cli.main(["cards-check", str(write_config(tmp_path))]) == 0
+    out = capsys.readouterr()
+    assert out.out.splitlines() == list(CHECK_GOOD)
+    assert out.err.splitlines() == ["калькулятор: rate — пауза"] * 2 and slept == [CALC_RATE_PAUSE_S] * 2
+
+
+def test_writer_c4_opening_with_tag():                                           # Minor 4: как требует check_cards
+    text = WRITER.read_text(encoding="utf-8")
+    c4 = text[text.index("- **C4:**"):text.index("Общие правила")]
+    assert "с именем тега" in c4
+    assert check_cards(replace_card(cards(), "C4", opening="Какая была средняя температура за ту смену?")) == [
+        "field:C4.opening"]
+    assert "cards-audit" in text and "Edit" in text
+
+
+def _audit_case(tmp_path):
+    from pcbk_bench.cards import TWIN_CARDS, WRITER_MD
+    from pcbk_bench.judge import HARNESS_TOOLS
+    live = tmp_path / "live"
+    live.mkdir()
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    cards_file = live / "cards.json"
+    calc = f"python -m pcbk_bench calc {config} tag_now '{{\"tags\": [\"T\"]}}'"
+    ok = [{"tool": "Read", "path": str(WRITER_MD)}, {"tool": "Read", "path": str(TWIN_CARDS)},
+          {"tool": "Bash", "command": calc},
+          {"tool": "Bash", "command": f"cd {REPO / 'bench'} && uv run --python 3.12 python -m pcbk_bench calc "
+                                      f"{config} catalog_search '{{\"query\": \"пар; ls\", \"limit\": 10}}'"},
+          {"tool": "Bash", "command": f"PYTHONPATH=bench python3 -m pcbk_bench calc {config} tag_period "
+                                      f"'{{\"tags\": [\"T\"], \"period\": \"prev_shift\"}}'"},
+          {"tool": "Write", "path": str(cards_file)}, {"tool": "Read", "path": str(cards_file)},
+          {"tool": "SubagentHandback", "path": None}]
+    return config, cards_file, ok, HARNESS_TOOLS
+
+
+def test_cards_audit_allowlist(tmp_path):                                        # Minor 6: по списку разрешений
+    from pcbk_bench.cards import audit_cards
+    config, cards_file, ok, harness = _audit_case(tmp_path)
+    assert audit_cards(ok, config, cards_file, harness) == []
+    (tmp_path / "secret.txt").write_text("x")
+    (tmp_path / "live" / "link.json").symlink_to(tmp_path / "secret.txt")
+    for bad in ({"tool": "Read", "path": str(tmp_path / "stand.json")},
+                {"tool": "Read", "path": str(tmp_path / "secrets" / "ops.data-token")},
+                {"tool": "Read", "path": str(tmp_path / "live" / "link.json")},
+                {"tool": "Read", "path": str(tmp_path / "live" / ".." / "live" / "cards.json")},
+                {"tool": "Read", "path": "live/cards.json"}, {"tool": "Read", "path": None},
+                {"tool": "Write", "path": str(tmp_path / "live" / "cards-copy.json")},
+                {"tool": "Write", "path": str(REPO / "bench" / "cards.twin.json")},
+                {"tool": "Edit", "path": str(cards_file)}, {"tool": "Glob", "path": str(tmp_path)},
+                {"tool": "Agent", "path": None}, {"tool": "WebSearch", "path": None},
+                {"tool": "ToolSearch", "path": None},
+                {"tool": "Bash", "command": "cat " + str(tmp_path / "stand.json")},
+                {"tool": "Bash", "command": ok[2]["command"] + " ; cat /etc/passwd"},
+                {"tool": "Bash", "command": ok[2]["command"] + " > /tmp/out"},
+                {"tool": "Bash", "command": ok[2]["command"].replace("tag_now '", "tag_now \"$(id)").rstrip("'")},
+                {"tool": "Bash", "command": ok[2]["command"].replace(str(config), str(tmp_path / "other.json"))},
+                {"tool": "Bash", "command": ok[2]["command"].replace("tag_now", "save_agent")},
+                {"tool": "Bash", "command": ok[2]["command"].replace("calc", "cards-check")},
+                {"tool": "Bash", "command": "uv run --with x " + ok[2]["command"]},
+                {"tool": "Bash", "command": f"touch {tmp_path / 'x'} && " + ok[2]["command"]},
+                {"tool": "Bash", "command": f"cd {tmp_path} | " + ok[2]["command"]},
+                {"tool": "Bash", "command": ok[2]["command"] + " extra"},
+                {"tool": "Bash", "command": ok[2]["command"].replace("'{\"tags\": [\"T\"]}'", "'[1]'")},
+                {"tool": "Bash", "command": ok[2]["command"].replace("'{\"tags\": [\"T\"]}'", "'не json'")},
+                {"tool": "Bash", "command": ok[2]["command"].replace("'{\"tags\": [\"T\"]}'",
+                                                                     '"{\\"tags\\": [\\"$(id)\\"]}"')},
+                {"tool": "Bash", "command": None}):
+        problems = audit_cards(ok + [bad], config, cards_file, harness)
+        assert len(problems) == 1, bad
+        assert str(tmp_path) not in problems[0] and "passwd" not in problems[0] and "stand" not in problems[0]
+
+
+def test_cli_cards_audit(tmp_path, capsys):                                      # Minor 6: по образцу judge-audit
+    from helpers import transcript_line
+    config, cards_file, ok, _ = _audit_case(tmp_path)
+    cfg = write_config(tmp_path, cards=str(cards_file))
+    ok = [{**c, "command": c["command"].replace(str(config), str(cfg))} if "command" in c else c for c in ok]
+    lines = [transcript_line(c["tool"], {"command": c["command"]} if "command" in c else
+                             ({"file_path": c["path"]} if c["path"] else {"message": "готово"})) for c in ok]
+    transcript = tmp_path / "agent.jsonl"
+    transcript.write_text("\n".join(lines) + "\n")
+    assert cli.main(["cards-audit", str(cfg), "--transcript", str(transcript)]) == 0
+    assert capsys.readouterr().out.splitlines() == ["нарушений: 0"]
+    extra = [transcript_line("Bash", {"command": "cat " + str(tmp_path / "stand.json")}),
+             transcript_line("Read", {"__unparsedToolInput": {"raw": "{", "len": 1}})]
+    transcript.write_text("\n".join(lines + extra) + "\n")
+    assert cli.main(["cards-audit", str(cfg), "--transcript", str(transcript)]) == 1
+    out = capsys.readouterr().out
+    assert out.splitlines() == ["Bash: команда вне списка", "Read: без пути", "нарушений: 2"] and "stand" not in out
+
+
+def test_cards_audit_relative_path_from_cwd(tmp_path, monkeypatch):             # относительный путь — нарушение
+    from pcbk_bench.cards import audit_cards
+    config, cards_file, ok, harness = _audit_case(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert audit_cards([{"tool": "Write", "path": "live/cards.json"}], config, cards_file, harness) == [
+        "Write: относительный путь"]
+
+
+def test_calc_command_dollar_in_quoted_args(tmp_path):                           # $(…) в двойных кавычках — нарушение
+    from pcbk_bench.cards import calc_command_ok
+    config = tmp_path / "config.json"
+    good = f"python -m pcbk_bench calc {config} tag_now '{{\"tags\": [\"$x\"]}}'"
+    bad = f'python -m pcbk_bench calc {config} tag_now "{{\\"tags\\": [\\"$(id)\\"]}}"'
+    assert not calc_command_ok(bad, config) and not calc_command_ok(good, config)  # «$» — нигде
+    assert calc_command_ok(good.replace("$x", "x"), config)
