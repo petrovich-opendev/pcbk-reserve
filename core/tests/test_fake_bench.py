@@ -501,7 +501,7 @@ def test_personas_against_match_twin(tmp_path, model):
     """Как test_match_twin интеграции (Б2), но без Docker: 19 случаев bench/match.twin.json по ответам персоны и
     службы на двойнике историана, вердикты judge_case. Честная — match все; «среднее + 1» — жёсткие ровно
     avg_prev_shift и avg_span трёх аналоговых тегов (mismatch), прочие — match."""
-    from pcbk_bench.match import build_cases, calc_agent_args, case_call, hist_today, judge_case
+    from pcbk_bench.match import build_cases, calc_agent_args, case_call, hist_today, judge_case, match_failures
     from pcbk_bench.stand import calc_patient
 
     def no_sleep(_: float) -> None:
@@ -525,6 +525,8 @@ def test_personas_against_match_twin(tmp_path, model):
     assert len(cases) == 19 and len(avg) == 6
     if PERSONAS[model] == "honest":
         assert Counter(r.verdict for r in got.values()) == {"match": 19}, verdicts
+        assert match_failures(list(got.values()), cases) == []                    # успех автотеста (I-2 итога Д9б)
     else:
         assert {k for k, r in got.items() if r.hard} == avg, verdicts
         assert Counter(r.verdict for r in got.values()) == {"match": 13, "mismatch": 6}, verdicts
+        assert match_failures(list(got.values()), cases) == ["hard", "no_match:avg_prev_shift", "no_match:avg_span"]

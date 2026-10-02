@@ -9,8 +9,8 @@ import pytest
 
 from fakes import FakeChat, FakeStand, twin_cards
 from pcbk_bench.gateway import WorkplaceNotReady
-from pcbk_bench.match import (CALC_AGENT, HARD, MatchRunner, build_cases, calc_agent_args, cases_from_agent,
-                              judge_case, probe_calc, render_match)
+from pcbk_bench.match import (BASIC_KINDS, CALC_AGENT, HARD, MatchResult, MatchRunner, build_cases, calc_agent_args,
+                              cases_from_agent, judge_case, match_failures, probe_calc, render_match)
 from pcbk_bench.record import ToolCall, Turn
 
 TAG = "20FAKE_201_PV"
@@ -462,8 +462,9 @@ def test_cli_prints_no_tags(fake_stand, tmp_path, capsys, monkeypatch):         
     cfg = _write_config(tmp_path)
     _patch_cli(monkeypatch, fake_stand, FakeChat.honest())
     out = []
-    for argv in (["match-cases", str(cfg)], ["match", str(cfg)], ["probe-calc", str(cfg)]):
-        assert main(argv) == 0, argv
+    # match — 3: FakeChat Д8 на виды Д9 отвечает не по ним, автотест — не успех (I-2 итогового ревью Д9б)
+    for argv, code in ((["match-cases", str(cfg)], 0), (["match", str(cfg)], 3), (["probe-calc", str(cfg)], 0)):
+        assert main(argv) == code, argv
         captured = capsys.readouterr()
         out.append(captured.out)
         assert "20FAKE" not in captured.out and "20FAKE" not in captured.err
@@ -480,9 +481,10 @@ def test_cli_match_only_basic(fake_stand, tmp_path, capsys, monkeypatch):
     (tmp_path / "match.cases.json").write_text(json.dumps({"analog": [TAG], "discrete": ["20FAKE_210_RUN"]}),
                                                encoding="utf-8")
     _patch_cli(monkeypatch, fake_stand, FakeChat.honest())
-    assert main(["match", str(cfg), "--only", "basic"]) == 0
+    assert main(["match", str(cfg), "--only", "basic"]) == 3                      # FakeChat Д8 — не успех (I-2)
     out = capsys.readouterr().out
     assert "случаев 5" in out and "profile_last_8h" not in out and "runtime_yesterday" not in out
+    assert "успех: нет (hard" in out
 
 
 # --- итоговая доводка Д9б ---
@@ -514,3 +516,84 @@ def test_period_length_is_not_state_hours(text):                                
 def test_full_day_state_hours_match(text):                                              # I-1: положительный контроль
     run = runtime_call(FULL_DAY)
     assert judge_case(CASES["runtime_yesterday"], turn(text, run), run.output).verdict == "match"
+
+
+ALL = build_cases([TAG, "20FAKE_202_PV", "20FAKE_104_PV"], ["20FAKE_210_RUN"], TODAY)          # 19 случаев окна
+
+
+@pytest.mark.parametrize("verdict,note", [("no_number", None), ("no_data", None), ("timeout", "turn_error")])
+def test_soft_only_run_is_not_success(verdict, note):                                   # I-2: нижняя граница
+    res = [MatchResult(c.id, verdict, [note] if note else []) for c in ALL]
+    fails = match_failures(res, ALL)
+    assert fails[:7] == [f"no_match:{k}" for k in ("now", "avg_prev_shift", "minmax_last_24h", "range_yesterday",
+                                                   "avg_span", "profile_last_8h", "runtime_yesterday")]
+    assert ("cut" in fails) is (verdict == "timeout")                                   # хвост — timeout: оборван
+    md = render_match(res, ALL)
+    assert "жёстких (неуспех 4) 0; service 0" in md and "\nуспех: нет (no_match:now" in md
+
+
+def test_kind_without_match_is_not_success():                                          # I-2
+    res = [MatchResult(c.id, "no_number" if c.kind == "avg_span" else "match") for c in ALL]
+    assert match_failures(res, ALL) == ["no_match:avg_span"]
+    assert render_match(res, ALL).rstrip().endswith("успех: нет (no_match:avg_span)")
+
+
+def test_run_cut_by_cap_is_not_success():                                              # I-2: обрыв по потолку
+    basic = [c for c in ALL if c.kind in BASIC_KINDS]                                   # 15: виды закрыты тегами 1–2
+    res = [MatchResult(c.id, "match") if i < 10 else MatchResult(c.id, "timeout", ["turn_error"])
+           for i, c in enumerate(basic)]
+    assert match_failures(res, basic) == ["cut"]
+    assert match_failures(res[:10], basic) == ["cut"]                                   # хвоста плана нет вовсе
+    mid = res[:10] + [MatchResult(c.id, "match") for c in basic[10:]]
+    mid[4] = MatchResult(basic[4].id, "timeout", ["turn_timeout"])                     # срок хода посреди плана
+    assert match_failures(mid, basic) == []
+
+
+def test_honest_run_is_success_and_hard_is_not():                                      # I-2
+    res = [MatchResult(c.id, "match") for c in ALL]
+    assert match_failures(res, ALL) == [] and render_match(res, ALL).rstrip().endswith("успех: да")
+    res[1] = MatchResult(ALL[1].id, "mismatch")
+    res[2] = MatchResult(ALL[2].id, "service", ["calc_differs"])
+    assert match_failures(res, ALL) == ["hard", "service"]
+
+
+class _StubRunner:
+    """Прогонщик CLI без шлюза: вердикты по виду (results_by_kind), прочие — match."""
+    results_by_kind: dict = {}
+
+    def __init__(self, chat, stand, place, cases, out, **kw):
+        self.cases = cases
+        out.mkdir(mode=0o700, parents=True, exist_ok=True)                        # как MatchRunner.prepare()
+
+    def run(self):
+        return [MatchResult(c.id, self.results_by_kind.get(c.kind, "match")) for c in self.cases]
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("by_kind,code,line", [({}, 0, "успех: да"),
+                                              ({"profile_last_8h": "no_number"}, 3,
+                                               "успех: нет (no_match:profile_last_8h)")])
+def test_cli_match_exit_code_says_success(fake_stand, tmp_path, capsys, monkeypatch, by_kind, code, line):   # I-2
+    import pcbk_bench.__main__ as cli
+    cfg = _write_config(tmp_path)
+    (tmp_path / "match.cases.json").write_text(json.dumps({"analog": [TAG], "discrete": ["20FAKE_210_RUN"]}),
+                                               encoding="utf-8")
+    _patch_cli(monkeypatch, fake_stand, FakeChat.honest())
+    monkeypatch.setattr(_StubRunner, "results_by_kind", by_kind)
+    monkeypatch.setattr(cli, "MatchRunner", _StubRunner)
+    assert cli.main(["match", str(cfg)]) == code
+    assert capsys.readouterr().out.rstrip().endswith(line)
+    assert (tmp_path / "out" / "match.md").read_text(encoding="utf-8").rstrip().endswith(line)
+
+
+def test_cli_match_cap_refusals_are_not_success(fake_stand, tmp_path, capsys, monkeypatch):   # I-2: потолок
+    from pcbk_bench.__main__ import main
+    cfg = _write_config(tmp_path)
+    (tmp_path / "match.cases.json").write_text(json.dumps({"analog": [TAG], "discrete": []}), encoding="utf-8")
+    _patch_cli(monkeypatch, fake_stand, FakeChat.honest(error="pcbk_run_spent"))      # каждый ход — отказ прокси
+    assert main(["match", str(cfg)]) == 3
+    out = capsys.readouterr().out
+    assert "match 0; жёстких (неуспех 4) 0; service 0; нет данных 0; прочих 6" in out
+    assert out.rstrip().endswith(", cut)")

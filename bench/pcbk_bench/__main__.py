@@ -44,12 +44,15 @@ place, login, cases, out_dir, turn_timeout_s, source; пароль учётки 
 - match-cases MCONFIG — случаи окна (cases_from_agent, I7) в файл cases (0600); печатает только «случаев N: аналоговых
   a (из агента k), состояний d»;
 - match MCONFIG [--only basic] — прогон агента проверки на месте place по файлу cases; печатает итог render_match
-  (псевдонимы ТЕГ-n, без тегов и чисел), пишет OUT/match.md и OUT/match.jsonl (0600). --only basic — без видов
-  profile_last_8h и runtime_yesterday (проба не прошла); режимов сухого прогона нет (I6);
+  (псевдонимы ТЕГ-n, без тегов и чисел) и строку «успех: да | нет (коды)», пишет OUT/match.md и OUT/match.jsonl
+  (0600). Код 0 — успех; 3 — не успех (match_failures: жёсткие, service, вид без match, прогон оборван до конца
+  плана). --only basic — без видов profile_last_8h и runtime_yesterday (проба не прошла); режимов сухого прогона нет
+  (I6);
 - probe-calc MCONFIG — проба форм окна: печатает только коды «series: …» и «runtime: …».
 
-Коды main: 0 — успех, 2 — RunRefused, 1 — прочее. Ошибка печатается только классом исключения (и кодом RunRefused),
-без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без разговоров и тегов) — в stderr.
+Коды main: 0 — успех, 2 — RunRefused, 3 — автотест match не успех, 1 — прочее. Ошибка печатается только классом
+исключения (и кодом RunRefused), без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без
+разговоров и тегов) — в stderr.
 
 stand.json (П4, $JOB/pcbk-d8/stand.json, 0600): {"ssh": ["ssh", …, "user@host"], "core_url": "http://127.0.0.1:18000",
 "edge_url": "https://127.0.0.1:28443", "edge_host": "<имя сертификата>[:порт]", "origin": null, "remote_dir":
@@ -70,7 +73,8 @@ from .cards import CHECK_GOOD, CardsFormError, audit_cards, cards_check, load_ca
 from .config import BenchConfig, load_config
 from .gateway import GatewayChat
 from .match import (BASIC_KINDS, MatchConfig, MatchRunner, build_cases, case_count, cases_from_agent, hist_today,
-                    load_case_tags, load_match_config, probe_calc, render_match, write_case_tags, write_private)
+                    load_case_tags, load_match_config, match_failures, probe_calc, render_match, write_case_tags,
+                    write_private)
 from .override import render_override
 from .runner import FUTURE_WINDOW_S, Runner, RunRefused, load_records, status_main
 from .secret import Secret
@@ -79,6 +83,7 @@ from .stand import DATA_TOOLS, ServerStand, Stand
 REPO = Path(__file__).resolve().parents[2]
 OPENCODE_JSON = REPO / "student" / "config" / "opencode.json"
 PROBE_LOGIN = "d8-probe-bench-{n:02d}"
+MATCH_NOT_PASSED = 3                    # match: прогон прошёл, но автотест — не успех (match_failures, I-2 итога Д9б)
 _STAND_KEYS = frozenset({"ssh", "core_url", "edge_url", "edge_host", "origin", "remote_dir"})
 
 
@@ -344,7 +349,7 @@ def _match(config: Path, only: str | None) -> int:
     md = render_match(results, cases)
     write_private(mcfg.out_dir / "match.md", md)
     sys.stdout.write(md)
-    return 0
+    return MATCH_NOT_PASSED if match_failures(results, cases) else 0
 
 
 def _probe_calc(config: Path) -> int:

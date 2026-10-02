@@ -41,7 +41,9 @@ ready в «Мои агенты» (≤ 60 с); иначе RunRefused (not_ready, 
 503 шлюза (место заснуло, WorkplaceNotReady) — один wake() и повтор случая; прочий отказ шлюза и обрыв связи — service
 (gateway, network), прогон идёт дальше. close() — abort открытых сессий, агент проверки — в архив.
 
-render_match — таблица Markdown с псевдонимами ТЕГ-n и итог; имён тегов и значений в ней нет.
+render_match — таблица Markdown с псевдонимами ТЕГ-n, итог и строка «успех: да | нет (коды match_failures)»; имён
+тегов и значений в ней нет. Успех автотеста (I-2 итогового ревью Д9б) — жёстких 0, service 0, у каждого вида хотя бы
+один match, прогон дошёл до конца плана.
 cases_from_agent — теги окна (I7): живые аналоговые из раздела «Теги узла» самого нового видимого агента места
 (до трёх), добор живыми из catalog_search("_pv", 50); тег состояния — живой дискретный из тегов агента, иначе из
 "_run", иначе из "_opn". probe_calc — проба форм окна (Д9-R93): только коды, без тегов и значений.
@@ -429,7 +431,8 @@ def _period_text(case: Case) -> str:
 
 
 def render_match(results: Iterable[MatchResult], cases: Iterable[Case]) -> str:
-    """Markdown: «ТЕГ-n · вид · инструмент · период · ключи · вердикт · заметки» и итог; имён тегов и чисел нет."""
+    """Markdown: «ТЕГ-n · вид · инструмент · период · ключи · вердикт · заметки», итог и строка успеха
+    (match_failures); имён тегов и чисел нет."""
     results, cases = list(results), list(cases)
     by_id = {c.id: c for c in cases}
     alias: dict[str, str] = {}
@@ -447,7 +450,30 @@ def render_match(results: Iterable[MatchResult], cases: Iterable[Case]) -> str:
     other = len(results) - count["match"] - hard - count["service"] - count["no_data"]
     total = (f"случаев {len(results)}; match {count['match']}; жёстких (неуспех 4) {hard}; service {count['service']}; "
              f"нет данных {count['no_data']}; прочих {other}")
-    return "\n".join(["# Агент = калькулятор", "", *rows, "", total, ""])
+    failures = match_failures(results, cases)
+    verdict = f"успех: нет ({', '.join(failures)})" if failures else "успех: да"
+    return "\n".join(["# Агент = калькулятор", "", *rows, "", total, verdict, ""])
+
+
+def match_failures(results: Iterable[MatchResult], cases: Iterable[Case]) -> list[str]:
+    """Причины неуспеха автотеста (I-2 итогового ревью Д9б, решение контроллера); пусто — успех. Успех — всё сразу:
+    жёстких 0 (hard), service 0 (service), у каждого вида случаев хотя бы один match (no_match:<вид>) и прогон дошёл
+    до конца плана (cut: у случая нет результата или последний — timeout: потолок прокси или срок хода оборвали хвост
+    плана). Мягкие no_number, no_data и timeout посреди плана успех не роняют, но вид без единого match — не успех.
+    Коды — без тегов и чисел."""
+    results, cases = list(results), list(cases)
+    by_id = {c.id: c for c in cases}
+    out = []
+    if any(r.hard for r in results):
+        out.append("hard")
+    if any(r.verdict == "service" for r in results):
+        out.append("service")
+    matched = {by_id[r.case].kind for r in results if r.verdict == "match" and r.case in by_id}
+    out += [f"no_match:{kind}" for kind in dict.fromkeys(c.kind for c in cases) if kind not in matched]
+    done = {r.case for r in results}
+    if not results or any(c.id not in done for c in cases) or results[-1].verdict == "timeout":
+        out.append("cut")
+    return out
 
 
 # --- прогонщик ---
@@ -880,5 +906,6 @@ def case_count(analog: Sequence[str], discrete: Sequence[str]) -> int:
 __all__ = ["ANALOG_KINDS", "BASIC_KINDS", "CALC_AGENT", "CALC_PROMPT", "Case", "HARD", "KINDS", "KindSpec",
            "MATCH_VERDICTS", "MatchConfig", "MatchResult", "MatchRunner", "STATE_KINDS", "build_cases",
            "calc_agent_args", "case_call", "case_count", "cases_from_agent", "hist_today", "judge_case", "key_values",
-           "load_case_tags", "load_match_config", "node_tags", "period_ok", "probe_calc", "render_match",
+           "load_case_tags", "load_match_config", "match_failures", "node_tags", "period_ok", "probe_calc",
+           "render_match",
            "write_case_tags", "write_private"]

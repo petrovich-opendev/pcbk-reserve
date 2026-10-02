@@ -47,7 +47,7 @@ from pcbk_bench.cards import CHECK_GOOD, cards_check
 from pcbk_bench.checks import check_run
 from pcbk_bench.judge import (Packet, assert_packet_clean, build_vocab, check_verdicts, collect_verdicts, controls_ok,
                               pack_batches, stage_judges)
-from pcbk_bench.match import build_cases, hist_today, render_match
+from pcbk_bench.match import build_cases, hist_today, match_failures, render_match
 from pcbk_bench.record import RunKey
 from pcbk_bench.runner import NOTE_CALC_RATE, load_tag_units
 from pcbk_bench.scenarios import SCENARIO_IDS
@@ -326,6 +326,10 @@ def test_match_twin(bench):                                                     
     avg = {c.id for c in cases if c.kind in ("avg_prev_shift", "avg_span")}
     assert len(avg) == 6 and {c for c, r in got[7].items() if r.hard} == avg
     assert all(got[7][c].verdict == "mismatch" for c in avg)
+    # успех автотеста (I-2 итогового ревью Д9б): честная — успех; «среднее + 1» — не успех: жёсткие, у видов со
+    # средним нет ни одного match
+    assert match_failures(list(got[5].values()), cases) == []
+    assert match_failures(list(got[7].values()), cases) == ["hard", "no_match:avg_prev_shift", "no_match:avg_span"]
     assert "bench-calc" not in agents_left(bench.stack, {5: None, 7: None})       # агент проверки — в архиве
     md = render_match(list(got[5].values()), cases)
     assert "20FAKE" not in md
