@@ -94,6 +94,13 @@ _MINUTES_ABBR = re.compile(rf"\d[{_SP}]*$")          # «5 мин» — мину
 _BOUNDARY = re.compile(r"[!?;|\n]|\.(?![ \t]*[0-9a-zа-яё])")
 # граница предложения (suspect_norm: «общие знания» — в том же предложении): «.!?» и перевод строки
 _SENTENCE = re.compile(r"[!?\n]|\.(?![ \t]*[0-9a-zа-яё])")
+# шкала прибора (доводка р1б): число с подписью шкалы при ТОЧНОМ совпадении с min_eu/max_eu вывода catalog_search
+# покрыто; подпись нормы в той же строке («норма», «допустимо», «должно быть», «предел» не прибора) — нет
+SCALE_WORDS = re.compile(r"\bшкал\w*|\bдиапазон\w*\s+измерен\w*|\bпредел\w*\s+(?:измерен\w*\s+)?(?:прибор|датчик)\w*",
+                         re.IGNORECASE)
+_NORM_WORDS = re.compile(r"\b(?:норм|допуск|допустим|долж|порог|регламент)\w*|"
+                         r"\bпредел\w*\b(?!\s+(?:измерен\w*\s+)?(?:прибор|датчик))", re.IGNORECASE)
+_ROW = re.compile(r"[!?;\n]|\.(?![ \t]*[0-9a-zа-яё])")            # строка таблицы — одна: «| Шкала | 0–60 |»
 _TIME_Z = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z?\b")
 
 
@@ -292,28 +299,51 @@ def value_label(text: str, s: Shown, blockers: Iterable[Shown]) -> str | None:
     return None
 
 
+def scale_covered(text: str, s: Shown, shown: Iterable[Shown], scale: Iterable[Decimal]) -> bool:
+    """Число — граница шкалы прибора: точно равно min_eu или max_eu, в той же строке есть подпись шкалы («шкала»,
+    «диапазон измерения», «пределы прибора/датчика»), между подписью и числом — только другие точные границы шкалы,
+    а подписи нормы в строке нет. «норма — до 60» и «шкала 0–70» при max_eu = 60 не покрыты."""
+    bounds = list(scale)
+    if not any(s.value == v for v in bounds):
+        return False
+    left, right = segment_of(text, s.start, s.end, _ROW)
+    if _NORM_WORDS.search(text, left, right):
+        return False
+    for w in SCALE_WORDS.finditer(text, left, right):
+        lo, hi = (w.end(), s.start) if w.end() <= s.start else (s.end, w.start())
+        if lo > hi:
+            continue
+        between = [b for b in shown if b is not s and lo <= b.start and b.end <= hi]
+        if all(any(b.value == v for v in bounds) for b in between):
+            return True
+    return False
+
+
 def value_word_near(text: str, s: Shown, blockers: Iterable[Shown]) -> bool:
     """Слово значения в том же отрезке без числа-заслона между словом и числом (I-р3-9, m-р4-10)."""
     return bool(_bound_words(text, s, blockers))
 
 
 def foreign_numbers(text: str, sources: Iterable[float], also: str = "", tag_units: Iterable[str] = (),
-                    strict_value_words: bool = False, weak: Iterable[float] = ()) -> list[Foreign]:
+                    strict_value_words: bool = False, weak: Iterable[float] = (),
+                    scale: Iterable[float] = ()) -> list[Foreign]:
     """Числа текста, которых нет в источниках, с классом allowed / hard / other (Д8-R72).
 
     sources и числа also, разобранные parse_numbers, — полные источники. weak и группы цифр дат и времени also —
     слабые (I-2 доводки р1): закрывают только число, которое иначе было бы other, и никогда — hard. Так шкала прибора
     (min_eu, max_eu), числа в строках службы и цифры периода не прячут «0 °C», «16 °C» или «150 °C» в C4.
-    strict_value_words (C2, C4): процент, кроме доли достоверности, — hard (I-3 доводки р1)."""
+    strict_value_words (C2, C4): процент, кроме доли достоверности, — hard (I-3 доводки р1).
+    scale — min_eu/max_eu вывода catalog_search: граница шкалы с подписью шкалы покрыта (scale_covered, р1б)."""
     src = [v for v in (_dec(x) for x in sources) if v is not None] + also_strong(also)
     soft = [v for v in (_dec(x) for x in weak) if v is not None] + also_weak(also)
+    bounds = [v for v in (_dec(x) for x in scale) if v is not None]
     units = [u for u in tag_units if u]
     shown = parse_numbers(text)
     kinds = {id(s): non_measure_kind(text, s) for s in shown}
     walls = [s for s in shown if kinds[id(s)] is None]          # неизмеряемое число слово значения не заслоняет
     out: list[Foreign] = []
     for s in shown:
-        if any(close(s, v) for v in src):
+        if any(close(s, v) for v in src) or (bounds and scale_covered(text, s, shown, bounds)):
             continue
         kind = kinds[id(s)]
         if kind is not None and kind != "percent":

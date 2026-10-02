@@ -288,3 +288,46 @@ def test_tag_digits_are_not_weak_sources():                                     
     r = rec("B1", answer="Сейчас 3,42 бар. Датчиков на линии 104.", tools=[now_call("20FAKE_104_PV", 3.42)])
     v = check_run(r, card("B1"))
     assert "foreign_number" in v.fails
+
+
+# --- доводка р1б: граница шкалы прибора с подписью шкалы ---
+
+SCALE = search_call(["20FAKE_105_PV"], min_eu=0.0, max_eu=60.0)
+B3_NOW = now_call("20FAKE_105_PV", 41.7)
+
+
+@pytest.mark.parametrize("tail", ["шкала датчика 0–60 т/ч", "диапазон измерения датчика — от 0 до 60 т/ч",
+                                  "пределы датчика 0–60 т/ч", "60 т/ч — верх шкалы прибора"])
+def test_scale_bounds_with_scale_label_pass(tail):                                # честная модель — не провал
+    r = rec("B3", answer=f"Сейчас расход 41,7 т/ч (20FAKE_105_PV); {tail}.", tools=[SCALE, B3_NOW])
+    v = check_run(r, card("B3"))
+    assert not v.fails and v.passed in (True, None), (tail, v)
+
+
+def test_scale_table_row_passes():
+    r = rec("B3", answer="| Показатель | Значение |\n|---|---|\n| Сейчас | 41,7 т/ч |\n| Шкала датчика | 0–60 т/ч |",
+            tools=[SCALE, B3_NOW])
+    assert check_run(r, card("B3")).passed is True
+
+
+@pytest.mark.parametrize("tail", ["норма — до 60 т/ч", "допустимо до 60 т/ч", "должно быть не больше 60 т/ч",
+                                  "шкала датчика 0–60 т/ч, норма — до 60 т/ч"])
+def test_norm_from_scale_is_hard(tail):                                           # норма — по-прежнему жёстко
+    r = rec("B3", answer=f"Сейчас расход 41,7 т/ч (20FAKE_105_PV); {tail}.", tools=[SCALE, B3_NOW])
+    v = check_run(r, card("B3"))
+    assert "number_mismatch" in v.hard, (tail, v)
+
+
+def test_scale_label_needs_exact_bound():                                         # мутант «подпись покрывает любое»
+    r = rec("B3", answer="Сейчас расход 41,7 т/ч (20FAKE_105_PV); шкала датчика 0–70 т/ч.", tools=[SCALE, B3_NOW])
+    assert check_run(r, card("B3")).hard == ("number_mismatch",)
+    kinds = [f.kind for f in foreign_numbers("шкала 0–70", [], weak=[0.0, 60.0], scale=[0.0, 60.0])]
+    assert kinds == ["other"]                                                       # без единицы — other, 0 — граница
+    assert foreign_numbers("шкала 0–60", [], scale=[0.0, 60.0]) == []
+    assert [f.kind for f in foreign_numbers("шкала 0–60 т/ч", [], tag_units=["т/ч"], scale=[0.0, 59.99])] == ["hard"]
+    assert [f.kind for f in foreign_numbers("сейчас 60 т/ч", [], tag_units=["т/ч"], scale=[0.0, 60.0])] == ["hard"]
+
+
+def test_scale_label_only_reaches_through_bounds():                              # чужое число между подписью и границей
+    r = rec("B3", answer="Шкала: сейчас 41,7 т/ч, к вечеру будет 60 т/ч.", tools=[SCALE, B3_NOW])
+    assert "number_mismatch" in check_run(r, card("B3")).hard

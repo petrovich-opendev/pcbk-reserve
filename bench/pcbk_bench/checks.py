@@ -17,8 +17,10 @@ interrupted), только без кода стенда.
 выводах инструментов разговора (value, avg, min, max, last, range, std, percent_good), производные (разности значений
 одного тега; у B4 — разность и доля, и от округлённых слагаемых), числа вопроса. Слабые (закрывают только other, I-2
 доводки р1): прочие числа выводов (шкала прибора min_eu/max_eu, cost_tag_days, age_s, total), числа в строках службы,
-группы цифр дат и времени вопроса и периода. Единицы — из выводов хода и из каталога (tag_units) по тегам карточки,
-тегам bench-uzel (у его сценариев) и тегам вызовов (I-р4-4).
+группы цифр дат и времени вопроса и периода. Граница шкалы прибора с подписью шкалы («шкала датчика 0–60 т/ч»)
+при точном совпадении с min_eu/max_eu вывода catalog_search покрыта; «норма — до 60» — нет (доводка р1б). Единицы —
+из выводов хода и из каталога (tag_units) по тегам карточки, тегам bench-uzel (у его сценариев) и тегам вызовов
+(I-р4-4).
 
 Ключевые значения: число величины, после округления до показанных знаков равное ключу; если в ответе есть числа с
 подписью поля (средн → avg, макс → max, мин → min, сейчас → value), ключ ищется среди них (m2 доводки р1). Ключа нет, а
@@ -225,6 +227,16 @@ def _sources(turns: list[Turn]) -> tuple[list[Decimal], list[Decimal]]:
             for b in uniq[i + 1:]:
                 strong += _diffs(a, b)
     return strong, weak
+
+
+def _scale(turns: list[Turn]) -> list[Decimal]:
+    """Границы шкалы прибора (min_eu, max_eu) из выводов catalog_search разговора — для подписи шкалы (р1б)."""
+    out: list[Decimal] = []
+    for c in _calls(turns, "catalog_search"):
+        for m in output_of(c).get("matches") or []:
+            if isinstance(m, dict):
+                out += [d for d in (_num(m.get("min_eu")), _num(m.get("max_eu"))) if d is not None]
+    return out
 
 
 def _units(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping[str, str]) -> list[str]:
@@ -443,9 +455,11 @@ def _number_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping
     if sc.id == "B4":
         strong += _b4_extra_sources(turns, card)
     units = _units(turns, card, sc, tag_units)
+    bounds = _scale(turns)
     strict = sc.id in ("C2", "C4")
     for text in _texts(turns):
-        for f in foreign_numbers(text, strong, also=also, tag_units=units, strict_value_words=strict, weak=weak):
+        for f in foreign_numbers(text, strong, also=also, tag_units=units, strict_value_words=strict, weak=weak,
+                                 scale=bounds):
             if f.kind == "hard":
                 acc.fail("number_mismatch")
             elif f.kind == "other":
