@@ -648,7 +648,8 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
   }
 
   const proxied = ["/pcbk/api/auth/", "/pcbk/api/auth/me", "/pcbk/api/auth/notice", "/pcbk/api/workplace",
-                   "/pcbk/api/workplace/wake", "/pcbk/api/agents"];                    // «Мои агенты» (Д7б, Д7-R64)
+                   "/pcbk/api/workplace/wake", "/pcbk/api/agents",                      // «Мои агенты» (Д7б, Д7-R64)
+                   "/pcbk/api/calc/"];                                                  // калькуляторы (Д9а, Д9-R87)
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
   const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
@@ -716,10 +717,16 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.equal(locs.filter((l) => l.port === 8443 && l.path === "/pcbk/api/agents").length, 1);
     assert.ok(flat("/pcbk/api/workplace").includes("limit_req zone=pcbk_place_rate burst=20 nodelay;"));   // контроль
     assert.equal(flat("/pcbk/api/agents"), flat("/pcbk/api/workplace"));
+    // Д9-R87: калькуляторы — префикс (имя инструмента сверяет core), копия пределов ручек места
+    const calc = "/pcbk/api/calc/";
+    assert.equal(loc(calc).exact, false);
+    assert.equal(locs.filter((l) => l.port === 8443 && l.path === calc).length, 1);
+    assert.equal(flat(calc), flat("/pcbk/api/workplace"));
   }
   assert.ok(loc("/pcbk/api/").body.includes("if ($pcbk_bad_api_uri) { return 400"));
   assert.match(loc("/pcbk/api/").body, /return 404 '\{"name":"NotFound"/);
-  for (const [path, code] of [["/pcbk/api", 404], ["/pcbk/api/auth", 404], ["/pcbk/api/oc", 403]]) {
+  for (const [path, code] of [["/pcbk/api", 404], ["/pcbk/api/auth", 404], ["/pcbk/api/oc", 403],
+                              ["/pcbk/api/calc", 404]]) {                               // Д9а, m7: калькуляторы
     assert.ok(loc(path)?.exact, path);                                                  // без «/» — не 301 HTML
     assert.match(loc(path).body, new RegExp(`return ${code} '\\{"name":"`), path);
   }

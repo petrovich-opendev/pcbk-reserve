@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +27,7 @@ import pytest
 import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel
@@ -43,6 +44,7 @@ from pcbk_core.data.service import DataService
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
 from pcbk_core.gateway import GatewayRole
 from pcbk_core.gateway.accounts import AccountStore
+from pcbk_core.gateway.api import COOKIE
 from pcbk_core.gateway.places import SpCtl, Workplaces
 from pcbk_core.gateway.stats import GatewayStats
 from pcbk_core.hooks import hooks_of
@@ -518,7 +520,8 @@ ORIGIN = "https://stand.test:8443"
 
 def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),
                  stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
-                 accounts: bool = True, agents_root: Path | None = None, **gw_overrides) -> GatewayRole:
+                 accounts: bool = True, agents_root: Path | None = None, calc: DataService | None = None,
+                 **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
     GatewaySettings (без проверок from_env). stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
 
@@ -527,6 +530,7 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
     открывается. Места из ready работают в двойнике Docker и готовы без пробуждения: первый такт их не трогает.
     Корень агентов (Settings.AGENTS_ROOT, Д7а, предпроверка П3) — agents_root как есть, по умолчанию
     tmp_path/agents, подготовленный make_agents_root: воркер перезагрузки проверяет каталог первым тактом.
+    calc — служба данных калькуляторов страницы (Д9-R87, обычно make_service), None — маршрут отвечает 503.
     Роли для тестов добавлены fake_docker, fake_places, mono.
     """
     tmp_path = Path(tmp_path)
@@ -551,7 +555,7 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
         ready_place(workplaces, docker, n)
     role = GatewayRole(replace(SETTINGS, DB_PATH=str(db), AGENTS_ROOT=str(root)), gw,
                        store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S), workplaces=workplaces, stats=stats,
-                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s)
+                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s, calc=calc)
     role.fake_docker, role.fake_places, role.mono = docker, oc, mono
     return role
 
@@ -577,6 +581,37 @@ def login(c, name: str, pw: str = PW, **headers) -> httpx.Response:
     sent = {"Origin": ORIGIN, **headers}
     return c.post("/pcbk/api/auth/login", json={"login": name, "password": pw},
                   headers={k: v for k, v in sent.items() if v != ""})
+
+
+# --- Шлюз: клиенты по зонам и учёткам (Д7б «Мои агенты»; общие с калькуляторами Д9а) ---
+
+BASE = "https://stand.test:8443"                # cookie сессии — Secure: клиент тестов шлёт её только по https
+FRONT = ("172.31.250.35", 40000)                # edge в pcbk-front
+PLACE_NET = ("172.31.3.3", 5000)                # сеть места 03
+
+
+class Gw:
+    """Шлюз на двойниках под lifespan: as_(login, client) — клиент с cookie сессии этой учётки (вход — из front),
+    anon(client) — без cookie, store_save — строка учёта агента напрямую в core.db."""
+
+    def __init__(self, app, role):
+        self.app, self.role = app, role
+
+    def as_(self, name: str, client=FRONT) -> TestClient:
+        r = login(TestClient(self.app, base_url=BASE, client=FRONT), name)
+        assert r.status_code == 200, (name, r.status_code)
+        return TestClient(self.app, base_url=BASE, client=client, headers={"Cookie": f"{COOKIE}={r.cookies[COOKIE]}"})
+
+    def anon(self, client=FRONT) -> TestClient:
+        return TestClient(self.app, base_url=BASE, client=client)
+
+    def store_save(self, place: int, name: str, state: str, title: str = "", purpose: str = "") -> None:
+        at = AGENT_NOW.isoformat()
+        with closing(sqlite3.connect(self.role.agents.db_path)) as db, db:
+            db.execute("INSERT INTO agents (place, name, title, node, purpose, tools, tags, digest, sha256,"
+                       " student_reply, flags, state, created_at, state_at, visible_at)"
+                       " VALUES (?, ?, ?, 'узел', ?, '[]', '[]', 'd', 's', 'да', '[]', ?, ?, ?, NULL)",
+                       (place, name, title or f"Агент {name}", purpose or f"назначение {name}", state, at, at))
 
 
 # --- Шлюз: прокси /pcbk/api/oc (Д5б, задача Б3) ---

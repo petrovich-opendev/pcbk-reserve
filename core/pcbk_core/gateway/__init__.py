@@ -23,8 +23,12 @@ workplaces.repair = reloads.repair. lifespan открывает учёт аге�
 сбоя учёта воркера (строка «Агенты студентов»), не config_error (предпроверка П13): вход студентов от учёта агентов не
 зависит. Воркер — фоновая задача рядом с уборщиком, при config_error не стартует; остановка роли его снимает.
 
-Модули accounts, agents_api, api, proxy и web (а через них — accounts) здесь импортируются только внутри методов:
-команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
+Калькуляторы страницы (Д9а, Д9-R87) — calc_router: POST /pcbk/api/calc/<tool> зовёт DataService роли «данные» (calc,
+передаёт main.build_roles) в процессе; без службы маршрут отвечает 503. DataService здесь — только под TYPE_CHECKING
+(m12).
+
+Модули accounts, agents_api, api, calc_api, proxy и web (а через них — accounts) здесь импортируются только внутри
+методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
 загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
 """
 from __future__ import annotations
@@ -53,6 +57,7 @@ from .reload import AgentReloads
 from .stats import GatewayStats
 
 if TYPE_CHECKING:
+    from ..data.service import DataService
     from .accounts import AccountStore
 
 log = logging.getLogger("pcbk_core.gateway")
@@ -214,7 +219,8 @@ class GatewayRole(RoleBase):
                  stats: GatewayStats, config_error: str | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 stream_recheck_s: float = 10.0, agent_stats: AgentStats | None = None):
+                 stream_recheck_s: float = 10.0, agent_stats: AgentStats | None = None,
+                 calc: DataService | None = None):
         from .accounts import LOCK_WINDOW_S
         from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
         from .web import WebReports
@@ -235,6 +241,8 @@ class GatewayRole(RoleBase):
         self.web_reports = WebReports()         # отчёты браузеров (Д6-R50): память, часы — monotonic
         # счётчики агентов студентов (Д7-R60): общий с ролью «данные» объект из build_roles, иначе свой
         self.agent_stats = AgentStats(monotonic=monotonic) if agent_stats is None else agent_stats
+        # служба данных для калькуляторов страницы (Д9-R87): общая с ролью «данные» из build_roles; None — 503
+        self.calc = calc
         # учёт агентов шлюза (Д7-R53: свой AgentStore на тот же core.db) и воркер перезагрузки (Д7-R58)
         self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
         self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
@@ -249,6 +257,7 @@ class GatewayRole(RoleBase):
     def router(self) -> APIRouter:
         from .agents_api import agents_router
         from .api import auth_router, catch_all_router, configured, front_only, workplace_router
+        from .calc_api import calc_router
         from .proxy import proxy_router
         from .web import web_router
 
@@ -260,6 +269,7 @@ class GatewayRole(RoleBase):
         router.include_router(web_router(self))         # зона и настройка — у маршрутов отчётов; до ловящего
         router.include_router(agents_router(self))      # /health/agents (Д7а) и /pcbk/api/agents (Д7б): зона и
                                                         # настройка — у маршрутов (m24); до ловящего
+        router.include_router(calc_router(self))        # калькуляторы страницы (Д9а): зона и настройка — у маршрута
 
         @router.get(HEALTH_PATH, dependencies=[Depends(front_only)])
         async def health_gateway() -> JSONResponse:
