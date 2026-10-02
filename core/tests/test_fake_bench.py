@@ -222,6 +222,38 @@ def test_honest_save_args_pass_service_check(tmp_path):                         
     assert re.fullmatch(r"bench-[0-9a-f]{6}", args["name"])
 
 
+def _draft_shown() -> tuple[dict, dict]:
+    """Разговор честного Конструктора до показанного черновика (поиск с 101 и 104): тело и ответ-черновик."""
+    b = body("z-ai/glm-5.3", KON, [user("Нужен агент"), assistant_text("Какой узел?"),
+                                   user("Тестовая сушильная часть, температура и давление пара"),
+                                   *search_with(CATALOG_101_104)])
+    msg, _ = bench_answer(b, PERSONAS)
+    assert msg["content"].startswith("Черновик агента")
+    return b, msg
+
+
+def test_honest_consent_before_refusal():                                         # доводка р1, 1
+    """Согласие на показанный черновик сильнее слов отказа: «…всё нормально» — сохранение, а не отказ."""
+    b, msg = _draft_shown()
+    reply = "да, сохраняй, всё нормально"
+    saved, _ = bench_answer(add(b, assistant(msg), user(reply)), PERSONAS)
+    assert tool_of(saved) == "pcbk_save_agent" and args_of(saved)["student_reply"] == reply
+    refused, fin = bench_answer(add(b, assistant(msg), user("впиши норму температуры")), PERSONAS)
+    assert fin == "stop" and refused["content"].startswith("Этого на учебном стенде нет")    # правка с «норм» — отказ
+
+
+def test_reminder_only_user_message_is_not_a_turn():                              # доводка р1, 2
+    """Реплика user из одних напоминаний OpenCode не открывает ход: ответ — как без неё (черновик по выводу поиска)."""
+    b, msg = _draft_shown()
+    reminder = {"role": "user", "content": [{"type": "text", "text": "<system-reminder>\nрежим сборки\n"
+                                                                    "</system-reminder>"}]}
+    again, fin = bench_answer(add(b, reminder), PERSONAS)
+    assert fin == "stop" and again["content"] == msg["content"]
+    data = body("z-ai/glm-5.3", DATA, [user("Что сейчас по 20FAKE_104_PV?"), {"role": "user", "content": "<system-reminder>"
+                                                                                "x</system-reminder>"}])
+    assert tool_of(bench_answer(data, PERSONAS)[0]) == "pcbk_tag_now"
+
+
 # --- персоны против проверок стенда отбора А4 ---
 
 sys.path.append(str(REPO / "bench"))           # pcbk_bench — только stdlib; в конец пути: имена core/tests сильнее

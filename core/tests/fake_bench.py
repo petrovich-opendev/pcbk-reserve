@@ -13,7 +13,8 @@ bench_answer(body, personas) -> (message, finish_reason) | None — ответ �
   Конструктор по шагам konstruktor.md:
   1. на первую реплику — NODE_QUESTION («Какой узел, что агент должен показывать и на какие вопросы отвечать?»);
   2. на просьбу под REFUSE_RE (SQL|файл|обход|игнорир|норм) — вежливый отказ без цифр и снова вопрос об узле (после
-     черновика — отказ и тот же черновик): норму в черновик и инструкцию не пишет (I-н3);
+     черновика — отказ и тот же черновик): норму в черновик и инструкцию не пишет (I-н3); согласие на показанный
+     черновик проверяется раньше отказа — «да, сохраняй, всё нормально» сохраняет;
   3. ответ об узле — pcbk_catalog_search по последнему слову ответа (основа до 5 букв);
   4. в выводе несколько тегов с одним описанием — список «тег — описание — единица» и вопрос; реплику выбора
      («первый», «второй» … или имя тега) понимает как выбор;
@@ -166,7 +167,9 @@ def _turns(body: dict) -> list[_Turn]:
     for m in msgs:
         role = m.get("role")
         if role == "user":
-            turns.append(_Turn(_text(m.get("content"))))
+            # реплика из одних служебных вставок OpenCode (напоминаний) — не новый ход: шаг идёт в прежний
+            if text := _text(m.get("content")):
+                turns.append(_Turn(text))
             continue
         if role not in ("assistant", "tool") or not turns:
             continue
@@ -382,14 +385,14 @@ def _constructor(body: dict, persona: str, turns: list[_Turn]) -> tuple[dict, st
     if state.saved:
         return _say(ALREADY_SAVED)
     prev = next((t.texts[-1] for t in reversed(turns[:-1]) if t.texts), "")
-    shown = DRAFT_RE.search(prev) is not None
+    shown = DRAFT_RE.search(prev) is not None and state.search is not None
+    if shown and CONSENT_RE.match(cur.user):                    # согласие раньше отказа: «да, всё нормально»
+        return _save(body, state, turns, cur.user)
     if REFUSE_RE.search(cur.user):
-        if shown and state.search is not None:
+        if shown:
             return _say(KON_REFUSAL + "\n\n" + render_draft(_fields(state, turns, body), state.tags()))
         return _say(f"{KON_REFUSAL} {NODE_QUESTION}")
-    if shown and state.search is not None:
-        if CONSENT_RE.match(cur.user):
-            return _save(body, state, turns, cur.user)
+    if shown:
         return _say(render_draft(_fields(state, turns, body), state.tags()))      # правка — новый черновик
     if prev.startswith(LIST_HEAD) and state.search is not None:
         if state.pick is None:

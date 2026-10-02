@@ -1,12 +1,16 @@
 """Двойник историана стенда отбора и обёртка запуска core тестового стенда (Д8-R75)."""
+import asyncio
 import os
 import re
 import subprocess
 import sys
+from dataclasses import replace
 
 from fastapi.testclient import TestClient
 
-from helpers import CORE_DIR, REPO, TOKEN, make_app, wait_until
+from helpers import CORE_DIR, LLM_ENV, REPO, SETTINGS, TOKEN, make_app, wait_until
+from pcbk_core.data.sql import catalog_sql, clock_sql
+from pcbk_core.main import build_roles
 from twin_core import install_twin
 from twin_historian import BENCH_FIXTURE, TwinHistorian, bench_whitelist
 
@@ -42,6 +46,32 @@ def test_install_twin_only_with_env(monkeypatch):                               
     assert install_twin({"PCBK_TWIN_HISTORIAN": " "}) is False and h.tds_query is real   # пустая — как нет
     assert install_twin({"PCBK_TWIN_HISTORIAN": str(BENCH_FIXTURE)}) is True
     assert isinstance(h.tds_query(None), TwinHistorian)
+
+
+def test_install_twin_reaches_data_role(monkeypatch, tmp_path):                  # доводка р1, 4
+    """install_twin, затем build_roles: роль «данные» ходит в двойник. Страховка от импорта tds_query на уровне
+    модуля: pcbk_core.main импортирован раньше подмены (как у тестов), и подмена всё равно доходит до роли."""
+    import pcbk_core.data.historian as h
+    monkeypatch.setattr(h, "tds_query", h.tds_query)
+    bdrv = tmp_path / "bdrv.env"
+    bdrv.write_text("BDRV_HOST=192.0.2.10\nBDRV_USER=u\nBDRV_PW=p\n", encoding="utf-8")
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"), BDRV_ENV_FILE=str(bdrv))
+    assert install_twin({"PCBK_TWIN_HISTORIAN": str(BENCH_FIXTURE)}) is True
+    data = {r.name: r for r in build_roles(settings, LLM_ENV)}["data"]
+    result = asyncio.run(data.gate.run([clock_sql(), catalog_sql()], lane="background", deadline_s=5))
+    names = {row[0] for row in result.rows[1]}
+    assert names == {row[0] for row in TwinHistorian.from_fixture(BENCH_FIXTURE).catalog} and "20FAKE_104_PV" in names
+
+
+def test_compose_test_twin_default_empty():                                      # доводка р1, 3
+    """У core тестового стенда переменная двойника по умолчанию пуста — двойник включает только явное значение."""
+    text = (REPO / "compose.test.yaml").read_text(encoding="utf-8")
+    core = re.search(r"^  core:\n(.*?)(?=^  \S)", text, re.M | re.S).group(1)
+    assert re.findall(r"^\s*PCBK_TWIN_HISTORIAN:.*$", text, re.M) == ["      PCBK_TWIN_HISTORIAN: ${PCBK_TWIN_HISTORIAN:-}"]
+    assert "      PCBK_TWIN_HISTORIAN: ${PCBK_TWIN_HISTORIAN:-}" in core.splitlines()
+    assert '    command: ["python", "-m", "twin_core"]' in core.splitlines()
+    assert "      PYTHONPATH: /twin" in core.splitlines()
+    assert re.search(r"source: \./core/tests, target: /twin, read_only: true", core)
 
 
 def test_twin_core_runs_main_as_module(tmp_path):
