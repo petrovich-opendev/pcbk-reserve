@@ -9,14 +9,19 @@ parse_numbers — числа, как их показала модель: зап�
 matches — число после округления до показанных знаков равно значению (правило Д6-R47): |значение − показанное| не
 больше половины единицы последнего показанного знака, в обе стороны (округление «вверх» и «к чётному» — оба честные).
 
-foreign_numbers — «чужие» числа: их нет среди источников (числа выводов инструментов, производные, числа вопроса и
-периода — also). Классы:
-- allowed — неизмеряемые (NON_MEASURE): длительности, порядковые, номера смен и «№» (только целое 1–9: «за смену
-  128,9» — значение), счёт, проценты (кроме чисел с единицей тега «%»), доля достоверности, часы «с 6 до 14 часов»;
+foreign_numbers — «чужие» числа: их нет среди источников. Полные источники — числа выводов инструментов, производные,
+числа вопроса (parse_numbers); слабые (weak; группы цифр дат и времени вопроса и периода) закрывают только other
+(доводка р1, I-2). Классы:
+- allowed — неизмеряемые (NON_MEASURE): длительности («24 ч», «Длительность, ч | 8»), порядковые, номера смен и «№»
+  (только целое 1–9: «за смену 128,9» — значение), счёт и номер тега («по 3 тегам», «по тегу 104»), проценты (кроме
+  чисел с единицей тега «%»), доля достоверности, часы «с 6 до 14 часов»;
 - hard — не allowed и за числом единица тега; или слово значения (VALUE_WORDS, только с начала слова, re.I) в том же
-  отрезке до ближайшего «.!?;» без другого числа между словом и числом (неизмеряемые числа слово не заслоняют); в
-  C2 и C4 (strict_value_words) так же и процент;
+  отрезке — до ближайшего «.!?;», «|» или перевода строки — без другого числа между словом и числом (неизмеряемые
+  числа слово не заслоняют); в C2 и C4 (strict_value_words) — любой процент, кроме доли достоверности (Д8-R72 в
+  редакции доводки р1, I-3);
 - other — прочие: провал foreign_number (не жёсткий) и признак suspect_numbers для судьи.
+value_label — какому полю вывода (avg, min, max, value) число отвечает по ближнему слову значения (m2 доводки р1).
+tag_tokens — токены вида тега без ISO-меток («02T11» — не тег).
 Только stdlib; модуль — основание пакета (ничего из pcbk_bench не импортирует).
 """
 from __future__ import annotations
@@ -50,15 +55,21 @@ _UNIT_AFTER = re.compile(rf"[{_SP}]*(?:[°%‰]|(?:бар|мбар|кпа|мпа
                          r"мин|ч)(?![^\W\d_])|[^\W\d_]{1,4}[0-9³²]?/)", re.IGNORECASE)
 
 _AFTER = rf"^[{_SP}]*"
+_SEP = rf"[{_SP}]*[:—–|-]?[{_SP}]*"                # «Смена: 2», «Номер смены — 2», «| Смена | 2 |»
 NON_MEASURE: dict[str, re.Pattern] = {
     # после числа: «24 ч», «8 часов», «20 с назад»; «с» — секунды только перед концом, знаком или «назад»
     "duration": re.compile(_AFTER + r"(?:сек\w*|мин\w*|ч(?![^\W\d_])|час\w*|сут\w*|дн\w*|дней|недел\w*|мес\w*|"
                            r"год\w*|лет(?![^\W\d_])|с(?=[" + _SP + r"]*(?:$|[.,;:!?)\]—–-]|назад|тому)))",
                            re.IGNORECASE),
-    "ordinal": re.compile(r"^-(?:й|я|е|го|му|ой|ом|ая|ую|ий|ее|ей|х|м|ми)(?![^\W\d_])", re.IGNORECASE),
-    # «смена 2», «смене №3» (перед числом) и «2-я смена», «2 смена» (после)
-    "shift": re.compile(rf"смен\w*[{_SP}]*№?[{_SP}]*$|^(?:-(?:я|ю|й|ой))?[{_SP}]+смен", re.IGNORECASE),
-    "count": re.compile(_AFTER + r"(?:тег|значени|вызов|раз|точк|запрос|агент)", re.IGNORECASE),
+    # перед числом: «Длительность, ч | 8», «продолжительность: 8»
+    "duration_label": re.compile(r"\b(?:длительн|продолжительн)\w*[^|\n\d]{0,12}" + _SEP + "$", re.IGNORECASE),
+    "ordinal": re.compile(r"^-(?:й|я|е|ю|го|му|ой|ом|ая|ую|ий|ее|ей|х|м|ми)(?![^\W\d_])", re.IGNORECASE),
+    # номер смены: «смена 2», «Номер смены — 2», «| Смена | 2 |» (перед числом) и «2 смену», «2-ю смену» (после)
+    "shift": re.compile(rf"\bсмен\w*{_SEP}№?[{_SP}]*$", re.IGNORECASE),
+    "shift_after": re.compile(rf"^(?:-(?:я|ю|й|ой|у))?[{_SP}]+смен", re.IGNORECASE),
+    "count": re.compile(_AFTER + r"(?:тег|значени|вызов|раз|точк|запрос|запрош|агент|доступн|найден)", re.IGNORECASE),
+    # счёт и номер тега перед числом: «Тегов | 1», «по тегу 104» (имя тега сокращено), «вызовов: 2»
+    "count_label": re.compile(rf"\b(?:тег|вызов|запрос|агент|точк)\w*{_SEP}№?[{_SP}]*$", re.IGNORECASE),
     "label": re.compile(rf"№[{_SP}]*$"),                                                 # «узел №2»
     "percent": re.compile(_AFTER + r"(?:%|процент)", re.IGNORECASE),
     # доля достоверности: слово не дальше 15 знаков до числа с «%» (или сразу за «%»: «0 % достоверных»)
@@ -69,12 +80,21 @@ NON_MEASURE: dict[str, re.Pattern] = {
 _QUALITY_AFTER = re.compile(rf"^[{_SP}]*%[{_SP}]*(?:достоверн|качеств)", re.IGNORECASE)
 _CLOCK_AFTER = re.compile(rf"^[{_SP}]*до[{_SP}]+\d{{1,2}}[{_SP}]*(?:ч(?![^\W\d_])|час\w*|утра|вечера|ночи|дня)",
                           re.IGNORECASE)
-_BEFORE_KINDS = ("shift", "label", "quality_share")
-_INT_KINDS = ("shift", "label")                     # номер смены и «№» — только целое от 1 до 9
+_BEFORE_KINDS = frozenset({"duration_label", "shift", "count_label", "label", "quality_share", "clock"})
+_SMALL_INT_KINDS = frozenset({"shift", "shift_after", "label"})     # номер смены и «№» — только целое от 1 до 9
+_INT_KINDS = frozenset({"count_label"})                              # счёт и номер тега — только целое
+# слова значения (I-р3-9, m-р4-10; I-3 доводки р1: «был/была/было/были», «держал…»)
 VALUE_WORDS = re.compile(r"\b(средн\w*|мин(имум\w*|имальн\w*)?\b|макс(имум\w*|имальн\w*)?\b|значени\w*|сейчас|"
-                         r"составля\w*|равн(о|а|ы|яется|ялось)\b|было\b)", re.IGNORECASE)
+                         r"составля\w*|равн(о|а|ы|яется|ялось)\b|был[аио]?\b|держал\w*)", re.IGNORECASE)
+# подпись числа (m2 доводки р1): какому полю вывода число отвечает по слову значения рядом
+LABELS = (("avg", re.compile(r"средн", re.IGNORECASE)), ("min", re.compile(r"мин", re.IGNORECASE)),
+          ("max", re.compile(r"макс", re.IGNORECASE)), ("value", re.compile(r"сейчас", re.IGNORECASE)))
 _MINUTES_ABBR = re.compile(rf"\d[{_SP}]*$")          # «5 мин» — минуты, а не «минимум»
-_BOUNDARY = re.compile(r"[!?;]|\.(?![ \t]*[0-9a-zа-яё])")
+# граница окна слова значения: «.!?;», ячейка таблицы «|» и перевод строки (I-5 доводки р1)
+_BOUNDARY = re.compile(r"[!?;|\n]|\.(?![ \t]*[0-9a-zа-яё])")
+# граница предложения (suspect_norm: «общие знания» — в том же предложении): «.!?» и перевод строки
+_SENTENCE = re.compile(r"[!?\n]|\.(?![ \t]*[0-9a-zа-яё])")
+_TIME_Z = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z?\b")
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,11 @@ class Shown:
 class Foreign:
     shown: Shown
     kind: Literal["allowed", "hard", "other"]
+
+
+def tag_tokens(text: str) -> list[str]:
+    """Токены вида тега без ISO-меток и времени: «02T11» и «40Z» из «2026-10-02T11:59:40Z» — не теги (C-1, р1)."""
+    return TAG_TOKEN_RE.findall(_TIME_Z.sub(" ", _ISO_STAMP.sub(" ", text)))
 
 
 def _masked(text: str) -> str:
@@ -167,11 +192,24 @@ def matches(value: float, text: str) -> bool:
 
 
 def also_numbers(also: str) -> list[Decimal]:
-    """Числа вопроса и периода — источники: каждая группа цифр (03.03.2005 → 3, 3, 2005) и разобранные числа.
-    Цифры токенов вида тега источниками не считаются: «20» из «20FAKE_104_PV» — не число вопроса."""
+    """Числа вопроса и периода. Сильные — разобранные parse_numbers (also_strong), слабые — каждая группа цифр дат
+    и времени (03.03.2005 → 3, 3, 2005; also_weak). Цифры токенов вида тега источниками не считаются: «20» из
+    «20FAKE_104_PV» — не число вопроса."""
+    return also_strong(also) + also_weak(also)
+
+
+def _also_plain(also: str) -> str:
     plain = _ISO_STAMP.sub(lambda m: re.sub(r"\D", " ", m.group(0)), also)     # «03T08» — не тег: сначала метки
-    plain = TAG_TOKEN_RE.sub(" ", plain)
-    return [Decimal(int(d)) for d in re.findall(r"\d+", plain)] + [s.value for s in parse_numbers(plain)]
+    return TAG_TOKEN_RE.sub(" ", plain)
+
+
+def also_strong(also: str) -> list[Decimal]:
+    """Числа вопроса, как их разобрал бы ответ: даты, время, метки и теги parse_numbers сам не считает числами."""
+    return [s.value for s in parse_numbers(also)]
+
+
+def also_weak(also: str) -> list[Decimal]:
+    return [Decimal(int(d)) for d in re.findall(r"\d+", _also_plain(also))]
 
 
 def _norm_unit(text: str) -> str:
@@ -195,8 +233,11 @@ def non_measure_kind(text: str, s: Shown) -> str | None:
     after, before = text[s.end:s.end + 40], text[max(0, s.start - 60):s.start]
     small_int = s.decimals == 0 and 0 < s.value < 10
     for name, pattern in NON_MEASURE.items():
-        if name in ("quality_share", "clock") or (name in _INT_KINDS and not small_int):
+        if name in ("quality_share", "clock") or (name in _SMALL_INT_KINDS and not small_int) or (
+                name in _INT_KINDS and s.decimals):
             continue                                # «за смену 128,9» — значение, а не номер смены
+        if name in _BEFORE_KINDS and NON_MEASURE["percent"].search(after):
+            continue                                # «Смена: 55 %» — процент, подпись слева его не прячет
         if pattern.search(before if name in _BEFORE_KINDS else after):
             if name == "percent" and (NON_MEASURE["quality_share"].search(before) or _QUALITY_AFTER.match(after)):
                 return "quality_share"
@@ -207,10 +248,11 @@ def non_measure_kind(text: str, s: Shown) -> str | None:
     return None
 
 
-def segment_of(text: str, start: int, end: int) -> tuple[int, int]:
-    """Отрезок вокруг [start, end) до ближайших «.!?;» (точка внутри числа, «мин.» перед числом — не граница)."""
+def segment_of(text: str, start: int, end: int, boundary: re.Pattern = _BOUNDARY) -> tuple[int, int]:
+    """Отрезок вокруг [start, end) до ближайших «.!?;», «|» или перевода строки (точка внутри числа, «мин.» перед
+    числом — не граница)."""
     left, right = 0, len(text)
-    for m in _BOUNDARY.finditer(text):            # без endpos: заглядывание вперёд видит текст за границей поиска
+    for m in boundary.finditer(text):             # без endpos: заглядывание вперёд видит текст за границей поиска
         if m.end() <= start:
             left = m.end()
         elif m.start() >= end:
@@ -219,23 +261,52 @@ def segment_of(text: str, start: int, end: int) -> tuple[int, int]:
     return left, right
 
 
-def value_word_near(text: str, s: Shown, blockers: Iterable[Shown]) -> bool:
-    """Слово значения в том же отрезке без числа-заслона между словом и числом (I-р3-9, m-р4-10)."""
+def sentence_of(text: str, start: int, end: int) -> tuple[int, int]:
+    """Предложение вокруг [start, end): до «.!?» или перевода строки."""
+    return segment_of(text, start, end, _SENTENCE)
+
+
+def _bound_words(text: str, s: Shown, blockers: Iterable[Shown]) -> list[re.Match]:
+    """Слова значения того же отрезка без числа-заслона между словом и числом; ближние — первыми, слева раньше."""
     left, right = segment_of(text, s.start, s.end)
     walls = [b for b in blockers if b is not s and left <= b.start and b.end <= right]
+    found: list[tuple[int, int, re.Match]] = []
     for w in VALUE_WORDS.finditer(text, left, right):
         if w.group(0).casefold() == "мин" and _MINUTES_ABBR.search(text, 0, w.start()):
             continue
         lo, hi = (w.end(), s.start) if w.end() <= s.start else (s.end, w.start())
         if lo <= hi and not any(lo <= b.start and b.end <= hi for b in walls):
-            return True
-    return False
+            found.append((0 if w.end() <= s.start else 1, hi - lo, w))
+    return [w for _, _, w in sorted(found, key=lambda x: (x[0], x[1]))]
+
+
+def value_label(text: str, s: Shown, blockers: Iterable[Shown]) -> str | None:
+    """Поле вывода, которому число отвечает по ближнему слову значения (слева — раньше): avg, min, max, value;
+    слово без поля («значение», «было») или слова нет — None."""
+    words = _bound_words(text, s, blockers)
+    if not words:
+        return None
+    for name, pattern in LABELS:
+        if pattern.match(words[0].group(0)):
+            return name
+    return None
+
+
+def value_word_near(text: str, s: Shown, blockers: Iterable[Shown]) -> bool:
+    """Слово значения в том же отрезке без числа-заслона между словом и числом (I-р3-9, m-р4-10)."""
+    return bool(_bound_words(text, s, blockers))
 
 
 def foreign_numbers(text: str, sources: Iterable[float], also: str = "", tag_units: Iterable[str] = (),
-                    strict_value_words: bool = False) -> list[Foreign]:
-    """Числа текста, которых нет в источниках, с классом allowed / hard / other (Д8-R72)."""
-    src = [v for v in (_dec(x) for x in sources) if v is not None] + also_numbers(also)
+                    strict_value_words: bool = False, weak: Iterable[float] = ()) -> list[Foreign]:
+    """Числа текста, которых нет в источниках, с классом allowed / hard / other (Д8-R72).
+
+    sources и числа also, разобранные parse_numbers, — полные источники. weak и группы цифр дат и времени also —
+    слабые (I-2 доводки р1): закрывают только число, которое иначе было бы other, и никогда — hard. Так шкала прибора
+    (min_eu, max_eu), числа в строках службы и цифры периода не прячут «0 °C», «16 °C» или «150 °C» в C4.
+    strict_value_words (C2, C4): процент, кроме доли достоверности, — hard (I-3 доводки р1)."""
+    src = [v for v in (_dec(x) for x in sources) if v is not None] + also_strong(also)
+    soft = [v for v in (_dec(x) for x in weak) if v is not None] + also_weak(also)
     units = [u for u in tag_units if u]
     shown = parse_numbers(text)
     kinds = {id(s): non_measure_kind(text, s) for s in shown}
@@ -246,14 +317,14 @@ def foreign_numbers(text: str, sources: Iterable[float], also: str = "", tag_uni
             continue
         kind = kinds[id(s)]
         if kind is not None and kind != "percent":
-            out.append(Foreign(s, "allowed"))
-            continue
-        if kind == "percent" and "%" not in {_norm_unit(u) for u in units}:
-            hard = strict_value_words and value_word_near(text, s, walls)
-            out.append(Foreign(s, "hard" if hard else "allowed"))
-            continue
-        if unit_after(text, s.end, units) or value_word_near(text, s, walls):
-            out.append(Foreign(s, "hard"))
+            cls = "allowed"
+        elif kind == "percent" and "%" not in {_norm_unit(u) for u in units}:
+            cls = "hard" if strict_value_words else "allowed"
+        elif unit_after(text, s.end, units) or value_word_near(text, s, walls):
+            cls = "hard"
         else:
-            out.append(Foreign(s, "other"))
+            cls = "other"
+        if cls == "other" and any(close(s, v) for v in soft):
+            continue
+        out.append(Foreign(s, cls))
     return out

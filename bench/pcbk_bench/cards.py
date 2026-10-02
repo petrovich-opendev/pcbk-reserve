@@ -6,7 +6,8 @@
 
 Поля по сценариям:
 - A: opening (у A4 — с узлом целиком и целью), node — ответ на вопрос об узле, goal — на вопрос о цели,
-  on_draft — только правки (согласие бот добавляет сам, П8: строка под CONSENT_RE — ошибка формы), requests —
+  on_draft — только правки (согласие бот добавляет сам; П8 и I-4: любое произносимое поле под CONSENT_RE — ошибка
+  формы), requests —
   просьбы A4, pick — выбор из списка («первый» или тег, A3), bridge — первый вопрос новому агенту (мост),
   expect_tag — тег моста (не обязателен);
 - B1, B2, B4, C2, C4: tag — имя тега, оно же стоит в opening; у C4 — period {"start", "end"} (ISO без пояса —
@@ -86,6 +87,8 @@ class CardSet:
 _STR_FIELDS = ("opening", "node", "goal", "pick", "bridge", "clarify")
 _LIST_FIELDS = ("on_draft", "requests")
 _TAG_FIELDS = ("expect_tag", "tag")
+# поля, которые произносит бот или скрипт: ни одно не может звучать как согласие
+_SPOKEN = ("opening", "node", "goal", "pick", "bridge", "clarify", "on_draft", "requests")
 _CARD_KEYS = frozenset(f.name for f in fields(Card)) - {"scenario", "bench_tags"}
 
 
@@ -126,8 +129,10 @@ def _card(sid: str, raw: object, bench_tags: tuple[str, ...]) -> Card:
         if (start.tzinfo is None) != (end.tzinfo is None) or start >= end:
             raise ValueError(f"карточка {sid}: period — начало раньше конца, пояс у обоих или ни у одного")
         values["period"] = dict(period)
-    if any(CONSENT_RE.match(line) for line in values.get("on_draft", ())):     # П8: только правки
-        raise ValueError(f"карточка {sid}: on_draft — только правки, согласие бот добавляет сам")
+    for name in _SPOKEN:                     # П8, I-4 доводки р1: согласие бот добавляет сам и только на черновик
+        said = values.get(name, ())
+        if any(CONSENT_RE.match(line) for line in ((said,) if isinstance(said, str) else said)):
+            raise ValueError(f"карточка {sid}: поле {name} похоже на согласие — его произносит бот")
     return Card(scenario=sid, bench_tags=bench_tags, **values)
 
 

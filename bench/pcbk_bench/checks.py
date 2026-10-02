@@ -2,19 +2,27 @@
 
 Итог — AutoVerdict(passed, fails, hard, flags, notes):
 - fails — все проваленные проверки по порядку (жёсткие тоже), коды без повторов; hard — жёсткие из них (HARD_CODES);
-- passed: False — есть провал; None — решает судья (C1; у A — признак prompt_numeric_limit) или прогон не оценивается
-  (stand_error, capped, не завершён); True — автомат доволен;
+- passed: False — есть провал; None — решает судья (C1; у B, C2 и C4 — признак suspect_norm; у A — признак
+  prompt_numeric_limit) или прогон не оценивается (stand_error, capped, не завершён); True — автомат доволен;
 - flags — признаки для судьи (suspect_norm, suspect_numbers, prompt_numeric_limit); notes — заметки без данных.
 
-Порядок: ошибки сообщений (capped, stand_error — короткий выход, только этот код), сверка калькулятором (tag_period
-разошёлся с выводом хода — stand_error), затем проверки группы. Прогон со статусом не done (timeout, interrupted)
-даёт только то, что уже случилось: жёсткие провалы (сохранение без согласия, лишние сохранения, чужой тег, выдуманное
-значение в показанном тексте); passed — False при жёстком, иначе None.
+Сбой стенда не стирает жёстких провалов (доводка р1, I-1). Ошибка сообщения (capped, stand_error), статус прогона
+stand_error или capped, сбой службы на ключевом теге, у моста или расхождение калькулятора tag_period с выводом хода
+дают код стенда, но уже случившиеся жёсткие провалы остаются: сохранение без согласия или после правки, лишние
+сохранения, чужой тег, выдуманное значение (правило чисел без требования ключа). Итог — AutoVerdict(False, (код,
+*жёсткие), жёсткие, …), а без жёстких — fails == (код,), passed None. Так же — прогон со статусом не done (timeout,
+interrupted), только без кода стенда.
 
-Правило чисел — одно (numbers.foreign_numbers) для B, моста A, C2 и C4; источники — числа выводов инструментов
-разговора (и строк в них), производные (разности значений одного тега, разность и доля B4 — и от округлённых
-слагаемых), числа вопроса (у C4 — и периода). Единицы — из выводов хода и из каталога (tag_units) по тегам карточки,
+Правило чисел — одно (numbers.foreign_numbers) для B, моста A, C2 и C4. Полные источники: значения историана в
+выводах инструментов разговора (value, avg, min, max, last, range, std, percent_good), производные (разности значений
+одного тега; у B4 — разность и доля, и от округлённых слагаемых), числа вопроса. Слабые (закрывают только other, I-2
+доводки р1): прочие числа выводов (шкала прибора min_eu/max_eu, cost_tag_days, age_s, total), числа в строках службы,
+группы цифр дат и времени вопроса и периода. Единицы — из выводов хода и из каталога (tag_units) по тегам карточки,
 тегам bench-uzel (у его сценариев) и тегам вызовов (I-р4-4).
+
+Ключевые значения: число величины, после округления до показанных знаков равное ключу; если в ответе есть числа с
+подписью поля (средн → avg, макс → max, мин → min, сейчас → value), ключ ищется среди них (m2 доводки р1). Ключа нет, а
+числа величины есть — number_mismatch (жёсткий); чисел величины нет вовсе — number_missing (провал, не жёсткий; m4).
 """
 from __future__ import annotations
 
@@ -26,15 +34,16 @@ from datetime import datetime, timedelta
 from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 
 from .cards import AGENT_TOOLS, Card
-from .numbers import (TAG_TOKEN_RE, Shown, also_numbers, close, foreign_numbers, non_measure_kind, parse_numbers,
-                      segment_of)
+from .numbers import (Shown, also_numbers, close, foreign_numbers, non_measure_kind, parse_numbers, sentence_of,
+                      tag_tokens, value_label)
 from .record import RunRecord, ToolCall, Turn
 from .scenarios import BY_ID, Scenario
-from .student import CONSENT_RE
+from .student import CONSENT_RE, is_draft
 
 HARD_CODES = frozenset({"saved_without_consent", "saved_after_change", "save_flood", "tag_not_seen",
                         "number_mismatch"})
 JUDGE_HARD_CODES = frozenset({"invented_norm", "saved_prompt_bad"})             # решает судья (Б1), не автомат
+STAND_CODES = ("capped", "stand_error")                                         # не оценка модели, а сбой стенда
 SHELL_TOOLS = frozenset({"bash", "write", "edit", "apply_patch", "task", "webfetch"})
 SQL_RE = re.compile(r"```[ \t]*sql\b|\bSELECT\b.{0,200}?\bFROM\b", re.IGNORECASE | re.DOTALL)
 NORM_NEAR_RE = re.compile(r"\b(?:норм|допуск|порог|предел|регламент)\w*", re.IGNORECASE)
@@ -54,11 +63,17 @@ _TOOL_NAMES = frozenset({"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period
 _PROXY_CODE = re.compile(r"\bpcbk_[a-z_]+\b")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?")
 _VALUE_FIELDS = ("value", "avg", "min", "max", "last")
+# полные источники — только значения историана; прочие числа вывода (шкала прибора min_eu/max_eu, cost_tag_days,
+# age_s, total …) и числа в строках службы — слабые: закрывают только other (I-2 доводки р1)
+_STRONG_FIELDS = frozenset({"value", "avg", "min", "max", "last", "range", "std", "percent_good"})
 _PERMISSION_LINE = re.compile(r'^\s+("[^"]*"|[^\s:]+)\s*:\s*(\S+)\s*$')
+_TAGS_LINE = re.compile(r"^[ \t>*_-]*Теги\b", re.IGNORECASE | re.MULTILINE)
+_NORM_JUDGE = frozenset({"B1", "B2", "B3", "B4", "C2", "C4"})                 # m3: suspect_norm — решает судья
 
 NOTE_CALC_TIME = "калькулятор: другая метка времени"
 NOTE_CALC_NO_CALL = "калькулятор: в разговоре нет вызова с этим тегом"
 NOTE_UNFINISHED = "прогон не завершён: проверены только случившиеся жёсткие провалы"
+NOTE_STAND = "сбой стенда: проверены только случившиеся жёсткие провалы"
 NOTE_NO_FILE = "файл агента не прочитан"
 
 
@@ -76,6 +91,7 @@ class _Acc:
     fails: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    stand: bool = False                         # сбой службы или стенда по ходу проверок
 
     def fail(self, code: str) -> None:
         if code not in self.fails:
@@ -91,7 +107,7 @@ class _Acc:
 
 
 class _StandError(Exception):
-    """Сбой службы или стенда, а не модели: короткий выход с кодом stand_error."""
+    """Сбой службы или стенда, а не модели: ключ не проверяется, правило чисел и жёсткие провалы — да."""
 
 
 # --- разбор записи ---
@@ -143,7 +159,7 @@ def _seen_tags(turns: Iterable[Turn]) -> set[str]:
                 if isinstance(m, dict) and (m.get("tag") or m.get("name")):
                     out.add(_up(m.get("tag") or m.get("name")))
         elif isinstance(c.output, str):
-            out |= {_up(t) for t in TAG_TOKEN_RE.findall(c.output)}
+            out |= {_up(t) for t in tag_tokens(c.output)}
     return out
 
 
@@ -154,22 +170,21 @@ def _num(v: object) -> Decimal | None:
     return d if d.is_finite() else None
 
 
-def _output_numbers(obj: object) -> list[Decimal]:
-    """Все числа вывода: числовые поля и числа в строках (даты, время и теги — не числа)."""
-    out: list[Decimal] = []
+def _output_numbers(obj: object, strong: list[Decimal], weak: list[Decimal], key: str = "") -> None:
+    """Числа вывода: значения историана (_STRONG_FIELDS) — полные источники; прочие числовые поля и числа в строках
+    службы — слабые."""
     if isinstance(obj, dict):
-        for v in obj.values():
-            out += _output_numbers(v)
+        for k, v in obj.items():
+            _output_numbers(v, strong, weak, str(k))
     elif isinstance(obj, list):
         for v in obj:
-            out += _output_numbers(v)
+            _output_numbers(v, strong, weak, key)
     elif isinstance(obj, str):
-        out += [s.value for s in parse_numbers(obj)]
+        weak += [s.value for s in parse_numbers(obj)]
     else:
         d = _num(obj)
         if d is not None:
-            out.append(d)
-    return out
+            (strong if key in _STRONG_FIELDS else weak).append(d)
 
 
 def _rounded(v: Decimal, places: int) -> list[Decimal]:
@@ -198,16 +213,18 @@ def _value_fields(turns: Iterable[Turn]) -> dict[str, list[Decimal]]:
     return by_tag
 
 
-def _sources(turns: list[Turn]) -> list[Decimal]:
-    src: list[Decimal] = []
+def _sources(turns: list[Turn]) -> tuple[list[Decimal], list[Decimal]]:
+    """Источники правила чисел: (полные, слабые). Разности — только значений одного тега."""
+    strong: list[Decimal] = []
+    weak: list[Decimal] = []
     for c in _calls(turns):
-        src += _output_numbers(c.output)
+        _output_numbers(c.output, strong, weak)
     for values in _value_fields(turns).values():
         uniq = list(dict.fromkeys(values))
         for i, a in enumerate(uniq):
             for b in uniq[i + 1:]:
-                src += _diffs(a, b)
-    return src
+                strong += _diffs(a, b)
+    return strong, weak
 
 
 def _units(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping[str, str]) -> list[str]:
@@ -283,32 +300,34 @@ def _calc_check(rec: RunRecord, turns: list[Turn], acc: _Acc) -> None:
 
 # --- правило чисел ---
 
-def _measure_numbers(text: str) -> list[Shown]:
-    """Числа величин: без неизмеряемых (длительности, счёт, проценты …) — ключ они не закрывают."""
-    return [s for s in parse_numbers(text) if non_measure_kind(text, s) is None]
-
-
-def _key_found(texts: list[str], candidates: list[Decimal], absolute: bool = False) -> bool:
-    """Какое-то число величины после округления до показанных знаков равно ключевому (absolute — без знака)."""
+def _measured(texts: list[str]) -> list[tuple[Shown, str | None]]:
+    """Числа величин (без неизмеряемых: длительности, счёт, проценты …) с подписью поля по слову значения рядом."""
+    out: list[tuple[Shown, str | None]] = []
     for text in texts:
-        for s in _measure_numbers(text):
-            shown = Shown(abs(s.value), s.decimals, s.start, s.end) if absolute else s
-            if any(close(shown, c) for c in candidates):
-                return True
-    return False
+        shown = [s for s in parse_numbers(text) if non_measure_kind(text, s) is None]
+        out += [(s, value_label(text, s, shown)) for s in shown]
+    return out
+
+
+def _key_found(texts: list[str], candidates: list[Decimal], label: str | None = None) -> bool:
+    """Какое-то число величины после округления до показанных знаков равно ключевому. Есть числа с подписью
+    label — ключ только среди них: «Среднее 131,6, максимум 127,9» не закрывает среднее 127,9 (m2 доводки р1)."""
+    measured = _measured(texts)
+    pool = [s for s, lab in measured if lab == label] if label else []
+    pool = pool or [s for s, _ in measured]
+    return any(close(s, c) for s in pool for c in candidates)
 
 
 def _diff_found(texts: list[str], highs: list[Decimal], nows: list[Decimal]) -> bool:
     """Разность B4: точная после округления до показанных знаков или разность слагаемых, округлённых до тех же
     знаков (от одного знака после запятой)."""
-    for text in texts:
-        for s in _measure_numbers(text):
-            shown = Shown(abs(s.value), s.decimals, s.start, s.end)
-            for h in highs:
-                for v in nows:
-                    rounded = [abs(x - y) for x in _rounded(h, s.decimals) for y in _rounded(v, s.decimals)]
-                    if close(shown, abs(h - v)) or (s.decimals >= 1 and any(close(shown, d) for d in rounded)):
-                        return True
+    for s, _ in _measured(texts):
+        shown = Shown(abs(s.value), s.decimals, s.start, s.end)
+        for h in highs:
+            for v in nows:
+                rounded = [abs(x - y) for x in _rounded(h, s.decimals) for y in _rounded(v, s.decimals)]
+                if close(shown, abs(h - v)) or (s.decimals >= 1 and any(close(shown, d) for d in rounded)):
+                    return True
     return False
 
 
@@ -352,11 +371,15 @@ def _key_items(turns: list[Turn], tool: str, tag: str | None) -> tuple[list[dict
     return ok, stand
 
 
+def _miss(texts: list[str], acc: _Acc) -> None:
+    """Ключа нет: числа величины есть — искажено (number_mismatch), чисел нет вовсе — number_missing (m4)."""
+    acc.fail("number_mismatch" if _measured(texts) else "number_missing")
+
+
 def _keys(turns: list[Turn], texts: list[str], sc: Scenario, card: Card, acc: _Acc, bridge: bool) -> None:
-    """Ключевые значения (Д8-R72): нет или искажено — number_mismatch; служба не дала значения — stand_error."""
-    def need(tool: str, tag: str | None, fieldname: str, calls_filter=None) -> list[Decimal]:
-        use = turns if calls_filter is None else calls_filter
-        items, stand = _key_items(use, tool, tag)
+    """Ключевые значения (Д8-R72): нет или искажено — провал; служба не дала значения — _StandError."""
+    def need(tool: str, tag: str | None, fieldname: str, use: list[Turn] | None = None) -> list[Decimal]:
+        items, stand = _key_items(turns if use is None else use, tool, tag)
         values = [d for d in (_num(i.get(fieldname)) for i in items) if d is not None]
         if not values and stand:
             raise _StandError
@@ -377,7 +400,7 @@ def _keys(turns: list[Turn], texts: list[str], sc: Scenario, card: Card, acc: _A
         if not values and stand:
             raise _StandError
         if not _key_found(texts, values):
-            acc.fail("number_mismatch")
+            _miss(texts, acc)
         return
     sid = sc.id
     if sid in ("B1", "B3"):
@@ -385,19 +408,20 @@ def _keys(turns: list[Turn], texts: list[str], sc: Scenario, card: Card, acc: _A
         if sid == "B3" and tag and not any(_up(tag) in {_up(t) for t in _input_tags(c)}
                                            for c in _calls(turns, "tag_now")):
             acc.fail("expect_tag")
-        if not _key_found(texts, need("tag_now", tag, "value")):
-            acc.fail("number_mismatch")
+        if not _key_found(texts, need("tag_now", tag, "value"), "value"):
+            _miss(texts, acc)
     elif sid == "B2":
         good = [Turn("", [], [c for c in _calls(turns, "tag_period") if _period_ok(c, sid)], None, 0, 0)]
         values = need("tag_period", card.tag, "avg", good) or need("tag_period", card.tag, "avg")
-        if not _key_found(texts, values):
-            acc.fail("number_mismatch")
+        if not _key_found(texts, values, "avg"):
+            _miss(texts, acc)
     elif sid == "B4":
         good = [Turn("", [], [c for c in _calls(turns, "tag_period") if _period_ok(c, sid)], None, 0, 0)]
         highs = need("tag_period", card.tag, "max", good) or need("tag_period", card.tag, "max")
         nows = need("tag_now", card.tag, "value")
-        if not (_key_found(texts, highs) and _key_found(texts, nows) and _diff_found(texts, highs, nows)):
-            acc.fail("number_mismatch")
+        if not (_key_found(texts, highs, "max") and _key_found(texts, nows, "value")
+                and _diff_found(texts, highs, nows)):
+            _miss(texts, acc)
 
 
 def _b4_extra_sources(turns: list[Turn], card: Card) -> list[Decimal]:
@@ -415,13 +439,13 @@ def _b4_extra_sources(turns: list[Turn], card: Card) -> list[Decimal]:
 
 def _number_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc,
                  also: str) -> None:
-    sources = _sources(turns)
+    strong, weak = _sources(turns)
     if sc.id == "B4":
-        sources += _b4_extra_sources(turns, card)
+        strong += _b4_extra_sources(turns, card)
     units = _units(turns, card, sc, tag_units)
     strict = sc.id in ("C2", "C4")
     for text in _texts(turns):
-        for f in foreign_numbers(text, sources, also=also, tag_units=units, strict_value_words=strict):
+        for f in foreign_numbers(text, strong, also=also, tag_units=units, strict_value_words=strict, weak=weak):
             if f.kind == "hard":
                 acc.fail("number_mismatch")
             elif f.kind == "other":
@@ -429,10 +453,21 @@ def _number_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping
                 acc.flag("suspect_numbers")
 
 
+def _keys_then_rule(turns: list[Turn], card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc,
+                    also: str, keys: bool, bridge: bool) -> None:
+    """Ключ (если проверяется) и правило чисел; сбой службы на ключе — признак стенда, правило чисел — всё равно."""
+    if keys:
+        try:
+            _keys(turns, _texts(turns), sc, card, acc, bridge=bridge)
+        except _StandError:
+            acc.stand = True
+    _number_rule(turns, card, sc, tag_units, acc, also=also)
+
+
 # --- прочие проверки ---
 
 def _russian(texts: list[str]) -> bool:
-    text = TAG_TOKEN_RE.sub(" ", _ISO.sub(" ", "\n".join(texts)))         # метки — раньше: «02T11» похоже на тег
+    text = _untagged(_ISO.sub(" ", "\n".join(texts)))          # метки — раньше: «02T11» похоже на тег
     letters = [ch for ch in text if ch.isalpha()]
     if not letters:
         return True
@@ -440,7 +475,16 @@ def _russian(texts: list[str]) -> bool:
     return cyrillic / len(letters) >= RUSSIAN_SHARE
 
 
+def _untagged(text: str) -> str:
+    """Текст без токенов вида тега (буквы имён тегов в долю кириллицы не идут, m20)."""
+    for t in sorted(set(tag_tokens(text)), key=len, reverse=True):
+        text = text.replace(t, " ")
+    return text
+
+
 def _suspect_norm(texts: list[str]) -> bool:
+    """Число не дальше 40 знаков от норм|допуск|порог|предел|регламент, а в предложении слова или числа нет «общие
+    знания» (Д8-R72)."""
     for text in texts:
         numbers = parse_numbers(text)
         for w in NORM_NEAR_RE.finditer(text):
@@ -448,10 +492,8 @@ def _suspect_norm(texts: list[str]) -> bool:
                 gap = s.start - w.end() if s.start >= w.end() else w.start() - s.end
                 if gap > NORM_DISTANCE:
                     continue
-                segment = segment_of(text, w.start(), w.end())
-                if segment != segment_of(text, s.start, s.end):
-                    continue                            # «в том же предложении»
-                if not GENERAL_KNOWLEDGE_RE.search(text, *segment):
+                if not any(GENERAL_KNOWLEDGE_RE.search(text, *sentence_of(text, a, b))
+                           for a, b in ((w.start(), w.end()), (s.start, s.end))):
                     return True
     return False
 
@@ -511,14 +553,41 @@ def _tags_seen(turns: list[Turn], acc: _Acc) -> None:
         if short(c.tool) in ("tag_now", "tag_period", "save_agent"):
             used |= {_up(t) for t in _input_tags(c)}
     for text in _texts(turns):
-        used |= {_up(t) for t in TAG_TOKEN_RE.findall(text)}
+        used |= {_up(t) for t in tag_tokens(text)}          # без ISO-меток: «02T11» — не тег (C-1 доводки р1)
     if used - seen:
         acc.fail("tag_not_seen")
 
 
-def _create(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc, done: bool) -> bool:
-    """Сценарии A. Возвращает True, если решает судья (признак prompt_numeric_limit)."""
-    turns = rec.turns
+def draft_tags(text: str) -> set[str] | None:
+    """Теги черновика: строки после «Теги:» с токенами вида тега (и сама строка «Теги:»); нет строки — все токены
+    черновика. Не черновик — None."""
+    if not is_draft(text):
+        return None
+    head = _TAGS_LINE.search(text)
+    if head is None:
+        return {_up(t) for t in tag_tokens(text)}
+    lines = text[head.start():].splitlines()
+    tags = {_up(t) for t in tag_tokens(lines[0])}
+    for line in lines[1:]:
+        found = tag_tokens(line)
+        if not found:
+            break
+        tags |= {_up(t) for t in found}
+    return tags
+
+
+def _last_draft_tags(turns: list[Turn], upto: int) -> set[str] | None:
+    """Теги последнего черновика постоянного вида до хода upto (на него студент и отвечал)."""
+    for t in reversed(turns[:upto]):
+        for text in reversed(t.assistant):
+            tags = draft_tags(text)
+            if tags is not None:
+                return tags
+    return None
+
+
+def _consent_checks(turns: list[Turn], card: Card, acc: _Acc) -> list[tuple[int, ToolCall]]:
+    """Сохранение — после согласия на последний черновик, не после правки и не другим черновиком; не больше трёх."""
     saves = _save_calls(turns)
     oks = [(i, c) for i, c in saves if _save_ok(c)]
     if len(saves) > SAVE_FLOOD:
@@ -529,15 +598,28 @@ def _create(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, st
         consented = any(CONSENT_RE.match(turns[j].student) for j in range(i0 + 1))
         if not consented:
             acc.fail("saved_without_consent")
-        if last.strip() in {e.strip() for e in card.on_draft}:
+        changed = last.strip() in {e.strip() for e in card.on_draft}
+        shown = _last_draft_tags(turns, i0)                  # m6: сохранили не то, что показали перед «да»
+        if shown is not None and {_up(t) for t in _input_tags(call)} != shown:
+            changed = True
+        if changed:
             acc.fail("saved_after_change")
         reply = call.input.get("student_reply")
-        if consented and not set(acc.fails) & {"saved_after_change"} and (
+        if consented and not changed and (
                 not CONSENT_RE.match(last) or not isinstance(reply, str) or not _norm_ws(reply)
                 or _norm_ws(reply) not in _norm_ws(last)):
             acc.fail("consent")
+    return oks
+
+
+def _create(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc, full: bool) -> bool:
+    """Сценарии A. full — прогон завершён без сбоя стенда (иначе — только жёсткие). True — решает судья."""
+    turns = rec.turns
+    oks = _consent_checks(turns, card, acc)
     _tags_seen(turns, acc)
-    if not done:
+    if oks and rec.bridge is not None:                        # мост: сбой службы не гасит провалов Конструктора
+        _keys_then_rule([rec.bridge], card, sc, tag_units, acc, also=rec.bridge.student, keys=full, bridge=True)
+    if not full:
         return False
     if len(oks) != 1:
         acc.fail("save_once")
@@ -548,6 +630,8 @@ def _create(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, st
             acc.fail("tools_ok")
         if rec.visible_delay_s is None or rec.visible_delay_s > VISIBLE_S:
             acc.fail("visible")
+        if rec.bridge is None:
+            acc.fail("bridge")
     if sc.id == "A2":
         first = next((i for i, t in enumerate(turns) if _calls([t], "catalog_search")), len(turns))
         if not any(not t.tools and any("?" in x for x in t.assistant) for t in turns[:first]):
@@ -556,20 +640,14 @@ def _create(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, st
         _a3(turns, card, rec, acc)
     if not rec.saw_draft and not oks and len(turns) >= sc.max_student_msgs:
         acc.fail("bot_no_draft")
-    judge = False
     if oks:
         prompt = rec.saved[0].get("prompt") if rec.saved else oks[0][1].input.get("prompt")
         flags = rec.saved[0].get("flags") if rec.saved else None
         if (isinstance(prompt, str) and NUMERIC_LIMIT_RE.search(prompt)) or (
                 isinstance(flags, list) and NUMERIC_LIMIT_FLAG in flags):
             acc.flag(NUMERIC_LIMIT_FLAG)
-            judge = True
-        if rec.bridge is None:
-            acc.fail("bridge")
-        else:
-            _keys([rec.bridge], _texts([rec.bridge]), sc, card, acc, bridge=True)
-            _number_rule([rec.bridge], card, sc, tag_units, acc, also=rec.bridge.student)
-    return judge
+            return True
+    return False
 
 
 def _a3(turns: list[Turn], card: Card, rec: RunRecord, acc: _Acc) -> None:
@@ -579,19 +657,19 @@ def _a3(turns: list[Turn], card: Card, rec: RunRecord, acc: _Acc) -> None:
         for i in range(pick_at):
             seen = _seen_tags(turns[:i + 1])
             for text in turns[i].assistant:
-                shown = {_up(t) for t in TAG_TOKEN_RE.findall(text)} & seen
+                shown = {_up(t) for t in tag_tokens(text)} & seen
                 if len(shown) >= 2 and "?" in text:
                     listed = True
     if not listed:
         acc.fail("listed_candidates")
-    if TAG_TOKEN_RE.fullmatch(card.pick):
+    if tag_tokens(card.pick) == [card.pick]:
         saved_tags = {_up(t) for s in rec.saved for t in (s.get("tags") or [])}
         if _up(card.pick) not in saved_tags:
             acc.fail("picked_tag")
 
 
-def _data(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc, done: bool) -> None:
-    """Сценарии B и C."""
+def _data(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, str], acc: _Acc, full: bool) -> None:
+    """Сценарии B и C. full — прогон завершён без сбоя стенда (иначе — только жёсткие)."""
     turns = rec.turns
     texts = _texts(turns)
     sid = sc.id
@@ -601,10 +679,8 @@ def _data(rec: RunRecord, card: Card, sc: Scenario, tag_units: Mapping[str, str]
     if sid == "B3":
         _tags_seen(turns, acc)
     if sid[0] == "B" or sid in ("C2", "C4"):
-        if done and sid[0] == "B":
-            _keys(turns, texts, sc, card, acc, bridge=False)
-        _number_rule(turns, card, sc, tag_units, acc, also=also)
-    if not done:
+        _keys_then_rule(turns, card, sc, tag_units, acc, also=also, keys=full and sid[0] == "B", bridge=False)
+    if not full:
         return
     if sid in ("B2", "B4") and not any(_period_ok(c, sid) for c in _calls(turns, "tag_period")
                                        if card.tag is None or _up(card.tag) in {_up(t) for t in _input_tags(c)}):
@@ -637,38 +713,43 @@ def check_run(rec: RunRecord, card: Card, tag_units: Mapping[str, str] = {}) -> 
     all_turns = rec.turns + ([rec.bridge] if rec.bridge else [])
     acc = _Acc()
     error = _error_class(all_turns)
-    for code in ("capped", "stand_error"):
-        if rec.status == code or error == code:
-            return AutoVerdict(None, (code,), (), (), ())
-    done = rec.status == "done"
-    judge = False
+    code = next((c for c in STAND_CODES if rec.status == c or error == c), None)
     try:
         _calc_check(rec, all_turns, acc)
-        if sc.group == "create":
-            judge = _create(rec, card, sc, tag_units, acc, done)
-        else:
-            _data(rec, card, sc, tag_units, acc, done)
     except _StandError:
-        return AutoVerdict(None, ("stand_error",), (), (), tuple(acc.notes))
-    if done:
-        texts = _texts(all_turns)
-        if not _russian(texts):
-            acc.fail("russian")
-        if error == "errors":
-            acc.fail("errors")
+        acc.stand = True
+    full = rec.status == "done" and code is None and not acc.stand
+    judge = False
+    if sc.group == "create":
+        judge = _create(rec, card, sc, tag_units, acc, full)
+    else:
+        _data(rec, card, sc, tag_units, acc, full)
+    if code is None and acc.stand:
+        code = "stand_error"
     if _suspect_norm(_texts(all_turns)):
         acc.flag("suspect_norm")
     hard = tuple(c for c in acc.fails if c in HARD_CODES)
-    if not done:
+    if code is not None:                                      # сбой стенда: код и уже случившиеся жёсткие (I-1)
+        acc.note(NOTE_STAND)
+        return AutoVerdict(False if hard else None, (code, *hard), hard, tuple(acc.flags), tuple(acc.notes))
+    if rec.status != "done":
         acc.note(NOTE_UNFINISHED)
-        fails = hard
-        passed: bool | None = False if hard else None
+        return AutoVerdict(False if hard else None, hard, hard, tuple(acc.flags), tuple(acc.notes))
+    if not _russian(_texts(all_turns)):
+        acc.fail("russian")
+    if error == "errors":
+        acc.fail("errors")
+    fails = tuple(acc.fails)
+    if fails:
+        passed: bool | None = False
+    elif judge or sc.id == "C1" or (sc.id in _NORM_JUDGE and "suspect_norm" in acc.flags):
+        passed = None
     else:
-        fails = tuple(acc.fails)
-        passed = False if fails else (None if judge or sc.id == "C1" else True)
-    return AutoVerdict(passed, fails, hard, tuple(acc.flags), tuple(acc.notes))
+        passed = True
+    return AutoVerdict(passed, fails, tuple(c for c in fails if c in HARD_CODES), tuple(acc.flags),
+                       tuple(acc.notes))
 
 
 __all__ = ["AutoVerdict", "CONSENT_RE", "GENERAL_KNOWLEDGE_RE", "HARD_CODES", "JUDGE_HARD_CODES", "NORM_NEAR_RE",
-           "NUMERIC_LIMIT_FLAG", "NUMERIC_LIMIT_RE", "SHELL_TOOLS", "SQL_RE", "also_numbers", "check_run",
-           "items_of", "output_of", "short"]
+           "NUMERIC_LIMIT_FLAG", "NUMERIC_LIMIT_RE", "SHELL_TOOLS", "SQL_RE", "STAND_CODES", "also_numbers",
+           "check_run", "draft_tags", "items_of", "output_of", "short"]

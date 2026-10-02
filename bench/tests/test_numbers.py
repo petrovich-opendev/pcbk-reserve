@@ -124,8 +124,9 @@ def test_units_variants():
 
 def test_sources_and_also():
     assert foreign_numbers("Сейчас 3,4 бар", [3.4217], tag_units=["бар"]) == []       # округлено — из вывода
-    assert foreign_numbers("с 8 до 16 часов 03.03.2005", [], also="2005-03-03T08:00:00 2005-03-03T16:00:00",
-                           strict_value_words=True) == []
+    assert all(f.kind == "allowed" for f in foreign_numbers("с 8 до 16 часов 03.03.2005", [],
+                                                            also="2005-03-03T08:00:00 2005-03-03T16:00:00",
+                                                            strict_value_words=True))
     (f,) = foreign_numbers("Сейчас 20 бар", [], also="тег 20FAKE_104_PV", tag_units=["бар"])
     assert isinstance(f, Foreign) and f.kind == "hard"                                 # цифры имени тега — не источник
 

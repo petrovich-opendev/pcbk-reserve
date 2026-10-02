@@ -230,8 +230,8 @@ def test_key_tool_stand_failure_is_stand_error():
     out = {"tool": "tag_now", "status": "rate", "message": "слишком часто", "notes": []}
     r = rec("B1", answer="Служба просит подождать.", tools=[call("pcbk_tag_now", {"tags": ["20FAKE_104_PV"]}, out)])
     assert check_run(r, card("B1")).fails == ("stand_error",)
-    r = rec("B1", answer="Не знаю.")
-    assert check_run(r, card("B1")).hard == ("number_mismatch",)                    # не спросил — ответа нет
+    v = check_run(rec("B1", answer="Не знаю."), card("B1"))
+    assert v.fails == ("number_missing",) and not v.hard and v.passed is False       # m4: числа нет вовсе
 
 
 def test_c2_refusal_and_c3_ok():

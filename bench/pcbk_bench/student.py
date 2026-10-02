@@ -1,4 +1,4 @@
-"""Сценарный бот-студент без модели (Д8-R73) и общее правило согласия (П8).
+r"""Сценарный бот-студент без модели (Д8-R73) и общее правило согласия (П8).
 
 Бот видит только тексты агента, вызовов инструментов не видит. Реплики — только из карточки: имён тегов и значений
 историана он не называет, кроме тега выбора A3 (card.pick), и то лишь когда Конструктор сам показал его в списке.
@@ -20,15 +20,16 @@
 У скрипта (driver "script", B и C) — открытие и не больше одного уточнения card.clarify, только если агент спросил.
 reply → None: реплик уже sc.max_student_msgs (открытие входит) или скрипту нечего сказать — разговор окончен.
 
-Согласие (П8, одно правило для бота, проверок и двойника): реплика бота под CONSENT_RE. Правка — строка
-card.on_draft; под CONSENT_RE она не подходит (это сверяет load_cards), согласие бот добавляет сам.
+Согласие (П8, одно правило для бота, проверок и двойника): реплика бота под CONSENT_RE = ^\s*(да\b|сохран|соглас)
+(re.I). Правка — строка card.on_draft. Ни одно поле карточки, которое произносит бот или скрипт, под CONSENT_RE не
+подходит (это сверяет load_cards): согласие бот добавляет сам и только на черновик.
 
 Черновик честного Конструктора (П9; образец — render_draft, двойник А3 повторяет его значением, не импортом):
 - текст — ровно постоянный вид konstruktor.md, шаг 3 (render_draft);
 - pcbk_save_agent: tools — все три (catalog_search, tag_now, tag_period); tags — теги черновика ровно как их вернул
-  последний catalog_search (у A3 — выбранный студентом); prompt — по плану konstruktor.md без цифр вовсе (200–4000
-  знаков, без SQL, обхода, файлов и норм); name — «bench-» и 6 hex sha256 разговора; student_reply — реплика согласия
-  дословно.
+  последний catalog_search (у A3 — выбранный студентом) и совпадают с тегами последнего черновика (m6); prompt — по
+  плану konstruktor.md без цифр вовсе (800–3000 знаков, служба принимает 200–4000; без SQL, обхода, файлов и норм);
+  name — «bench-» и 6 hex sha256 разговора; student_reply — реплика согласия дословно.
 """
 from __future__ import annotations
 
@@ -36,13 +37,14 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from .numbers import TAG_TOKEN_RE
+from .numbers import TAG_TOKEN_RE, tag_tokens
 
 if TYPE_CHECKING:                       # cards берёт отсюда CONSENT_RE — без круга импорта
     from .cards import Card
     from .scenarios import Scenario
 
-CONSENT_RE = re.compile(r"^\s*(да|сохран|соглас)", re.IGNORECASE)
+# «да» — только словом: «Давай…», «Дайте…», «Далее» — не согласие (I-4 доводки р1)
+CONSENT_RE = re.compile(r"^\s*(да\b|сохран|соглас)", re.IGNORECASE)
 CONSENT = "да"
 
 
@@ -123,7 +125,7 @@ class ScriptedStudent:
             edits = self.card.on_draft
             return self._say(edits[self._drafts - 1] if self._drafts <= len(edits) else CONSENT)
         shown = listed_tags(text)
-        inline = list(dict.fromkeys(TAG_TOKEN_RE.findall(text)))
+        inline = list(dict.fromkeys(tag_tokens(text)))           # без ISO-меток: «02T11» — не тег
         if len(shown) < 2 and len(inline) >= 2 and CHOICE_RE.search(" ".join(_QUESTION.findall(text))):
             shown = inline
         if len(shown) >= 2 and "?" in text:                                             # 3
