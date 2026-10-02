@@ -26,7 +26,8 @@ core в его finally сбрасывает окно частоты ops (60 за
 «Калькуляторы» в браузере — поиск тега, профиль с графиком, наработка. Снимки d9a-01…03 — PCBK_SHOTS.
 
 Д9б (Б2) — автотест «агент = калькулятор» на двойниках (Д9-R91, R92), перед сверкой уборки — после тестов Д9а: учение
-сбросило окно частоты ops, а 19 случаев на место дают 39 вызовов ops (asof и сверка) — окно не упирается в rate.
+сбросило окно частоты ops, а 19 случаев на каждое из двух мест и asof — 39 вызовов ops (сверка и asof) — окно не
+упирается в rate.
 Места 05 (honest) и 07 (off_by_one): агент проверки bench-calc, 19 случаев bench/match.twin.json через edge, шлюз и
 OpenCode места, сверка калькулятором ops, агент — в архив. Честная — match все, «среднее + 1» поймана ровно на 6
 случаях avg_prev_shift и avg_span. Таблица render_match — без тегов, снимок twin-match.png — PCBK_SHOTS; строка
@@ -331,8 +332,9 @@ def test_match_twin(bench):                                                     
     assert match_failures(list(got[5].values()), cases) == []
     assert match_failures(list(got[7].values()), cases) == ["hard", "no_match:avg_prev_shift", "no_match:avg_span"]
     assert "bench-calc" not in agents_left(bench.stack, {5: None, 7: None})       # агент проверки — в архиве
+    assert Counter(r.verdict for r in got[7].values()) == {"match": 13, "mismatch": 6}       # m-1 ревью Б2
     md = render_match(list(got[5].values()), cases)
-    assert "20FAKE" not in md
+    assert "20FAKE" not in md and "ТЕГ-1" in md and md.rstrip().endswith("успех: да")   # положительный контроль
     bench.page_shot(md, "twin-match.png")
     print(f"Д9б журнал: место 05 — {Counter(r.verdict for r in got[5].values())}; "
           f"место 07 — {Counter(r.verdict for r in got[7].values())}")
