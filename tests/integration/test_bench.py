@@ -250,6 +250,9 @@ def test_tool_failing_row_on_page(bench):                                       
     finally:
         bench.recreate_core(bench.cfg.run_id, bench.cfg.cap_usd)
     bench.stack.wait_status(lambda s: row_of(s, "historian")["state"] == "ok", 60)
+    # ревью А7, I-1: «ok» даёт и забытое учение (серия обнулена пересозданием) — учение снято, не только серия
+    assert bench.stack.health_historian()["drill"] is None
+    assert row_of(bench.stack.wait_status(lambda s: True, 10), "historian")["note"] == ""      # у ok — без «учения»
 
 
 def test_calc_route_same_as_service(bench):                                       # Review Focus 4
