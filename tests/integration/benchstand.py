@@ -8,7 +8,9 @@
 - bench_env(run_id, cap, places) — LLM_RUN_* core на время прогона (Д8-R69).
 - BenchHarness(stack, tmp, places) — режим отбора на двойниках (start) и уборка (cleanup): core с двойником историана
   и прогоном, сторож с коротким порогом тишины, персоны двойника OpenRouter, места с переопределением модели
-  (render_override), учётки d8-probe-bench-NN, прогонщики (runner_for), снимок страницы состояния (shot).
+  (render_override), учётки d8-probe-bench-NN, прогонщики (runner_for), снимок страницы состояния со строкой
+  компонента (shot; Д9а — строка «Историан БДРВ» под учением). recreate_core(…, extra=…) — ещё переменные core поверх
+  режима отбора (Д9а: учение DRILL_DATA).
 - agents_left(stack, places) — имена живых (не archived) агентов мест по порядку мест.
 - BenchHarness.judge_and_table(out) (Б3) — таблица отбора по OUT после вердиктов судьи: table.build (check_verdicts,
   aggregate с load_tag_units(out) и планом конфига прогона OUT); Markdown и table.json — в OUT, копия Markdown — в
@@ -78,9 +80,9 @@ REFUSALS_PY = ("import sqlite3, sys; "
                "% ','.join('?' * len(cs)), [sys.argv[1], *cs]).fetchone()[0])")
 # белый список двойника историана внутри core (PYTHONPATH=/twin): сверка с bench_data (решение контроллера к А6)
 TWIN_WHITELIST_PY = "from twin_historian import bench_whitelist; print('\\n'.join(sorted(bench_whitelist())))"
-# строка «LLM-прокси и бюджет» страницы состояния — в середину экрана (для снимка)
-LLM_ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
-                        "&& e.textContent.trim() === 'LLM-прокси и бюджет').scrollIntoView({block: 'center'}), 1")
+# строка страницы состояния с этим заголовком (title строки status.json, %s — JSON) — в середину экрана (для снимка)
+ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
+                    "&& e.textContent.trim() === %s).scrollIntoView({block: 'center'}), 1")
 
 
 def bench_env(run_id: str, cap: float, places: Iterable[int]) -> dict[str, str]:
@@ -235,13 +237,14 @@ class BenchHarness:
         running = [n for n in self.places if self.stack.inspect(self._container(n))["State"]["Running"]]
         wait_for(lambda: all(self.stand.place_mcp_ok(n) for n in running), MCP_WAIT_S)
 
-    def recreate_core(self, run_id: str, cap: float) -> None:
-        """core с двойником историана, белым списком отбора и прогоном run_id с потолком cap; затем mcp=connected у
-        работающих мест модуля."""
+    def recreate_core(self, run_id: str, cap: float, extra: Mapping[str, str] | None = None) -> None:
+        """core с двойником историана, белым списком отбора и прогоном run_id с потолком cap; extra — ещё переменные
+        core поверх (Д9а: {"DRILL_DATA": "tool_error"}); следующий вызов без extra их снимает — компоновка берёт
+        умолчания. Затем mcp=connected у работающих мест модуля."""
         if self.data_dir is None:
             self.data_dir = bench_data(self.tmp)
         self.stack.recreate("core", {"PCBK_TWIN_HISTORIAN": TWIN_FIXTURE, "DATA_DIR": str(self.data_dir),
-                                     **bench_env(run_id, cap, self.places)})
+                                     **bench_env(run_id, cap, self.places), **dict(extra or {})})
         self._wait_mcp()
 
     def _chat(self, n: int) -> GatewayChat:
@@ -319,19 +322,20 @@ class BenchHarness:
             page.screenshot(Path(where) / name)
             assert browser.handler_errors == [] and page.console_errors() == [], browser.handler_errors
 
-    def shot(self, name: str) -> None:
-        """Снимок страницы состояния тестового стенда (cdp.py Д6) со строкой «LLM-прокси и бюджет» — в PCBK_SHOTS
-        (снимки для владельца); без переменной — ничего. Страница ждёт текст строки llm последнего снимка сторожа."""
+    def shot(self, name: str, row: str = "llm") -> None:
+        """Снимок страницы состояния тестового стенда (cdp.py Д6) со строкой компонента row (по умолчанию «LLM-прокси
+        и бюджет»; Д9а — "historian", «Историан БДРВ») в середине экрана — в PCBK_SHOTS (снимки для владельца); без
+        переменной — ничего. Страница ждёт заголовок и текст этой строки из последнего снимка сторожа."""
         where = os.environ.get("PCBK_SHOTS")
         if not where:
             return
-        detail = row_of(self.stack.wait_status(lambda s: True, 30), "llm")["detail"]
+        line = row_of(self.stack.wait_status(lambda s: True, 30), row)
         with cdp.Browser() as browser:
             page = browser.page(isolated=True)
             page.goto(f"{STAND_ORIGIN}/status")
-            page.wait_text(r"LLM-прокси и бюджет", 20)
-            page.wait_text(re.escape(detail), 20)
-            page.eval(LLM_ROW_INTO_VIEW_JS)
+            page.wait_text(re.escape(line["title"]), 20)
+            page.wait_text(re.escape(line["detail"]), 20)
+            page.eval(ROW_INTO_VIEW_JS % json.dumps(line["title"], ensure_ascii=False))
             page.screenshot(Path(where) / name)
             assert browser.handler_errors == [], browser.handler_errors
 
@@ -421,12 +425,13 @@ class BenchHarness:
                                 "--place", str(n), "--yes")
 
     def _core_plain(self) -> None:
-        """core и сторож — значения test.env ({}), если ещё нет: прогона, двойника историана, белого списка отбора и
-        короткого порога тишины нет."""
+        """core и сторож — значения test.env ({}), если ещё нет: прогона, двойника историана, белого списка отбора,
+        учения службы данных (Д9а) и короткого порога тишины нет."""
         env = _env_of(self.stack, "pcbk-core")
         mounts = {m["Destination"]: m["Source"] for m in self.stack.inspect("pcbk-core")["Mounts"]}
         whitelist = str(Path(self.stack.test_env()["DATA_DIR"]) / "whitelist.txt")
-        if any(env.get(k) for k in ("LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS", "PCBK_TWIN_HISTORIAN")) \
+        if any(env.get(k) for k in ("LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS", "PCBK_TWIN_HISTORIAN",
+                                    "DRILL_DATA")) \
                 or mounts.get("/app/data/whitelist.txt") != whitelist:
             self.stack.recreate("core", {})
         if _env_of(self.stack, "pcbk-watchdog").get("LLM_RUN_SILENT_S") != SILENT_DEFAULT:

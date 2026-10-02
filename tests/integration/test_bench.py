@@ -17,6 +17,13 @@
 честная модель — «рекомендую», плохие персоны — нет, по своим причинам. Калькулятор на пределе частоты ops (60 за 300 с):
 прогонщик ждёт окно, сверка не пропускается молча (calc_skipped таблицы — 0). Строки «Б3 журнал: …» — время прогона,
 статусы, вызовы ops и rate, вердикты.
+
+Д9а (А7) — калькуляторы на двойнике историана, три теста перед сверкой уборки, учение — первым из них: пересоздание
+core в его finally сбрасывает окно частоты ops (60 за 300 с), выбранное полным планом Б3, и сверка «вкладка = служба»
+не упирается в rate. Учение DRILL_DATA=tool_error — серия ошибок tag_series на странице состояния (строка «Историан
+БДРВ»), по событиям самих вызовов, без SQL; вкладка = служба — POST /pcbk/api/calc/<tool> учёткой места 05 через edge и
+шлюз равен POST /api/data/<tool> токеном ops на тех же аргументах (кроме cache), события вкладки — канал web; вкладка
+«Калькуляторы» в браузере — поиск тега, профиль с графиком, наработка. Снимки d9a-01…03 — PCBK_SHOTS.
 """
 import json
 import re
@@ -25,8 +32,9 @@ from collections import Counter
 
 import pytest
 
+import cdp
 from benchstand import BenchHarness, agents_left
-from conftest import CORE_URL, row_of, wait_for
+from conftest import CORE_URL, login_to_chat, row_of, shot, wait_for
 from pcbk_bench.cards import CHECK_GOOD, cards_check
 from pcbk_bench.checks import check_run
 from pcbk_bench.judge import (Packet, assert_packet_clean, build_vocab, check_verdicts, collect_verdicts, controls_ok,
@@ -36,7 +44,7 @@ from pcbk_bench.runner import NOTE_CALC_RATE, load_tag_units
 from pcbk_bench.scenarios import SCENARIO_IDS
 from pcbk_bench.table import recommend
 from pcbk_bench.twin_judge import write_twin_verdicts
-from pcbk_watchdog.checks import RUN_CAP_DETAIL, RUN_SILENT_DETAIL
+from pcbk_watchdog.checks import RUN_CAP_DETAIL, RUN_SILENT_DETAIL, TOOL_FAILING_DETAIL
 
 PLACES = {5: "pcbk/z-ai/glm-5.3", 6: "pcbk/deepseek/deepseek-v4.1-flash", 7: "pcbk/google/gemini-3.8-flash",
           8: "pcbk/openai/gpt-6-sol"}
@@ -48,6 +56,12 @@ TWIN_VOCAB_WORDS = ("коллектор", "сушильн", "конденсат�
 FULL_RUNS = 128                                                                  # A×2, B×3, C×3 на 4 места
 DIAL_MAX = 10                           # дозвон до потолка (итоговая доводка Д8б, I-1): прямых вызовов не больше
 DIAL_CHAT = {"model": PLACES[5].split("/", 1)[1], "stream": True, "messages": [{"role": "user", "content": "вопрос"}]}
+# Д9а: summary событий под учением — pcbk_core.data.service.DRILL_SUMMARY (pcbk_core на хосте теста не импортируется)
+DRILL_SUMMARY = "учения: tool_error"
+# закрытый период у всех трёх (m11): открытый расходится между двумя вызовами на границе округления «сейчас»
+TWIN_ARGS = (("tag_period", {"tags": ["20FAKE_201_PV"], "period": "yesterday"}),
+             ("tag_series", {"tags": ["20FAKE_201_PV", "20FAKE_202_PV"], "period": "yesterday", "points": 9}),
+             ("calc_runtime", {"tags": ["20FAKE_210_RUN"], "period": "yesterday"}))
 
 
 @pytest.fixture(scope="module")
@@ -218,6 +232,61 @@ def test_bench_twin_judged_table(bench):                                        
               f"{r.not_judged}, качество {r.quality}, прогноз 5 000 — {r.f5000}; вердикт: {rec[model]}")
 
 
+# --- Д9а (А7): калькуляторы на двойнике историана; учение — первым (окно частоты ops, шапка модуля) ---
+
+def test_tool_failing_row_on_page(bench):                                         # Review Focus 3
+    bench.recreate_core(bench.cfg.run_id, bench.cfg.cap_usd, extra={"DRILL_DATA": "tool_error"})
+    try:
+        for _ in range(3):
+            assert bench.stand.calc("tag_series", dict(TWIN_ARGS[1][1]))["status"] == "error"
+        # учение без SQL — по событиям самих вызовов (Б1 критики р1): общий счётчик ворот растит опрос свежести
+        events = bench.stack.data_events("ops", "tag_series", 3)
+        assert [(e["outcome"], e["summary"], e["sent"]) for e in events] == [("error", DRILL_SUMMARY, [])] * 3
+        assert bench.stack.health_historian()["drill"] == "tool_error"
+        s = bench.stack.wait_status(lambda s: row_of(s, "historian")["detail"] == TOOL_FAILING_DETAIL, 40)
+        assert (row_of(s, "historian")["state"], row_of(s, "historian")["note"]) == \
+            ("warn", "tag_series; учения: tool_error")
+        bench.shot("d9a-03-tools-failing.png", row="historian")
+    finally:
+        bench.recreate_core(bench.cfg.run_id, bench.cfg.cap_usd)
+    bench.stack.wait_status(lambda s: row_of(s, "historian")["state"] == "ok", 60)
+
+
+def test_calc_route_same_as_service(bench):                                       # Review Focus 4
+    chat = bench._chat(5)
+    chat.login()
+    before = bench.stack.data_event_count("student-05", "web")
+    for tool, args in TWIN_ARGS:
+        page = chat.calc(tool, args)
+        direct = bench.stand.calc(tool, args)
+        assert page["status"] == "ok", tool
+        assert {k: v for k, v in page.items() if k != "cache"} == {k: v for k, v in direct.items() if k != "cache"}
+    assert bench.stack.data_event_count("student-05", "web") - before == len(TWIN_ARGS)
+
+
+def test_calc_page_in_browser(bench):                                             # Д9-R88
+    with cdp.Browser() as browser:
+        page = browser.page(isolated=True)
+        login_to_chat(page, bench.login(5), bench._pw[5], ack_notice=True)
+        page.click_text("Калькуляторы")
+        page.type("#calc-query", "привод")
+        page.click_text("Найти тег")
+        page.wait_text("20FAKE_201_PV", 20, css=".calc-matches")
+        page.click(".calc-matches button")                                         # I2: совпадение одно — вся строка
+        assert not page.eval("!!document.querySelector('textarea')?.getClientRects().length")   # m6: чат скрыт
+        page.select("#calc-mode", "profile")
+        page.click_text("Посчитать")
+        page.wait_selector("svg.profile polyline", 30)
+        page.wait_text("В начале", 10)
+        shot(page, "d9a-01-profile.png")
+        page.type("#calc-tag", "20FAKE_210_RUN", clear=True)
+        page.select("#calc-mode", "runtime")
+        page.click_text("Посчитать")
+        page.wait_text(r"работает \(по суффиксу\)", 30)
+        shot(page, "d9a-02-runtime.png")
+        assert browser.handler_errors == [] and page.console_errors() == []
+
+
 def test_bench_cleanup_restores(bench):                                          # последним в модуле
     """Зависит от предыдущих тестов модуля (принято): уборка сверяется после их прогонов, а счётчик калькулятора ops
     (calc_calls > 0) набран прогонами test_bench_twin_run. Отдельно, без них, этот тест не гонять."""
@@ -234,6 +303,7 @@ def test_bench_cleanup_restores(bench):                                         
     assert {"LLM_RUN_ID", "PCBK_TWIN_HISTORIAN"} <= core_env                        # имена есть, значения пусты
     env = dict(e.split("=", 1) for e in bench.stack.inspect("pcbk-core")["Config"]["Env"])
     assert (env["LLM_RUN_ID"], env["LLM_RUN_USD"], env["LLM_RUN_CALLERS"], env["PCBK_TWIN_HISTORIAN"]) == ("",) * 4
+    assert env.get("DRILL_DATA", "") == ""                                          # учение Д9а снято
     watchdog = dict(e.split("=", 1) for e in bench.stack.inspect("pcbk-watchdog")["Config"]["Env"])
     assert watchdog["LLM_RUN_SILENT_S"] == "300"
     ops = bench.stack.data_event_count("ops", "http") - bench.ops_events0
