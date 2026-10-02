@@ -7,9 +7,10 @@ health() и health_json() читают только память; ошибка �
 первый такт не задерживает запуск других ролей (Д5-R27).
 
 Крючки — только через реестр hooks_of(app) (Д4а): обработчик HTTPException на /pcbk/api/ и /health/gateway
-(отказы вида OpenCode) и предел тела /pcbk/api/ с 413 того же вида (Ш22).
+(отказы вида OpenCode) и пределы тела /pcbk/api/ и /pcbk/api/oc/ (Д5б, GW_MAX_BODY_BYTES) с 413 того же вида
+(Ш22) — вне pcbk-front 404.
 
-Модули accounts и api (а через api — accounts) здесь импортируются только внутри методов: команда
+Модули accounts, api и proxy (а через них — accounts) здесь импортируются только внутри методов: команда
 администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
 загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
 """
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, TypeVar
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.responses import JSONResponse
 
+from .. import zones
 from ..app import RoleBase
 from ..hooks import hooks_of
 from ..settings import GatewaySettings, Settings
@@ -195,7 +197,8 @@ class GatewayRole(RoleBase):
     def __init__(self, settings: Settings, gw: GatewaySettings, *, store: AccountStore, workplaces: Workplaces,
                  stats: GatewayStats, config_error: str | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
-                 wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 stream_recheck_s: float = 10.0):
         from .accounts import LOCK_WINDOW_S
         from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
 
@@ -207,6 +210,8 @@ class GatewayRole(RoleBase):
         self.config_error = config_error
         self.monotonic = monotonic
         self.wallclock = wallclock
+        self.stream_recheck_s = stream_recheck_s    # сессия потока /event — не реже и не чаще раза за срок (Д5-R35)
+        self.event_streams: set = set()             # открытые потоки /event (proxy._EventStream): закрыть при остановке
         self.started_at = wallclock()           # checked_at до первого такта — время запуска роли
         self.login_gate = LoginGate(LOGIN_PARALLEL, LOGIN_QUEUE, LOGIN_BACKLOG, clock=store.clock,
                                     window=LOCK_WINDOW_S)
@@ -216,11 +221,13 @@ class GatewayRole(RoleBase):
 
     def router(self) -> APIRouter:
         from .api import auth_router, catch_all_router, configured, front_only, workplace_router
+        from .proxy import proxy_router
 
         router = APIRouter()
         guarded = [Depends(front_only), Depends(configured(self))]
         router.include_router(auth_router(self), dependencies=guarded)
         router.include_router(workplace_router(self), dependencies=guarded)
+        router.include_router(proxy_router(self))       # front_only и configured — у самого роутера прокси
 
         @router.get(HEALTH_PATH, dependencies=[Depends(front_only)])
         async def health_gateway() -> JSONResponse:
@@ -233,13 +240,21 @@ class GatewayRole(RoleBase):
     def install(self, app: FastAPI) -> None:
         """Только через реестр Д4а: отказы HTTPException и 413 под /pcbk/api/ — JSON вида OpenCode (Ш22), отказ
         front_only и 405 на /health/gateway — тоже; предел тела вне pcbk-front отвечает 404, как зона (ревью
-        А4, M3); сеть мест для сверки токенов служб (Ш25)."""
+        А4, M3), — и у /pcbk/api/oc/ с пределом GW_MAX_BODY_BYTES (Д5-R36): самый длинный префикс берёт его, и
+        без respond= сеть места получила бы 413 и узнала бы ручку; у него же общий бюджет тел (H2, сверх — 503
+        busy, вне pcbk-front — 404); сеть мест для сверки токенов служб (Ш25)."""
         from .api import PREFIX, http_exception_handler, too_large
+        from .proxy import GW_BODY_BUDGET_BYTES, OC_PREFIX, body_busy
 
         hooks = hooks_of(app)
         hooks.http_exception(PREFIX + "/", http_exception_handler)
         hooks.http_exception(HEALTH_PATH, http_exception_handler)
         hooks.body_limit(PREFIX + "/", BODY_LIMIT, respond=too_large)
+        # общий бюджет тел до обработчика (H2); не меньше предела одного тела — иначе оно не поместилось бы; вне
+        # pcbk-front бюджет не доступен: 404 без чтения тела (медленные тела из сети места его не займут)
+        hooks.body_limit(OC_PREFIX + "/", self.gw.GW_MAX_BODY_BYTES, respond=too_large,
+                         budget=max(GW_BODY_BUDGET_BYTES, self.gw.GW_MAX_BODY_BYTES), over_budget=body_busy(self),
+                         budget_admits=zones.is_front)
         app.state.pcbk_stu_net = self.gw.STU_NET
 
     # --- здоровье: только память ---
@@ -256,7 +271,7 @@ class GatewayRole(RoleBase):
         return True, "принимает вход"
 
     def health_json(self, now: datetime) -> dict:
-        """Договор сторожа (задача А1): ровно эти ключи, только числа и тексты."""
+        """Договор сторожа (задача А1; Б1 — четыре ключа прокси): ровно эти ключи, только числа и тексты."""
         w, count = self.workplaces, self.stats.count_1h
         checked = w.checked_at if w.checked_at is not None else self.started_at
         return {
@@ -275,6 +290,11 @@ class GatewayRole(RoleBase):
             "login_busy_1h": count("login_busy"),
             "cookies_duplicate_1h": count("cookies_duplicate"),
             "drill": self.gw.DRILL_GATEWAY,
+            # Д5б (Б1): сторож читает все четыре вместе или ни одного
+            "refused_1h": count("refused"),
+            "streams": self.stats.streams,
+            "stream_broken_1h": count("stream_broken"),
+            "upstream_failed_1h": count("upstream_failed"),
         }
 
     # --- жизненный цикл ---
@@ -319,6 +339,19 @@ class GatewayRole(RoleBase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await self.login_gate.drain()           # неудачные входы — в замок до выхода
+        # потоки /event — до клиентов мест: закрытие каждого (своё или начатое снятой задачей запроса) доводится здесь,
+        # всех вместе — не дольше STREAM_SHUTDOWN_S (Б4-m2): остановка не ждёт застрявшее место по 11 с; недоведённые
+        # закрывает конец процесса
+        from . import proxy                     # лениво, как proxy_router: срок читается при остановке (тесты его меняют)
+        closing = [asyncio.ensure_future(stream.shutdown()) for stream in list(self.event_streams)]
+        if closing:
+            _, pending = await asyncio.wait(closing, timeout=proxy.STREAM_SHUTDOWN_S)
+            for task in closing:
+                if task.done() and not task.cancelled():
+                    task.exception()                # ошибка закрытия уже в журнале release(); не «never retrieved»
+            if pending:
+                log.warning("шлюз: потоки /event не закрылись при остановке за %g с: %d", proxy.STREAM_SHUTDOWN_S,
+                            len(pending))
         for name, close in (("места", self.workplaces.aclose), ("прокси сокета", self.workplaces.spctl.aclose)):
             try:
                 await close()

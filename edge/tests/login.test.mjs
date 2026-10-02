@@ -358,7 +358,25 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
 
   for (const line of [
     'map $request_uri $pcbk_bad_api_uri {',
-    '"~(%2[eEfF]|%5[cC]|/\\.|//)" 1;',
+    '"~^[^?]*(%2[eEfF]|%5[cC]|/\\.|//)" 1;',                                     // только путь до «?» (Д5б)
+    "map $uri $pcbk_api_csp {",                                                        // путь после нормализации и error_page
+    `"~^/pcbk(?:/api(?:/|$)|-errors/)" "default-src 'none'";`,
+    "add_header Content-Security-Policy $pcbk_api_csp always;",
+    "map $request $pcbk_log_request {",                                                // журнал доступа без строки запроса,
+    '"~^(\\S+) ([^?\\s]*)\\S* (\\S+)$" "$1 $2 $3";',                                  // метод — исходный (Б5-m1)
+    `'$remote_addr - $remote_user [$time_local] "$pcbk_log_request" '`,
+    "limit_req_zone $pcbk_oc_session zone=pcbk_oc_rate:1m rate=20r/s;",                // N1
+    "limit_req_zone $pcbk_oc_session zone=pcbk_oc_event:1m rate=20r/s;",
+    "limit_req_zone $pcbk_oc_session zone=pcbk_place_rate:1m rate=5r/s;",              // ручки места (остаток Д5б)
+    "access_log /var/log/nginx/access.log pcbk;",
+    "map $cookie_pcbk_session $pcbk_oc_session {",
+    '"~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;',
+    "limit_conn_zone $pcbk_oc_session zone=pcbk_oc_session:1m;",
+    '    default "-";\n    "~^[A-Za-z0-9_-]{43}$" $cookie_pcbk_session;\n}',           // без cookie — корзина «-», не мимо предела
+    "limit_conn_zone $server_port zone=pcbk_oc_all:1m;",
+    "client_body_temp_path /var/lib/pcbk-edge/client;",
+    "proxy_temp_path       /var/lib/pcbk-edge/proxy;",
+    "error_page 509 =503 /pcbk-errors/busy.json;",
     "limit_req_zone $binary_remote_addr zone=pcbk_login:1m rate=5r/s;",
     "set $pcbk_core pcbk-core:8000;",
     "proxy_set_header X-Forwarded-Host $host;",
@@ -377,6 +395,9 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     "error_page 502 503 504 =503 /pcbk-errors/503.json;",
     'if ($host !~* "^[a-z0-9-]{1,63}(\\.[a-z0-9-]{1,63}){0,5}$") { rewrite ^ /pcbk-errors/host.json last; }',
   ]) assert.ok(conf.includes(line), line);
+  assert.doesNotMatch(conf, /^\s*"" "";/m);                                           // запросы без cookie — не мимо предела
+  assert.equal(conf.match(/\$request(?![_a-z])/g).length, 1);                           // строка запроса целиком — только
+  assert.ok(conf.includes("map $request $pcbk_log_request {"));                          // источник карты журнала
 
   for (const l of locs) {                                                              // всё это — уровень server
     assert.doesNotMatch(l.body, /error_page[^;]*pcbk-errors/, l.path);
@@ -394,6 +415,9 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.match(l.body, /\binternal;/, code);                                         // снаружи не видны
     assert.match(l.body, new RegExp(`return ${code === "host" ? 400 : code} '\\{"name":"${name}","data":\\{"message":"[^"]+"\\}\\}';`), code);
   }
+  const busy = loc("/pcbk-errors/busy.json");                                          // limit_conn /pcbk/api/oc/ — как занятость шлюза
+  assert.ok(busy && busy.exact && /\binternal;/.test(busy.body));
+  assert.ok(busy.body.includes(`return 503 '{"name":"WorkplaceBusy","data":{"message":"Слишком много одновременных запросов — повторите позже"}}';`));
 
   for (const path of ["/login", "/login.js", "/login.css"]) {
     const l = loc(path);
@@ -405,12 +429,13 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
   }
 
   const proxied = ["/pcbk/api/auth/", "/pcbk/api/workplace", "/pcbk/api/workplace/wake"];
+  const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
   assert.equal(passes.length, conf.match(/proxy_pass\b/g).length);                     // каждый proxy_pass — внутри location
   assert.equal(new Set(passes.map(([path]) => path)).size, passes.length);              // по одному на location
   assert.deepEqual(Object.fromEntries(passes), {                                        // в core — только пути шлюза
     "/status": "http://$pcbk_watchdog", "/status.js": "http://$pcbk_watchdog", "/status.json": "http://$pcbk_watchdog",
-    ...Object.fromEntries(proxied.map((path) => [path, "http://$pcbk_core"])),
+    ...Object.fromEntries([...proxied, ...oc].map((path) => [path, "http://$pcbk_core"])),
   });
   assert.equal(loc("/pcbk/api/auth/").exact, false);
   assert.equal(loc("/pcbk/api/workplace").exact, true);
@@ -423,6 +448,12 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.equal(b.includes("limit_req zone=pcbk_login burst=20 nodelay;"), path === "/pcbk/api/auth/", path);
   }
   assert.ok(loc("/pcbk/api/auth/").body.includes("limit_req_status 429;"));
+  for (const path of ["/pcbk/api/workplace", "/pcbk/api/workplace/wake"]) {             // остаток Д5б: поток без учётки
+    const b = loc(path).body;
+    assert.ok(b.includes("limit_req zone=pcbk_place_rate burst=20 nodelay;"), path);
+    assert.deepEqual([...b.matchAll(/limit_req_status (\d+);/g)].map((m) => m[1]), ["509"], path);   // busy.json, не 429 входа
+    assert.ok(b.includes("limit_req_log_level warn;"), path);
+  }
   assert.ok(loc("/pcbk/api/").body.includes("if ($pcbk_bad_api_uri) { return 400"));
   assert.match(loc("/pcbk/api/").body, /return 404 '\{"name":"NotFound"/);
   for (const [path, code] of [["/pcbk/api", 404], ["/pcbk/api/auth", 404], ["/pcbk/api/oc", 403]]) {
@@ -434,6 +465,36 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.doesNotMatch(l.body, /error_page|proxy_set_header|add_header/, l.path);
     assert.match(l.body, /default_type application\/json;/, l.path);
   }
-  assert.equal(locs.filter((l) => l.path === "/pcbk/api/oc/").length, 0);                // /pcbk/api/oc/* — Д5б
+  assert.equal(loc("/pcbk/api/oc/").exact, false);                                     // вызовы адаптера OpenCode (Д5б)
+  assert.equal(loc("/pcbk/api/oc/event").exact, true);
+  for (const path of oc) {
+    const b = loc(path).body;
+    for (const line of ["proxy_pass http://$pcbk_core;", "if ($pcbk_bad_api_uri) { return 400", "client_max_body_size 512k;",
+                        "limit_conn pcbk_oc_session 10;", "limit_conn pcbk_oc_all 64;", "limit_conn_status 509;",
+                        "limit_conn_log_level warn;", "proxy_request_buffering on;", "proxy_buffers 4 32k;",
+                        "limit_req_status 509;", "limit_req_log_level warn;", "client_body_timeout 10s;"])
+      assert.ok(b.includes(line), `${path}: ${line}`);
+    assert.doesNotMatch(b, /zone=pcbk_login/, path);                                     // корзина входа — не здесь
+  }
+  assert.ok(loc("/pcbk/api/oc/").body.includes("limit_req zone=pcbk_oc_rate burst=200 nodelay;"));   // N1: ≥ 124
+  assert.ok(loc("/pcbk/api/oc/event").body.includes("limit_req zone=pcbk_oc_event burst=60 nodelay;"));
+  // отказ limit_req и limit_conn: код 509 → error_page на уровне server → busy.json → 503 WorkplaceBusy, как у
+  // занятости места в core. Не 429: error_page 429 отдаёт «Слишком много попыток входа», и чат Д6 его не повторяет
+  for (const path of oc) {
+    for (const kind of ["limit_req", "limit_conn"]) {
+      const codes = [...loc(path).body.matchAll(new RegExp(`${kind}_status (\\d+);`, "g"))].map((m) => m[1]);
+      assert.deepEqual(codes, ["509"], `${path}: ${kind}_status`);
+    }
+  }
+  assert.equal(conf.match(/error_page 509 /g).length, 1);
+  assert.ok(conf.includes("error_page 509 =503 /pcbk-errors/busy.json;"));
+  assert.match(loc("/pcbk-errors/busy.json").body,
+    /return 503 '\{"name":"WorkplaceBusy","data":\{"message":"Слишком много одновременных запросов — повторите позже"\}\}';/);
+  const call = loc("/pcbk/api/oc/").body;                                               // срок edge больше хода core (25 с)
+  assert.ok(call.includes("proxy_read_timeout 45s;") && call.includes("proxy_max_temp_file_size 8m;"));
+  assert.doesNotMatch(call, /proxy_buffering off|proxy_max_temp_file_size 0/);          // ответ core читается без остановки
+  const stream = loc("/pcbk/api/oc/event").body;                                        // поток: без буфера, шлюз рвёт первым
+  for (const line of ["proxy_buffering off;", "proxy_cache off;", "gzip off;", "proxy_read_timeout 90s;", "send_timeout 60s;"])
+    assert.ok(stream.includes(line), line);
   assert.ok(loc("/status").body.includes("error_page 502 503 504 /watchdog-down.html;")); // страница состояния Д1 — своя
 });

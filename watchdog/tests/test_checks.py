@@ -1,5 +1,7 @@
+import itertools
 import json
 import time
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -7,7 +9,8 @@ import pytest
 
 from helpers import T0, gw, insp, llm_obj, now_utc
 from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, BUDGET_STEPS, DRIFT_WARN_USD, EGRESS_STALE_S,
-                                  GW_DRILL_MODES, GW_OFF_CONTRACT_DETAIL, GW_SP_CTL_STATES, LLM_STALE_S,
+                                  GW_DRILL_MODES, GW_KEYS_D5A, GW_KEYS_D5B, GW_OFF_CONTRACT_DETAIL,
+                                  GW_SP_CTL_STATES, LLM_STALE_S,
                                   LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, GatewayReply,
                                   check_container, check_gateway,
                                   check_historian, check_http, check_llm, check_memory, check_tls, fmt_total,
@@ -928,14 +931,15 @@ def test_gateway_off_contract_reply_has_own_text(fake_core):                    
                 gw(running_n=True), gw(ready_n=1.0), gw(wake_ok_1h=None), gw(wake_failed_1h="0"),
                 gw(stop_failed_1h=0.5), gw(place_auth_failed_1h=False), gw(logins_failed_1h=[]),
                 gw(origin_refused_1h={}), gw(login_busy_1h="1"), gw(cookies_duplicate_1h=None), gw(drill=None),
-                gw(refused_1h="7"), gw(streams=None), gw(stream_broken_1h=True), gw(upstream_failed_1h=1.5),
+                # ключи Д5б — только полным набором (gw5): у gw() с одним ключом отказ был бы за неполноту (Б1-m1)
+                gw5(refused_1h="7"), gw5(streams=None), gw5(stream_broken_1h=True), gw5(upstream_failed_1h=1.5),
                 # доводка по ревью А1: I1 — sp_ctl вне договора; M1 — отрицательные счётчики;
                 # M2 — пустая причина настройки; M3 — неизвестный режим учений
                 gw(sp_ctl="DOWN"), gw(sp_ctl=""), gw(sp_ctl="up"), gw(sp_ctl="down "),
                 gw(wake_ok_1h=-1), gw(running_n=-1), gw(ready_n=-2), gw(wake_failed_1h=-3), gw(stop_failed_1h=-1),
                 gw(place_auth_failed_1h=-1), gw(logins_failed_1h=-30), gw(origin_refused_1h=-1),
-                gw(login_busy_1h=-1), gw(cookies_duplicate_1h=-1), gw(refused_1h=-1), gw(streams=-1),
-                gw(stream_broken_1h=-1), gw(upstream_failed_1h=-1),
+                gw(login_busy_1h=-1), gw(cookies_duplicate_1h=-1), gw5(refused_1h=-1), gw5(streams=-1),
+                gw5(stream_broken_1h=-1), gw5(upstream_failed_1h=-1),
                 gw(config_error=""), gw(config_error="   "), gw(config_error="\n\t"),
                 gw(drill="x"), gw(drill=" "), gw(drill="FREEZE_REAPER"), gw(drill="freeze_reaper "),
                 gw(drill="freeze_poll")):
@@ -951,7 +955,7 @@ def test_gateway_reply_accepts_whole_contract(fake_core):                       
         assert GatewayReply.parse(gw(sp_ctl=state)).sp_ctl == state
     for mode in ("", *sorted(GW_DRILL_MODES)):
         assert GatewayReply.parse(gw(drill=mode)).drill == mode
-    zeros = gw(running_n=0, ready_n=0, wake_ok_1h=0, refused_1h=0, streams=0, stream_broken_1h=0, upstream_failed_1h=0)
+    zeros = gw5(running_n=0, ready_n=0, wake_ok_1h=0)
     assert GatewayReply.parse(zeros).running_n == 0
     assert (gate_check(fake_core, gw(sp_ctl="unknown")).state, gate_check(fake_core, gw(sp_ctl="unknown")).detail) == \
            ("ok", "принимает вход")
@@ -965,3 +969,83 @@ def test_gateway_reply_d5b_keys_are_optional():                                 
     new = GatewayReply.parse(gw(refused_1h=7, streams=2, stream_broken_1h=1, upstream_failed_1h=0))
     assert (new.refused_1h, new.streams, new.stream_broken_1h, new.upstream_failed_1h) == (7, 2, 1, 0)
     assert (new.checked_at, new.store_ok, new.running_n, new.drill) == (T0 - timedelta(seconds=5), True, 1, "")
+
+
+# --- Б1 Д5б: счётчики прокси на строке «Шлюз и вход» ---
+
+def test_gateway_proxy_rows_and_note(fake_core):
+    cases = [(gw(refused_1h=7, streams=2, stream_broken_1h=0, upstream_failed_1h=0),
+              ("ok", "принимает вход", "работает мест: 1; потоков: 2; отказов за час: 7")),
+             (gw(refused_1h=0, streams=0, stream_broken_1h=0, upstream_failed_1h=2),
+              ("warn", "рабочее место не отвечает шлюзу", "2 за час")),
+             (gw(refused_1h=0, streams=1, stream_broken_1h=1, upstream_failed_1h=0),
+              ("warn", "поток событий рвётся", "1 за час")),
+             (gw(), ("ok", "принимает вход", "работает мест: 1"))]                    # core :d5a
+    for obj, want in cases:
+        r = gate_check(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+
+
+D5B_KEYS = ("refused_1h", "streams", "stream_broken_1h", "upstream_failed_1h")
+
+
+def gw5(age=5, **kw):
+    """Ответ core :d5b — 15 ключей Д5а и четыре ключа прокси, всё в норме."""
+    return gw(age, **{"refused_1h": 0, "streams": 0, "stream_broken_1h": 0, "upstream_failed_1h": 0, **kw})
+
+
+def test_gateway_d5b_keys_all_or_none(fake_core):                                # решение контроллера 1
+    assert (GW_KEYS_D5A, GW_KEYS_D5B) == (set(gw()), set(D5B_KEYS))
+    assert GW_KEYS_D5A | GW_KEYS_D5B == {f.name for f in fields(GatewayReply)}      # Б1-m3: договор = поля разбора
+    assert len(gw5()) == 19 and GatewayReply.parse(gw5()).streams == 0
+    partial = [{k: v for k, v in gw5().items() if k not in dropped}                # 1–3 из 4 ключей
+               for n in (1, 2, 3) for dropped in itertools.combinations(D5B_KEYS, n)]
+    assert len(partial) == 14
+    for obj in (*partial,
+                gw(extra=0), gw5(extra=0), gw(refused=0), gw5(streams_1h=0),         # лишний неизвестный ключ
+                *(gw5(**{k: -1}) for k in D5B_KEYS),                                 # отрицательный
+                *(gw5(**{k: v}) for k in D5B_KEYS for v in (True, False, 1.0, 0.5, "1", None, [], {}))):
+        r = gate_check(fake_core, obj)
+        assert (r.state, r.detail, r.note) == ("fail", GW_OFF_CONTRACT_DETAIL, ""), obj
+        with pytest.raises(ValueError):
+            GatewayReply.parse(obj)
+
+
+def test_gateway_proxy_rows_order(fake_core):                                    # решение контроллера 2
+    cases = [(gw5(place_auth_failed_1h=1, upstream_failed_1h=5, stream_broken_1h=6),
+              ("warn", "рабочее место не приняло пароль шлюза", "1 за час")),
+             (gw5(upstream_failed_1h=5, stream_broken_1h=6, cookies_duplicate_1h=1, origin_refused_1h=1,
+                  login_busy_1h=1, wake_failed_1h=1, stop_failed_1h=1, logins_failed_1h=99),
+              ("warn", "рабочее место не отвечает шлюзу", "5 за час")),
+             (gw5(stream_broken_1h=6, cookies_duplicate_1h=1, origin_refused_1h=1, login_busy_1h=1,
+                  wake_failed_1h=1, stop_failed_1h=1, logins_failed_1h=99),
+              ("warn", "поток событий рвётся", "6 за час")),
+             # тяжёлые строки Д5а выше по-прежнему выигрывают
+             (gw5(sp_ctl="down", upstream_failed_1h=3, stream_broken_1h=2),
+              ("fail", "нет связи с прокси сокета — места не будятся", "")),
+             (gw5(wake_ok_1h=0, wake_failed_1h=3, upstream_failed_1h=3),
+              ("fail", "рабочие места не поднимаются", "3 за час")),
+             (gw5(age=121, stream_broken_1h=2), ("fail", "уборщик простоя молчит — места не засыпают", "")),
+             (gw5(checked_at=None, upstream_failed_1h=1), ("unknown", "уборщик простоя ещё не проходил", "")),
+             # отказы и открытые потоки строку не красят — только note
+             (gw5(refused_1h=500, streams=30), ("ok", "принимает вход", "работает мест: 1; потоков: 30; отказов за час: 500")),
+             (gw5(running_n=0, ready_n=0), ("ok", "принимает вход", "работает мест: 0; потоков: 0; отказов за час: 0")),
+             (gw5(logins_failed_1h=30, refused_1h=4), ("warn", "много неверных паролей", "30 за час")),
+             # учения — первыми в note и у строк Д5б
+             (gw5(drill="freeze_reaper", refused_1h=7, streams=2),
+              ("ok", "принимает вход", "учения: freeze_reaper; работает мест: 1; потоков: 2; отказов за час: 7")),
+             (gw5(drill="bad_place_pw", stream_broken_1h=2), ("warn", "поток событий рвётся", "учения: bad_place_pw; 2 за час"))]
+    for obj, want in cases:
+        r = gate_check(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+
+
+def test_gateway_proxy_rows_constant_text(fake_core, tmp_path):                  # решение контроллера 4
+    rows = [gate_check(fake_core, gw5(upstream_failed_1h=k)) for k in (1, 2, 40)]
+    rows += [gate_check(fake_core, gw5(stream_broken_1h=k)) for k in (3, 5, 70)]
+    rows += [gate_check(fake_core, gw5(streams=s, refused_1h=k)) for s, k in ((0, 0), (5, 1), (30, 200))]
+    assert [(r.state, r.detail) for r in rows] == [("warn", "рабочее место не отвечает шлюзу")] * 3 + \
+           [("warn", "поток событий рвётся")] * 3 + [("ok", "принимает вход")] * 3
+    assert all(len(r.detail) <= REASON_CHARS for r in rows) and len({r.note for r in rows}) == 9
+    journal = Journal(str(tmp_path / "j.db"))
+    assert sum(len(journal.record([r], T0 + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 3

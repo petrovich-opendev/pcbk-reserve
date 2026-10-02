@@ -27,20 +27,35 @@ GW_IDLE_STOP_S), паузу снимают удачная остановка, т
 пробуждения. Исключение шага одного места (gather с return_exceptions) — строка журнала с классом, проход
 идёт дальше: неожиданный ответ места не останавливает уборщик.
 
-Конструкторы без ввода-вывода. httpx.AsyncClient создаётся в open() или при первом запросе (как Upstream,
-П22), прокси окружения не берутся (trust_env=False). Сроки попыток держит asyncio.timeout поверх срока
+Конструкторы без ввода-вывода. У каждого места свой httpx.AsyncClient (доводка Б3, G1): создаётся при первом
+запросе к месту (как Upstream, П22), закрывается в aclose(); соединений — не больше PLACE_CONNECTIONS (потоки
+учётки, вызовы прокси и один служебный запрос), так что потоп одного места не выбирает соединения соседа.
+Прокси окружения не берутся (trust_env=False), перенаправлениям не следуют, cookie места не хранятся и месту не
+возвращаются (политика без разрешённых доменов, G3). Сроки попыток держит asyncio.timeout поверх срока
 httpx. Исключения httpx ловятся целиком (httpx.HTTPError, Ш11) и в журнал не пишутся: строки журнала — только
-номера мест, коды и виды. Authorization к месту ставит только request(); пароль места и Basic не попадают ни
-в журнал, ни в тексты исключений.
+номера мест, коды и виды. Authorization к месту ставит только _place_headers(), её зовут request() и fetch();
+пароль места и Basic не попадают ни в журнал, ни в тексты исключений.
+
+fetch() (Д5б, прокси Б3) читает ответ места кусками и бросает его на пределе: память шлюза не зависит от места.
+Место просят не сжимать ответ (Accept-Encoding: identity — OpenCode сжимает только по просьбе клиента), сжатый
+ответ — PlaceAnswerEncoded: размер распакованного не узнать, не распаковав.
+
+stream() (Д5б, поток /event задачи Б4) — GET потока событий места клиентом этого места: Accept: text/event-stream,
+тоже identity, срок чтения httpx снят (пульс OpenCode — раз в 10 с; тишину считает шлюз, SSE_READ_TIMEOUT_S), а
+заголовки ответа ждутся не дольше STREAM_OPEN_S под asyncio.timeout: двойник MockTransport сроков httpx не знает.
+Константы читаются при вызове — тесты их подменяют.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import http.cookiejar
 import logging
 import re
+import ssl
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,7 +63,7 @@ from typing import Any, Literal
 
 import httpx
 
-from pcbk_core.gateway.stats import GatewayStats
+from pcbk_core.gateway.stats import MAX_STREAMS_PER_LOGIN, GatewayStats
 from pcbk_core.settings import GatewaySettings
 
 log = logging.getLogger("pcbk_core.gateway.places")
@@ -61,7 +76,12 @@ READY_ATTEMPT_S = 2.0         # попытка GET /agent: первые ~3 с п
 READY_PAUSE_S = 0.5
 BUSY_CHECK_S = 2.0
 PLACE_READ_S = 20.0           # срок чтения запроса к месту (Д5-R30)
+SSE_READ_TIMEOUT_S = 60.0     # тишина потока /event дольше — обрыв: шесть пульсов OpenCode по 10 с (Д5-R35)
+STREAM_OPEN_S = 10.0          # заголовки ответа места на /event (Д5-R35)
 PLACE_PORT = 4096
+PROXY_PARALLEL = 2            # вызовов прокси к одному месту разом (Б3, G1); потоки /event — отдельно
+# соединений клиента места: потоки учётки, вызовы прокси и один служебный (пробуждение, такт уборщика)
+PLACE_CONNECTIONS = MAX_STREAMS_PER_LOGIN + PROXY_PARALLEL + 1
 SP_CTL_DOWN_TICK_S = 5.0      # такт, пока sp-ctl не отвечает (Ш10)
 PLACES = range(1, 11)
 # занятая сессия OpenCode: busy — ход идёт, retry — ход ждёт повтора запроса к модели
@@ -81,6 +101,8 @@ PLACE_TEXTS = {
 }
 
 PLACE_TIMEOUT = httpx.Timeout(connect=2, read=PLACE_READ_S, write=5, pool=5)
+STREAM_TIMEOUT = httpx.Timeout(connect=2, read=None, write=5, pool=5)     # поток /event: тишину считает шлюз
+PLACE_LIMITS = httpx.Limits(max_connections=PLACE_CONNECTIONS, max_keepalive_connections=PLACE_CONNECTIONS)
 _SP_CTL_TIMEOUT = httpx.Timeout(ACTION_TIMEOUT_S, connect=PING_TIMEOUT_S)
 # нет ответа: соединение, срок (asyncio.timeout — TimeoutError), обрыв, отказ охраны выхода (OSError)
 _NO_ANSWER = (httpx.HTTPError, TimeoutError, OSError)
@@ -110,6 +132,22 @@ class SpCtlError(Exception):
 class PlacePasswordError(OSError):
     """У шлюза нет пароля места: файла нет, он не читается или первая строка пуста. OSError — чтобы вызов
     места без пароля шёл тем же путём «место не отвечает», что обрыв соединения (Д5б)."""
+
+
+class PlaceAnswerTooLarge(Exception):
+    """Ответ места больше предела fetch(): тело прочитано не дальше предела и одного куска."""
+
+
+class PlaceAnswerEncoded(OSError):
+    """Место сжало ответ, хотя шлюз просил identity. OSError — как «место не отвечает» (прокси Б3)."""
+
+
+@dataclass(frozen=True)
+class PlaceAnswer:
+    """Ответ места из fetch(): код, Content-Type (None — нет) и тело целиком — bytearray чтения, без копии."""
+    status: int
+    content_type: str | None
+    body: bytes | bytearray
 
 
 class SpCtl:
@@ -231,7 +269,8 @@ class Workplaces:
         self._transport = transport
         self._monotonic = monotonic
         self._sleep = sleep
-        self._client: httpx.AsyncClient | None = None
+        self._clients: dict[int, httpx.AsyncClient] = {}
+        self._ssl: ssl.SSLContext | None = None          # один на все клиенты мест (H5), при первом клиенте
         self._locks = {n: asyncio.Lock() for n in PLACES}
         self._tasks: dict[int, asyncio.Task] = {}
         self._ready: dict[int, str | None] = {}          # место → StartedAt, при котором оно готово
@@ -252,14 +291,21 @@ class Workplaces:
 
     # --- клиент мест ---
 
-    def _http(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(transport=self._transport, timeout=PLACE_TIMEOUT, trust_env=False,
-                                             follow_redirects=False)
-        return self._client
+    def _http(self, n: int) -> httpx.AsyncClient:
+        """Клиент места n — свой у каждого места (G1): свой пул соединений, своя пустая банка cookie (G3); контекст
+        TLS — общий (H5): места ходят по http, и набор корневых сертификатов строится один раз, а не на каждое место."""
+        client = self._clients.get(n)
+        if client is None:
+            if self._ssl is None:
+                self._ssl = ssl.create_default_context()
+            jar = http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+            client = self._clients[n] = httpx.AsyncClient(
+                transport=self._transport, timeout=PLACE_TIMEOUT, limits=PLACE_LIMITS, cookies=jar, verify=self._ssl,
+                trust_env=False, follow_redirects=False)
+        return client
 
     async def open(self) -> None:
-        self._http()
+        """Клиенты мест создаются при первом запросе к месту: открывать нечего."""
 
     async def aclose(self) -> None:
         tasks = [t for t in self._tasks.values() if not t.done()]
@@ -267,8 +313,8 @@ class Workplaces:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        client, self._client = self._client, None
-        if client is not None:
+        clients, self._clients = list(self._clients.values()), {}
+        for client in clients:
             await client.aclose()
 
     def lock(self, n: int) -> asyncio.Lock:
@@ -298,19 +344,65 @@ class Workplaces:
             pw += "-drill"
         return "Basic " + base64.b64encode(f"opencode:{pw}".encode("utf-8")).decode("ascii")
 
-    async def request(self, n: int, method: str, path: str, *, params=None, json=None,
-                      timeout: float | None = None) -> httpx.Response:
-        """Запрос к месту n — единственное место, где ставится Authorization. timeout — срок попытки целиком
-        (asyncio.timeout: TimeoutError). Ни заголовков, ни запроса в журнал."""
+    def _place_headers(self, n: int, path: str, extra: dict[str, str] | None = None) -> tuple[str, dict[str, str]]:
+        """Адрес и заголовки запроса к месту n — единственное место, где ставится Authorization."""
         if not path.startswith("/"):
             raise ValueError("путь к месту начинается с «/»")
-        headers = {"Authorization": self.basic(n)}
-        url = self.place_url(n) + path
+        return self.place_url(n) + path, {**(extra or {}), "Authorization": self.basic(n)}
+
+    async def request(self, n: int, method: str, path: str, *, params=None, json=None,
+                      timeout: float | None = None) -> httpx.Response:
+        """Запрос к месту n. timeout — срок попытки целиком (asyncio.timeout: TimeoutError). Ни заголовков, ни
+        запроса в журнал."""
+        url, headers = self._place_headers(n, path)
         if timeout is None:
-            return await self._http().request(method, url, params=params, json=json, headers=headers)
+            return await self._http(n).request(method, url, params=params, json=json, headers=headers)
         async with asyncio.timeout(timeout):
-            return await self._http().request(method, url, params=params, json=json, headers=headers,
-                                              timeout=timeout)
+            return await self._http(n).request(method, url, params=params, json=json, headers=headers,
+                                               timeout=timeout)
+
+    async def fetch(self, n: int, method: str, path: str, *, params=None, json=None,
+                    max_bytes: int) -> PlaceAnswer:
+        """Запрос к месту n с ответом не больше max_bytes (прокси Б3). Объявленная длина больше предела —
+        PlaceAnswerTooLarge без чтения тела; иначе тело читается кусками, и кусок, переходящий предел, —
+        PlaceAnswerTooLarge: дальше предела и одного куска не читается. Сжатый ответ — PlaceAnswerEncoded.
+        Исключения httpx и OSError (нет пароля места) — наружу; срок хода держит вызывающий."""
+        url, headers = self._place_headers(n, path, {"Accept-Encoding": "identity"})
+        client = self._http(n)
+        request = client.build_request(method, url, params=params, json=json, headers=headers)
+        response = await client.send(request, stream=True)
+        try:
+            encoding = response.headers.get("content-encoding", "").strip().lower()
+            if encoding not in ("", "identity"):
+                raise PlaceAnswerEncoded("ответ места сжат")
+            declared = response.headers.get("content-length", "").strip()
+            if declared.isascii() and declared.isdigit() and (len(declared) > 18 or int(declared) > max_bytes):
+                raise PlaceAnswerTooLarge()
+            body = bytearray()
+            # сжатие отсечено выше: aiter_bytes без распаковки — те же куски, что aiter_raw, и ответ, уже
+            # прочитанный транспортом (двойник MockTransport), он тоже отдаёт
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > max_bytes:
+                    raise PlaceAnswerTooLarge()
+                body += chunk
+            return PlaceAnswer(response.status_code, response.headers.get("content-type"), body)
+        finally:
+            await response.aclose()
+
+    @asynccontextmanager
+    async def stream(self, n: int, path: str) -> AsyncIterator[httpx.Response]:
+        """Поток места n (Д5б, /event): GET с Accept: text/event-stream и Accept-Encoding: identity, сроки
+        STREAM_TIMEOUT; заголовки ответа — не дольше STREAM_OPEN_S (TimeoutError). Отдаёт ответ с непрочитанным
+        телом (aiter_raw), на выходе закрывает его. Исключения httpx и OSError — наружу."""
+        url, headers = self._place_headers(n, path, {"Accept": "text/event-stream", "Accept-Encoding": "identity"})
+        client = self._http(n)
+        request = client.build_request("GET", url, headers=headers, timeout=STREAM_TIMEOUT)
+        async with asyncio.timeout(STREAM_OPEN_S):
+            response = await client.send(request, stream=True)
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
     # --- состояние места ---
 

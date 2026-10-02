@@ -59,6 +59,18 @@ def test_two_session_cookies_refused(tmp_path):                                 
     assert role.store.session(own) is None and role.store.session(other) is None        # обе закрыты на сервере
 
 
+def test_fourth_login_closes_oldest_session(tmp_path):                                  # итоговая доводка Д5б, N2
+    app, _ = make_gateway(tmp_path)
+    cookies = []
+    with TestClient(app, base_url=BASE) as c:
+        for _ in range(4):                                                              # четыре устройства одного студента
+            c.cookies.clear()
+            cookies.append(login(c, "stu-03").cookies["pcbk_session"])
+        c.cookies.clear()
+        codes = [c.get("/pcbk/api/auth/me", headers={"Cookie": f"pcbk_session={v}"}).status_code for v in cookies]
+    assert len(set(cookies)) == 4 and codes == [401, 200, 200, 200]                    # первая cookie — вход заново
+
+
 def rfc_paths(path):                                                                    # RFC 6265 §5.1.4
     parts = path.strip("/").split("/")
     heads = ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]
@@ -435,6 +447,25 @@ def test_wake_needs_origin(tmp_path):                                           
         assert role.stats.count_1h("origin_refused") == 1
         wait_until(lambda: ("start", 3) in role.fake_docker.calls)
     assert [call for call in role.fake_docker.calls if call[0] == "start"] == [("start", 3)]
+
+
+def test_wake_without_session_leaves_no_trace(tmp_path, gwlog):                        # остаток Д5б, 1
+    app, role = make_gateway(tmp_path)
+    with TestClient(app, base_url=BASE) as c:
+        codes = {c.post("/pcbk/api/workplace/wake").status_code for _ in range(50)}   # без cookie и без Origin
+        assert (codes, role.stats.count_1h("origin_refused")) == ({401}, 0)
+        assert "gw origin refused" not in gwlog.text                                    # журнал не вымывается
+        assert login(c, "stu-03").status_code == 200                                    # с учёткой, но без Origin
+        for _ in range(3):
+            assert c.post("/pcbk/api/workplace/wake").status_code == 403
+        assert role.stats.count_1h("origin_refused") == 3                               # счётчик — на каждый
+        lines = re.findall(r"gw origin refused path=/pcbk/api/workplace/wake n=([0-9]+) since_s=([0-9]+)", gwlog.text)
+        assert lines == [("1", "0")]                                                    # строка — одна за минуту
+        role.mono.advance(61)
+        assert c.post("/pcbk/api/workplace/wake").status_code == 403
+        lines = re.findall(r"gw origin refused path=/pcbk/api/workplace/wake n=([0-9]+) since_s=([0-9]+)", gwlog.text)
+        assert lines == [("1", "0"), ("3", "61")]                                       # 2 свёрнутых + этот, копились 61 с
+        assert role.workplaces.view(3).state == "sleeping"                              # отказ не будит
 
 
 def test_disabled_answer_equals_unknown(tmp_path):                                      # F8 (ревью A, M5)

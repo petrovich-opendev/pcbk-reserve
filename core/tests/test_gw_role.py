@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from unittest.mock import AsyncMock
 
@@ -19,6 +20,7 @@ from helpers import (BDRV_CFG, CORE_DIR, LLM_ENV, LLM_SETTINGS, LLM_TOKEN, SETTI
 from pcbk_core.app import create_app
 from pcbk_core.gateway import places
 from pcbk_core.gateway.accounts import AccountStore, StoreError
+from pcbk_core.gateway.stats import MAX_STREAMS_PER_LOGIN, GatewayStats
 from pcbk_core.main import PLACE_PORT, PLACES, build_roles, egress_targets, gateway_settings
 from pcbk_core.settings import GW_ERROR_CHARS, GatewaySettings, Settings
 
@@ -43,6 +45,8 @@ def test_gateway_settings_error_keeps_core(tmp_path):                           
     settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
     roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_ORIGIN": "https://x/path"})}   # не бросает
     assert roles["gateway"].config_error.startswith("настройки шлюза: GW_ORIGIN")
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_MAX_BODY_BYTES": "4194305"})}  # N8: сверх 4 МиБ
+    assert roles["gateway"].config_error.startswith("настройки шлюза: GW_MAX_BODY_BYTES")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root пишет и в каталог 0500")
@@ -174,10 +178,93 @@ def test_health_json_only_numbers(tmp_path):
         j = c.get("/health/gateway").json()
         assert set(j) == {"checked_at", "config_error", "store_ok", "sp_ctl", "running_n", "ready_n", "wake_ok_1h",
                           "wake_failed_1h", "stop_failed_1h", "place_auth_failed_1h", "logins_failed_1h",
-                          "origin_refused_1h", "login_busy_1h", "cookies_duplicate_1h", "drill"}
-        assert all(isinstance(j[k], int) for k in j if k.endswith(("_n", "_1h")))
+                          "origin_refused_1h", "login_busy_1h", "cookies_duplicate_1h", "drill",
+                          "refused_1h", "streams", "stream_broken_1h", "upstream_failed_1h"}          # Д5б (Б1)
+        assert all(isinstance(j[k], int) for k in j if k.endswith(("_n", "_1h")) or k == "streams")
         assert c.get("/healthz/gateway").json() == {"ok": True, "detail": "принимает вход"}
         assert "stu-03" not in json.dumps(j)
+
+
+def test_health_json_has_proxy_counters_and_stream_cap(tmp_path):
+    app, role = make_gateway(tmp_path)
+    role.stats.event("refused"); role.stats.event("stream_broken")
+    assert [role.stats.stream_opened("stu-03") for _ in range(4)] == [True, True, True, False]
+    role.stats.stream_closed("stu-05")                                                 # чужой логин — не ниже нуля
+    with TestClient(app) as c:
+        j = c.get("/health/gateway").json()
+    assert (j["refused_1h"], j["streams"], j["stream_broken_1h"], j["upstream_failed_1h"]) == (1, 3, 1, 0)
+
+
+# --- Б1, сверх брифа: слоты потоков (решение контроллера 3) ---
+
+def test_stream_slots_per_login_and_no_zero_entries():
+    s = GatewayStats()
+    assert (MAX_STREAMS_PER_LOGIN, s.streams_of("stu-01"), s.streams) == (3, 0, 0)          # незнакомый логин — 0
+    assert [s.stream_opened("stu-01") for _ in range(3)] + [s.stream_opened("stu-02")] == [True] * 4
+    assert (s.streams_of("stu-01"), s.streams_of("stu-02"), s.streams) == (3, 1, 4)        # предел — на учётку
+    assert s.stream_opened("stu-01") is False and s.streams_of("stu-01") == 3              # отказ слота не берёт
+    s.stream_closed("stu-01")
+    assert s.stream_opened("stu-01") is True and s.stream_opened("stu-01") is False        # закрытый слот — снова
+    for _ in range(5):                                                                     # лишние закрытия
+        s.stream_closed("stu-01")
+    s.stream_closed("stu-09")                                                              # незнакомый логин
+    assert (s.streams_of("stu-01"), s.streams_of("stu-09"), s.streams) == (0, 0, 1)
+    s.stream_closed("stu-02")
+    assert s.streams == 0 and s._streams == {}                                             # учётки с нулём не копятся
+    for kind in ("refused", "stream_broken", "upstream_failed"):                           # виды Д5б
+        s.event(kind)
+        assert s.count_1h(kind) == 1
+
+
+class _SlowDict(dict):
+    """Словарь слотов, который после каждого чтения отдаёт GIL: без замка гонка потоков неизбежна. Медленны все пути
+    чтения (get, [], in) — тест не привязан к тому, как GatewayStats читает словарь (Б1-m2); reads — число чтений,
+    тест сверяет, что медленный путь пройден."""
+
+    reads = 0
+
+    def _slow(self, value):
+        type(self).reads += 1
+        time.sleep(0.01)
+        return value
+
+    def get(self, *args):
+        return self._slow(super().get(*args))
+
+    def __getitem__(self, key):
+        return self._slow(super().__getitem__(key))
+
+    def __contains__(self, key):
+        return self._slow(super().__contains__(key))
+
+
+def _all_at_once(fn, n: int = 8) -> None:
+    start = threading.Barrier(n)
+
+    def run() -> None:
+        start.wait()
+        fn()
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def test_stream_slots_thread_safe():
+    """Слоты — под замком GatewayStats: восемь потоков разом берут слот одной учётки — удач ровно
+    MAX_STREAMS_PER_LOGIN; восемь закрытий разом — ноль, и учётка из словаря ушла."""
+    s = GatewayStats()
+    s._streams = _SlowDict()
+    _SlowDict.reads = 0
+    got: list[bool] = []
+    _all_at_once(lambda: got.append(s.stream_opened("stu-01")))
+    assert (got.count(True), s.streams_of("stu-01")) == (MAX_STREAMS_PER_LOGIN, MAX_STREAMS_PER_LOGIN)
+    opened_reads = _SlowDict.reads
+    _all_at_once(lambda: s.stream_closed("stu-01"))
+    assert (s.streams, dict(s._streams)) == (0, {})
+    assert opened_reads >= 8 and _SlowDict.reads >= opened_reads + 8                     # каждый вызов читал медленно
 
 
 def test_freeze_reaper_drill_stops_ticks(tmp_path):                                    # Review Focus 3

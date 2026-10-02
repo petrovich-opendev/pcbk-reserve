@@ -74,6 +74,12 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # временные файлы тел запросов и ответов core (Д5б) — на диске: tmpfs считался бы в mem_limit 64m, а ответ
+      # core под /pcbk/api/oc/ — до 4 МиБ; каталоги proxy/ и client/ создаёт мастер nginx (proxy_temp_path)
+      - {type: volume, source: pcbk-edge-temp, target: /var/lib/pcbk-edge}
+    # журнал с поворотом (итоговая доводка Д5б): отказы limit_req и limit_conn пишутся строкой на каждый запрос —
+    # поток отказов одной cookie не растит диск сервера без предела
+    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
     networks: [pcbk-public, pcbk-front]
     healthcheck:
       test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
@@ -84,8 +90,8 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d4b остаётся на сервере для отката
-    image: pcbk-reserve/watchdog:d5a
+    # :d5a остаётся на сервере для отката
+    image: pcbk-reserve/watchdog:d5b
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -197,8 +203,8 @@ services:
   # на адресе core в pcbk-front (Д5-R31). Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d4b остаётся на сервере для отката
-    image: pcbk-reserve/core:d5a
+    # :d5a остаётся на сервере для отката
+    image: pcbk-reserve/core:d5b
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -213,6 +219,9 @@ services:
     # слой; первый — у места нет маршрута по умолчанию (Д2). По умолчанию netns контейнера наследует 1 хоста
     sysctls: {net.ipv4.tcp_fastopen: "0", net.ipv4.ip_forward: "0"}
     restart: unless-stopped
+    # мягкая остановка uvicorn — 2 с, затем роль шлюза закрывает открытые потоки /event (все вместе — не дольше
+    # 3 с) и lifespan журнала LLM дописывает очередь; 20 с — с запасом до SIGKILL (Д5б)
+    stop_grace_period: 20s
     environment:                    # только несекретное
       CORE_PORT: "8000"
       FRESH_POLL_S: ${FRESH_POLL_S:-30}
@@ -554,6 +563,8 @@ volumes:
   # журнал событий серверного слоя (core.db) — так же с префиксом проекта: тестовый проект
   # pcbk-test том выкладки не тронет
   pcbk-core-data:
+  # временные файлы edge (Д5б): только тела и ответы в пути, данных нет — с префиксом проекта, как журналы
+  pcbk-edge-temp:
   # данные студентов: внешние — Compose их не создаёт и не удаляет (down -v их не тронет)
   pcbk-student-01-state: {name: pcbk-student-01-state, external: true}
   pcbk-student-01-work: {name: pcbk-student-01-work, external: true}

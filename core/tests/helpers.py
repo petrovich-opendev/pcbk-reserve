@@ -517,7 +517,7 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
                  stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
                  accounts: bool = True, **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
-    GatewaySettings (без проверок from_env). stream_recheck_s — параметр роли Д5б, в Д5а не используется.
+    GatewaySettings (без проверок from_env). stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
 
     tmp_path создаётся; база — db_path или tmp_path/core.db. accounts — завести отдельным AccountStore с open()
     учётки stu-03 (место 3), stu-05 (место 5) и teach (преподаватель), у всех пароль PW; иначе база заранее не
@@ -544,7 +544,8 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
     for n in ready:
         ready_place(workplaces, docker, n)
     role = GatewayRole(replace(SETTINGS, DB_PATH=str(db)), gw, store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S),
-                       workplaces=workplaces, stats=stats, config_error=config_error, monotonic=mono)
+                       workplaces=workplaces, stats=stats, config_error=config_error, monotonic=mono,
+                       stream_recheck_s=stream_recheck_s)
     role.fake_docker, role.fake_places, role.mono = docker, oc, mono
     return role
 
@@ -562,3 +563,22 @@ def login(c, name: str, pw: str = PW, **headers) -> httpx.Response:
     sent = {"Origin": ORIGIN, **headers}
     return c.post("/pcbk/api/auth/login", json={"login": name, "password": pw},
                   headers={k: v for k, v in sent.items() if v != ""})
+
+
+# --- Шлюз: прокси /pcbk/api/oc (Д5б, задача Б3) ---
+
+def oc_headers(**extra) -> dict:
+    """Заголовки вызова адаптера со своей страницы: Origin: ORIGIN и extra (места готовит make_gateway(…, ready=…))."""
+    return {"Origin": ORIGIN, **extra}
+
+
+# --- Шлюз: поток /event (Д5б, задача Б4) ---
+
+def login_cookie(url: str, name: str, pw: str = PW) -> str:
+    """Вход по HTTP (serve_app) — значение cookie pcbk_session из Set-Cookie: по http httpx cookie Secure не шлёт,
+    тест ставит её заголовком Cookie сам."""
+    r = httpx.post(url + "/pcbk/api/auth/login", json={"login": name, "password": pw}, headers={"Origin": ORIGIN},
+                   trust_env=False)
+    assert r.status_code == 200, r.status_code
+    line = next(h for h in r.headers.get_list("set-cookie") if h.startswith("pcbk_session="))
+    return line.split(";", 1)[0].split("=", 1)[1]

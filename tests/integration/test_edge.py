@@ -20,7 +20,7 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d5a", "pcbk-core": "pcbk-reserve/core:d5a",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d5b", "pcbk-core": "pcbk-reserve/core:d5b",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d4"}
@@ -105,6 +105,16 @@ def test_edge_tmpfs_root_owned_0755(stack):
     assert stack.inspect("pcbk-edge")["HostConfig"]["Tmpfs"] == {p: "mode=0755" for p in paths}
     for path in paths:
         assert stack.exec("pcbk-edge", "stat", "-L", "-c", "%a %U", path) == "755 root", path
+
+
+def test_edge_temp_files_on_disk_volume(stack):
+    """Д5б: временные файлы тел и ответов core — на томе (диск), не в tmpfs 64m; каталоги создал мастер для рабочих."""
+    mounts = {m["Destination"]: m for m in stack.inspect("pcbk-edge")["Mounts"]}
+    temp = mounts["/var/lib/pcbk-edge"]
+    assert (temp["Type"], temp["Name"], temp["RW"]) == ("volume", "pcbk-test_pcbk-edge-temp", True)
+    assert "/var/lib/pcbk-edge" not in stack.inspect("pcbk-edge")["HostConfig"]["Tmpfs"]
+    for d in ("client", "proxy"):
+        assert stack.exec("pcbk-edge", "stat", "-c", "%a %U", f"/var/lib/pcbk-edge/{d}") == "700 nginx", d
 
 
 def test_edge_limits(stack):

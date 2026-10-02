@@ -65,12 +65,14 @@ def test_place_sees_no_gateway(stack, accounts):                                
 
 def test_edge_passes_only_gateway_paths(stack):                                       # Review Focus 2
     c = stack.gw_client()
-    for path in ("/pcbk/api/data/tag_now", "/pcbk/api/healthz", "/pcbk/api/oc/session", "/pcbk/api/llm/v1/chat/completions",
+    for path in ("/pcbk/api/data/tag_now", "/pcbk/api/healthz", "/pcbk/api/llm/v1/chat/completions",
                  "/pcbk/api", "/pcbk/api/auth"):
         code, body, _ = c.call("GET", path)
         assert (code, body["name"]) == (404, "NotFound"), path                        # JSON, не 301
     code, body, _ = c.call("GET", "/pcbk/api/oc")
     assert (code, body["data"]["message"]) == (403, "Вызов не разрешён")
+    code, body, _ = c.call("GET", "/pcbk/api/oc/session")                             # Д5б: путь шлюза, без cookie — вход
+    assert (code, body["name"]) == (401, "Unauthorized")
     for path in ("/pcbk/api/auth/%2e%2e/data/tag_now", "/pcbk/api/auth/..%2Fdata%2Ftag_now", "/pcbk/api/auth//me",
                  "/pcbk/api/data/%2e%2e/auth/me", "/pcbk/api/auth/./me", "/pcbk/api/auth/me%00"):
         code, body, _ = c.call("GET", path)

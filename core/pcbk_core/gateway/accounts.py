@@ -6,7 +6,9 @@
 - gw_places — за кем закреплено место. Строка пишется при первой выдаче места и не удаляется ни
   disable, ни remove: она же надгробие логина — логин с закреплением без учётки занят. Снимает её
   только release_place: у пробных учёток dN-probe-* и без действующей учётки на месте;
-- gw_sessions — сессии: sha256 значения cookie, сам токен в базе не лежит. Срок — от открытия;
+- gw_sessions — сессии: sha256 значения cookie, сам токен в базе не лежит. Срок — от открытия; живых сессий на
+  учётку не больше MAX_SESSIONS_PER_LOGIN — новый вход закрывает самые старые (итоговая доводка Д5б, N2: иначе
+  один студент своими сессиями занял бы общий предел соединений edge);
 - gw_login_failures — неудачные входы существующих логинов в окне LOCK_WINDOW_S. Неизвестные
   логины — только в памяти (UNKNOWN_KEYS ключей под threading.Lock, ключ — sha256 логина): замок
   для всех одинаков, перебор чужих логинов не растит базу и память. При переполнении вытесняется
@@ -62,6 +64,7 @@ SQLITE_TIMEOUT_S = 2.0
 
 ROLES = ("student", "teacher")
 SESSION_TOKEN_BYTES = 32           # secrets.token_urlsafe(32) — 43 знака
+MAX_SESSIONS_PER_LOGIN = 3         # живых сессий на учётку (N2): 3 × 10 запросов edge — меньше половины общих 64
 GENERATED_PW_BYTES = 9             # --generate: secrets.token_urlsafe(9) — 12 знаков
 # scrypt по Д5-R24: n = 2**14, r = 8, p = 1, соль 16 байт, хеш 32 байта
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 16384, 8, 1
@@ -508,7 +511,9 @@ class AccountStore:
 
     def open_session(self, login: str) -> str:
         """Новая сессия действующей учётки: токен (secrets.token_urlsafe(32)) — вызывающему, в базу — его sha256.
-        Заодно удаляются истёкшие сессии. Нет учётки или она отключена — ValueError."""
+        Заодно удаляются истёкшие сессии, а сверх MAX_SESSIONS_PER_LOGIN живых у этой учётки — самые старые по
+        порядку записи (rowid, а не часам: шаг часов назад не вытесняет только что открытую), в той же транзакции.
+        Нет учётки или она отключена — ValueError."""
         token = secrets.token_urlsafe(SESSION_TOKEN_BYTES)
         now = self.clock()
         with self._op(write=True) as db:
@@ -519,7 +524,12 @@ class AccountStore:
                                (_sha(token), now, now + self.ttl_s, login)).rowcount
             if added != 1:
                 raise ValueError("учётки нет или она отключена")
+            evicted = db.execute("DELETE FROM gw_sessions WHERE login = ? AND rowid NOT IN (SELECT rowid FROM"
+                                 " gw_sessions WHERE login = ? ORDER BY rowid DESC LIMIT ?)",
+                                 (login, login, MAX_SESSIONS_PER_LOGIN)).rowcount
             db.execute("COMMIT")
+        if evicted:
+            log.info("gw sessions evicted login=%s n=%d", login, evicted)
         return token
 
     def session(self, token: str | None) -> Account | None:

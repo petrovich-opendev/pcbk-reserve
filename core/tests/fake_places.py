@@ -6,12 +6,22 @@ pcbk-student-01…10; путь вне правил — 403, метод без п
 
 Пароли мест тестов — PLACE_PW; их пишет helpers.pw_dir. Ожидаемый Authorization двойник считает сам, а не
 берёт у Workplaces.basic: неверная сборка заголовка (и учения bad_place_pw) получает 401, как от места.
+
+Д5б (задача Б3): FakePlaces записывает запросы видом Recorded, отвечает списками агентов (agents) и висящих
+разрешений (pending), по месту умеет ответить заданным кодом и заголовками (force_status), бросить исключение
+(raise_for), помолчать (hang_for) и отдать большое тело кусками по 1 КиБ со счётом отданного (big, big_sent).
+
+Д5б (задача Б4): GET /event — поток событий места (events, event_starts, event_open, event_closed; см. FakePlaces).
 """
 import asyncio
 import base64
+import gzip
 import itertools
+import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 
 import httpx
 
@@ -23,7 +33,17 @@ NEVER_STARTED = "0001-01-01T00:00:00Z"          # StartedAt контейнера
 _DOCKER_GET = re.compile(r"/v1\.44/(_ping|containers/pcbk-student-(0[1-9]|10)/json)")
 _DOCKER_POST = re.compile(r"/v1\.44/containers/pcbk-student-(0[1-9]|10)/(start|stop)")
 _PLACE_TAIL = re.compile(r"([1-9]|10)\.3")         # после префикса STU_NET: N.3, номер без нуля впереди
+_PROMPT_ASYNC = re.compile(r"/session/[^/]+/prompt_async")
+BIG_CHUNK = 1024                                   # кусок большого тела big: предел читается с точностью до КиБ
+PULSE_S = 0.05                                     # пульс потока "endless"
+# "silent" молчит столько, а не вечно: поломка, при которой шлюз тишину не видит, роняет тест, а не вешает прогон
+SILENT_S = 20.0
 _stamps = itertools.count(1)
+
+
+def sse(event_type: str, **props) -> bytes:
+    """Событие потока места, как его пишет OpenCode 1.18.33: одна строка data: с JSON и пустая строка."""
+    return b"data: " + json.dumps({"id": "e", "type": event_type, "properties": props}).encode() + b"\n\n"
 
 
 def expected_basic(n: int) -> str:
@@ -124,17 +144,106 @@ class FakeDocker:
         return httpx.Response(204)
 
 
+@dataclass(frozen=True)
+class Recorded:
+    """Запрос к месту, как его увидел двойник: имена заголовков — в нижнем регистре, json — разобранное тело
+    (нет тела — None), query — строка запроса как есть. url — прежним тестам Д5а (r.url.path, r.url.host)."""
+    method: str
+    path: str
+    query: str
+    headers: dict[str, str]
+    json: object
+    url: httpx.URL
+
+
+class _EventBody(httpx.AsyncByteStream):
+    """Тело ответа /event двойника: куски по сценарию; закрытие (aclose или конец сценария) учитывается один раз.
+
+    Сценарий — список, где bytes — кусок, ("pause", s) — пауза, вызываемое — вызов без аргументов (проба теста в
+    момент чтения), ("raise", исключение) — бросить его (обрыв посреди потока), ("repeat", кусок, s) — этот кусок раз в
+    s без конца, ("linger", s) — ждать без конца, а отмену пережить на s секунд (медленный читатель при закрытии);
+    "endless" — пульс server.heartbeat раз в PULSE_S без конца; "silent" — server.connected и тишина SILENT_S (для
+    шлюза — без конца), затем конец."""
+
+    def __init__(self, places: "FakePlaces", n: int, script: object):
+        self._places, self._n, self._script = places, n, script
+        self._closed = False
+        places.event_starts[n] += 1
+        places.event_open[n] += 1
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        script = self._script
+        if script == "endless":
+            while True:
+                yield sse("server.heartbeat")
+                await asyncio.sleep(PULSE_S)
+        if script == "silent":
+            yield sse("server.connected")
+            await asyncio.sleep(SILENT_S)
+            return
+        for item in script:
+            if isinstance(item, tuple) and item[0] == "pause":
+                await asyncio.sleep(item[1])
+            elif isinstance(item, tuple) and item[0] == "raise":
+                raise item[1]
+            elif isinstance(item, tuple) and item[0] == "repeat":
+                while True:
+                    yield item[1]
+                    await asyncio.sleep(item[2])
+            elif isinstance(item, tuple) and item[0] == "linger":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(item[1])
+                    raise
+            elif isinstance(item, Callable):
+                item()
+            else:
+                yield item
+
+    async def aclose(self) -> None:
+        """Закрытие — точка отмены (await): закрывающий без щита в отменённой области его не доведёт. Двойник здесь
+        строже настоящего транспорта — httpcore закрывает соединение сам под щитом; строгость нарочная: так тесты
+        ловят release() без своего щита (доводка Б4 K1, Б4-m1)."""
+        if not self._closed:
+            await asyncio.sleep(0)
+            self._closed = True
+            self._places.event_open[self._n] -= 1
+            self._places.event_closed[self._n] = True
+
+
+def _record(request: httpx.Request) -> Recorded:
+    body = request.content
+    try:
+        parsed = json.loads(body) if body else None
+    except ValueError:
+        parsed = body
+    return Recorded(request.method, request.url.path, request.url.query.decode("ascii"),
+                    {k.lower(): v for k, v in request.headers.items()}, parsed, request.url)
+
+
 class FakePlaces:
     """Серверы OpenCode мест по хосту {stu_net}.N.3:4096 (stu_net — как STU_NET шлюза; чужой хост —
-    ConnectError).
+    ConnectError). Порядок ответа места n:
 
-    - Authorization не тот (expected_basic) или wrong_pw — 401 на любой запрос;
-    - /agent — 200 [] начиная с вызова номер ready_after этого места (после настоящей паузы agent_delay),
-      раньше и при never_ready — 503;
-    - /session/status — {} (после status_delay), у мест из busy — одна занятая сессия, у мест из status_raw —
+    - запрос записывается в requests (Recorded);
+    - raise_for[n] — это исключение; hang_for[n] — столько секунд молчания перед ответом;
+    - force_status[n] = (код, заголовки) — этот код и заголовки (Content-Type по умолчанию — JSON, значение None —
+      заголовка нет) на любой запрос, тело {"name": "Forced"}, при content-encoding: gzip — сжатое по-настоящему;
+    - Authorization не тот (expected_basic) или wrong_pw — 401;
+    - big[n] — 200 с телом из стольких байт кусками по BIG_CHUNK; big_sent[n] — сколько байт отдано;
+    - GET /agent — agents[n] (по умолчанию []) начиная с вызова номер ready_after этого места (после настоящей
+      паузы agent_delay), раньше и при never_ready — 503;
+    - GET /session/status — {} (после status_delay), у мест из busy — одна занятая сессия, у мест из status_raw —
       эти байты как тело 200 (неверный ответ места);
-    - прочее — 404.
-    agent_calls[n] — сколько раз звали /agent места n; requests — все запросы по порядку.
+    - GET /permission — pending[n] (по умолчанию []);
+    - check_status[n] — этот код и {"name": "Check"} на GET /agent и GET /permission (сверки прокси);
+    - GET /event — 200 text/event-stream с потоком по сценарию events[n] (_EventBody; по умолчанию —
+      server.connected и конец); event_starts[n] — сколько потоков место отдало, event_open[n] — сколько открыто
+      сейчас, event_closed[n] — закрыт ли хоть один (False, пока не закрыт ни один); пауза до заголовков — hang_for;
+    - POST /session/{id}/prompt_async — 204; прочее — 200 {}.
+    agent_calls[n] — сколько раз звали /agent места n; active[n] — запросов к месту n в работе сейчас, max_active[n]
+    — наибольшее их число (от записи запроса до ответа; у /event — до заголовков).
     """
 
     def __init__(self, *, ready_after: int = 1, never_ready: bool = False, wrong_pw: bool = False,
@@ -147,8 +256,29 @@ class FakePlaces:
         self.agent_delay = agent_delay
         self.stu_net = "172.31"
         self.status_raw: dict[int, bytes] = {}
+        self.agents: dict[int, list[dict]] = {}
+        self.pending: dict[int, list[dict]] = {}
+        self.force_status: dict[int, tuple[int, dict]] = {}
+        self.raise_for: dict[int, Exception] = {}
+        self.hang_for: dict[int, float] = {}
+        self.big: dict[int, int] = {}
+        self.big_sent: Counter[int] = Counter()
+        self.check_status: dict[int, int] = {}
         self.agent_calls: Counter[int] = Counter()
-        self.requests: list[httpx.Request] = []
+        self.active: Counter[int] = Counter()
+        self.max_active: Counter[int] = Counter()
+        self.requests: list[Recorded] = []
+        self.events: dict[int, object] = {}
+        self.event_starts: Counter[int] = Counter()
+        self.event_open: Counter[int] = Counter()
+        self.event_closed: defaultdict[int, bool] = defaultdict(bool)
+
+    async def _big_body(self, n: int, size: int):
+        while size > 0:
+            k = min(BIG_CHUNK, size)
+            self.big_sent[n] += k
+            yield b"x" * k
+            size -= k
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         host, prefix = request.url.host, self.stu_net + "."
@@ -156,21 +286,107 @@ class FakePlaces:
         if m is None or request.url.port != 4096:
             raise httpx.ConnectError("нет такого места", request=request)
         n = int(m[1])
-        self.requests.append(request)
+        self.requests.append(_record(request))
+        self.active[n] += 1
+        self.max_active[n] = max(self.max_active[n], self.active[n])
+        try:
+            return await self._answer(request, n)
+        finally:
+            self.active[n] -= 1
+
+    async def _answer(self, request: httpx.Request, n: int) -> httpx.Response:
+        if n in self.raise_for:
+            raise self.raise_for[n]
+        if self.hang_for.get(n):
+            await asyncio.sleep(self.hang_for[n])
+        if n in self.force_status:
+            status, headers = self.force_status[n]
+            body = b'{"name":"Forced"}'
+            if headers.get("content-encoding") == "gzip":                # сжатие настоящее: httpx его распакует
+                body = gzip.compress(body)
+            merged = {"content-type": "application/json", **headers}
+            return httpx.Response(status, headers={k: v for k, v in merged.items() if v is not None}, content=body)
         if self.wrong_pw or request.headers.get("authorization") != expected_basic(n):
             return _json(401, {"name": "Unauthorized"})
+        if n in self.big:
+            return httpx.Response(200, headers={"content-type": "application/json"},
+                                  content=self._big_body(n, self.big[n]))
         path = request.url.path
+        if request.method == "GET" and path == "/event":
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  stream=_EventBody(self, n, self.events.get(n, [sse("server.connected")])))
+        if request.method == "GET" and path in ("/agent", "/permission") and n in self.check_status:
+            return _json(self.check_status[n], {"name": "Check"})
         if request.method == "GET" and path == "/agent":
             self.agent_calls[n] += 1
             if self.agent_delay:
                 await asyncio.sleep(self.agent_delay)
             if self.never_ready or self.agent_calls[n] < self.ready_after:
                 return _json(503, {"name": "NotReady"})
-            return _json(200, [])
+            return _json(200, self.agents.get(n, []))
         if request.method == "GET" and path == "/session/status":
             if self.status_delay:
                 await asyncio.sleep(self.status_delay)
             if n in self.status_raw:
                 return httpx.Response(200, content=self.status_raw[n], headers={"content-type": "application/json"})
             return _json(200, {"ses_" + "B" * 26: {"type": "busy"}} if n in self.busy else {})
-        return _json(404, {"name": "NotFound"})
+        if request.method == "GET" and path == "/permission":
+            return _json(200, self.pending.get(n, []))
+        if request.method == "POST" and _PROMPT_ASYNC.fullmatch(path):
+            return httpx.Response(204)
+        return _json(200, {})
+
+
+class LoopPlace:
+    """Место на петле (доводка Б3, G1): настоящий сервер asyncio, HTTP/1.1 от руки, пароль не сверяется. На любой
+    запрос — 200 {} после hold (если задан). conns/max_conns — открытые соединения, active/max_active — запросы в
+    работе. Пулы соединений httpx видны только на настоящих сокетах, MockTransport их не имеет."""
+
+    def __init__(self, hold: asyncio.Event | None = None):
+        self.hold = hold
+        self.conns = self.max_conns = self.active = self.max_active = self.served = 0
+        self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+
+    async def start(self, host: str, port: int = 0) -> int:
+        """Слушать host:port (0 — выберет ядро); отдаёт порт."""
+        self._server = await asyncio.start_server(self._conn, host, port)
+        return self._server.sockets[0].getsockname()[1]
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+        for writer in list(self._writers):
+            writer.close()
+        if self.hold is not None:
+            self.hold.set()
+
+    async def _conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.add(writer)
+        self.conns += 1
+        self.max_conns = max(self.max_conns, self.conns)
+        try:
+            while await reader.readline():               # строка запроса; пусто — соединение закрыто
+                length = 0
+                while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
+                    name, _, value = line.partition(b":")
+                    if name.strip().lower() == b"content-length":
+                        length = int(value)
+                if length:
+                    await reader.readexactly(length)
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    if self.hold is not None:
+                        await self.hold.wait()
+                finally:
+                    self.active -= 1
+                self.served += 1
+                writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}")
+                await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            self.conns -= 1
+            self._writers.discard(writer)
+            writer.close()

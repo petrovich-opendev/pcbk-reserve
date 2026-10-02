@@ -27,6 +27,9 @@ USAGE = "использование: python -m pcbk_core.main [--healthcheck]"
 # места Д2: {STU_NET}.N.3, сервер OpenCode на 4096 (как gateway.places — без его импорта: он тянет httpx)
 PLACES = range(1, 11)
 PLACE_PORT = 4096
+# мягкая остановка uvicorn: столько ждать соединений, потом снять их задачи и пройти lifespan ролей (журнал вызовов
+# LLM, R19; замок входа). Без срока открытый поток /event (Д5б) держит остановку до SIGKILL stop_grace_period 10 с
+GRACEFUL_SHUTDOWN_S = 2.0
 
 
 def _why(exc: Exception) -> str:
@@ -229,6 +232,13 @@ def healthcheck(settings: Settings) -> int:
         conn.close()
 
 
+def uvicorn_options(settings: Settings) -> dict:
+    """Параметры uvicorn.run службы: журнал uvicorn не настраивается (log_config=None), доступ не пишется —
+    здоровье опрашивают часто; остановка ждёт соединений не дольше GRACEFUL_SHUTDOWN_S."""
+    return {"host": "0.0.0.0", "port": settings.CORE_PORT, "log_config": None, "access_log": False,
+            "timeout_graceful_shutdown": GRACEFUL_SHUTDOWN_S}
+
+
 def serve(settings: Settings) -> None:
     """Точка входа службы: охрана выхода и поток обновления её адресов — до ролей. Плохой bdrv.env — без
     историана, плохие LLM_* — OpenRouter по умолчанию, плохие GW_* — прошедшие проверку поля и умолчания; причины
@@ -255,9 +265,7 @@ def serve(settings: Settings) -> None:
     roles = build_roles(settings)
     log.info("серверный слой слушает порт %s, роли: %s",
              settings.CORE_PORT, ", ".join(r.name for r in roles) or "нет")
-    # журнал uvicorn не настраивает (log_config=None), доступ не пишем: здоровье опрашивают часто
-    uvicorn.run(create_app(settings, roles), host="0.0.0.0", port=settings.CORE_PORT,
-                log_config=None, access_log=False)
+    uvicorn.run(create_app(settings, roles), **uvicorn_options(settings))
 
 
 def main(argv: list[str] | None = None) -> int:
