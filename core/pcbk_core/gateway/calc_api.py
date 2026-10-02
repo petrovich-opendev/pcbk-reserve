@@ -7,7 +7,8 @@ DataService, что HTTP /api/data/ и MCP, в процессе, без HTTP к 
 3. сессия current_account — 401 (сбой базы учёток — 503 store);
 4. источник origin_checked — 403; после сессии, как у wake: запрос без учётки — 401 без строки журнала и счётчика;
 5. инструмент не из CALC_TOOLS — 404 not_found (save_agent и прочее службе не передаются);
-6. преподаватель (у учётки нет места) — 403 TEACHER_CALC_TEXT: калькуляторы преподавателю — в Д10;
+6. не студент или у учётки нет места — 403 TEACHER_CALC_TEXT: калькуляторы преподавателю — в Д10; роль
+   проверяется явно, как у прокси: связь «студент ↔ место» держит только AccountStore.add, не схема базы;
 7. службы нет (role.calc is None) — 503 CALC_DOWN_TEXT;
 8. тело не объект JSON — 400 bad_body, события нет;
 9. аргументы — модели http_api (те же, что у /api/data/): ошибка — refuse_args службы с каналом web (событие refused) и
@@ -92,7 +93,7 @@ def calc_router(role: GatewayRole) -> APIRouter:
         await check_origin(request)         # после сессии: без учётки — 401, ни строки, ни счётчика origin_refused
         if tool not in CALC_TOOLS:
             return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
-        if account.place is None:
+        if account.role != "student" or account.place is None:      # итоговое ревью Д9а, m-5: роль — явно
             return gw_error(403, ERROR_NAMES[403], TEACHER_CALC_TEXT)
         svc = role.calc
         if svc is None:

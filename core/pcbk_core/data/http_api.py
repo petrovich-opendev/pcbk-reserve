@@ -209,9 +209,22 @@ def _error_field(err: dict[str, Any]) -> str:
     return ".".join(str(part) for part in loc) or "тело"
 
 
+def _reason(err: dict[str, Any]) -> str:
+    """«поле: текст»; пределы тегов и точек — словами службы (_tags_problem, _points_problem): у HTTP, MCP и вкладки
+    отказ тот же, что у прямого вызова службы (итоговая доводка Д9а, сомнение 2 исполнителя А2)."""
+    field, kind = _error_field(err), err.get("type", "")
+    if field == "points" and kind in ("less_than_equal", "greater_than_equal"):
+        return f"points: от {SERIES_MIN_POINTS} до {SERIES_MAX_POINTS}"
+    if field == "tags" and kind == "too_long":
+        return f"tags: не больше {(err.get('ctx') or {}).get('max_length', MAX_NAMES)} тегов за вызов"
+    if field == "tags" and kind == "too_short":
+        return "tags: нужен хотя бы один тег"
+    return f"{field}: {_error_text(err)}"
+
+
 def validation_reason(errors: list[dict[str, Any]]) -> str:
-    """«tags: не больше 16 элементов; limit: не больше 50» — не больше REASON_ERRORS ошибок."""
-    return "; ".join(f"{_error_field(e)}: {_error_text(e)}" for e in errors[:REASON_ERRORS]) or "тело: неверное"
+    """«tags: не больше 16 тегов за вызов; limit: не больше 50» — не больше REASON_ERRORS ошибок."""
+    return "; ".join(_reason(e) for e in errors[:REASON_ERRORS]) or "тело: неверное"
 
 
 def requested_from_body(body: object) -> tuple[str, ...]:

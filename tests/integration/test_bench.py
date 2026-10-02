@@ -36,6 +36,7 @@ import json
 import re
 import time
 from collections import Counter
+from datetime import datetime, timezone
 
 import pytest
 
@@ -246,11 +247,16 @@ def test_tool_failing_row_on_page(bench):                                       
     bench.recreate_core(bench.cfg.run_id, bench.cfg.cap_usd, extra={"DRILL_DATA": "tool_error"})
     try:
         for _ in range(3):
-            assert bench.stand.calc("tag_series", dict(TWIN_ARGS[1][1]))["status"] == "error"
+            answer = bench.stand.calc("tag_series", dict(TWIN_ARGS[1][1]))
+            assert answer["status"] == "error"
+            assert not {"items", "period", "points", "source"} & set(answer)      # ревью А7, m-3: данных в ответе нет
+        third = datetime.now(timezone.utc)
         # учение без SQL — по событиям самих вызовов (Б1 критики р1): общий счётчик ворот растит опрос свежести
         events = bench.stack.data_events("ops", "tag_series", 3)
         assert [(e["outcome"], e["summary"], e["sent"]) for e in events] == [("error", DRILL_SUMMARY, [])] * 3
         assert bench.stack.health_historian()["drill"] == "tool_error"
+        # ревью А7, m-4 (критерий 3): «внимание» — уже в первом такте сторожа после третьего вызова
+        assert row_of(bench.stack.wait_snapshot_after(third, 40), "historian")["detail"] == TOOL_FAILING_DETAIL
         s = bench.stack.wait_status(lambda s: row_of(s, "historian")["detail"] == TOOL_FAILING_DETAIL, 40)
         assert (row_of(s, "historian")["state"], row_of(s, "historian")["note"]) == \
             ("warn", "tag_series; учения: tool_error")
@@ -258,6 +264,9 @@ def test_tool_failing_row_on_page(bench):                                       
     finally:
         bench.recreate_core(bench.cfg.run_id, bench.cfg.cap_usd)
     bench.stack.wait_status(lambda s: row_of(s, "historian")["state"] == "ok", 60)
+    # ревью А7, I-1: «ok» даёт и забытое учение (серия обнулена пересозданием) — учение снято, не только серия
+    assert bench.stack.health_historian()["drill"] is None
+    assert row_of(bench.stack.wait_status(lambda s: True, 10), "historian")["note"] == ""      # у ok — без «учения»
 
 
 def test_calc_route_same_as_service(bench):                                       # Review Focus 4
@@ -281,16 +290,20 @@ def test_calc_page_in_browser(bench):                                           
         page.click_text("Найти тег")
         page.wait_text("20FAKE_201_PV", 20, css=".calc-matches")
         page.click(".calc-matches button")                                         # I2: совпадение одно — вся строка
-        assert not page.eval("!!document.querySelector('textarea')?.getClientRects().length")   # m6: чат скрыт
+        page.wait(lambda: page.eval("document.querySelector('#calc-tag')?.value") == "20FAKE_201_PV", 10,
+                  "#calc-tag = выбранное совпадение")                               # ревью А7, m-1
+        # m6: чат скрыт, а не снят из DOM (ревью А7, m-2: без поля проверка была бы зелёной и так)
+        assert page.eval("(() => { const t = document.querySelector('textarea'); "
+                         "return t !== null && t.getClientRects().length === 0; })()")
         page.select("#calc-mode", "profile")
         page.click_text("Посчитать")
         page.wait_selector("svg.profile polyline", 30)
-        page.wait_text("В начале", 10)
+        page.wait_text("В начале", 10, css="section.calc-result")                  # ревью А7, m-1: итог — в своей области
         shot(page, "d9a-01-profile.png")
         page.type("#calc-tag", "20FAKE_210_RUN", clear=True)
         page.select("#calc-mode", "runtime")
         page.click_text("Посчитать")
-        page.wait_text(r"работает \(по суффиксу\)", 30)
+        page.wait_text(r"работает \(по суффиксу\)", 30, css="section.calc-result")
         shot(page, "d9a-02-runtime.png")
         assert browser.handler_errors == [] and page.console_errors() == []
 

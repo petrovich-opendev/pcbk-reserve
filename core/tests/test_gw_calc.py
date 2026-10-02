@@ -4,7 +4,10 @@
 настройка → сессия → источник → инструмент → преподаватель → служба → тело → аргументы. Служба — make_service на
 двойнике историана (core.db службы — в tmp_path, I1), шлюз — make_gateway(tmp_path / "gw", calc=svc): у них разные
 core.db."""
+import asyncio
 import re
+import sqlite3
+from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
@@ -43,6 +46,7 @@ def test_calc_route_answers_from_service(gwc):                                  
 
 
 def test_calc_route_refusals(gwc):                                                # Review Focus 4
+    before = len(gwc.svc.role.events.recent())                                    # ревью А4, m-1
     assert post(gwc.anon(), "tag_now", BODY).status_code == 401
     r = post(gwc.as_("teach"), "tag_now", BODY)
     assert (r.status_code, r.json()) == (403, {"name": "Forbidden", "data": {"message": TEACHER_CALC_TEXT}})
@@ -50,6 +54,7 @@ def test_calc_route_refusals(gwc):                                              
     assert post(s, "tag_now", BODY, origin="https://evil.test").status_code == 403
     assert post(s, "save_agent", BODY).status_code == 404
     assert post(gwc.as_("stu-03", client=PLACE_NET), "tag_now", BODY).status_code == 404     # вне pcbk-front
+    assert len(gwc.svc.role.events.recent()) == before          # m-1: на отказ шлюза службу не зовут — ни события
     bad = s.post(CALC_PREFIX + "tag_now", content=b"{", headers={"Origin": ORIGIN, "Content-Type": "application/json"})
     assert (bad.status_code, bad.json()["name"]) == (400, "BadRequest")
     r = post(s, "tag_series", {**BODY, "period": "last_8h", "points": 1})
@@ -108,10 +113,46 @@ def test_calc_route_every_tool_through_service(gwc):                            
 def test_calc_route_body_not_object(gwc):                                        # R87, шаг 8: 400 bad_body без события
     s = gwc.as_("stu-03")
     before = len(gwc.svc.role.events.recent())
-    for raw in (b"[]", b'"x"', b"7", b"null", b"\xff", b""):
+    for raw in (b"[]", b'"x"', b"7", b"null", b"\xff", b"", b"[" * 30000 + b"]" * 30000):   # ревью А4, m-3: глубина
         r = s.post(CALC_PREFIX + "tag_now", content=raw, headers={"Origin": ORIGIN, "Content-Type": "application/json"})
         assert (r.status_code, r.json()) == (400, {"name": "BadRequest",
                                                    "data": {"message": GW_MESSAGES["bad_body"]}}), raw
+    assert len(gwc.svc.role.events.recent()) == before
+
+
+def test_calc_route_own_period_and_limit_same_as_service(gwc):    # ревью А7, I-2 и А4, m-2: свой период и limit
+    """Свой закрытый период (start, end), точки ряда и limit поиска доходят до службы как есть: ответ шлюза (кроме
+    cache) равен ответу службы на тех же аргументах; перестановка start и end или потерянный limit — красный."""
+    s = gwc.as_("stu-03")
+    own = {"start": "2026-10-01T04:00", "end": "2026-10-01T10:00"}
+    svc, caller = gwc.svc, "student-03"
+    cases = (("tag_period", {**BODY, **own}, lambda: svc.tag_period(caller, "http", BODY["tags"], None, **own)),
+             ("tag_series", {**BODY, **own, "points": 5},
+              lambda: svc.tag_series(caller, "http", BODY["tags"], None, **own, points=5)),
+             ("calc_runtime", {"tags": ["25FAKE_007_CLS"], **own},
+              lambda: svc.calc_runtime(caller, "http", ["25FAKE_007_CLS"], None, **own)),
+             ("catalog_search", {"query": "FAKE", "limit": 2}, lambda: svc.catalog_search(caller, "http", "FAKE", 2)))
+    drop = lambda d: {k: v for k, v in d.items() if k != "cache"}
+    for tool, body, direct in cases:
+        page = post(s, tool, body).json()
+        assert page["status"] == "ok", (tool, page)
+        assert drop(page) == drop(asyncio.run(direct())), tool
+    assert len(page["matches"]) == 2 and page["total"] > 2                       # limit дошёл, а не умолчание
+    assert gwc.svc.role.events.recent()[1].channel == "web"
+
+
+def test_calc_route_student_role_only(gwc):                     # итоговое ревью Д9а, m-5: роль — явно, не «нет места»
+    """Связь «студент ↔ место» держит только AccountStore.add: учётка преподавателя с местом и учётка чужой роли
+    (правка базы мимо CHECK) — 403 TEACHER_CALC_TEXT без вызова службы, как у прокси."""
+    with closing(sqlite3.connect(gwc.role.store.path)) as db, db:
+        db.execute("UPDATE gw_accounts SET place = 7 WHERE login = 'teach'")
+        db.execute("PRAGMA ignore_check_constraints = ON")
+        db.execute("INSERT INTO gw_accounts (login, role, place, pw_hash, disabled, created_at) SELECT 'oper',"
+                   " 'operator', 8, pw_hash, 0, created_at FROM gw_accounts WHERE login = 'stu-05'")
+    before = len(gwc.svc.role.events.recent())
+    for login in ("teach", "oper"):
+        r = post(gwc.as_(login), "tag_now", BODY)
+        assert (r.status_code, r.json()["data"]["message"]) == (403, TEACHER_CALC_TEXT), login
     assert len(gwc.svc.role.events.recent()) == before
 
 

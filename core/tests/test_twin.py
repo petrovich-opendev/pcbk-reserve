@@ -12,8 +12,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from helpers import CORE_DIR, LLM_ENV, REPO, SETTINGS, TOKEN, make_app, make_service, wait_until
-from pcbk_core.data.sql import (SUMMARY_COLUMNS, catalog_sql, clock_sql, live_all_sql, live_sql, series_sql, state_sql,
-                                summary_sql)
+from pcbk_core.data.sql import (SUMMARY_COLUMNS, SummaryShape, catalog_sql, clock_sql, live_all_sql, live_sql,
+                                series_sql, state_sql, summary_sql)
 from pcbk_core.main import build_roles
 from twin_core import install_twin
 from twin_historian import BENCH_FIXTURE, TZ, TwinHistorian, analog_value, bench_whitelist, state_value
@@ -206,3 +206,45 @@ def test_twin_live_signal():
     names = {r[0] for r in t([live_all_sql()], 10.0)[0]}
     assert {"20FAKE_201_PV", "20FAKE_202_PV", "20FAKE_210_RUN"} <= names           # признак «живой» в каталоге
     assert not names & {"20FAKE_211_CLS", "20FAKE_107_PV"}
+
+
+# --- итоговая доводка Д9а (ревью А3, m-2…m-5) ---
+
+def test_twin_runtime_not_longer_than_period():                                  # m-2: конец не на целой минуте
+    t = TwinHistorian.from_fixture(now=lambda: NOW + timedelta(seconds=30))
+    rows = t([state_sql(["20FAKE_210_RUN"], L(2026, 10, 10), L(2026, 10, 10, 12, 0, 30))], 10.0)[0]
+    assert sum(r[2] for r in rows) == (12 * 3600 + 30) * 1000                     # 12 ч 30 с, не 721 минута
+    assert sum(r[3] for r in rows) == pytest.approx(100.0)
+    day = t([state_sql(["20FAKE_210_RUN"], L(2026, 10, 9), L(2026, 10, 10))], 10.0)[0]
+    assert {r[1]: r[2] for r in day} == {1.0: 18 * 3_600_000, 0.0: 6 * 3_600_000}  # целые минуты — как были
+
+
+def test_twin_signals_checked_at_load():                                         # m-3: битая фикстура — сразу
+    base = twin()
+    bad_signals = ({"20FAKE_201_PV": {"base": 600, "amp": 20}},                          # не того вида
+                   {"20FAKE_999_PV": {"base": 600, "amp": 20, "period_h": 6}},           # тег вне каталога
+                   {"20FAKE_211_CLS": {"base": 1, "amp": 1, "period_h": 6}},             # аналоговый у тега состояния
+                   {"20FAKE_201_PV": {"base": 600, "amp": 20, "period_h": 0}},           # период — ноль
+                   {"20FAKE_210_RUN": {"cycle_h": 0, "duty": 0.75}},                      # цикл — ноль
+                   {"20FAKE_210_RUN": {"cycle_h": 3, "duty": 1.5}})                       # доля вне 0…1
+    for signals in bad_signals:
+        with pytest.raises(ValueError):
+            TwinHistorian(base.catalog, base.values, base.summary, signals=signals)
+    assert TwinHistorian(base.catalog, base.values, base.summary, signals={"20FAKE_210_RUN": {"cycle_h": 3, "duty": 1}})
+
+
+def test_twin_has_no_fakes_data():                                               # m-4: ряд и наработка fakes не тянутся
+    t = twin()
+    assert (t.live, t.clock, t.series, t.states) == ({}, [], {}, {})
+
+
+def test_twin_summary_last_in_period():                                          # m-5: Last — в периоде, не «сейчас»
+    t = twin()
+    shape = SummaryShape(has_last=True)
+    row = t([summary_sql(["20FAKE_201_PV"], L(2026, 10, 9), L(2026, 10, 10), shape)], 10.0)[0][0]
+    cols = dict(zip(("TagName", *shape.columns), row))
+    last = L(2026, 10, 9, 23, 59)                                                 # последний отсчёт [start, end)
+    assert cols["LastDateTime"] == last
+    assert cols["Last"] == pytest.approx(analog_value(t.signals["20FAKE_201_PV"], last.replace(tzinfo=TZ).timestamp()))
+    plain = t([summary_sql(["20FAKE_104_PV"], L(2026, 10, 9), L(2026, 10, 10), shape)], 10.0)[0][0]
+    assert dict(zip(("TagName", *shape.columns), plain))["Last"] == 3.42             # тег Д8 — живое, как было

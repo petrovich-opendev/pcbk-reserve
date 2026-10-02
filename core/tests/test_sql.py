@@ -184,7 +184,7 @@ def test_bad_probe_constants_fail_at_import(tmp_path, line, bad):
 
 
 def test_pin_outside_ww_constants_refused():
-    for bad in ("Delta", "STAIRSTEP' OR 1=1 --"):
+    for bad in ("Delta", "STAIRSTEP' OR 1=1 --", "Cyclic"):            # Cyclic — режим ряда (ревью А2, m-3)
         with pytest.raises(ValueError):
             summary_form(SummaryShape(pin=bad))
         with pytest.raises(ValueError):
@@ -264,3 +264,14 @@ def test_new_templates_names_and_columns():
         state_sql(["25FAKE_007_CLS"], S.replace(tzinfo=timezone.utc), E)
     for s in (series_sql(["20FAKE_001_PV"], S, E, 24), state_sql(["25FAKE_007_CLS"], S, E)):
         assert not re.search(r"\?|%s|@|;|\bLIKE\b|\bOR\b", s) and not re.search(r"\bww\w+\s+IN\b", s)
+
+
+def test_series_form_names_not_more_than_series_max_tags():     # итоговое ревью Д9а, m-3: ворота — как series_sql
+    four = [f"20FAKE_{i:03d}_PV" for i in range(SERIES_MAX_TAGS)]
+    sql = series_sql(four, S, E, 72)
+    assert template_of(sql) == "series"
+    five = sql.replace("'20FAKE_003_PV')", "'20FAKE_003_PV', '20FAKE_004_PV')")
+    sixteen = sql.replace("'20FAKE_003_PV')", ", ".join(f"'20FAKE_{i:03d}_PV'" for i in range(3, MAX_NAMES)) + ")")
+    for bad in (five, sixteen):
+        assert bad != sql and template_of(bad) is None
+    assert template_of(live_sql([f"20FAKE_{i:03d}_PV" for i in range(MAX_NAMES)])) == "live"   # live — по-прежнему 16

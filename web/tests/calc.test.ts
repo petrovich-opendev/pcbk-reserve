@@ -3,7 +3,7 @@
 // ручка api.calc — POST /pcbk/api/calc/<tool> (маршрут шлюза Д9-R87).
 import { expect, test } from "vitest";
 import { createApi, type JsonFetch } from "../src/api";
-import { buildRequest, fmtNum, fmtTime, MODE_CHOICES, PERIOD_CHOICES, POINT_CHOICES, profileSegments,
+import { badRange, buildRequest, fmtNum, fmtTime, MODE_CHOICES, PERIOD_CHOICES, POINT_CHOICES, profileSegments,
          type CalcForm } from "../src/calc";
 
 const F: CalcForm = { mode: "period", tag: "20FAKE_001_PV", period: "prev_shift", start: "", end: "", points: 24 };
@@ -75,4 +75,13 @@ test("api_calc_posts_args_to_gateway_route", async () => {                      
   expect(seen[0]!.init.credentials).toBe("same-origin");
   expect(seen[0]!.init.headers).toEqual({ Accept: "application/json", "Content-Type": "application/json" });
   expect(seen[0]!.init.body).toBe('{"tags":["20FAKE_001_PV"],"period":"last_8h","points":24}');
+});
+
+test("build_request_refuses_backward_custom_range", () => {                      // ревью А5, m-4: частота — не на отказ
+  const custom = { ...F, period: "custom" };
+  expect(buildRequest({ ...custom, start: "2026-10-01T12:00", end: "2026-10-01T08:00" })).toBeNull();
+  expect(buildRequest({ ...custom, start: "2026-10-01T08:00", end: "2026-10-01T08:00" })).toBeNull();
+  expect(buildRequest({ ...custom, start: "2026-10-01T08:00", end: "2026-10-01T08:00:30" })?.args)
+    .toEqual({ tags: ["20FAKE_001_PV"], start: "2026-10-01T08:00", end: "2026-10-01T08:00:30" });
+  expect(badRange({ ...custom, start: "2026-10-01T08:00", end: "" })).toBe(false);    // пустое — «укажите», не «позже»
 });

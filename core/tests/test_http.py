@@ -9,7 +9,10 @@ from helpers import (LLM_TOKEN, SETTINGS, TOKEN, chat_body, gateway_role, make_a
                      wait_until, wait_until_async)
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS
-from pcbk_core.data.http_api import MAX_BODY_BYTES, BodyLimit
+from pcbk_core.data.http_api import (MAX_BODY_BYTES, BodyLimit, CalcRuntimeArgs, TagNowArgs, TagSeriesArgs,
+                                     validation_reason)
+from pcbk_core.data.service import _points_problem, _tags_problem
+from pcbk_core.data.sql import SERIES_MAX_TAGS
 from pcbk_core.logs import setup_logging
 
 
@@ -237,12 +240,12 @@ def test_http_calculator_models(tmp_path):
     app, role = make_app(tmp_path)
     auth = {"Authorization": f"Bearer {TOKEN}"}
     cases = [("tag_series", {"tags": [f"20FAKE_00{i}_PV" for i in range(5)], "period": "last_8h"},
-              "tags: не больше 4 элементов"),
-             ("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h", "points": 97}, "points: не больше 96"),
+              "tags: не больше 4 тегов за вызов"),
+             ("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h", "points": 97}, "points: от 2 до 96"),
              ("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h", "points": "много"},
               "points: нужно целое число"),
              ("calc_runtime", {"tags": [f"25FAKE_{i:03d}_CLS" for i in range(17)], "period": "yesterday"},
-              "tags: не больше 16 элементов"),
+              "tags: не больше 16 тегов за вызов"),
              ("calc_runtime", {"tags": ["25FAKE_007_CLS"], "period": "last_year"}, "period: неизвестное значение")]
     with TestClient(app) as c:
         wait_until(lambda: role.catalog.loaded)
@@ -255,6 +258,20 @@ def test_http_calculator_models(tmp_path):
         assert (r.status_code, r.json()["points"], r.json()["status"]) == (200, 24, "ok")
         unauthorized = c.post("/api/data/calc_runtime", json={"tags": ["25FAKE_007_CLS"], "period": "yesterday"})
         assert unauthorized.status_code == 401
+
+
+def test_model_refusal_texts_same_as_service():                 # итоговая доводка Д9а, сомнение 2 исполнителя А2
+    """Отказ модели (HTTP 422, MCP, вкладка) по тегам и точкам — тем же текстом, что у прямого вызова службы."""
+    from pydantic import ValidationError
+    cases = ((TagSeriesArgs, {"tags": ["A"], "points": 97}, _points_problem(97)),
+             (TagSeriesArgs, {"tags": ["A"], "points": 1}, _points_problem(1)),
+             (TagSeriesArgs, {"tags": ["A"] * 5}, _tags_problem(["A"] * 5, SERIES_MAX_TAGS)),
+             (CalcRuntimeArgs, {"tags": ["A"] * 17}, _tags_problem(["A"] * 17)),
+             (TagNowArgs, {"tags": []}, _tags_problem([])))
+    for model, body, direct in cases:
+        with pytest.raises(ValidationError) as exc:
+            model.model_validate(body)
+        assert direct and validation_reason(list(exc.value.errors())) == direct, body
 
 
 def test_http_calculators_config_error_is_503(tmp_path):

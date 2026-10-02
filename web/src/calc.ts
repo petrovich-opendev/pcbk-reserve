@@ -30,13 +30,25 @@ export const PERIOD_CHOICES: readonly { key: PeriodKey; label: string }[] =
   PERIOD_KEYS.map((key) => ({ key, label: CALC_LABELS.periods[key] }));
 export const CUSTOM_PERIOD: PeriodKey = "custom";
 
-export const POINT_CHOICES: readonly number[] = [12, 24, 48, 96];   // в пределах службы 2–96 (Д9-R84)
+// точки профиля — в пределах службы SERIES_MIN_POINTS…SERIES_MAX_POINTS (sql.py, Д9-R84), по умолчанию — её 24
+// (сверка — tests/texts.test.ts)
+export const POINT_CHOICES: readonly number[] = [12, 24, 48, 96];
 export const CALC_SEARCH_LIMIT = 20;                                 // совпадений поиска тега за вызов (≤ SEARCH_LIMIT службы)
+// пределы полей — QUERY_CHARS и TAG_CHARS службы (service.py; сверка — texts.test.ts)
+export const CALC_QUERY_CHARS = 200;
+export const CALC_TAG_CHARS = 128;
+// заметка поиска службы, обращённая к агенту (SIMILAR_NOTE service.py; сверка — texts.test.ts): на вкладке — своя
+export const SIMILAR_NOTE_CORE = "точного совпадения нет — вот похожие, выберите вместе со студентом";
 
 // режим по умолчанию — сводка за прошлую смену (m14), 24 точки профиля
 export const DEFAULT_FORM: CalcForm = { mode: "period", tag: "", period: "prev_shift", start: "", end: "", points: 24 };
 
-// форма → инструмент и аргументы шлюза; null — нет тега или свой период без начала или конца
+// свой период с концом не позже начала: строки datetime-local одной формы — сравнение строк хронологическое
+export const badRange = (form: CalcForm): boolean =>
+  form.start.trim() !== "" && form.end.trim() !== "" && form.start >= form.end;
+
+// форма → инструмент и аргументы шлюза; null — нет тега, свой период без начала или конца или с концом не позже начала
+// (такой вызов служба отказала бы, а предел частоты он бы съел — ревью А5, m-4)
 export function buildRequest(form: CalcForm): { tool: CalcTool; args: Record<string, unknown> } | null {
   const tag = form.tag.trim();
   const choice = MODE_CHOICES.find((c) => c.mode === form.mode);
@@ -44,7 +56,7 @@ export function buildRequest(form: CalcForm): { tool: CalcTool; args: Record<str
   const args: Record<string, unknown> = { tags: [tag] };
   if (form.mode !== "now") {                            // у текущего значения периода нет
     if (form.period === CUSTOM_PERIOD) {
-      if (form.start.trim() === "" || form.end.trim() === "") return null;
+      if (form.start.trim() === "" || form.end.trim() === "" || badRange(form)) return null;
       args.start = form.start;
       args.end = form.end;
     } else {

@@ -369,7 +369,23 @@ test("tabs_switch_keeps_chat_mounted", async () => {
   expect(screen.getByTestId("fake-chat").closest("[hidden]")).not.toBeNull();       // чат не снят — поток жив
   fireEvent.click(screen.getByRole("button", { name: "Чат" }));
   expect(screen.getByTestId("fake-chat").closest("[hidden]")).toBeNull();
+  const title = screen.getByRole("heading", { name: "Калькуляторы БДРВ — те же расчёты, что у агентов", hidden: true });
+  expect(title.closest("[hidden]")).not.toBeNull();                                 // ревью А5, m-1: скрыты
   expect(a.calc).not.toHaveBeenCalled();                                            // вкладка сама ничего не спрашивает
+});
+
+test("tabs_on_workplace_and_asleep_screens", async () => {                        // ревью А5, m-1: фазы места и «спит»
+  const { Chat } = controlledChat();
+  const a = api({ me: student, workplace: [[200, { state: "starting" }], [200, { state: "ready" }]],
+                  wake: [202, { state: "starting" }] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={Chat} startPolling={okPolling} pollMs={POLL_MS} />);
+  expect(await screen.findByText("Готовлю рабочее место…")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Калькуляторы" })).toBeTruthy();       // место ещё готовится
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "asleep" }));
+  expect(await screen.findByText("Рабочее место спит")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  expect(screen.getByRole("heading", { name: "Калькуляторы БДРВ — те же расчёты, что у агентов" })).toBeTruthy();
 });
 
 test("no_tabs_for_teacher_and_notice", async () => {

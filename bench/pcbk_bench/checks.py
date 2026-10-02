@@ -62,14 +62,15 @@ RUSSIAN_SHARE = 0.5
 RUN_SPENT_TEXT = "Потолок прогона отбора модели исчерпан"                      # LLM_MESSAGES["run_spent"]
 STAND_STATUSES = frozenset({"unavailable", "rate", "error"})                    # ответ службы — её сбой, не модели
 # имена инструментов службы — не коды отказа прокси (Д8-R72); ряд и наработка — с Д9а (Д9-R89)
-_TOOL_NAMES = frozenset({"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period", "pcbk_tag_series",
-                         "pcbk_calc_runtime", "pcbk_save_agent"})
+_TOOL_NAMES = frozenset({f"pcbk_{tool}" for tool in ALLOWED_TOOLS} | {"pcbk_save_agent"})   # как runner.TOOL_NAMES
 _PROXY_CODE = re.compile(r"\bpcbk_[a-z_]+\b")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?")
 _VALUE_FIELDS = ("value", "avg", "min", "max", "last")
 # полные источники — только значения историана; прочие числа вывода (шкала прибора min_eu/max_eu, cost_tag_days,
-# age_s, total …) и числа в строках службы — слабые: закрывают только other (I-2 доводки р1)
-_STRONG_FIELDS = frozenset({"value", "avg", "min", "max", "last", "range", "std", "percent_good"})
+# age_s, total …) и числа в строках службы — слабые: закрывают только other (I-2 доводки р1). С Д9а — и профиль ряда
+# (first, change; min, max, last — те же имена) и часы и доли состояний наработки (итоговая доводка Д9а, ревью А6 m-1)
+_STRONG_FIELDS = frozenset({"value", "avg", "min", "max", "last", "range", "std", "percent_good", "first", "change",
+                            "hours", "percent"})
 # служебные поля — не источники вовсе (р2, п. 5): цена, лимиты, счётчики, строки («0» из cost_tag_days 0,333)
 _SERVICE_FIELD = re.compile(r"^(?:cost|limit|total|rows|count|calls)|_(?:count|limit|rows)$")
 # «предел прибора/датчика/шкалы/измерения» — шкала, а не норма: признак suspect_norm не ставит (р2)
@@ -213,12 +214,13 @@ def _diffs(a: Decimal, b: Decimal) -> list[Decimal]:
 
 
 def _value_fields(turns: Iterable[Turn]) -> dict[str, list[Decimal]]:
-    """Значения (value, avg, min, max, last) по тегам из выводов tag_now и tag_period."""
+    """Значения (value, avg, min, max, last) по тегам из выводов tag_now и tag_period; у ряда — из профиля (и first)."""
     by_tag: dict[str, list[Decimal]] = {}
-    for c in _calls(turns, "tag_now") + _calls(turns, "tag_period"):
+    for c in _calls(turns, "tag_now") + _calls(turns, "tag_period") + _calls(turns, "tag_series"):
         for item in items_of(c):
-            for name in _VALUE_FIELDS:
-                d = _num(item.get(name))
+            src = item.get("profile") if short(c.tool) == "tag_series" else item
+            for name in _VALUE_FIELDS + ("first",):
+                d = _num(src.get(name)) if isinstance(src, dict) else None
                 if d is not None and item.get("tag"):
                     by_tag.setdefault(_up(item["tag"]), []).append(d)
     return by_tag
@@ -628,7 +630,7 @@ def _tags_seen(turns: list[Turn], acc: _Acc) -> None:
     seen = _seen_tags(turns)
     used: set[str] = set()
     for c in _calls(turns):
-        if short(c.tool) in ("tag_now", "tag_period", "save_agent"):
+        if short(c.tool) in ALLOWED_TOOLS or short(c.tool) == "save_agent":     # теги вызова — из каталога
             used |= {_up(t) for t in _input_tags(c)}
     for text in _texts(turns):
         used |= {_up(t) for t in tag_tokens(text)}          # без ISO-меток: «02T11» — не тег (C-1 доводки р1)

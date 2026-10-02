@@ -947,7 +947,9 @@ class DataService:
     @staticmethod
     def _runtime_item(entry: _Entry, snap: Snapshot | None, period_hours: float) -> dict[str, Any]:
         """Состояния по убыванию значения («нет данных» — последним): часы, доля периода, переходы;
-        covered_percent — сумма долей состояний со значением."""
+        covered_percent — сумма долей состояний со значением. Доли нет у состояния с часами (не ноль или NULL) —
+        покрытие неизвестно: covered_percent null и без coverage_note (ревью А2, m-2: иначе «покрывают 0 %» при
+        часах в ответе — ложное утверждение)."""
         if entry.lookup.status != "ok":
             return _other_item(entry)
         info = entry.lookup.info
@@ -967,11 +969,12 @@ class DataService:
         if not valued:
             return _no_data_item(info)
         valued.sort(key=lambda state: state["value"], reverse=True)
-        covered = sum((state["percent"] for state in valued if state["percent"] is not None), 0.0)
+        known = all(state["percent"] is not None or state["hours"] == 0 for state in valued)
+        covered = sum((state["percent"] for state in valued if state["percent"] is not None), 0.0) if known else None
         item: dict[str, Any] = {"tag": info.name, "status": "ok", "description": info.description,
                                 "states": valued + unknown, "covered_percent": covered,
                                 "period_hours": period_hours}
-        if covered < COVERAGE_MIN:
+        if covered is not None and covered < COVERAGE_MIN:
             item["coverage_note"] = (f"данные покрывают {_percent(covered)} % периода — часы состояний в сумме "
                                      "меньше периода")
         return item

@@ -9,8 +9,9 @@ TwinHistorian — тот же QueryFn, что FakeHistorian (запись выз
   сводки (20FAKE_107_PV) нет — у службы no_data; ряд (_SERIES_IN) — постоянное живое значение;
 - теги с сигналом (поле signals: 20FAKE_201_PV, 20FAKE_202_PV, 20FAKE_210_RUN) — числа по времени t, секундам эпохи
   UTC (analog_value, state_value): живое значение — в момент «сейчас − 20 с»; сводка и наработка (_STATE_IN) — по
-  отсчётам через 60 с на [start, end); ряд — N точек от start до end, концы включены, Quality 0. Числа зависят от
-  периода: автотест «агент = калькулятор» отличит неверный период;
+  отсчётам через 60 с на [start, end) (у наработки последний отсчёт — до конца периода; Last сводки — последний
+  отсчёт периода); ряд — N точек от start до end, концы включены, Quality 0. Числа зависят от периода: автотест
+  «агент = калькулятор» отличит неверный период;
 - тег состояния без сигнала (20FAKE_211_CLS) строк наработки не даёт — у службы no_data.
 
 Разбор SQL — регулярками fakes, период и число точек — своими, даты литералов — по своему DATE_FMT (не из
@@ -61,12 +62,22 @@ def state_value(sig: Mapping, t: float) -> int:
 
 
 def _is_state(sig: Mapping) -> bool:
-    """Вид сигнала по ключам: состояние (cycle_h, duty) или аналоговый (base, amp, period_h); иное — ValueError."""
+    """Вид сигнала по ключам: состояние (cycle_h, duty) или аналоговый (base, amp, period_h); иное — ValueError.
+    Числа — тоже при загрузке (ревью А3, m-3): период и цикл больше нуля, доля 0…1; иначе первый запрос дал бы
+    ZeroDivisionError, а доля вне 0…1 — молча постоянное состояние."""
     if set(sig) == STATE_KEYS:
+        if not (_finite(sig["cycle_h"]) and sig["cycle_h"] > 0 and _finite(sig["duty"]) and 0 <= sig["duty"] <= 1):
+            raise ValueError("двойник историана: цикл сигнала не больше нуля или доля вне 0…1")
         return True
     if set(sig) == ANALOG_KEYS:
+        if not (all(_finite(sig[k]) for k in ANALOG_KEYS) and sig["period_h"] > 0):
+            raise ValueError("двойник историана: период сигнала не больше нуля")
         return False
     raise ValueError("двойник историана: сигнал не того вида")
+
+
+def _finite(x: object) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def _epoch(local: datetime) -> float:
@@ -117,7 +128,8 @@ class TwinHistorian(FakeHistorian):
         if any(types.get(name) != (STATE_TYPE if name in self._states else ANALOG_TYPE) for name in self.signals):
             raise ValueError("двойник историана: сигнал у тега вне каталога или не того вида")
         self.now = now
-        self.live, self.clock = {}, []          # постоянные ответы FakeHistorian здесь не действуют
+        # постоянные ответы и данные FakeHistorian (live, clock, ряд и наработка fakes) здесь не действуют (А3, m-4)
+        self.live, self.clock, self.series, self.states = {}, [], {}, {}
 
     @classmethod
     def from_fixture(cls, path: Path | str = BENCH_FIXTURE,
@@ -149,11 +161,14 @@ class TwinHistorian(FakeHistorian):
         строка фикстуры за любой период; нет ни того, ни другого или нет отсчётов — None."""
         if name not in self.signals:
             return self.summary.get(name)
-        values = [self._value_at(name, t) for t in _samples(*span)]
+        times = _samples(*span)
+        values = [self._value_at(name, t) for t in times]
         if not values:
             return None
+        # Last (HAS_LAST) — последнее значение в периоде, а не живое (ревью А3, m-5): у закрытого периода — его конец
+        last = datetime.fromtimestamp(times[-1], TZ).replace(tzinfo=None)
         return {"Minimum": min(values), "Maximum": max(values), "Average": statistics.fmean(values),
-                "StdDev": statistics.pstdev(values), "PercentGood": 100.0}
+                "StdDev": statistics.pstdev(values), "PercentGood": 100.0, "Last": values[-1], "LastDateTime": last}
 
     def _series_of(self, name: str, times: list[datetime], stamp: datetime) -> list[Row]:
         """Точки ряда: по сигналу в каждый момент сетки, у тега без сигнала — постоянное живое значение."""
@@ -164,16 +179,20 @@ class TwinHistorian(FakeHistorian):
             return []
         return [(name, when, live[2], live[3]) for when in times]
 
-    def _states_of(self, name: str, samples: list[float]) -> list[Row]:
+    def _states_of(self, name: str, samples: list[float], t1: float) -> list[Row]:
         """Наработка тега состояния с сигналом по отсчётам — строка на каждое встретившееся состояние, по убыванию
-        значения: vValue; StateTimeTotal — отсчёты × SAMPLE_S в мс; StateTimePercent — доля отсчётов × 100;
-        StateCount — переходы в состояние внутри периода (начальное не считается). Без сигнала — строк нет."""
+        значения: vValue; StateTimeTotal — время отсчётов в мс: каждый отсчёт — SAMPLE_S, последний — до конца периода
+        t1 (ревью А3, m-2: конец не на целой минуте — часы не длиннее периода); StateTimePercent — доля этого времени
+        × 100; StateCount — переходы в состояние внутри периода (начальное не считается). Без сигнала — строк нет."""
         if name not in self._states or not samples:
             return []
         seq = [state_value(self.signals[name], t) for t in samples]
-        held = Counter(seq)
+        held: Counter[int] = Counter()
+        for t, v in zip(samples, seq):
+            held[v] += min(SAMPLE_S, t1 - t)
+        total = sum(held.values())
         entered = Counter(b for a, b in zip(seq, seq[1:]) if a != b)
-        return [(name, float(v), held[v] * SAMPLE_S * 1000, held[v] / len(seq) * 100, entered[v])
+        return [(name, float(v), round(held[v] * 1000), held[v] / total * 100, entered[v])
                 for v in sorted(held, reverse=True)]
 
     def _answer(self, sql: str) -> list[Row]:
@@ -214,8 +233,9 @@ class TwinHistorian(FakeHistorian):
             times = [start + (end - start) * i / (n - 1) for i in range(n)]     # концы включены, последняя — end
             return [row for name in _names(m.group("names")) for row in self._series_of(name, times, stamp)]
         if m := _STATE_IN.fullmatch(sql):
-            samples = _samples(*_span(sql))
-            return [row for name in _names(m.group("names")) for row in self._states_of(name, samples)]
+            start, end = _span(sql)
+            samples = _samples(start, end)
+            return [row for name in _names(m.group("names")) for row in self._states_of(name, samples, _epoch(end))]
         raise AssertionError("двойник историана: SQL вне шаблонов службы")
 
 

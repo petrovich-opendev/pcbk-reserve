@@ -36,7 +36,7 @@ PW = {login: Secret(secrets.token_urlsafe(12)) for login in OWN}
 SAVER = ('---\ndescription: "probe-save"\nmode: primary\npermission:\n  "*": deny\n'
          '  pcbk_save_agent: allow\n  pcbk_tag_now: allow\n---\nprobe\n')
 PCBK2 = {"pcbk_catalog_search", "pcbk_tag_now"}
-PCBK5 = PCBK2 | {"pcbk_tag_period", "pcbk_tag_series", "pcbk_calc_runtime"}   # агент по умолчанию места (Д6-R45, Д9-R89)
+PCBK5 = PCBK2 | {"pcbk_tag_period", "pcbk_tag_series", "pcbk_calc_runtime"}   # агент места по умолчанию (Д9-R89)
 RELOAD_TICK_S = 2.0                                                     # такт воркера перезагрузки (Д7-R58)
 # строк очереди перезагрузки у мест модуля — изнутри pcbk-core, только чтение: истина об очереди, а не pending
 # /health/agents (тот считает только готовые места)

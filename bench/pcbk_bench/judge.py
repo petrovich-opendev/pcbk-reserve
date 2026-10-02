@@ -43,7 +43,7 @@ from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Literal
 
-from .cards import Card, CardSet
+from .cards import ALLOWED_TOOLS, Card, CardSet
 from .checks import check_run, number_rule, output_of, short, suspect_norm_numbers
 from .numbers import TAG_TOKEN_RE, Shown, close, parse_numbers
 from .record import RunRecord, ToolCall, Turn
@@ -127,7 +127,8 @@ REFUSAL_TEXTS: dict[str, str] = {
     "prompt_length": "Инструкция агента — от 200 до 4000 знаков",
     "forbidden": "В поле … недопустимый фрагмент «…»: инструкции обхода, SQL, адреса, пути и пароли на стенде "
                  "запрещены",
-    "tools_empty": "Агенту нужен хотя бы один инструмент: catalog_search, tag_now, tag_period, tag_series, calc_runtime",
+    "tools_empty": "Агенту нужен хотя бы один инструмент: catalog_search, tag_now, tag_period, tag_series, "
+                   "calc_runtime",
     "tool_not_allowed": "Инструмента «…» на стенде нет. Можно: catalog_search, tag_now, tag_period, tag_series, "
                         "calc_runtime.",
     "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series или calc_runtime), а без тегов — "
@@ -197,14 +198,18 @@ HARNESS_TOOLS: frozenset[str] = frozenset({"SubagentHandback"})
 # ключи пакета с постоянными значениями (роль, инструмент, статусы, коды, период, единица): слова каталога не ищутся
 CONST_KEYS: frozenset[str] = frozenset({"role", "stage", "tool", "tools", "status", "code", "period", "preset",
                                         "unit", "already"})
+# инструменты данных агента студента — cards.ALLOWED_TOOLS, один источник (итоговое ревью Д9а, I-1): словарь, аргументы
+# и выводы пакета берут набор отсюда, а не литералами; save_agent — инструмент Конструктора, не данных
+DATA_TOOLS = frozenset(ALLOWED_TOOLS)
 # служебные слова пакета (ключи, инструменты, статусы, классы): из словаря каталога вычитаются, как постоянные тексты
 _SERVICE_TEXT = ("role stage tool tools args output status code text period preset start end items matches tag tags "
                  "description unit value avg min max last range std percent_good age_s time last_time quality "
                  "min_eu max_eu name title node purpose student_reply query problems already scenario what pass_if "
                  "transcript saved_prompt auto_flags numbers sources class allowed hard other suspect_norm "
                  "suspect_numbers prompt_numeric_limit number_missing foreign_number ok no_data no_value unlisted "
-                 "unknown refused partial error unavailable rate completed catalog_search tag_now tag_period "
-                 "save_agent bash write edit webfetch task")
+                 "unknown refused partial error unavailable rate completed points profile first first_time change "
+                 "min_time max_time states label hours percent count covered_percent period_hours "
+                 + " ".join(ALLOWED_TOOLS) + " save_agent bash write edit webfetch task")
 CONTROL_IDS = ("J1", "J2", "J3", "J4")
 
 
@@ -445,10 +450,10 @@ def _all_turns(rec: RunRecord) -> list[Turn]:
 
 
 def build_vocab(records: list[RunRecord], cards: CardSet) -> frozenset[str]:
-    """Словарь прогона: слова описаний из выводов catalog_search, tag_now и tag_period всех записей и узлы карточек
-    (Card.node, CardSet.bench_node); цели карточек — нет (П3)."""
+    """Словарь прогона: слова описаний из выводов всех инструментов данных (DATA_TOOLS — с Д9а и ряд tag_series, и
+    наработка calc_runtime) всех записей и узлы карточек (Card.node, CardSet.bench_node); цели карточек — нет (П3)."""
     descriptions = [d for r in records for t in _all_turns(r) for c in t.tools
-                    if short(c.tool) in ("catalog_search", "tag_now", "tag_period") for d in _descriptions_of(c)]
+                    if short(c.tool) in DATA_TOOLS for d in _descriptions_of(c)]
     nodes = [c.node for c in cards.cards.values() if c.node] + [cards.bench_node]
     return vocab_from(descriptions, nodes)
 
@@ -537,7 +542,11 @@ _CODE_RE = re.compile(r"[a-z_]{1,40}")
 _KEY_RE = re.compile(r"[A-Za-z_]{1,40}")
 _VALUE_FIELDS = ("value", "avg", "min", "max", "last", "range", "std", "percent_good")
 _SCALE_FIELDS = ("min_eu", "max_eu")
-_STAMP_FIELDS = ("time", "start", "end", "last_time")
+_STAMP_FIELDS = ("time", "start", "end", "last_time", "first_time", "min_time", "max_time")
+# профиль ряда (tag_series) и состояния наработки (calc_runtime, Д9а): числа — в вывод пакета, источники Ч-n
+_PROFILE_FIELDS = ("first", "last", "change", "min", "max")
+_PROFILE_STAMPS = ("first_time", "last_time", "min_time", "max_time")
+_STATE_FIELDS = ("hours", "percent", "count")
 ARG_TEXT_MAX = 400
 
 
@@ -655,19 +664,22 @@ def _known(rec: RunRecord, card: Card) -> tuple[list[str], list[str], dict[str, 
 
 
 def _args(c: ToolCall, m: _Masker) -> dict:
+    """Аргументы инструментов службы (DATA_TOOLS) и save_agent — по полям: теги псевдонимами, период, свои границы,
+    точки ряда, запрос; встроенных инструментов OpenCode — текстом."""
     tool = short(c.tool)
     raw = c.input if isinstance(c.input, dict) else {}
     out: dict[str, Any] = {}
-    if tool in ("tag_now", "tag_period", "catalog_search", "save_agent"):
+    if tool in DATA_TOOLS or tool == "save_agent":
         if isinstance(raw.get("tags"), list):
             out["tags"] = [m.tag(t) if isinstance(t, str) else "?" for t in raw["tags"]]
-        if tool == "tag_period":
+        if tool in DATA_TOOLS:
             period = raw.get("period")
             if isinstance(period, str):
                 out["period"] = period if period in PERIOD_PRESETS else m.text(period[:ARG_TEXT_MAX])
             for k in ("start", "end"):
                 if isinstance(raw.get(k), str):
                     out[k] = m.text(raw[k][:ARG_TEXT_MAX])
+            _put_num(out, "points", raw.get("points"))
         if tool == "catalog_search" and isinstance(raw.get("query"), str):
             out["query"] = m.text(raw["query"][:ARG_TEXT_MAX])
         if tool == "save_agent":
@@ -691,6 +703,31 @@ def _put_num(dst: dict, key: str, value: object) -> None:
         dst[key] = value
 
 
+def _series_runtime(i: dict, item: dict, m: _Masker) -> None:
+    """Профиль ряда (tag_series) и состояния наработки (calc_runtime) элемента: числа, метки времени профиля, подпись
+    состояния; точки сетки целиком в пакет не идут."""
+    profile = i.get("profile")
+    if isinstance(profile, dict):
+        prof: dict[str, Any] = {}
+        for k in _PROFILE_FIELDS:
+            _put_num(prof, k, profile.get(k))
+        for k in _PROFILE_STAMPS:
+            if isinstance(profile.get(k), str) and _ISO_RE.fullmatch(profile[k]):
+                prof[k] = profile[k]
+        item["profile"] = prof
+    if isinstance(i.get("states"), list):
+        states = []
+        for st in i["states"]:
+            if isinstance(st, dict):
+                one: dict[str, Any] = {"label": m.text(st["label"][:40])} if isinstance(st.get("label"), str) else {}
+                for k in _STATE_FIELDS:
+                    _put_num(one, k, st.get(k))
+                states.append(one)
+        item["states"] = states
+    for k in ("covered_percent", "period_hours"):
+        _put_num(item, k, i.get(k))
+
+
 def _output(c: ToolCall, m: _Masker) -> dict:
     """Сжатый вывод: значения, единицы, время, качество, статусы, коды отказов с постоянным текстом."""
     tool = short(c.tool)
@@ -698,8 +735,8 @@ def _output(c: ToolCall, m: _Masker) -> dict:
     if not out:
         return {"status": _code(c.status or "error")}
     res: dict[str, Any] = {"status": _code(out.get("status"))}
-    if tool in ("tag_now", "tag_period"):
-        if tool == "tag_period" and isinstance(out.get("period"), dict):
+    if tool in DATA_TOOLS and tool != "catalog_search":       # элементы по тегам: tag_now, tag_period, ряд, наработка
+        if isinstance(out.get("period"), dict):
             p = out["period"]
             span: dict[str, Any] = {}
             if isinstance(p.get("preset"), str) and p["preset"] in PERIOD_PRESETS:
@@ -727,6 +764,7 @@ def _output(c: ToolCall, m: _Masker) -> dict:
                     item[k] = i[k]
             if isinstance(i.get("quality"), str):
                 item["quality"] = m.text(i["quality"][:40])
+            _series_runtime(i, item, m)
             items.append(item)
         res["items"] = items
     elif tool == "catalog_search":

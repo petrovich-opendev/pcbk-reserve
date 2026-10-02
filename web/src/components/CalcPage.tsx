@@ -8,11 +8,12 @@
 // Стили — только классы chat.css: атрибутов style нет (CSP style-src 'self').
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { replyText, type Api, type CalcTool, type Reply } from "../api";
-import { buildRequest, CALC_SEARCH_LIMIT, CUSTOM_PERIOD, DEFAULT_FORM, fmtNum, fmtTime, MODE_CHOICES, PERIOD_CHOICES,
-         POINT_CHOICES, profileSegments, type CalcForm, type CalcMode } from "../calc";
-import { CALC_LABELS as L, T_CALC_ASOF_LINE, T_CALC_BUSY, T_CALC_COVERED, T_CALC_FIND, T_CALC_NO_RANGE, T_CALC_NO_TAG,
-         T_CALC_NOTHING, T_CALC_PERCENT, T_CALC_PERIOD_LINE, T_CALC_RUN, T_CALC_SECONDS, T_CALC_STATE_VALUE,
-         T_CALC_TITLE, T_UNKNOWN } from "../texts";
+import { badRange, buildRequest, CALC_QUERY_CHARS, CALC_SEARCH_LIMIT, CALC_TAG_CHARS, CUSTOM_PERIOD, DEFAULT_FORM,
+         fmtNum, fmtTime, MODE_CHOICES, PERIOD_CHOICES, POINT_CHOICES, profileSegments, SIMILAR_NOTE_CORE,
+         type CalcForm, type CalcMode } from "../calc";
+import { CALC_LABELS as L, T_CALC_ASOF_LINE, T_CALC_BAD_RANGE, T_CALC_BUSY, T_CALC_COVERED, T_CALC_FIND,
+         T_CALC_NO_RANGE, T_CALC_NO_TAG, T_CALC_NOTHING, T_CALC_PERCENT, T_CALC_PERIOD_LINE, T_CALC_RUN,
+         T_CALC_SECONDS, T_CALC_SIMILAR, T_CALC_STATE_VALUE, T_CALC_TITLE, T_UNKNOWN } from "../texts";
 
 export interface CalcPageProps {
   api: Api;
@@ -29,8 +30,6 @@ const noAnswer = (): Reply => ({ status: 0, body: null });
 
 const CHART_W = 600;
 const CHART_H = 160;
-const QUERY_CHARS = 200;        // QUERY_CHARS службы
-const TAG_CHARS = 128;          // TAG_CHARS службы
 
 // ответ шлюза → тело службы, текст для человека или конец сессии
 type Outcome = { kind: "body"; body: Obj } | { kind: "text"; text: string } | { kind: "signed_out" };
@@ -56,7 +55,9 @@ function searchOf(o: Outcome): Search {
     const tag = str(m.tag);
     if (tag !== null) matches.push({ tag, label: [tag, str(m.description), str(m.unit)].filter((s) => s !== null).join(" — ") });
   }
-  return { kind: "matches", matches, notes: strings(o.body.notes) };
+  // заметка службы «выберите вместе со студентом» адресована агенту — студенту своя (ревью А5, m-3)
+  const notes = strings(o.body.notes).map((n) => (n === SIMILAR_NOTE_CORE ? T_CALC_SIMILAR : n));
+  return { kind: "matches", matches, notes };
 }
 
 const withUnit = (x: unknown, unit: unknown): string => {
@@ -197,10 +198,12 @@ function Item({ tool, item }: { tool: CalcTool; item: Obj }) {
   );
 }
 
-// под числами: период с поясом (у текущего значения — момент чтения), источник, вид среднего, заметки ответа
-function About({ body }: { body: Obj }) {
+// под числами: период с поясом (у текущего значения — момент чтения), источник (у профиля — и число точек на тег:
+// текст источника службы постоянный, «N точек»), вид среднего, заметки ответа
+function About({ tool, body }: { tool: CalcTool; body: Obj }) {
   const period = isObject(body.period) ? body.period : null;
   const source = str(body.source);
+  const points = tool === "tag_series" && isNum(body.points) ? fmtNum(body.points) : null;
   const avgKind = isObject(body.avg_kind) ? str(body.avg_kind.text) : null;
   return (
     <>
@@ -210,9 +213,10 @@ function About({ body }: { body: Obj }) {
       {period === null && str(body.asof) !== null && (
         <p className="calc-period">{T_CALC_ASOF_LINE(fmtTime(body.asof), str(body.tz) ?? "—")}</p>
       )}
-      {(source !== null || avgKind !== null) && (
+      {(source !== null || points !== null || avgKind !== null) && (
         <dl className="calc-about">
           {source !== null && <div><dt>{L.source}</dt><dd>{source}</dd></div>}
+          {points !== null && <div><dt>{L.pointsPerTag}</dt><dd>{points}</dd></div>}
           {avgKind !== null && <div><dt>{L.avgKind}</dt><dd>{avgKind}</dd></div>}
         </dl>
       )}
@@ -226,7 +230,7 @@ function Answer({ tool, body }: { tool: CalcTool; body: Obj }) {
     <>
       {!answered(body) && <p className="calc-msg" role="alert">{str(body.message) ?? T_UNKNOWN}</p>}
       {objects(body.items).map((item, i) => <Item key={i} tool={tool} item={item} />)}
-      <About body={body} />
+      <About tool={tool} body={body} />
     </>
   );
 }
@@ -276,7 +280,7 @@ export function CalcPage(p: CalcPageProps) {
     if (inFlight.current.run) return;
     const request = buildRequest(form);
     if (request === null) {
-      setHint(form.tag.trim() === "" ? T_CALC_NO_TAG : T_CALC_NO_RANGE);
+      setHint(form.tag.trim() === "" ? T_CALC_NO_TAG : badRange(form) ? T_CALC_BAD_RANGE : T_CALC_NO_RANGE);
       return;
     }
     inFlight.current.run = true;
@@ -298,7 +302,7 @@ export function CalcPage(p: CalcPageProps) {
       <form className="calc-row" onSubmit={(e) => void find(e)}>
         <div className="calc-field calc-wide">
           <label htmlFor="calc-query">{L.query}</label>
-          <input id="calc-query" type="text" value={query} maxLength={QUERY_CHARS} autoComplete="off"
+          <input id="calc-query" type="text" value={query} maxLength={CALC_QUERY_CHARS} autoComplete="off"
                  onChange={(e) => setQuery(e.target.value)} />
         </div>
         <button type="submit" disabled={searching || query.trim() === ""}>{T_CALC_FIND}</button>
@@ -321,8 +325,8 @@ export function CalcPage(p: CalcPageProps) {
       <form className="calc-row" onSubmit={(e) => void run(e)}>
         <div className="calc-field calc-wide">
           <label htmlFor="calc-tag">{L.tag}</label>
-          <input id="calc-tag" type="text" value={form.tag} maxLength={TAG_CHARS} autoComplete="off" spellCheck={false}
-                 onChange={(e) => set({ tag: e.target.value })} />
+          <input id="calc-tag" type="text" value={form.tag} maxLength={CALC_TAG_CHARS} autoComplete="off"
+                 spellCheck={false} onChange={(e) => set({ tag: e.target.value })} />
         </div>
         <div className="calc-field">
           <label htmlFor="calc-mode">{L.mode}</label>

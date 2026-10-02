@@ -354,8 +354,8 @@ async def test_mcp_calculators_answer_from_service(core_server):
     assert series["status"] == "ok" and drop(series) == drop(json.loads(body))          # одна служба
     assert series["items"][0]["profile"]["change"] == 2.5 and runtime["items"][0]["states"][0]["hours"] == 18.0
     assert (default["status"], default["points"]) == ("ok", 24)                          # null — «не задан»
-    assert bad["message"] == "неверные аргументы: points: не больше 96"
-    assert five["message"] == "неверные аргументы: tags: не больше 4 элементов"
+    assert bad["message"] == "неверные аргументы: points: от 2 до 96"            # как у службы
+    assert five["message"] == "неверные аргументы: tags: не больше 4 тегов за вызов"
     events = core_server.role.events.recent(channel="mcp")
     assert [(e.tool, e.outcome) for e in events[:2]] == [("tag_series", "refused")] * 2
     assert {e.caller for e in events} == {"student-01"}

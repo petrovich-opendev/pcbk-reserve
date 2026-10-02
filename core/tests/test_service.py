@@ -610,6 +610,37 @@ async def test_failing_expires_without_calls(svc):                              
     assert s.tools_stats()["failing"] == []
 
 
+async def test_failing_streak_reset_by_refusal_midway(svc):                      # ревью А1, M-1: «любой другой исход»
+    s, fake = svc
+    fake.fail = HistorianError("query", "x")
+    for _ in range(FAIL_STREAK - 1):
+        await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert (await s.tag_now("student-01", "http", ["20FAKE_404_PV"]))["status"] == "refused"      # без SQL — обнуляет
+    await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert [e.outcome for e in s.role.events.recent()][:2] == ["error", "refused"]
+    assert s.tools_stats()["failing"] == []                                       # R83: серия — снова с одной ошибки
+
+
+async def test_failing_sorted_by_name(svc):                                      # ревью А1, M-2: по алфавиту, не по порядку
+    s, fake = svc
+    fake.fail = HistorianError("query", "x")
+    for tool in ("tag_period", "tag_now"):                                        # порядок вставки дал бы обратный
+        for _ in range(FAIL_STREAK):
+            if tool == "tag_period":
+                await s.tag_period("student-01", "http", ["20FAKE_001_PV"], period="prev_shift")
+            else:
+                await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
+    assert s.tools_stats()["failing"] == ["tag_now", "tag_period"]
+
+
+async def test_drill_before_args_and_catalog(tmp_path):                          # ревью А1, M-3: сразу после частоты
+    s, fake = make_service(tmp_path, settings=replace(SETTINGS, DRILL_DATA="tool_error"))
+    for tags in (["20FAKE_404_PV"], [" "], []):                                  # отказ каталога и аргументов — не раньше
+        r = await s.tag_now("ops", "http", tags)
+        assert (r["status"], r["message"]) == ("error", ERROR_MESSAGE) and "items" not in r, tags
+    assert fake.calls == [] and s.role.events.recent()[0].summary == DRILL_SUMMARY
+
+
 async def test_drill_tool_error_no_sql(tmp_path):                                 # Review Focus 3
     s, fake = make_service(tmp_path, settings=replace(SETTINGS, DRILL_DATA="tool_error"))
     for _ in range(FAIL_STREAK):
@@ -875,7 +906,9 @@ async def test_calculator_answers_are_strict_json(svc):
     it = series["items"][0]
     assert it["points"][1] == ["2026-10-01T08:00:00+05:00", None] and (it["profile"]["max"], it["profile"]["min"]) == (
         12.5, 10.0)
-    assert runtime["items"][0]["states"][1]["percent"] is None and runtime["items"][0]["covered_percent"] == 75.0
+    assert runtime["items"][0]["states"][1]["percent"] is None
+    it = runtime["items"][0]
+    assert it["covered_percent"] is None and "coverage_note" not in it          # ревью А2, m-2: доли нет
 
 
 async def test_failing_streak_counts_calculators(svc):                           # решение контроллера А2
@@ -891,3 +924,64 @@ async def test_failing_streak_counts_calculators(svc):                          
     assert s.tools_stats()["failing"] == ["calc_runtime"]
     r = await s.calc_runtime("student-02", "http", ["20FAKE_001_PV"], period="yesterday")   # отказ — не ошибка
     assert r["status"] == "refused" and s.tools_stats()["failing"] == []
+
+
+# итоговая доводка Д9а, ревью А2: покрытие без ложного утверждения (m-1, m-2) и пробелы тестов полей ответа (m-4)
+
+
+async def test_calc_runtime_coverage_unknown_without_percent(svc):                # m-2: «0 %» при 24 ч часов — ложь
+    s, fake = svc
+    fake.states["25FAKE_007_CLS"] = [(1.0, 64_800_000, None, 3), (0.0, 21_600_000, None, 3)]
+    it = (await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="yesterday"))["items"][0]
+    assert [x["hours"] for x in it["states"]] == [18.0, 6.0]
+    assert it["covered_percent"] is None and "coverage_note" not in it
+    fake.states["25FAKE_007_CLS"] = [(1.0, 86_400_000, 100.0, 1), (0.0, 0, None, 0)]   # без доли, но и без часов
+    it = (await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="last_24h"))["items"][0]
+    assert it["covered_percent"] == 100.0 and "coverage_note" not in it
+
+
+async def test_calc_runtime_zero_hours_ok_with_coverage_note(svc):               # m-1: «ok», но о покрытии — сказано
+    s, fake = svc
+    fake.states["25FAKE_007_CLS"] = [(1.0, 0, 0.0, 0), (0.0, 0, 0.0, 0)]
+    it = (await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="yesterday"))["items"][0]
+    assert (it["status"], [x["hours"] for x in it["states"]], it["covered_percent"]) == ("ok", [0.0, 0.0], 0.0)
+    assert it["coverage_note"] == "данные покрывают 0 % периода — часы состояний в сумме меньше периода"
+
+
+async def test_calc_runtime_period_hours_and_notes(svc):                         # m-4: длина периода, заметки периода
+    s, _ = svc
+    r = await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="last_8h")
+    assert (r["items"][0]["period_hours"], r["notes"]) == (8.0, [OPEN_NOTE])
+    r = await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="current_shift")
+    assert r["notes"] == [SHIFT_NOTE, OPEN_NOTE] and r["items"][0]["period_hours"] == 6.0
+
+
+async def test_tag_series_clamped_own_period_notes(svc):                         # m-4: конец ограничен «сейчас»
+    s, _ = svc
+    r = await s.tag_series("student-01", "http", ["20FAKE_001_PV"], start="2026-10-01T04:00", end="2026-10-01T13:00",
+                           points=3)
+    assert r["notes"] == [GRID_NOTE, OPEN_NOTE, CLAMP_NOTE]
+    assert (r["period"]["end"], r["period"]["clamped"], r["period"]["preset"]) == ("2026-10-01T12:00:00+05:00", True,
+                                                                                   None)
+
+
+async def test_tag_series_open_from_cache(svc):                                  # m-4: числа читались, пока период шёл
+    s, _ = svc
+    own = {"start": "2026-10-01T04:00", "end": "2026-10-01T11:55:30", "points": 3}
+    s.role.monotonic.advance(29)                          # 12:00:29: конец 4 мин 59 с назад — период ещё идёт
+    first = await s.tag_series("student-01", "http", ["20FAKE_001_PV"], **own)
+    s.role.monotonic.advance(2)                           # 12:00:31: по часам период закрыт, запись кэша жива
+    again = await s.tag_series("student-02", "http", ["20FAKE_001_PV"], **own)
+    fresh = await s.tag_series("student-02", "http", ["20FAKE_001_PV"], **{**own, "points": 4})
+    assert (first["cache"], again["cache"], fresh["cache"]) == ("miss", "hit", "miss")
+    assert first["period"]["open"] is again["period"]["open"] is True and OPEN_NOTE in again["notes"]
+    assert fresh["period"]["open"] is False and OPEN_NOTE not in fresh["notes"]    # контроль: без кэша — закрыт
+
+
+async def test_tag_series_first_of_equal_extremes(svc):                          # m-4: из равных — первый
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = [(datetime(2026, 10, 1, h), v, 0) for h, v in ((4, 10.0), (6, 15.0), (8, 10.0),
+                                                                                    (12, 15.0))]
+    p = (await s.tag_series("student-01", "http", ["20FAKE_001_PV"], period="last_8h", points=4))["items"][0]["profile"]
+    assert (p["min_time"], p["max_time"]) == ("2026-10-01T04:00:00+05:00", "2026-10-01T06:00:00+05:00")
+    assert (p["min"], p["max"], p["change"]) == (10.0, 15.0, 5.0)
