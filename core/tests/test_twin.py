@@ -54,7 +54,7 @@ def test_install_twin_reaches_data_role(monkeypatch, tmp_path):                 
     import pcbk_core.data.historian as h
     monkeypatch.setattr(h, "tds_query", h.tds_query)
     bdrv = tmp_path / "bdrv.env"
-    bdrv.write_text("BDRV_HOST=192.0.2.10\nBDRV_USER=u\nBDRV_PW=p\n", encoding="utf-8")
+    bdrv.write_text("BDRV_HOST=192.0.2.10\nBDRV_USER=u\nBDRV_PW=<test-pw>\n", encoding="utf-8")   # заглушка
     settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"), BDRV_ENV_FILE=str(bdrv))
     assert install_twin({"PCBK_TWIN_HISTORIAN": str(BENCH_FIXTURE)}) is True
     data = {r.name: r for r in build_roles(settings, LLM_ENV)}["data"]
