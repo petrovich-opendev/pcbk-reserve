@@ -1,15 +1,18 @@
 """Ворота к историану: белый список литералов, полосы и места, срок, общий предел, защёлка входа."""
 import asyncio
 import time
+from datetime import datetime
 
 import anyio
+import pytds
 import pytest
 
-from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian
+from fakes import CLOCK_ROWS, WHITELIST, FakeHistorian, RecordingConnect
 from helpers import FakeMono
 from pcbk_core.data.gate import AUTH_LATCH_TEXT, CONNECT_COOLDOWN_S, GateRefused, HistorianGate, SlidingWindow
-from pcbk_core.data.historian import HistorianError
-from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, live_sql
+from pcbk_core.data.historian import HistorianError, tds_query
+from pcbk_core.secrets import BdrvConfig
+from pcbk_core.data.sql import allowed_literal, catalog_sql, clock_sql, lit_dt, live_all_sql, live_sql, summary_sql
 from pcbk_core.logs import setup_logging
 
 pytestmark = pytest.mark.anyio
@@ -151,6 +154,22 @@ async def test_auth_error_latches_until_restart():                              
     assert len(fake.calls) == 1 and g.stats()["auth_latched"] is True
 
 
+async def test_sql_browser_login_error_pauses_not_latches():                  # ревью: LoginError — не пароль
+    mono = FakeMono(1000.0)
+    rec = RecordingConnect(fail_on_connect=pytds.LoginError("Instance INST not found on server h"))
+    g = gate(tds_query(BdrvConfig("h\\INST", None, "Runtime", "u", "p"), connect=rec), monotonic=mono)
+    with pytest.raises(HistorianError) as e:
+        await g.run([clock_sql()], lane="background")
+    assert e.value.code == "connect" and g.stats()["auth_latched"] is False
+    with pytest.raises(HistorianError) as e:
+        await g.run([clock_sql()], lane="background")
+    assert e.value.detail == "пауза после обрыва" and rec.connect_count == 1
+    mono.advance(CONNECT_COOLDOWN_S)
+    rec.fail_on_connect, rec.results = None, [CLOCK_ROWS]
+    assert (await g.run([clock_sql()], lane="background")).rows == [CLOCK_ROWS]
+    assert rec.connect_count == 2 and g.stats()["auth_latched"] is False
+
+
 async def test_connect_failure_pauses_attempts():
     mono = FakeMono(1000.0)
     fake = FakeHistorian(fail=HistorianError("connect", "refused"))
@@ -198,7 +217,7 @@ async def test_literal_ok_does_not_open_names_and_names_do_not_open_literals():
     assert fake.calls == []
 
 
-async def test_driver_errors_carry_sent_and_log_no_detail(capfd):
+async def test_driver_errors_carry_sent_and_log_no_detail(capfd, restore_logging):
     setup_logging()                                    # обработчик берёт sys.stderr в момент записи
     fake = FakeHistorian(fail=HistorianError("query", "Invalid object name '20FAKE_001_PV' for user 'FAKEUSER'"))
     g = gate(fake)
@@ -305,3 +324,35 @@ async def test_latch_text_names_both_causes():
         await g.run([clock_sql()])
     assert AUTH_LATCH_TEXT in e.value.detail
     assert "обновите bdrv.env или проверьте, не была ли база историана недоступна" in AUTH_LATCH_TEXT
+
+
+# Д3б, задача 2: сводка — даты и ww-значения через literal_ok, форма summary в реестре (F1)
+
+T6, T14 = datetime(2026, 10, 1, 6), datetime(2026, 10, 1, 14)          # те же, что в test_sql.py
+
+
+@pytest.mark.anyio
+async def test_gate_passes_summary_literals_only():
+    g = HistorianGate(FakeHistorian(), allowed=WHITELIST, literal_ok=allowed_literal)
+    assert (await g.run([summary_sql(["20FAKE_001_PV"], T6, T14)])).sent == ("20FAKE_001_PV",)
+    assert g.stats()["refused_unlisted"] == 0                    # форма summary зарегистрирована (F1)
+    with pytest.raises(GateRefused):
+        await g.run(["SELECT TagName FROM AnalogHistory WHERE TagName = '20FAKE_001_PV' AND wwRetrievalMode = 'Delta'"])
+    with pytest.raises(GateRefused):                              # имя вне списка и в верной форме
+        await g.run([summary_sql(["16FAKE_009_PV"], T6, T14)])
+
+
+async def test_gate_refuses_summary_with_non_ascii_digits():                   # ревью I1
+    fake = FakeHistorian()
+    g = HistorianGate(fake, allowed=WHITELIST, literal_ok=allowed_literal)
+    good = summary_sql(["20FAKE_001_PV"], T6, T14)
+    start = lit_dt(T6)
+    # год и вторая цифра секунд — там strptime берёт любые цифры; форма на \d — тоже
+    bads = [good.replace(start, start.replace("2026", "٢٠٢٦", 1).replace(":00.000", ":0٥.000")),
+            good.replace(start, start.replace("2026", "２０２６", 1))]
+    assert all(bad != good for bad in bads)
+    for bad in bads:
+        with pytest.raises(GateRefused) as e:
+            await g.run([bad])
+        assert e.value.code == "unlisted"
+    assert fake.calls == [] and g.stats()["refused_unlisted"] == 2

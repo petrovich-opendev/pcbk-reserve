@@ -75,8 +75,8 @@ def _error(code: ErrorCode, exc: BaseException) -> HistorianError:
 
 
 def _login_code(exc: BaseException) -> ErrorCode:
-    if isinstance(exc, pytds.LoginError):
-        return "auth"
+    # отказ учётных данных — только по номеру сообщения SQL Server. pytds.LoginError у 1.17.1 бросает лишь
+    # клиент SQL Browser («экземпляр не найден», «нет TCP»), вход не начинался, msg_no = 0 — это связь
     if isinstance(exc, pytds.OperationalError) and _msg_no(exc) in AUTH_MSG_NOS:
         return "auth"
     return "connect"            # в том числе встроенный TimeoutError: вход не успел — это связь

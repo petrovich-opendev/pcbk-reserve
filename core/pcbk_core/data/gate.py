@@ -113,6 +113,12 @@ class HistorianGate:
         self._auth_latched = False
         self._pause_until: float | None = None
 
+    def clear_pause(self) -> None:
+        """Только для тестов: снимает защёлку входа и паузу после обрыва. У людей их снимает перезапуск
+        службы."""
+        self._auth_latched = False
+        self._pause_until = None
+
     def stats(self) -> dict:
         """Только числа и флаги, без имён тегов."""
         return {"sent_names_total": self._sent_names_total,

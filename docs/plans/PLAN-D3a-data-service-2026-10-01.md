@@ -108,7 +108,9 @@
   задачи 8 не делаются, выкладка останавливается перед шагом 4. Видимый
   результат — как в ветке «задача 7 не зелёна», плюс строка владельцу.
 - **Проба получила отказ учётных данных** (задача 1, запрос 1 — `auth`:
-  `LoginError`, 18452, 18456, 18486–18488) — **стоп**: ни построителя, ни
+  `OperationalError` с 18452, 18456, 18486–18488; `LoginError` в pytds 1.17.1
+  бросает только клиент SQL Browser — «экземпляр не найден / нет TCP», вход не
+  делался, это `connect`, см. `$JOB/pcbk-d3/probe-notes.md`) — **стоп**: ни построителя, ни
   `core`, ни учений, потому что каждый вход бьёт общую с Dify учётку. В тот же
   час владельцу — строка «обновить `/opt/dify/scripts/.bdrv.env` или копию и
   повторить `install`». День идёт локально.
@@ -460,7 +462,7 @@ Expected: ответ на каждый из 6 запросов (вердикт �
 
 | Итог | Решение | По умолчанию |
 |---|---|---|
-| запрос 1 — `auth` (`LoginError`, 18452, 18456, 18486–18488) | **стоп** (ветка шапки): ни построителя, ни `core`, ни учений; строка владельцу | — |
+| запрос 1 — `auth` (`OperationalError` с 18452, 18456, 18486–18488; `LoginError` — SQL Browser, это `connect`) | **стоп** (ветка шапки): ни построителя, ни `core`, ни учений; строка владельцу | — |
 | О11: 8-й по свежести тег набора моложе 100 с | `HIST_WARN_S=300`, `HIST_FAIL_S=900` | те же |
 | О11: он старше 100 с | `HIST_WARN_S` = 3 × его возраст (вверх до минуты), `HIST_FAIL_S` = 3 × `HIST_WARN_S` | — |
 | запросы 5 + 6 дольше 10 с | `CATALOG_DEADLINE_S` = 3 × их сумма (вверх до 10 с) | `60` |
@@ -680,8 +682,9 @@ git commit -m "Серверный слой: каркас ролей, здоро�
       аргументом и `fetchall()`; закрытие — в `finally`;
     - `disable_connect_retry=True`: иначе pytds внутри одного `connect`
       делает до 4 попыток входа;
-    - разбор ошибок — по фазе. Из `connect`: `pytds.LoginError` или
-      `pytds.OperationalError` с `msg_no` из `AUTH_MSG_NOS` → `auth`, всё
+    - разбор ошибок — по фазе. Из `connect`: `pytds.OperationalError` с
+      `msg_no` из `AUTH_MSG_NOS` → `auth` (`pytds.LoginError` бросает только
+      клиент SQL Browser до входа — это `connect`, исправлено d408b42), всё
       прочее (в том числе встроенный `TimeoutError`) → `connect`. При чтении:
       `socket.timeout`/`TimeoutError` → `timeout`, `OSError` → `connect`,
       `pytds.Error` → `query`;
@@ -829,7 +832,7 @@ def test_connect_args_prelude_one_argument_and_deadline_timeout():
     assert "port" not in rec2.kwargs and rec2.kwargs["timeout"] == 45
 
 @pytest.mark.parametrize("where,exc,code", [
-    ("connect", pytds.LoginError("Login failed"), "auth"),
+    ("connect", pytds.LoginError("Instance X not found on server Y"), "connect"),  # SQL Browser, d408b42
     ("connect", auth_operational_error(18456), "auth"),          # OperationalError с msg_no
     ("connect", auth_operational_error(18452), "auth"),
     ("connect", ConnectionRefusedError(), "connect"),

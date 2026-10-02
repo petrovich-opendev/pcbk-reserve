@@ -1,20 +1,73 @@
 """Общие константы и помощники тестов серверного слоя (импорт явный: from helpers import …)."""
+import atexit
+import hashlib
 import itertools
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
 import time
-from collections.abc import Callable
-from contextlib import nullcontext
+import urllib.error
+import urllib.request
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
 
+import anyio
+import httpx
+import pytest
+import uvicorn
 from fastapi import APIRouter, FastAPI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
 from fakes import WHITELIST, FakeHistorian
-from pcbk_core.app import RoleBase
+from pcbk_core.app import RoleBase, create_app
 from pcbk_core.data import DataRole
+from pcbk_core.data.catalog import Catalog
+from pcbk_core.data.events import CallEvent
+from pcbk_core.data.historian import parse_clock
+from pcbk_core.data.service import DataService
+from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
+from pcbk_core.secrets import TokenTable
 from pcbk_core.settings import Settings
 
-# настройки тестов строятся напрямую: проверки from_env на них не действуют
-SETTINGS = Settings()
+# каталог core/: из него подпроцессы импортируют pcbk_core
+CORE_DIR = Path(__file__).resolve().parent.parent
 
 _files = itertools.count(1)
+
+
+def sha(text: str) -> str:
+    """sha256 строки в шестнадцатеричном виде — как в файле core-tokens."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# тестовый токен — не 48 шестнадцатеричных знаков: шаблон проверки на секреты Д2 его не ловит (F17)
+TOKEN = "test-token-student-01"
+TEST_TOKENS = TokenTable({"student-01": sha(TOKEN)})
+
+# каталог сессии тестов: журнал событий и core-tokens — здесь, не в /var/lib/pcbk-core и /run/secrets (F4)
+SESSION_DIR = Path(tempfile.mkdtemp(prefix="pcbk-core-tests-"))
+atexit.register(shutil.rmtree, SESSION_DIR, ignore_errors=True)
+(SESSION_DIR / "core-tokens").write_text(f"student-01 {sha(TOKEN)}\n", encoding="utf-8")
+# настройки тестов строятся напрямую: проверки from_env на них не действуют
+SETTINGS = Settings(DB_PATH=str(SESSION_DIR / "core.db"), TOKENS_FILE=str(SESSION_DIR / "core-tokens"))
+
+# тесты, где права отнимает chmod: от root права каталога и файла не действуют
+non_root = pytest.mark.skipif(os.geteuid() == 0, reason="от root chmod не отнимает права")
+
+# пример события вызова: берут test_events.py и test_role.py (F16)
+EVENT = CallEvent(ts=datetime(2026, 10, 1, 7, tzinfo=timezone.utc), caller="student-01", agent=None,
+                  channel="http", tool="tag_now", requested=("20FAKE_001_PV", "X' OR 1=1--"),
+                  tags=("20FAKE_001_PV",), sent=("20FAKE_001_PV",), start=None, end=None, outcome="partial",
+                  summary="", cost=0.0, cache="miss", rows=1, duration_ms=12)
 
 
 def write(tmp_path, text: str) -> str:
@@ -22,6 +75,39 @@ def write(tmp_path, text: str) -> str:
     path = tmp_path / f"file-{next(_files)}.env"
     path.write_text(text, encoding="utf-8")
     return str(path)
+
+
+def run_python(code: str) -> str:
+    """Код в свежем интерпретаторе из каталога core/; ненулевой код — CalledProcessError.
+
+    stdout — результат; stderr не перехватывается: pytest покажет его у упавшего теста.
+    """
+    return subprocess.run([sys.executable, "-c", code], cwd=CORE_DIR, check=True,
+                          stdout=subprocess.PIPE, text=True).stdout
+
+
+def free_port() -> int:
+    """Свободный сейчас TCP-порт на 127.0.0.1."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_http(url: str, timeout: float = 10) -> tuple[int, str]:
+    """GET, пока слушатель не ответит: (код, тело), в том числе 503; не дождался — AssertionError."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # мимо прокси окружения
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            with opener.open(url, timeout=2) as r:
+                return r.status, r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read().decode("utf-8")
+        except (urllib.error.URLError, OSError):
+            if time.monotonic() > end:
+                raise AssertionError(f"{url}: слушатель не ответил за {timeout} с") from None
+            time.sleep(0.1)
 
 
 class FakeMono:
@@ -38,12 +124,46 @@ class FakeMono:
 
 
 def make_role(settings: Settings = SETTINGS, fake: FakeHistorian | None = None,
-              whitelist: frozenset[str] = WHITELIST, mono: Callable[[], float] | None = None,
-              ) -> tuple[DataRole, FakeHistorian]:
-    """Роль «данные» на двойнике историана; часы по умолчанию — FakeMono(1000.0)."""
+              whitelist: frozenset[str] = WHITELIST, mono: Callable[[], float] | None = None, *,
+              db_dir: str | Path | None = None, tokens: TokenTable = TEST_TOKENS,
+              config_error: str | None = None) -> tuple[DataRole, FakeHistorian]:
+    """Роль «данные» на двойнике историана; часы по умолчанию — FakeMono(1000.0).
+
+    Журнал событий — core.db в db_dir, по умолчанию в новом каталоге внутри каталога сессии: у каждой
+    роли свой журнал. Каталог только запоминается — роль его не трогает до lifespan или записи.
+    """
     fake = FakeHistorian() if fake is None else fake
     mono = FakeMono(1000.0) if mono is None else mono
-    return DataRole(settings, fake, whitelist, monotonic=mono), fake
+    db_dir = tempfile.mkdtemp(dir=SESSION_DIR) if db_dir is None else db_dir
+    settings = replace(settings, DB_PATH=str(Path(db_dir) / "core.db"))
+    return DataRole(settings, fake, whitelist, monotonic=mono, tokens=tokens, config_error=config_error), fake
+
+
+def make_service(tmp_path, **kwargs) -> tuple[DataService, FakeHistorian]:
+    """Служба роли с загруженным каталогом; fake.calls очищены.
+
+    Каталог грузится теми же запросами, что refresh_catalog, но прямо через двойник, без ворот и цикла
+    событий: помощник синхронный. Первый вызов инструмента поэтому — первый вход ворот.
+    """
+    role, fake = make_role(db_dir=tmp_path, **kwargs)
+    clock_rows, tag_rows = fake([clock_sql(), catalog_sql()], 10.0)
+    [live_rows] = fake([live_all_sql()], 10.0)
+    role._catalog_loaded(Catalog.from_rows(tag_rows, live_rows, role.whitelist), parse_clock(clock_rows),
+                         role.monotonic())
+    fake.calls.clear()
+    fake.timeouts.clear()
+    return role.service, fake
+
+
+def make_app(tmp_path, **kwargs) -> tuple[FastAPI, DataRole]:
+    """Приложение с одной ролью «данные» на двойнике; каталог грузит lifespan (TestClient)."""
+    role, _ = make_role(db_dir=tmp_path, **kwargs)
+    return create_app(SETTINGS, [role]), role
+
+
+def sent_of(fake: FakeHistorian) -> list[str]:
+    """Имена из names_in всех SQL, переданных двойнику, по порядку."""
+    return [name for call in fake.calls for sql in call for name in names_in(sql)]
 
 
 def wait_until(pred: Callable[[], bool], timeout: float = 5) -> None:
@@ -53,6 +173,71 @@ def wait_until(pred: Callable[[], bool], timeout: float = 5) -> None:
         if time.monotonic() > end:
             raise AssertionError(f"условие не выполнилось за {timeout} с")
         time.sleep(0.01)
+
+
+async def wait_until_async(pred: Callable[[], bool], timeout: float = 5) -> None:
+    """Ждёт условия в цикле событий теста, отдавая его фоновым задачам; не дождался — AssertionError."""
+    end = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > end:
+            raise AssertionError(f"условие не выполнилось за {timeout} с")
+        await anyio.sleep(0.01)
+
+
+@contextmanager
+def serve_role(role: DataRole, *, wait_catalog: bool = True) -> Iterator[str]:
+    """create_app с одной ролью под uvicorn в потоке на 127.0.0.1 (порт выбирает ядро); отдаёт url.
+
+    wait_catalog — ждать загрузки каталога (роль с ошибкой настройки его не грузит). Журнал uvicorn не
+    настраивается, доступ не пишется — как в serve().
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(create_app(SETTINGS, [role]), lifespan="on", log_config=None,
+                                           access_log=False))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, name="serve-role", daemon=True)
+    thread.start()
+    try:
+        wait_until(lambda: server.started or not thread.is_alive(), timeout=10)
+        assert server.started, "uvicorn не поднялся"
+        if wait_catalog:
+            wait_until(lambda: role.catalog.loaded)
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        sock.close()
+        assert not thread.is_alive(), "uvicorn не остановился за 10 с"
+
+
+@asynccontextmanager
+async def mcp_session(url: str, token: str) -> AsyncIterator[ClientSession]:
+    """Клиент MCP SDK с Bearer-токеном: Streamable HTTP → ClientSession → initialize().
+
+    streamable_http_client с готовым httpx-клиентом — то же, что устаревший streamablehttp_client(url,
+    headers=…), без предупреждения; trust_env=False — мимо прокси окружения.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(10, read=30), trust_env=False) as client:
+        async with streamable_http_client(url, http_client=client) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+
+def http_post(url: str, body: object, token: str | None = None) -> tuple[int, str]:
+    """POST JSON мимо прокси окружения: (код, тело), в том числе 4xx и 5xx."""
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=10) as r:
+            return r.status, r.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, e.read().decode("utf-8")
 
 
 async def dummy(scope, receive, send):

@@ -2,7 +2,7 @@
 import pytest
 
 from fakes import CATALOG_ROWS, EXTRA, WHITELIST, FakeHistorian
-from helpers import write
+from helpers import run_python, write
 from pcbk_core.data import build_whitelist
 from pcbk_core.data.build_whitelist import RULE_VERSION, main, select_whitelist, summary_lines, write_list
 from pcbk_core.data.historian import HistorianError
@@ -108,7 +108,8 @@ def test_write_list_replaces_read_only_file_and_checks_input(tmp_path):
     assert [f.name for f in tmp_path.iterdir()] == ["whitelist.txt"]      # временных файлов не осталось
 
 
-def _run(monkeypatch, tmp_path, fake, *extra_args, extra_text="QFAKE_010\nQFAKE_011_LMN\nQFAKE_GONE\n"):
+def _run(monkeypatch, tmp_path, fake, *extra_args, extra_text="QFAKE_010\nQFAKE_011_LMN\nQFAKE_GONE\n",
+         guard=False):
     seen = []
 
     def fake_tds_query(cfg):
@@ -119,7 +120,8 @@ def _run(monkeypatch, tmp_path, fake, *extra_args, extra_text="QFAKE_010\nQFAKE_
     extra = tmp_path / "whitelist.extra"
     extra.write_text(extra_text)
     out = tmp_path / "whitelist.txt"
-    code = main(["--out", str(out), "--extra", str(extra), "--env-file", write(tmp_path, ENV), *extra_args])
+    code = main(["--out", str(out), "--extra", str(extra), "--env-file", write(tmp_path, ENV), *extra_args],
+                guard=guard)
     return code, out, seen
 
 
@@ -182,3 +184,27 @@ def test_main_bad_list_fails_before_historian(monkeypatch, tmp_path, capsys):
     err = capsys.readouterr().err
     assert code == 1 and fake.calls == [] and seen == [] and not out.exists()
     assert "whitelist.extra: строка 2: недопустимое имя" in err
+
+
+def test_main_installs_guard_only_when_asked(monkeypatch, tmp_path):             # F2
+    seen = []
+    monkeypatch.setattr(build_whitelist, "install_historian_guard", seen.append)
+    assert _run(monkeypatch, tmp_path, FakeHistorian())[0] == 0 and seen == []
+    assert _run(monkeypatch, tmp_path, FakeHistorian(), guard=True)[0] == 0
+    assert [(c.host, c.port) for c in seen] == [("h", 1433)]
+
+
+def test_builder_entry_point_installs_guard(tmp_path):                          # F2: охрана — в __main__
+    extra, env = write(tmp_path, "QFAKE_010\n"), write(tmp_path, ENV)
+    out = run_python(f"""
+import runpy, sys
+import pcbk_core.data.historian as h
+h.tds_query = lambda cfg: (lambda statements, t: [[]])       # историана нет: пустой каталог → код 1
+sys.argv = ['build_whitelist', '--out', {str(tmp_path / 'w.txt')!r}, '--extra', {extra!r}, '--env-file', {env!r}]
+try:
+    runpy.run_module('pcbk_core.data.build_whitelist', run_name='__main__')
+except SystemExit as e:
+    from pcbk_core.egress import egress_guard_installed
+    print(e.code, egress_guard_installed())
+""")
+    assert out.splitlines()[-1].split() == ["1", "True"]        # выше — счётчики построителя
