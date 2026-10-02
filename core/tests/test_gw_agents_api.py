@@ -2,6 +2,7 @@
 own и limit. Место — только из учётки сессии; зона, ошибка настройки (у маршрута свои front_only и configured, m24),
 сессия, преподаватель и сбой учёта — отказы JSON вида OpenCode. Строки учёта тест пишет напрямую (файл агента ручке не
 нужен); воркер перезагрузки припаркован — его проход менял бы состояния строк посреди теста."""
+import json
 import re
 import sqlite3
 from contextlib import closing
@@ -87,6 +88,11 @@ def test_agents_api_refusals(gw):
 
 def test_image_agents_match_image():
     assert {n for n, _, _ in IMAGE_AGENTS} == {p.stem for p in (REPO / "student/config/agent").glob("*.md")}
+
+
+def test_image_permission_denies_all_first():                           # итоговое ревью Д7б, I-1: без Docker
+    perm = json.loads((REPO / "student/config/opencode.json").read_text("utf-8"))["permission"]
+    assert list(perm)[0] == "*" and perm["*"] == "deny"            # агент без своих правил — только правила стенда
 
 
 # --- сверх брифа ---
