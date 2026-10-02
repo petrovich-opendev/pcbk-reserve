@@ -232,6 +232,12 @@ def _sources(turns: list[Turn]) -> tuple[list[Decimal], list[Decimal]]:
         for i, a in enumerate(uniq):
             for b in uniq[i + 1:]:
                 strong += _diffs(a, b)
+    for c in _calls(turns, "tag_now"):
+        vals = [(i.get("unit"), d) for i in items_of(c) if (d := _num(i.get("value"))) is not None]
+        for k, (u, a) in enumerate(vals):
+            for u2, b in vals[k + 1:]:
+                if u == u2:
+                    strong += _diffs(a, b)
     return strong, weak
 
 
@@ -345,6 +351,8 @@ def _key_found(texts: list[str], candidates: list[Decimal], label: str | None = 
                 lab = value_label(text, x, shown)
                 if lab in (label, None) or _bound_words(text, x, shown)[0].end() > x.start:
                     pool.append(x)
+        if not any(lab == label for _, lab in measured):
+            pool = [s for s, _ in measured]
     return any(close(s, c) for s in pool for c in candidates)
 
 
