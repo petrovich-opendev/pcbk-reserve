@@ -21,10 +21,14 @@ PERIODS = {"prev_shift": ("2026-10-09T22:00:00+05:00", "2026-10-10T06:00:00+05:0
            "yesterday": ("2026-10-09T00:00:00+05:00", "2026-10-10T00:00:00+05:00")}
 
 
+NOW_END = PERIODS["last_24h"][1]                # «сейчас» тестовых данных — 10.10 12:00 историана
+
+
 def period_call(preset=None, span=None, avg=81.234, mn=70.0, mx=90.5, status="ok"):
+    # доводка р1 (I-1, решение контроллера): период, кончающийся «сейчас» (12:00), — open, иной — нет; и свой тоже
     start, end = span or PERIODS[preset]
     out = {"tool": "tag_period", "status": "ok" if status == "ok" else status,
-           "period": {"preset": preset, "start": start, "end": end, "tz": "UTC+05:00", "open": preset == "last_24h"},
+           "period": {"preset": preset, "start": start, "end": end, "tz": "UTC+05:00", "open": end == NOW_END},
            "items": [{"tag": TAG, "status": status, "avg": avg, "min": mn, "max": mx, "range": mx - mn}]}
     inp = {"tags": [TAG], **({"period": preset} if preset else {"start": start[:19], "end": end[:19]})}
     return ToolCall("pcbk_tag_period", inp, out, "completed")
@@ -151,6 +155,103 @@ def test_calc_agent_args_have_all_tools_no_digits():
     a = calc_agent_args(list(CASES.values()))
     assert a["tools"] == ["catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime"]
     assert a["tags"] == [TAG, "20FAKE_210_RUN"] and not any(ch.isdigit() for ch in a["prompt"])
+
+
+# --- доводка р1: ложный match (I-1 — I-4 ревью) ---
+
+MINMAX = "Минимум 70, максимум 90,5."
+PROFILE = "В начале 600,51, в конце 612,25."
+
+
+def series_call(span, open_):
+    start, end = span
+    out = {"tool": "tag_series", "status": "ok",
+           "period": {"preset": None, "start": start, "end": end, "tz": "UTC+05:00", "open": open_},
+           "items": [{"tag": TAG, "status": "ok", "unit": "м/мин",
+                      "profile": {"first": 600.512, "last": 612.25, "change": 11.738}}]}
+    return ToolCall("pcbk_tag_series", {"tags": [TAG], "start": start[:19], "end": end[:19], "points": 24}, out,
+                    "completed")
+
+
+@pytest.mark.parametrize("kind,call,text", [
+    ("minmax_last_24h", period_call(span=PERIODS["yesterday"]), MINMAX),                  # вчерашние сутки 00–00
+    ("minmax_last_24h", period_call(span=("2026-10-09T07:00:00+05:00", "2026-10-10T07:00:00+05:00")),   # UTC без
+     MINMAX),                                                                             # пояса: сдвиг на 5 ч
+    ("profile_last_8h", series_call(PERIODS["prev_shift"], False), PROFILE),              # прошлая смена 22–06
+])
+def test_custom_window_not_ending_now_is_wrong_period(kind, call, text):                 # I-1 (решение контроллера)
+    r = judge_case(CASES[kind], turn(text, call), call.output)
+    assert (r.verdict, r.hard) == ("wrong_period", True)
+
+
+def test_custom_window_ending_now_needs_its_length():                                    # I-4, M12
+    short = period_call(span=("2026-10-09T13:00:00+05:00", NOW_END))                   # 23 ч, кончается «сейчас»
+    assert short.output["period"]["open"] is True
+    assert judge_case(CASES["minmax_last_24h"], turn(MINMAX, short), short.output).verdict == "wrong_period"
+    eight = series_call(("2026-10-10T04:00:00+05:00", NOW_END), True)                   # свои 8 ч до «сейчас»
+    assert judge_case(CASES["profile_last_8h"], turn(PROFILE, eight), eight.output).verdict == "match"
+
+
+def test_no_data_with_number_is_mismatch():                                              # I-2
+    call = period_call("prev_shift", status="no_data")
+    r = judge_case(CASES["avg_prev_shift"], turn("Среднее за смену — 81,2 м/мин.", call), call.output)
+    assert (r.verdict, r.hard, r.notes) == ("mismatch", True, ["no_data_number"])
+
+
+def test_service_with_number_keeps_verdict_and_notes_it():                               # I-2
+    call = period_call("prev_shift", status="unavailable")
+    r = judge_case(CASES["avg_prev_shift"], turn("Среднее за смену — 81,2 м/мин.", call), call.output)
+    assert (r.verdict, r.hard, r.notes) == ("service", False, ["tool_unavailable", "number_in_text"])
+
+
+def test_period_checked_before_no_data():                                                # I-2, M7
+    call = period_call("last_24h", status="no_data")
+    r = judge_case(CASES["avg_prev_shift"], turn("Данных за сутки нет.", call), call.output)
+    assert (r.verdict, r.hard) == ("wrong_period", True)
+
+
+def test_no_tool_percent_is_mismatch():                                                  # I-3
+    r = judge_case(CASES["avg_prev_shift"], turn("Среднее за смену — 45,2 %."), None)
+    assert (r.verdict, r.hard, r.notes) == ("mismatch", True, ["no_tool"])
+    r = judge_case(CASES["avg_prev_shift"], turn("Данных нет: доля достоверных 0 %."), None)
+    assert (r.verdict, r.notes) == ("no_number", ["no_tool"])                         # доля достоверности — не величина
+
+
+def test_swapped_min_max_is_mismatch():                                                  # I-4, M1: подпись поля
+    call = period_call("last_24h")
+    r = judge_case(CASES["minmax_last_24h"], turn("Минимум 90,5, максимум 70.", call), call.output)
+    assert (r.verdict, r.hard) == ("mismatch", True)
+
+
+@pytest.mark.parametrize("text,avg", [("За 8 часов смены посчитал, смотрите выше.", 8.0),
+                                      ("Смена 2, посчитал.", 2.0)])
+def test_non_measure_numbers_are_not_keys(text, avg):                                    # I-4, M4
+    call = period_call("prev_shift", avg=avg)
+    assert judge_case(CASES["avg_prev_shift"], turn(text, call), call.output).verdict == "no_number"
+
+
+def test_last_call_of_case_decides():                                                    # I-4, M5
+    good, other = period_call("prev_shift"), period_call("last_24h")
+    text = "Среднее за прошлую смену — 81,2 м/мин."
+    assert judge_case(CASES["avg_prev_shift"], turn(text, good, other), other.output).verdict == "wrong_period"
+    assert judge_case(CASES["avg_prev_shift"], turn(text, other, good), good.output).verdict == "match"
+
+
+def test_open_flag_not_kind_decides_calc_moved():                                        # I-4, M8 (m-15)
+    shift = period_call("prev_shift")
+    shift.output["period"]["open"] = True                                         # первые 5 мин после смены
+    r = judge_case(CASES["avg_prev_shift"], turn("Среднее 81,2.", shift), period_call("prev_shift", avg=80.0).output)
+    assert (r.verdict, r.notes) == ("match", ["calc_moved"])
+    day = period_call("last_24h")
+    day.output["period"]["open"] = False                                          # готовые сутки, но вывод закрыт
+    r = judge_case(CASES["minmax_last_24h"], turn(MINMAX, day), period_call("last_24h", mn=69.0).output)
+    assert (r.verdict, r.notes) == ("service", ["calc_differs"])
+
+
+def test_percent_unit_value_is_a_quantity():                                             # I-4, M10
+    call = period_call("prev_shift", avg=45.2)
+    call.output["items"][0]["unit"] = "%"
+    assert judge_case(CASES["avg_prev_shift"], turn("Среднее за смену — 45,2 %.", call), call.output).verdict == "match"
 
 
 # --- заглушка стенда для пробы и случаев окна (I7, m-7) ---

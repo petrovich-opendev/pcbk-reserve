@@ -8,12 +8,18 @@ avg_span start и end — ISO без пояса (время историана) 
 Вердикт (judge_case; calc — ответ калькулятора на аргументы вызова случая):
 1. ход с ошибкой или без конца — timeout;
 2. вызова случая нет (case_call: последний вызов pcbk_<tool> хода с тегом случая во входе, без регистра): в тексте
-   есть числа величин — mismatch с заметкой no_tool, иначе no_number;
-3. элемент тега no_data — мягкий no_data (I7); вывод не ok/partial или элемент тега не ok — service;
-4. период не тот (period_ok) — wrong_period: у готового периода input.period или output.period.preset равен периоду
-   случая; у last_24h и last_8h годится и свой период длиной 24 или 8 ч ± 60 с; у avg_span начало и конец вывода
-   отличаются от времени случая (в поясе вывода) не больше чем на 60 с. Период решают поля периода, а не числа:
-   у двойника сигналы дают одни и те же числа на разных периодах;
+   есть числа величин (источника нет вовсе — процент тоже величина, I-3 р1) — mismatch с заметкой no_tool, иначе
+   no_number;
+3. вывод не ok/partial или элемент тега не ok и не no_data — service; есть в тексте числа величин — ещё заметка
+   number_in_text (I-2 р1: число могло прийти из прежнего вызова хода — разбор покажет);
+4. период не тот (period_ok) — wrong_period, и раньше no_data (I-2 р1: неверный период без данных — не мягкий
+   вердикт): у готового периода input.period или output.period.preset равен периоду случая; у last_24h и last_8h
+   годится и свой период длиной 24 или 8 ч ± 60 с, но только кончающийся «сейчас» — output.period.open истина
+   (решение контроллера по I-1 р1, сознательно строже буквы R91: вчерашние сутки, прошлая смена и окно со сдвигом
+   на пояс — не «последние»); у avg_span начало и конец вывода отличаются от времени случая (в поясе вывода) не
+   больше чем на 60 с. Период решают поля периода, а не числа: у двойника сигналы дают одни и те же числа на разных
+   периодах. Элемент тега no_data — мягкий no_data (I7), а с числами величин в тексте — mismatch с заметкой
+   no_data_number (I-2 р1: число не из этого вызова);
 5. каждый ключ (key_values) есть в тексте ответа по правилу numbers.matches — округление до показанных знаков, —
    но только среди чисел величин (parse_numbers без неизмеряемых non_measure_kind; процент — величина у тега с
    единицей «%», часы «ч» — у hours_top). Ключ с подписью поля (value, avg, min, max) ищется среди чисел с той же
@@ -294,8 +300,9 @@ def period_ok(case: Case, call: ToolCall) -> bool:
     hours = {"last_24h": 24, "last_8h": 8}.get(case.period or "")
     if hours is None or asked or preset:
         return False
-    span = _span(period) or _span(call.input)
-    return span is not None and abs((span[1] - span[0]).total_seconds() - hours * 3600) <= SPAN_SLACK_S
+    span = _span(period)                    # свой период «последних» — только кончающийся «сейчас» (I-1 р1)
+    return (period.get("open") is True and span is not None
+            and abs((span[1] - span[0]).total_seconds() - hours * 3600) <= SPAN_SLACK_S)
 
 
 def _quantities(text: str, case: Case, unit: Any = None) -> list[Shown]:
@@ -343,18 +350,25 @@ def judge_case(case: Case, turn: Turn | None, calc: dict | None) -> MatchResult:
         return MatchResult(case.id, "timeout", ["turn_error" if turn is not None and turn.error else "turn_unfinished"])
     text = "\n".join(turn.assistant)
     call = case_call(case, turn)
-    if call is None:
-        return MatchResult(case.id, "mismatch" if _quantities(text, case) else "no_number", ["no_tool"])
+    if call is None:                        # источника нет вовсе: и процент — число величины (I-3 р1)
+        return MatchResult(case.id, "mismatch" if _quantities(text, case, "%") else "no_number", ["no_tool"])
     out = output_of(call)
     item = _item(out, case.tag)
-    if item is not None and item.get("status") == "no_data":
-        return MatchResult(case.id, "no_data")
-    if out.get("status") not in OK_STATUSES:
-        return MatchResult(case.id, "service", [_code("tool", out.get("status"))])
-    if item is None or item.get("status") != "ok":
-        return MatchResult(case.id, "service", ["no_item" if item is None else _code("item", item.get("status"))])
+    no_data = item is not None and item.get("status") == "no_data"
+    if not no_data and (out.get("status") not in OK_STATUSES or item is None or item.get("status") != "ok"):
+        if out.get("status") not in OK_STATUSES:
+            notes = [_code("tool", out.get("status"))]
+        else:
+            notes = ["no_item" if item is None else _code("item", item.get("status"))]
+        if _quantities(text, case, "%"):
+            notes.append("number_in_text")
+        return MatchResult(case.id, "service", notes)
     if not period_ok(case, call):
         return MatchResult(case.id, "wrong_period")
+    if no_data:
+        if _quantities(text, case):
+            return MatchResult(case.id, "mismatch", ["no_data_number"])
+        return MatchResult(case.id, "no_data")
     keys = key_values(case, item)
     if any(v is None for v in keys.values()):
         return MatchResult(case.id, "service", ["no_key"])
