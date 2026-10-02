@@ -1,4 +1,4 @@
-"""MCP службы данных: те же три инструмента, что HTTP, поверх одной DataService.
+"""MCP службы данных: те же три инструмента, что HTTP, поверх одной DataService; save_agent (Д7а) — только MCP.
 
 Токен → ошибка настройки → аргументы → служба; /mcp — точный маршрут, GET — 405, Host любой.
 """
@@ -18,6 +18,7 @@ from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data.budget import PER_CALLER_LIMIT
 from pcbk_core.data.mcp_server import TOOL_DESCRIPTIONS, mcp_auth
 from pcbk_core.data.periods import PRESETS
+from pcbk_core.data.save_agent import SAVE_DESCRIPTION, SAVE_REQUIRED
 from pcbk_core.logs import RECORD_CHARS, OneLine, setup_logging
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -39,11 +40,25 @@ def raw(url, method="POST", body=INIT, **headers):
 
 
 @pytest.mark.anyio
-async def test_mcp_lists_three_readonly_tools(core_server):
+async def test_mcp_lists_tools(core_server):
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
         tools = {t.name: t for t in (await s.list_tools()).tools}
-    assert set(tools) == {"catalog_search", "tag_now", "tag_period"}
-    assert all(t.annotations.readOnlyHint for t in tools.values())
+    assert set(tools) == {"catalog_search", "tag_now", "tag_period", "save_agent"}
+    assert all(tools[name].annotations.readOnlyHint is True for name in ("catalog_search", "tag_now", "tag_period"))
+    saver = tools["save_agent"]
+    assert (saver.annotations.readOnlyHint, saver.annotations.destructiveHint, saver.annotations.idempotentHint,
+            saver.annotations.openWorldHint) == (False, False, True, False)                  # Д7-R57
+    assert sorted(saver.inputSchema["required"]) == sorted(SAVE_REQUIRED) and len(SAVE_REQUIRED) == 8   # m8
+    props = saver.inputSchema["properties"]
+    assert set(props) == set(SAVE_REQUIRED) and "mode" not in props and "steps" not in props
+    assert (props["name"]["pattern"], props["name"]["minLength"], props["name"]["maxLength"]) == (
+        "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", 3, 40)
+    assert props["tools"]["items"]["enum"] == ["catalog_search", "tag_now", "tag_period"]
+    assert (props["tags"]["maxItems"], props["prompt"]["minLength"], props["prompt"]["maxLength"]) == (16, 200, 4000)
+    assert saver.description == SAVE_DESCRIPTION == (
+        "Сохраняет агента студента после его явного согласия на последний показанный черновик. Служба проверяет "
+        "черновик и пишет файл агента сама; права и правила стенда добавляет она же. Агент появится в „Мои агенты“ "
+        "после окончания этого ответа. При отказе вернётся список problems — исправьте и повторите не больше двух раз.")
     tags = tools["tag_now"].inputSchema["properties"]["tags"]
     assert (tags["type"], tags["maxItems"], tags["items"]["maxLength"]) == ("array", 16, 128)
     assert tools["tag_now"].description == TOOL_DESCRIPTIONS["tag_now"]

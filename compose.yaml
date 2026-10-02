@@ -91,7 +91,7 @@ services:
   watchdog:
     build: ./watchdog
     # :d6a остаётся на сервере для отката Д6б (:d5b — для отката Д6а)
-    image: pcbk-reserve/watchdog:d6b
+    image: pcbk-reserve/watchdog:d7a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -125,6 +125,9 @@ services:
       # строка «Шлюз и вход» (Д5а): метка такта уборщика старше GW_STALE_S — «уборщик простоя молчит»;
       # не меньше 4 × GW_REAPER_TICK_S у core
       GW_STALE_S: ${GW_STALE_S:-120}
+      # строка «Агенты студентов» (Д7а): метка прохода воркера перезагрузки агентов старше AGENTS_STALE_S —
+      # «перезагрузка агентов молчит»; воркер ставит её раз в 2 с и перед каждым местом прохода
+      AGENTS_STALE_S: ${AGENTS_STALE_S:-60}
     volumes:
       # только сертификат: им сторож проверяет, что edge отдаёт именно его
       - type: bind
@@ -205,7 +208,7 @@ services:
     build: ./core
     # :d6a остаётся на сервере для отката Д6б (:d5b — для отката Д6а); откат только статики и login.js при core:d6b
     # снимает предупреждение при первом входе (deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d6b
+    image: pcbk-reserve/core:d7a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -249,9 +252,16 @@ services:
       # учения: freeze_reaper — уборщик замирает после первого такта, bad_place_pw — шлюз портит пароль
       # места; пусто — нет
       DRILL_GATEWAY: ${DRILL_GATEWAY:-}
+      # учения агентов студентов (Д7а): freeze_reload — воркер перезагрузки мест замирает после первого
+      # прохода; пусто — нет
+      DRILL_AGENTS: ${DRILL_AGENTS:-}
     volumes:
       - {type: bind, source: "${DATA_DIR:?DATA_DIR не задан}/whitelist.txt", target: /app/data/whitelist.txt,
          read_only: true, bind: {create_host_path: false}}
+      # каталог агентов студентов (Д7-R55): core пишет файлы агентов мест (save_agent), карантин и архив; место
+      # монтирует только свой student-NN и только на чтение. Владелец — 10003, корень 0700, каталоги мест 0755
+      - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}", target: /srv/agents,
+         bind: {create_host_path: false}}
       # журнал событий core.db; каталог образа принадлежит 10003 — том наследует владельца
       - {type: volume, source: pcbk-core-data, target: /var/lib/pcbk-core}
     secrets:

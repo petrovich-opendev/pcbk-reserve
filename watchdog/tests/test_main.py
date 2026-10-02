@@ -263,7 +263,7 @@ def test_components_file_d4a():                    # было test_components_fi
 def test_components_file_d4b():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
-    assert ids[-6:-1] == ["core", "core-container", "historian", "llm", "gateway"]
+    assert ids[-7:-2] == ["core", "core-container", "historian", "llm", "gateway"]
     cc = comps[ids.index("core-container")]
     assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
            ("container", "pcbk-core", False, "Серверный слой — контейнер")
@@ -277,14 +277,19 @@ def test_components_file_d5a():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
     g = comps[ids.index("gateway")]
-    assert ids[-2] == "gateway"
+    assert ids[-3] == "gateway"
     assert (g["title"], g["kind"], g["url"]) == ("Шлюз и вход", "gateway", "http://pcbk-core:8000/health/gateway")
 
 
 def test_components_have_web_row():
     comps = load_components("components.json")
-    assert comps[-1] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
+    assert comps[-2] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
                          "reports_url": "http://pcbk-core:8000/health/web"}                # Д6б: отчёты браузеров
+
+
+def test_components_have_agents_row():
+    assert load_components("components.json")[-1] == {"id": "agents", "title": "Агенты студентов", "kind": "agents",
+                                                      "url": "http://pcbk-core:8000/health/agents"}
 
 
 def test_run_checks_web_kind(web_site):                                        # M2 предпроверки Д6а
@@ -309,6 +314,36 @@ def test_run_checks_web_reports_url(web_site, fake_core):                       
     comps = [{"id": "web", "title": "Веб-чат", "kind": "web", "url": url, "reports_url": fake_core.base + "/health/web"}]
     checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
     assert [(c.state, c.detail, c.note) for c in checks] == [("warn", "чат падает в браузере", "2 за час")]
+
+
+def test_agents_stale_setting():                                               # задача А1 Д7а
+    assert Settings().AGENTS_STALE_S == 60
+    assert Settings.from_env({"AGENTS_STALE_S": "20"}).AGENTS_STALE_S == 20     # ручка учения
+    for bad in ({"AGENTS_STALE_S": "0"}, {"AGENTS_STALE_S": "-5"}, {"AGENTS_STALE_S": "abc"},
+                {"AGENTS_STALE_S": "1.5"}):
+        with pytest.raises(ValueError):
+            Settings.from_env(bad)
+    # как GW_STALE_S: проверка агентов — один HTTP-запрос, правило срока такта порог не затрагивает
+    assert Settings(AGENTS_STALE_S=1).tick_budget_s == Settings().tick_budget_s
+
+
+def test_run_checks_agents_kind(json_site):
+    # вид agents идёт через _check_one в check_agents с порогом AGENTS_STALE_S; note доходит до снимка
+    assert pcbk_watchdog.main.KINDS["agents"] == ("url",)
+    assert "agents" not in pcbk_watchdog.main.LOCAL_KINDS
+    reply = {"checked_at": (T0 - timedelta(seconds=30)).isoformat(), "store_ok": True, "dir_error": None, "pending": 1,
+             "pending_oldest_s": 4.0, "saved_1h": 3, "refused_1h": 0, "unavailable_1h": 0, "visible_1h": 3,
+             "not_visible_1h": 0, "quarantined_1h": 0, "reload_failed_1h": 0, "reload_delayed_1h": 0,
+             "image_config_1h": 0, "drill": ""}
+    comps = [{"id": "agents", "title": "Агенты студентов", "kind": "agents", "url": json_site(200, reply)}]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert [(c.component, c.title, c.state, c.detail, c.note) for c in checks] == [
+        ("agents", "Агенты студентов", "ok", "агенты сохраняются", "сохранено за час: 3; ждут перезагрузки: 1")]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), replace(SETTINGS, AGENTS_STALE_S=20), T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "перезагрузка агентов молчит")
+    comps[0]["url"] = "http://127.0.0.1:9/health/agents"
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "служба агентов не отвечает")
 
 
 def test_gw_stale_setting():

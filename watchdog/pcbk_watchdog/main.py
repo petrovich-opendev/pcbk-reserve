@@ -16,8 +16,8 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .checks import (HTTP_OK_DETAIL, NET_CHECK_TIMEOUT_S, REASON_CHARS, UNHEALTHY_DETAIL, Check,
-                     check_container, check_gateway, check_historian, check_http, check_llm, check_memory,
-                     check_tls, check_web, not_installed)
+                     check_agents, check_container, check_gateway, check_historian, check_http, check_llm,
+                     check_memory, check_tls, check_web, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
 from .page import Snapshot, is_stale, render_html, status_json
@@ -29,7 +29,7 @@ log = logging.getLogger("pcbk_watchdog")
 KINDS: dict[str, tuple[str, ...]] = {
     "memory": (), "http": ("url",), "tls": ("host", "port"), "docker_ping": (),
     "container": ("container", "sleeping_ok"), "absent": (), "historian": ("url",),
-    "llm": ("url",), "gateway": ("url",), "web": ("url",),
+    "llm": ("url",), "gateway": ("url",), "web": ("url",), "agents": ("url",),
 }
 # виды без сети — их срок такта не отменяет
 LOCAL_KINDS = frozenset({"memory", "absent"})
@@ -69,6 +69,9 @@ class Settings:
     # уборщик простоя шлюза молчит дольше этого, с — «места не засыпают» (Д5-R29); не меньше
     # 4 × GW_REAPER_TICK_S core; учения freeze_reaper ставят 20
     GW_STALE_S: int = 120
+    # проход воркера перезагрузки агентов старше этого, с — «перезагрузка агентов молчит» (Д7-R60): метка ставится
+    # раз в такт RELOAD_TICK_S = 2 с и перед каждым местом прохода (Д7-R58, раунд 1, m3)
+    AGENTS_STALE_S: int = 60
 
     def __post_init__(self):
         if self.TICK_S <= 0 or self.DOCKER_TIMEOUT_S <= 0:
@@ -88,6 +91,9 @@ class Settings:
         # GW_STALE_S, как HIST_*, правило срока такта не затрагивает: проверка шлюза — один HTTP-запрос
         if self.GW_STALE_S <= 0:
             raise ValueError("GW_STALE_S должен быть больше нуля")
+        # AGENTS_STALE_S — так же: проверка агентов — один HTTP-запрос
+        if self.AGENTS_STALE_S <= 0:
+            raise ValueError("AGENTS_STALE_S должен быть больше нуля")
 
     @property
     def tz(self) -> ZoneInfo:
@@ -192,6 +198,8 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
         return check_gateway(cid, title, comp["url"], now, settings.GW_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "web":
         return check_web(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S, reports_url=comp.get("reports_url"))
+    if kind == "agents":
+        return check_agents(cid, title, comp["url"], now, settings.AGENTS_STALE_S, timeout=NET_CHECK_TIMEOUT_S)
     if kind == "tls":
         return check_tls(cid, title, comp["host"], comp["port"], settings.TLS_CAFILE, now,
                          timeout=NET_CHECK_TIMEOUT_S)

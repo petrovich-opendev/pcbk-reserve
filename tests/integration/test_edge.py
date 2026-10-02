@@ -12,11 +12,13 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "DOCKER_TIMEOUT_S", "MEM_WARN_MIB", "MEM_FAIL_MIB", "TLS_CAFILE",
                       "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH", "DRILL_FREEZE_LOOP",
                       "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
-                      "GW_STALE_S"},                                   # строка «Шлюз и вход» (Д5а)
+                      "GW_STALE_S",                                    # строка «Шлюз и вход» (Д5а)
+                      "AGENTS_STALE_S"},                               # строка «Агенты студентов» (Д7а, П10)
     "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
                   "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
                   # шлюз (Д5а): сети мест для сверки токенов и адресов мест, origin входа, простой, такт, учения
                   "STU_NET", "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY",
+                  "DRILL_AGENTS",                                  # учения агентов студентов (Д7а, П10)
                   # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
                   # бюджет (учение «бюджет стенда израсходован», Д4б)
                   "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD"},
@@ -25,7 +27,7 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d6b", "pcbk-core": "pcbk-reserve/core:d6b",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d7a", "pcbk-core": "pcbk-reserve/core:d7a",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d6a"}

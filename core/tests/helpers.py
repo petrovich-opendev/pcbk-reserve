@@ -33,9 +33,10 @@ from pydantic import BaseModel
 
 from fake_places import PLACE_PW, FakeDocker, FakePlaces
 from fakes import WHITELIST, FakeHistorian
+from pcbk_core.agents.draft import Draft, render_agent_file
 from pcbk_core.app import Role, RoleBase, create_app
 from pcbk_core.data import DataRole
-from pcbk_core.data.catalog import Catalog
+from pcbk_core.data.catalog import Catalog, TagInfo
 from pcbk_core.data.events import CallEvent
 from pcbk_core.data.historian import parse_clock
 from pcbk_core.data.service import DataService
@@ -515,17 +516,20 @@ ORIGIN = "https://stand.test:8443"
 
 def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),
                  stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
-                 accounts: bool = True, **gw_overrides) -> GatewayRole:
+                 accounts: bool = True, agents_root: Path | None = None, **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
     GatewaySettings (без проверок from_env). stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
 
     tmp_path создаётся; база — db_path или tmp_path/core.db. accounts — завести отдельным AccountStore с open()
     учётки stu-03 (место 3), stu-05 (место 5) и teach (преподаватель), у всех пароль PW; иначе база заранее не
     открывается. Места из ready работают в двойнике Docker и готовы без пробуждения: первый такт их не трогает.
+    Корень агентов (Settings.AGENTS_ROOT, Д7а, предпроверка П3) — agents_root как есть, по умолчанию
+    tmp_path/agents, подготовленный make_agents_root: воркер перезагрузки проверяет каталог первым тактом.
     Роли для тестов добавлены fake_docker, fake_places, mono.
     """
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
+    root = make_agents_root(tmp_path / "agents") if agents_root is None else Path(agents_root)
     db = Path(db_path) if db_path is not None else tmp_path / "core.db"
     docker = FakeDocker() if docker is None else docker
     oc = FakePlaces() if oc is None else oc
@@ -543,11 +547,19 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
         s.add("teach", "teacher", None, PW)
     for n in ready:
         ready_place(workplaces, docker, n)
-    role = GatewayRole(replace(SETTINGS, DB_PATH=str(db)), gw, store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S),
-                       workplaces=workplaces, stats=stats, config_error=config_error, monotonic=mono,
-                       stream_recheck_s=stream_recheck_s)
+    role = GatewayRole(replace(SETTINGS, DB_PATH=str(db), AGENTS_ROOT=str(root)), gw,
+                       store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S), workplaces=workplaces, stats=stats,
+                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s)
     role.fake_docker, role.fake_places, role.mono = docker, oc, mono
     return role
+
+
+def park_reload_worker(role: GatewayRole) -> None:
+    """Фоновый воркер перезагрузки агентов (Д7-R58) под lifespan не идёт, а ждёт остановки роли: такты ведёт тест сам
+    (предпроверка m9) — ручной такт и фоновый не спорят о пульсе и флагах учёта."""
+    async def parked() -> None:
+        await asyncio.Event().wait()
+    role.reloads.run = parked
 
 
 def make_gateway(tmp_path, **kw) -> tuple[FastAPI, GatewayRole]:
@@ -582,3 +594,61 @@ def login_cookie(url: str, name: str, pw: str = PW) -> str:
     assert r.status_code == 200, r.status_code
     line = next(h for h in r.headers.get_list("set-cookie") if h.startswith("pcbk_session="))
     return line.split(";", 1)[0].split("=", 1)[1]
+
+
+# --- Агенты студентов: каталог черновика (Д7а, задача А2) ---
+
+# 16 тегов белого списка с именами ровно по 128 знаков (вид SAFE_NAME) — худший черновик по размеру файла (m10)
+BIG_TAGS = tuple(f"20FAKE_{100 + i:03d}_PV".ljust(128, "X") for i in range(16))
+
+
+def _agent_tag(name: str, description: str, unit: str | None) -> TagInfo:
+    return TagInfo(name=name, description=description, kind="analog", unit=unit, min_eu=0.0, max_eu=100.0,
+                   live=False, live_time=None)
+
+
+def agent_catalog(big: bool = False) -> Catalog:
+    """Каталог черновика агента: 20FAKE_001_PV (в списке; описание с кавычками, переводом строки, «##» и обратными
+    кавычками; °C), 20FAKE_002_PV (вне списка), 20FAKE_003_PV (в списке, без единицы).
+
+    big — ещё BIG_TAGS в белом списке: описания по 50 знаков и единицы по 10 знаков, кириллицей (два байта на знак).
+    """
+    tags = [_agent_tag("20FAKE_001_PV", 'Температура "сукна"\n## x `y`', "°C"),
+            _agent_tag("20FAKE_002_PV", "Скорость сеточного стола", "м/мин"),
+            _agent_tag("20FAKE_003_PV", "Давление пара в сушильной части", None)]
+    listed = {"20FAKE_001_PV", "20FAKE_003_PV"}
+    if big:
+        tags += [_agent_tag(name, f"Описание длинного тега номер {i:02d} ".ljust(50, "ж"), "единицаизм")
+                 for i, name in enumerate(BIG_TAGS)]
+        listed |= set(BIG_TAGS)
+    return Catalog({t.name: t for t in tags}, frozenset(listed))
+
+
+# --- Агенты студентов: учёт и файлы (Д7а, задача А3) ---
+
+AGENT_NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
+# черновик агента тестов: синтетический текст, без тегов (данных заказчика в файле нет)
+AGENT_DRAFT = Draft(name="sushka-bdm2", title="Сушка БДМ-2", node="Сушильная часть",
+                    purpose="Текущие значения и сводка за смену", tools=("catalog_search", "tag_now"), tags=(),
+                    prompt="Ты — помощник технолога по узлу «Сушка». Отвечай про температуру и давление коротко. " * 4,
+                    student_reply="да, сохраняй")
+
+
+def agent_text(draft: Draft = AGENT_DRAFT, caller: str = "student-03") -> str:
+    """Файл агента по шаблону v1 (Д7-R55) для черновика тестов."""
+    return render_agent_file(draft, {}, caller=caller, created_at=AGENT_NOW)
+
+
+def make_agents_root(path) -> Path:
+    """Корень агентов, как на сервере после смены владельца (Д7-R55): student-01…10 — 0755, quarantine и
+    archive — 0700. Сам корень — 0700 (у владельца тестов)."""
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    for n in range(1, 11):
+        (root / f"student-{n:02d}").mkdir(exist_ok=True)
+        (root / f"student-{n:02d}").chmod(0o755)
+    for side in ("quarantine", "archive"):
+        (root / side).mkdir(exist_ok=True)
+        (root / side).chmod(0o700)
+    return root

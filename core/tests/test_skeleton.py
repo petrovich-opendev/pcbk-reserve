@@ -353,3 +353,8 @@ def test_bad_management_key_disables_only_credits(tmp_path, capfd, restore_loggi
     err = capfd.readouterr().err
     assert err.count("WARNING pcbk_core.main: LLM-прокси: ключ управления OpenRouter") == 2
     assert "управление-не-ascii" not in err
+
+
+def test_build_roles_share_agent_stats(monkeypatch, tmp_path):                  # Д7-R53, задача А1 Д7а
+    data, _, gw = build_roles(SETTINGS, env={})
+    assert data.agent_stats is gw.agent_stats

@@ -13,8 +13,16 @@ health() и health_json() читают только память; ошибка �
 Отчёты браузеров (Д6б, Д6-R50) — web_router: POST /pcbk/api/web/report и GET /health/web; счётчики WebReports —
 в памяти роли (web_reports), окно — час.
 
-Модули accounts, api, proxy и web (а через них — accounts) здесь импортируются только внутри методов: команда
-администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
+Агенты студентов (Д7а, Д7-R60) — agents_router: GET /health/agents (зона front, тот же обработчик отказов из реестра);
+счётчики AgentStats — общие с ролью «данные» (main.build_roles), без переданного объекта роль создаёт свой.
+
+Перезагрузка агентов (Д7-R58, задача А5): свой AgentStore (agents) на тот же core.db, воркер reloads (AgentReloads) и
+крючок готовности workplaces.on_ready = reloads.place_ready. lifespan открывает учёт агентов в потоке; неудача — флаг
+сбоя учёта воркера (строка «Агенты студентов»), не config_error (предпроверка П13): вход студентов от учёта агентов не
+зависит. Воркер — фоновая задача рядом с уборщиком, при config_error не стартует; остановка роли его снимает.
+
+Модули accounts, agents_api, api, proxy и web (а через них — accounts) здесь импортируются только внутри методов:
+команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
 загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
 """
 from __future__ import annotations
@@ -33,10 +41,13 @@ from fastapi import APIRouter, Depends, FastAPI
 from fastapi.responses import JSONResponse
 
 from .. import zones
+from ..agents.stats import AgentStats
+from ..agents.store import AgentStore
 from ..app import RoleBase
 from ..hooks import hooks_of
 from ..settings import GatewaySettings, Settings
 from .places import PLACES, Workplaces
+from .reload import AgentReloads
 from .stats import GatewayStats
 
 if TYPE_CHECKING:
@@ -201,7 +212,7 @@ class GatewayRole(RoleBase):
                  stats: GatewayStats, config_error: str | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 stream_recheck_s: float = 10.0):
+                 stream_recheck_s: float = 10.0, agent_stats: AgentStats | None = None):
         from .accounts import LOCK_WINDOW_S
         from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
         from .web import WebReports
@@ -220,11 +231,20 @@ class GatewayRole(RoleBase):
         self.login_gate = LoginGate(LOGIN_PARALLEL, LOGIN_QUEUE, LOGIN_BACKLOG, clock=store.clock,
                                     window=LOCK_WINDOW_S)
         self.web_reports = WebReports()         # отчёты браузеров (Д6-R50): память, часы — monotonic
+        # счётчики агентов студентов (Д7-R60): общий с ролью «данные» объект из build_roles, иначе свой
+        self.agent_stats = AgentStats(monotonic=monotonic) if agent_stats is None else agent_stats
+        # учёт агентов шлюза (Д7-R53: свой AgentStore на тот же core.db) и воркер перезагрузки (Д7-R58)
+        self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
+        self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
+                                    wallclock=wallclock, drill=gw.DRILL_AGENTS)
+        workplaces.on_ready = self.reloads.place_ready
         self._reaper: asyncio.Task | None = None
+        self._reload_task: asyncio.Task | None = None
 
     # --- маршруты и крючки ---
 
     def router(self) -> APIRouter:
+        from .agents_api import agents_router
         from .api import auth_router, catch_all_router, configured, front_only, workplace_router
         from .proxy import proxy_router
         from .web import web_router
@@ -235,6 +255,7 @@ class GatewayRole(RoleBase):
         router.include_router(workplace_router(self), dependencies=guarded)
         router.include_router(proxy_router(self))       # front_only и configured — у самого роутера прокси
         router.include_router(web_router(self))         # зона и настройка — у маршрутов отчётов; до ловящего
+        router.include_router(agents_router(self))      # /health/agents (Д7а): зона — у маршрута; до ловящего
 
         @router.get(HEALTH_PATH, dependencies=[Depends(front_only)])
         async def health_gateway() -> JSONResponse:
@@ -249,8 +270,9 @@ class GatewayRole(RoleBase):
         front_only и 405 на /health/gateway — тоже; предел тела вне pcbk-front отвечает 404, как зона (ревью
         А4, M3), — и у /pcbk/api/oc/ с пределом GW_MAX_BODY_BYTES (Д5-R36): самый длинный префикс берёт его, и
         без respond= сеть места получила бы 413 и узнала бы ручку; у него же общий бюджет тел (H2, сверх — 503
-        busy, вне pcbk-front — 404); сеть мест для сверки токенов служб (Ш25). /health/web (Д6б) — тот же
-        обработчик, что /health/gateway: отказ зоны и 405 — 404 вида OpenCode без Allow."""
+        busy, вне pcbk-front — 404); сеть мест для сверки токенов служб (Ш25). /health/web (Д6б) и /health/agents
+        (Д7а) — тот же обработчик, что /health/gateway: отказ зоны и 405 — 404 вида OpenCode без Allow."""
+        from .agents_api import HEALTH_AGENTS_PATH
         from .api import PREFIX, http_exception_handler, too_large
         from .proxy import GW_BODY_BUDGET_BYTES, OC_PREFIX, body_busy
         from .web import HEALTH_WEB_PATH
@@ -259,6 +281,7 @@ class GatewayRole(RoleBase):
         hooks.http_exception(PREFIX + "/", http_exception_handler)
         hooks.http_exception(HEALTH_PATH, http_exception_handler)
         hooks.http_exception(HEALTH_WEB_PATH, http_exception_handler)
+        hooks.http_exception(HEALTH_AGENTS_PATH, http_exception_handler)
         hooks.body_limit(PREFIX + "/", BODY_LIMIT, respond=too_large)
         # общий бюджет тел до обработчика (H2); не меньше предела одного тела — иначе оно не поместилось бы; вне
         # pcbk-front бюджет не доступен: 404 без чтения тела (медленные тела из сети места его не займут)
@@ -307,6 +330,32 @@ class GatewayRole(RoleBase):
             "upstream_failed_1h": count("upstream_failed"),
         }
 
+    def agents_health_json(self, now: datetime) -> dict:
+        """Договор сторожа /health/agents (Д7-R60): ровно 15 ключей, только числа и тексты — ни имён агентов, ни номеров
+        мест. store_ok — учёт пишется и у роли «данные», и у воркера (оба флага None). checked_at — пульс воркера
+        перезагрузки (до первого прохода — null: строка сторожа честно «неизвестно»); pending и pending_oldest_s — только
+        по готовым местам очереди (reloads.pending_view(now)). Только память."""
+        s, count = self.agent_stats, self.agent_stats.count_1h
+        checked = self.reloads.checked_at
+        pending, oldest = self.reloads.pending_view(now)
+        return {
+            "checked_at": None if checked is None else checked.isoformat(),
+            "store_ok": s.store_error is None and s.worker_store_error is None,
+            "dir_error": s.dir_error,
+            "pending": pending,
+            "pending_oldest_s": oldest,
+            "saved_1h": count("saved"),
+            "refused_1h": count("refused"),
+            "unavailable_1h": count("unavailable"),
+            "visible_1h": count("visible"),
+            "not_visible_1h": count("not_visible"),
+            "quarantined_1h": count("quarantined"),
+            "reload_failed_1h": count("reload_failed"),
+            "reload_delayed_1h": count("reload_delayed"),
+            "image_config_1h": count("image_config"),
+            "drill": self.gw.DRILL_AGENTS,
+        }
+
     # --- жизненный цикл ---
 
     def _add_config_error(self, why: str) -> None:
@@ -329,12 +378,14 @@ class GatewayRole(RoleBase):
             self.started_at = self.wallclock()
             if not await asyncio.to_thread(self.store.open):
                 self._add_config_error(f"учётные записи не открываются: {self.store.last_error or 'сбой'}")
+            await self._open_agents()               # не бросает: сбой — флаг воркера, не config_error (П13)
             await self.workplaces.spctl.open()
             await self.workplaces.open()
             if self.config_error:
                 log.error("шлюз: ошибка настройки: %s", self.config_error)
             else:
                 self._reaper = asyncio.create_task(self._reaper_loop(), name="gw-reaper")   # не ожидается
+                self._reload_task = asyncio.create_task(self.reloads.run(), name="gw-agents-reload")
         except Exception as exc:                # запуск шлюза не роняет core: причина — на страницу
             self._add_config_error(f"запуск шлюза: {type(exc).__name__}")
             log.error("шлюз: ошибка настройки: %s", self.config_error)
@@ -343,11 +394,25 @@ class GatewayRole(RoleBase):
         finally:
             await self._shutdown()
 
+    async def _open_agents(self) -> None:
+        """Таблицы учёта агентов (CREATE IF NOT EXISTS) в потоке. Неудача — флаг сбоя учёта воркера и строка журнала:
+        строка «Агенты студентов» краснеет, а вход студентов и /healthz/gateway — нет (П13)."""
+        try:
+            opened = await asyncio.to_thread(self.agents.open)
+        except Exception as exc:
+            self.agents.last_error, opened = type(exc).__name__, False
+        if not opened:
+            self.agent_stats.worker_store_failed(self.agents.last_error or "Error")
+            log.error("шлюз: учёт агентов не открыт (%s)", self.agents.last_error)
+
     async def _shutdown(self) -> None:
-        task, self._reaper = self._reaper, None
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        for name in ("_reaper", "_reload_task"):
+            task = getattr(self, name)
+            setattr(self, name, None)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await self.reloads.drain()              # крючок готовности: метки — в учёт до выхода
         await self.login_gate.drain()           # неудачные входы — в замок до выхода
         # потоки /event — до клиентов мест: закрытие каждого (своё или начатое снятой задачей запроса) доводится здесь,
         # всех вместе — не дольше STREAM_SHUTDOWN_S (Б4-m2): остановка не ждёт застрявшее место по 11 с; недоведённые

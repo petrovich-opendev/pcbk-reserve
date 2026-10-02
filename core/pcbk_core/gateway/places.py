@@ -29,7 +29,12 @@ GW_IDLE_STOP_S), паузу снимают удачная остановка, т
 
 Конструкторы без ввода-вывода. У каждого места свой httpx.AsyncClient (доводка Б3, G1): создаётся при первом
 запросе к месту (как Upstream, П22), закрывается в aclose(); соединений — не больше PLACE_CONNECTIONS (потоки
-учётки, вызовы прокси и один служебный запрос), так что потоп одного места не выбирает соединения соседа.
+учётки, вызовы прокси и два служебных запроса — уборщик или пробуждение и воркер перезагрузки агентов, Д7-R58), так
+что потоп одного места не выбирает соединения соседа.
+
+Д7а (Д7-R58): крючок готовности on_ready(n) зовётся, когда место стало готовым — удачный _await_ready (пробуждение) и
+_restore (первый проход уборщика); исключение крючка — строка журнала, пробуждение не ломает. is_waking(n) — идёт ли
+задача пробуждения места (воркер перезагрузки такое место пропускает).
 Прокси окружения не берутся (trust_env=False), перенаправлениям не следуют, cookie места не хранятся и месту не
 возвращаются (политика без разрешённых доменов, G3). Сроки попыток держит asyncio.timeout поверх срока
 httpx. Исключения httpx ловятся целиком (httpx.HTTPError, Ш11) и в журнал не пишутся: строки журнала — только
@@ -80,8 +85,9 @@ SSE_READ_TIMEOUT_S = 60.0     # тишина потока /event дольше �
 STREAM_OPEN_S = 10.0          # заголовки ответа места на /event (Д5-R35)
 PLACE_PORT = 4096
 PROXY_PARALLEL = 2            # вызовов прокси к одному месту разом (Б3, G1); потоки /event — отдельно
-# соединений клиента места: потоки учётки, вызовы прокси и один служебный (пробуждение, такт уборщика)
-PLACE_CONNECTIONS = MAX_STREAMS_PER_LOGIN + PROXY_PARALLEL + 1
+# соединений клиента места: потоки учётки, вызовы прокси и два служебных — пробуждение или такт уборщика и воркер
+# перезагрузки агентов (Д7-R58, раунд 1, m4)
+PLACE_CONNECTIONS = MAX_STREAMS_PER_LOGIN + PROXY_PARALLEL + 2
 SP_CTL_DOWN_TICK_S = 5.0      # такт, пока sp-ctl не отвечает (Ш10)
 PLACES = range(1, 11)
 # занятая сессия OpenCode: busy — ход идёт, retry — ход ждёт повтора запроса к модели
@@ -288,6 +294,8 @@ class Workplaces:
         self.checked_at: datetime | None = None
         self.last_tick_mono = monotonic()
         self.ticks = 0
+        # крючок готовности (Д7-R58): его ставит GatewayRole — AgentReloads.place_ready
+        self.on_ready: Callable[[int], None] | None = None
 
     # --- клиент мест ---
 
@@ -419,6 +427,20 @@ class Workplaces:
     def _waking(self, n: int) -> bool:
         task = self._tasks.get(n)
         return task is not None and not task.done()
+
+    def is_waking(self, n: int) -> bool:
+        """Идёт задача пробуждения места (публичная обёртка _waking, Д7-R58)."""
+        return self._waking(_place(n))
+
+    def _became_ready(self, n: int) -> None:
+        """Место стало готовым (_await_ready, _restore): крючок on_ready; его исключение — строка журнала."""
+        hook = self.on_ready
+        if hook is None:
+            return
+        try:
+            hook(n)
+        except Exception as exc:
+            log.warning("gw ready hook place=%02d error=%s", n, type(exc).__name__)
 
     def _busy(self, n: int) -> bool:
         """Место сейчас трогает пробуждение или остановка: такт его итог не применяет."""
@@ -613,6 +635,7 @@ class Workplaces:
         self._gen[n] += 1
         self._mark_running(n)
         self._confirm(n)
+        self._became_ready(n)
         return None
 
     async def _stop_quiet(self, n: int) -> bool:
@@ -732,6 +755,7 @@ class Workplaces:
                 self._ready[n] = container.started_at
                 self._gen[n] += 1
                 self._confirm(n)
+                self._became_ready(n)
 
     async def _session_busy(self, n: int) -> bool:
         """Идёт ли ход на месте: GET /session/status; нет ответа или ответ не тот — не занято."""

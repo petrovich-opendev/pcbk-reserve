@@ -26,6 +26,9 @@ class Settings:
     CATALOG_DEADLINE_S: float = 60.0
     # учения: freeze_stamps — метки не растут, freeze_poll — опрос встаёт после первого
     DRILL_FRESHNESS: str = ""
+    # агенты студентов (Д7-R53): ${AGENTS_DIR} хоста на запись; student-NN — каталоги мест (их точки монтирования),
+    # quarantine и archive — в корне, вне каталогов мест
+    AGENTS_ROOT: str = "/srv/agents"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -157,6 +160,8 @@ class LlmSettings:
 # строчными), порт без ведущих нулей и не 443 (браузер его не пишет) — иначе Origin не совпал бы никогда;
 # STU_NET — два октета без ведущих нулей (ipaddress их не принимает)
 DRILL_GATEWAY_MODES = frozenset({"", "freeze_reaper", "bad_place_pw"})
+# учения агентов студентов (Д7-R53, Д7-R58): freeze_reload — воркер перезагрузки замирает после первого прохода
+DRILL_AGENTS_MODES = frozenset({"", "freeze_reload"})
 _GW_ORIGIN = re.compile(r"https://[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::(?P<port>[1-9][0-9]{0,4}))?")
 _OCTET = r"(0|[1-9][0-9]{0,2})"
 _STU_NET = re.compile(_OCTET + r"\." + _OCTET)
@@ -216,6 +221,12 @@ def _drill_gateway(raw: str) -> str:
     return raw
 
 
+def _drill_agents(raw: str) -> str:
+    if raw not in DRILL_AGENTS_MODES:
+        raise ValueError("DRILL_AGENTS: пусто или freeze_reload")
+    return raw
+
+
 # проверка каждого поля по отдельности: значение из env → значение поля или ValueError (имя и правило)
 _GW_FIELD_CHECKS: dict[str, Callable[[str], object]] = {
     "GW_ORIGIN": _gw_origin,
@@ -228,6 +239,7 @@ _GW_FIELD_CHECKS: dict[str, Callable[[str], object]] = {
     "STU_NET": _stu_net,
     "DRILL_GATEWAY": _drill_gateway,
     "GW_MAX_BODY_BYTES": _gw_max_body,
+    "DRILL_AGENTS": _drill_agents,
 }
 
 
@@ -245,6 +257,7 @@ class GatewaySettings:
     STU_NET: str = "172.31"                   # первые два октета сетей мест: место N — {STU_NET}.N.0/28
     DRILL_GATEWAY: str = ""                   # учения: freeze_reaper, bad_place_pw
     GW_MAX_BODY_BYTES: int = 524288           # предел тела /pcbk/api/oc/ (Д5-R36; у edge — client_max_body_size 512k)
+    DRILL_AGENTS: str = ""                    # учения агентов студентов (Д7а): freeze_reload
 
     @classmethod
     def _parse(cls, env: Mapping[str, str] | None) -> tuple[dict[str, object], list[str]]:

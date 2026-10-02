@@ -16,6 +16,7 @@ import secrets
 import shutil
 import ssl
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -33,6 +34,9 @@ from workplace import IMAGE as STUDENT_IMAGE
 from workplace import ONESHOT_LABEL
 
 REPO = Path(__file__).resolve().parents[2]
+# двойник OpenRouter (core/tests/fake_openrouter.py, только stdlib) — и модулем тестов: save_args (Д7а, П7). В конец
+# пути: имена модулей интеграции (conftest, test_*) не перекрываются модулями core/tests
+sys.path.append(str(REPO / "core" / "tests"))
 PROJECT = "pcbk-test"
 HOST, PORT = "127.0.0.1", 18443
 LOCK = REPO / "deploy" / "images.lock"
@@ -55,6 +59,8 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "LLM_TOTAL_USD",
                         # шлюз (Д5а): core и срок молчания уборщика у сторожа
                         "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY", "GW_STALE_S",
+                        # срок молчания воркера перезагрузки агентов у сторожа и учения агентов у core (Д7а)
+                        "AGENTS_STALE_S", "DRILL_AGENTS",
                         # статика edge тестового стенда со сборкой чата (Д6а): compose.test.yaml, «:?»
                         "PCBK_TEST_STATIC"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
@@ -98,6 +104,51 @@ DATA_EVENT_COUNT_PY = ("import sqlite3, sys; "
                        "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
                        "print(c.execute('SELECT COUNT(*) FROM agent_events WHERE caller = ? AND channel = ?', "
                        "(sys.argv[1], sys.argv[2])).fetchone()[0])")
+# каталог агентов студентов (Д7-R55): владелец — uid core, корень 0700, каталоги мест 0755, карантин и архив 0700 в
+# корне. Владельца ставит одноразовый busybox от root без сети (раунд 1, I5: образа core до сборки ещё нет); в конце
+# владелец возвращается разработчику — иначе каталог 0700 чужого владельца не удалить
+CORE_UID = 10003
+AGENTS_IN_CORE = "/srv/agents"
+AGENTS_OWN_SH = (f"chown {CORE_UID}:{CORE_UID} /a /a/student-* && chmod 0700 /a && chmod 0755 /a/student-* "
+                 f"&& mkdir -m 0700 /a/quarantine /a/archive && chown {CORE_UID}:{CORE_UID} /a/quarantine /a/archive")
+# файл агента места изнутри pcbk-core от владельца каталога: argv — put|get|rm, место, имя без .md. put — текст из
+# stdin, файл 0644 (место читает его от своего uid); get — текст в stdout, файла нет — исключение и код 1; rm — нет
+# файла — не ошибка
+AGENT_FILE_PY = f"""\
+import os, sys
+from pathlib import Path
+action, place, name = sys.argv[1:4]
+path = Path("{AGENTS_IN_CORE}") / f"student-{{int(place):02d}}" / f"{{name}}.md"
+if action == "put":
+    path.write_text(sys.stdin.read(), encoding="utf-8")
+    os.chmod(path, 0o644)
+elif action == "get":
+    sys.stdout.write(path.read_text(encoding="utf-8"))
+elif action == "rm":
+    path.unlink(missing_ok=True)
+else:
+    sys.exit("действие: put, get или rm")
+"""
+# save_agent клиентом MCP SDK изнутри pcbk-core на петле (127.0.0.1 — зона администратора, Ш25: токен места годен и не
+# из сети места): stdin — токен данных места первой строкой, дальше JSON аргументов; stdout — structuredContent ответа
+MCP_SAVE_PY = """\
+import asyncio, json, sys
+import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+token, _, raw = sys.stdin.read().partition("\\n")
+async def main():
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(10, read=30), trust_env=False) as client:
+        async with streamable_http_client("http://127.0.0.1:8000/mcp", http_client=client) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool("save_agent", json.loads(raw))
+    if result.isError or result.structuredContent is None:
+        sys.exit("save_agent: ответ — ошибка MCP, а не результат службы")
+    print(json.dumps(result.structuredContent, ensure_ascii=False))
+asyncio.run(main())
+"""
 # разговор через API OpenCode места (Bun из образа места): converse.js рядом с этим файлом
 CONVERSE_JS = REPO / "tests" / "integration" / "converse.js"
 # худший случай converse.js сверх timeout_s — из его сроков (каждый запрос — до CONVERSE_REQUEST_S = 10 с,
@@ -196,6 +247,47 @@ def wait_for(pred: Callable[[], bool], timeout: float, step: float = 1.0) -> Non
         if time.monotonic() > deadline:
             raise AssertionError(f"за {timeout} с условие не выполнилось")
         time.sleep(step)
+
+
+def tool_names_of(body: dict) -> set[str]:
+    """Имена инструментов запроса к модели: body["tools"][*]["function"]["name"]."""
+    return {t["function"]["name"] for t in body.get("tools") or []}
+
+
+def system_text(body: dict) -> str:
+    """Тексты всех сообщений system запроса к модели через перевод строки: строка или части {"type": "text"}."""
+    texts = []
+    for m in body.get("messages") or []:
+        if m.get("role") != "system":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts += [p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)]
+    return "\n".join(texts)
+
+
+def turn_bodies(stack: "Stack", place: int, session: str) -> list[dict]:
+    """Тела запросов хода к двойнику OpenRouter у разговора session места place, по порядку. Только с инструментами:
+    фоновый запрос заголовка разговора (без инструментов) сюда не попадает (раунд 1, I4). Прокси заголовков клиента не
+    пересылает — сессия только в теле."""
+    sid = f"student-{place:02d}:{session}"
+    return [r["body"] for r in stack.fake_requests() if r["body"].get("session_id") == sid and r["body"].get("tools")]
+
+
+def row_of(status: dict, component: str) -> dict:
+    """Строка компонента из списка status["checks"] (/status.json сторожа); нет — KeyError."""
+    for c in status["checks"]:
+        if c["component"] == component:
+            return c
+    raise KeyError(component)
+
+
+def agents_owner(root: Path, script: str) -> None:
+    """Владелец и права каталога агентов (корень root) — скриптом sh одноразового busybox от root без сети."""
+    _run(["docker", "run", "--rm", "--pull", "never", "--network", "none", "--user", "0", "--label", ONESHOT_LABEL,
+          "-v", f"{root}:/a", locked_image("busybox"), "sh", "-c", script])
 
 
 def secret_forms(pw: str) -> list[Secret]:
@@ -427,7 +519,42 @@ class Stack:
         return Secret((self.secrets_dir / f"student-{n:02d}.data-token").read_text(encoding="ascii"))
 
     def agents_dir(self, n: int) -> Path:
+        """Путь каталога агентов места на хосте — для сверки компоновки. Владелец каталога — core (корень 0700): файлы
+        — только через put_agent_file, agent_file и rm_agent_file."""
         return self.agents_root / f"student-{n:02d}"
+
+    def _agent_file(self, action: str, n: int, name: str, text: str = "") -> subprocess.CompletedProcess:
+        """AGENT_FILE_PY в pcbk-core от владельца каталога; код не 0 — subprocess.CalledProcessError (П9)."""
+        return subprocess.run(["docker", "exec", "-i", "-u", str(CORE_UID), "pcbk-core", "python", "-c", AGENT_FILE_PY,
+                               action, str(n), name], input=text, capture_output=True, text=True, timeout=60,
+                              check=True)
+
+    def put_agent_file(self, n: int, name: str, text: str) -> None:
+        """Файл <name>.md в каталог агентов места n (0644) — от владельца каталога внутри pcbk-core, текст — stdin."""
+        self._agent_file("put", n, name, text)
+
+    def agent_file(self, n: int, name: str) -> str:
+        """Текст файла <name>.md места n; файла нет — subprocess.CalledProcessError."""
+        return self._agent_file("get", n, name).stdout
+
+    def rm_agent_file(self, n: int, name: str) -> None:
+        """Удалить файл <name>.md места n; файла нет — не ошибка."""
+        self._agent_file("rm", n, name)
+
+    def mcp_save(self, n: int, args: dict) -> dict:
+        """save_agent службы данных клиентом MCP изнутри pcbk-core (петля — зона администратора, Ш25) с токеном данных
+        места n — в stdin, не в argv; ответ — structuredContent."""
+        r = _run(["docker", "exec", "-i", "pcbk-core", "python", "-c", MCP_SAVE_PY],
+                 input=Secret(self.data_token(n) + "\n" + json.dumps(args, ensure_ascii=False)))
+        return json.loads(r.stdout)
+
+    def agents_admin(self, *args: str) -> str:
+        """Команда администратора агентов (Д7-R61) в pcbk-core; код не 0 — RuntimeError со stderr."""
+        return self.exec("pcbk-core", "python", "-m", "pcbk_core.agents.admin", *args)
+
+    def agents_health(self) -> dict:
+        """/health/agents серверного слоя изнутри pcbk-watchdog — из pcbk-front, как его читает сторож."""
+        return json.loads(self.body_from_watchdog("http://pcbk-core:8000/health/agents"))
 
     def env_names(self, name: str) -> set[str]:
         return {e.split("=", 1)[0] for e in self.inspect(name)["Config"]["Env"] or []}
@@ -651,19 +778,21 @@ class Stack:
         return datetime.fromisoformat(self._state(name)["StartedAt"])
 
     def converse(self, n: int, question: str, *, model: str | None = None, tools: dict[str, bool] | None = None,
-                 timeout: float = 180.0, host: str | None = None, pw_file: Path | None = None) -> dict:
+                 agent: str | None = None, timeout: float = 180.0, host: str | None = None,
+                 pw_file: Path | None = None) -> dict:
         """Разговор через API OpenCode места n: converse.js в одноразовом контейнере образа места в сети
         pcbk-stu-NN; пароль (места n или pw_file) и запрос — файлами только для чтения. JSON из stdout.
 
         model — «провайдер/модель» («pcbk/z-ai/glm-5.3»); tools — карта OpenCode «инструмент → разрешён»
-        ({"pcbk_*": False} закрывает инструменты MCP на эту сессию). host — адрес OpenCode вместо STU.N.3.
+        ({"pcbk_*": False} закрывает инструменты MCP на эту сессию); agent — агент хода (Д7а, m15), без него —
+        агент по умолчанию места. host — адрес OpenCode вместо STU.N.3.
         """
         ref = None
         if model is not None:
             provider, _, model_id = model.partition("/")
             ref = {"providerID": provider, "modelID": model_id}
         request = {"url": f"http://{host or f'{self.stu_net}.{n}.3'}:4096", "question": question, "model": ref,
-                   "tools": tools, "timeout_s": timeout}
+                   "tools": tools, "agent": agent, "timeout_s": timeout}
         pw = pw_file or self.secrets_dir / f"student-{n:02d}.pw"
         with tempfile.TemporaryDirectory(prefix="pcbk-converse-", dir=self.env_file.parent) as tmp:
             req = Path(tmp) / "req.json"
@@ -931,10 +1060,15 @@ def stack(tmp_path_factory, student_image):
     s.refuse_foreign()
     s.down()   # остатки прошлого прогона — только своего проекта
     try:
+        agents_owner(work / "agents", AGENTS_OWN_SH)       # до up: core пишет в каталог агентов с первого прохода
         s.up()
         yield s
     finally:
-        s.down()
+        try:
+            s.down()
+        finally:   # владелец — снова разработчик, иначе каталог 0700 чужого владельца не удалить; данные теста — прочь
+            agents_owner(work / "agents", f"chown -R {os.getuid()}:{os.getgid()} /a && chmod -R u+rwX /a")
+            shutil.rmtree(work / "agents")
 
 
 @pytest.fixture(scope="module")

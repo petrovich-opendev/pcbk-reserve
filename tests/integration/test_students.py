@@ -195,15 +195,13 @@ def test_project_dir_cannot_override_stubs(stack, running):        # Review Focu
 
 def test_agent_file_visible_after_dispose(stack, running):
     assert "probe" not in agent_names(stack)                       # экземпляр создан до записи файла
-    probe = stack.agents_dir(1) / "probe.md"
-    try:
-        probe.write_text(PROBE_AGENT)
-        probe.chmod(0o644)
+    try:                                                           # каталог агентов — core (Д7а): файл пишет он
+        stack.put_agent_file(1, "probe", PROBE_AGENT)
         assert "probe" not in agent_names(stack)                   # без dispose не виден
         assert stack.oc(1, "POST", "/instance/dispose", 1)[0] == 200
         assert "probe" in agent_names(stack)
     finally:
-        probe.unlink(missing_ok=True)
+        stack.rm_agent_file(1, "probe")
         stack.oc(1, "POST", "/instance/dispose", 1)
 
 
@@ -213,7 +211,7 @@ def test_readonly_where_it_matters(stack, running):
         assert stack.sh("pcbk-student-01", f"touch {d}/.pcbk-w")[0] != 0, f"{d} пишется"
     for d in ("/var/lib/opencode", "/work", "/tmp"):
         assert stack.sh("pcbk-student-01", f"touch {d}/.pcbk-w && rm {d}/.pcbk-w")[0] == 0, f"{d} не пишется"
-    assert list(stack.agents_dir(1).iterdir()) == []
+    assert stack.exec("pcbk-core", "ls", "-A", "/srv/agents/student-01") == ""   # каталог агентов — core (Д7а)
 
 
 def routes(table: str) -> list[tuple[str, str]]:

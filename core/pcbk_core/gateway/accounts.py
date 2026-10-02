@@ -52,6 +52,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from pcbk_core.agents.store import AgentStore, DirUnavailable
+from pcbk_core.agents.store import StoreError as AgentStoreError
 from pcbk_core.settings import Settings
 
 log = logging.getLogger("pcbk_core.gateway.accounts")
@@ -83,6 +85,8 @@ _SQLITE_CODE = re.compile(r"SQLITE_[A-Z_]{1,40}")
 
 _LOGIN_RULE = "логин: 3…32 знака из a-z, 0-9, «.», «_», «-», первый — буква a-z"
 _RELEASE_REFUSED = "освобождать можно только места пробных учёток после disable"
+# release-place при агентах места (Д7-R61): иначе место отдали бы новому студенту с чужими агентами (неуспех 3)
+_AGENTS_LEFT = "на месте остались агенты — сначала python -m pcbk_core.agents.admin archive --place {place} --yes"
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS gw_accounts (
@@ -461,16 +465,27 @@ class AccountStore:
             db.execute("DELETE FROM gw_notices WHERE login = ?", (login,))
             db.execute("COMMIT")
 
-    def release_place(self, place: int) -> None:
-        """Снимает закрепление места — только за пробной учёткой (PROBE_LOGIN) и без действующей учётки на месте."""
+    @staticmethod
+    def _check_release(db: sqlite3.Connection, place: object) -> None:
+        """Правило release_place: место закреплено за пробной учёткой (PROBE_LOGIN), действующей учётки на нём нет."""
         if type(place) is not int or place not in PLACES:
             raise ValueError("место: 1…10")
+        bound = db.execute("SELECT login FROM gw_places WHERE place = ?", (place,)).fetchone()
+        active = db.execute("SELECT 1 FROM gw_accounts WHERE place = ? AND disabled = 0", (place,)).fetchone()
+        if bound is None or PROBE_LOGIN.fullmatch(bound[0]) is None or active is not None:
+            raise ValueError(_RELEASE_REFUSED)
+
+    def check_release(self, place: int) -> None:
+        """То же правило без записи — команда сверяет его до агентов места: иначе отказ «сначала archive» увёл бы
+        администратора уносить в архив агентов настоящего студента, а место всё равно не освободилось бы."""
+        with self._op() as db:
+            self._check_release(db, place)
+
+    def release_place(self, place: int) -> None:
+        """Снимает закрепление места — только за пробной учёткой (PROBE_LOGIN) и без действующей учётки на месте."""
         with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
-            bound = db.execute("SELECT login FROM gw_places WHERE place = ?", (place,)).fetchone()
-            active = db.execute("SELECT 1 FROM gw_accounts WHERE place = ? AND disabled = 0", (place,)).fetchone()
-            if bound is None or PROBE_LOGIN.fullmatch(bound[0]) is None or active is not None:
-                raise ValueError(_RELEASE_REFUSED)
+            self._check_release(db, place)
             db.execute("DELETE FROM gw_places WHERE place = ?", (place,))
             db.execute("COMMIT")
 
@@ -717,7 +732,8 @@ def _parser() -> argparse.ArgumentParser:
     remove.add_argument("--yes", action="store_true")
     unlock = sub.add_parser("unlock", help="снять замок входа")
     unlock.add_argument("--login", required=True)
-    release = sub.add_parser("release-place", help="освободить место пробной учётки после disable")
+    release = sub.add_parser("release-place", help="освободить место пробной учётки после disable и archive агентов"
+                                                   " места (python -m pcbk_core.agents.admin)")
     release.add_argument("--place", required=True, type=int)
     release.add_argument("--yes", action="store_true")
     sub.add_parser("list", help="учётки (последний столбец — предупреждён: да/нет, у преподавателя «-») и закрепления"
@@ -747,7 +763,26 @@ def _fail(message: str) -> int:
     return 1
 
 
-def _run(store: AccountStore, args: argparse.Namespace) -> int:
+def _refuse_if_agents(settings: Settings, place: int) -> None:
+    """Отказ release-place, пока у места есть агенты (Д7-R61): живые строки учёта или любой не-каталог в каталоге места,
+    рекурсивно (**/*.md, символьная ссылка, прочий файл — AgentStore.place_has_agents): файл без строки тоже агент для
+    места (раунд 1, I2), а прочий файл — данные прежнего студента (доводка А3 р1, m3). Учёт открывается open(): без
+    таблиц отказ пришёл бы от «no such table», а не по агентам (m21). Каталог или учёт не читаются — тоже отказ."""
+    agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
+    if not agents.open():
+        detail = f" ({agents.last_error})" if agents.last_error else ""
+        raise ValueError(f"учёт агентов не открывается{detail} — освобождать место нельзя")
+    try:
+        left = agents.place_has_agents(place)
+    except DirUnavailable:
+        raise ValueError("каталог агентов места недоступен — освобождать место нельзя") from None
+    except AgentStoreError:
+        raise ValueError("учёт агентов недоступен — освобождать место нельзя") from None
+    if left:
+        raise ValueError(_AGENTS_LEFT.format(place=place))
+
+
+def _run(store: AccountStore, args: argparse.Namespace, settings: Settings) -> int:
     command = args.command
     if command in ("add", "passwd"):
         password = secrets.token_urlsafe(GENERATED_PW_BYTES) if args.generate else _read_password()
@@ -768,6 +803,8 @@ def _run(store: AccountStore, args: argparse.Namespace) -> int:
     elif command == "release-place":
         if not args.yes:
             raise ValueError("release-place снимает закрепление места — повторите с --yes")
+        store.check_release(args.place)
+        _refuse_if_agents(settings, args.place)
         store.release_place(args.place)
     elif command == "list":
         for a in store.list():
@@ -780,7 +817,8 @@ def _run(store: AccountStore, args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Команда администратора. База — Settings.from_env().DB_PATH, перед операцией open().
+    """Команда администратора. База — Settings.from_env().DB_PATH, перед операцией open(); release-place ещё
+    сверяет агентов места по Settings.from_env().AGENTS_ROOT (Д7-R61).
 
     Удача — код 0; ошибка — код 1 и одна строка в stderr без пароля. Пароль порождённый (--generate)
     печатается в stdout один раз, после удачи; больше ничего в stdout не идёт (кроме вывода list).
@@ -790,14 +828,14 @@ def main(argv: list[str] | None = None) -> int:
     except _UsageError as exc:
         return _fail(f"команда: {exc}")
     try:
-        path = Settings.from_env().DB_PATH
+        settings = Settings.from_env()
     except ValueError as exc:
         return _fail(f"настройки: {exc}")
-    store = AccountStore(path)
+    store = AccountStore(settings.DB_PATH)
     if not store.open():
         return _fail(f"база учётных записей не открывается: {store.last_error}")
     try:
-        return _run(store, args)
+        return _run(store, args, settings)
     except (ValueError, StoreError) as exc:
         return _fail(str(exc))
     except Exception as exc:                        # текст непредвиденной ошибки может нести ввод — только класс

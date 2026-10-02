@@ -1,5 +1,5 @@
 """Роль «данные»: каталог тегов, свежесть историана, журнал событий, ручки здоровья и инструменты
-(DataService — service.py; HTTP /api/data/* — http_api.py; MCP /mcp — mcp_server.py).
+(DataService — service.py; HTTP /api/data/* — http_api.py; MCP /mcp — mcp_server.py; save_agent — save_agent.py).
 
 Два фоновых цикла делят одно фоновое место ворот. Каталог грузится сразу при
 старте и дальше раз в CATALOG_REFRESH_S, после неудачи — с растущей паузой.
@@ -8,6 +8,11 @@ FRESH_POLL_S. Каждая попытка обоих — событие system �
 открывается первым делом в lifespan, его запись проверяется в фоне раз в
 EVENTS_CHECK_S. Состояние роли меняется только в цикле событий; SQLite — в
 потоках asyncio.to_thread.
+
+Учёт агентов студентов (AgentStore, Д7-R56) открывается в lifespan сразу после журнала событий. Его сбой —
+agent_stats.store_failed (строка сторожа «Агенты студентов»), а не config_error: /healthz/data от агентов не
+зависит (П13). Дальше учёт открывается заново и пробуется на запись раз в EVENTS_CHECK_S вместе с проверкой журнала
+(итоговое ревью Д7а, I-1): флаг сбоя после одного SQLITE_BUSY у save_agent снимается сам, без перезапуска core.
 """
 import asyncio
 import logging
@@ -20,6 +25,8 @@ from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp
 
+from ..agents.stats import AgentStats
+from ..agents.store import AgentStore, StoreError
 from ..app import RoleBase
 from ..hooks import hooks_of
 from ..secrets import TokenTable
@@ -31,6 +38,7 @@ from .gate import GateRefused, GateResult, HistorianGate
 from .historian import HistClock, HistorianError, QueryFn, parse_clock
 from .http_api import data_router, validation_handler
 from .mcp_server import MCP_PATH, build_mcp, mcp_auth
+from .save_agent import SaveAgent
 from .service import DataService
 from .sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql
 
@@ -47,6 +55,7 @@ CONFIG_ERRORS = {
 TOKENS_ERROR = "токены не читаются — все вызовы получают 401"
 EVENTS_ERROR = "журнал событий не пишется: "
 EVENTS_ERROR_CHARS = 53                 # 27 + 53 ≤ 80 (F10)
+STORE_PREFIX = "учёт агентов: "        # начало текста StoreError — в строке журнала проверки не повторяется
 
 log = logging.getLogger("pcbk_core.data")
 
@@ -59,6 +68,11 @@ class DataRole(RoleBase):
     core-tokens не прочитан. Конструктор без ввода-вывода (F4): журнал событий только запоминает путь,
     служба (service) — кэш, single-flight и окно частоты в памяти, MCP (mcp, mcp_app) строится один
     раз — его session_manager.run() SDK даёт однажды, и его запускает lifespan.
+
+    agent_stats — счётчики агентов студентов (Д7-R53, Д7-R60): один объект на процесс, его создаёт
+    main.build_roles и отдаёт и шлюзу (/health/agents); не передан — свой (тесты). agents — учёт и файлы агентов
+    (Д7-R56): не передан — AgentStore(settings.DB_PATH, settings.AGENTS_ROOT), конструктор только запоминает пути;
+    save_agent — инструмент MCP save_agent (Д7-R57).
     """
 
     name = "data"
@@ -67,7 +81,8 @@ class DataRole(RoleBase):
                  monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  config_error: str | None = None,
-                 tokens: TokenTable | None = None, tokens_error: str | None = None):
+                 tokens: TokenTable | None = None, tokens_error: str | None = None,
+                 agents: AgentStore | None = None, agent_stats: AgentStats | None = None):
         self.settings = settings
         self.config_error = config_error
         self.tokens = TokenTable.empty() if tokens is None else tokens
@@ -76,6 +91,8 @@ class DataRole(RoleBase):
         self.whitelist = whitelist
         self.monotonic = monotonic
         self.wallclock = wallclock
+        self.agent_stats = AgentStats(monotonic=monotonic) if agent_stats is None else agent_stats
+        self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT) if agents is None else agents
         # вне TagName IN (…) ворота пускают только даты сводки и закрытый набор ww-значений
         self.gate = HistorianGate(query, allowed=whitelist, literal_ok=allowed_literal, monotonic=monotonic)
         self.catalog = Catalog.empty()
@@ -88,6 +105,7 @@ class DataRole(RoleBase):
         self.clock: HistClock | None = None
         self.clock_mono: float | None = None
         self.service = DataService(self)
+        self.save_agent = SaveAgent(self)
         self.mcp = build_mcp(self)
         self.mcp_app = mcp_auth(self.mcp.streamable_http_app(), self)
 
@@ -263,6 +281,36 @@ class DataRole(RoleBase):
         """Проверка записи журнала — в потоке (F9); health() читает только её итог."""
         await asyncio.to_thread(self.events.check)
 
+    def _agents_writable(self) -> str | None:
+        """В потоке: open() (схема идемпотентна) и проба записи с откатом — на файле только для чтения open() проходит.
+        None — учёт пишется, иначе причина без пути и значений."""
+        if not self.agents.open():
+            return self.agents.last_error or "Error"
+        try:
+            self.agents.probe_write()
+        except StoreError as exc:
+            return str(exc).removeprefix(STORE_PREFIX)
+        return None
+
+    async def check_agents(self) -> None:
+        """Учёт агентов — снова open() и проба записи в потоке: удача — store_ok, сбой — store_failed (I-1). В журнал
+        службы — только смена «пишется / не пишется». Прежнее состояние читается после потока: сбой save_agent, пришедший
+        за время проверки, — тоже смена, и её строка журнала не теряется."""
+        try:
+            error = await asyncio.to_thread(self._agents_writable)
+        except Exception as exc:            # страховка — только класс
+            error = type(exc).__name__
+        ok = error is None
+        was = self.agent_stats.store_error
+        if ok:
+            self.agent_stats.store_ok()
+            if was is not None:
+                log.info("учёт агентов: запись снова проходит")
+        else:
+            self.agent_stats.store_failed(error)
+            if was is None:
+                log.error("учёт агентов: запись не проходит (%s)", error)
+
     # --- протокол роли ---
 
     def health(self) -> tuple[bool, str]:
@@ -320,6 +368,12 @@ class DataRole(RoleBase):
             # первым делом — core.db и схема (F23), и при ошибке настройки; сбой — причина здоровья, не падение
             if not await asyncio.to_thread(self.events.open):
                 log.error("журнал событий: не открыт (%s)", self.events.last_error)
+            # учёт агентов — после журнала (П13): сбой — строка сторожа «Агенты студентов», не config_error
+            if await asyncio.to_thread(self.agents.open):
+                self.agent_stats.store_ok()
+            else:
+                self.agent_stats.store_failed(self.agents.last_error or "Error")
+                log.error("учёт агентов: не открыт (%s)", self.agents.last_error)
             if self.config_error:
                 log.error("служба данных: фоновые циклы не запущены — %s", self.config_error)
                 yield
@@ -369,7 +423,8 @@ class DataRole(RoleBase):
             await asyncio.sleep(self.settings.FRESH_POLL_S)
 
     async def _events_loop(self) -> None:
-        """Проверка записи журнала сразу и дальше раз в EVENTS_CHECK_S; в журнал службы — только смена."""
+        """Проверка записи журнала и учёта агентов (I-1) сразу и дальше раз в EVENTS_CHECK_S; в журнал службы — только
+        смена."""
         while True:
             was = self.events.writable_ok
             try:
@@ -381,6 +436,7 @@ class DataRole(RoleBase):
                 log.error("журнал событий: запись не проходит (%s)", self.events.last_error)
             elif now and was is False:
                 log.info("журнал событий: запись снова проходит")
+            await self.check_agents()
             await asyncio.sleep(EVENTS_CHECK_S)
 
 

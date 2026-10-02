@@ -269,9 +269,8 @@ def test_prompt_fields_stripped(stack, users):                                  
 
 def test_foreign_agent_refused(stack, users):                                           # Review Focus 3
     a, b = users
-    probe = stack.agents_dir(6) / "probe.md"
-    try:
-        probe.write_text(PROBE_AGENT); probe.chmod(0o644)
+    try:                                                                                # файл пишет core (Д7а)
+        stack.put_agent_file(6, "probe", PROBE_AGENT)
         stack.oc(6, "POST", "/instance/dispose", 6)
         body = {"parts": [{"type": "text", "text": "x"}], "agent": "probe"}
         sa = a.call("POST", "/pcbk/api/oc/session")[1]["id"]
@@ -280,7 +279,7 @@ def test_foreign_agent_refused(stack, users):                                   
         code, resp, _ = b.call("POST", f"/pcbk/api/oc/session/{sb}/prompt_async", body)
         assert (code, resp["data"]["message"]) == (400, "Агент «probe» недоступен")      # агент места А у Б — нет
     finally:
-        probe.unlink(missing_ok=True); stack.oc(6, "POST", "/instance/dispose", 6)
+        stack.rm_agent_file(6, "probe"); stack.oc(6, "POST", "/instance/dispose", 6)
 
 
 def test_foreign_ids_give_no_data(stack, users):                                        # Review Focus 3

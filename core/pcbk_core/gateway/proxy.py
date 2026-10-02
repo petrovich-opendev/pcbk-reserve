@@ -17,6 +17,14 @@ Starlette ведёт маршрут по раскодированному path, 
 активность места (touch) до пересылки. Проверка агента или разрешения и пересылка — под одним сроком
 PROXY_DEADLINE_S.
 
+Ворота перезагрузки места (Д7а, Д7-R58): prompt_async — единственное правило, начинающее ход, — после разбора тела
+проходит ворота места role.reloads.gates.turn(n) (читатель): ждёт только идущую перезагрузку агентов, не дольше
+reload.RELOAD_WAIT_S. Ожидание стоит снаружи срока хода: после ворот ход места получает весь PROXY_DEADLINE_S (H1;
+худший случай 10 + 25 = 35 с < 45 с у edge). Внутри ворот — снова готовность места (оно могло уйти в перезапуск, m-н4,
+ответ — как у спящего), затем прежний ход; при выходе из ворот — note_turn_start(n): отсрочка перезагрузки считается от
+конца пересылки (предпроверка П11). Не дождался ворот — 503 WorkplaceBusy с PROXY_MESSAGES["reloading"], без счётчика
+refused (место живо, отказа по правилам нет), строка «gw oc … reason=reloading». Прочие правила ворот не берут.
+
 Занятость (доводка Б3, G1): к одному месту разом — не больше PROXY_PARALLEL вызовов (сверка, пересылка и отправка
 ответа браузеру — один вызов: слот отдаёт _PlaceResponse, когда ответ отправлен), ждущих — не больше PROXY_QUEUE;
 сверх очереди, не дождавшийся слота за PROXY_QUEUE_WAIT_S и PoolTimeout клиента места — 503 WorkplaceBusy «busy»:
@@ -92,6 +100,7 @@ from . import places
 from .api import (ERROR_NAMES, GW_MESSAGES, PREFIX, configured, current_account, front_only, gw_error, same_origin,
                   session_tokens)
 from .places import PLACE_READ_S, PROXY_PARALLEL, PlaceAnswer, PlaceAnswerTooLarge
+from .reload import GateTimeout
 from .rules import (AGENT_NAME, ALLOWED_EVENTS, APPROVABLE, METHODS, RULE_MESSAGES, RULES, Refused, Rule, filter_query,
                     match)
 from .stats import MAX_STREAMS_PER_LOGIN
@@ -143,6 +152,7 @@ PROXY_MESSAGES = {
     "too_big": "Ответ рабочего места слишком большой",
     "streams": "Открыто слишком много вкладок чата — закройте лишние",
     "busy": "Слишком много одновременных запросов — повторите позже",
+    "reloading": "Обновляю список агентов рабочего места — повторите через несколько секунд",     # Д7-R58
 }
 
 _BAD_JSON = object()
@@ -780,6 +790,28 @@ async def _proxy(role: GatewayRole, request: Request, account: Account, not_read
     if method != "GET":                             # действие студента — активность места до пересылки (Д5-R28)
         role.workplaces.touch(n)
     started = time.monotonic()
+    if rule.name != "prompt_async":
+        return await _forward(role, call, rule, n, rest, upstream, params, body, gate, started)
+    # prompt_async — читатель ворот перезагрузки места (Д7-R58): ожидание — снаружи срока хода (H1)
+    reloads = role.reloads
+    try:
+        async with reloads.gates.turn(n):
+            try:
+                if not role.workplaces.is_ready(n):     # место ушло в перезапуск, пока ждали ворота (m-н4)
+                    return _not_ready(call, n, not_ready)
+                return await _forward(role, call, rule, n, rest, upstream, params, body, gate, started)
+            finally:
+                reloads.note_turn_start(n)              # отсрочка перезагрузки — от конца пересылки (П11)
+    except GateTimeout:                             # перезагрузка дольше RELOAD_WAIT_S: место живо, без refused
+        _oc_line(call, rule, 503, started, " reason=reloading", warn=True)
+        return gw_error(503, "WorkplaceBusy", PROXY_MESSAGES["reloading"])
+
+
+async def _forward(role: GatewayRole, call: _Call, rule: Rule, n: int, rest: str, upstream: str, params, body,
+                   gate: _PlaceGate, started: float) -> Response:
+    """Слот места, сверка агента или разрешения и пересылка — под одним сроком PROXY_DEADLINE_S (срок читается при
+    вызове); ответ места браузеру держит слот до конца отправки."""
+    method = call.method
     release: Callable[[], None] | None = None       # слот места; None до очереди и после передачи ответу
     try:
         try:

@@ -10,6 +10,12 @@ test-mgmt-key.
 Обычный ответ — поток SSE с комментарием «: OPENROUTER PROCESSING», последним чанком с usage
 (cost 0.0012) и data: [DONE]; заголовок X-Generation-Id: gen-<N>.
 
+Запись агента (Д7а): FAKESAVE — если у запроса есть инструмент pcbk_save_agent, а в ходе инструментов ещё не было,
+вызов pcbk_save_agent с save_args(имя); имя — из «agent=<имя>» последнего сообщения user, по умолчанию proverka-d7a.
+После ответа инструмента — текст «Готово: …». FAKESAVESLOW — то же, но этот текст идёт кусками раз в 0,5 с 10 с подряд,
+как у FAKESLOW; запрос без инструментов (фоновый заголовок разговора) получает обычный быстрый ответ. FAKESAVEBAD —
+то же, что FAKESAVE, с tools: ["bash"] (отказ службы tool_not_allowed). Ветка — раньше ветки pcbk_tag_now.
+
 /generation по id: первые два запроса — 404, потом total_cost 0.002 (id ответа FAKEGENNEVER — всегда
 404). /key: usage ключа — сумма отданных цен (usage потока и найденные дозапросом, каждая один раз).
 /credits: ключом управления — {"total_credits": 50.0, "total_usage": 20.0}, иначе 403.
@@ -42,8 +48,19 @@ ASK_ARGS = {"questions": [{"question": "Какой из тегов?", "header": 
                            "options": [{"label": "20FAKE_001_PV", "description": "первый"}]}]}
 WORDS = ("FAKE402", "FAKE402INFLIGHT", "FAKE403KEY", "FAKE403REGION", "FAKE401", "FAKE500", "FAKE404",
          "FAKEMIDERR", "FAKEMID402", "FAKENOUSAGE", "FAKEGENNEVER", "FAKEFLAKY", "FAKEASK", "FAKEBREAK",
-         "FAKESLOW", "FAKESLOWSTART", "FAKEPROVIDER", "FAKEMIDSTR", "FAKEDRIP")
+         "FAKESLOW", "FAKESLOWSTART", "FAKEPROVIDER", "FAKEMIDSTR", "FAKEDRIP",
+         "FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD")
 _WORD = re.compile(r"\bFAKE[A-Z0-9]+\b")
+SAVE_WORDS = ("FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD")
+SAVE_NAME = "proverka-d7a"              # имя агента, если в вопросе нет «agent=<имя>»
+_AGENT = re.compile(r"\bagent=([a-z][a-z0-9-]*)")
+
+
+def save_args(name: str) -> dict:
+    """Аргументы pcbk_save_agent двойника (Д7а): годный черновик без тегов — служба его сохраняет."""
+    return {"name": name, "title": "Проверка Д7", "node": "Тестовый узел", "purpose": "Проверка записи агента службой",
+            "tools": ["catalog_search", "tag_now"], "tags": [],
+            "prompt": "Ты — помощник технолога по тестовому узлу. " * 6, "student_reply": "да"}
 MID_ERRORS = {"FAKEMIDERR": (502, "Provider returned error"), "FAKEMID402": (402, "Insufficient credits"),
               "FAKEMIDSTR": ("server_error", "Provider returned error")}      # error.code строкой
 DRIP_EVERY_S = 0.2                      # FAKEDRIP: 502, тело ошибки по байту — около 14 с
@@ -118,6 +135,12 @@ def answer(body: dict, word: str | None, gen: str = "gen-0") -> tuple[dict, str]
     loop = any("FAKELOOP" in _text(m.get("content")) for m in msgs if m.get("role") == "user")
     if word == "FAKEASK" and "question" in tools and not turn_tools:
         return _tool_call(gen, "question", ASK_ARGS), "tool_calls"
+    if word in SAVE_WORDS and "pcbk_save_agent" in tools and not turn_tools:      # раньше ветки pcbk_tag_now
+        found = _AGENT.search(_text(msgs[last_user].get("content")))
+        args = save_args(found[1] if found else SAVE_NAME)
+        if word == "FAKESAVEBAD":
+            args["tools"] = ["bash"]
+        return _tool_call(gen, "pcbk_save_agent", args), "tool_calls"
     if "pcbk_tag_now" in tools and not turn_tools:
         return _tool_call(gen, "pcbk_tag_now", {"tags": ["20FAKE_001_PV"]}), "tool_calls"
     if "pcbk_tag_now" in tools and loop:        # аргумент меняется с числом сообщений tool: не doom_loop
@@ -303,6 +326,9 @@ class Handler(BaseHTTPRequestHandler):
         provider = "Together" if word == "FAKEPROVIDER" else "Fireworks"
         with_usage = word not in ("FAKENOUSAGE", "FAKEGENNEVER")
         message, finish = answer(body, word, gen)
+        # FAKESAVESLOW медлит только текстом хода после инструмента: запрос заголовка (без инструментов) — быстрый
+        slow = word in ("FAKESLOW", "FAKESLOWSTART") or (word == "FAKESAVESLOW" and finish == "stop"
+                                                          and bool(_tool_names(body)))
         if body.get("stream") is not True:
             reply = {"id": gen, "object": "chat.completion", "created": int(time.time()), "model": body.get("model"),
                      "provider": provider, "choices": [{"index": 0, "message": message, "finish_reason": finish}]}
@@ -310,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
                 reply["usage"] = USAGE
                 self._charge(key, USAGE["cost"])
             return self._json(200, reply, (("X-Generation-Id", gen),))
-        self._stream(key, gen, provider, word, message, finish, with_usage)
+        self._stream(key, gen, provider, word, message, finish, with_usage, slow)
 
     def _drip(self) -> None:
         """502 с телом ошибки по байту раз в DRIP_EVERY_S: каждый кусок успевает до срока чтения."""
@@ -331,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
             self.state.usage[key] += cost
 
     def _stream(self, key: str, gen: str, provider: str, word: str | None, message: dict, finish: str,
-                with_usage: bool) -> None:
+                with_usage: bool, slow: bool = False) -> None:
         if word == "FAKESLOWSTART":
             time.sleep(SLOW_START_S)                # молчание до строки статуса и заголовков (П7)
         self.send_response(200)
@@ -359,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
                     error = MID_ERRORS[word]
                     send(f"data: {json.dumps({'error': {'code': error[0], 'message': error[1]}})}\n\n".encode())
                 return                              # без [DONE]; FAKEBREAK — меньше обещанной длины
-            if word in ("FAKESLOW", "FAKESLOWSTART"):
+            if slow:                                # FAKESLOW, FAKESLOWSTART, текст хода FAKESAVESLOW
                 for i in range(SLOW_CHUNKS):
                     send(chunk({"role": "assistant", "content": f"{i} "}))
                     time.sleep(SLOW_EVERY_S)
