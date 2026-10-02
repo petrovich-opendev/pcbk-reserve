@@ -1,5 +1,7 @@
 """CLI стенда отбора (Д8-R74, П4, m-р4-16): python -m pcbk_bench override CONFIG | run CONFIG | status OUT
-[--stale-s N].
+[--stale-s N] | judge-pack CONFIG [--real-data] | judge-stage CONFIG [--only-missing] [--root DIR] | judge-audit STAGE
+--batch batch-NN --transcript PATH [--discard] | judge-collect CONFIG [--batch batch-NN …] [--root DIR] | judge-check
+CONFIG | table CONFIG ….
 
 - override CONFIG — файл переопределения мест (render_override) в stdout;
 - run CONFIG — прогон: load_config → window_start (без него или позже сейчас + 5 мин — RunRefused("window_start")
@@ -7,6 +9,20 @@
   прогона;
 - status OUT — код состояния прогона по OUT/progress.json (status_main): 0 — идёт и свеж или закончен, 1 — молчит
   или завис, 2 — остановлен или на паузе.
+
+Судья (Б1, Д8-R78; команды по конфигу — П7: OUT = out_dir, карточки — cards, секреты — secrets/ рядом со stand.json,
+корень каталога судей — каталог stand.json или --root, run_id — из конфига):
+- judge-pack CONFIG [--real-data] — пакеты и пачки в OUT/judge/ (только done, последняя запись ключа); --real-data —
+  только с OUT/judge/real-data-consent.txt, иначе RunRefused("consent");
+- judge-stage CONFIG [--only-missing] — каталог судей <root>/judge-<run_id>/ с заданиями tasks/batch-NN.txt;
+  --only-missing — второй заход: задания только по пропавшим и кривым вердиктам (m7);
+- judge-audit STAGE --batch batch-NN --transcript PATH [--discard] — сверка транскрипта субагента по списку
+  разрешений: печатает только нарушения (инструмент и вид пути), код 1 при нарушениях; --discard — вердикты пачки
+  с нарушением удаляются из каталога судей;
+- judge-collect CONFIG [--batch batch-NN …] — перенос вердиктов (всех или этих пачек) в OUT/judge/verdicts/;
+- judge-check CONFIG — разбор вердиктов: счёт, id пропавших и кривых пакетов, контроль J1–J4; код 1, если есть
+  пропавшие или кривые;
+- table CONFIG … — таблица и рекомендация (pcbk_bench.table.main, Б2), ленивым импортом.
 
 Коды main: 0 — успех, 2 — RunRefused, 1 — прочее. Ошибка печатается только классом исключения (и кодом RunRefused),
 без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без разговоров и тегов) — в stderr.
@@ -29,7 +45,7 @@ from .cards import load_cards
 from .config import BenchConfig, load_config
 from .gateway import GatewayChat
 from .override import render_override
-from .runner import FUTURE_WINDOW_S, Runner, RunRefused, status_main
+from .runner import FUTURE_WINDOW_S, Runner, RunRefused, load_records, status_main
 from .secret import Secret
 from .stand import ServerStand, Stand
 
@@ -56,6 +72,25 @@ def _parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="код состояния прогона по OUT/progress.json")
     status.add_argument("out", type=Path)
     status.add_argument("--stale-s", type=float, default=120.0)
+    pack = sub.add_parser("judge-pack", help="пакеты судьи и пачки в OUT/judge/")
+    pack.add_argument("config", type=Path)
+    pack.add_argument("--real-data", action="store_true")
+    stage = sub.add_parser("judge-stage", help="каталог судей с заданиями пачек")
+    stage.add_argument("config", type=Path)
+    stage.add_argument("--only-missing", action="store_true")
+    stage.add_argument("--root", type=Path, default=None)
+    audit = sub.add_parser("judge-audit", help="сверка транскрипта субагента-судьи по списку разрешений")
+    audit.add_argument("stage", type=Path)
+    audit.add_argument("--batch", required=True)
+    audit.add_argument("--transcript", type=Path, required=True)
+    audit.add_argument("--discard", action="store_true")
+    collect = sub.add_parser("judge-collect", help="перенос вердиктов в OUT/judge/verdicts/")
+    collect.add_argument("config", type=Path)
+    collect.add_argument("--batch", action="append", default=None)
+    collect.add_argument("--root", type=Path, default=None)
+    check = sub.add_parser("judge-check", help="разбор вердиктов и контроль J1–J4")
+    check.add_argument("config", type=Path)
+    sub.add_parser("table", help="таблица и рекомендация (Б2): table CONFIG …", add_help=False)
     return p
 
 
@@ -79,6 +114,82 @@ def connect(cfg: BenchConfig) -> tuple[Stand, dict[int, GatewayChat]]:
     return stand, chats
 
 
+def _out(cfg: BenchConfig) -> Path:
+    if cfg.out_dir is None:
+        raise ValueError("конфиг: out_dir — путь")
+    return Path(cfg.out_dir)
+
+
+def _judge_root(cfg: BenchConfig, root: Path | None) -> Path:
+    """Корень каталога судей: --root, иначе каталог stand.json ($JOB/pcbk-d8, П7)."""
+    if root is not None:
+        return root
+    if cfg.stand is None:
+        raise ValueError("конфиг: stand не задан — укажите --root")
+    return Path(cfg.stand).parent
+
+
+def _secrets(cfg: BenchConfig) -> list[Secret]:
+    """Секреты стенда для сканера пакетов: файлы secrets/ рядом со stand.json (токен ops, пароли учёток)."""
+    if cfg.stand is None:
+        return []
+    folder = Path(cfg.stand).parent / "secrets"
+    if not folder.is_dir():
+        return []
+    out = []
+    for f in sorted(folder.iterdir()):
+        if f.is_file():
+            value = f.read_text(encoding="utf-8", errors="replace").strip()
+            if value:
+                out.append(Secret(value))
+    return out
+
+
+def _judge(args: argparse.Namespace) -> int:
+    from . import judge                       # лениво: прогону судья не нужен
+
+    if args.command == "judge-audit":
+        problems = judge.audit_transcripts(judge.transcript_calls(args.transcript), args.stage, args.batch)
+        for line in problems:
+            print(line)
+        print(f"нарушений: {len(problems)}")
+        if problems and args.discard:
+            print(f"вердиктов пачки удалено: {judge.discard_verdicts(args.stage, args.batch)}")
+        return 1 if problems else 0
+    cfg = load_config(args.config, OPENCODE_JSON)
+    out = _out(cfg)
+    if args.command == "judge-pack":
+        batches = judge.pack_batches(out, load_records(out), load_cards(cfg.cards), _secrets(cfg), seed=cfg.run_id,
+                                     real_data=args.real_data)
+        cmap = judge.load_map(out)
+        print(f"пакетов: {len(cmap['packets']) - len(cmap['refused'])}, отказано сканером: {len(cmap['refused'])}, "
+              f"контрольных: {len(cmap['controls'])}, пачек: {len(batches)}")
+        return 0
+    if args.command == "judge-stage":
+        only = None
+        if args.only_missing:
+            report = judge.check_verdicts(out)
+            only = set(report.missing) | set(report.invalid)
+        stage = judge.stage_judges(out, cfg.run_id, _judge_root(cfg, args.root), only=only)
+        print(f"каталог судей: {stage}")
+        print(f"заданий: {len(list((stage / 'tasks').glob('batch-*.txt')))}")
+        return 0
+    if args.command == "judge-collect":
+        stage = _judge_root(cfg, args.root) / f"judge-{cfg.run_id}"
+        print(f"вердиктов перенесено: {judge.collect_verdicts(stage, out, args.batch)}")
+        return 0
+    report = judge.check_verdicts(out)                                  # judge-check
+    print(f"разобрано: {len(report.ok)}, пропало: {len(report.missing)}, кривых: {len(report.invalid)}, "
+          f"отказано сканером: {len(report.refused)}")
+    for pid in report.missing:
+        print(f"пропал: {pid}")
+    for pid in report.invalid:
+        print(f"кривой: {pid}")
+    for cid, ok in judge.controls_ok(report, judge.load_map(out)["controls"]).items():
+        print(f"контроль {cid}: {'верен' if ok else 'ПРОМАХ'}")
+    return 1 if report.missing or report.invalid else 0
+
+
 def _run(config: Path) -> int:
     cfg = load_config(config, OPENCODE_JSON)
     if cfg.window_start is None or cfg.window_start > datetime.now(timezone.utc) + timedelta(seconds=FUTURE_WINDOW_S):
@@ -97,8 +208,14 @@ def main(argv: list[str] | None = None) -> int:
     previous = logger.level
     logger.setLevel(logging.INFO)
     parser = _parser()
+    args_list = list(sys.argv[1:] if argv is None else argv)
     try:
-        args = parser.parse_args(argv)
+        if args_list[:1] == ["table"]:
+            from .table import main as table_main          # лениво: таблица — Б2
+            return table_main(args_list[1:])
+        args = parser.parse_args(args_list)
+        if args.command.startswith("judge-"):
+            return _judge(args)
         if args.command == "override":
             sys.stdout.write(render_override(load_config(args.config, OPENCODE_JSON).places))
             return 0
