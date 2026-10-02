@@ -407,3 +407,17 @@ def test_table_main_errors_without_text(tmp_path, capsys):
     assert table.main(["--constructor-share", "2", str(tmp_path / "нет.json")]) == 1
     err = capsys.readouterr().err
     assert "нет.json" not in err
+
+
+def test_calc_rate_counted_as_calculator_unavailable():                           # Б3: сверка не пропущена молча
+    rate = {"tool": "tag_now", "status": "rate", "message": "слишком часто"}
+    skipped = rec("B1", answer="Сейчас 3,42 бар.", tools=[now_call("20FAKE_104_PV", 3.42)], calc={"tag_now": rate})
+    from helpers import now_item
+    checked = rec("B1", rep=2, answer="Сейчас 3,42 бар.", tools=[now_call("20FAKE_104_PV", 3.42)],
+                  calc={"tag_now": {"tool": "tag_now", "status": "ok", "items": [now_item("20FAKE_104_PV", 3.42)]}})
+    got = aggregate([skipped, checked], cards(), verdicts(skipped, checked))[0]
+    assert got.calc_skipped == 1 and got.judged == 2                                # оценка — по выводам, как была
+    md = render_markdown([got], {"run_id": "x"})
+    assert "калькулятор недоступен" in md and "1 прогонов (`z-ai/glm-5.3` — 1)" in md
+    assert "калькулятор недоступен" not in render_markdown([aggregate([checked], cards(), verdicts(checked))[0]],
+                                                           {"run_id": "x"})

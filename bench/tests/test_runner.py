@@ -1065,3 +1065,25 @@ def test_health_end_snapshot(tmp_path):                                         
     assert runner(out=tmp_path, stand=stand, only=[RunKey(7, "B1", 1)]).run() == "finished"
     snap = json.loads((tmp_path / "health_end.json").read_text())
     assert snap["key_spent_usd"] == 12.5 and snap["run"]["id"] == "d8-test"          # блок run не затёрт
+
+
+def test_calc_rate_waits_whole_window_then_notes():                             # Б3: сверка не пропускается молча
+    from pcbk_bench.runner import NOTE_CALC_RATE
+    from pcbk_bench.stand import CALC_RATE_PAUSE_S, CALC_RATE_WINDOW_S, CALC_TRIES
+    sleeps: list[float] = []
+    rec = runner(stand=FakeStand(calc_rate=10), sleep=sleeps.append).run_one(RunKey(7, "B1", 1))
+    assert rec.calc["tag_now"]["status"] == "ok" and sleeps.count(15.0) == 10      # больше трёх попыток прежнего
+    assert NOTE_CALC_RATE not in rec.notes
+    sleeps.clear()
+    rec = runner(stand=FakeStand(calc_rate=10_000), sleep=sleeps.append).run_one(RunKey(7, "B1", 1))
+    assert rec.status == "done" and rec.calc["tag_now"]["status"] == "rate" and NOTE_CALC_RATE in rec.notes
+    assert sleeps.count(CALC_RATE_PAUSE_S) == CALC_TRIES - 1                       # паузы — на всё окно частоты
+    assert (CALC_TRIES - 1) * CALC_RATE_PAUSE_S >= CALC_RATE_WINDOW_S
+
+
+def test_calc_rate_respects_run_deadline():                                       # пауза не выходит за срок прогона
+    clock = FakeClock()
+    stand = FakeStand(calc_rate=10_000)
+    r = runner(stand=stand, clock=clock.mono, sleep=clock.sleep)
+    answer = r._calc("tag_now", {"tags": ["20FAKE_104_PV"]}, deadline=clock.mono() + 40.0)
+    assert answer["status"] == "rate" and len(stand.calc_calls) == 3                 # 0, 15, 30 с; 45 с — за сроком

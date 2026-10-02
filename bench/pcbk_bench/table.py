@@ -25,6 +25,8 @@
   (invented_norm, saved_prompt_bad) у последней done-записи ключа с вердиктом ok — и при сбое стенда (доводка р1,
   I1: в качество и доли такая запись не идёт); create_hard — то же у группы A (m9);
 - мягкие (soft) — foreign_number автомата и numbers_not_from_tools судьи (I-р3-2); number_missing — провал без жёсткого;
+- калькулятор недоступен (calc_skipped, Б3) — последняя done-запись ключа, у которой калькулятор ответил rate и после
+  пауз на всё окно частоты (заметка прогонщика NOTE_CALC_RATE): вторая сверка не сделана — строкой в шапке;
 - цена хода — Σ цены строк llm_calls всех попыток группы / Σ ходов (реплик студента; мост — тоже ход) тех сессий,
   у которых есть строки журнала (priced_turns, доводка р1 I2; исключённые ходы — в шапке); заголовок
   разговора (step 0) входит; строка без пришедшей цены — по cost_est (сумма — estimated_usd, «по оценке»); отказ
@@ -110,6 +112,8 @@ class ModelRow:
     - not_run — не прогнано по причинам (timeout, stand_error, capped, interrupted); not_judged — не оценено
       (judge_failed, judge_refused_secret, judge_refused_data, judge_refused, no_packet, no_card);
     - bot_no_draft — прогонов A, где бот так и не увидел черновика;
+    - calc_skipped — прогонов (последняя done-запись ключа), где сверка калькулятором не сделана: ответ rate и после
+      пауз на всё окно частоты (калькулятор недоступен, Б3); в шапке Markdown — строкой;
     - hard — жёсткие провалы поштучно (автомат и судья), create_hard — они же у A; soft — мягкие сигналы
       (foreign_number, numbers_not_from_tools);
     - quality — средняя оценка судьи по всем пунктам оценённых; quality_groups — по группам;
@@ -132,6 +136,7 @@ class ModelRow:
     not_run: dict[str, int] = field(default_factory=dict)
     not_judged: dict[str, int] = field(default_factory=dict)
     bot_no_draft: int = 0
+    calc_skipped: int = 0
     hard: dict[str, int] = field(default_factory=dict)
     create_hard: dict[str, int] = field(default_factory=dict)
     soft: dict[str, int] = field(default_factory=dict)
@@ -462,11 +467,14 @@ def _row(name: str, plan: tuple[dict[str, int], int], recs: list[RunRecord], car
     passed: Counter = Counter()
     scores: dict[str, list[float]] = defaultdict(list)
     bot_no_draft = 0
+    calc_skipped = 0
     for r in latest.values():                            # оценка — по последней записи ключа (m12)
         av = autos[id(r)]
         group = BY_ID[r.key.scenario].group
         if r.status != "done":
             continue
+        if any(isinstance(e, Mapping) and e.get("status") == "rate" for e in r.calc.values()):
+            calc_skipped += 1                            # калькулятор недоступен: сверка не сделана (Б3)
         status, v = _judge_of(r, *index)
         if status == "ok" and v is not None:             # находки судьи — и у записи со сбоем стенда (р1, I1)
             vh = getattr(v, "hard", None) or {}
@@ -508,7 +516,8 @@ def _row(name: str, plan: tuple[dict[str, int], int], recs: list[RunRecord], car
         judged=sum(judged.values()), create_planned=groups_plan.get("create", 0), create_judged=judged["create"],
         create_passed=passed["create"],
         groups={g: {"planned": groups_plan.get(g, 0), "judged": judged[g], "passed": passed[g]} for g in GROUPS},
-        not_run=dict(not_run), not_judged=dict(not_judged), bot_no_draft=bot_no_draft, hard=dict(hard),
+        not_run=dict(not_run), not_judged=dict(not_judged), bot_no_draft=bot_no_draft, calc_skipped=calc_skipped,
+        hard=dict(hard),
         create_hard=dict(create_hard), soft=dict(soft), quality=_mean([s for g in GROUPS for s in scores[g]]),
         quality_groups={g: m for g in GROUPS if (m := _mean(scores[g])) is not None}, cost=costs,
         turn=f["turn"] if f else None, p90_turn=_p90([c for r in recs for c in _per_turn(r)]),
@@ -665,6 +674,11 @@ def _header(meta: Mapping[str, Any], rows: list[ModelRow]) -> list[str]:
         per = "; ".join(f"`{m}` — {n}" for m, n in excluded)
         lines.append(f"- Ходов без строк журнала прокси (исключены из цены хода): {sum(n for _, n in excluded)} "
                      f"({per}).")
+    skipped = [(r.model, r.calc_skipped) for r in rows if r.calc_skipped]
+    if skipped:
+        per = "; ".join(f"`{m}` — {n}" for m, n in skipped)
+        lines.append(f"- Сверка калькулятором не сделана (калькулятор недоступен: rate после пауз на всё окно "
+                     f"частоты): {sum(n for _, n in skipped)} прогонов ({per}).")
     if _num(meta.get("pending")):
         lines.append(f"- Строк журнала прокси с ценой в ожидании (pending): {int(meta['pending'])} — "
                      "их цена по оценке.")

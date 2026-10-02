@@ -20,9 +20,9 @@ ready (только если в плане есть его сценарии: ф�
 mcp=connected), разговор со сценарным ботом или скриптом (ScriptedStudent), у A — после удачного save_agent ожидание
 ready нового агента, мост к нему в новой сессии и архив всех агентов места, кроме bench-uzel, при любом статусе (и
 сохранённых уже после abort, m-р4-3), с ожиданием их ухода из «Мои агенты» — внутри срока прогона. Затем калькулятор
-по аргументам последних вызовов tag_now и tag_period хода (статус rate — пауза и повтор, m10) и строки журнала
-прокси: у каждой сессии с законченным ходом (и у моста) есть строки, их model — модель места, иначе stand_error
-(Д8-R71, р1 m6).
+по аргументам последних вызовов tag_now и tag_period хода (статус rate — пауза и повтор на всё окно частоты службы,
+calc_patient; rate и после него — заметка NOTE_CALC_RATE, сверка не молчит, Б3) и строки журнала прокси: у каждой
+сессии с законченным ходом (и у моста) есть строки, их model — модель места, иначе stand_error (Д8-R71, р1 m6).
 
 Сроки (m-р4-5): ожидание хода — min(turn_timeout_s, срок прогона − сейчас), у A срок разговора — без
 archive_reserve_s. Срок — abort сессии через шлюз, статус timeout; срок, вышедший между ходами, — timeout без новой
@@ -70,7 +70,7 @@ from .gateway import GatewayChat, GatewayError
 from .numbers import TAG_TOKEN_RE
 from .record import RunKey, RunRecord, ToolCall, Turn, parse_turn
 from .scenarios import BENCH_AGENT, BY_ID, SCENARIO_IDS
-from .stand import Stand
+from .stand import CALC_RATE_PAUSE_S, CALC_TRIES, Stand, calc_patient  # noqa: F401 — постоянные: имена прогонщика
 from .student import ScriptedStudent
 
 log = logging.getLogger("pcbk_bench.runner")
@@ -96,11 +96,10 @@ STAND_STRIKES = 3
 PLACE_STRIKES = 3
 HEALTH_TRIES = 3
 HEALTH_PAUSE_S = 5.0
-CALC_TRIES = 3
-CALC_RATE_PAUSE_S = 15.0
 ROWS_RETRY_S = 2.0
 POLL_S = 1.0
 BARRIER_TICK_S = 0.05
+NOTE_CALC_RATE = "калькулятор: rate — сверка не сделана"     # заметка записи; таблица считает такие прогоны
 AGENTS = {"bench": BENCH_AGENT, "konstruktor": "konstruktor", "pomoshnik": "pomoshnik"}
 _PCBK_CODE = re.compile(r"\bpcbk_[a-z_]+\b")
 
@@ -519,6 +518,8 @@ class Runner:
             if tag in units:
                 continue
             answer = self._calc("catalog_search", {"query": tag, "limit": 10})
+            if answer.get("status") == "rate":
+                log.warning("подготовка: единица тега не прочитана — rate")
             for match in answer.get("matches") or []:
                 if (isinstance(match, dict) and str(match.get("tag", "")).upper() == tag.upper()
                         and isinstance(match.get("unit"), str) and match["unit"]):
@@ -955,15 +956,8 @@ class Runner:
             log.warning("место %02d: архив агентов не прошёл (%s)", place, type(exc).__name__)
 
     def _calc(self, tool: str, args: dict, deadline: float | None = None) -> dict:
-        answer = self.stand.calc(tool, args)
-        tries = 1
-        while answer.get("status") == "rate" and tries < CALC_TRIES:
-            if deadline is not None and self.clock() + CALC_RATE_PAUSE_S > deadline:
-                break
-            self.sleep(CALC_RATE_PAUSE_S)
-            answer = self.stand.calc(tool, args)
-            tries += 1
-        return answer
+        """Калькулятор: rate — пауза и повтор на всё окно частоты службы (calc_patient), не позже deadline."""
+        return calc_patient(self.stand, tool, args, sleep=self.sleep, clock=self.clock, deadline=deadline)
 
     def _calc_all(self, rec: RunRecord, deadline: float) -> None:
         """Сверка калькулятором по аргументам последнего вызова tag_now и tag_period разговора (и моста)."""
@@ -977,6 +971,10 @@ class Runner:
                 rec.calc[tool] = self._calc(tool, dict(calls[-1].input), deadline)
             except Exception as exc:
                 rec.notes.append(f"калькулятор: сбой {type(exc).__name__}")
+                continue
+            if rec.calc[tool].get("status") == "rate":       # окно частоты не освободилось до срока: не молча (Б3)
+                rec.notes.append(NOTE_CALC_RATE)
+                log.warning("место %02d: сверка калькулятором не сделана — rate", rec.key.place)
 
     def _llm_rows(self, rec: RunRecord) -> None:
         """Строки журнала прокси сессий прогона (Д8-R71): у КАЖДОЙ сессии с законченным ходом (и у моста) есть строки

@@ -17,6 +17,9 @@ ServerStand(ssh, core_url, edge_url, edge_host, secrets, remote_dir):
 - calc — POST core_url/api/data/<инструмент> токеном данных ops (secrets/ops.data-token) через туннель к core;
 - health_llm — GET core_url/health/llm; status — GET edge_url/status.json сторожа с Host = edge_host.
 
+calc_patient(stand, tool, args, sleep=…) — калькулятор с паузой и повтором на rate на всё окно частоты службы (Б3):
+его зовут прогонщик (сверка и единицы) и cards_check (Б3).
+
 STU_NET и SECRETS_DIR берутся из .env в remote_dir (/opt/pcbk-reserve) один раз простым grep, сверяются по виду и
 идут в команды литералами (SD=…; STU=…;) — подстановки команд «$(…)» в удалённых командах нет; без строк в .env —
 умолчания compose.
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import re
 import shlex
 import ssl
@@ -105,6 +109,30 @@ asyncio.run(main())
 
 class StandError(Exception):
     """Сбой стенда (SSH, docker, HTTP): текст — постоянный, без вывода команд и тел ответов."""
+
+
+# частота вызывающего службы данных (core/pcbk_core/data: PER_CALLER_LIMIT за RATE_WINDOW_S — 60 вызовов за 300 с,
+# скользящее окно, отказ не записывается) — значением: стенд только на stdlib
+CALC_RATE_WINDOW_S = 300.0
+CALC_RATE_PAUSE_S = 15.0
+# пауза и повтор на всё окно частоты (Б3): за CALC_RATE_WINDOW_S любой прежний вызов выходит из окна, и повтор
+# проходит; трёх попыток (30 с) мало — у двойника прогоны идут быстрее предела, и сверка пропускалась бы
+CALC_TRIES = 1 + math.ceil(CALC_RATE_WINDOW_S / CALC_RATE_PAUSE_S)
+
+
+def calc_patient(stand: Stand, tool: str, args: dict, *, sleep: Callable[[float], None],
+                 clock: Callable[[], float] | None = None, deadline: float | None = None) -> dict:
+    """Калькулятор (stand.calc) с паузой и повтором на ответ rate: до CALC_TRIES попыток через CALC_RATE_PAUSE_S, не
+    позже deadline по clock. Ответ rate после всех попыток возвращается как есть — его учитывает вызывающий."""
+    answer = stand.calc(tool, args)
+    tries = 1
+    while isinstance(answer, dict) and answer.get("status") == "rate" and tries < CALC_TRIES:
+        if deadline is not None and clock is not None and clock() + CALC_RATE_PAUSE_S > deadline:
+            break
+        sleep(CALC_RATE_PAUSE_S)
+        answer = stand.calc(tool, args)
+        tries += 1
+    return answer
 
 
 class Stand(Protocol):
@@ -325,5 +353,5 @@ class ServerStand:
         return answer
 
 
-__all__ = ["AGENT_FILE_PY", "AGENT_ROWS_PY", "LLM_ROWS_PY", "MCP_SAVE_PY", "ServerStand", "Stand", "StandError",
-           "mcp_connected"]
+__all__ = ["AGENT_FILE_PY", "AGENT_ROWS_PY", "CALC_RATE_PAUSE_S", "CALC_RATE_WINDOW_S", "CALC_TRIES", "LLM_ROWS_PY",
+           "MCP_SAVE_PY", "ServerStand", "Stand", "StandError", "calc_patient", "mcp_connected"]
