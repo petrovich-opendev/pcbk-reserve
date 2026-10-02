@@ -1,7 +1,8 @@
 """Headless Chrome по протоколу DevTools (CDP), только stdlib: запуск, вкладки, ввод, ожидания, сеть, CSP, снимки.
 
 Для браузерных тестов веб-чата (Д6а; список разговоров — rename_thread, open_thread, click_text_in — Д6б; панель
-«Агенты» и агент разговора — click_agent, agent_line, ready_agents, texts, current_thread_id, reload — Д7б): фикстуры
+«Агенты» и агент разговора — click_agent, agent_line, ready_agents, texts, current_thread_id, reload — Д7б; вкладка
+«Калькуляторы» — select и type(…, clear=True) — Д9а): фикстуры
 browser (на модуль) и page (на тест, вкладка закрывается) — в conftest.py. Все вкладки — сессии одного соединения с
 браузером (Target.attachToTarget, flatten). Клиент WebSocket — свой, по RFC 6455 в том объёме, что нужен CDP: только
 ws://127.0.0.1, текстовые кадры, длина до 64 бит.
@@ -405,12 +406,35 @@ class Page:
         if not self.eval(js):
             raise AssertionError(f"{selector}: не принял фокус")
 
-    def type(self, selector: str, text: str, timeout: float = 10) -> None:
+    def type(self, selector: str, text: str, timeout: float = 10, clear: bool = False) -> None:
         """Фокус в поле и ввод текста, как с клавиатуры (Input.insertText: события input — у React тоже). Пароль —
         строкой с безопасным repr (conftest.Secret): этот кадр и params вызова pytest печатает при сбое как есть, а
-        провод (send, _frame) печатается только длиной."""
+        провод (send, _frame) печатается только длиной. clear — прежний текст поля выделяется целиком и ввод его
+        заменяет (как Ctrl+A и набор): одно событие input с новым значением, без промежуточного пустого."""
         self._focus(selector, timeout)
+        if clear:
+            js = (f"(() => {{ const e = document.querySelector({json.dumps(selector)}); if (!e) return false; "
+                  "e.select(); return e.selectionStart === 0 && e.selectionEnd === e.value.length; })()")
+            if not self.eval(js):
+                raise AssertionError(f"{selector}: текст поля не выделился")
         self._call("Input.insertText", {"text": text})
+
+    def select(self, css: str, value: str, timeout: float = 10) -> None:
+        """Выбор значения в видимом <select> css, как выбор пользователя: value ставится нативным сеттером и
+        уходит событие change (React слушает его у select); затем проверка, что поле держит value — у управляемого
+        поля React вернул бы прежнее значение, если выбор не дошёл до состояния. Значения нет среди option —
+        AssertionError."""
+        self.wait_selector(css, timeout)
+        js = (f"(() => {{ const e = document.querySelector({json.dumps(css)}), want = {json.dumps(value)}; "
+              "if (!(e instanceof HTMLSelectElement)) return 'не select'; "
+              "if (![...e.options].some((o) => o.value === want)) return 'нет такого значения'; "
+              "Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(e, want); "
+              "e.dispatchEvent(new Event('change', { bubbles: true })); return 'ok'; })()")
+        got = self.eval(js)
+        if got != "ok":
+            raise AssertionError(f"{css}: выбор {value!r} — {got}")
+        held = f"document.querySelector({json.dumps(css)})?.value === {json.dumps(value)}"
+        self.wait(lambda: self.eval(held), timeout, f"{css} держит значение {value!r}")
 
     def press_enter(self, selector: str, timeout: float = 10) -> None:
         """Enter в поле: у поля формы — отправка формы, у поля чата — отправка сообщения."""

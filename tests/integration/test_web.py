@@ -30,18 +30,17 @@
 """
 import html
 import json
-import os
 import re
 import secrets
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
 import cdp
 import conftest
-from conftest import REPO, STAND_ORIGIN, Secret, failure, leaks, system_text, tool_names_of, turn_bodies, wait_for
+from conftest import (NOTICE_RE, REPO, STAND_ORIGIN, Secret, failure, leaks, login_to_chat, shot, system_text,
+                      tool_names_of, turn_bodies, wait_for)
 from fake_openrouter import save_args                                   # core/tests на пути импорта (conftest, П7)
 from gateway_cases import ALLOWED, OC, SES_FAKE, TWINS
 
@@ -74,14 +73,10 @@ STORE_CLEAN_JS = ("(async () => { localStorage.removeItem('pcbk-probe'); session
                   "document.cookie = 'pcbk-probe=; path=/chat/; max-age=0'; await new Promise((ok, no) => { "
                   "const r = indexedDB.deleteDatabase('pcbk-probe'); r.onsuccess = () => ok(1); "
                   "r.onerror = () => no(r.error); }); return 1; })()")
-# форма входа видна: /me ответил 401 (без сессии); при живой сессии форма так и остаётся скрытой
-LOGIN_FORM_JS = "(() => { const e = document.getElementById('login'); return !!e && e.getClientRects().length > 0; })()"
 # строка «Веб-чат» страницы состояния — в середину экрана (для снимка 04)
 WEB_ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
                         "&& e.textContent.trim() === 'Веб-чат').scrollIntoView({block: 'center'}), 1")
 EVENT = OC + "/event"                           # поток событий вкладки (только у открытого разговора)
-# предупреждение при первом входе (Д6-R49, текст — web/src/texts.ts)
-NOTICE_RE = r"Преподаватель видит ваши разговоры"
 DEFAULT_TITLE = "New session - "               # имя разговора OpenCode до самозаголовка
 TOO_MANY_TABS = r"Открыто слишком много вкладок чата — закройте лишние"
 # подтверждение предупреждения мимо шлюза (preflight Ф5): без пароля и без новой сессии — вход вытеснил бы сессию вкладок
@@ -222,28 +217,6 @@ def web_users(stack):
             stack.stop(name)
 
 
-def login_to_chat(page, login, password) -> str:
-    """Вход на /login; «Рабочее место готово» ведёт в чат сама страница входа. «Вы вошли как» не годится признаком
-    чата: этот текст есть и на странице входа, и в шапке чата на экранах места и предупреждения (раунд 2, Minor 7) —
-    он сверяет только учётку, когда поле ввода чата уже видно.
-
-    Сессия этой вкладки уже есть (cookie вкладок одного контекста общие, браузер — на модуль) — страница входа сама
-    будит место и ведёт в чат, формы нет: второй вход не нужен. Каждый вход — новая сессия, а их у учётки не больше
-    трёх (новая вытесняет старую), так что тесты входят как можно реже. Возвращает "form" (вошли формой) или "chat"
-    (сессия уже была)."""
-    page.goto(STAND + "/login")
-    how = page.wait(lambda: "chat" if page.url().split("?")[0].endswith("/chat/")
-                    else "form" if page.eval(LOGIN_FORM_JS) else None, 90, "форма входа или переход в чат")
-    if how == "form":
-        page.type("#login", login)
-        page.type("#password", password)
-        page.press_enter("#password")
-    page.wait_url("/chat/", 90)
-    page.wait_selector("textarea", 90)
-    page.wait_text(rf"Вы вошли как {re.escape(login)}\b", 10)
-    return how
-
-
 def ask(page, text: str, timeout: float = 120) -> str:
     """Вопрос в поле ввода и Enter; ждёт новое сообщение агента — их стало на одно больше, чем до отправки (preflight
     F4: иначе второй вопрос вернул бы уже показанный ответ), в нём «Готово: …», и ход кончился. Текст этого сообщения
@@ -333,13 +306,6 @@ def session_of(stack, n: int, sid: str) -> dict:
 def web_reports(stack) -> dict:
     """/health/web серверного слоя изнутри сторожа (pcbk-front): счётчики отчётов браузеров за час."""
     return json.loads(stack.body_from_watchdog("http://pcbk-core:8000/health/web"))
-
-
-def shot(page, name: str) -> None:
-    """Снимок вкладки в PCBK_SHOTS (снимки для владельца, M17); без переменной — ничего."""
-    where = os.environ.get("PCBK_SHOTS")
-    if where:
-        page.screenshot(Path(where) / name)
 
 
 def open_chat(stack, page, password) -> None:

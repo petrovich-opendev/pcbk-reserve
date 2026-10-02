@@ -112,6 +112,14 @@ DATA_EVENTS_PY = ("import json, sqlite3, sys; "
                   "+ (' WHERE channel = ?' if ch else '') + ' ORDER BY rowid DESC LIMIT ?'; "
                   "print(json.dumps([dict(zip(('caller', 'channel', 'tool', 'outcome'), r)) "
                   "for r in c.execute(q, ((ch,) if ch else ()) + (int(sys.argv[1]),))]))")
+# события вызывающего по инструменту изнутри pcbk-core (Д9а, Б1 критики р1): последние n, новые сверху — исход,
+# summary, sent (имена, ушедшие драйверу: список) и канал; argv — вызывающий, инструмент, n
+DATA_EVENTS_OF_PY = ("import json, sqlite3, sys; "
+                     "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
+                     "print(json.dumps([{'outcome': o, 'summary': s, 'sent': json.loads(t), 'channel': ch} "
+                     "for o, s, t, ch in c.execute('SELECT outcome, summary, sent, channel FROM agent_events "
+                     "WHERE caller = ? AND tool = ? ORDER BY rowid DESC LIMIT ?', "
+                     "(sys.argv[1], sys.argv[2], int(sys.argv[3])))], ensure_ascii=False))")
 # число событий вызывающего в канале: argv — вызывающий и канал
 DATA_EVENT_COUNT_PY = ("import sqlite3, sys; "
                        "c = sqlite3.connect('file:/var/lib/pcbk-core/core.db?mode=ro', uri=True); "
@@ -223,6 +231,14 @@ STAND_HOST = "stand.pcbk.test:18443"
 STAND_ORIGIN = f"https://{STAND_HOST}"
 # D1: соединение есть, если curl -v его сообщил
 CONNECTED = re.compile(r"Established connection|Connected to")
+# --- вход в чат браузером (Д6а; из test_web.py — общие помощники с Д9а: вкладка «Калькуляторы» в test_bench) ---
+# форма входа видна: /me ответил 401 (без сессии); при живой сессии форма так и остаётся скрытой
+LOGIN_FORM_JS = "(() => { const e = document.getElementById('login'); return !!e && e.getClientRects().length > 0; })()"
+# предупреждение при первом входе (Д6-R49, текст — web/src/texts.ts) и его кнопка (T_NOTICE_ACK)
+NOTICE_RE = r"Преподаватель видит ваши разговоры"
+NOTICE_ACK = "Понятно"
+# поле ввода чата видно (экран чата, а не предупреждения)
+CHAT_FIELD_JS = "!!document.querySelector('textarea')?.getClientRects().length"
 
 
 def failure(fn, *args, **kw) -> BaseException:
@@ -295,6 +311,45 @@ def row_of(status: dict, component: str) -> dict:
         if c["component"] == component:
             return c
     raise KeyError(component)
+
+
+def login_to_chat(page, login, password, ack_notice: bool = False) -> str:
+    """Вход на /login; «Рабочее место готово» ведёт в чат сама страница входа. «Вы вошли как» не годится признаком
+    чата: этот текст есть и на странице входа, и в шапке чата на экранах места и предупреждения (раунд 2, Minor 7) —
+    он сверяет только учётку, когда поле ввода чата уже видно.
+
+    Сессия этой вкладки уже есть (cookie вкладок одного контекста общие, браузер — на модуль) — страница входа сама
+    будит место и ведёт в чат, формы нет: второй вход не нужен. Каждый вход — новая сессия, а их у учётки не больше
+    трёх (новая вытесняет старую), так что тесты входят как можно реже. Возвращает "form" (вошли формой) или "chat"
+    (сессия уже была).
+
+    ack_notice (Д9а) — новая учётка видит в чате сначала предупреждение первого входа (Д6-R49): «Понятно», если оно
+    есть (подтверждение — через шлюз), затем поле ввода. Без ack_notice экран предупреждения — сбой по сроку ожидания
+    поля, как прежде."""
+    page.goto(STAND_ORIGIN + "/login")
+    how = page.wait(lambda: "chat" if page.url().split("?")[0].endswith("/chat/")
+                    else "form" if page.eval(LOGIN_FORM_JS) else None, 90, "форма входа или переход в чат")
+    if how == "form":
+        page.type("#login", login)
+        page.type("#password", password)
+        page.press_enter("#password")
+    page.wait_url("/chat/", 90)
+    if ack_notice:
+        seen = page.wait(lambda: "chat" if page.eval(CHAT_FIELD_JS) else "notice" if page.has_text(NOTICE_RE) else None,
+                         90, "поле ввода чата или предупреждение первого входа")
+        if seen == "notice":
+            page.click_text(NOTICE_ACK)
+            page.wait_gone(NOTICE_RE, 30)
+    page.wait_selector("textarea", 90)
+    page.wait_text(rf"Вы вошли как {re.escape(login)}\b", 10)
+    return how
+
+
+def shot(page, name: str) -> None:
+    """Снимок вкладки в PCBK_SHOTS (снимки для владельца, M17); без переменной — ничего."""
+    where = os.environ.get("PCBK_SHOTS")
+    if where:
+        page.screenshot(Path(where) / name)
 
 
 def agents_owner(root: Path, script: str) -> None:
@@ -782,6 +837,13 @@ class Stack:
             raise RuntimeError(f"/health/llm: код {code}")
         return json.loads(body)
 
+    def health_historian(self) -> dict:
+        """/health/historian серверного слоя — с хоста теста, без токена (Д9а: ключ drill, tools.failing)."""
+        code, body = self.http_host("GET", CORE_URL + "/health/historian")
+        if code != 200:
+            raise RuntimeError(f"/health/historian: код {code}")
+        return json.loads(body)
+
     def llm_calls(self, last: int = 5) -> list[dict]:
         """Последние строки журнала вызовов LLM (новые — первыми): только столбцы llm_calls."""
         return json.loads(self._docker("exec", "pcbk-core", "python", "-c", LLM_CALLS_PY, str(last)).stdout)
@@ -790,9 +852,23 @@ class Stack:
         """Сколько отказов прокси с этим code у сессии OpenCode в журнале вызовов."""
         return int(self._docker("exec", "pcbk-core", "python", "-c", LLM_REFUSALS_PY, session, code).stdout)
 
-    def data_events(self, last: int = 5, channel: str | None = None) -> list[dict]:
-        """Последние события службы данных (новые — первыми): caller, channel, tool, outcome; channel — отбор."""
-        return json.loads(self._docker("exec", "pcbk-core", "python", "-c", DATA_EVENTS_PY, str(last),
+    def data_events(self, caller: str | int = 5, tool: str | None = None, n: int | None = None, *,
+                    channel: str | None = None) -> list[dict]:
+        """Последние события службы данных, новые — первыми; чтение изнутри pcbk-core (mode=ro). Два вида вызова:
+
+        - data_events(caller, tool, n) (Д9а) — последние n событий этого вызывающего и инструмента: outcome, summary,
+          sent (список имён, ушедших драйверу), channel;
+        - data_events(last, channel=…) (Д3б, прежний вид) — последние last событий (channel — отбор): caller,
+          channel, tool, outcome.
+        """
+        if isinstance(caller, str):
+            if tool is None or n is None or channel is not None:
+                raise TypeError("data_events(caller, tool, n): нужны вызывающий, инструмент и n, без channel")
+            return json.loads(self._docker("exec", "pcbk-core", "python", "-c", DATA_EVENTS_OF_PY, caller, tool,
+                                           str(int(n))).stdout)
+        if tool is not None or n is not None:
+            raise TypeError("data_events(last, channel=…): инструмент и n — только у вида с вызывающим")
+        return json.loads(self._docker("exec", "pcbk-core", "python", "-c", DATA_EVENTS_PY, str(caller),
                                        channel or "").stdout)
 
     def data_event_count(self, caller: str, channel: str) -> int:

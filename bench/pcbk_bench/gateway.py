@@ -15,11 +15,15 @@ wait_idle(session, timeout_s) опрашивает GET /session/status раз в
 законченный (time.completed или error) ответ ассистента после последней реплики, отправленной этим клиентом:
 сразу после prompt_async старый ответ прошлого хода за конец не принимается. Вопросы и запросы разрешений своей
 сессии снимаются отказом, как converse.js. Срок — TimeoutError.
+
+calc(tool, args) (Д9а) — калькулятор вкладки «Калькуляторы»: POST /pcbk/api/calc/<tool> (Д9-R87) — тот же DataService,
+место — из учётки, канал web; ответ службы JSON при 200 (любой статус службы), иначе GatewayError.
 """
 from __future__ import annotations
 
 import http.client
 import json
+import re
 import ssl
 import threading
 import time
@@ -36,6 +40,8 @@ RETRY_DELAY_S = 2.0
 STATUS_POLL_S = 1.0
 MESSAGES_POLL_S = 5.0
 WAKE_POLL_S = 2.0
+CALC = API + "/calc"
+TOOL_RE = re.compile(r"[a-z_]{1,32}")     # имя инструмента в пути калькулятора — без «/», «.» и «?»
 
 
 class GatewayError(Exception):
@@ -191,6 +197,19 @@ class GatewayChat:
         data = self._call("GET", API + "/agents")
         agents = data.get("agents") if isinstance(data, dict) else None
         return [a for a in agents if isinstance(a, dict)] if isinstance(agents, list) else []
+
+    def calc(self, tool: str, args: dict) -> dict:
+        """POST /pcbk/api/calc/<tool> — калькулятор вкладки (Д9-R87): тело — аргументы инструмента как есть; ответ
+        службы (dict) при 200 — с любым её статусом, в том числе refused и error. Не 200 (нет сессии, чужой
+        инструмент, преподаватель, службы нет, тело не объект) — GatewayError; 200 не с объектом JSON —
+        GatewayError(200, "NotJson"). Повторы — как у прочих вызовов (_call): 401 — один повторный вход, 429 и 503 —
+        до RETRIES. Имя инструмента вне [a-z_] — ValueError до запроса."""
+        if not TOOL_RE.fullmatch(tool):
+            raise ValueError("calc: имя инструмента — [a-z_], до 32 знаков")
+        data = self._call("POST", f"{CALC}/{tool}", dict(args))
+        if not isinstance(data, dict):
+            raise GatewayError(200, "NotJson")
+        return data
 
     # --- разговор (белый список шлюза, rules.py) ---
 
