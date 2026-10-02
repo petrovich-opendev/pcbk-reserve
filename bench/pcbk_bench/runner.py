@@ -37,11 +37,11 @@ archive_reserve_s. Срок — abort сессии через шлюз, стат
 pcbk_run_spent в ходе; money — pcbk_money_out, pcbk_key_limit, pcbk_budget_spent, pcbk_share_spent; stand — строка
 «LLM-прокси и бюджет» fail или «Память сервера» не ok STAND_STRIKES проверок подряд через STAND_CHECK_S (одна
 проверка на прогонщик: перед повтором и в главном потоке, m13), или в /health/llm нет блока run этого прогона (перед
-каждым прогоном и каждой репликой, р1 I2); window; interrupt — SIGINT/SIGTERM: идущие сессии получают abort каждый
-такт, пока они идут (р1 m2), прогоны — interrupted; projection — пауза на барьере 1: прогноз Σ_g(расход повтора 1
-группы g × reps[g]) больше cap − stop_margin, а projection_ack нет; place — у места, остановленного PLACE_STRIKES
-stand_error подряд, остались прогоны плана (р1, I1; state stopped, status — код 2). После cap по 402, money,
-interrupt и пропавшего блока run места новых реплик не шлют («жёсткая» остановка).
+каждым прогоном и каждой репликой, р1 I2); window; interrupt — SIGINT/SIGTERM: идущие сессии получают abort, пока
+они идут, не чаще ABORT_REPEAT_S (р1 m2, р1б), прогоны — interrupted; projection — пауза на барьере 1: прогноз
+Σ_g(расход повтора 1 группы g × reps[g]) больше cap − stop_margin, а projection_ack нет; place — у места,
+остановленного PLACE_STRIKES stand_error подряд, остались прогоны плана (р1, I1; state stopped, status — код 2).
+После cap по 402, money, interrupt и пропавшего блока run места новых реплик не шлют («жёсткая» остановка).
 
 Журнал сессий OUT/sessions.log — строки «<id>\\t<NN>\\tstart» при создании сессии и «<id>\\t<NN>\\tend» в конце
 прогона, при abort и при уборке (П5). Записи прогонов — OUT/runs.jsonl (RunRecord.to_json, по строке); возобновление
@@ -52,6 +52,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -89,6 +90,7 @@ AGENT_WAIT_S = 60.0
 IDLE_WAIT_S = 60.0
 FUTURE_WINDOW_S = 300.0                                    # window_start позже сейчас + 5 мин — отказ (р1, m7)
 ABORT_WAIT_S = 10.0
+ABORT_REPEAT_S = 1.0                                        # повторный abort одной сессии — не чаще (р1б, п. 4)
 STAND_CHECK_S = 60.0
 STAND_STRIKES = 3
 PLACE_STRIKES = 3
@@ -104,7 +106,8 @@ _PCBK_CODE = re.compile(r"\bpcbk_[a-z_]+\b")
 
 
 class RunRefused(Exception):
-    """Отказ запуска прогона: код (locked, run_id, run_callers, place_model, bench_agent, not_ready, window_start)."""
+    """Отказ запуска прогона: код (locked, run_id, run_callers, place_model, bench_agent, not_ready, place_busy,
+    window_start)."""
 
     def __init__(self, code: str):
         super().__init__(code)
@@ -331,6 +334,7 @@ class Runner:
         self._waiting: dict[int, float] = {}
         self._ended: set[str] = set()
         self._turned: set[str] = set()                  # сессии с законченным ходом (строки журнала — у каждой)
+        self._aborted_at: dict[str, float] = {}         # сессия → clock последнего abort главного потока
         self._thread_errors: list[BaseException] = []
         latest: dict[RunKey, RunRecord] = {}
         for rec in load_records(self.out):
@@ -613,8 +617,14 @@ class Runner:
                 log.warning("место %02d: пробуждение на барьере не удалось (%s)", place, type(exc).__name__)
 
     def _abort_live(self) -> None:
+        """abort идущих сессий; одной сессии — не чаще ABORT_REPEAT_S (р1б, п. 4): иначе неснятый ход дал бы ~20
+        запросов в секунду на cookie, а limit_req edge (pcbk_oc_rate, 20 r/s) ответил бы 503 busy."""
+        now = self.clock()
         with self._lock:
-            live = dict(self._live)
+            live = {p: s for p, s in self._live.items()
+                    if now - self._aborted_at.get(s, -math.inf) >= ABORT_REPEAT_S}
+            for session in live.values():
+                self._aborted_at[session] = now
         for place, session in live.items():
             try:
                 self.chats[place].abort(session)
@@ -799,11 +809,11 @@ class Runner:
             msg: str | None = first
             since = 0
             while msg is not None:
-                if self._hard.is_set():
+                self._run_guard()                         # сначала /health/llm: пока он читается, могли прийти
+                if self._hard.is_set():                   # чужая жёсткая остановка или срок (р1б, п. 1)
                     raise _RunStatus("interrupted")
                 if self.clock() >= deadline:              # срок вышел между ходами — реплики нет (р1, m1)
                     raise _RunStatus("timeout")
-                self._run_guard()
                 self._gw(place, chat.send, session, msg, agent)
                 sent = self.now()
                 if self._interrupt.is_set():              # сигнал пришёл, пока реплика уходила (р1, m2)

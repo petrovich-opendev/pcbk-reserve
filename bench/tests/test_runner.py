@@ -467,6 +467,23 @@ def test_deadline_between_turns_sends_nothing():                                
     assert [c for c in chat.calls if c[0] == "send"] == [("send", rec.sessions[0])]     # уточнения нет
 
 
+def test_guard_read_before_deadline_check():                                     # р1б, п. 1
+    clock = FakeClock(start=T0)
+    stand = FakeStand(health_advance=(clock, 700))                                 # чтение /health/llm — 700 с
+    chat = FakeChat.honest()
+    r = runner(chat=chat, stand=stand, places={7: M1}, now=clock.now, clock=clock.mono, sleep=clock.sleep,
+               run_timeout_s={"number": 600})
+    rec = r.run_one(RunKey(7, "B1", 1))                                             # срок 600 с вышел, пока шло чтение
+    assert rec.status == "timeout" and not [c for c in chat.calls if c[0] == "send"]
+
+
+def test_guard_read_failure_lets_reply_go():                                     # р1б, п. 3: сбой чтения — не стоп
+    stand = FakeStand(health_fail_calls={1})                                        # сторож первой реплики
+    r = runner(stand=stand, places={7: M1})
+    rec = r.run_one(RunKey(7, "B1", 1))
+    assert rec.status == "done" and len(rec.turns) == 1 and not r._hard.is_set() and stand.health_calls == 1
+
+
 def test_window_checked_after_slow_health():                                     # р1, m3
     clock = FakeClock(start=T0)
     stand = FakeStand(health_advance=(clock, 50 * 60))                             # каждый /health/llm — 50 мин
@@ -503,6 +520,13 @@ def test_foreign_model_on_timeout_is_stand_error():                             
     stand = FakeStand(rows_model="z-ai/other")
     rec = runner(chat=FakeChat.never_idle(), stand=stand, turn_timeout_s=0.1).run_one(RunKey(7, "B1", 1))
     assert rec.status == "stand_error"
+
+
+def test_rows_needed_on_timeout_after_finished_turn():                          # р1б, п. 2
+    chat = FakeChat.honest(b3_asks=True, stall_after_turns={7: 1})                 # уточнение упирается в срок
+    r = runner(chat=chat, stand=FakeStand(rows_none=True), places={7: M1}, turn_timeout_s=0.2, sleep=lambda s: None)
+    rec = r.run_one(RunKey(7, "B3", 1))
+    assert len(rec.turns) == 1 and rec.status == "stand_error" and rec.llm_rows == []
 
 
 def test_rows_needed_for_each_session_with_turn():                              # р1, m6: мост без строк
@@ -553,6 +577,23 @@ def test_interrupt_reaborts_every_tick():                                       
     threading.Thread(target=fire, daemon=True).start()
     assert r.run() == "interrupt"
     assert load_records(r.out)[0].status == "interrupted" and chat.calls.count(("abort", chat.sessions[0])) >= 2
+
+
+def test_interrupt_reabort_throttled(monkeypatch):                               # р1б, п. 4: не чаще ABORT_REPEAT_S
+    import pcbk_bench.runner as mod
+    monkeypatch.setattr(mod, "ABORT_WAIT_S", 0.1)                                  # ожидание после abort по сроку
+    chat = FakeChat.never_idle(ignore_aborts=1000)                                 # место abort не видит вовсе
+    r = runner(chat=chat, places={7: M1}, only=[RunKey(7, "B1", 1)], turn_timeout_s=1.6)
+
+    def fire():
+        deadline = time.monotonic() + 10
+        while not chat.sessions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        r._on_signal(signal.SIGINT, None)
+    threading.Thread(target=fire, daemon=True).start()
+    assert r.run() == "interrupt"
+    aborts = chat.calls.count(("abort", chat.sessions[0]))
+    assert 2 <= aborts <= 4                  # главный поток — в 0 и 1 с, место — по сроку хода 1,6 с; без предела — ~30
 
 
 def test_interrupt_during_send_aborts_before_turn():                             # р1, m2: сигнал, пока реплика уходит
@@ -951,6 +992,8 @@ def test_server_stand_commands(tmp_path):
         stand.archive_agent(7, "../etc")
     with pytest.raises(StandError):
         stand.agent_rows(11)
+    ssh.out = "[]"
+    assert stand.agent_rows(7) == []
     ssh.out = '{"model": "pcbk/z-ai/glm-5.3"}'
     stand.place_model(7)
     ssh.out = "student-07\n"
@@ -958,7 +1001,7 @@ def test_server_stand_commands(tmp_path):
     ssh.out = ""
     stand.agent_file(7, "bench-uzel")
     stand.place_mcp_ok(7)
-    assert len(ssh.calls) == 8 and not [c for c in ssh.calls if "$(" in c[0][4]]     # р1, m5: без «$(» нигде
+    assert len(ssh.calls) == 9 and not [c for c in ssh.calls if "$(" in c[0][4]]     # р1, m5: без «$(» нигде
 
 
 def test_server_stand_remote_env_literal_and_checked(tmp_path):                # р1, m5
