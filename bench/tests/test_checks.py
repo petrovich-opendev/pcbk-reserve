@@ -321,3 +321,11 @@ def test_b4_diff_precision_and_bridge_period():
     r = honest_a_record("A1", bridge_answer="Среднее за прошлую смену 127,9 °C.")
     r.bridge.tools[:] = [period_call("20FAKE_101_PV", avg=127.9, low=125.1, high=131.6)]
     assert check_run(r, card("A1")).passed is True                         # мост ответил сводкой
+
+
+def test_b4_difference_is_a_key_value():                                          # разность обязательна сама по себе
+    tools = [period_call("20FAKE_104_PV", high=3.71, period="last_24h"), now_call("20FAKE_104_PV", 3.42)]
+    v = check_run(rec("B4", answer="Максимум за сутки 3,71 бар, сейчас 3,42 бар.", tools=tools), card("B4"))
+    assert v.hard == ("number_mismatch",) and v.fails == ("number_mismatch",)        # чужих чисел нет — только ключ
+    v = check_run(rec("B4", answer="Максимум 3,71 бар, сейчас 3,42 бар, выше на 1.", tools=tools), card("B4"))
+    assert v.hard == ("number_mismatch",)                                            # «4 − 3» от целых — не разность
