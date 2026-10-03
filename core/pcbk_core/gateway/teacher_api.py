@@ -48,10 +48,12 @@ change_failed.
 учёток (иначе 404 not_found) → тело вручную (accounts — ровно {"login", "place": "NN"}, логин не того вида — 400 текстом
 правила без логина; прочие — пусто или {}) → цель → строка started (target — логин, place — место; нет строки — 503
 journal, действия нет, change_failed) → операция AccountStore в потоке (правила — только его: ValueError — 400 его
-текстом, StoreError — 503 store) → finish(ok | refused | error). Итог не записан (finish упал), а действие прошло —
-ответ удачи всё равно (иначе порождённый пароль пропал бы), change_failed и хвост finish=failed строки журнала службы;
-строка started остаётся следом попытки. Пароль — secrets.token_urlsafe(GENERATED_PW_BYTES), как --generate команды,
-только в теле ответа с Cache-Control: no-store и Pragma: no-cache; ни в журнал действий, ни в журнал службы он не идёт.
+текстом, StoreError — 503 store; password, disable и unlock — с student_only: роль цели хранилище сверяет ещё раз в
+транзакции изменения, ревью Б1+Б2 M-1; enable сверяет её всегда) → finish(ok | refused | error). Итог не записан
+(finish упал), а действие прошло — ответ удачи всё равно (иначе порождённый пароль пропал бы), change_failed и хвост
+finish=failed строки журнала службы; строка started остаётся следом попытки. Пароль —
+secrets.token_urlsafe(GENERATED_PW_BYTES), как --generate команды, только в теле ответа с Cache-Control: no-store и
+Pragma: no-cache; ни в журнал действий, ни в журнал службы он не идёт.
 Счётчики: удача — change; сбой SQLite или журнала — change_failed; отказ правил — без счётчика. Выданный пароль
 известен преподавателю (I-10): вход по нему — вход студентом; след — строки account_add/account_passwd журнала действий
 и «gw login ok» журнала службы.
@@ -836,11 +838,13 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
     async def account_passwd(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
         password = secrets.token_urlsafe(GENERATED_PW_BYTES)     # set_password закрывает сессии и снимает замок
         return await account_op(request, account, login, "account_passwd",
-                                lambda: role.store.set_password(login, password), lambda: (200, {"password": password}))
+                                lambda: role.store.set_password(login, password, student_only=True),
+                                lambda: (200, {"password": password}))
 
     @router.post(P + "accounts/{login}/disable", dependencies=guarded)
     async def account_disable(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
-        return await account_op(request, account, login, "account_disable", lambda: role.store.disable(login))
+        return await account_op(request, account, login, "account_disable",
+                                lambda: role.store.disable(login, student_only=True))
 
     @router.post(P + "accounts/{login}/enable", dependencies=guarded)
     async def account_enable(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
@@ -848,6 +852,7 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
 
     @router.post(P + "accounts/{login}/unlock", dependencies=guarded)
     async def account_unlock(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
-        return await account_op(request, account, login, "account_unlock", lambda: role.store.unlock(login))
+        return await account_op(request, account, login, "account_unlock",
+                                lambda: role.store.unlock(login, student_only=True))
 
     return router

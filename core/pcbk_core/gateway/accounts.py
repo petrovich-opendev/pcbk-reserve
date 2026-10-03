@@ -34,7 +34,10 @@ core.db делят журналы, их запись ждёт блокировк
 
 Д10б (Д10-R108): те же операции зовёт кабинет преподавателя (gateway.teacher_api) — add только студентом и без
 same_person, set_password, disable, enable, unlock; правила — только здесь. enable — новое: включает отключённую
-учётку студента на её же место; у команды — enable --login L.
+учётку студента на её же место; у команды — enable --login L. set_password, disable и unlock кабинет зовёт с
+student_only: роль цели сверяется в той же транзакции, что и изменение (ревью Б1+Б2, M-1 — шлюз проверяет цель раньше,
+отдельным чтением); не студент или учётки нет — ValueError, ничего не меняется. Команда администратора зовёт их без
+student_only, как прежде.
 """
 from __future__ import annotations
 
@@ -432,27 +435,39 @@ class AccountStore:
             log.info("gw account readd login=%s place=%s", login, _nn(place))
         return Account(login, role, place, False)
 
-    def set_password(self, login: str, password: str) -> None:
-        """Новый пароль: сессии учётки закрываются, замок снимается."""
+    @staticmethod
+    def _target(login: str, student_only: bool) -> tuple[str, tuple[str, ...]]:
+        """Условие WHERE цели операции и его параметры: student_only — только учётка студента (в той же транзакции)."""
+        return ("login = ? AND role = 'student'", (login,)) if student_only else ("login = ?", (login,))
+
+    @staticmethod
+    def _missing(login: str, student_only: bool) -> ValueError:
+        return ValueError(f"учётки студента {login} нет" if student_only else f"учётки {login} нет")
+
+    def set_password(self, login: str, password: str, *, student_only: bool = False) -> None:
+        """Новый пароль: сессии учётки закрываются, замок снимается. student_only — только учётка студента."""
         _check_login(login)
         _check_password(password)
         pw_hash = hash_password(password)           # scrypt — до транзакции записи (Г14)
+        where, args = self._target(login, student_only)
         with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("UPDATE gw_accounts SET pw_hash = ? WHERE login = ?", (pw_hash, login)).rowcount != 1:
-                raise ValueError(f"учётки {login} нет")
+            if db.execute(f"UPDATE gw_accounts SET pw_hash = ? WHERE {where}", (pw_hash, *args)).rowcount != 1:
+                raise self._missing(login, student_only)
             db.execute("DELETE FROM gw_sessions WHERE login = ?", (login,))
             db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
             db.execute("COMMIT")
         self._forget_unknown(login)
 
-    def disable(self, login: str) -> None:
-        """Учётка отключается, её сессии закрываются; закрепление места остаётся."""
+    def disable(self, login: str, *, student_only: bool = False) -> None:
+        """Учётка отключается, её сессии закрываются; закрепление места остаётся. student_only — только учётка
+        студента."""
         _check_login(login)
+        where, args = self._target(login, student_only)
         with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("UPDATE gw_accounts SET disabled = 1 WHERE login = ?", (login,)).rowcount != 1:
-                raise ValueError(f"учётки {login} нет")
+            if db.execute(f"UPDATE gw_accounts SET disabled = 1 WHERE {where}", args).rowcount != 1:
+                raise self._missing(login, student_only)
             db.execute("DELETE FROM gw_sessions WHERE login = ?", (login,))
             db.execute("COMMIT")
 
@@ -716,9 +731,19 @@ class AccountStore:
         key, _ = queue.popitem(last=False)
         del self.unknown_failures[key]
 
-    def unlock(self, login: str) -> None:
-        """Снимает замок логина: строки таблицы и счётчик в памяти."""
-        if isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
+    def unlock(self, login: str, *, student_only: bool = False) -> None:
+        """Снимает замок логина: строки таблицы и счётчик в памяти. student_only — только существующая учётка студента
+        (сверка и снятие — в одной транзакции; иначе ValueError и замок остаётся)."""
+        if student_only:
+            _check_login(login)
+            where, args = self._target(login, student_only)
+            with self._op(write=True) as db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute(f"SELECT 1 FROM gw_accounts WHERE {where}", args).fetchone() is None:
+                    raise self._missing(login, student_only)
+                db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
+                db.execute("COMMIT")
+        elif isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
             with self._op(write=True) as db:
                 db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
         self._forget_unknown(login)

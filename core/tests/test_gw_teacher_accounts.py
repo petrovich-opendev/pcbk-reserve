@@ -2,6 +2,7 @@
 # test_gw_teacher.py; пароли — Secret (m-14): в сообщении упавшего assert пароль печатается как «<скрыт>»
 import json
 import logging
+import re
 import sqlite3
 from contextlib import closing
 
@@ -9,9 +10,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from helpers import BASE, FRONT, ORIGIN, PW, Gw, Secret, park_reload_worker, teacher_gateway
-from pcbk_core.gateway.accounts import LOCK_FAILURES
+from pcbk_core.gateway.accounts import LOCK_FAILURES, Account
 from pcbk_core.gateway.api import GW_MESSAGES
 from pcbk_core.gateway.teacher_api import TEACHER_PREFIX as P, TEACHER_TEXTS
+from pcbk_core.teacher_log import ACTIONS
 
 
 @pytest.fixture
@@ -287,3 +289,53 @@ def test_counters_and_service_lines(tg, caplog):                          # R108
     assert [(r.action, r.place, r.target, r.outcome) for r in rows] == [
         ("account_disable", 5, "stu-05", "ok"), ("account_add", 3, "other", "refused"),
         ("account_add", 4, "d10-probe-n", "ok")]
+
+
+# --- итоговая доводка Д10б (Parked ревью Б1+Б2) ---
+
+def test_role_rechecked_in_store_transaction(tg, monkeypatch):            # M-1: TOCTOU роли цели
+    """Цель шлюз сверяет отдельным чтением (store.list), изменение идёт позже своей транзакцией. Логин успел стать
+    преподавателем (подмена list: шлюз ещё видит teach2 студентом места 06) — хранилище всё равно откажет: 400 его
+    текстом, строка refused; пароль, состояние и замок учётки преподавателя прежние."""
+    store = tg.role.store
+    store.add("teach2", "teacher", None, PW)
+    for _ in range(LOCK_FAILURES):
+        store.failure("teach2")
+    real = store.list
+
+    def stale() -> list[Account]:                                            # чтение до смены роли
+        return [Account(a.login, "student", 6, a.disabled) if a.login == "teach2" else a for a in real()]
+    monkeypatch.setattr(store, "list", stale)
+    t = tg.as_("teach")
+    for kind in ("password", "disable", "unlock"):
+        r = post(t, f"accounts/teach2/{kind}", {})
+        assert (r.status_code, r.json()["data"]["message"]) == (400, "учётки студента teach2 нет"), kind
+        assert "password" not in r.json(), kind
+    assert store.verify("teach2", PW) is not None and store.status("teach2") == "active" and store.locked("teach2")
+    rows = tg.role.teacher_log.recent(3)
+    assert [(r.action, r.target, r.outcome) for r in rows] == [
+        ("account_unlock", "teach2", "refused"), ("account_disable", "teach2", "refused"),
+        ("account_passwd", "teach2", "refused")]
+
+
+def test_generated_passwords_differ_and_have_form(tg):                   # M-2: пароль порождается, а не константа
+    t = tg.as_("teach")
+    got = [post(t, "accounts", {"login": "d10-probe-n", "place": "04"}), post(t, "accounts/stu-03/password", {}),
+           post(t, "accounts/stu-03/password", {}), post(t, "accounts", {"login": "stu-06", "place": "06"})]
+    assert [r.status_code for r in got] == [201, 200, 200, 201]
+    pws = [Secret(r.json()["password"]) for r in got]
+    assert all(re.fullmatch(r"[A-Za-z0-9_-]{12}", pw) for pw in pws)            # token_urlsafe(9): 72 бита
+    assert len(set(pws)) == len(pws)
+    assert tg.role.store.verify("stu-03", pws[2]) is not None and tg.role.store.verify("stu-03", pws[1]) is None
+
+
+def test_account_actions_are_journal_vocabulary(tg):                     # M-3: коды строк — из ACTIONS журнала
+    t = tg.as_("teach")
+    for _ in range(LOCK_FAILURES):
+        tg.role.store.failure("stu-05")
+    post(t, "accounts", {"login": "d10-probe-n", "place": "04"})
+    for kind in ("password", "disable", "enable", "unlock"):
+        assert post(t, f"accounts/stu-05/{kind}", {}).status_code in (200, 204), kind
+    actions = {r.action for r in tg.role.teacher_log.recent(100)}
+    assert actions == {"account_add", "account_passwd", "account_disable", "account_enable", "account_unlock"}
+    assert actions <= ACTIONS

@@ -1,6 +1,6 @@
 """Персоны двойника OpenRouter стенда отбора модели (Д8-R75) и автотеста «агент = калькулятор» (Д9-R92: ряд,
 наработка, размах). Только stdlib, без twin_historian и fakes: в образ двойника (Dockerfile.fake,
-pcbk-test/fake-openrouter:d9b) копируется только этот файл рядом с fake_openrouter.py.
+pcbk-test/fake-openrouter:d10a) копируется только этот файл рядом с fake_openrouter.py.
 
 bench_answer(body, personas) -> (message, finish_reason) | None — ответ «модели» body["model"] по её персоне
 (personas: модель → имя персоны, PERSONAS — модели мест 05–08). None — у модели персоны нет или запрос не к агенту

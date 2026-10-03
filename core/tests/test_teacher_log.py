@@ -36,7 +36,8 @@ def test_teacher_log_drill_fails_and_is_seen(tmp_path):
 # --- сверх брифа ---
 
 def test_vocabulary():
-    assert ACTIONS == {"sessions", "read", "agents", "agent", "wake", "shares"}
+    assert ACTIONS == {"sessions", "read", "agents", "agent", "wake", "shares",           # Д10а
+                       "account_add", "account_passwd", "account_disable", "account_enable", "account_unlock"}   # Д10б
     assert OUTCOMES == {"requested", "ok", "refused", "error", "started"}
     assert JOURNAL_DRILL == "journal_down"
 

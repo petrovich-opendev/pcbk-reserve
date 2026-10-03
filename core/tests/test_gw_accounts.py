@@ -397,6 +397,35 @@ def test_enable_only_own_free_place(tmp_path):                                  
     assert s.write_failures == 0 and s.read_failures == 0                              # отказ по правилам — не сбой
 
 
+def test_student_only_ops_refuse_other_roles(tmp_path):                                  # ревью Б1+Б2, M-1 (TOCTOU роли)
+    """set_password, disable и unlock с student_only (так их зовёт кабинет) — роль цели сверяется в транзакции изменения:
+    у преподавателя и неизвестного логина ValueError, ничего не меняется (пароль, состояние, замок, сессии), счётчики
+    сбоев не растут. Учётке студента — как без флага; команда администратора (без флага) — как прежде."""
+    s = store(tmp_path)
+    s.add("teach", "teacher", None, PW)
+    s.add("stu-a", "student", 3, PW)
+    token = s.open_session("teach")
+    for login in ("teach", "stu-a"):
+        for _ in range(LOCK_FAILURES):
+            s.failure(login)
+    for login in ("teach", "nobody"):
+        for op in (lambda: s.set_password(login, "другой-пароль-1", student_only=True),
+                   lambda: s.disable(login, student_only=True), lambda: s.unlock(login, student_only=True)):
+            with pytest.raises(ValueError, match=f"^учётки студента {login} нет$"):
+                op()
+    assert s.status("teach") == "active" and s.locked("teach") and s.session(token) is not None
+    assert s.verify("teach", PW) is not None and not s.exists("nobody")
+    assert s.write_failures == 0 and s.read_failures == 0                              # отказ по правилам — не сбой
+    s.unlock("stu-a", student_only=True)
+    assert not s.locked("stu-a")
+    s.set_password("stu-a", "другой-пароль-1", student_only=True)
+    assert s.verify("stu-a", "другой-пароль-1") is not None
+    s.disable("stu-a", student_only=True)
+    assert s.status("stu-a") == "disabled"
+    s.unlock("teach"); s.set_password("teach", "другой-пароль-2"); s.disable("teach")   # команда — без флага
+    assert not s.locked("teach") and s.status("teach") == "disabled" and s.session(token) is None
+
+
 def test_cli_enable(tmp_path, capsys, monkeypatch):                                    # сверх брифа: команда enable
     monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
     monkeypatch.setattr("sys.stdin", io.StringIO(PW + "\n"))
