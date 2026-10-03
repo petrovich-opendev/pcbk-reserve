@@ -15,6 +15,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from typing import Literal
 from urllib.parse import urljoin, urlsplit
 
+from .memory import MemHistory, memory_verdict, parse_sample
+
 State = Literal["ok", "warn", "fail", "absent", "unknown"]
 
 # запуск моложе этого считается свежим перезапуском
@@ -23,6 +25,8 @@ RECENT_RESTART = timedelta(minutes=15)
 CRASH_LOOP_RESTARTS = 3
 # текст постоянный: с числом перезапусков журнал писал бы событие на каждый
 CRASH_LOOP_DETAIL = "падает в цикле (перезапуски подряд)"
+# причина перезапуска контейнера (Д11-R115, memory.RestartReasons): oom — убит по памяти, crash — сбой не по памяти
+RESTART_REASON_TEXTS = {"oom": "убит по памяти", "crash": "сбой не по памяти"}
 # проверка здоровья места: интервал 30 с + срок 5 с с запасом
 HEALTH_SILENCE = timedelta(minutes=2)
 HEALTH_SILENT_DETAIL = "проверка здоровья молчит"
@@ -222,33 +226,33 @@ def not_installed(component: str, title: str) -> Check:
     return Check(component, title, "absent", "ещё не установлен")
 
 
-def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Check:
-    """Свободная память по полю MemAvailable из /proc/meminfo."""
-    title = "Память сервера"
-    for line in meminfo.splitlines():
-        key, _, value = line.partition(":")
-        if key.strip() == "MemAvailable":
-            mib = int(value.split()[0]) // 1024
-            break
-    else:
-        return Check("memory", title, "unknown", "нет данных о свободной памяти")
-    # в warn/fail текст постоянный: иначе журнал пишет событие каждый такт
-    if mib < fail_mib:
-        return Check("memory", title, "fail", f"свободно меньше {fail_mib} МиБ")
-    if mib < warn_mib:
-        return Check("memory", title, "warn", f"свободно меньше {warn_mib} МиБ")
-    return Check("memory", title, "ok", f"свободно {mib} МиБ")
+def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024, vmstat: str = "", pressure: str = "",
+                 swap_grow_warn_mib: int = 512, psi_full_max: float = 10.0) -> Check:
+    """«Память сервера» по одному замеру — memory_verdict на пустой истории (Д11-R114).
+
+    Пороги и тексты Д1 и числа note; роста swap, удержания давления и убийств вне мест у одного замера нет — их
+    видит история тактов (main.MemState). В warn/fail текст постоянный: иначе журнал пишет событие каждый такт.
+    """
+    now = datetime.now(timezone.utc)
+    sample = parse_sample(meminfo, vmstat, pressure)
+    history = MemHistory()
+    history.observe(now, sample)
+    state, detail, note = memory_verdict(sample, history, now, warn_mib, fail_mib, swap_grow_warn_mib, psi_full_max)
+    return Check("memory", "Память сервера", state, detail, note)
 
 
 def check_container(component: str, title: str, inspect: dict | None, *,
-                    sleeping_ok: bool, now: datetime, unhealthy_detail: str = UNHEALTHY_DETAIL) -> Check:
+                    sleeping_ok: bool, now: datetime, unhealthy_detail: str = UNHEALTHY_DETAIL,
+                    restart_reason: str | None = None, last_reason: str | None = None) -> Check:
     """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1, задачи 2 Д2 и задачи 3 Д4б.
 
     unhealthy_detail — текст строки при Health.Status unhealthy: по умолчанию — про OpenCode места,
     у контейнеров с другой проверкой здоровья (core) — свой из components.json.
+    restart_reason — причина перезапуска с этим StartedAt (Д11-R115): «oom» или «crash», None — неизвестна (текст
+    Д2); last_reason — последняя известная причина, в note строки «падает в цикле».
     """
-    def result(state: State, detail: str) -> Check:
-        return Check(component, title, state, detail)
+    def result(state: State, detail: str, note: str = "") -> Check:
+        return Check(component, title, state, detail, note)
 
     if inspect is None:
         return result("fail", "нет контейнера")
@@ -261,7 +265,8 @@ def check_container(component: str, title: str, inspect: dict | None, *,
         return result("fail", "приостановлен")
     if st["Running"] or st["Restarting"]:
         if restarts >= CRASH_LOOP_RESTARTS and recent:
-            return result("fail", CRASH_LOOP_DETAIL)
+            last = RESTART_REASON_TEXTS.get(last_reason or "")
+            return result("fail", CRASH_LOOP_DETAIL, f"последний — {last}" if last else "")
         if st["Restarting"]:
             return result("warn", "перезапускается")
         health = st.get("Health")
@@ -279,6 +284,9 @@ def check_container(component: str, title: str, inspect: dict | None, *,
         if restarts > 0 and recent:
             # время — в поясе now и с явным смещением
             at = started.astimezone(now.tzinfo).strftime("%H:%M UTC%:z")
+            why = RESTART_REASON_TEXTS.get(restart_reason or "")
+            if why:
+                return result("warn", f"перезапущен: {why} в {at} ({restarts} с последнего запуска)")
             return result("warn", f"перезапущен после сбоя в {at} ({restarts} с последнего запуска)")
         if restarts > 0:
             return result("ok", f"работает, сбоев с последнего запуска: {restarts}")

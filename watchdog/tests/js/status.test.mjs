@@ -31,6 +31,7 @@ function fakeDoc({ hidden = true, ageS = '2' } = {}) {
     overall: new FakeEl('span'),
     'checked-at': new FakeEl('time'),
     checks: new FakeEl('ul'),
+    drills: Object.assign(new FakeEl('p'), { hidden: true }),   // абзац «Идут учения» (Д11-R116): учений нет
     content: new FakeEl('main', hidden ? {} : { 'data-stale': '' }),
   };
   return { els, getElementById: (id) => els[id] ?? null, createElement: (tag) => new FakeEl(tag) };
@@ -205,4 +206,23 @@ test('row without note has no separator', async () => {
   await start(doc, () => Promise.resolve(reply(200, json)));
   await advance(1000);
   assert.deepEqual(doc.els.checks.children.map((li) => li.children[2].textContent), ['отвечает', 'отвечает']);
+});
+
+// страница со свежими ответами: первый — сразу, update(json) — следующий опрос (через 5 с)
+async function loadPage(json) {
+  const doc = fakeDoc();
+  let current = { ...body(false), ...json };
+  await start(doc, () => Promise.resolve(reply(200, current)));
+  return {
+    byId: (id) => doc.getElementById(id),
+    update: async (next) => { current = { ...body(false), ...next }; await advance(5000); },
+  };
+}
+
+test("drills paragraph follows notes", async () => {                        // Д11-R116
+  const page = await loadPage({ checks: [{ component: "llm", title: "LLM-прокси и бюджет", state: "fail",
+    detail: "x", note: "учения DRILL_LLM=402" }] });
+  assert.equal(page.byId("drills").textContent, "Идут учения: LLM-прокси и бюджет");
+  await page.update({ checks: [{ component: "llm", title: "LLM-прокси и бюджет", state: "ok", detail: "x", note: "" }] });
+  assert.equal(page.byId("drills").hidden, true);
 });

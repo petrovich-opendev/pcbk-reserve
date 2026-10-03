@@ -107,6 +107,9 @@ services:
       TLS_CAFILE: /app/tls/cert.pem
       JOURNAL_PATH: /var/lib/pcbk-watchdog/journal.db
       MEMINFO_PATH: /proc/meminfo
+      # «Память сервера» (Д11): счётчик убийств по памяти oom_kill и давление памяти; под runc — значения хоста
+      VMSTAT_PATH: /proc/vmstat
+      PRESSURE_PATH: /proc/pressure/memory
       COMPONENTS_PATH: /app/components.json
       # настраиваются из .env или оболочки (учения меняют TICK_S и MEM_WARN_MIB)
       TICK_S: ${TICK_S:-10}
@@ -115,6 +118,10 @@ services:
       DISPLAY_TZ: ${DISPLAY_TZ:-UTC}
       MEM_WARN_MIB: ${MEM_WARN_MIB:-2048}
       MEM_FAIL_MIB: ${MEM_FAIL_MIB:-1024}
+      # «Память сервера» (Д11): swap вырос за 10 мин на SWAP_GROW_WARN_MIB, МиБ, — «вытесняет память в swap»;
+      # давление full avg10 выше PSI_FULL_MAX, %, 3 такта подряд — «давление выше порога» (В1 правит оба по базе)
+      SWAP_GROW_WARN_MIB: ${SWAP_GROW_WARN_MIB:-512}
+      PSI_FULL_MAX: ${PSI_FULL_MAX:-10}
       # учения «цикл молчит при живом HTTP»: 1 — цикл замирает после первого такта
       DRILL_FREEZE_LOOP: ${DRILL_FREEZE_LOOP:-0}
       # свежесть историана (Д3а): возраст метки — «внимание» / «сбой»; опрос службы данных

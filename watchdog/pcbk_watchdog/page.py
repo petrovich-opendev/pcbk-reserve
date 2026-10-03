@@ -1,4 +1,5 @@
 """Снимок проверок, его JSON и HTML страницы состояния."""
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
@@ -18,6 +19,16 @@ LABELS: dict[str, str] = {"ok": "норма", "warn": "внимание", "fail"
 EXTRA_TITLES = {"watchdog": "Сторож", "journal": "Журнал сторожа"}
 
 SILENCE_TEXT = "Сторож не отвечает — состояние неизвестно"
+
+# пометка учений в detail или note строки (Д11-R116): слово на «учени» — «учения: tool_error», «учения DRILL_LLM=402»,
+# «учения: порог выше всей памяти»; «обучения», «получения» — не учения. Тот же признак — в status.js
+DRILL_MARK = re.compile(r"(?<![а-яё])учени", re.IGNORECASE)
+DRILLS_PREFIX = "Идут учения: "
+
+
+def drill_titles(checks) -> list[str]:
+    """Заголовки строк под учениями, по порядку страницы."""
+    return [c.title for c in checks if DRILL_MARK.search(c.detail) or DRILL_MARK.search(c.note)]
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,8 @@ h2 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; }
 #overall.s-fail { color: var(--fail); } #overall.s-unknown { color: var(--unknown); }
 .detail:empty { display: none; }
 .events li { padding: .2rem 0; } .events time { color: var(--muted); margin-right: .5rem; }
+.drills { margin: .5rem 0 1rem; padding: .6rem .9rem; font-weight: 600; background: var(--card);
+  border-left: .35rem solid var(--warn); border-radius: .25rem; }
 @media (max-width: 40rem) { .check { grid-template-columns: 1fr auto; } .check .detail { grid-column: 1 / -1; } }
 """
 
@@ -135,6 +148,9 @@ def render_html(snapshot: Snapshot | None, events: list[Event], now: datetime, s
     event_rows = ("\n".join(_event_row(e, titles, tz) for e in events)
                   or "<li>Событий пока нет</li>")
     hidden = "" if stale else " hidden"
+    drills = drill_titles(checks)
+    drills_html = (f'<p id="drills" class="drills">{escape(DRILLS_PREFIX + ", ".join(drills))}</p>' if drills
+                   else '<p id="drills" class="drills" hidden></p>')
     stale_mark = " data-stale" if stale else ""   # старое под полосой — серым
     return f"""<!doctype html>
 <html lang="ru">
@@ -151,6 +167,7 @@ def render_html(snapshot: Snapshot | None, events: list[Event], now: datetime, s
 <h1>Состояние резервного стенда</h1>
 <p class="summary">Общее состояние: {summary}</p>
 <p class="meta">Проверено: {at} · {age_text}. Страница обновляется сама каждые 5 с.</p>
+{drills_html}
 <ul id="checks" class="checks">
 {rows}
 </ul>

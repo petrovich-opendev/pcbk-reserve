@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from helpers import T0, gw, insp, llm_obj, now_utc, put_build
-from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_KEYS, BUDGET_STEPS, DRIFT_WARN_USD,
+from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_KEYS, BUDGET_STEPS, CRASH_LOOP_DETAIL,
+                                  DRIFT_WARN_USD,
                                   EGRESS_STALE_S, AgentsReply, agents_verdict, check_agents,
                                   GW_DRILL_MODES, GW_KEYS_D5A, GW_KEYS_D5B, GW_OFF_CONTRACT_DETAIL,
                                   GW_SP_CTL_STATES, LLM_STALE_S, MAX_BODY_BYTES,
@@ -92,6 +93,19 @@ def test_crash_loop_detail_is_constant(tmp_path):
     journal = Journal(str(tmp_path / "journal.db"))
     assert sum(len(journal.record([c], T0 + timedelta(seconds=10 * i)))
                for i, c in enumerate(loops)) == 1
+
+
+def test_restart_detail_names_reason():                                      # Д11-R115
+    fresh = insp(running=True, restarts=1, started=T0 - timedelta(minutes=3))
+    def row(reason, i=fresh, last=None):
+        return check_container("student-01", "Рабочее место 01", i, sleeping_ok=True, now=T0, restart_reason=reason,
+                               last_reason=last)
+    assert (row("oom").state, row("oom").detail) == ("warn", "перезапущен: убит по памяти в 11:57 UTC+00:00 (1 с последнего запуска)")
+    assert row("crash").detail == "перезапущен: сбой не по памяти в 11:57 UTC+00:00 (1 с последнего запуска)"
+    assert row(None).detail == "перезапущен после сбоя в 11:57 UTC+00:00 (1 с последнего запуска)"
+    loop = row(None, insp(running=True, restarts=3, started=T0 - timedelta(minutes=3)), last="oom")
+    assert (loop.state, loop.detail, loop.note) == ("fail", CRASH_LOOP_DETAIL, "последний — убит по памяти")
+    assert all(len(row(r).detail) <= 80 for r in ("oom", "crash", None))
 
 
 def test_health_unhealthy_is_fail():

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from helpers import T0
 from pcbk_watchdog.checks import Check, not_installed
 from pcbk_watchdog.journal import Event
-from pcbk_watchdog.page import Snapshot, overall, render_html, status_json
+from pcbk_watchdog.page import Snapshot, drill_titles, overall, render_html, status_json
 
 
 def test_overall_ignores_absent_and_takes_worst():
@@ -130,3 +130,13 @@ def test_note_is_escaped():
     s = Snapshot(T0, (Check("x", "X", "ok", "a", note='<b>&"</b>'),))
     html = render_html(s, [], T0, 30, ZoneInfo("UTC"))
     assert "<b>" not in html and "a · &lt;b&gt;&amp;&quot;&lt;/b&gt;" in html
+
+
+def test_page_lists_rows_under_drills():                                       # Д11-R116
+    rows = (Check("llm", "LLM-прокси и бюджет", "fail", "На счёте…", "учения DRILL_LLM=402"),
+            Check("gateway", "Шлюз и вход", "ok", "принимает вход", "учения: freeze_reaper; работает мест: 0"),
+            Check("memory", "Память сервера", "ok", "свободно 8000 МиБ", ""))
+    assert drill_titles(rows) == ["LLM-прокси и бюджет", "Шлюз и вход"]
+    html = render_html(Snapshot(T0, rows), [], T0, 30, ZoneInfo("UTC"))
+    assert '<p id="drills" class="drills">Идут учения: LLM-прокси и бюджет, Шлюз и вход</p>' in html
+    assert '<p id="drills" class="drills" hidden></p>' in render_html(Snapshot(T0, rows[2:]), [], T0, 30, ZoneInfo("UTC"))

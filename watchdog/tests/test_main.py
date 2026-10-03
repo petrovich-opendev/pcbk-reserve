@@ -8,12 +8,12 @@ from datetime import timedelta
 import pytest
 
 import pcbk_watchdog.main
-from helpers import (CHROME, SETTINGS, T0, chrome_dom, gw, http_get, http_status, insp, llm_obj, now_utc,
-                     put_build, start_test_server)
+from helpers import (CHROME, SETTINGS, T0, NoJournalWrite, chrome_dom, gw, http_get, http_status, insp, llm_obj,
+                     now_utc, put_build, start_test_server, wait_until)
 from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
 from pcbk_watchdog.journal import Journal
-from pcbk_watchdog.main import (LazyJournal, Settings, WatchState, load_components, run_checks,
+from pcbk_watchdog.main import (LazyJournal, MemState, Settings, WatchState, load_components, run_checks,
                                 run_loop, tick)
 from pcbk_watchdog.page import Snapshot, is_stale
 
@@ -574,3 +574,60 @@ def test_browser_on_real_server_with_csp():
     srv = start_test_server(Flip())
     dom = chrome_dom(f"http://127.0.0.1:{srv.server_port}/status", virtual_time_ms=8000)
     assert re.search(r'id="silence"(?![^>]*hidden)', dom)
+
+
+# Д11-R115, m-10 р1: счётчик oom_kill — до и после осмотра, проводка MemState через run_loop → tick → run_checks
+class RestartingDocker:
+    """Первый осмотр — место работает; дальше — перезапущено, и за этот осмотр счётчик oom_kill вырос.
+
+    at — «сейчас» проверок: T0 для run_checks, часы машины для run_loop (свежий перезапуск — моложе 15 мин)."""
+    def __init__(self, vm, at=T0):
+        self.vm, self.n, self.at = vm, 0, at
+    def inspect(self, name):
+        self.n += 1
+        if self.n == 1:
+            return insp(running=True, started=self.at - timedelta(hours=1))
+        if self.n == 2:
+            self.vm.write_text("oom_kill 6\n")
+        return insp(running=True, restarts=1, started=self.at - timedelta(seconds=5))
+    def ping(self):
+        pass
+
+
+COMPS = [{"id": "memory", "title": "Память сервера", "kind": "memory"},
+         {"id": "student-01", "title": "Рабочее место 01", "kind": "container", "container": "pcbk-student-01",
+          "sleeping_ok": True}]
+
+
+def settings_with(tmp_path, **kw):
+    vm = tmp_path / "vmstat"; vm.write_text("oom_kill 5\n")
+    return vm, replace(SETTINGS, VMSTAT_PATH=str(vm), PRESSURE_PATH=str(tmp_path / "none"), **kw)
+
+
+def test_run_checks_reads_oom_around_inspect(tmp_path):
+    vm, settings = settings_with(tmp_path)
+    docker, mem = RestartingDocker(vm), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    assert run_checks(COMPS, docker, settings, T0, mem=mem)[1].detail.startswith("перезапущен: убит по памяти")
+    assert run_checks(COMPS, docker, settings, T0 + timedelta(minutes=1), mem=mem)[0].state == "ok"
+
+
+def test_run_loop_wires_mem_state(tmp_path):                                # проводка, а не только run_checks
+    vm, settings = settings_with(tmp_path, TICK_S=0.05)
+    state, stop = WatchState(), threading.Event()
+    t = threading.Thread(target=run_loop, args=(state, NoJournalWrite(), COMPS, RestartingDocker(vm, now_utc()),
+                                                settings, stop))
+    t.start()
+    try:
+        wait_until(lambda: state.snapshot and state.snapshot.checks[1].detail.startswith("перезапущен: убит по памяти"), 5)
+    finally:
+        stop.set(); t.join(5)
+
+
+def test_memory_settings():
+    s = Settings.from_env({})
+    assert (s.VMSTAT_PATH, s.PRESSURE_PATH, s.SWAP_GROW_WARN_MIB, s.PSI_FULL_MAX) == \
+           ("/proc/vmstat", "/proc/pressure/memory", 512, 10.0)
+    for name, bad in (("SWAP_GROW_WARN_MIB", "0"), ("PSI_FULL_MAX", "0"), ("PSI_FULL_MAX", "101")):
+        with pytest.raises(ValueError, match=name):
+            Settings.from_env({name: bad})

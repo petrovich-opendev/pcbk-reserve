@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -102,6 +103,25 @@ class NoJournal:
 
     def recent(self, limit: int = 50) -> list:
         return []
+
+
+class NoJournalWrite(NoJournal):
+    """Журнал для такта без записи: проба проходит, переходов нет (цикл run_loop в тестах, Д11 А1)."""
+
+    def probe(self) -> None:
+        pass
+
+    def record(self, checks, now) -> list:
+        return []
+
+
+def wait_until(cond, timeout_s: float, step_s: float = 0.02) -> None:
+    """Ждать, пока cond() истинно; не дождались за timeout_s — AssertionError."""
+    deadline = time.monotonic() + timeout_s
+    while not cond():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"условие не выполнилось за {timeout_s} с")
+        time.sleep(step_s)
 
 
 def start_test_server(state, journal=None, settings=SETTINGS):

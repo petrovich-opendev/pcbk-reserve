@@ -20,6 +20,8 @@ from .checks import (HTTP_OK_DETAIL, LLM_RUN_SILENT_S, NET_CHECK_TIMEOUT_S, REAS
                      check_memory, check_teacher, check_tls, check_web, not_installed)
 from .docker_api import CONTAINER_NAME, DockerReader, DockerUnavailable
 from .journal import Event, Journal
+from .memory import MEM_WINDOW_S, SWAP_WINDOW_S, MemHistory, MemSample, RestartReasons, memory_verdict, \
+    parse_oom_kill, parse_sample
 from .page import Snapshot, is_stale, render_html, status_json
 
 log = logging.getLogger("pcbk_watchdog")
@@ -56,6 +58,13 @@ class Settings:
     TLS_CAFILE: str = "/app/tls/cert.pem"
     JOURNAL_PATH: str = "/var/lib/pcbk-watchdog/journal.db"
     MEMINFO_PATH: str = "/proc/meminfo"
+    # «Память сервера» v2 (Д11-R114): счётчик убийств по памяти oom_kill и давление памяти; файлы необязательны
+    VMSTAT_PATH: str = "/proc/vmstat"
+    PRESSURE_PATH: str = "/proc/pressure/memory"
+    # swap вырос за 10 мин на столько, МиБ, — «сервер вытесняет память в swap» (В1 правит по базе сервера)
+    SWAP_GROW_WARN_MIB: int = 512
+    # давление full avg10 выше этого, %, 3 такта подряд — «давление выше порога» (В1: max(5, 3 × база))
+    PSI_FULL_MAX: float = 10.0
     COMPONENTS_PATH: str = "/app/components.json"
     # учения «цикл молчит при живом HTTP»: 1 — после первого такта цикл замирает
     DRILL_FREEZE_LOOP: bool = False
@@ -106,6 +115,11 @@ class Settings:
         # TEACHER_STALE_S — так же: проверка кабинета преподавателя — один HTTP-запрос
         if self.TEACHER_STALE_S <= 0:
             raise ValueError("TEACHER_STALE_S должен быть больше нуля")
+        # пороги строки памяти (Д11-R114) — локальная проверка, правило срока такта не затрагивают
+        if not 0 < self.SWAP_GROW_WARN_MIB <= 1_048_576:
+            raise ValueError("SWAP_GROW_WARN_MIB: нужно от 1 до 1048576 МиБ")
+        if not 0 < self.PSI_FULL_MAX <= 100:
+            raise ValueError("PSI_FULL_MAX: нужно больше 0 и не больше 100 (%)")
 
     @property
     def tz(self) -> ZoneInfo:
@@ -191,12 +205,83 @@ def _log_error_once(component: str, e: BaseException) -> None:
         log.warning("%s: %s", component, text)
 
 
-def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: datetime) -> Check:
+def _read_optional(path: str) -> str:
+    """Необязательный файл замера (vmstat, давление): не читается — пусто, поле замера — None."""
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+class MemState:
+    """Память сервера между тактами (Д11-R114, R115): история замеров и причины перезапусков контейнеров.
+
+    Замер — в начале такта (begin); строка «Память сервера» — verdict; у каждой строки вида container счётчик
+    oom_kill читается до и после осмотра Docker (oom_kill). grace_s = 2 × TICK_S, match_s = 3 × TICK_S: учения,
+    меняющие такт, меняют и окна.
+    """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.history = MemHistory(window_s=MEM_WINDOW_S, swap_window_s=SWAP_WINDOW_S,
+                                  grace_s=2 * settings.TICK_S, match_s=3 * settings.TICK_S)
+        self.reasons = RestartReasons()
+        self._sample: MemSample | None = None
+        self._error: Exception | None = None
+
+    def begin(self, now: datetime) -> None:
+        """Замер такта: meminfo обязателен — сбой чтения покажет строка памяти; vmstat и давление — нет."""
+        self._sample, self._error = None, None
+        try:
+            with open(self.settings.MEMINFO_PATH) as f:
+                meminfo = f.read()
+        except Exception as e:
+            self._error = e
+            return
+        self._sample = parse_sample(meminfo, _read_optional(self.settings.VMSTAT_PATH),
+                                    _read_optional(self.settings.PRESSURE_PATH))
+        self.history.observe(now, self._sample)
+
+    def verdict(self, now: datetime) -> tuple[str, str, str]:
+        if self._error is not None:
+            raise self._error
+        s = self.settings
+        return memory_verdict(self._sample, self.history, now, s.MEM_WARN_MIB, s.MEM_FAIL_MIB,
+                              s.SWAP_GROW_WARN_MIB, s.PSI_FULL_MAX)
+
+    def oom_kill(self) -> int | None:
+        return parse_oom_kill(_read_optional(self.settings.VMSTAT_PATH))
+
+
+def _check_container(comp: dict, docker: DockerReader, now: datetime, mem: MemState | None) -> Check:
+    cid, title = comp["id"], comp["title"]
+    unhealthy = comp.get("unhealthy_detail", UNHEALTHY_DETAIL)
+    if mem is None:
+        return check_container(cid, title, docker.inspect(comp["container"]), sleeping_ok=comp["sleeping_ok"],
+                               now=now, unhealthy_detail=unhealthy)
+    # счётчик ядра до и после осмотра: убийство между ними объясняет перезапуск этого контейнера (R115)
+    v_before = mem.oom_kill()
+    inspect = docker.inspect(comp["container"])
+    v_after = mem.oom_kill()
+    reason, n = mem.reasons.observe(cid, inspect, v_before, v_after)
+    if reason == "oom" and n > 0:
+        mem.history.attribute(n, now)
+    started = datetime.fromisoformat(inspect["State"]["StartedAt"]) if inspect is not None else None
+    return check_container(cid, title, inspect, sleeping_ok=comp["sleeping_ok"], now=now,
+                           unhealthy_detail=unhealthy, restart_reason=mem.reasons.reason(cid, started),
+                           last_reason=mem.reasons.last(cid))
+
+
+def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: datetime,
+               mem: MemState | None = None) -> Check:
     cid, title, kind = comp["id"], comp["title"], comp["kind"]
     if kind == "memory":
-        with open(settings.MEMINFO_PATH) as f:
+        if mem is not None:
+            return Check(cid, title, *mem.verdict(now))
+        with open(settings.MEMINFO_PATH) as f:   # без истории тактов — один замер (тесты и наборы без цикла)
             c = check_memory(f.read(), settings.MEM_WARN_MIB, settings.MEM_FAIL_MIB)
-        return Check(cid, title, c.state, c.detail)
+        return Check(cid, title, c.state, c.detail, c.note)
     if kind == "http":
         return check_http(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S,
                           ok_detail=comp.get("ok_detail", HTTP_OK_DETAIL))
@@ -222,18 +307,22 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
         docker.ping()
         return Check(cid, title, "ok", "отвечает")
     if kind == "container":
-        return check_container(cid, title, docker.inspect(comp["container"]),
-                               sleeping_ok=comp["sleeping_ok"], now=now,
-                               unhealthy_detail=comp.get("unhealthy_detail", UNHEALTHY_DETAIL))
+        return _check_container(comp, docker, now, mem)
     if kind == "absent":
         return not_installed(cid, title)
     raise ValueError(f"неизвестный вид проверки: {kind!r}")
 
 
 def run_checks(components: list[dict], docker: DockerReader, settings: Settings,
-               now: datetime) -> list[Check]:
-    """Все проверки такта; сбой одной не останавливает остальные."""
+               now: datetime, mem: MemState | None = None) -> list[Check]:
+    """Все проверки такта; сбой одной не останавливает остальные.
+
+    mem — память между тактами (цикл run_loop): замер в начале такта, строка памяти по истории, причины
+    перезапусков контейнеров; None — строка памяти по одному замеру, причины перезапуска неизвестны.
+    """
     deadline = time.monotonic() + settings.tick_budget_s
+    if mem is not None:
+        mem.begin(now)
     docker_down = False
     checks = []
     for comp in components:
@@ -246,7 +335,7 @@ def run_checks(components: list[dict], docker: DockerReader, settings: Settings,
             checks.append(Check(cid, title, "unknown", "проверка пропущена: такт не уложился в срок"))
             continue
         try:
-            check = _check_one(comp, docker, settings, now)
+            check = _check_one(comp, docker, settings, now, mem)
             _logged_errors.pop(cid, None)
         except DockerUnavailable as e:
             docker_down = True
@@ -311,9 +400,9 @@ def _journal_fail(e: BaseException) -> Check:
 
 
 def tick(state: WatchState, journal: Journal, components: list[dict], docker: DockerReader,
-         settings: Settings, now: datetime) -> None:
+         settings: Settings, now: datetime, mem: MemState | None = None) -> None:
     """Одна итерация цикла: проверки → снимок → журнал переходов."""
-    checks = run_checks(components, docker, settings, now)
+    checks = run_checks(components, docker, settings, now, mem)
     try:
         journal.probe()
         _logged_errors.pop("journal", None)
@@ -338,10 +427,11 @@ def run_loop(state: WatchState, journal: Journal, components: list[dict], docker
              settings: Settings, stop: threading.Event) -> None:
     if settings.DRILL_FREEZE_LOOP:
         log.warning("учения DRILL_FREEZE_LOOP=1: после первого такта цикл замрёт, HTTP продолжит отвечать")
+    mem = MemState(settings)   # история памяти и причины перезапусков живут столько, сколько цикл
     while not stop.is_set():
         started = time.monotonic()
         try:
-            tick(state, journal, components, docker, settings, datetime.now(settings.tz))
+            tick(state, journal, components, docker, settings, datetime.now(settings.tz), mem)
         except Exception:
             log.exception("такт упал")
         if settings.DRILL_FREEZE_LOOP:
