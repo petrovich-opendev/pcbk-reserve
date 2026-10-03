@@ -1129,8 +1129,8 @@ pause`, `DRILL_FRESHNESS`, `DRILL_FREEZE_LOOP`, `LLM_RUN_SILENT_S`, правка
   `gw stop place=NN reason=run_halted result=ok`, `gw wake place=NN result=refused kind=run_halted`.
 
 На тестовом стенде без прогонщика (сроки — по вызову модели токеном места и `State.FinishedAt`, не по журналу тормоза)
-после падения памяти: 402 у места — через 13,7 с, места остановлены — через 12,7 с; пороги плана — 20 и 35 с
-(`docs/checks/D11a.md`).
+после падения памяти: 402 у места — через 13,7–15,9 с, места остановлены — через 12,7–15,1 с (три прогона); пороги
+плана — 20 и 35 с, раньше удержания 3 проверок (≈ 10 с) — нет (`docs/checks/D11a.md`).
 
 **Что видно:**
 - `/health/llm` — блок `run_brake`: `null` без прогона; при прогоне ровно 13 ключей: `state` (`watching` или `halted`),
