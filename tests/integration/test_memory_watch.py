@@ -31,22 +31,26 @@ def wait_hidden(page, css_id: str, timeout: float) -> None:
 
 
 def test_memory_rows_drills(stack, page):
-    stack.recreate("watchdog", {"MEM_WARN_MIB": "1000000"})
-    s = stack.wait_status(lambda d: row_of(d, "memory")["state"] == "warn", 30)
-    assert row_of(s, "memory")["note"].endswith(MEM_DRILL_NOTE)
-    stack.recreate("watchdog", {})
-    stack.set_psi("watchdog", 12.0)
-    stack.wait_status(lambda d: row_of(d, "memory")["detail"] == MEM_PSI_DETAIL, HOLD_WAIT_S)
-    stack.set_psi("watchdog", 0.0)
-    stack.set_memory("watchdog", 8000, swap_used_mib=900)
-    stack.wait_status(lambda d: row_of(d, "memory")["detail"] == MEM_SWAP_DETAIL, HOLD_WAIT_S)
-    page.goto(f"{STAND}/status"); page.wait_text("сервер вытесняет память в swap", 20, css="#checks")
-    into_view(page, "Память сервера")
-    shot(page, "d11a-01-memory-row.png")
-    stack.set_memory("watchdog", 8000, swap_used_mib=0)
-    stack.set_oom_kill("watchdog", 1)
-    stack.wait_status(lambda d: row_of(d, "memory")["detail"] == MEM_OOM_OUTSIDE_DETAIL, 60)
-    stack.recreate("watchdog", {})                                          # новая история: база — 1
+    try:
+        stack.recreate("watchdog", {"MEM_WARN_MIB": "1000000"})
+        s = stack.wait_status(lambda d: row_of(d, "memory")["state"] == "warn", 30)
+        assert row_of(s, "memory")["note"].endswith(MEM_DRILL_NOTE)
+        stack.recreate("watchdog", {})
+        stack.set_psi("watchdog", 12.0)
+        stack.wait_status(lambda d: row_of(d, "memory")["detail"] == MEM_PSI_DETAIL, HOLD_WAIT_S)
+        stack.set_psi("watchdog", 0.0)
+        stack.set_memory("watchdog", 8000, swap_used_mib=900)
+        stack.wait_status(lambda d: row_of(d, "memory")["detail"] == MEM_SWAP_DETAIL, HOLD_WAIT_S)
+        page.goto(f"{STAND}/status"); page.wait_text("сервер вытесняет память в swap", 20, css="#checks")
+        into_view(page, "Память сервера")
+        shot(page, "d11a-01-memory-row.png")
+        stack.set_memory("watchdog", 8000, swap_used_mib=0)
+        stack.set_oom_kill("watchdog", 1)
+        stack.wait_status(lambda d: row_of(d, "memory")["detail"] == MEM_OOM_OUTSIDE_DETAIL, 60)
+    finally:                                                                # и при сбое: двойники — в норме (m-4)
+        stack.set_psi("watchdog", 0.0)
+        stack.set_memory("watchdog", 8000, swap_used_mib=0)
+        stack.recreate("watchdog", {})                                      # новая история: база счётчика — как есть
     stack.wait_status(lambda d: row_of(d, "memory")["state"] == "ok", 30)
 
 
@@ -58,31 +62,35 @@ def test_place_oom_restart_reason(stack, page):                             # н
             stack.wait_status(lambda d: row_of(d, "student-10")["detail"].startswith("перезапущен: убит по памяти"), 120)
             seen = datetime.now(timezone.utc)
             s = stack.wait_snapshot_after(seen + timedelta(seconds=GRACE_S + TICK_S))   # I-5 р2: после grace
-            assert row_of(s, "memory")["detail"] != MEM_OOM_OUTSIDE_DETAIL           # без объяснения — было бы «вне мест»
+            assert row_of(s, "memory")["state"] == "ok"                     # без объяснения — было бы «вне мест» (m-5)
             page.goto(f"{STAND}/status"); page.wait_text("убит по памяти", 20, css="#checks")
             into_view(page, "Рабочее место 10")
             shot(page, "d11a-02-oom-restart.png")
-            stack.sh("pcbk-student-10", "rm -f /work/.oom-drill")
-    finally:
+    finally:                                                                # место уже остановлено — метка из тома (m-4)
+        stack.place_work_rm(10, ".oom-drill")
         stack.recreate("watchdog", {})
 
 
 def test_place_crash_restart_reason(stack, page):
-    stack.start("pcbk-student-10"); stack.wait_ready("pcbk-student-10")
-    stack.wait_snapshot_after(datetime_now())
-    stack.sh("pcbk-student-10", f"kill -KILL {stack.opencode_pid('pcbk-student-10')}")
-    stack.wait_status(lambda d: row_of(d, "student-10")["detail"].startswith("перезапущен: сбой не по памяти"), 90)
-    page.goto(f"{STAND}/status"); page.wait_text("сбой не по памяти", 20, css="#checks")
-    into_view(page, "Рабочее место 10")
-    shot(page, "d11a-03-crash-restart.png")
-    stack.compose("create", "--force-recreate", "--no-build", "student-10")
+    try:
+        stack.start("pcbk-student-10"); stack.wait_ready("pcbk-student-10")
+        stack.wait_snapshot_after(datetime_now())
+        stack.sh("pcbk-student-10", f"kill -KILL {stack.opencode_pid('pcbk-student-10')}")
+        stack.wait_status(lambda d: row_of(d, "student-10")["detail"].startswith("перезапущен: сбой не по памяти"), 90)
+        page.goto(f"{STAND}/status"); page.wait_text("сбой не по памяти", 20, css="#checks")
+        into_view(page, "Рабочее место 10")
+        shot(page, "d11a-03-crash-restart.png")
+    finally:                                                                # и при сбое: место — без перезапусков (m-4)
+        stack.compose("create", "--force-recreate", "--no-build", "student-10")
 
 
 def test_drills_line_on_page(stack, page):
-    stack.recreate("core", {"DRILL_LLM": "402"})
-    page.goto(f"{STAND}/status"); page.wait_text("Идут учения: LLM-прокси и бюджет", 30, css="#drills")
-    shot(page, "d11a-05-drills-line.png")
-    stack.recreate("core", {})
+    try:
+        stack.recreate("core", {"DRILL_LLM": "402"})
+        page.goto(f"{STAND}/status"); page.wait_text("Идут учения: LLM-прокси и бюджет", 30, css="#drills")
+        shot(page, "d11a-05-drills-line.png")
+    finally:                                                                # и при сбое: core без учений (m-4)
+        stack.recreate("core", {})
     wait_hidden(page, "#drills", 30)
 
 

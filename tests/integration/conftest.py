@@ -1249,6 +1249,12 @@ class Stack:
                     self._docker("stop", name)
                 self.compose("create", "--force-recreate", "--no-build", service)
 
+    def place_work_rm(self, n: int, path: str) -> None:
+        """Удалить path в томе /work места n одноразовым busybox от root без сети: место может быть остановлено (уборка
+        метки учения переполнения после place_override, итог Д11а m-4). Только тома теста — pcbk-student-NN-work."""
+        _run(["docker", "run", "--rm", "--pull", "never", "--network", "none", "--user", "0", "--label", ONESHOT_LABEL,
+              "-v", f"pcbk-student-{n:02d}-work:/work", locked_image("busybox"), "rm", "-f", f"/work/{path}"])
+
     def stop(self, name: str) -> None:
         self._docker("stop", name)
         if self._state(name)["Running"]:
