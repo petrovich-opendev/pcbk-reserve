@@ -2,6 +2,8 @@
 # test_gw_teacher.py; пароли — Secret (m-14): в сообщении упавшего assert пароль печатается как «<скрыт>»
 import json
 import logging
+import sqlite3
+from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
@@ -75,6 +77,39 @@ def test_student_refused_on_accounts(tg):
 
 
 # --- сверх брифа ---
+
+def test_not_teacher_refused_on_every_account_route(tg):                  # доводка р1, ревью I-1; Review Focus 1
+    """Роль — на сервере у каждой из пяти ручек учёток: студент и учётка чужой роли (правка базы мимо CHECK, как в
+    test_gw_calc) — 403 teacher_only, без сессии — 401; учётки не меняются, строк журнала действий нет. Без проверки роли
+    в account_op студент получил бы 200 и пароль чужой учётки."""
+    store = tg.role.store
+    with closing(sqlite3.connect(store.path)) as db, db:
+        db.execute("PRAGMA ignore_check_constraints = ON")
+        db.execute("INSERT INTO gw_accounts (login, role, place, pw_hash, disabled, created_at) SELECT 'oper',"
+                   " 'operator', 8, pw_hash, 0, created_at FROM gw_accounts WHERE login = 'stu-05'")
+    store.add("stu-06", "student", 6, PW)
+    store.disable("stu-06")                                                   # цель enable — отключённая учётка
+    for _ in range(LOCK_FAILURES):
+        store.failure("stu-05")                                               # цель unlock — запертая учётка
+    calls = (("accounts", {"login": "x-new", "place": "04"}), ("accounts/stu-05/password", {}),
+             ("accounts/stu-05/disable", {}), ("accounts/stu-06/enable", {}), ("accounts/stu-05/unlock", {}),
+             ("accounts/teach/password", {}))
+    rows = len(tg.role.teacher_log.recent(100))
+    for login in ("stu-03", "oper"):
+        c = tg.as_(login)
+        for path, body in calls:
+            r = post(c, path, body)
+            assert (r.status_code, r.json()["data"]["message"]) == (403, TEACHER_TEXTS["teacher_only"]), (login, path)
+            assert "password" not in r.json(), (login, path)
+    for path, body in calls:
+        assert post(tg.anon(), path, body).status_code == 401, path
+    assert len(tg.role.teacher_log.recent(100)) == rows
+    assert tg.role.teacher_stats.count_1h("role_refused") == 2 * len(calls)
+    assert store.verify("stu-05", PW) is not None and store.status("stu-05") == "active" and store.locked("stu-05")
+    assert store.status("stu-06") == "disabled" and store.verify("teach", PW) is not None
+    assert not store.exists("x-new")
+    assert tg.role.teacher_stats.count_1h("change") == 0
+
 
 def test_password_answers_say_no_cache_and_carry_only_password(tg):     # R108: заголовки и форма ответов
     t = tg.as_("teach")
