@@ -89,7 +89,11 @@ test("sessions_transcript_agents_journal_shapes", () => {
   expect(parseJournal({ rows: [{ ...JOURNAL_ROWS.rows[1], id: "2" }] })).toBeNull();
   expect(ACTION_LABELS).toEqual({ sessions: "открыл список разговоров", read: "прочитал разговор",
                                   agents: "открыл список агентов", agent: "прочитал инструкцию агента",
-                                  wake: "разбудил место", shares: "перевёл долю" });
+                                  wake: "разбудил место", shares: "перевёл долю",
+                                  // действия учёток Д10б (R108)
+                                  account_add: "завёл учётку студента", account_passwd: "выдал новый пароль",
+                                  account_disable: "отключил учётку", account_enable: "включил учётку",
+                                  account_unlock: "снял замок входа" });
 });
 
 test("teacher_api_paths_and_bodies", async () => {
