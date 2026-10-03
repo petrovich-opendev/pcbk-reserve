@@ -11,7 +11,15 @@ health_json() читают только запомненное. Состояни
 ledger.settled (пол доли, B-1) и отдаёт его Budget — отказ «доля израсходована» идёт по доле своего места. Доли
 открываются в lifespan сразу после журнала (asyncio.to_thread); не открылись — config_error «доли бюджета не загружены»:
 все вызовы /llm/ — 403 pcbk_config (закрыто при сбое: иначе студент с урезанной долей снова получил бы долю по
-умолчанию)."""
+умолчанию).
+
+Тормоз прогона (Д11, Д11-R117): brake — RunBrake при прогоне (LLM_RUN_*), иначе None (тормоза нет вовсе). lifespan после
+открытия журнала читает его защёлку и базы из llm_meta (brake.load), а без config_error ставит задачу llm-run-brake:
+проверка сразу и раз в RUN_BRAKE_POLL_S, в потоке (чтение /proc и flush журнала при защёлке); исключение — строка журнала
+и проверка без данных (blind). Под защёлкой Budget отказывает вызывающим прогона 402 pcbk_run_halted (budget.halted —
+чтение флага), шлюз усыпляет места прогона и не будит их (gateway: Workplaces.halted, _halt_watch). /health/llm — блок
+run_brake (32-й ключ): null без прогона. Модуль brake импортируется только внутри методов: python -m
+pcbk_core.llm.brake иначе давал бы RuntimeWarning runpy."""
 import asyncio
 import logging
 import math
@@ -21,7 +29,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, FastAPI
@@ -38,6 +46,9 @@ from .shares import PLACES, Shares
 from .state import FAIL_STATES, UpstreamState
 from .turns import TurnLimiter
 from .upstream import Upstream, UpstreamError, UpstreamKind
+
+if TYPE_CHECKING:
+    from .brake import RunBrake
 
 # llm-tokens не прочитан: это не config_error — всем 401, но опрос /key, дозапрос цен и проверка журнала идут
 LLM_TOKENS_ERROR = "токены LLM не читаются"
@@ -118,9 +129,18 @@ class LlmRole(RoleBase):
         self.shares = shares
         if shares is not None:
             shares.settled_of = ledger.settled
+        # тормоз прогона (Д11-R117): только при прогоне; конструктор без ввода-вывода — мету читает load() в lifespan
+        self.brake: "RunBrake | None" = None
+        if run is not None:
+            from .brake import RunBrake
+            self.brake = RunBrake(
+                (llm.LLM_RUN_MEMINFO, llm.LLM_RUN_VMSTAT, llm.LLM_RUN_PRESSURE),
+                (llm.LLM_RUN_MEM_FAIL_MIB, llm.LLM_RUN_SWAP_GROW_MIB, llm.LLM_RUN_SWAP_BASE_MIB,
+                 llm.LLM_RUN_PSI_FULL_MAX),
+                meta=ledger, run_id=run.id, monotonic=monotonic, wallclock=wallclock, started_mono=self.started_mono)
         self.budget = Budget(ledger, total_usd=llm.LLM_TOTAL_USD, share_usd=llm.LLM_SHARE_USD,
                              ops_share_usd=llm.LLM_OPS_SHARE_USD, key_spent=self.key_spent_usd, run=run,
-                             shares=shares)
+                             shares=shares, halted=self.run_halted)
         self.turns = TurnLimiter(limit=llm.LLM_TURN_CALLS, monotonic=monotonic)
         self.state = UpstreamState(drill=self.drill)
         self.inflight: dict[str, int] = {}
@@ -141,6 +161,11 @@ class LlmRole(RoleBase):
     @property
     def stopped(self) -> bool:
         return self.llm.LLM_STATE == "stopped"
+
+    def run_halted(self) -> bool:
+        """Защёлка тормоза прогона (Д11-R117): чтение флага, без ввода-вывода; без прогона — ложь."""
+        brake = self.brake
+        return brake is not None and brake.halted
 
     def key_spent_usd(self) -> float | None:
         """Расход по ключу с точки отсчёта этого ключа (Д4а-R13); без точки, usage или при off — None."""
@@ -226,6 +251,7 @@ class LlmRole(RoleBase):
             "egress": refresh_status(self.egress_name),
             "refresh_started_age_s": refresh_started_age_s(),
             "run": self.run_json(self.monotonic()),
+            "run_brake": None if self.brake is None else self.brake.json(self.monotonic()),
         }
 
     def run_json(self, now_mono: float) -> dict | None:
@@ -470,6 +496,8 @@ class LlmRole(RoleBase):
         self.budget.run_base = bases        # состояние роли — в цикле событий (m4)
         if error is not None:
             self.config_error = f"{self.config_error}; {error}" if self.config_error else error
+        if self.brake is not None:          # защёлка и базы тормоза прогона — из llm_meta (память журнала)
+            self.brake.load()
         llm = self.llm
         allocated = (len(PLACES) * llm.LLM_SHARE_USD if shares is None else shares.sum_cents() / 100)
         log.info("LLM-прокси: моделей %d, доли мест: распределено $%g из $%g, по умолчанию $%g", len(self.models),
@@ -490,6 +518,8 @@ class LlmRole(RoleBase):
                 for call_id, gen_id in self.ledger.pending_to_resolve():     # цена, которую не дождался прошлый запуск
                     self.spawn_resolve(call_id, gen_id)
             tasks.append(asyncio.create_task(self._poll_loop(), name="llm-poll"))
+            if self.brake is not None:      # тормоз прогона (Д11-R117) — только при прогоне и без config_error
+                tasks.append(asyncio.create_task(self._brake_loop(), name="llm-run-brake"))
         try:
             yield
         finally:
@@ -518,6 +548,26 @@ class LlmRole(RoleBase):
             elif now and was is False:
                 log.info("LLM-прокси: журнал вызовов: запись снова проходит")
             await asyncio.sleep(LEDGER_CHECK_S)
+
+    async def _brake_loop(self) -> None:
+        """Тормоз прогона: проверка сразу и раз в RUN_BRAKE_POLL_S (читается каждый раз), в потоке. Исключение — строка
+        журнала с классом и проверка без данных (blind): цикл не умирает, а молчание видно по age_s."""
+        from . import brake as brake_module
+
+        brake = self.brake
+        log.info("LLM-прокси: тормоз прогона %s: свободно меньше %d МиБ, swap +%d МиБ (база %s), давление full > %g %%",
+                 brake.run_id, brake.fail_mib, brake.swap_grow_mib,
+                 "первая проверка" if brake.swap_base_cfg < 0 else f"{brake.swap_base_cfg} МиБ", brake.psi_full_max)
+        while True:
+            try:
+                await asyncio.to_thread(brake.check)
+            except Exception as exc:
+                log.error("LLM-прокси: тормоз прогона: проверка упала (%s)", type(exc).__name__)
+                try:
+                    await asyncio.to_thread(brake.failed)
+                except Exception as again:
+                    log.error("LLM-прокси: тормоз прогона: учёт сбоя упал (%s)", type(again).__name__)
+            await asyncio.sleep(brake_module.RUN_BRAKE_POLL_S)
 
     async def _poll_loop(self) -> None:
         while True:

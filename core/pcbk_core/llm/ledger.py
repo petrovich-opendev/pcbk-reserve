@@ -61,7 +61,7 @@ COUNTERS_WINDOW = timedelta(hours=24)
 WRITER_NAME = "pcbk-ledger-writer"
 OPS = "ops"
 
-Refusal = Literal["budget_spent", "run_spent", "share_spent"]
+Refusal = Literal["budget_spent", "run_halted", "run_spent", "share_spent"]
 STATUSES = ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lost", "unknown")
 CLOSED_STATUSES = tuple(s for s in STATUSES if s != "open")   # закрытая строка open быть не может
 COST_SOURCES = ("stream", "body", "generation", "pending", "unknown", "none")
@@ -781,12 +781,12 @@ class Budget:
 
     run_base — точки отсчёта прогона по вызывающим (llm_meta, ставит lifespan роли по LlmRole.ensure_run_base до
     первого вызова). shares — доли мест (Д10-R98, Shares: память, без SQLite); None — у всех мест одна share_usd, как
-    до Д10.
+    до Д10. halted — защёлка тормоза прогона (Д11-R117, RunBrake.halted: чтение флага, без ввода-вывода).
     """
 
     def __init__(self, ledger: Ledger, *, total_usd: float, share_usd: float, ops_share_usd: float,
                  key_spent: Callable[[], float | None] = lambda: None, run: RunSpec | None = None,
-                 shares: "Shares | None" = None):
+                 shares: "Shares | None" = None, halted: Callable[[], bool] = lambda: False):
         self.ledger = ledger
         self.total_usd = total_usd
         self.share_usd = share_usd
@@ -794,6 +794,7 @@ class Budget:
         self.key_spent = key_spent
         self.run = run
         self.shares = shares
+        self.halted = halted
         self.run_base: dict[str, float] = {}
 
     def run_spent(self) -> float:
@@ -826,12 +827,16 @@ class Budget:
         return max(self.ledger.spent() - self.ledger.reserved_open(), self.key_spent() or 0.0)
 
     def refusal(self, caller: str) -> Refusal | None:
-        """Сначала общий бюджет, потом потолок прогона (только вызывающим прогона), потом доля вызывающего."""
+        """Сначала общий бюджет, потом тормоз прогона и потолок прогона (только вызывающим прогона, Д11-R117), потом
+        доля вызывающего."""
         if self.total_spent() >= self.total_usd:
             return "budget_spent"
         run = self.run
-        if run is not None and caller in run.callers and self.run_spent() >= run.cap_usd:
-            return "run_spent"
+        if run is not None and caller in run.callers:
+            if self.halted():
+                return "run_halted"
+            if self.run_spent() >= run.cap_usd:
+                return "run_spent"
         if self.ledger.spent(caller) >= self.share_of(caller):
             return "share_spent"
         return None

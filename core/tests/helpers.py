@@ -87,6 +87,18 @@ for _name, _file in (("LLM_TOKENS_FILE", "llm-tokens"), ("OPENROUTER_KEY_FILE", 
     (SESSION_DIR / _file).write_text("", encoding="utf-8")
     LLM_ENV[_name] = str(SESSION_DIR / _file)
 
+# тормоз прогона (Д11-R117): двойники /proc для ролей llm тестов — свободно 8000 из 16000 МиБ, swap свободен, убийств и
+# давления нет. Настоящий /proc машины тестов в тормоз не идёт: её память и убийства — не повод для 402 в тестах Д8
+BRAKE_PROC: dict[str, str] = {}
+for _name, _file, _text in (
+        ("LLM_RUN_MEMINFO", "meminfo",
+         "MemTotal: 16384000 kB\nMemAvailable: 8192000 kB\nSwapTotal: 4194304 kB\nSwapFree: 4194304 kB\n"),
+        ("LLM_RUN_VMSTAT", "vmstat", "oom_kill 0\n"),
+        ("LLM_RUN_PRESSURE", "pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                                         "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")):
+    (SESSION_DIR / f"brake-{_file}").write_text(_text, encoding="utf-8")
+    BRAKE_PROC[_name] = str(SESSION_DIR / f"brake-{_file}")
+
 # тестовые токены LLM — не 48 шестнадцатеричных знаков (шаблон проверки на секреты)
 LLM_TOKEN = "test-llm-token-student-01"
 OPS_LLM_TOKEN = "test-llm-token-ops"
@@ -397,9 +409,12 @@ def make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key
 
     shares (Д10а, задача А2) — доли мест Shares на том же core.db (бюджет и доля по умолчанию — из LlmSettings, учение —
     shares_drill), как в build_llm_role. Доли не открыты: их открывает lifespan роли — так тест «доли не загрузились»
-    проверяет настоящий путь."""
+    проверяет настоящий путь.
+
+    Тормоз прогона (Д11а): пути /proc — двойники BRAKE_PROC, если тест не задал свои LLM_RUN_MEMINFO/VMSTAT/PRESSURE."""
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
+    llm_overrides = {**BRAKE_PROC, **llm_overrides}
     if fake is not None:
         llm_overrides = {"OPENROUTER_BASE_URL": fake.url, **llm_overrides}
     llm = replace(LLM_SETTINGS, **llm_overrides)
@@ -524,6 +539,8 @@ def ready_place(workplaces: Workplaces, docker: FakeDocker, n: int) -> None:
 BDRV_CFG = BdrvConfig("h", 1433, "Runtime", "u", "p")
 # публичный origin страницы входа в тестах (GW_ORIGIN)
 ORIGIN = "https://stand.test:8443"
+# заголовки источника записи со своей страницы — у POST ручек шлюза (Д11а, тормоз прогона: вход студента и кабинет)
+ORIGIN_HEADERS = {"Origin": ORIGIN}
 
 
 def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),

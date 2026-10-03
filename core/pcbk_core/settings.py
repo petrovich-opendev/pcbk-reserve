@@ -79,9 +79,14 @@ DRILL_LLM_MODES = frozenset({"", "402"})
 # (поле, наименьшее, наибольшее) — целые пределы; предел шагов стоит в тексте отказа — не больше 100
 # (OpenCode ищет в тексте 429|500|502|503|504|524)
 _LLM_INT_RANGES = (("LLM_MAX_TOKENS", 1, 16000), ("LLM_TURN_CALLS", 1, 100),
-                   ("LLM_MAX_BODY_BYTES", 65536, 4194304), ("LLM_CALLER_CONCURRENCY", 1, 16))
+                   ("LLM_MAX_BODY_BYTES", 65536, 4194304), ("LLM_CALLER_CONCURRENCY", 1, 16),
+                   # тормоз прогона (Д11-R117), МиБ: порог свободной памяти и роста swap; база swap −1 — от первой проверки
+                   ("LLM_RUN_MEM_FAIL_MIB", 1, 1048576), ("LLM_RUN_SWAP_GROW_MIB", 1, 1048576),
+                   ("LLM_RUN_SWAP_BASE_MIB", -1, 1048576))
 # наименьшее у дробных, кроме «больше нуля»: опрос OpenRouter не чаще раза в 5 с
 _LLM_FLOAT_MIN = {"LLM_POLL_S": 5.0}
+# наибольшее у дробных: давление памяти full avg10 — проценты (Д11-R117)
+_LLM_FLOAT_MAX = {"LLM_RUN_PSI_FULL_MAX": 100.0}
 _LLM_CHOICES = (("LLM_KEY_DEDICATED", LLM_KEY_MODES), ("LLM_STATE", LLM_STATES), ("DRILL_LLM", DRILL_LLM_MODES))
 # пути к файлам секретов роли llm: без проверок, их берёт и запасная настройка при ошибке в LLM_*
 _LLM_FILE_FIELDS = ("OPENROUTER_KEY_FILE", "OPENROUTER_MGMT_KEY_FILE", "LLM_TOKENS_FILE")
@@ -144,6 +149,15 @@ class LlmSettings:
     LLM_RUN_ID: str = ""                    # RUN_ID_RE; новый id — новая точка отсчёта
     LLM_RUN_USD: float = 0.0                # потолок прогона, $: больше нуля и не больше LLM_TOTAL_USD
     LLM_RUN_CALLERS: str = ""               # места прогона через запятую (RUN_CALLER_RE)
+    # тормоз прогона (Д11-R117, llm/brake.py): работает только при LLM_RUN_*; пороги — у core вложенным умолчанием
+    # compose.yaml (от MEM_FAIL_MIB, SWAP_GROW_WARN_MIB, PSI_FULL_MAX сторожа), пути — только двойники стенда
+    LLM_RUN_MEM_FAIL_MIB: int = 1024        # свободно меньше — причина memory
+    LLM_RUN_SWAP_GROW_MIB: int = 512        # swap вырос от базы или за 10 мин на столько — причина swap
+    LLM_RUN_SWAP_BASE_MIB: int = -1         # база swap прогона, МиБ; −1 — первая проверка (хранится в llm_meta)
+    LLM_RUN_PSI_FULL_MAX: float = 10.0      # давление full avg10 выше, % — причина psi
+    LLM_RUN_MEMINFO: str = "/proc/meminfo"
+    LLM_RUN_VMSTAT: str = "/proc/vmstat"
+    LLM_RUN_PRESSURE: str = "/proc/pressure/memory"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "LlmSettings":
@@ -171,9 +185,12 @@ class LlmSettings:
             except ValueError:
                 raise ValueError(f"{f.name}: не {'целое ' if kind is int else ''}число") from None
             if kind is float:
-                low = _LLM_FLOAT_MIN.get(f.name)
-                if not (math.isfinite(value) and value > 0 and (low is None or value >= low)):
+                low, high = _LLM_FLOAT_MIN.get(f.name), _LLM_FLOAT_MAX.get(f.name)
+                if not (math.isfinite(value) and value > 0 and (low is None or value >= low)
+                        and (high is None or value <= high)):
                     need = "больше нуля" if low is None else f"не меньше {low:g}"
+                    if high is not None:
+                        need += f" и не больше {high:g}"
                     raise ValueError(f"{f.name}: нужно число {need}")
             values[f.name] = value
         llm = cls(**values)

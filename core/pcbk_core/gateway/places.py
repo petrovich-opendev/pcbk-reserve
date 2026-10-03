@@ -44,6 +44,14 @@ PLACE_TEXTS["config"]); not_config — как прежде (срок пробу�
 в начале под замком места; broken=True (image, capped после dispose) — та же задача только гасит место и кончается
 неудачей config, без start: повторных dispose раз в RELOAD_RETRY_S нет, студент видит текст места.
 
+Д11а (Д11-R117): тормоз прогона. Крючок halted() (его ставит GatewayRole) — места прогона под защёлкой тормоза core;
+без крючка — пусто. Под защёлкой wake(n) такого места — WakeRefused("run_halted") без touch и без задачи; restart(n) —
+тихий отказ (строка журнала, «готово» снято, без задачи и без исключения в воркер перезагрузки агентов); _wake_locked
+перед каждым spctl.start проверяет halted() и кончается неудачей run_halted. stop_now(n) — stop под замком места без
+проверки простоя и занятости (304 — удача), cancel_wake(n) — снять задачу пробуждения. Каждый такт уборщика, пока
+защёлка стоит, останавливает любое место прогона, которое inspect показал работающим (поднятое отменённой задачей, docker
+start мимо шлюза — что угодно), — и занятое: задача пробуждения снимается, замок ждётся.
+
 Прокси окружения не берутся (trust_env=False), перенаправлениям не следуют, cookie места не хранятся и месту не
 возвращаются (политика без разрешённых доменов, G3). Сроки попыток держит asyncio.timeout поверх срока
 httpx. Исключения httpx ловятся целиком (httpx.HTTPError, Ш11) и в журнал не пишутся: строки журнала — только
@@ -118,6 +126,8 @@ PLACE_TEXTS = {
     "crashed": "Рабочее место падает при запуске — сообщите преподавателю.",
     "timeout": "Рабочее место не ответило за отведённое время — попробуйте ещё раз или сообщите преподавателю.",
     "config": "Настройка рабочего места сломана — сообщите администратору.",
+    # тормоз прогона (Д11-R117): тот же текст, что у отказа пробуждения шлюзом и кабинетом (GW_MESSAGES["run_halted"])
+    "run_halted": "Прогон остановлен: сервер на пределе памяти — место не будится.",
 }
 
 PLACE_TIMEOUT = httpx.Timeout(connect=2, read=PLACE_READ_S, write=5, pool=5)
@@ -149,6 +159,15 @@ class SpCtlError(Exception):
         super().__init__(f"{kind} {status}" if status else kind)
         self.kind: SpCtlKind = kind
         self.status = status
+
+
+class WakeRefused(Exception):
+    """Пробуждение места отклонено (Д11-R117): kind — run_halted (место прогона под защёлкой тормоза core). Вход
+    студента и кабинет отвечают 503 Unavailable."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
 
 
 class PlacePasswordError(OSError):
@@ -317,6 +336,8 @@ class Workplaces:
         # перезапуск (restart): место → "restart" (stop, затем пробуждение) или "config" (только stop, неудача config);
         # его забирает ближайший _wake_locked места
         self._restarts: dict[int, str] = {}
+        # тормоз прогона (Д11-R117): места прогона под защёлкой тормоза core; его ставит GatewayRole, без него — пусто
+        self.halted: Callable[[], frozenset[int]] = frozenset
 
     # --- клиент мест ---
 
@@ -544,6 +565,9 @@ class Workplaces:
         и свежее подтверждение есть (_fresh_ready) — ответ «готово» без задачи: без inspect и строки журнала,
         событие wake_ok — только в памяти (счётчик строки сторожа)."""
         n = _place(n)
+        if n in self.halted():                           # тормоз прогона (Д11-R117): ни touch, ни задачи
+            log.warning("gw wake place=%02d result=refused kind=run_halted", n)
+            raise WakeRefused("run_halted")
         self.touch(n)
         if not self._waking(n):
             self._failed.pop(n, None)                    # неудача прошлого пробуждения сбрасывается здесь
@@ -572,9 +596,15 @@ class Workplaces:
 
         Задача пробуждения уже есть (ждёт замок, пока его держал воркер) — новая не ставится: метку перезапуска заберёт
         она. Не зовётся, пока у места идёт _wake_locked: тот держит замок места, а воркер зовёт restart, только отпустив
-        свой."""
+        свой.
+
+        Под защёлкой тормоза прогона (Д11-R117) — тихий отказ: «готово» снято, строка журнала, ни задачи, ни исключения
+        (m-6 р3): место гасит тормоз."""
         n = _place(n)
         self._unready(n)
+        if n in self.halted():
+            log.warning("gw halt restart place=%02d skipped", n)
+            return self.view(n)
         if broken or self._restarts.get(n) != "config":       # «только погасить» сильнее перезапуска
             self._restarts[n] = "config" if broken else "restart"
         self._failed.pop(n, None)
@@ -597,6 +627,9 @@ class Workplaces:
             log.info("gw wake place=%02d result=ready kind=- ms=%d", n, ms)
             return
         self._failed[n] = PLACE_TEXTS[kind]
+        if kind == "run_halted":                         # отказ тормоза — не сбой места: счётчик wake_failed не растёт
+            log.warning("gw wake place=%02d result=refused kind=run_halted ms=%d", n, ms)
+            return
         self.stats.event("wake_failed")
         if kind == "place_auth":
             self.stats.event("place_auth_failed")
@@ -613,6 +646,8 @@ class Workplaces:
             kind = await self._restart_stop(n)
             if kind is not None or mode == "config":
                 return kind or "config"
+        if n in self.halted():                           # тормоз прогона (Д11-R117): задача поставлена до защёлки
+            return "run_halted"
         try:
             self.basic(n)                                # пароль — до start: без него start не зовётся
         except PlacePasswordError:
@@ -632,6 +667,8 @@ class Workplaces:
         self._unready(n)
         base, repaired = before.started_at, False
         while True:
+            if n in self.halted():                       # тормоз прогона: проверка — перед каждым start (после await)
+                return "run_halted"
             try:
                 code = await self.spctl.start(n)
             except SpCtlError as exc:
@@ -728,6 +765,39 @@ class Workplaces:
         self._became_ready(n)
         return None
 
+    # --- тормоз прогона (Д11-R117) ---
+
+    def cancel_wake(self, n: int) -> bool:
+        """Снять задачу пробуждения (и перезапуска) места; True — была и снята. Замок места задача отпускает на отмене;
+        start, уже ушедший в sp-ctl, гасит следующий такт уборщика."""
+        task = self._tasks.get(_place(n))
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
+    async def stop_now(self, n: int) -> bool:
+        """stop места под его замком без проверки простоя и занятости (тормоз прогона): «готово» снято до stop; 204 и
+        304 — удача, место уходит из running; иначе stop_failed, а running не трогается (работает ли место, скажет
+        inspect следующего такта — он же повторит остановку, без паузы повтора уборщика)."""
+        n = _place(n)
+        async with self._locks[n]:
+            self._unready(n)
+            ok = await self._stop_quiet(n)
+            (log.info if ok else log.warning)("gw stop place=%02d reason=run_halted result=%s", n,
+                                              "ok" if ok else "failed")
+            if ok:
+                self._forget(n)
+        return ok
+
+    async def halt_place(self, n: int) -> bool:
+        """Место прогона под защёлкой: снять пробуждение, stop_now, текст места — «прогон остановлен»."""
+        self.cancel_wake(n)
+        ok = await self.stop_now(n)
+        if ok:
+            self._failed[_place(n)] = PLACE_TEXTS["run_halted"]
+        return ok
+
     async def _stop_quiet(self, n: int) -> bool:
         """stop без исключения наружу; неудача — счётчик stop_failed."""
         try:
@@ -821,14 +891,20 @@ class Workplaces:
                     if flag is None:
                         self._ready[n] = container.started_at
                     self._confirm(n)
+        halted = self.halted()
+        if halted:                                        # тормоз прогона: и занятые, и поднятые мимо шлюза (Д11-R117)
+            up = [n for n, info in zip(PLACES, infos) if n in halted and isinstance(info, dict)
+                  and _Container.of(info).running]
+            self._log_failures("halt", up, await asyncio.gather(*(self.halt_place(n) for n in up),
+                                                                return_exceptions=True))
         if not self._restored and answered:
             self._restored = True                         # первый проход, где sp-ctl ответил хоть об одном месте
-            todo = [n for n, c in seen.items() if not c.restarting and n not in self._ready]
+            todo = [n for n, c in seen.items() if not c.restarting and n not in self._ready and n not in halted]
             self._log_failures("restore", todo, await asyncio.gather(
                 *(self._restore(n, seen[n]) for n in todo), return_exceptions=True))
         limit = self.gw.GW_IDLE_STOP_S
         idle = [n for n in sorted(self.running)
-                if not self._busy(n) and self._stop_allowed(n) and self.idle_s(n) >= limit]
+                if n not in halted and not self._busy(n) and self._stop_allowed(n) and self.idle_s(n) >= limit]
         self._log_failures("reap", idle, await asyncio.gather(*(self._reap(n) for n in idle),
                                                               return_exceptions=True))
 

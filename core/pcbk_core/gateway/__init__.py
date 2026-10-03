@@ -43,6 +43,13 @@ lifespan через asyncio.to_thread при любой настройке: не
 каждая ручка на сервере. Ворота кабинета teacher_gate (TeacherGate) — у роли: чтений кабинета к одному месту не больше
 TEACHER_PARALLEL разом (свои соединения клиента места — places.PLACE_CONNECTIONS).
 
+Тормоз прогона (Д11а, Д11-R117): крючок workplaces.halted = _halted_places — места прогона (student-NN из LLM_RUN_CALLERS)
+под защёлкой тормоза роли llm, иначе пусто. Задача gw-halt-watch (при config_error не стартует, как уборщик) раз в
+HALT_WATCH_S смотрит флаг защёлки (llm.brake.event — threading.Event: его ставит поток проверки тормоза, к циклу событий
+он не привязан) и на новой защёлке делает _halt_once: у каждого места прогона — снять пробуждение и stop под замком места,
+304 — удача, не глядя на running (до первого такта уборщика он пуст). Дальше каждый такт уборщика гасит любое место
+прогона, которое inspect видит работающим (Workplaces._pass).
+
 Модули accounts, agents_api, api, calc_api, proxy, teacher_api и web (а через них — accounts) здесь импортируются только
 внутри методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
 загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
@@ -86,6 +93,7 @@ BODY_LIMIT = 65536                          # тела шлюза Д5а — ло
 CONFIG_ERROR_CHARS = 80                     # вся причина config_error, дописанная при запуске
 HEALTH_REASON_CHARS = 60                    # причина в health()
 SILENT_TICKS = 4                            # уборщик молчит дольше 4 тактов — сбой (GW_STALE_S сторожа)
+HALT_WATCH_S = 1.0                          # опрос защёлки тормоза прогона, с (читается при каждом шаге — тесты меняют)
 
 _T = TypeVar("_T")
 
@@ -280,8 +288,10 @@ class GatewayRole(RoleBase):
                                     wallclock=wallclock, drill=gw.DRILL_AGENTS)
         workplaces.on_ready = self.reloads.place_ready
         workplaces.repair = self.reloads.repair         # карантин кривого файла агента при пробуждении (Д7-R59)
+        workplaces.halted = self._halted_places         # тормоз прогона: места прогона под защёлкой (Д11-R117)
         self._reaper: asyncio.Task | None = None
         self._reload_task: asyncio.Task | None = None
+        self._halt_task: asyncio.Task | None = None
 
     # --- маршруты и крючки ---
 
@@ -458,6 +468,45 @@ class GatewayRole(RoleBase):
             finally:
                 self.teacher_log.ping()
 
+    # --- тормоз прогона (Д11-R117) ---
+
+    def _halted_places(self) -> frozenset[int]:
+        """Места прогона под защёлкой тормоза core: student-NN из вызывающих прогона (ops — не место); без роли llm, без
+        прогона или без защёлки — пусто. Только память."""
+        llm = self.llm
+        if llm is None or llm.run is None or not llm.run_halted():
+            return frozenset()
+        return frozenset(int(c.removeprefix("student-")) for c in llm.run.callers if c.startswith("student-"))
+
+    async def _halt_once(self) -> None:
+        """Один проход _halt_watch: у каждого места прогона под защёлкой — снять пробуждение и stop под замком места
+        (304 — удача), не глядя на running. Исключение места — строка журнала с классом."""
+        places = sorted(self._halted_places())
+        if not places:
+            return
+        log.error("шлюз: тормоз прогона — места прогона усыпляются: %d", len(places))
+        results = await asyncio.gather(*(self.workplaces.halt_place(n) for n in places), return_exceptions=True)
+        for n, result in zip(places, results):
+            if isinstance(result, BaseException):
+                log.warning("gw halt place=%02d error=%s", n, type(result).__name__)
+
+    async def _halt_watch(self) -> None:
+        """Раз в HALT_WATCH_S — флаг защёлки тормоза (llm.brake.event); новая защёлка — _halt_once. Защёлка снята в
+        процессе (RunBrake.clear) — следующая снова даст проход. Исключение — строка журнала, цикл живёт."""
+        brake = self.llm.brake
+        handled = False
+        while True:
+            try:
+                if brake.event.is_set():
+                    if not handled:
+                        handled = True
+                        await self._halt_once()
+                else:
+                    handled = False
+            except Exception as exc:
+                log.warning("шлюз: тормоз прогона: %s", type(exc).__name__)
+            await asyncio.sleep(HALT_WATCH_S)
+
     def _note_shares(self, ok: bool, drift: int, why: str | None) -> None:
         """Строка журнала службы на смену итога сверки долей: только числа и класс ошибки."""
         was, self._shares_seen = self._shares_seen, (ok, drift)
@@ -503,6 +552,8 @@ class GatewayRole(RoleBase):
             else:
                 self._reaper = asyncio.create_task(self._reaper_loop(), name="gw-reaper")   # не ожидается
                 self._reload_task = asyncio.create_task(self.reloads.run(), name="gw-agents-reload")
+                if self.llm is not None and self.llm.brake is not None:      # тормоз прогона (Д11-R117)
+                    self._halt_task = asyncio.create_task(self._halt_watch(), name="gw-halt-watch")
         except Exception as exc:                # запуск шлюза не роняет core: причина — на страницу
             self._add_config_error(f"запуск шлюза: {type(exc).__name__}")
             log.error("шлюз: ошибка настройки: %s", self.config_error)
@@ -535,7 +586,7 @@ class GatewayRole(RoleBase):
             log.error("шлюз: учёт агентов не открыт (%s)", self.agents.last_error)
 
     async def _shutdown(self) -> None:
-        for name in ("_reaper", "_reload_task"):
+        for name in ("_reaper", "_reload_task", "_halt_task"):
             task = getattr(self, name)
             setattr(self, name, None)
             if task is not None:

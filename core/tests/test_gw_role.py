@@ -464,3 +464,33 @@ def test_good_drill_teacher_reaches_shares_and_journal(tmp_path):         # св
         assert roles["gateway"].config_error is None and roles["llm"].config_error is None
     roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_ORIGIN": "https://x/path"})}
     assert "DRILL_TEACHER" not in (roles["llm"].config_error or "")         # чужая ошибка шлюза доли не закрывает
+
+
+# --- Д11а, задача А2: тормоз прогона (Д11-R117) — крючок мест и задача наблюдения, как у уборщика ---
+
+def test_build_roles_wires_brake_into_gateway(tmp_path):                  # роль llm build_roles — та же, что у шлюза
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    env = {**LLM_ENV, "LLM_RUN_ID": "d11-test", "LLM_RUN_USD": "5", "LLM_RUN_CALLERS": "student-02,ops",
+           "LLM_RUN_MEM_FAIL_MIB": "2048", "LLM_RUN_PSI_FULL_MAX": "7.5"}
+    roles = {r.name: r for r in build_roles(settings, env)}
+    llm, gw = roles["llm"], roles["gateway"]
+    assert llm.config_error is None and gw.llm is llm and (llm.brake.fail_mib, llm.brake.psi_full_max) == (2048, 7.5)
+    assert gw.workplaces.halted() == frozenset()
+    llm.brake.clear()                                                        # память процесса; мета не тронута
+    llm.brake.halt("memory")
+    assert gw.workplaces.halted() == frozenset({2})                          # ops — не место
+    plain = {r.name: r for r in build_roles(settings, LLM_ENV)}
+    assert plain["llm"].brake is None and plain["gateway"].workplaces.halted() == frozenset()
+
+
+def test_halt_watch_follows_reaper_rules(tmp_path):                       # при config_error не стартует; остановка снимает
+    run = {"LLM_RUN_ID": "d11-test", "LLM_RUN_USD": 5.0, "LLM_RUN_CALLERS": "student-03"}
+    llm = make_llm_role(tmp_path / "a", key=None, **run)
+    app, role = make_gateway(tmp_path / "a", llm=llm)
+    with TestClient(app):
+        task = role._halt_task
+        assert task is not None and not task.done() and task.get_name() == "gw-halt-watch"
+    assert role._halt_task is None and task.done()
+    app, role = make_gateway(tmp_path / "b", llm=llm, config_error="проба")
+    with TestClient(app):
+        assert role._halt_task is None and role._reaper is None

@@ -15,7 +15,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from typing import Literal
 from urllib.parse import urljoin, urlsplit
 
-from .memory import MemHistory, memory_verdict, parse_sample
+from .memory import MEM_DRILL_NOTE, MemHistory, memory_verdict, parse_sample
 
 State = Literal["ok", "warn", "fail", "absent", "unknown"]
 
@@ -116,6 +116,17 @@ RUN_CAP_DETAIL = "потолок прогона отбора исчерпан �
 RUN_SILENT_DETAIL = "прогон отбора молчит — к модели давно никто не обращался"
 # потолок прогона меньше этого, $, или не целый — в note с центами ($5.00, $80.50), иначе целым, как бюджет ($80)
 RUN_CAP_CENTS_BELOW_USD = 10.0
+# тормоз прогона в core (Д11-R117, R118): блок run_brake ответа /health/llm — null (прогона нет; ключа нет — core старше
+# Д11) или ровно эти ключи (llm/brake.py BRAKE_KEYS core); причины — коды BRAKE_REASONS core
+BRAKE_KEYS = frozenset({"state", "reason", "avail_mib", "total_mib", "fail_mib", "swap_base_mib", "swap_growth_mib",
+                        "swap_grow_mib", "psi_full10", "psi_full_max", "oom_kills", "age_s", "halted_at"})
+BRAKE_STATES = frozenset({"watching", "halted"})
+BRAKE_REASON_WORDS = {"memory": "мало памяти", "swap": "растёт swap", "psi": "давление", "oom": "убийство по памяти",
+                      "blind": "память не читается"}
+# тормоз не проверял память дольше этого, с, — «молчит» (опрос core — 5 с: шесть пропусков подряд)
+RUN_BRAKE_SILENT_S = 30
+RUN_HALT_DETAIL = "прогон остановлен тормозом памяти — вызовы прогона получают отказ"
+RUN_BRAKE_SILENT_DETAIL = "тормоз прогона по памяти молчит — прогон без защиты"
 
 # строка «Шлюз и вход» (задача А1 Д5а, Д5-R29); счётчики /health/gateway — за час в памяти core
 GW_DOWN_DETAIL = "шлюз не отвечает"
@@ -670,9 +681,60 @@ class RunInfo:
 
 
 @dataclass(frozen=True)
+class BrakeInfo:
+    """Блок run_brake ответа /health/llm (Д11-R117): тормоз прогона в core — состояние, причина, замер и пороги. Замер
+    до первой проверки (и у молчащего датчика) — None."""
+    state: str
+    reason: str | None
+    avail_mib: int | None
+    total_mib: int | None
+    fail_mib: int
+    swap_base_mib: int | None
+    swap_growth_mib: int | None
+    swap_grow_mib: int
+    psi_full10: float | None
+    psi_full_max: float
+    oom_kills: int | None
+    age_s: float
+    halted_at: datetime | None
+
+    @classmethod
+    def parse(cls, obj) -> "BrakeInfo | None":
+        """null — прогона нет; объект — ровно BRAKE_KEYS, state и reason — из своих наборов и согласованы (halted ⇔
+        причина ⇔ время защёлки), числа не меньше нуля, пороги больше нуля; иначе ValueError, TypeError или KeyError."""
+        if obj is None:
+            return None
+        if not isinstance(obj, dict):
+            raise TypeError("run_brake — не объект JSON")
+        if set(obj) != BRAKE_KEYS:
+            raise ValueError("run_brake: ключи не по договору")
+
+        def count(key: str) -> int | None:
+            return None if obj[key] is None else _count(obj, key)
+
+        b = cls(state=_text(obj, "state"), reason=_text(obj, "reason", nullable=True), avail_mib=count("avail_mib"),
+                total_mib=count("total_mib"), fail_mib=_count(obj, "fail_mib"), swap_base_mib=count("swap_base_mib"),
+                swap_growth_mib=count("swap_growth_mib"), swap_grow_mib=_count(obj, "swap_grow_mib"),
+                psi_full10=_usd(obj, "psi_full10", nullable=True), psi_full_max=_usd(obj, "psi_full_max"),
+                oom_kills=count("oom_kills"), age_s=_usd(obj, "age_s"), halted_at=_time(obj, "halted_at"))
+        if b.state not in BRAKE_STATES:
+            raise ValueError("run_brake: неизвестное состояние")
+        if b.reason is not None and b.reason not in BRAKE_REASON_WORDS:
+            raise ValueError("run_brake: неизвестная причина")
+        if (b.state == "halted") != (b.reason is not None) or (b.reason is None) != (b.halted_at is None):
+            raise ValueError("run_brake: состояние, причина и время защёлки не согласованы")
+        numbers = (b.avail_mib, b.total_mib, b.swap_base_mib, b.swap_growth_mib, b.psi_full10, b.oom_kills, b.age_s)
+        if any(v is not None and v < 0 for v in numbers):
+            raise ValueError("run_brake: число меньше нуля")
+        if min(b.fail_mib, b.swap_grow_mib, b.psi_full_max) <= 0:
+            raise ValueError("run_brake: порог не больше нуля")
+        return b
+
+
+@dataclass(frozen=True)
 class LlmReply:
     """Поля ответа /health/llm, которые читает сторож; типы проверены при разборе. run — прогон отбора (Д8а):
-    ключа нет (core старше сторожа во время выкладки) или null — None."""
+    ключа нет (core старше сторожа во время выкладки) или null — None. run_brake — тормоз прогона (Д11а), так же."""
     checked_at: datetime | None
     stopped: bool
     config_error: str | None
@@ -702,6 +764,7 @@ class LlmReply:
     egress_last_ok_age_s: float | None
     refresh_started_age_s: float | None
     run: RunInfo | None = None
+    run_brake: BrakeInfo | None = None
 
     @classmethod
     def parse(cls, reply) -> "LlmReply":
@@ -728,7 +791,7 @@ class LlmReply:
             egress_alive=_flag(egress, "alive", nullable=True),
             egress_last_ok_age_s=_usd(egress, "last_ok_age_s", nullable=True),
             refresh_started_age_s=_usd(reply, "refresh_started_age_s", nullable=True),
-            run=RunInfo.parse(reply.get("run")))
+            run=RunInfo.parse(reply.get("run")), run_brake=BrakeInfo.parse(reply.get("run_brake")))
         if r.upstream_state not in UPSTREAM_STATES:
             raise ValueError("неизвестное состояние OpenRouter")
         if not r.upstream_text.strip():
@@ -773,15 +836,37 @@ def llm_note(r: LlmReply) -> str:
         parts.append("остаток счёта не виден")   # /credits не ответил; rejected — своя строка detail
     if r.drill:
         parts.append(f"учения DRILL_LLM={r.drill}")
+    if r.run_brake is not None:
+        parts.extend(_brake_note(r.run_brake))
     return " · ".join(parts)
+
+
+def _brake_note(b: BrakeInfo) -> list[str]:
+    """Части note о тормозе прогона (Д11-R118): числа замера и пороги, причина словами; порог выше всей памяти —
+    пометка учений (последней частью). Число без данных — «нет данных»."""
+    def pct(x: float) -> str:
+        return f"{round(x, 2):g}"
+
+    avail = "свободно: нет данных" if b.avail_mib is None else f"свободно {b.avail_mib} МиБ"
+    swap = "swap: нет данных" if b.swap_growth_mib is None else f"swap +{b.swap_growth_mib} МиБ от базы"
+    psi = "давление: нет данных" if b.psi_full10 is None else f"давление {pct(b.psi_full10)} %"
+    kills = "убийств: нет данных" if b.oom_kills is None else f"убийств {b.oom_kills}"
+    text = (f"тормоз: {avail} (порог {b.fail_mib}), {swap} (порог {b.swap_grow_mib}), {psi} (порог "
+            f"{pct(b.psi_full_max)}), {kills}")
+    if b.reason is not None:
+        text += f" — остановлен: {BRAKE_REASON_WORDS[b.reason]}"
+    parts = [text]
+    if b.total_mib is not None and b.fail_mib > b.total_mib:
+        parts.append(MEM_DRILL_NOTE)
+    return parts
 
 
 def llm_verdict(r: LlmReply, now: datetime, run_silent_s: float = LLM_RUN_SILENT_S) -> tuple[State, str]:
     """Первая подходящая строка таблицы задачи 7 Д4а: сбои, «неизвестно», прогон отбора (Д8-R69), деньги мимо
     учёта и провайдер, полосы бюджета — последними, чтобы полоса после $500 не прятала остальное.
 
-    Строки прогона — после fail и unknown (учения 402 и сбой OpenRouter их перекрывают), до errors: исчерпанный
-    потолок, затем тишина дольше run_silent_s. В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
+    Строки прогона — после fail и unknown (учения 402 и сбой OpenRouter их перекрывают), до errors: защёлка тормоза
+    прогона и его молчание дольше RUN_BRAKE_SILENT_S (Д11-R118), исчерпанный потолок, затем тишина дольше run_silent_s. В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
     """
     upstream_text = _reason(r.upstream_text)
     if r.stopped:
@@ -812,6 +897,11 @@ def llm_verdict(r: LlmReply, now: datetime, run_silent_s: float = LLM_RUN_SILENT
         return "unknown", "OpenRouter ещё ни разу не ответил на опрос"
     if (now - r.checked_at).total_seconds() > LLM_STALE_S:
         return "unknown", "LLM-прокси давно не опрашивал OpenRouter"
+    if r.run_brake is not None:                 # тормоз прогона (Д11-R118) — раньше потолка и тишины прогона
+        if r.run_brake.state == "halted":
+            return "warn", RUN_HALT_DETAIL
+        if r.run_brake.age_s > RUN_BRAKE_SILENT_S:
+            return "warn", RUN_BRAKE_SILENT_DETAIL
     if r.run is not None:
         if r.run.spent_usd >= r.run.cap_usd:
             return "warn", RUN_CAP_DETAIL

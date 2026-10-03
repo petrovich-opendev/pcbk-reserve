@@ -22,7 +22,8 @@ from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_K
                                   LLM_RUN_SILENT_S, RUN_CAP_DETAIL, RUN_KEYS, RUN_SILENT_DETAIL, LlmReply,
                                   DRILL_NOTE, FAILING_MAX, TOOL_FAILING_DETAIL, llm_note, llm_verdict,
                                   TEACHER_DETAILS, TEACHER_DRILL_MODES, TEACHER_KEYS, TEACHER_STUDENT_FAIL,
-                                  TeacherReply, check_teacher, teacher_verdict)
+                                  TeacherReply, check_teacher, teacher_verdict,
+                                  BRAKE_KEYS, RUN_BRAKE_SILENT_DETAIL, RUN_BRAKE_SILENT_S, RUN_HALT_DETAIL, BrakeInfo)
 from pcbk_watchdog import checks as checks_module
 from pcbk_watchdog.journal import Journal
 
@@ -869,12 +870,20 @@ def test_llm_junction_with_real_health_json(fake_core):                         
             # Д8а: LLM_RUN_* заданы (d8-test, $1, student-01 и ops), два вызова
             "run_active": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · по ключу OpenRouter $0.0024"
                            " · отбор и проверки $0.0012 · прогон d8-test: $0.0024 из $1.00, вызовов за 10 мин: 2"
-                           " · на счёте $30.00")}
+                           " · на счёте $30.00"),
+            # Д11а (А2): то же с тормозом прогона на двойниках /proc — свободно 8000 из 16000 МиБ, swap и давления нет
+            "run_active_brake": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · прогон d8-test: $0.0024 из"
+                                 " $1.00, вызовов за 10 мин: 2 · на счёте $30.00 · тормоз: свободно 8000 МиБ (порог"
+                                 " 1024), swap +0 МиБ от базы (порог 512), давление 0 % (порог 10), убийств 0")}
     assert set(samples) == set(want)
+    keys = set(llm_obj())
+    assert len(keys) == 32 and set(samples["run_active_brake"]) == keys        # образец Д11 — все 32 ключа (m-5 р3)
     for name, obj in samples.items():
-        # помощник тестов сторожа держит тот же договор, что и настоящий ответ: 31 ключ и вложенные
-        assert set(obj) == set(llm_obj()) and len(obj) == 31, name
+        # помощник тестов сторожа держит тот же договор, что и настоящий ответ: 32 ключа (без run_brake — «core старше
+        # Д11», 31) и вложенные
+        assert set(obj) in (keys, keys - {"run_brake"}) and len(obj) in (31, 32), name
         assert obj["run"] is None or set(obj["run"]) == RUN_KEYS, name
+        assert obj.get("run_brake") is None or set(obj["run_brake"]) == BRAKE_KEYS, name
         assert (set(obj["upstream"]), set(obj["egress"]), set(obj["shares"])) == \
                ({"state", "text", "since"}, {"alive", "last_ok_age_s"}, {"over_80", "spent"}), name
         at = datetime.fromisoformat(obj["checked_at"]) if obj["checked_at"] else T0
@@ -1831,3 +1840,99 @@ def test_teacher_drift_bounded_by_places(json_site):                            
            ("fail", "LLM-прокси считает доли не так, как сохранено", "мест: 10")       # все десять мест — по договору
     for drift in (11, 10 ** 4000):
         assert teacher_row(json_site, {**T_BASE, "shares_drift": drift}) == TEACHER_OFF, drift
+
+
+# --- тормоз прогона в строке «LLM-прокси и бюджет» (задача А2 Д11а, Д11-R118) ---
+
+BRAKE = {"state": "watching", "reason": None, "avail_mib": 8000, "total_mib": 16000, "fail_mib": 1024, "swap_base_mib": 0,
+         "swap_growth_mib": 0, "swap_grow_mib": 512, "psi_full10": 0.5, "psi_full_max": 10.0, "oom_kills": 0,
+         "age_s": 3.0, "halted_at": None}
+RUN_D11 = {"id": "d11-1012", "cap_usd": 33.0, "spent_usd": 1.0, "callers": 10, "calls_10m": 40, "idle_s": 2.0}
+
+
+@pytest.mark.parametrize("brake,want", [
+    (BRAKE, "ok"),
+    ({**BRAKE, "state": "halted", "reason": "psi", "psi_full10": 12.0, "halted_at": T0.isoformat()}, ("warn", RUN_HALT_DETAIL)),
+    ({**BRAKE, "age_s": 31.0}, ("warn", RUN_BRAKE_SILENT_DETAIL)),
+])
+def test_brake_rows_in_llm_line(brake, want):
+    r = LlmReply.parse(llm_obj(run=RUN_D11, run_brake=brake))
+    state, detail = llm_verdict(r, T0)
+    assert (state if want == "ok" else (state, detail)) == want and "тормоз: свободно" in llm_note(r)
+
+
+def test_brake_drill_note_and_contract():
+    r = LlmReply.parse(llm_obj(run=RUN_D11, run_brake={**BRAKE, "fail_mib": 1_000_000, "state": "halted",
+                                                       "reason": "memory", "halted_at": T0.isoformat()}))
+    assert llm_note(r).endswith("учения: порог выше всей памяти")
+    for bad in ({**BRAKE, "x": 1}, {**BRAKE, "state": "on"}, {**BRAKE, "reason": "dify"}, []):
+        with pytest.raises((KeyError, TypeError, ValueError)):
+            LlmReply.parse(llm_obj(run=RUN_D11, run_brake=bad))
+    assert LlmReply.parse({k: v for k, v in llm_obj().items() if k != "run_brake"}).run_brake is None
+    assert BRAKE_KEYS == set(BRAKE)
+
+
+def test_brake_details_fit_80_chars():
+    for d in (RUN_HALT_DETAIL, RUN_BRAKE_SILENT_DETAIL):
+        assert len(d) <= 80 and not any(ch.isdigit() for ch in d)
+
+
+# сверх брифа
+
+def test_brake_note_text_reasons_and_no_data():
+    r = LlmReply.parse(llm_obj(run=RUN_D11, run_brake={**BRAKE, "swap_growth_mib": 130, "psi_full10": 2.345}))
+    assert llm_note(r).endswith(" · тормоз: свободно 8000 МиБ (порог 1024), swap +130 МиБ от базы (порог 512),"
+                                " давление 2.35 % (порог 10), убийств 0")
+    words = {"memory": "мало памяти", "swap": "растёт swap", "psi": "давление", "oom": "убийство по памяти",
+             "blind": "память не читается"}
+    for reason, word in words.items():
+        halted = {**BRAKE, "state": "halted", "reason": reason, "halted_at": T0.isoformat()}
+        assert llm_note(LlmReply.parse(llm_obj(run=RUN_D11, run_brake=halted))).endswith(f"— остановлен: {word}")
+    silent = {**BRAKE, **dict.fromkeys(("avail_mib", "total_mib", "swap_base_mib", "swap_growth_mib", "psi_full10",
+                                         "oom_kills")), "age_s": 31.0}
+    note = llm_note(LlmReply.parse(llm_obj(run=RUN_D11, run_brake=silent)))
+    assert note.endswith("тормоз: свободно: нет данных (порог 1024), swap: нет данных (порог 512), давление: нет данных"
+                         " (порог 10), убийств: нет данных")
+    assert "учения" not in note                                                  # всей памяти не знаем — не учения
+
+
+@pytest.mark.parametrize("bad", [
+    {**BRAKE, "state": "halted"},                                                # защёлка без причины
+    {**BRAKE, "reason": "memory"},                                               # причина без защёлки
+    {**BRAKE, "state": "halted", "reason": "memory"},                            # без времени защёлки
+    {**BRAKE, "halted_at": T0.isoformat()},                                      # время без защёлки
+    {**BRAKE, "state": "halted", "reason": "dify", "halted_at": T0.isoformat()},  # причина не из кодов core
+    {**BRAKE, "avail_mib": -1}, {**BRAKE, "age_s": -0.1}, {**BRAKE, "fail_mib": 0}, {**BRAKE, "psi_full_max": 0},
+    {**BRAKE, "avail_mib": 1.5}, {**BRAKE, "oom_kills": True}, {**BRAKE, "age_s": "3"}, {**BRAKE, "psi_full10": float("nan")},
+    {**BRAKE, "halted_at": 5}, {k: v for k, v in BRAKE.items() if k != "age_s"},
+])
+def test_brake_off_contract(bad):
+    with pytest.raises((KeyError, TypeError, ValueError)):
+        BrakeInfo.parse(bad)
+
+
+def test_brake_rows_order():                                                     # после fail и unknown, раньше прогона
+    halted = {**BRAKE, "state": "halted", "reason": "oom", "halted_at": T0.isoformat()}
+    capped = {**RUN_D11, "spent_usd": 33.0, "idle_s": 999.0}
+    cases = [
+        (llm_obj(config_error="проба", run=capped, run_brake=halted), ("fail", "ошибка настройки: проба")),
+        (llm_obj(checked_at=None, run=capped, run_brake=halted), ("unknown", "OpenRouter ещё не опрашивался")),
+        (llm_obj(run=capped, run_brake=halted), ("warn", RUN_HALT_DETAIL)),
+        (llm_obj(run=capped, run_brake={**halted, "age_s": 99.0}), ("warn", RUN_HALT_DETAIL)),   # защёлка раньше молчания
+        (llm_obj(run=capped, run_brake={**BRAKE, "age_s": 99.0}), ("warn", RUN_BRAKE_SILENT_DETAIL)),
+        (llm_obj(run=capped, run_brake=BRAKE), ("warn", RUN_CAP_DETAIL)),
+        (llm_obj(run=RUN_D11, run_brake={**BRAKE, "age_s": float(RUN_BRAKE_SILENT_S)}), ("ok", "OpenRouter отвечает")),
+    ]
+    for obj, want in cases:
+        assert llm_verdict(LlmReply.parse(obj), T0) == want, obj
+    assert RUN_BRAKE_SILENT_S == 30
+
+
+def test_brake_through_check(fake_core):                                         # тот же договор по HTTP
+    halted = {**BRAKE, "state": "halted", "reason": "swap", "swap_growth_mib": 600, "halted_at": T0.isoformat()}
+    fake_core.set_llm(llm_obj(run=RUN_D11, run_brake=halted))
+    r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", T0, timeout=0.5)
+    assert (r.state, r.detail) == ("warn", RUN_HALT_DETAIL) and r.note.endswith("— остановлен: растёт swap")
+    fake_core.set_llm(llm_obj(run=RUN_D11, run_brake={**BRAKE, "state": "on"}))
+    r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", T0, timeout=0.5)
+    assert (r.state, r.detail) == ("fail", "LLM-прокси ответил не по договору")

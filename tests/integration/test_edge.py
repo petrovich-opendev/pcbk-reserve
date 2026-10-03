@@ -25,6 +25,8 @@ DECLARED_ENV = {                   # наши переменные сверх п
                   "DRILL_AGENTS",                                  # учения агентов студентов (Д7а, П10)
                   "DRILL_TEACHER",                                 # учения кабинета преподавателя (Д10а)
                   "LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS",  # прогон отбора модели (Д8-R69)
+                  # тормоз прогона (Д11-R117): пороги — вложенным умолчанием compose.yaml
+                  "LLM_RUN_MEM_FAIL_MIB", "LLM_RUN_SWAP_GROW_MIB", "LLM_RUN_SWAP_BASE_MIB", "LLM_RUN_PSI_FULL_MAX",
                   # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
                   # бюджет (учение «бюджет стенда израсходован», Д4б); обёртка запуска и двойник историана (Д8-R75)
                   "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD", "PYTHONPATH", "PCBK_TWIN_HISTORIAN"},

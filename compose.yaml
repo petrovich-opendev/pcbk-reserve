@@ -260,6 +260,13 @@ services:
       LLM_RUN_ID: ${LLM_RUN_ID:-}
       LLM_RUN_USD: ${LLM_RUN_USD:-}
       LLM_RUN_CALLERS: ${LLM_RUN_CALLERS:-}
+      # тормоз прогона (Д11): только при LLM_RUN_* core сам раз в 5 с читает /proc хоста и под защёлкой отказывает
+      # вызовам мест прогона и усыпляет их; пороги — свои, иначе пороги сторожа (MEM_FAIL_MIB, SWAP_GROW_WARN_MIB,
+      # PSI_FULL_MAX); база swap −1 — от первой проверки прогона. Пути к /proc здесь не задаются (двойники — compose.test.yaml)
+      LLM_RUN_MEM_FAIL_MIB: ${LLM_RUN_MEM_FAIL_MIB:-${MEM_FAIL_MIB:-1024}}
+      LLM_RUN_SWAP_GROW_MIB: ${LLM_RUN_SWAP_GROW_MIB:-${SWAP_GROW_WARN_MIB:-512}}
+      LLM_RUN_SWAP_BASE_MIB: ${LLM_RUN_SWAP_BASE_MIB:--1}
+      LLM_RUN_PSI_FULL_MAX: ${LLM_RUN_PSI_FULL_MAX:-${PSI_FULL_MAX:-10}}
       # шлюз (Д5а). STU_NET — те же сети мест, что ниже: по нему core сверяет токен места с его сетью
       # (Ш25) и зовёт место на STU.N.3; без него при нестандартной подсети отказ получило бы каждое место
       STU_NET: ${STU_NET:-172.31}

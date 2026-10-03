@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from helpers import (LLM_SETTINGS, LLM_TOKEN, LLM_TOKENS, OPS_LLM_TOKEN, SES, SETTINGS, auth, chat_body, make_llm_app,
-                     wait_until)
+                     make_llm_role, wait_until)
 from pcbk_core.app import create_app
 from pcbk_core.llm import RUN_BASE_KEY, RUN_WINDOW_S, LlmRole
 from pcbk_core.llm.api import LLM_MESSAGES, REFUSALS
@@ -343,3 +343,29 @@ def test_run_spec_from_replace_settings():
     from pcbk_core.settings import LlmSettings
     assert run_spec(replace(LlmSettings(), **RUN)) == RunSpec("d8-test", 0.002, frozenset({"student-01", "ops"}))
     assert run_spec(LlmSettings()) is None
+
+
+# --- тормоз прогона (Д11-R117) в цепочке отказов прогона ---
+
+def test_run_halted_before_run_spent_and_logged(tmp_path, fake_or):            # бюджет → тормоз → потолок → доля
+    app, role = make_llm_app(tmp_path, fake_or, **RUN)
+    with TestClient(app) as c:
+        post(c, chat_body()); post(c, chat_body())                                 # потолок прогона исчерпан
+        assert post(c, chat_body()).json()["error"]["code"] == "pcbk_run_spent"
+        role.brake.halt("memory")
+        r = post(c, chat_body(), token=OPS_LLM_TOKEN)                              # ops — вызывающий прогона
+        run = c.get("/health/llm").json()["run"]
+    assert (r.status_code, r.json()["error"]["code"]) == (402, "pcbk_run_halted") and len(fake_or.requests) == 2
+    row = role.ledger.recent(1)[0]
+    assert (row.status, row.code, row.http_status, row.caller, row.cost) == ("refused", "pcbk_run_halted", 402, "ops", 0.0)
+    assert run["calls_10m"] == 2                                                    # отказ — не вызов модели
+
+
+def test_run_brake_from_role_settings(tmp_path, fake_or):                       # пороги и пути — из LlmSettings
+    role = make_llm_role(tmp_path, fake_or, **RUN, LLM_RUN_MEM_FAIL_MIB=2048, LLM_RUN_SWAP_GROW_MIB=256,
+                         LLM_RUN_SWAP_BASE_MIB=100, LLM_RUN_PSI_FULL_MAX=7.5, LLM_RUN_MEMINFO="/x/m",
+                         LLM_RUN_VMSTAT="/x/v", LLM_RUN_PRESSURE="/x/p")
+    b = role.brake
+    assert (b.meminfo_path, b.vmstat_path, b.pressure_path, b.run_id) == ("/x/m", "/x/v", "/x/p", "d8-test")
+    assert (b.fail_mib, b.swap_grow_mib, b.swap_base_cfg, b.psi_full_max) == (2048, 256, 100, 7.5)
+    assert b.json(role.monotonic())["swap_base_mib"] == 100 and role.budget.halted() is False

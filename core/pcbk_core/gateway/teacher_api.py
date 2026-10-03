@@ -33,7 +33,8 @@ login=… reason=role» (одна на логин за ORIGIN_LOG_S), ни ме�
 /session/SES — 404 no_session; прочее не 200, не JSON, не по договору (transcript.TranscriptError) — 502 bad_answer.
 
 Пробуждение (R102, I-2) — обычный запуск места: та же задача Workplaces.wake, что у студента (touch, sp-ctl start,
-_await_ready, крючок готовности и карантин), своих запросов к месту у кабинета нет.
+_await_ready, крючок готовности и карантин), своих запросов к месту у кабинета нет. Место прогона под защёлкой тормоза
+core (Д11-R117) — 503 Unavailable run_halted, как у студента.
 
 Доли (R104): роли llm нет — 503 no_llm; доли не загружены или журнал вызовов не открыт — 503 shares_down без записи и
 без строки журнала (иначе пол был бы 0, ревью А2 m-2); тело не по форме (повтор или лишний ключ) — 400 bad_body; затем
@@ -71,7 +72,7 @@ from ..teacher_log import TeacherLogError
 from .accounts import NOTICE, Account, StoreError, login_key
 from .api import (ERROR_NAMES, GW_MESSAGES, PREFIX, GatewayRefusal, _RolledLines, _unique_keys, configured,
                   current_account, front_only, gw_error, origin_checked)
-from .places import PLACES, TEACHER_PARALLEL, PlaceAnswer, PlaceAnswerTooLarge
+from .places import PLACES, TEACHER_PARALLEL, PlaceAnswer, PlaceAnswerTooLarge, WakeRefused
 from .proxy import PLACE_LIST_MAX_BYTES, PROXY_DEADLINE_S, PROXY_MESSAGES, UPSTREAM_MAX_BYTES
 from .rules import ID_RE
 from .transcript import TranscriptError, sessions_view, transcript
@@ -560,7 +561,10 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
         if (refused := await cab.journal(call)) is not None:
             return refused
         # обычный запуск места — та же задача, что у студента (I-2): атрибут читается при вызове
-        view = await role.workplaces.wake(call.place)
+        try:
+            view = await role.workplaces.wake(call.place)
+        except WakeRefused:                         # тормоз прогона (Д11-R117)
+            return _fail_text(call, 503, ERROR_NAMES[503], GW_MESSAGES["run_halted"], "run_halted")
         return _ok(call, view.to_json(), status=202)
 
     async def read(account: Account, nn: str, ses: str | None) -> Response:

@@ -459,8 +459,9 @@ def test_health_json_keys_and_no_secrets(tmp_path, fake_or):
                              "total_usd", "ops_usd", "shares", "pending", "pending_stuck", "cost_unknown_24h",
                              "provider_mismatch_24h", "account_remaining_usd", "models",
                              "ledger_queue", "ledger_fresh", "ledger_reset", "egress", "refresh_started_age_s",
-                             "run"}                                              # Д8-R69: 31 ключ
-    assert len(r.json()) == 31 and r.json()["run"] is None                      # без LLM_RUN_* прогона нет
+                             "run", "run_brake"}                                 # Д8-R69, Д11-R117: 32 ключа
+    assert len(r.json()) == 32 and r.json()["run"] is None                      # без LLM_RUN_* прогона нет
+    assert r.json()["run_brake"] is None                                        # и тормоза прогона нет
     assert r.json()["egress"] == {"alive": None, "last_ok_age_s": None}        # в pytest потока обновления нет
     assert (r.json()["refresh_started_age_s"], r.json()["ledger_error"]) == (None, None)
     assert set(r.json()["upstream"]) == {"state", "text", "since"}
