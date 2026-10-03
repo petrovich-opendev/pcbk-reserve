@@ -33,6 +33,11 @@ your max_price», max_price в теле нет — обычный ответ).
 персонами сначала спрашивает bench_answer; None — дальше прежняя логика слов. Провайдер ответа — по закреплённой
 точке запроса (provider.only, PROVIDER_NAMES: «google-vertex/global» → «Google Vertex»); без точки или с чужой —
 «Fireworks», как раньше; слово FAKEPROVIDER сильнее точки — «Together».
+
+Нагрузка (Д11б, Б2): POST /_delay {"s": x} — 204, каждый следующий вызов чата (верный ключ и тело) идёт не меньше x
+секунд (0 ≤ x ≤ DELAY_MAX_S, иначе 400): у потока — после заголовков и комментария «: OPENROUTER PROCESSING», как
+долгая модель, у ответа без потока — до него; DELETE /_delay — 204, задержки нет. Ход двойника длится, и тормоз
+прогонщика останавливает его посреди хода; ответы-ошибки до потока (ERRORS, FAKEDRIP, FAKEFLAKY) задержку не ждут.
 """
 import json
 import re
@@ -81,6 +86,7 @@ def save_args(name: str) -> dict:
 MID_ERRORS = {"FAKEMIDERR": (502, "Provider returned error"), "FAKEMID402": (402, "Insufficient credits"),
               "FAKEMIDSTR": ("server_error", "Provider returned error")}      # error.code строкой
 DRIP_EVERY_S = 0.2                      # FAKEDRIP: 502, тело ошибки по байту — около 14 с
+DELAY_MAX_S = 60.0                      # POST /_delay: задержка вызова чата не больше (Д11б)
 ERRORS = {   # слово → (код, текст, metadata, Retry-After)
     "FAKE402": (402, "Insufficient credits. Add more using https://openrouter.ai/settings/credits", None, None),
     "FAKE402INFLIGHT": (402, "Too many requests in flight for this key's budget, retry shortly",
@@ -110,6 +116,7 @@ class State:
         self.gen_cost: dict[str, float] = {}     # id → своя цена /generation (FAKEDEAR), иначе GENERATION_COST
         self.flaky = 0
         self.personas: dict[str, str] = {}      # стенд отбора: модель → персона fake_bench (POST /_bench)
+        self.delay_s = 0.0                      # нагрузка: задержка каждого вызова чата (POST /_delay, Д11б)
 
 
 def _text(content: object) -> str:
@@ -279,6 +286,10 @@ class Handler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.personas = {}
             return self._no_content()
+        if path == "/_delay":
+            with self.state.lock:
+                self.state.delay_s = 0.0
+            return self._no_content()
         return self._error(404, "Not Found")
 
     def do_POST(self):
@@ -308,6 +319,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "need {personas: {model: " + "|".join(sorted(PERSONA_NAMES)) + "}}")
             with self.state.lock:
                 self.state.personas = dict(personas)
+            return self._no_content()
+        if path == "/_delay":
+            s = payload.get("s")
+            if isinstance(s, bool) or not isinstance(s, (int, float)) or not 0 <= s <= DELAY_MAX_S:
+                return self._error(400, f"need {{s: 0..{DELAY_MAX_S:g}}}")
+            with self.state.lock:
+                self.state.delay_s = float(s)
             return self._no_content()
         return self._error(404, "Not Found")
 
@@ -390,6 +408,7 @@ class Handler(BaseHTTPRequestHandler):
         slow = word in ("FAKESLOW", "FAKESLOWSTART") or (word == "FAKESAVESLOW" and finish == "stop"
                                                           and bool(_tool_names(body)))
         if body.get("stream") is not True:
+            self._delay()
             reply = {"id": gen, "object": "chat.completion", "created": int(time.time()), "model": body.get("model"),
                      "provider": provider, "choices": [{"index": 0, "message": message, "finish_reason": finish}]}
             if with_usage:
@@ -411,6 +430,13 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(DRIP_EVERY_S)
         except OSError:
             pass                                # клиент бросил чтение по своему сроку
+
+    def _delay(self) -> None:
+        """Задержка вызова чата (POST /_delay, Д11б): спит, сколько велено сейчас."""
+        with self.state.lock:
+            delay = self.state.delay_s
+        if delay > 0:
+            time.sleep(delay)
 
     def _charge(self, key: str, cost: float) -> None:
         with self.state.lock:
@@ -439,6 +465,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.end_headers()
             send(b": OPENROUTER PROCESSING\n\n")
+            self._delay()                           # долгая модель (Д11б): заголовки уже ушли, ответа ещё нет
             if word in ("FAKEBREAK", *MID_ERRORS):
                 send(chunk({"role": "assistant", "content": "Начало ответа"}))
                 if word != "FAKEBREAK":

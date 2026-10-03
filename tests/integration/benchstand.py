@@ -15,6 +15,16 @@
   со своим клиентом шлюза учётки места и StackStand; prepare() — вход, пробуждение, агент проверки bench-calc;
   cleanup() закрывает и его (агент — в архив), если тест не закрыл сам.
 - agents_left(stack, places) — имена живых (не archived) агентов мест по порядку мест.
+- Нагрузка (Д11б, Б2; Д11-R119, R120): BenchHarness(stack, tmp, places, config=…, login=…) — конфиг прогонщика
+  (bench/config.load.twin.json) и вид учёток (d11-probe-load-NN — пробные, место освобождается); у конфига нагрузки
+  recreate_core выставляет пороги тормоза core LLM_RUN_* ровно по полям базы окна конфига (brake_env; null — умолчание
+  компоновки) и ждёт их в /health/llm — иначе прогонщик откажет RunRefused("run_limits"). delay(s) — задержка каждого
+  вызова чата двойника OpenRouter (POST /_delay; 0 — DELETE), уборка её снимает. settle() — между учениями тормоза:
+  агенты, оставшиеся от оборванных ходов (кроме bench-uzel), — в архив, очередь перезагрузки мест пуста (места, где
+  такие были, — списком, для журнала). StackStand режима нагрузки:
+  sleep_places — docker stop мест одной командой (как ServerStand), dify_swap_mib — файл двойника dify-swap (нет,
+  пусто или не число — StandError: слепота, не ноль), load_check — LOAD_CHECK_PY изнутри pcbk-core, с out — и цена
+  реплики OUT/price.json (load.write_price).
 - BenchHarness.judge_and_table(out) (Б3) — таблица отбора по OUT после вердиктов судьи: table.build (check_verdicts,
   aggregate с load_tag_units(out) и планом конфига прогона OUT); Markdown и table.json — в OUT, копия Markdown — в
   PCBK_TABLES (twin-table.md, каталог $JOB), снимок страницы проверки с этим Markdown — PCBK_SHOTS/twin-table.png
@@ -23,7 +33,8 @@
 Уборка (cleanup, решение контроллера П2 — порядок test_agents.py): прогонщики закрыты → персоны выключены → учётки
 disable (до этого — пробуждение работающих мест с агентами: архив перезагружает только готовое место) → агенты мест — в
 архив, пока места работают → очередь перезагрузки мест пуста → места без переопределения и остановлены
-(create --force-recreate, тома не трогаются) → учётки remove → release-place → core и сторож — значения test.env.
+(create --force-recreate, тома не трогаются) → учётки remove → release-place → core и сторож — значения test.env (у
+core — и пороги тормоза LLM_RUN_* как без переменных). Задержка двойника OpenRouter снимается вместе с персонами.
 Каждый шаг смотрит на состояние стенда и идемпотентен; сбой шага не обрывает остальные — первый сбой поднимается в
 конце.
 
@@ -50,11 +61,13 @@ from fake_bench import PERSONAS                                   # core/tests �
 from pcbk_bench.cards import CardSet, load_cards
 from pcbk_bench.config import BenchConfig, load_config
 from pcbk_bench.gateway import GatewayChat
+from pcbk_bench.load import LOAD_CHECK_PY, write_price
 from pcbk_bench.match import Case, MatchRunner
 from pcbk_bench.override import render_override
 from pcbk_bench.record import RunRecord
 from pcbk_bench.runner import Runner, load_records
-from pcbk_bench.stand import AGENT_ROWS_PY, DATA_TOOLS, LLM_ROWS_PY
+from pcbk_bench.scenarios import BENCH_AGENT
+from pcbk_bench.stand import AGENT_ROWS_PY, DATA_TOOLS, LLM_ROWS_PY, SLEEP_STOP_S, StandError
 from pcbk_bench.table import ModelRow, build, render_markdown
 
 CONFIG = REPO / "bench" / "config.twin.json"
@@ -69,6 +82,9 @@ SILENT_DEFAULT = "300"
 MCP_WAIT_S = 90                     # места переподключают MCP после пересоздания core не сразу (test_conversation)
 PLACE_READY_S = 120
 DRAIN_S = 60                        # очередь перезагрузки мест после архива
+# воркер перезагрузки проходит места по одному (простой 3 с, dispose до 5 с, проверка видимости), а место, поднятое
+# docker start, шлюз видит готовым не сразу: десяти местам нагрузки (Д11б) 60 с мало — срок растёт с числом мест
+DRAIN_PER_PLACE_S = 15
 WAKE_S = 120
 # строки очереди перезагрузки мест (argv) — изнутри pcbk-core, только чтение: истина об очереди (QUEUED_PY test_agents)
 QUEUED_PY = ("import sqlite3, sys; "
@@ -87,12 +103,29 @@ TWIN_WHITELIST_PY = "from twin_historian import bench_whitelist; print('\\n'.joi
 # строка страницы состояния с этим заголовком (title строки status.json, %s — JSON) — в середину экрана (для снимка)
 ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
                     "&& e.textContent.trim() === %s).scrollIntoView({block: 'center'}), 1")
+# пороги тормоза core (Д11-R117) по полям базы окна конфига нагрузки: поле конфига → переменная core → ключ run_brake
+# /health/llm (так их сверяет прогонщик, доводка р1 Б1, m-3)
+BRAKE_ENV = (("mem_fail_mib", "LLM_RUN_MEM_FAIL_MIB", "fail_mib"),
+             ("swap_base_mib", "LLM_RUN_SWAP_BASE_MIB", "swap_base_mib"),
+             ("swap_grow_mib", "LLM_RUN_SWAP_GROW_MIB", "swap_grow_mib"),
+             ("psi_full_max", "LLM_RUN_PSI_FULL_MAX", "psi_full_max"))
+BRAKE_READY_S = 30                  # первая проверка тормоза core после старта — раз в 5 с
+FAKE_DELAY_PATH = "/_delay"         # задержка вызовов чата двойника OpenRouter (Д11б)
+PLACE_NAME_RE = re.compile(r"student-\d{2}")
 
 
 def bench_env(run_id: str, cap: float, places: Iterable[int]) -> dict[str, str]:
     """LLM_RUN_* core на время прогона (Д8-R69): id, потолок, места прогона через запятую."""
     return {"LLM_RUN_ID": run_id, "LLM_RUN_USD": str(float(cap)),
             "LLM_RUN_CALLERS": ",".join(f"student-{n:02d}" for n in sorted(places))}
+
+
+def brake_env(cfg: BenchConfig) -> dict[str, str]:
+    """Пороги тормоза core LLM_RUN_* — ровно поля базы окна конфига нагрузки (Д11-R119); поле null — переменной нет
+    (умолчание компоновки), вне нагрузки — пусто."""
+    if not cfg.load:
+        return {}
+    return {var: str(getattr(cfg, field)) for field, var, _ in BRAKE_ENV if getattr(cfg, field) is not None}
 
 
 def _env_of(stack: Stack, name: str) -> dict[str, str]:
@@ -173,18 +206,57 @@ class StackStand:
         since = self.stack.started_at("pcbk-core")
         return "mcp=connected" in self.stack.health_output(f"pcbk-student-{place:02d}", since)
 
+    # --- режим нагрузки (Д11-R119, R120) ---
+
+    def sleep_places(self, places: list[int]) -> None:
+        """docker stop мест одной командой, срок -t SLEEP_STOP_S (как ServerStand); остановленное место — не ошибка."""
+        if any(isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 10 for n in places):
+            raise StandError("место: 1…10")
+        names = [f"pcbk-student-{n:02d}" for n in places]
+        if names:
+            _run(["docker", "stop", "-t", str(SLEEP_STOP_S), *names])
+
+    def dify_swap_mib(self) -> int:
+        """swap Dify двойника, МиБ: файл dify-swap каталога двойников памяти (Stack.set_dify_swap). Нет файла, пусто
+        или не целое — StandError: нечитаемое — слепота сторожа памяти прогонщика, а не ноль (как у ServerStand)."""
+        try:
+            text = (self.stack.mem_dir / "dify-swap").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            raise StandError("swap Dify: файл двойника не читается") from None
+        if not text.isdecimal():
+            raise StandError("swap Dify: в файле двойника не целое МиБ")
+        return int(text)
+
+    def load_check(self, callers: list[str], since: str, until: str, out: Path | None = None) -> dict:
+        """Числа нагрузки за [since, until] (LOAD_CHECK_PY изнутри pcbk-core, только чтение); с out — и цена реплики
+        в OUT/price.json (load.write_price), как у ServerStand."""
+        if not all(isinstance(c, str) and PLACE_NAME_RE.fullmatch(c) for c in callers):
+            raise StandError("load_check: вызывающие — student-NN")
+        numbers = json.loads(self.stack.exec("pcbk-core", "python", "-c", LOAD_CHECK_PY, json.dumps(list(callers)),
+                                             since, until))
+        if not isinstance(numbers, dict):
+            raise StandError("load_check: ответ — не объект")
+        if out is not None:
+            numbers["price"] = write_price(Path(out))
+        return numbers
+
 
 class BenchHarness:
     """Режим отбора на двойниках тестового стенда и его уборка (см. шапку модуля). start() — подъём режима, cleanup() —
-    уборка; поля stack, tmp, cards, runner (прогонщик фикстуры, OUT — tmp/out), stand (StackStand)."""
+    уборка; поля stack, tmp, cards, runner (прогонщик фикстуры, OUT — tmp/out), stand (StackStand). config — конфиг
+    прогонщика (по умолчанию bench/config.twin.json; Д11б — config.load.twin.json), login — вид учёток мест ({n:02d};
+    пробный, под PROBE_LOGIN core — release-place освобождает место)."""
 
-    def __init__(self, stack: Stack, tmp: Path, places: Mapping[int, str]):
+    def __init__(self, stack: Stack, tmp: Path, places: Mapping[int, str], *, config: Path = CONFIG,
+                 login: str = PROBE_LOGIN):
         self.stack = stack
         self.tmp = Path(tmp)
         self.places = dict(sorted(places.items()))
-        cfg = load_config(CONFIG, OPENCODE_JSON)
+        cfg = load_config(config, OPENCODE_JSON)
         if cfg.places != self.places:
-            raise ValueError("места модуля — не места bench/config.twin.json (m4)")
+            raise ValueError(f"места модуля — не места {Path(config).name} (m4)")
+        self._login = login
+        self.drain_s = max(DRAIN_S, DRAIN_PER_PLACE_S * len(self.places))     # Д8: 4 места — 60 с, как было
         self.cfg: BenchConfig = replace(cfg, out_dir=self.tmp / "out")
         self.cards: CardSet = load_cards(self.cfg.cards)
         self.stand = StackStand(stack)
@@ -198,7 +270,7 @@ class BenchHarness:
     # --- имена ---
 
     def login(self, n: int) -> str:
-        return PROBE_LOGIN.format(n=n)
+        return self._login.format(n=n)
 
     def _container(self, n: int) -> str:
         return f"pcbk-student-{n:02d}"
@@ -209,8 +281,9 @@ class BenchHarness:
     # --- подъём режима отбора ---
 
     def start(self) -> None:
-        """1) core — двойник историана, белый список отбора и прогон cfg (run_id, cap); сторож — порог тишины SILENT_S;
-        2) персоны двойника OpenRouter, места с переопределением модели; 3) учётки d8-probe-bench-NN и прогонщик."""
+        """1) core — двойник историана, белый список отбора и прогон cfg (run_id, cap; у нагрузки — и пороги тормоза);
+        сторож — порог тишины SILENT_S; 2) персоны двойника OpenRouter, места с переопределением модели; 3) учётки
+        мест (login) и прогонщик."""
         self.data_dir = bench_data(self.tmp)
         self.recreate_core(self.cfg.run_id, self.cfg.cap_usd)
         twin = self.stack.exec("pcbk-core", "python", "-c", TWIN_WHITELIST_PY).split()
@@ -236,20 +309,41 @@ class BenchHarness:
         if code != 204:
             raise RuntimeError(f"двойник OpenRouter: /_bench — код {code}")
 
+    def delay(self, s: float) -> None:
+        """Задержка каждого вызова чата двойника OpenRouter, с (Д11б): больше нуля — POST /_delay {"s": s}, 0 — DELETE
+        /_delay (задержки нет); 204."""
+        if s:
+            code, _ = self.stack.http_host("POST", FAKE_OPENROUTER_URL + FAKE_DELAY_PATH, {"s": s})
+        else:
+            code, _ = self.stack.http_host("DELETE", FAKE_OPENROUTER_URL + FAKE_DELAY_PATH)
+        if code != 204:
+            raise RuntimeError(f"двойник OpenRouter: {FAKE_DELAY_PATH} — код {code}")
+
     def _wait_mcp(self) -> None:
         """mcp=connected у работающих мест модуля после старта core (≤ MCP_WAIT_S)."""
         running = [n for n in self.places if self.stack.inspect(self._container(n))["State"]["Running"]]
         wait_for(lambda: all(self.stand.place_mcp_ok(n) for n in running), MCP_WAIT_S)
 
     def recreate_core(self, run_id: str, cap: float, extra: Mapping[str, str] | None = None) -> None:
-        """core с двойником историана, белым списком отбора и прогоном run_id с потолком cap; extra — ещё переменные
-        core поверх (Д9а: {"DRILL_DATA": "tool_error"}); следующий вызов без extra их снимает — компоновка берёт
-        умолчания. Затем mcp=connected у работающих мест модуля."""
+        """core с двойником историана, белым списком отбора и прогоном run_id с потолком cap; у конфига нагрузки — и
+        пороги тормоза по полям базы окна (brake_env), затем ожидание их чисел в run_brake /health/llm (до первой
+        проверки тормоза их нет — прогонщик отказал бы run_limits); extra — ещё переменные core поверх (Д9а:
+        {"DRILL_DATA": "tool_error"}); следующий вызов без extra их снимает — компоновка берёт умолчания. Затем
+        mcp=connected у работающих мест модуля."""
         if self.data_dir is None:
             self.data_dir = bench_data(self.tmp)
         self.stack.recreate("core", {"PCBK_TWIN_HISTORIAN": TWIN_FIXTURE, "DATA_DIR": str(self.data_dir),
-                                     **bench_env(run_id, cap, self.places), **dict(extra or {})})
+                                     **bench_env(run_id, cap, self.places), **brake_env(self.cfg),
+                                     **dict(extra or {})})
+        if self.cfg.load:
+            wait_for(self._brake_numbers, BRAKE_READY_S)
         self._wait_mcp()
+
+    def _brake_numbers(self) -> bool:
+        """В run_brake /health/llm есть числа порогов, которые сверяет прогонщик, и возраст проверки."""
+        brake = self.stack.llm_health().get("run_brake")
+        return isinstance(brake, dict) and all(isinstance(brake.get(key), (int, float))
+                                               for key in ("age_s", *(k for _, _, k in BRAKE_ENV)))
 
     def _chat(self, n: int) -> GatewayChat:
         account = {"login": self.login(n), "password": self._pw[n]}             # как connect() CLI стенда
@@ -294,9 +388,30 @@ class BenchHarness:
             found += [self.stack.password(n), self.stack.llm_token(n), self.stack.data_token(n)]
         return [*found, Secret(TEST_OPS_DATA_TOKEN)]
 
-    def queued(self) -> int:
-        """Строки очереди перезагрузки агентов у мест модуля."""
-        return int(self.stack.exec("pcbk-core", "python", "-c", QUEUED_PY, *map(str, self.places)))
+    def queued(self, places: Iterable[int] | None = None) -> int:
+        """Строки очереди перезагрузки агентов у мест модуля (или у мест places)."""
+        ps = self.places if places is None else places
+        return int(self.stack.exec("pcbk-core", "python", "-c", QUEUED_PY, *map(str, ps)))
+
+    def settle(self) -> list[int]:
+        """Между учениями нагрузки (Д11б): жёсткая остановка рвёт ход, а агент, сохранённый посреди оборванного хода,
+        в записи прогона не остаётся (Д8 m-р4-3) и живёт на месте — следующая подготовка отказала бы place_agents
+        (R121); агенты, которых прогонщик архивировал при спящем месте, держат место в очереди перезагрузки. Такие
+        агенты (кроме bench-uzel) — в архив, места с ними и с очередью работают (спящее — docker start), очередь пуста
+        (≤ drain_s). Возвращает места, где были такие агенты."""
+        strays = {n: [r["name"] for r in _agent_rows(self.stack, n) if r.get("name") != BENCH_AGENT]
+                  for n in self.places}
+        strays = {n: names for n, names in strays.items() if names}
+        busy = sorted(set(strays) | {n for n in self.places if self.queued([n])})
+        for n in busy:
+            if not self._running(n):
+                self.stack.start(self._container(n))
+        for n, names in strays.items():
+            for name in names:
+                self.stack.agents_admin("archive", "--place", str(n), "--name", name, "--yes")
+        if busy:
+            wait_for(lambda: self.queued() == 0, self.drain_s)
+        return sorted(strays)
 
     def judge_and_table(self, out: Path) -> list[ModelRow]:
         """Таблица отбора по OUT (Б3): table.build — check_verdicts, aggregate с load_tag_units(out) и планом конфига
@@ -400,7 +515,7 @@ class BenchHarness:
             raise errors[0]
 
     def _archive(self) -> None:
-        """Агенты мест — в архив, пока места работают; затем очередь перезагрузки мест пуста (≤ DRAIN_S). Место без
+        """Агенты мест — в архив, пока места работают; затем очередь перезагрузки мест пуста (≤ drain_s). Место без
         агентов не трогается: archive ставит место в очередь и без агентов, а спящее место её не снимет."""
         for n in self.places:
             if not self._has_agents(n):
@@ -408,7 +523,7 @@ class BenchHarness:
             if not self._running(n):
                 self.stack.start(self._container(n))
             self.stack.agents_admin("archive", "--place", str(n), "--yes")
-        wait_for(lambda: self.queued() == 0, DRAIN_S)
+        wait_for(lambda: self.queued() == 0, self.drain_s)
 
     def _places_plain(self) -> None:
         """Места без переопределения и остановлены: stop, затем create --force-recreate (тома не трогаются)."""
@@ -439,12 +554,14 @@ class BenchHarness:
 
     def _core_plain(self) -> None:
         """core и сторож — значения test.env ({}), если ещё нет: прогона, двойника историана, белого списка отбора,
-        учения службы данных (Д9а) и короткого порога тишины нет."""
+        учения службы данных (Д9а), своих порогов тормоза (Д11б) и короткого порога тишины нет."""
         env = _env_of(self.stack, "pcbk-core")
         mounts = {m["Destination"]: m["Source"] for m in self.stack.inspect("pcbk-core")["Mounts"]}
         whitelist = str(Path(self.stack.test_env()["DATA_DIR"]) / "whitelist.txt")
+        plain = self.stack.compose_config({})["services"]["core"]["environment"]
         if any(env.get(k) for k in ("LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS", "PCBK_TWIN_HISTORIAN",
                                     "DRILL_DATA")) \
+                or any(env.get(var) != plain.get(var) for _, var, _ in BRAKE_ENV) \
                 or mounts.get("/app/data/whitelist.txt") != whitelist:
             self.stack.recreate("core", {})
         if _env_of(self.stack, "pcbk-watchdog").get("LLM_RUN_SILENT_S") != SILENT_DEFAULT:
@@ -453,8 +570,8 @@ class BenchHarness:
     def cleanup(self) -> None:
         """Уборка по README (порядок — П2, см. шапку модуля); идемпотентна. Сбой шага не обрывает следующих."""
         errors: list[BaseException] = []
-        for step in (self._close_runners, lambda: self._bench(on=False), self._disable, self._archive,
-                     self._places_plain, self._release, self._core_plain):
+        for step in (self._close_runners, lambda: self._bench(on=False), lambda: self.delay(0), self._disable,
+                     self._archive, self._places_plain, self._release, self._core_plain):
             try:
                 step()
             except Exception as exc:                # noqa: BLE001 — уборка идёт дальше, первый сбой — в конце
@@ -514,4 +631,4 @@ def markdown_page(text: str) -> str:
             f"<style>{PAGE_CSS}</style></head><body>{''.join(out)}</body></html>")
 
 
-__all__ = ["BenchHarness", "StackStand", "agents_left", "bench_env", "markdown_page"]
+__all__ = ["BRAKE_ENV", "BenchHarness", "StackStand", "agents_left", "bench_env", "brake_env", "markdown_page"]
