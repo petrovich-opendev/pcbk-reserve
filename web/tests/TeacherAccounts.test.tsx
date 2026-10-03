@@ -233,3 +233,23 @@ test("login_rule_same_as_gateway_accounts", () => {
   expect(["ab", "a" + "b".repeat(32), "-abc", "1abc", "Abc", "ab c", "abc\n", "абв"].map(isLogin))
     .toEqual([false, false, false, false, false, false, false, false]);
 });
+
+test("journal_shows_account_actions_in_words", async () => {
+  // строки учёток журнала действий (R108: target — логин, у account_add — и место) — словами, а не кодом действия
+  const rows = { rows: [
+    { id: 2, at: "2026-10-11T09:05:00+00:00", login: "t", action: "account_disable", place: null, target: "stu-03",
+      outcome: "ok" },
+    { id: 1, at: "2026-10-11T09:04:00+00:00", login: "t", action: "account_add", place: "04", target: "d10-probe-n",
+      outcome: "ok" },
+  ] };
+  const a = teacherApi({ overview: [200, OVERVIEW_FREE_04], journal: [200, rows] });
+  const { container } = render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
+  await waitFor(() => expect(container.querySelectorAll(".journal li")).toHaveLength(2));
+  const items = [...container.querySelectorAll(".journal li")].map((li) => li.textContent!.replace(/\s/g, " "));
+  expect(items[1]).toContain("завёл учётку студента");
+  expect(items[1]).toContain("место 04");
+  expect(items[1]).toContain("выполнено");
+  expect(items[1]).not.toContain("account_add");
+  expect(items[0]).toContain("отключил учётку");
+  expect(items[0]).not.toContain("account_disable");
+});
