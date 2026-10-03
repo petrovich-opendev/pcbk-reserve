@@ -125,6 +125,19 @@ def test_own_core_oom_after_restart_counts(tmp_path):                       # б
     assert (again.halted, again.reason) == (True, "oom")
 
 
+def test_swap_base_survives_restart(tmp_path):                             # ревью А2, I-1: база swap — из llm_meta
+    clock = FakeMono(100.0)
+    b, mi, vm, ps, led = make(tmp_path, clock)
+    b.check()                                                              # база swap 0
+    mi.write_text(MEM.format(5000 * 1024, 4194304 - 300 * 1024)); clock.advance(3600)
+    again = RunBrake((str(mi), str(vm), str(ps)), (1024, 512, -1, 10.0), meta=led, run_id="d11-test",
+                     monotonic=clock, wallclock=lambda: NOW, started_mono=clock())   # core перезапущен при swap 300
+    again.check(); mi.write_text(MEM.format(5000 * 1024, 4194304 - 600 * 1024))
+    for _ in range(3):
+        clock.advance(700); again.check()                                  # за 10 мин — меньше порога
+    assert (again.halted, again.reason, again.json(clock())["swap_base_mib"]) == (True, "swap", 0)
+
+
 def test_latch_flushed_before_return(tmp_path):                           # m-1 р3: защёлка на диске сразу
     clock = FakeMono(100.0)
     b, *_ = make(tmp_path, clock)
