@@ -11,6 +11,9 @@
   (render_override), учётки d8-probe-bench-NN, прогонщики (runner_for), снимок страницы состояния со строкой
   компонента (shot; Д9а — строка «Историан БДРВ» под учением). recreate_core(…, extra=…) — ещё переменные core поверх
   режима отбора (Д9а: учение DRILL_DATA).
+- BenchHarness.match_runner(place, cases, out) (Д9б, Б2) — прогонщик «агент = калькулятор» (pcbk_bench.match) места
+  со своим клиентом шлюза учётки места и StackStand; prepare() — вход, пробуждение, агент проверки bench-calc;
+  cleanup() закрывает и его (агент — в архив), если тест не закрыл сам.
 - agents_left(stack, places) — имена живых (не archived) агентов мест по порядку мест.
 - BenchHarness.judge_and_table(out) (Б3) — таблица отбора по OUT после вердиктов судьи: table.build (check_verdicts,
   aggregate с load_tag_units(out) и планом конфига прогона OUT); Markdown и table.json — в OUT, копия Markdown — в
@@ -47,6 +50,7 @@ from fake_bench import PERSONAS                                   # core/tests �
 from pcbk_bench.cards import CardSet, load_cards
 from pcbk_bench.config import BenchConfig, load_config
 from pcbk_bench.gateway import GatewayChat
+from pcbk_bench.match import Case, MatchRunner
 from pcbk_bench.override import render_override
 from pcbk_bench.record import RunRecord
 from pcbk_bench.runner import Runner, load_records
@@ -186,7 +190,7 @@ class BenchHarness:
         self.stand = StackStand(stack)
         self.override = self.tmp / "compose.bench.yaml"
         self._pw = {n: Secret(secrets.token_urlsafe(18)) for n in self.places}
-        self._runners: list[Runner] = []
+        self._runners: list[Runner | MatchRunner] = []        # закрывает cleanup(); close() у обоих идемпотентен
         self._cfgs: dict[Path, BenchConfig] = {}              # конфиг прогонщика по OUT — для таблицы (Б3)
         self.runner: Runner | None = None
         self.data_dir: Path | None = None
@@ -257,6 +261,15 @@ class BenchHarness:
         cfg = replace(self.cfg, out_dir=Path(out_dir), **cfg_overrides)
         self._cfgs[Path(out_dir)] = cfg
         runner = Runner(cfg, self.stand, {n: self._chat(n) for n in cfg.places}, self.cards)
+        self._runners.append(runner)
+        return runner
+
+    def match_runner(self, place: int, cases: list[Case], out: Path) -> MatchRunner:
+        """Прогонщик «агент = калькулятор» (Д9-R91) места place модуля: клиент шлюза учётки места, StackStand,
+        OUT out. Вход и агент проверки — prepare(); закрывает тест, а забытый — cleanup()."""
+        if place not in self.places:
+            raise ValueError("место — не место модуля")
+        runner = MatchRunner(self._chat(place), self.stand, place, cases, Path(out))
         self._runners.append(runner)
         return runner
 

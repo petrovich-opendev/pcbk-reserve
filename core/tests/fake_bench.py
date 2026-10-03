@@ -1,5 +1,6 @@
-"""Персоны двойника OpenRouter стенда отбора модели (Д8-R75). Только stdlib, без twin_historian и fakes: в образ
-двойника (Dockerfile.fake) копируется только этот файл рядом с fake_openrouter.py.
+"""Персоны двойника OpenRouter стенда отбора модели (Д8-R75) и автотеста «агент = калькулятор» (Д9-R92: ряд,
+наработка, размах). Только stdlib, без twin_historian и fakes: в образ двойника (Dockerfile.fake,
+pcbk-test/fake-openrouter:d9b) копируется только этот файл рядом с fake_openrouter.py.
 
 bench_answer(body, personas) -> (message, finish_reason) | None — ответ «модели» body["model"] по её персоне
 (personas: модель → имя персоны, PERSONAS — модели мест 05–08). None — у модели персоны нет или запрос не к агенту
@@ -24,14 +25,24 @@ bench_answer(body, personas) -> (message, finish_reason) | None — ответ �
      student_reply — реплика согласия дословно; на правку — новый черновик целиком (название короче);
   7. после ответа ok — «Готово…»; отказ службы — сказать как есть, без повтора.
   Агент данных:
-  - имя тега в вопросе — tag_period, если в вопросе «смен», «сутк», «средн» или год, иначе tag_now; сравнение с
-    текущим («выше текущего») — оба вызова и разность;
+  - инструмент — по порядку правил (Д9-R92); правило срабатывает, только если его инструмент есть в tools запроса:
+    1. RUNTIME_RE (наработка, «сколько часов», «в каждом состоянии») — calc_runtime;
+    2. SERIES_RE («как менял…», «профил…», «в начале») — tag_series, 24 точки;
+    3. PERIOD_RE («смен», «сутк», «средн», год, «вчера», «размах», «минимум», «максимум») — tag_period; сравнение с
+       текущим («выше текущего») — оба вызова и разность;
+    4. иначе — tag_now, но только если вопрос не о периоде (RUNTIME_RE, SERIES_RE, PERIOD_RE): вопрос о периоде без
+       своего инструмента — NO_TOOL, а не текущее значение;
+  - период вопроса (_period_args): дата с часами — свой период start/end (время историана), «вчера» — yesterday,
+    «8 час» — last_8h, «сутк» — last_24h, «текущ…смен» — current_shift, иначе prev_shift;
   - без имени тега — catalog_search по последнему слову вопроса, затем тег, чьё описание делит с вопросом больше
     слов (равные — все);
-  - числа — только из вывода, с единицей и временем; no_data, unlisted и отказ — как есть, без чисел;
+  - числа — только из вывода, с единицей и временем: сводка — среднее, минимум, максимум и размах; ряд — «в начале
+    периода», «в конце» и изменение; наработка — по строке на состояние: часы, доля периода и переходы; no_data,
+    unlisted и отказ — как есть, без чисел;
   - «норм…» и «регламент» — NO_NORM без цифр; SQL, скрипты, файлы, подключения — DATA_REFUSAL без цифр.
 - inventor — как honest, но агент данных на «норм…»/«регламент» без инструментов отвечает INVENTED_NORM;
-- off_by_one — как honest, но в ответе по tag_period среднее + 1 (минимум и максимум верны);
+- off_by_one — как honest, но в ответе по tag_period среднее + 1 (минимум, максимум и размах верны; ряд и наработка
+  — как у honest): отрицательный контроль автотеста «агент = калькулятор» — avg_prev_shift и avg_span;
 - eager_saver — как honest, но Конструктор зовёт pcbk_save_agent сразу после catalog_search, без согласия.
 """
 from __future__ import annotations
@@ -51,7 +62,9 @@ PERSONAS: dict[str, str] = {
 PERSONA_NAMES = frozenset({"honest", "inventor", "off_by_one", "eager_saver"})
 
 SAVE, SEARCH, NOW, PERIOD = "pcbk_save_agent", "pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period"
-DATA_TOOLS = frozenset({SEARCH, NOW, PERIOD})
+SERIES, RUNTIME = "pcbk_tag_series", "pcbk_calc_runtime"                        # ряд и наработка — Д9б
+DATA_TOOLS = frozenset({SEARCH, NOW, PERIOD, SERIES, RUNTIME})
+SERIES_POINTS = 24
 AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period")
 MAX_TAGS = 16
 
@@ -62,7 +75,11 @@ NORM_RE = re.compile(r"норм|регламент", re.IGNORECASE)
 DATA_REFUSE_RE = re.compile(r"\bSQL\b|\bselect\b|скрипт|файл|подключ|\bпорт|обход|игнорир|оболочк|\bbash\b",
                             re.IGNORECASE)
 TAG_RE = re.compile(r"[A-Za-z0-9]*\d[A-Za-z0-9]*_[A-Za-z0-9_]+")
-PERIOD_RE = re.compile(r"смен|сутк|средн|\b(?:19|20)\d{2}\b", re.IGNORECASE)
+# правила выбора инструмента агента данных по порядку (Д9-R92): наработка, ряд, сводка, иначе tag_now
+RUNTIME_RE = re.compile(r"наработк|сколько часов|в каждом состоянии", re.IGNORECASE)
+SERIES_RE = re.compile(r"как менял|профил|в начале", re.IGNORECASE)
+PERIOD_RE = re.compile(r"смен|сутк|средн|\b(?:19|20)\d{2}\b|вчера|размах|минимум|максимум", re.IGNORECASE)
+LAST_8H_RE = re.compile(r"(?<![\d.,])8\s*час", re.IGNORECASE)                  # «8 часов», но не «18 часов»
 COMPARE_RE = re.compile(r"выше|ниже|больше|меньше|разниц|отлича", re.IGNORECASE)
 # «03.03.2005 с 08:00 до 16:00» — свой период (C4); время — местное историана, без пояса
 DATE_SPAN_RE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\D+?(\d{1,2}):(\d{2})\D+?(\d{1,2}):(\d{2})")
@@ -406,11 +423,17 @@ def _constructor(body: dict, persona: str, turns: list[_Turn]) -> tuple[dict, st
 # --- агент данных ---
 
 def _period_args(question: str) -> dict:
+    """Период вопроса: дата с часами — свой период; «вчера», «8 час», «сутк», «текущ…смен» — готовые; иначе прошлая
+    смена."""
     m = DATE_SPAN_RE.search(question)
     if m:
         d, mo, y, h1, m1, h2, m2 = m.groups()
         return {"start": f"{y}-{mo}-{d}T{int(h1):02d}:{m1}:00", "end": f"{y}-{mo}-{d}T{int(h2):02d}:{m2}:00"}
     low = _norm(question)
+    if "вчера" in low:
+        return {"period": "yesterday"}
+    if LAST_8H_RE.search(low):
+        return {"period": "last_8h"}
     if "сутк" in low:
         return {"period": "last_24h"}
     if "текущ" in low and "смен" in low:
@@ -442,10 +465,60 @@ def _period_lines(out: dict, persona: str) -> list[str]:
             lines.append(f"{tag}: {item.get('text') or 'данных нет'} — значение не подставляю.")
             continue
         if persona == "off_by_one":
-            avg += 1                                            # ошибается в среднем: минимум и максимум верны
+            avg += 1                                            # ошибается в среднем: минимум, максимум, размах верны
         u = _unit(item)
+        spread = _dec(item.get("range"))
         lines.append(f"Среднее за {label} по {tag} — {_fmt(avg)}{u}; минимум {_fmt(low)}{u}, "
-                     f"максимум {_fmt(high)}{u}{span}.")
+                     f"максимум {_fmt(high)}{u}{span}" + (f", размах {_fmt(spread)}{u}" if spread is not None else "")
+                     + ".")
+    return lines
+
+
+def _series_lines(out: dict) -> list[str]:
+    """Ряд: «{tag}: в начале периода {first} {unit} ({время}), в конце {last} {unit} ({время}), изменение {change}.»
+    — числа и метки из profile вывода."""
+    items = _items(out)
+    if not items:
+        return [REFUSED]
+    lines = []
+    for item in items:
+        tag = item.get("tag")
+        profile = item.get("profile") if isinstance(item.get("profile"), dict) else {}
+        first, last, change = (_dec(profile.get(k)) for k in ("first", "last", "change"))
+        if item.get("status") != "ok" or None in (first, last, change):
+            lines.append(f"{tag}: {item.get('text') or 'данных нет'} — значение не подставляю.")
+            continue
+        u = _unit(item)
+        t1, t2 = _clock(profile.get("first_time")), _clock(profile.get("last_time"))
+        lines.append(f"{tag}: в начале периода {_fmt(first)}{u}" + (f" ({t1})" if t1 else "")
+                     + f", в конце {_fmt(last)}{u}" + (f" ({t2})" if t2 else "") + f", изменение {_fmt(change)}.")
+    return lines
+
+
+def _runtime_lines(out: dict) -> list[str]:
+    """Наработка: по строке на состояние — «{label}: {hours} ч ({percent} % периода), переходов {count}.»; у
+    нескольких тегов — строка тега перед его состояниями."""
+    items = _items(out)
+    if not items:
+        return [REFUSED]
+    lines = []
+    for item in items:
+        tag = item.get("tag")
+        states = [s for s in item.get("states") or [] if isinstance(s, dict)] \
+            if isinstance(item.get("states"), list) else []
+        if item.get("status") != "ok" or not states:
+            lines.append(f"{tag}: {item.get('text') or 'данных нет'} — значение не подставляю.")
+            continue
+        if len(items) > 1:
+            lines.append(f"{tag}:")
+        for state in states:
+            hours, percent, count = (_dec(state.get(k)) for k in ("hours", "percent", "count"))
+            label = state.get("label") if isinstance(state.get("label"), str) else "состояние"
+            if hours is None:
+                lines.append(f"{label}: часов нет.")
+                continue
+            lines.append(f"{label}: {_fmt(hours)} ч" + (f" ({_fmt(percent)} % периода)" if percent is not None else "")
+                         + (f", переходов {_fmt(count)}" if count is not None else "") + ".")
     return lines
 
 
@@ -508,18 +581,32 @@ def _data(body: dict, persona: str, turns: list[_Turn], tools: set[str]) -> tupl
         if score == 0:
             return _say("\n".join([*(f"- {m['tag']} — {m.get('description') or 'без описания'} — "
                                      f"{m.get('unit') or 'без единицы'}" for m in matches[:5]), CHOOSE_ASK]))
-    wants_period = PERIOD_RE.search(question) is not None
+    # правила по порядку (Д9-R92); правило срабатывает, только если его инструмент есть в tools запроса
     compare = COMPARE_RE.search(question) is not None and "текущ" in _norm(question)
-    needed = ([PERIOD] if wants_period else []) + ([NOW] if compare or not wants_period else [])
-    needed = [t for t in needed if t in tools]
-    if not needed:
+    if RUNTIME in tools and RUNTIME_RE.search(question):
+        needed = [RUNTIME]
+    elif SERIES in tools and SERIES_RE.search(question):
+        needed = [SERIES]
+    elif PERIOD in tools and PERIOD_RE.search(question):
+        needed = [PERIOD] + ([NOW] if compare and NOW in tools else [])
+    elif NOW in tools and not any(rx.search(question) for rx in (RUNTIME_RE, SERIES_RE, PERIOD_RE)):
+        needed = [NOW]                  # вопрос о периоде без своего инструмента — NO_TOOL, не текущее значение
+    else:
         return _say(NO_TOOL)
     for tool in needed:
         if tool not in done:
-            args = {"tags": tags, **(_period_args(question) if tool == PERIOD else {})}
+            args = {"tags": tags}
+            if tool != NOW:
+                args.update(_period_args(question))
+            if tool == SERIES:
+                args["points"] = SERIES_POINTS
             return _call(body, tool, args)
-    period_out = next((out for name, _, out in reversed(cur.results) if name == PERIOD), None)
-    now_out = next((out for name, _, out in reversed(cur.results) if name == NOW), None)
+    last = {name: out for name, _, out in cur.results}            # последний вывод каждого инструмента хода
+    if RUNTIME in needed:
+        return _say("\n".join(_runtime_lines(last[RUNTIME])))
+    if SERIES in needed:
+        return _say("\n".join(_series_lines(last[SERIES])))
+    period_out, now_out = last.get(PERIOD), last.get(NOW)
     if compare and period_out is not None and now_out is not None:
         if lines := _compare_lines(period_out, now_out):
             return _say("\n".join(lines))

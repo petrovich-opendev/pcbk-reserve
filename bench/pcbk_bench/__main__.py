@@ -1,7 +1,8 @@
 """CLI стенда отбора (Д8-R74, П4, m-р4-16): python -m pcbk_bench override CONFIG | run CONFIG | status OUT
 [--stale-s N] | judge-pack CONFIG [--real-data] | judge-stage CONFIG [--only-missing] [--root DIR] | judge-audit STAGE
 --batch batch-NN --transcript PATH [--discard] | judge-collect CONFIG [--batch batch-NN …] [--root DIR] | judge-check
-CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG | cards-audit CONFIG --transcript PATH.
+CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG | cards-audit CONFIG --transcript PATH |
+match-cases MCONFIG | match MCONFIG [--only basic] | probe-calc MCONFIG.
 
 - override CONFIG — файл переопределения мест (render_override) в stdout;
 - run CONFIG — прогон: load_config → window_start (без него или позже сейчас + 5 мин — RunRefused("window_start")
@@ -38,8 +39,22 @@ CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG | cards-a
   (cards.audit_cards): печатает только нарушения (инструмент и вид), код 1 при нарушениях. Команда — из того же
   дерева, откуда субагент читал WRITER.md: образец и задание сверяются по путям этого дерева.
 
-Коды main: 0 — успех, 2 — RunRefused, 1 — прочее. Ошибка печатается только классом исключения (и кодом RunRefused),
-без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без разговоров и тегов) — в stderr.
+«Агент = калькулятор» (Д9-R91, Д9-R93; MCONFIG — MatchConfig JSON, $JOB/pcbk-d9/live/match.config.json: stand,
+place, login, cases, out_dir, turn_timeout_s, source; пароль учётки — secrets/<login>.pw рядом со stand.json):
+- match-cases MCONFIG — случаи окна (cases_from_agent, I7) в файл cases (0600); печатает только «случаев N: аналоговых
+  a (из агента k), состояний d» и, если живые теги без данных за период пропущены (I-3 итога Д9б), «; без данных за
+  период пропущено m»;
+- match MCONFIG [--only basic] — прогон агента проверки на месте place по файлу cases; печатает итог render_match
+  (псевдонимы ТЕГ-n, без тегов и чисел) и строку «успех: да | нет (коды)», пишет OUT/match.md и OUT/match.jsonl
+  (0600). Код 0 — успех; 3 — не успех (match_failures: жёсткие, service, вид без match, прогон оборван до конца
+  плана). --only basic — без видов profile_last_8h и runtime_yesterday (проба не прошла); режимов сухого прогона нет
+  (I6);
+- probe-calc MCONFIG — проба форм окна: печатает только коды «series: …» и «runtime: …» (unresolved — у живых тегов
+  вида нет данных за период: проба не решена).
+
+Коды main: 0 — успех, 2 — RunRefused, 3 — автотест match не успех, 1 — прочее. Ошибка печатается только классом
+исключения (и кодом RunRefused), без текста и трассировки: в тексте бывают данные. Журнал прогонщика (logging, без
+разговоров и тегов) — в stderr.
 
 stand.json (П4, $JOB/pcbk-d8/stand.json, 0600): {"ssh": ["ssh", …, "user@host"], "core_url": "http://127.0.0.1:18000",
 "edge_url": "https://127.0.0.1:28443", "edge_host": "<имя сертификата>[:порт]", "origin": null, "remote_dir":
@@ -59,6 +74,9 @@ from pathlib import Path
 from .cards import CHECK_GOOD, CardsFormError, audit_cards, cards_check, load_cards
 from .config import BenchConfig, load_config
 from .gateway import GatewayChat
+from .match import (BASIC_KINDS, MatchConfig, MatchRunner, build_cases, case_count, cases_from_agent, hist_today,
+                    load_case_tags, load_match_config, match_failures, probe_calc, render_match, write_case_tags,
+                    write_private)
 from .override import render_override
 from .runner import FUTURE_WINDOW_S, Runner, RunRefused, load_records, status_main
 from .secret import Secret
@@ -67,6 +85,7 @@ from .stand import DATA_TOOLS, ServerStand, Stand
 REPO = Path(__file__).resolve().parents[2]
 OPENCODE_JSON = REPO / "student" / "config" / "opencode.json"
 PROBE_LOGIN = "d8-probe-bench-{n:02d}"
+MATCH_NOT_PASSED = 3                    # match: прогон прошёл, но автотест — не успех (match_failures, I-2 итога Д9б)
 _STAND_KEYS = frozenset({"ssh", "core_url", "edge_url", "edge_host", "origin", "remote_dir"})
 
 
@@ -114,13 +133,23 @@ def _parser() -> argparse.ArgumentParser:
     cards_audit = sub.add_parser("cards-audit", help="сверка транскрипта субагента карточек по списку разрешений")
     cards_audit.add_argument("config", type=Path)
     cards_audit.add_argument("--transcript", type=Path, required=True)
+    sub.add_parser("match-cases", help="случаи окна «агент = калькулятор» из агента места-источника").add_argument(
+        "config", type=Path)
+    match = sub.add_parser("match", help="прогон «агент = калькулятор»: итог без тегов, OUT/match.md")
+    match.add_argument("config", type=Path)
+    match.add_argument("--only", choices=["basic"], default=None)
+    sub.add_parser("probe-calc", help="проба форм окна: только коды").add_argument("config", type=Path)
     return p
 
 
 def _stand_json(cfg: BenchConfig) -> dict:
     if cfg.stand is None:
         raise ValueError("конфиг: stand — путь к stand.json не задан")
-    raw = json.loads(Path(cfg.stand).read_text(encoding="utf-8"))
+    return _read_stand(Path(cfg.stand))
+
+
+def _read_stand(path: Path) -> dict:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or not {"ssh", "core_url", "edge_url", "edge_host"} <= set(raw) <= _STAND_KEYS:
         raise ValueError("stand.json: ключи ssh, core_url, edge_url, edge_host (origin, remote_dir — по желанию)")
     if not isinstance(raw["ssh"], list) or not all(isinstance(a, str) for a in raw["ssh"]):
@@ -130,10 +159,30 @@ def _stand_json(cfg: BenchConfig) -> dict:
 
 def server_stand(cfg: BenchConfig) -> Stand:
     """Только стенд сервера по stand.json и secrets/ рядом с ним (m19: calc и cards-check — без клиентов шлюза)."""
-    raw = _stand_json(cfg)
+    if cfg.stand is None:
+        raise ValueError("конфиг: stand — путь к stand.json не задан")
+    return _server_stand_at(Path(cfg.stand))
+
+
+def _server_stand_at(path: Path) -> Stand:
+    raw = _read_stand(path)
     extra = {"remote_dir": raw["remote_dir"]} if raw.get("remote_dir") else {}
-    return ServerStand(raw["ssh"], raw["core_url"], raw["edge_url"], raw["edge_host"],
-                       Path(cfg.stand).parent / "secrets", **extra)
+    return ServerStand(raw["ssh"], raw["core_url"], raw["edge_url"], raw["edge_host"], Path(path).parent / "secrets",
+                       **extra)
+
+
+def match_stand(mcfg: MatchConfig) -> Stand:
+    """Стенд сервера «агент = калькулятор» (match-cases, probe-calc): только stand.json и токен ops."""
+    return _server_stand_at(mcfg.stand)
+
+
+def match_connect(mcfg: MatchConfig) -> tuple[Stand, GatewayChat]:
+    """Стенд сервера и клиент шлюза учётки login (пароль — secrets/<login>.pw рядом со stand.json); вход — в
+    MatchRunner.prepare()."""
+    raw = _read_stand(mcfg.stand)
+    pw_file = mcfg.stand.parent / "secrets" / f"{mcfg.login}.pw"
+    account = {"login": mcfg.login, "password": Secret(pw_file.read_text(encoding="ascii").strip())}
+    return match_stand(mcfg), GatewayChat(raw["edge_url"], raw["edge_host"], raw.get("origin"), **account)
 
 
 def connect(cfg: BenchConfig) -> tuple[Stand, dict[int, GatewayChat]]:
@@ -274,6 +323,44 @@ def _cards_audit(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+def _match_cases(config: Path) -> int:
+    """match-cases MCONFIG: теги окна → файл cases (0600); в stdout — только счёт."""
+    mcfg = load_match_config(config)
+    if mcfg.source_place is None:
+        raise ValueError("конфиг: source — место-источник случаев не задано")
+    analog, discrete, from_agent, skipped = cases_from_agent(match_stand(mcfg), mcfg.source_place)
+    write_case_tags(mcfg.cases, analog, discrete)
+    print(f"случаев {case_count(analog, discrete)}: аналоговых {len(analog)} (из агента {from_agent}), "
+          f"состояний {len(discrete)}" + (f"; без данных за период пропущено {skipped}" if skipped else ""))
+    return 0 if analog or discrete else 1
+
+
+def _match(config: Path, only: str | None) -> int:
+    """match MCONFIG [--only basic]: прогон по файлу cases; итог render_match — в stdout и OUT/match.md (0600)."""
+    mcfg = load_match_config(config)
+    analog, discrete = load_case_tags(mcfg.cases)
+    stand, chat = match_connect(mcfg)
+    cases = build_cases(analog, discrete, hist_today(stand, (analog + discrete)[0]))
+    if only == "basic":
+        cases = [c for c in cases if c.kind in BASIC_KINDS]
+    runner = MatchRunner(chat, stand, mcfg.place, cases, mcfg.out_dir, turn_timeout_s=mcfg.turn_timeout_s)
+    try:
+        results = runner.run()
+    finally:
+        runner.close()
+    md = render_match(results, cases)
+    write_private(mcfg.out_dir / "match.md", md)
+    sys.stdout.write(md)
+    return MATCH_NOT_PASSED if match_failures(results, cases) else 0
+
+
+def _probe_calc(config: Path) -> int:
+    """probe-calc MCONFIG: коды пробы форм окна по строке."""
+    for code in probe_calc(match_stand(load_match_config(config))):
+        print(code)
+    return 0
+
+
 def _run(config: Path) -> int:
     cfg = load_config(config, OPENCODE_JSON)
     if cfg.window_start is None or cfg.window_start > datetime.now(timezone.utc) + timedelta(seconds=FUTURE_WINDOW_S):
@@ -311,6 +398,12 @@ def main(argv: list[str] | None = None) -> int:
             return _cards_check(args.config)
         if args.command == "cards-audit":
             return _cards_audit(args)
+        if args.command == "match-cases":
+            return _match_cases(args.config)
+        if args.command == "match":
+            return _match(args.config, args.only)
+        if args.command == "probe-calc":
+            return _probe_calc(args.config)
         return _run(args.config)
     except RunRefused as exc:
         print(f"RunRefused: {exc.code}", file=sys.stderr)
