@@ -104,8 +104,14 @@ test("teacher_texts", () => {
     .toEqual(["Кабинет преподавателя", "Только чтение: писать в разговор студента нельзя", "Разбудить для просмотра",
               "Доли обновлены", "Кабинет преподавателя столкнулся с ошибкой. Сбой отмечен для администратора.",
               "Перезапустить кабинет"]);
-  // подписи действий журнала — ровно ACTIONS журнала действий Д10а (Д10-R99); Д10б добавит действия учёток
-  expect(Object.keys(texts.ACTION_LABELS).sort()).toEqual(["agent", "agents", "read", "sessions", "shares", "wake"]);
+  // подписи действий журнала — ровно ACTIONS журнала действий: Д10а (Д10-R99) и учётки Д10б (R108)
+  expect(Object.keys(texts.ACTION_LABELS).sort()).toEqual(["account_add", "account_disable", "account_enable",
+    "account_passwd", "account_unlock", "agent", "agents", "read", "sessions", "shares", "wake"]);
   expect([texts.ACTION_LABELS.sessions, texts.ACTION_LABELS.read, texts.ACTION_LABELS.wake, texts.ACTION_LABELS.shares])
     .toEqual(["открыл список разговоров", "прочитал разговор", "разбудил место", "перевёл долю"]);
+  // действия учёток — словами, как остальные, а не кодом (сомнение 1 Б2, решение контроллера)
+  expect([texts.ACTION_LABELS.account_add, texts.ACTION_LABELS.account_passwd, texts.ACTION_LABELS.account_disable,
+          texts.ACTION_LABELS.account_enable, texts.ACTION_LABELS.account_unlock])
+    .toEqual(["завёл учётку студента", "выдал новый пароль", "отключил учётку", "включил учётку", "снял замок входа"]);
+  for (const label of Object.values(texts.ACTION_LABELS)) expect(label).not.toMatch(/[a-z_]/);   // ни одного кода
 });

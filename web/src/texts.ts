@@ -308,7 +308,7 @@ export const T_TCH_JOURNAL_RELOAD = "Обновить журнал";
 export const T_TCH_JOURNAL_EMPTY = "Записей пока нет";
 export const T_TCH_JOURNAL_PLACE = (nn: string): string => `место ${nn}`;
 export const T_TCH_JOURNAL_SHARE = (nn: string, from: string, to: string): string => `${nn}: ${from} → ${to}`;
-// подписи действий журнала (ACTIONS, Д10-R99); незнакомое — кодом как есть. Д10б добавит действия учёток
+// подписи действий журнала (ACTIONS, Д10-R99; действия учёток — Д10б, R108); незнакомое — кодом как есть
 export const ACTION_LABELS: Readonly<Record<string, string>> = {
   sessions: "открыл список разговоров",
   read: "прочитал разговор",
@@ -316,6 +316,11 @@ export const ACTION_LABELS: Readonly<Record<string, string>> = {
   agent: "прочитал инструкцию агента",
   wake: "разбудил место",
   shares: "перевёл долю",
+  account_add: "завёл учётку студента",
+  account_passwd: "выдал новый пароль",
+  account_disable: "отключил учётку",
+  account_enable: "включил учётку",
+  account_unlock: "снял замок входа",
 };
 // итоги строк журнала (OUTCOMES, Д10-R99)
 export const OUTCOME_LABELS: Readonly<Record<string, string>> = {
