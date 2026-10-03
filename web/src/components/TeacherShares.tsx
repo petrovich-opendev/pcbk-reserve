@@ -8,11 +8,11 @@
 // Подсказки до запроса (одно место, ноль, больше «доля − пол») — без вызова: сервер проверяет те же правила сам.
 // 401 — на вход. Пока ответ в пути, кнопки выключены: второе нажатие не уходит.
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { replyText, type Reply } from "../api";
-import { parseMoney, transferChanges, type Overview } from "../teacher";
+import type { Reply } from "../api";
+import { parseMoney, tchReplyText, transferChanges, type Overview } from "../teacher";
 import type { TeacherApi } from "../teacherApi";
-import { T_TCH_AMOUNT, T_TCH_BAD_AMOUNT, T_TCH_FLOOR, T_TCH_FLOOR_HINT, T_TCH_FREE, T_TCH_FROM, T_TCH_MOVE, T_TCH_PICK,
-         T_TCH_SAME_PLACE, T_TCH_SHARES, T_TCH_SHARES_DONE, T_TCH_TO } from "../texts";
+import { T_TCH_AMOUNT, T_TCH_BAD_AMOUNT, T_TCH_FLOOR, T_TCH_FLOOR_HINT, T_TCH_FREE, T_TCH_FROM, T_TCH_MOVE,
+         T_TCH_NO_ACCOUNT, T_TCH_PICK, T_TCH_SAME_PLACE, T_TCH_SHARES, T_TCH_SHARES_DONE, T_TCH_TO } from "../texts";
 
 export interface TeacherSharesProps {
   api: TeacherApi;
@@ -57,7 +57,7 @@ export function TeacherShares(p: TeacherSharesProps) {
       p.onChanged();
       return;
     }
-    setNote({ kind: "fail", text: replyText(r) });
+    setNote({ kind: "fail", text: tchReplyText(r) });
     if (reloadOn.includes(r.status)) p.onChanged();
   };
 
@@ -77,8 +77,11 @@ export function TeacherShares(p: TeacherSharesProps) {
     void send(() => p.api.stopPlace(from, to), [400, 409]);
   };
 
+  // подпись места — как в таблице мест: закреплённое за удалённым логином — «без учётки», не «свободно» (ревью А4, m-5)
   const options = p.overview.places.map((row) => (
-    <option key={row.place} value={row.place}>{`${row.place} — ${row.login ?? T_TCH_FREE}`}</option>
+    <option key={row.place} value={row.place}>
+      {`${row.place} — ${row.login ?? (row.free ? T_TCH_FREE : T_TCH_NO_ACCOUNT)}`}
+    </option>
   ));
   return (
     <section className="tch-shares" aria-label={T_TCH_SHARES}>

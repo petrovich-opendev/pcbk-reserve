@@ -8,18 +8,20 @@
 //   кабинет не будит. Список — .sessions button[data-session-id]; выбор — TeacherReader (только чтение). Агенты —
 //   TeacherAgents: место для них не нужно.
 // - Ниже — «Доли бюджета на модель» (TeacherShares) и «Журнал действий» (TeacherJournal).
-// 401 любой ручки — onSignedOut (один раз); прочие отказы — текст ответа (replyText). Роль решает сервер: страница только
-// показывает. Стили — классы chat.css, атрибутов style нет (CSP style-src 'self').
+// 401 любой ручки — onSignedOut (один раз); прочие отказы — текст ответа (tchReplyText: свои запасные тексты кабинета,
+// ревью А4, m-4). Обзор после изменения не пришёл — прежний (таблица, открытое место, «Доли обновлены») остаётся, причина —
+// строкой над ним (m-1). Роль решает сервер: страница только показывает. Стили — классы chat.css, атрибутов style нет
+// (CSP style-src 'self').
 import { useCallback, useEffect, useRef, useState } from "react";
-import { replyText, type Api, type Reply } from "../api";
-import { fmtCents, fmtUsd, fmtWhen, parseOverview, parseSessions, parseTranscript, type Overview, type PlaceRow,
-         type SessionRow, type Transcript } from "../teacher";
+import type { Api, Reply } from "../api";
+import { fmtCents, fmtUsd, fmtWhen, forTeacher, label, parseOverview, parseSessions, parseTranscript, tchReplyText,
+         type Overview, type PlaceRow, type SessionRow, type Transcript } from "../teacher";
 import type { TeacherApi } from "../teacherApi";
 import { PLACE_STATE_LABELS, T_PLACE_PREPARING, T_TCH_ARCHIVED, T_TCH_BUDGET, T_TCH_FREE, T_TCH_LOADING,
          T_TCH_MARK_DISABLED, T_TCH_MARK_LOCKED, T_TCH_MARK_NOT_NOTICED, T_TCH_NO_ACCOUNT, T_TCH_NO_SESSIONS,
          T_TCH_NO_SHARES, T_TCH_NONE, T_TCH_OPEN, T_TCH_OPEN_LABEL, T_TCH_PLACE_TABS, T_TCH_PLACE_TITLE, T_TCH_PLACES,
-         T_TCH_REFRESH, T_TCH_RELOAD_LIST, T_TCH_TAB_AGENTS, T_TCH_TAB_SESSIONS, T_TCH_TITLE, T_TCH_WAKE, T_UNKNOWN,
-         T_UNTITLED, TCH_COLUMNS as C } from "../texts";
+         T_TCH_OVERVIEW_FAILED, T_TCH_REFRESH, T_TCH_RELOAD_LIST, T_TCH_TAB_AGENTS, T_TCH_TAB_SESSIONS, T_TCH_TITLE,
+         T_TCH_UNKNOWN, T_TCH_WAKE, T_UNTITLED, TCH_COLUMNS as C } from "../texts";
 import { wakeAndWait, type Timers } from "../workplace";
 import { TeacherAgents } from "./TeacherAgents";
 import { TeacherJournal } from "./TeacherJournal";
@@ -66,7 +68,7 @@ function PlacesTable({ overview, open, onOpen }: { overview: Overview; open: str
               {row.login ?? (row.free ? T_TCH_FREE : T_TCH_NO_ACCOUNT)}
               {marks(row).map((m) => <span key={m} className="tch-mark">{" "}{m}</span>)}
             </td>
-            <td data-state={row.state}>{PLACE_STATE_LABELS[row.state] ?? row.state}</td>
+            <td data-state={row.state}>{label(PLACE_STATE_LABELS, row.state)}</td>
             <td>{money(row.share_cents)}</td>
             <td>{row.spent_usd === null ? T_TCH_NONE : fmtUsd(row.spent_usd)}</td>
             <td>{row.agents === null ? T_TCH_NONE : String(row.agents)}</td>
@@ -136,10 +138,10 @@ function PlaceSessions(p: PlaceProps) {
     const r = await api.sessions(row.place).catch(noAnswer);
     if (!alive.current || my !== listSeq.current) return;
     if (r.status === 401) return props.current.onSignedOut();
-    if (asleep(r)) return setList({ kind: "asleep", text: replyText(r) });
-    if (r.status !== 200) return setList({ kind: "text", text: replyText(r) });
+    if (asleep(r)) return setList({ kind: "asleep", text: tchReplyText(r) });
+    if (r.status !== 200) return setList({ kind: "text", text: tchReplyText(r) });
     const sessions = parseSessions(r.body);
-    setList(sessions === null ? { kind: "text", text: T_UNKNOWN } : { kind: "list", sessions });
+    setList(sessions === null ? { kind: "text", text: T_TCH_UNKNOWN } : { kind: "list", sessions });
   }, []);
 
   useEffect(() => {
@@ -168,8 +170,8 @@ function PlaceSessions(p: PlaceProps) {
     const result = await wakeAndWait({
       api: place as Api, pollMs, timers, signal: ctl.signal,
       onView: (v) => {
-        last = v.text;
-        if (alive.current) setList({ kind: "waking", text: v.text, stuck: false });
+        last = forTeacher(v.text);                                    // тексты места — кабинетные (m-4)
+        if (alive.current) setList({ kind: "waking", text: last, stuck: false });
       },
     });
     waking.current = null;
@@ -189,11 +191,11 @@ function PlaceSessions(p: PlaceProps) {
     if (asleep(r)) {                                                  // место уснуло, пока список был открыт
       listSeq.current += 1;
       setReading({ kind: "none" });
-      return setList({ kind: "asleep", text: replyText(r) });
+      return setList({ kind: "asleep", text: tchReplyText(r) });
     }
-    if (r.status !== 200) return setReading({ kind: "text", text: replyText(r) });
+    if (r.status !== 200) return setReading({ kind: "text", text: tchReplyText(r) });
     const t = parseTranscript(r.body);
-    setReading(t === null ? { kind: "text", text: T_UNKNOWN } : { kind: "transcript", t });
+    setReading(t === null ? { kind: "text", text: T_TCH_UNKNOWN } : { kind: "transcript", t });
   };
 
   const current = reading.kind === "loading" ? reading.id : reading.kind === "transcript" ? reading.t.session.id : null;
@@ -269,7 +271,8 @@ function PlacePanel(p: PlaceProps) {
 
 // --- страница ---
 
-type Load = { kind: "loading" } | { kind: "text"; text: string } | { kind: "ready"; overview: Overview };
+// ready.error — новый обзор не пришёл: на экране прежний, причина — строкой над ним (m-1)
+type Load = { kind: "loading" } | { kind: "text"; text: string } | { kind: "ready"; overview: Overview; error: string | null };
 
 export function TeacherPage(p: TeacherPageProps) {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
@@ -287,15 +290,17 @@ export function TeacherPage(p: TeacherPageProps) {
     props.current.onSignedOut();
   }, []);
 
-  // обзор; прежний остаётся на экране, пока новый в пути
+  // обзор; прежний остаётся на экране, пока новый в пути, — и когда новый не пришёл (m-1): иначе удачный перевод и
+  // открытый разговор пропали бы вместе с таблицей
   const fetchOverview = useCallback(async (): Promise<void> => {
     const my = ++seq.current;
     const r = await props.current.api.overview().catch(noAnswer);
     if (!alive.current || my !== seq.current) return;
     if (r.status === 401) return signOut();
-    if (r.status !== 200) return setLoad({ kind: "text", text: replyText(r) });
-    const overview = parseOverview(r.body);
-    setLoad(overview === null ? { kind: "text", text: T_UNKNOWN } : { kind: "ready", overview });
+    const overview = r.status === 200 ? parseOverview(r.body) : null;
+    if (overview !== null) return setLoad({ kind: "ready", overview, error: null });
+    const text = r.status === 200 ? T_TCH_UNKNOWN : tchReplyText(r);
+    setLoad((prev) => (prev.kind === "ready" ? { ...prev, error: text } : { kind: "text", text }));
   }, [signOut]);
 
   useEffect(() => {
@@ -320,6 +325,9 @@ export function TeacherPage(p: TeacherPageProps) {
       </div>
       {load.kind === "loading" && <p className="tch-hint">{T_TCH_LOADING}</p>}
       {load.kind === "text" && <p data-kind="fail" role="alert">{load.text}</p>}
+      {load.kind === "ready" && load.error !== null && (
+        <p data-kind="fail" role="alert">{T_TCH_OVERVIEW_FAILED(load.error)}</p>
+      )}
       {overview !== null && (
         <>
           <BudgetLine overview={overview} />

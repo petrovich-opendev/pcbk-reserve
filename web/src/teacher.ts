@@ -1,9 +1,11 @@
 // Чистые помощники кабинета преподавателя (Д10-R106): разбор ответов ручек R101–R104, деньги и перевод доли.
-// Разбор строгий: ответ не той формы — null, и страница пишет «Неожиданный ответ сервера…» (T_UNKNOWN), а не рисует
+// Разбор строгий: ответ не той формы — null, и страница пишет «Неожиданный ответ сервера…» (T_TCH_UNKNOWN), а не рисует
 // половину. Деньги — целые центы, как у сервера (Д10-R97); доллары расхода — числом как пришли. Правила перевода здесь —
 // только подсказка до запроса: проверяет сервер, его отказ показывается дословно.
+import { replyText, type Reply } from "./api";
 import { isAgentName, isSessionId, type ShareChange } from "./teacherApi";
-import { T_TCH_NO_SHARES, T_TCH_SAME_PLACE, T_TCH_TAKE_MAX, T_TCH_ZERO } from "./texts";
+import { T_PLACE_GAVE_UP, T_PLACE_ODD, T_TCH_NO_SHARES, T_TCH_PLACE_GAVE_UP, T_TCH_PLACE_ODD, T_TCH_SAME_PLACE,
+         T_TCH_TAKE_MAX, T_TCH_UNKNOWN, T_TCH_ZERO, T_UNKNOWN } from "./texts";
 
 export { ACTION_LABELS } from "./texts";
 
@@ -201,6 +203,22 @@ function journalRow(v: unknown): JournalRow | null {
 export function parseJournal(body: unknown): JournalRow[] | null {
   return isObj(body) ? all(body.rows, journalRow) : null;
 }
+
+// --- подписи и тексты кабинета ---
+
+// подпись кода из словаря: только свои ключи словаря (ревью А4, m-6) — «constructor» с сервера дал бы функцию вместо
+// текста; незнакомый код — как пришёл
+export const label = (dict: Readonly<Record<string, string>>, key: string): string =>
+  Object.hasOwn(dict, key) ? dict[key]! : key;
+
+// общие тексты чата для студента («…сообщите преподавателю») — кабинетным (ревью А4, m-4); прочие — как есть
+const FOR_TEACHER: ReadonlyMap<string, string> = new Map([
+  [T_UNKNOWN, T_TCH_UNKNOWN], [T_PLACE_GAVE_UP, T_TCH_PLACE_GAVE_UP], [T_PLACE_ODD, T_TCH_PLACE_ODD],
+]);
+export const forTeacher = (text: string): string => FOR_TEACHER.get(text) ?? text;
+
+// отказ ручки кабинета — текстом для преподавателя: текст сервера дословно, иначе свой запасной (replyText)
+export const tchReplyText = (r: Reply): string => forTeacher(replyText(r));
 
 // --- деньги: центы и доллары ru-RU (1 234,56 $) ---
 
