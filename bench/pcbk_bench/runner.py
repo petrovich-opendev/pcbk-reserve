@@ -51,15 +51,18 @@ pcbk_run_spent в ходе; money — pcbk_money_out, pcbk_key_limit, pcbk_budge
 
 Режим нагрузки (cfg.load; Д11-R119…R122, R131; сторож памяти и вердикт — load.py). prepare(): окно → замок → пульс →
 сторож памяти (первая точка) → блок run (места ⊆ вызывающих) и run_brake (watching и свежий, иначе RunRefused("brake"))
-→ строка памяти на старте ok, без пометок «нет данных» (иначе RunRefused("memory")) → режим данных (none — пометка
+→ потолок и пороги LLM_RUN_* core — как в конфиге ступени (иначе RunRefused("run_limits", поле); доводка р1, m-3) →
+строка памяти на старте ok, без пометок «нет данных» (иначе RunRefused("memory")) → режим данных (none — пометка
 «учения: tool_error» в строке историана, иначе RunRefused("data_drill"); live — OUT/real-data-consent.txt, иначе
 RunRefused("consent"), и без пометки учения; twin — только стенд) → OUT/health_start.json → поток сторожа → для каждого
 места: остановка — выход; вход; опрос сторожа (тормоз перед пробуждением, I-6 р2); остановка — выход; пробуждение и
 ensure_ready → живые агенты, кроме bench-uzel, — RunRefused("place_agents") без архива → OUT/pre_sessions.json (id
 разговоров, бывших на местах) → прежние сессии → пустой /session/status → модель → единицы → bench-uzel (если нужен).
-Остановка во время подготовки — выход без исключения: run() вернёт её причину.
-Жёсткая остановка сторожа (memory, blind, brake) и pcbk_run_halted в ходе — _halt_stop: причина (поверх мягкой), abort
-идущих сессий (и на каждом шаге барьера), stand.sleep_places всех мест конфига; пробуждений после неё нет, а
+Остановка во время подготовки — выход без исключения: run() вернёт её причину. В «без данных» пометку учения сторож
+проверяет и на ходу, каждым опросом: пропала — жёстко data_drill (доводка р1, m-4).
+Жёсткая остановка сторожа (memory, data_drill, blind, brake) и pcbk_run_halted в ходе — _halt_stop: причина (поверх
+мягкой), сначала stand.sleep_places всех мест конфига (медленный шлюз не держит сон, доводка р1, I-2), затем abort
+идущих сессий (и на каждом шаге барьера); пробуждений после неё нет, а
 пробуждение, гонкой прошедшее после неё, сразу снова усыпляет место; close() усыпляет все места ещё раз. Мягкая
 (memory_warn) — новые прогоны не начинаются, идущие доходят. Решения о памяти — только у сторожа (_stand_ok смотрит
 строку LLM из его последнего опроса). Живость сторожа — на каждом шаге барьера (поток жив, опрос не старше
@@ -98,11 +101,12 @@ from .student import ScriptedStudent
 log = logging.getLogger("pcbk_bench.runner")
 
 STOP_REASONS = ("cap", "money", "stand", "window", "interrupt", "projection", "place", "memory", "blind", "brake",
-                "memory_warn")
+                "memory_warn", "data_drill")
 MONEY_CODES = frozenset({"pcbk_money_out", "pcbk_key_limit", "pcbk_budget_spent", "pcbk_share_spent"})
 CAP_CODE = "pcbk_run_spent"
 RUN_SPENT_TEXT = "Потолок прогона отбора модели исчерпан"           # LLM_MESSAGES["run_spent"]
 HALT_CODE = "pcbk_run_halted"                                        # тормоз прогона core (Д11-R117)
+LIMIT_EPS = 1e-6                                                     # сверка LLM_RUN_* core с конфигом ступени
 RUN_HALTED_TEXT = "Прогон остановлен: сервер на пределе памяти"     # LLM_MESSAGES["run_halted"]
 MODEL_CODES = frozenset({"pcbk_turn_limit"})                         # отказ прокси по вине модели — не стенд
 # имена инструментов службы — не коды отказа прокси: из ALLOWED_TOOLS (тот же источник, что у check_run; с Д9а — и ряд
@@ -143,11 +147,13 @@ def card_tags(cards: CardSet) -> list[str]:
 
 class RunRefused(Exception):
     """Отказ запуска прогона: код (locked, run_id, run_callers, place_model, bench_agent, not_ready, place_busy,
-    window_start; нагрузка — brake, memory, data_drill, consent, load_data, place_agents, window_base)."""
+    window_start; нагрузка — brake, run_limits, memory, data_drill, consent, load_data, place_agents, window_base) и
+    уточнение без значений (у run_limits — какое поле LLM_RUN_* расходится с конфигом)."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, detail: str | None = None):
         super().__init__(code)
         self.code = code
+        self.detail = detail
 
 
 class PlaceNotReady(Exception):
@@ -544,7 +550,8 @@ class Runner:
         if not p.health_ok or p.brake != "watching" or p.brake_age_s is None or p.brake_age_s > BRAKE_SILENT_S:
             log.warning("подготовка: тормоз прогона core не следит (%s)", p.brake)
             raise RunRefused("brake")
-        if p.state != "ok" or first != "ok":
+        self._check_run_limits(guard.last_health)
+        if p.state != "ok" or first not in ("ok", "data_drill"):          # пометку учения называет режим данных
             log.warning("подготовка: строка памяти на старте — %s, сторож — %s", p.state, first)
             raise RunRefused("memory")
         self._check_data_mode(guard.last_status)
@@ -597,6 +604,24 @@ class Runner:
             return
         if any(BY_ID[k.scenario].agent == "bench" for k in self.plan):
             self._bench_agents()
+
+    def _check_run_limits(self, health: dict | None) -> None:
+        """Потолок прогона и пороги тормоза core (LLM_RUN_*, как их отдаёт /health/llm) — как в конфиге ступени (доводка
+        р1, m-3): забытый LLM_RUN_SWAP_BASE_MIB или другой потолок — отказ с полем; поле конфига null — не сверяется."""
+        health = health if isinstance(health, dict) else {}
+        run = health.get("run") if isinstance(health.get("run"), dict) else {}
+        brake = health.get("run_brake") if isinstance(health.get("run_brake"), dict) else {}
+        pairs = (("cap_usd", run.get("cap_usd"), self.cfg.cap_usd),
+                 ("mem_fail_mib", brake.get("fail_mib"), self.cfg.mem_fail_mib),
+                 ("swap_base_mib", brake.get("swap_base_mib"), self.cfg.swap_base_mib),
+                 ("swap_grow_mib", brake.get("swap_grow_mib"), self.cfg.swap_grow_mib),
+                 ("psi_full_max", brake.get("psi_full_max"), self.cfg.psi_full_max))
+        for name, have, want in pairs:
+            if want is None:
+                continue
+            if isinstance(have, bool) or not isinstance(have, (int, float)) or abs(have - want) > LIMIT_EPS:
+                log.warning("подготовка: %s в core — не как в конфиге ступени", name)
+                raise RunRefused("run_limits", name)
 
     def _check_data_mode(self, status: dict | None) -> None:
         """Режим данных (R131) по строке историана страницы: none — пометка учения tool_error обязательна; live —
@@ -896,15 +921,16 @@ class Runner:
         return self._interrupt.is_set() or self._halt.is_set()
 
     def _on_guard(self, verdict: str) -> None:
-        """Вердикт сторожа памяти: memory, blind, brake — жёстко; soft — мягко memory_warn."""
+        """Вердикт сторожа памяти: memory, data_drill, blind, brake — жёстко; soft — мягко memory_warn."""
         if verdict in HARD_VERDICTS:
             self._halt_stop(verdict)
         elif verdict == "soft":
             self._set_stop("memory_warn")
 
     def _halt_stop(self, reason: str) -> None:
-        """Жёсткая остановка тормозом (R119): причина (поверх мягкой; первая жёсткая остаётся), abort идущих сессий,
-        сон всех мест конфига — один раз (close() повторит)."""
+        """Жёсткая остановка тормозом (R119): причина (поверх мягкой; первая жёсткая остаётся), сон всех мест конфига —
+        один раз и первым (close() повторит): abort идёт через шлюз и при больном core тянется минутами (доводка р1,
+        I-2), а docker stop от шлюза не зависит; затем abort идущих сессий (его повторяет и барьер)."""
         with self._lock:
             first = not self._halt.is_set()
             if self._stop_reason is None or not self._hard.is_set():
@@ -913,9 +939,9 @@ class Runner:
                 self._stop_reason = reason
             self._halt.set()
             self._hard.set()
-        self._abort_live()
         if first:
             self._sleep_places()
+        self._abort_live()
 
     def _sleep_places(self) -> None:
         places = sorted(self.cfg.places)
@@ -1205,10 +1231,14 @@ class Runner:
         self._talk(rec, place, name, bridge_text, lambda turn: None, deadline, bridge=True)
 
     def _archive_place(self, rec: RunRecord, place: int, deadline: float) -> None:
-        """После A — все агенты места, кроме bench-uzel, в архив и ожидание их ухода (внутри срока прогона)."""
+        """После A — все агенты места, кроме bench-uzel, в архив и ожидание их ухода (внутри срока прогона). В режиме
+        нагрузки — только сохранённые этим прогоном (rec.saved): чужой агент остаётся уликой для isolation.json (R121,
+        доводка р1, I-1); сохранённый уже после abort тоже остаётся и считается чужим — ошибка в безопасную сторону."""
         try:
+            own = {s.get("name") for s in rec.saved} if self.cfg.load else None
             names = [r["name"] for r in self.stand.agent_rows(place)
-                     if isinstance(r.get("name"), str) and r["name"] != BENCH_AGENT]
+                     if isinstance(r.get("name"), str) and r["name"] != BENCH_AGENT
+                     and (own is None or r["name"] in own)]
             for name in names:
                 self.stand.archive_agent(place, name)
             for name in names:

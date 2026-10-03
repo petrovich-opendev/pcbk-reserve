@@ -30,8 +30,10 @@
   стольких пробуждений мест ответ — первый элемент status_seq, после — второй; dify_swap_seq — ответы dify_swap_mib
   по очереди (последний повторяется; умолчание 0); health — словарь поверх /health/llm или функция номера вызова
   (health_brake); historian_note — строка историана с этой note на странице; slept — пачки мест sleep_places.
-- health_brake(halt_after_calls=None, age_after_calls=None) — блок run_brake /health/llm по номеру вызова: после
-  halt_after_calls вызовов — halted, после age_after_calls[0] — age_s = age_after_calls[1].
+- health_brake(halt_after_calls=None, age_after_calls=None, limits=None) — блок run_brake /health/llm по номеру вызова:
+  после halt_after_calls вызовов — halted, после age_after_calls[0] — age_s = age_after_calls[1]. Пороги и база
+  тормоза (fail_mib, swap_base_mib, swap_grow_mib, psi_full_max) — как в конфиге прогона нагрузки (core стенда
+  выставлен по конфигу ступени, как в Б2), limits — свои поверх (расхождение LLM_RUN_* с конфигом, доводка р1 m-3).
 - FakeClock — подставные часы: mono, now (с поясом), sleep двигает время.
 - cfg(…), runner(…) — фабрики; out по умолчанию — свой каталог под OUT_BASE (автофикстура test_runner — tmp_path).
   Такт сторожа памяти нагрузки — MEM_POLL_REAL_S настоящих секунд, на подставных часах (sleep задан) — LOAD_MEM_POLL_S
@@ -663,6 +665,12 @@ class FakeStand:
                 raise RuntimeError("health down")
         run["spent_usd"] = round(float(run["spent_usd"]) + self.spent(), 6)
         extra = self.health_extra(n) if callable(self.health_extra) else self.health_extra
+        brake = extra.get("run_brake")
+        if isinstance(brake, dict):                     # core стенда выставлен по конфигу ступени (как в Б2)
+            own = {"fail_mib": cfg.mem_fail_mib or 1024, "swap_base_mib": 0 if cfg.swap_base_mib is None
+                   else cfg.swap_base_mib, "swap_grow_mib": cfg.swap_grow_mib or 512,
+                   "psi_full_max": cfg.psi_full_max or 10.0}
+            extra = {**extra, "run_brake": {**own, **brake}}
         return {"run": run, "spent_usd": run["spent_usd"], "key_spent_usd": None, **extra}
 
     def run_callers(self) -> frozenset[str]:
@@ -830,16 +838,20 @@ def fake_stand_raising(exc: BaseException) -> Iterator[None]:
         cli.connect = original
 
 
-def health_brake(halt_after_calls: int | None = None, age_after_calls: tuple[int, float] | None = None):
+BRAKE_LIMITS = ("fail_mib", "swap_base_mib", "swap_grow_mib", "psi_full_max")
+
+
+def health_brake(halt_after_calls: int | None = None, age_after_calls: tuple[int, float] | None = None,
+                 limits: dict | None = None):
     """Блок run_brake /health/llm по номеру вызова (FakeStand(health=…)): после halt_after_calls вызовов — halted,
-    после age_after_calls[0] — age_s = age_after_calls[1]; иначе watching, 2 с."""
+    после age_after_calls[0] — age_s = age_after_calls[1]; иначе watching, 2 с. Пороги и база (BRAKE_LIMITS) —
+    FakeStand ставит по конфигу прогона; limits — поверх них."""
     def block(n: int) -> dict:
         halted = halt_after_calls is not None and n > halt_after_calls
         age = float(age_after_calls[1]) if age_after_calls is not None and n > age_after_calls[0] else 2.0
         return {"run_brake": {"state": "halted" if halted else "watching", "reason": "memory" if halted else None,
-                              "avail_mib": 8000, "total_mib": 16000, "fail_mib": 1024, "swap_base_mib": 0,
-                              "swap_growth_mib": 0, "swap_grow_mib": 512, "psi_full10": 0.0, "psi_full_max": 10.0,
-                              "oom_kills": 0, "age_s": age, "halted_at": None}}
+                              "avail_mib": 8000, "total_mib": 16000, "swap_growth_mib": 0, "psi_full10": 0.0,
+                              "oom_kills": 0, "age_s": age, "halted_at": None, **dict(limits or {})}}
     return block
 
 
@@ -947,5 +959,5 @@ def write_config(tmp: Path, **patch: Any) -> Path:
 
 
 __all__ = ["FakeChat", "FakeClock", "FakeStand", "M1", "M2", "M3", "M4", "MEM_POLL_REAL_S", "OUT_BASE", "PlaceChat",
-           "T0", "cfg", "close_runners", "fake_stand_raising", "health_brake", "iso", "now", "runner", "twin_cards",
-           "write_config"]
+           "T0", "BRAKE_LIMITS", "cfg", "close_runners", "fake_stand_raising", "health_brake", "iso", "now", "runner",
+           "twin_cards", "write_config"]

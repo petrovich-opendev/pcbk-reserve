@@ -78,9 +78,11 @@ if sessions:
 print(json.dumps(rows, ensure_ascii=False))
 """
 # swap контейнеров Dify (всех не pcbk-*): пути memory.swap.current их cgroup (v2, драйвер systemd), значения — байты по
-# строке; нет файла — код cat не 0 (xargs 123) и StandError: нечитаемое — не ноль
-DIFY_SWAP_SH = ("docker ps --no-trunc --format '{{.ID}} {{.Names}}' | awk '$2 !~ /^pcbk-/ "
-                "{print \"/sys/fs/cgroup/system.slice/docker-\" $1 \".scope/memory.swap.current\"}' | xargs -r cat")
+# строке; bash -o pipefail — сбой docker ps или cat (нет файла) даёт код не 0 и StandError, а пустой вывод (контейнеров
+# не pcbk- не видно — на сервере рядом с Dify это «не вижу») — тоже StandError: нечитаемое — не ноль (доводка р1, I-3)
+_DIFY_PIPE = ("docker ps --no-trunc --format '{{.ID}} {{.Names}}' | awk '$2 !~ /^pcbk-/ "
+              "{print \"/sys/fs/cgroup/system.slice/docker-\" $1 \".scope/memory.swap.current\"}' | xargs -r cat")
+DIFY_SWAP_SH = shlex.join(["bash", "-o", "pipefail", "-c", _DIFY_PIPE])
 # живые (не archived) агенты места: argv — место
 AGENT_ROWS_PY = """\
 import json, sqlite3, sys
@@ -319,9 +321,13 @@ class ServerStand:
             self._ssh(shlex.join(["docker", "stop", "-t", str(SLEEP_STOP_S), *names]))
 
     def dify_swap_mib(self) -> int:
-        """Сумма memory.swap.current cgroup контейнеров не pcbk-*, МиБ; не прочитано — StandError."""
+        """Сумма memory.swap.current cgroup контейнеров не pcbk-*, МиБ; не прочитано или не видно ни одного — StandError
+        (слепота сторожа памяти, не ноль)."""
         total = 0
-        for line in self._ssh(DIFY_SWAP_SH, timeout=DIFY_SWAP_TIMEOUT_S).split():
+        lines = self._ssh(DIFY_SWAP_SH, timeout=DIFY_SWAP_TIMEOUT_S).split()
+        if not lines:
+            raise StandError("swap Dify: контейнеров не pcbk- не видно")
+        for line in lines:
             if not line.isdecimal():
                 raise StandError("swap Dify: значение cgroup — не число")
             total += int(line)

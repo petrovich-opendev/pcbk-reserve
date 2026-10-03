@@ -19,6 +19,8 @@ OUT/memory.jsonl (ровно MEM_KEYS). Опрос и вердикт — check()
   А1) или пометка «нет данных: swap|vmstat|давление» в note — датчик жёсткого условия без данных: это слепота, а не
   «0 убийств» и не «давление в норме» (решение контроллера 03.10, итоговое ревью Д11а I-2); swap Dify не читается
   DIFY_FAIL_LIMIT раз подряд; сторож умер;
+- data_drill (жёстко, только «без данных» — load_data none): в строке историана страницы нет пометки «учения:
+  tool_error» (core пересоздан без DRILL_DATA посреди ступени; доводка р1, m-4);
 - brake (жёстко): в /health/llm нет run_brake или его age_s > BRAKE_SILENT_S (/health/llm не прочитан — возраст
   считается от последнего прочитанного);
 - soft (мягко — memory_warn): warn по порогу и ни одного жёсткого числа.
@@ -29,7 +31,9 @@ swap_base_mib и dify_swap_base_mib конфига; null (конфиг стен�
 load-gate (R122): база B — первая точка memory.jsonl, минимум M, мест k (OUT/load.json); прирост на место P = (B − M) /
 k, прогноз на K мест B − K × P; «можно» — прогноз не ниже warn_mib + GATE_MARGIN_MIB. На старте ступени (первая точка)
 нет данных датчика жёсткого условия (поле точки — null: свободная память, swap, давление, vmstat, swap Dify) — «нельзя»
-без прогноза (start_gaps; решение контроллера 03.10).
+без прогноза (start_gaps; решение контроллера 03.10). Ступень кончилась не «закончен» (причина в OUT/load.json —
+остановка тормозом, мягкая, окно, недоделанная) — «нельзя» без прогноза: прогноз по оборванной ступени занижает прирост,
+а давление после сна мест спадает (доводка р1, I-4; причины нет — load.json не прогонщика, судят числа).
 
 load-check (R120): LOAD_CHECK_PY изнутри pcbk-core (sqlite mode=ro, белый список /app/data/whitelist.txt) — только
 числа; check_verdict судит их, снимки /health/llm начала и конца и OUT/isolation.json; цена реплики price_per_reply —
@@ -99,7 +103,7 @@ THRESHOLD_RE = re.compile(r"свободно меньше \d+ МиБ")
 
 MEM_KEYS = ("t", "checked_at", "state", "kind", "free_mib", "swap_used_mib", "swap_grow10_mib", "psi_full",
             "oom_outside", "dify_swap_mib", "brake", "brake_age_s")
-HARD_VERDICTS = ("memory", "blind", "brake")
+HARD_VERDICTS = ("memory", "data_drill", "blind", "brake")
 VERDICTS = ("ok", "soft", *HARD_VERDICTS)
 BRAKE_STATES = ("watching", "halted")
 _KINDS = {MEM_SWAP_DETAIL: "swap", MEM_OOM_OUTSIDE_DETAIL: "oom_outside", MEM_PSI_DETAIL: "psi",
@@ -126,7 +130,8 @@ class MemPoint:
     """Один опрос сторожа памяти: t — часы прогонщика; checked_at — снимок сторожа (None — страницы нет или в ней нет
     времени); state, kind — строка «Память сервера» (None — страницы или строки нет); числа note; swap Dify, МиБ;
     run_brake core. Служебные: fresh — страница прочитана, не stale и строка памяти в ней есть; no_data — датчики с
-    пометкой «нет данных: …»; health_ok — /health/llm прочитан; dify_fails — неудачных чтений swap Dify подряд."""
+    пометкой «нет данных: …»; health_ok — /health/llm прочитан; dify_fails — неудачных чтений swap Dify подряд;
+    drill — в строке историана пометка «учения: tool_error» (None — страницы нет)."""
     t: float
     checked_at: str | None
     state: str | None
@@ -143,6 +148,7 @@ class MemPoint:
     no_data: tuple[str, ...] = ()
     health_ok: bool = True
     dify_fails: int = 0
+    drill: bool | None = None
 
 
 def point_json(p: MemPoint) -> dict:
@@ -225,23 +231,28 @@ def mem_point(status: Mapping | None, health: Mapping | None, dify_swap: int | N
     brake = _text(rb.get("state")) or None if isinstance(rb, Mapping) else None
     age = _number(rb.get("age_s")) if isinstance(rb, Mapping) else None
     dify = None if isinstance(dify_swap, bool) or not isinstance(dify_swap, (int, float)) else int(dify_swap)
+    hist = _row(st, "historian")
+    drill = None if st is None else (hist is not None
+                                     and DRILL_DATA_NOTE in f"{_text(hist.get('detail'))} {_text(hist.get('note'))}")
     return MemPoint(t=float(t), checked_at=checked, state=state, kind=kind, free_mib=free, swap_used_mib=used,
                     psi_full=psi, dify_swap_mib=dify, brake=brake, brake_age_s=age, swap_grow10_mib=grow,
                     oom_outside=kills, fresh=row is not None and not st.get("stale"), no_data=no_data,
-                    health_ok=isinstance(health, Mapping))
+                    health_ok=isinstance(health, Mapping), drill=drill)
 
 
 # --- вердикт ---
 
 @dataclass(frozen=True)
 class Limits:
-    """Пороги и базы окна сторожа памяти; база None — условие «от базы» не проверяется."""
+    """Пороги и базы окна сторожа памяти; база None — условие «от базы» не проверяется; need_drill — «без данных»:
+    пометка учения tool_error обязательна на каждой странице."""
     swap_base_mib: int | None
     swap_grow_mib: int
     dify_swap_base_mib: int | None
     dify_swap_max_mib: int
     mem_fail_mib: int
     psi_full_max: float
+    need_drill: bool = False
 
 
 def limits(cfg: Any, swap_base: int | None = None, dify_base: int | None = None) -> Limits:
@@ -252,7 +263,8 @@ def limits(cfg: Any, swap_base: int | None = None, dify_base: int | None = None)
     return Limits(swap_base_mib=get("swap_base_mib", swap_base), swap_grow_mib=get("swap_grow_mib", SWAP_GROW_MIB),
                   dify_swap_base_mib=get("dify_swap_base_mib", dify_base),
                   dify_swap_max_mib=get("dify_swap_max_mib", DIFY_SWAP_MAX_MIB),
-                  mem_fail_mib=get("mem_fail_mib", MEM_FAIL_MIB), psi_full_max=float(get("psi_full_max", PSI_FULL_MAX)))
+                  mem_fail_mib=get("mem_fail_mib", MEM_FAIL_MIB), psi_full_max=float(get("psi_full_max", PSI_FULL_MAX)),
+                  need_drill=getattr(cfg, "load_data", None) == "none")
 
 
 def _psi_held(points: Sequence[MemPoint], psi_max: float) -> bool:
@@ -303,14 +315,16 @@ def _brake_silent(points: Sequence[MemPoint], cur: MemPoint, now_t: float) -> bo
 
 
 def guard_verdict(points: Sequence[MemPoint], cfg: Any, last_fresh_t: float | None, now_t: float) -> str:
-    """Вердикт сторожа памяти по точкам (последняя — текущая): memory, blind, brake (жёстко), soft или ok (см. шапку
-    модуля). cfg — конфиг прогона или Limits; last_fresh_t — часы последнего нового свежего снимка."""
+    """Вердикт сторожа памяти по точкам (последняя — текущая): memory, data_drill, blind, brake (жёстко), soft или ok
+    (см. шапку модуля). cfg — конфиг прогона или Limits; last_fresh_t — часы последнего нового свежего снимка."""
     if not points:
         return "blind"
     lim = cfg if isinstance(cfg, Limits) else limits(cfg)
     cur = points[-1]
     if _memory_hard(points, cur, lim):
         return "memory"
+    if lim.need_drill and cur.drill is False:                # «без данных» без пометки учения — данные заказчика
+        return "data_drill"
     if (cur.kind == "silent" or cur.no_data or cur.dify_fails >= DIFY_FAIL_LIMIT or last_fresh_t is None
             or now_t - last_fresh_t > LOAD_BLIND_S):
         return "blind"
@@ -561,7 +575,13 @@ def gate_from_out(out: Path, next_k: int, warn_mib: int = MEM_WARN_MIB) -> tuple
     gaps = start_gaps(lines[0])
     if gaps:
         return f"нельзя: на старте ступени нет данных датчиков: {', '.join(gaps)}", 1
-    places = json.loads((Path(out) / "load.json").read_text(encoding="utf-8")).get("places")
+    summary = json.loads((Path(out) / "load.json").read_text(encoding="utf-8"))
+    if not isinstance(summary, dict):
+        raise ValueError("load-gate: load.json — не объект")
+    reason = summary.get("reason")
+    if reason is not None and reason != "finished":
+        return f"нельзя: ступень не закончена ({reason})", 1
+    places = summary.get("places")
     if not isinstance(places, list):
         raise ValueError("load-gate: в load.json нет мест ступени")
     v = gate_verdict(points, len(places), next_k, warn_mib)

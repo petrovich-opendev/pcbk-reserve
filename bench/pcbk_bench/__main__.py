@@ -475,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
             return _load_gate(args.out, args.next_k, args.warn_mib)
         return _run(args.config)
     except RunRefused as exc:
-        print(f"RunRefused: {exc.code}", file=sys.stderr)
+        print(f"RunRefused: {exc.code}" + (f" ({exc.detail})" if exc.detail else ""), file=sys.stderr)
         return 2
     except _UsageError:
         parser.print_usage(sys.stderr)

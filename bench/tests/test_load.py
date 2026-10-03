@@ -608,9 +608,8 @@ def test_server_stand_load_methods(tmp_path):
     assert stand.dify_swap_mib() == 8
     command, timeout = ssh.calls[-1][0][2], ssh.calls[-1][1]
     assert "$2 !~ /^pcbk-/" in command and "memory.swap.current" in command and timeout == 20 and "$(" not in command
-    ssh.out = ""
-    assert stand.dify_swap_mib() == 0                                       # контейнеров Dify нет — ноль
-    for out, code in (("max\n", 0), ("", 123)):                             # не число; файла cgroup нет
+    assert command.startswith("bash -o pipefail -c ")                      # сбой docker ps — код не 0 (I-3 р1)
+    for out, code in (("max\n", 0), ("", 123), ("", 1), ("", 0)):          # не число; нет файла; docker ps; не видно
         ssh.out, ssh.code = out, code
         with pytest.raises(StandError):
             stand.dify_swap_mib()
@@ -840,3 +839,129 @@ def test_cli_load_check(tmp_path, capsys, monkeypatch):                     # R1
     (out / "health_end.json").write_text(json.dumps({**end, "run": {**end["run"], "spent_usd": 9.0}}))
     assert main(["load-check", str(cfg)]) == 1
     assert "расход прогона выше потолка и перерасхода" in capsys.readouterr().out
+
+
+
+# --- доводка р1 (ревью Б1: I-1…I-4, m-3, m-4; решения контроллера) ---
+
+def test_load_archive_keeps_foreign_agent(tmp_path):                       # I-1: чужой агент — улика, не архив
+    stand = FakeStand(health=health_brake())
+    chat = FakeChat.honest()
+    chat.on_send = lambda place, n: stand.add_agent(place, "chuzhoy") if n == 1 else None
+    r = runner(out=tmp_path, places={1: M1}, stand=stand, chat=chat, **TWIN, scenarios=("A1",))
+    assert r.run() == "finished"
+    assert (1, "chuzhoy") not in stand.archived and any(n.startswith("bench-") for _, n in stand.archived)
+    assert json.loads((tmp_path / "isolation.json").read_text())["1"]["foreign_agents"] == 1
+
+
+def test_selection_archive_unchanged(tmp_path):                             # вне нагрузки — как Д8: весь архив
+    stand = FakeStand()
+    chat = FakeChat.honest()
+    chat.on_send = lambda place, n: stand.add_agent(place, "chuzhoy") if n == 1 else None
+    r = runner(out=tmp_path, places={7: M1}, stand=stand, chat=chat, scenarios=("A1",), reps={"create": 1, "number": 1,
+                                                                                             "trap": 1})
+    r.run()
+    assert (7, "chuzhoy") in stand.archived
+
+
+def test_sleep_before_slow_aborts(tmp_path):                                # I-2: сон мест не ждёт abort через шлюз
+    at = {}
+
+    class Stand(FakeStand):
+        def sleep_places(self, places):
+            at.setdefault("sleep", time.monotonic())
+            super().sleep_places(places)
+
+    class SlowAbort:                                                        # шлюз болен: abort по 0,5 с на место
+        def __init__(self, inner):
+            self.inner = inner
+
+        def abort(self, session):
+            at.setdefault("abort", time.monotonic())
+            time.sleep(0.5)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+    r = runner(out=tmp_path, places={1: M1, 2: M1, 3: M1}, stand=Stand(health=health_brake()), **TWIN)
+    r.chats = {n: SlowAbort(c) for n, c in r.chats.items()}
+    r._live = {1: "s1", 2: "s2", 3: "s3"}
+    t0 = time.monotonic()
+    r._halt_stop("memory")
+    assert at["sleep"] - t0 < 0.4 and at["sleep"] <= at["abort"]
+
+
+def _step(tmp_path, psi, reason):
+    pts = [{"t": 60 * k, "checked_at": f"s{k}", "state": "ok", "kind": "other", "free_mib": 8000 - k,
+            "swap_used_mib": 100, "swap_grow10_mib": 0, "psi_full": v, "oom_outside": 0, "dify_swap_mib": 50,
+            "brake": "watching", "brake_age_s": 1} for k, v in enumerate(psi)]
+    (tmp_path / "memory.jsonl").write_text("".join(json.dumps(x) + "\n" for x in pts), encoding="utf-8")
+    (tmp_path / "load.json").write_text(json.dumps({"places": [1, 2], "reason": reason}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("reason,code", [("memory", 1), ("blind", 1), ("memory_warn", 1), ("window", 1),
+                                         ("finished", 0)])
+def test_load_gate_after_stopped_step_says_no(tmp_path, capsys, reason, code):    # I-4: ворота строго
+    _step(tmp_path, [0.5, 40.0, 40.0, 40.0, 0.5], reason)                   # давление спало после сна мест
+    assert main(["load-gate", str(tmp_path), "--next", "5"]) == code        # память ровная: прогноз сказал бы «можно»
+    out = capsys.readouterr().out
+    assert out.startswith(f"нельзя: ступень не закончена ({reason})") if code else "— можно" in out
+
+
+@pytest.mark.parametrize("limits,run,field", [
+    ({"swap_base_mib": 0}, {}, "swap_base_mib"),                            # забыт LLM_RUN_SWAP_BASE_MIB
+    ({"swap_base_mib": None}, {}, "swap_base_mib"),                         # core ещё не взял базу: не сверить — отказ
+    ({"fail_mib": 2048}, {}, "mem_fail_mib"),
+    ({"swap_grow_mib": 256}, {}, "swap_grow_mib"),
+    ({"psi_full_max": 20.0}, {}, "psi_full_max"),
+    ({}, {"cap_usd": 7.5}, "cap_usd"),                                     # потолок core — не потолок ступени
+])
+def test_run_limits_mismatch_refused(tmp_path, limits, run, field):        # m-3: LLM_RUN_* — как в конфиге ступени
+    stand = FakeStand(run=run, health=health_brake(limits=limits))
+    r = runner(out=tmp_path, places={1: M1}, stand=stand, **TWIN)
+    with pytest.raises(RunRefused) as e:
+        r.prepare()
+    assert (e.value.code, e.value.detail) == ("run_limits", field) and r.chats[1].fake.woke == []
+
+
+def test_run_limits_null_config_fields_not_compared(tmp_path):              # конфиг стенда: null — умолчание сторожа
+    stand = FakeStand(health=health_brake(limits={"fail_mib": 2048, "psi_full_max": 20.0}))
+    runner(out=tmp_path, places={1: M1}, stand=stand, load=True, load_data="twin", swap_base_mib=0).prepare()
+
+
+def test_cli_prints_refusal_detail(capsys, monkeypatch):
+    import pcbk_bench.__main__ as cli
+
+    def refuse(config):
+        raise RunRefused("run_limits", "swap_base_mib")
+    monkeypatch.setattr(cli, "_run", refuse)
+    assert main(["run", "config.json"]) == 2
+    assert capsys.readouterr().err.strip() == "RunRefused: run_limits (swap_base_mib)"
+
+
+DRILL = "учения: tool_error"
+
+
+@pytest.mark.parametrize("st,data,want", [
+    (status(historian=DRILL), "none", "ok"),
+    (status(historian=""), "none", "data_drill"),                           # пометка пропала посреди ступени
+    (status(historian="последняя метка 20 с назад"), "none", "data_drill"),
+    ({**status(), "checks": status()["checks"][:2]}, "none", "data_drill"),   # строки историана нет — пометки нет
+    (None, "none", "ok"),                                                   # страницы нет — дело таймера слепоты
+    (status("fail", note="свободно 900 МиБ"), "none", "memory"),           # числа памяти — первыми
+    (status(historian=""), "twin", "ok"),
+    (status(historian=""), "live", "ok"),
+])
+def test_guard_verdict_drill_note(st, data, want):                         # m-4: пометка учения — каждым опросом
+    cfg = type("Cfg", (), {**BASE, "load_data": data})
+    assert guard_verdict([mem_point(st, health(OK_BRAKE), 50, 5.0)], cfg, 0, 5) == want
+
+
+def test_drill_note_lost_mid_step_is_hard(tmp_path):                       # m-4: «без данных» без пометки — жёстко
+    drilled, plain = status(historian=DRILL), status(historian="")
+    stand = FakeStand(status_seq=[drilled, drilled, plain], health=health_brake())
+    chat = FakeChat.honest(delay_s={1: 20})                                 # ход идёт — стоп посреди него
+    r = runner(out=tmp_path, places={1: M1}, stand=stand, chat=chat, **{**TWIN, "load_data": "none"},
+               scenarios=("B3",), reps={"create": 1, "number": 1, "trap": 1})
+    started = time.monotonic()
+    assert r.run() == "data_drill" and [1] in stand.slept and time.monotonic() - started < 10
+    assert "data_drill" in STOP_REASONS
