@@ -18,11 +18,17 @@ OP_TIMEOUT_S (Г14). Сбой SQLite — StoreError без пути и знач�
 - карантин и архив переносят сам файл или саму ссылку (os.replace без следования) и никогда не перезаписывают:
   имя назначения сначала занимается пустым файлом (O_EXCL), затем os.replace поверх него.
 
+Кабинет преподавателя (Д10а, Д10-R103) — только чтение: cards(place) — карточки живых строк места (узел, инструменты,
+теги), read_file(place, name) — текст файла живого агента места (каталог места — настоящий каталог, файл —
+O_NOFOLLOW, только обычный файл до MAX_FILE_BYTES в UTF-8; иначе AgentMissing), live_counts() — живых строк по местам
+одним запросом.
+
 Только stdlib (Д7-R53, П1). Имён агентов, путей и значений полей в текстах исключений нет: тексты идут в журнал службы
 и в вывод команды администратора.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -106,6 +112,30 @@ class TooManyAgents(Exception):
 
     def __init__(self) -> None:
         super().__init__(f"у места уже {MAX_AGENTS} агентов")
+
+
+class AgentMissing(Exception):
+    """read_file: агента у места нет (нет живой строки, архивный, файла нет) или файл не годится — odd: ссылка, не
+    обычный файл, больше MAX_FILE_BYTES, не UTF-8 (шлюз пишет строку WARNING). Текст — без имени и пути."""
+
+    def __init__(self, odd: bool = False) -> None:
+        super().__init__("файл агента не годится" if odd else "агента нет")
+        self.odd = odd
+
+
+@dataclass(frozen=True)
+class AgentCard:
+    """Карточка живой строки учёта для кабинета преподавателя (Д10-R103): tools и tags — списки из JSON столбцов."""
+    place: int
+    name: str
+    title: str
+    node: str
+    purpose: str
+    tools: list[str]
+    tags: list[str]
+    state: AgentState
+    created_at: str
+    visible_at: str | None
 
 
 @dataclass(frozen=True)
@@ -194,6 +224,15 @@ def _iso(now: datetime) -> str:
 
 def _agent_name(rel: str) -> str:
     return rel[:-3] if rel.endswith(".md") else rel
+
+
+def _str_list(text: object) -> list[str]:
+    """Столбец tools или tags — JSON-список строк; иначе (правка мимо службы) — пустой список."""
+    try:
+        value = json.loads(text) if isinstance(text, str) else None
+    except (ValueError, RecursionError):
+        return []
+    return list(value) if isinstance(value, list) and all(isinstance(v, str) for v in value) else []
 
 
 def _store_error(exc: sqlite3.Error) -> StoreError:
@@ -665,6 +704,75 @@ class AgentStore:
             rows = db.execute("SELECT place, name, title, purpose, state, created_at, visible_at FROM agents"
                               f" WHERE {_LIVE} ORDER BY id", (place,)).fetchall()
         return [AgentRow(*row) for row in rows]
+
+    # --- кабинет преподавателя (Д10-R103): только чтение ---
+
+    def cards(self, place: int) -> list[AgentCard]:
+        """Живые (неархивные) строки места в порядке записи — карточки с узлом, инструментами и тегами."""
+        _check_place(place)
+        with self._op() as db:
+            rows = db.execute("SELECT place, name, title, node, purpose, tools, tags, state, created_at, visible_at"
+                              f" FROM agents WHERE {_LIVE} ORDER BY id", (place,)).fetchall()
+        return [AgentCard(p, name, title, node, purpose, _str_list(tools), _str_list(tags), state, created, visible)
+                for p, name, title, node, purpose, tools, tags, state, created, visible in rows]
+
+    def live_counts(self) -> dict[int, int]:
+        """Живых (неархивных) строк по местам одним запросом; мест без строк в ответе нет."""
+        with self._op() as db:
+            rows = db.execute("SELECT place, count(*) FROM agents WHERE state != 'archived' GROUP BY place").fetchall()
+        return {place: count for place, count in rows}
+
+    def read_file(self, place: int, name: str) -> str:
+        """Текст файла живого агента места (Д10-R103), только чтение.
+
+        Нет живой строки места с этим именем (архивный, неизвестный, имя не по правилам) или файла нет — AgentMissing.
+        Каталог места — настоящий каталог (_place_base, m-12), открывается O_DIRECTORY | O_NOFOLLOW, файл — относительно
+        него с O_NOFOLLOW | O_NONBLOCK (FIFO не держит поток): каталог места — ссылка или не открывается —
+        DirUnavailable; файл — ссылка, не обычный файл, больше MAX_FILE_BYTES или не UTF-8 — AgentMissing(odd=True).
+        Прочие ошибки чтения файла — DirUnavailable. Сбой SQLite — StoreError."""
+        _check_place(place)
+        if not _valid_name(name):
+            raise AgentMissing()
+        with self._op() as db:
+            row = db.execute(f"SELECT 1 FROM agents WHERE name = ? AND {_LIVE}", (name, place)).fetchone()
+        if row is None:
+            raise AgentMissing()
+        base = self._place_base(place)
+        try:
+            dfd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise DirUnavailable(f"{DIR_PLACE} ({type(exc).__name__})") from None
+        try:
+            try:
+                fd = os.open(f"{name}.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+            except FileNotFoundError:
+                raise AgentMissing() from None
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENXIO, errno.EISDIR, errno.ENOTDIR):     # ссылка, сокет, …
+                    raise AgentMissing(odd=True) from None
+                raise DirUnavailable(f"{DIR_PLACE} ({type(exc).__name__})") from None
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES:
+                    raise AgentMissing(odd=True)
+                data = bytearray()
+                while len(data) <= MAX_FILE_BYTES:      # файл мог вырасти после fstat: дальше предела + 1 не читаем
+                    chunk = os.read(fd, MAX_FILE_BYTES + 1 - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError as exc:
+                raise DirUnavailable(f"{DIR_PLACE} ({type(exc).__name__})") from None
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dfd)
+        if len(data) > MAX_FILE_BYTES:
+            raise AgentMissing(odd=True)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise AgentMissing(odd=True) from None
 
     def stray_files(self, place: int) -> tuple[str, ...]:
         """Прочие не-каталоги места — не *.md и не ссылки (временные файлы оборванной записи, любые другие файлы), пути

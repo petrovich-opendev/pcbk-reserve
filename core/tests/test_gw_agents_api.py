@@ -16,7 +16,7 @@ from pcbk_core.gateway.api import GW_MESSAGES
 
 REPO = Path(__file__).resolve().parents[2]      # m11: в helpers его нет; чистая копия — с student (и web)
 EGRESS = ("172.31.250.81", 40000)               # pcbk-egress — не front
-TEACHER_TEXT = "Агенты студентов для преподавателя — в следующих выпусках стенда"
+TEACHER_TEXT = "Агенты студентов — в кабинете преподавателя, только на чтение"      # Д10-R100
 
 
 @pytest.fixture

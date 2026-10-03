@@ -79,7 +79,7 @@ GW_MESSAGES = {
     "store": "Учётные записи недоступны — повторите позже",
 }
 ERROR_NAMES = {400: "BadRequest", 401: "Unauthorized", 403: "Forbidden", 404: "NotFound", 405: "MethodNotAllowed",
-               429: "TooManyAttempts", 503: "Unavailable"}
+               409: "Conflict", 429: "TooManyAttempts", 502: "BadGateway", 503: "Unavailable"}   # 409, 502 — Д10-R100
 CONFIG_ERROR_SHOWN = 60                 # знаков причины в ответе 503 «Шлюз не настроен: …»
 
 # удаления cookie (Д5-R25, Д5-R30): пути не длиннее самого длинного пути белого списка, не больше трёх

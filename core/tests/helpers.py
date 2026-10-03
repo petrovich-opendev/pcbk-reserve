@@ -587,14 +587,40 @@ def make_gateway(tmp_path, **kw) -> tuple[FastAPI, GatewayRole]:
     return app, role
 
 
-def teacher_gateway(tmp_path, *, ready: Sequence[int] = (3,), **gw_overrides) -> tuple[FastAPI, GatewayRole]:
+# разговор места 03 для кабинета преподавателя (Д10а, задача А3): один вопрос и один ответ, вид — как у
+# web/tests/chatGateway.ts (OpenCode 1.18.33); теги — только 20FAKE_*
+TEACHER_SES = "ses_" + "teacher0123456789abcdefgh".ljust(26, "Z")
+TEACHER_SESSION = {"id": TEACHER_SES, "slug": "s", "projectID": "p", "directory": "/work",
+                   "title": "Значение 20FAKE_001_PV", "version": "1.18.33", "time": {"created": 1, "updated": 3}}
+TEACHER_HISTORY = [
+    {"info": {"id": "msg_t1", "sessionID": TEACHER_SES, "role": "user", "time": {"created": 1}, "agent": "pomoshnik",
+              "model": {"providerID": "openrouter", "modelID": "m"}},
+     "parts": [{"id": "prt_msg_t1", "sessionID": TEACHER_SES, "messageID": "msg_t1", "type": "text",
+                "text": "что сейчас на 20FAKE_001_PV"}]},
+    {"info": {"id": "msg_t2", "sessionID": TEACHER_SES, "role": "assistant", "time": {"created": 2, "completed": 3},
+              "parentID": "msg_t1", "modelID": "m", "providerID": "openrouter", "mode": "pomoshnik",
+              "agent": "pomoshnik", "path": {"cwd": "/work", "root": "/work"}, "cost": 0,
+              "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "finish": "stop"},
+     "parts": [{"id": "prt_msg_t2", "sessionID": TEACHER_SES, "messageID": "msg_t2", "type": "text",
+                "text": "Готово: 12,5"}]},
+]
+
+
+def teacher_gateway(tmp_path, *, ready: Sequence[int] = (3,), oc: FakePlaces | None = None,
+                    **gw_overrides) -> tuple[FastAPI, GatewayRole]:
     """Шлюз кабинета преподавателя (Д10а, задача А2; m-1): роль llm с долями мест на том же core.db (без ключа
     OpenRouter, учение долей — DRILL_TEACHER из gw_overrides, как в build_roles), доли открыты здесь (роль llm в
     приложение шлюза не входит, её lifespan не идёт; итог open() не проверяется — тест «доли не загрузились» его
-    подменяет), затем make_gateway(…, llm=…, ready=ready, **gw_overrides). Место 03 по умолчанию готово."""
+    подменяет), затем make_gateway(…, llm=…, ready=ready, **gw_overrides). Место 03 по умолчанию готово.
+
+    Задача А3: у двойника мест (oc или новый FakePlaces) место 03 держит разговор TEACHER_SES с сообщениями
+    TEACHER_HISTORY — его читает кабинет."""
     llm = make_llm_role(tmp_path, key=None, shares=True, shares_drill=gw_overrides.get("DRILL_TEACHER", ""))
     llm.shares.open()
-    return make_gateway(tmp_path, llm=llm, ready=ready, **gw_overrides)
+    oc = FakePlaces() if oc is None else oc
+    oc.sessions.setdefault(3, [TEACHER_SESSION])
+    oc.messages.setdefault((3, TEACHER_SES), TEACHER_HISTORY)
+    return make_gateway(tmp_path, llm=llm, ready=ready, oc=oc, **gw_overrides)
 
 
 def login(c, name: str, pw: str = PW, **headers) -> httpx.Response:

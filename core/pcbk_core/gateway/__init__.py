@@ -38,6 +38,11 @@ lifespan через asyncio.to_thread при любой настройке: не
 (llm.shares.verify с центами, по которым отказывает прокси, — budget.share_of, I-7) и пульс журнала (teacher_log.ping).
 При config_error уборщик не стартует, сверки нет, и строка сторожа — «неизвестно» (m-13).
 
+Ручки кабинета (задача А3, Д10-R100…R104) — тот же teacher_router под /pcbk/api/teacher/: обзор, журнал, разговоры и
+агенты места только на чтение, пробуждение обычным запуском места, перевод доли и «Остановить место»; роль проверяет
+каждая ручка на сервере. Ворота кабинета teacher_gate (TeacherGate) — у роли: чтений кабинета к одному месту не больше
+TEACHER_PARALLEL разом (свои соединения клиента места — places.PLACE_CONNECTIONS).
+
 Модули accounts, agents_api, api, calc_api, proxy, teacher_api и web (а через них — accounts) здесь импортируются только
 внутри методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
 загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
@@ -237,6 +242,7 @@ class GatewayRole(RoleBase):
                  calc: DataService | None = None, llm: LlmRole | None = None):
         from .accounts import LOCK_WINDOW_S
         from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
+        from .teacher_api import TeacherGate
         from .web import WebReports
 
         self.settings = settings
@@ -264,6 +270,8 @@ class GatewayRole(RoleBase):
         self.llm: LlmRole | None = llm
         self.teacher_log = TeacherLog(settings.DB_PATH, drill=gw.DRILL_TEACHER,
                                       clock=lambda: self.wallclock().timestamp())
+        # ворота кабинета (Д10-R102): чтений кабинета к месту — не больше TEACHER_PARALLEL разом, ждущих — TEACHER_QUEUE
+        self.teacher_gate = TeacherGate()
         self._teacher_lock = threading.Lock()   # такт уборщика и ручной такт (тесты) не перекрываются
         self._shares_seen: tuple[bool, int] = (True, 0)   # (ok, drift) прошлой сверки: строка журнала — на смену
         # учёт агентов шлюза (Д7-R53: свой AgentStore на тот же core.db) и воркер перезагрузки (Д7-R58)

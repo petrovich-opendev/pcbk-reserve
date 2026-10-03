@@ -660,7 +660,8 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
 
   const proxied = ["/pcbk/api/auth/", "/pcbk/api/auth/me", "/pcbk/api/auth/notice", "/pcbk/api/workplace",
                    "/pcbk/api/workplace/wake", "/pcbk/api/agents",                      // «Мои агенты» (Д7б, Д7-R64)
-                   "/pcbk/api/calc/"];                                                  // калькуляторы (Д9а, Д9-R87)
+                   "/pcbk/api/calc/",                                                   // калькуляторы (Д9а, Д9-R87)
+                   "/pcbk/api/teacher/"];                                               // кабинет (Д10-R105)
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
   const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
@@ -733,11 +734,17 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.equal(loc(calc).exact, false);
     assert.equal(locs.filter((l) => l.port === 8443 && l.path === calc).length, 1);
     assert.equal(flat(calc), flat("/pcbk/api/workplace"));
+    // Д10-R105: кабинет — префикс, копия пределов ручек места; заглушка — 404 JSON
+    const teacher = "/pcbk/api/teacher/";
+    assert.equal(loc(teacher).exact, false);
+    assert.equal(locs.filter((l) => l.port === 8443 && l.path === teacher).length, 1);
+    assert.equal(flat(teacher), flat("/pcbk/api/workplace"));
   }
   assert.ok(loc("/pcbk/api/").body.includes("if ($pcbk_bad_api_uri) { return 400"));
   assert.match(loc("/pcbk/api/").body, /return 404 '\{"name":"NotFound"/);
   for (const [path, code] of [["/pcbk/api", 404], ["/pcbk/api/auth", 404], ["/pcbk/api/oc", 403],
-                              ["/pcbk/api/calc", 404]]) {                               // Д9а, m7: калькуляторы
+                              ["/pcbk/api/calc", 404],                                  // Д9а, m7: калькуляторы
+                              ["/pcbk/api/teacher", 404]]) {                            // Д10-R105: кабинет
     assert.ok(loc(path)?.exact, path);                                                  // без «/» — не 301 HTML
     assert.match(loc(path).body, new RegExp(`return ${code} '\\{"name":"`), path);
   }

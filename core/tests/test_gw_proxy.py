@@ -277,7 +277,7 @@ def test_messages_shared_with_rules():                                          
     assert PROXY_MESSAGES["not_whitelisted"] is RULE_MESSAGES["not_whitelisted"]
     assert PROXY_MESSAGES == {
         "not_whitelisted": "Вызов не разрешён",
-        "teacher": "Просмотр разговоров студентов — в следующих выпусках стенда",
+        "teacher": "Преподаватель читает разговоры студентов в кабинете — писать в них нельзя",     # Д10-R100
         "not_ready": "Рабочее место спит — разбудите его на странице входа",
         "no_answer": "Рабочее место не отвечает — разбудите его на странице входа",
         "place_auth": "Рабочее место не приняло пароль шлюза — сообщите администратору",

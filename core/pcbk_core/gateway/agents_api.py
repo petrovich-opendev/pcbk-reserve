@@ -10,8 +10,9 @@ GET /pcbk/api/agents — панель «Агенты» чата (Д7-R64, R65): 
   настроен: …») → сессия (401, сбой базы учёток — 503 store); проверки источника у GET нет. agents_router включён в
   GatewayRole.router без общих guarded, поэтому front_only и configured(role) стоят у самого маршрута (предпроверка
   Д7б, m24): иначе при config_error ручка отвечала бы. Неизвестный метод — 404 без Allow тем же обработчиком.
-- У преподавателя места нет — 403 «Агенты студентов для преподавателя — в следующих выпусках стенда», учёт не
-  читается. Место — только account.place учётки сессии; параметров и заголовков места у ручки нет (Review Focus 2).
+- У преподавателя места нет — 403 «Агенты студентов — в кабинете преподавателя, только на чтение» (Д10-R100: агентов
+  студентов преподаватель читает в кабинете, /pcbk/api/teacher/), учёт не читается. Место — только account.place учётки
+  сессии; параметров и заголовков места у ручки нет (Review Focus 2).
 - Сначала IMAGE_AGENTS — встроенные агенты образа места (student/config/agent/*.md), оба ready; названия совпадают с
   BUILTIN_AGENT_TITLES веба (web/src/texts.ts) и с description файлов образа. Затем строки учёта места
   (AgentStore.list_place — без archived, старые первыми): visible → ready, saved → pending, not_visible и quarantined
@@ -48,7 +49,7 @@ IMAGE_AGENTS: tuple[tuple[str, str, str], ...] = (
 )
 # состояние строки учёта → состояние панели; archived list_place не отдаёт, прочее — broken (не выбирается)
 OWN_STATES = {"visible": "ready", "saved": "pending", "not_visible": "broken", "quarantined": "broken"}
-TEACHER_TEXT = "Агенты студентов для преподавателя — в следующих выпусках стенда"
+TEACHER_TEXT = "Агенты студентов — в кабинете преподавателя, только на чтение"      # Д10-R100
 
 
 def agents_json(rows: list[AgentRow]) -> dict:
