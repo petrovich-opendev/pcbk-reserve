@@ -1,4 +1,5 @@
-// Фазы чата (Д6-R39, R42, R44): вход, преподаватель (кабинет, Д10-R106), пробуждение места, «место спит», выход.
+// Фазы чата (Д6-R39, R42, R44): вход, преподаватель (кабинет, Д10-R106; вкладки кабинета — Д10-R110), пробуждение места,
+// «место спит», выход.
 // api, teacherApi и ChatImpl подменены; startPolling — заглушка, отдающая вид «ok»; опрос места — pollMs (M11).
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useEffect } from "react";
@@ -7,7 +8,7 @@ import { App } from "../src/App";
 import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import type { startStatusPolling } from "../src/status";
-import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_NOTICE_UNKNOWN } from "../src/texts";
+import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_NOTICE_UNKNOWN, T_TCH_UNKNOWN, T_UNKNOWN } from "../src/texts";
 import { OVERVIEW_READY_03, teacherApi } from "./teacherFixtures";
 
 type Answer = [number, unknown];
@@ -401,17 +402,57 @@ test("tabs_on_workplace_and_asleep_screens", async () => {                      
   expect(screen.getByRole("heading", { name: "Калькуляторы БДРВ — те же расчёты, что у агентов" })).toBeTruthy();
 });
 
-test("no_tabs_for_teacher_and_notice", async () => {
-  const { unmount } = render(<App api={api({ me: [200, { login: "t", role: "teacher", place: null }] })}
-                                  teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })}
-                                  navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+// --- Д10б: вкладки «Кабинет» и «Калькуляторы» у преподавателя (Д10-R110, Д10-R109) ---
+
+test("teacher_has_cabinet_and_calc_tabs", async () => {
+  const a = api({ me: [200, { login: "t", role: "teacher", place: null }] });
+  render(<App api={a} teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })} navigate={vi.fn()}
+              ChatImpl={FakeChat} startPolling={okPolling} />);
   await screen.findByText("Кабинет преподавателя");
-  expect(screen.queryByRole("button", { name: "Калькуляторы" })).toBeNull();
-  unmount();
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  expect(screen.getByRole("heading", { name: "Калькуляторы БДРВ — те же расчёты, что у агентов" })).toBeTruthy();
+  expect(screen.queryByTestId("fake-chat")).toBeNull();
+  expect(a.wake).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Кабинет" }));
+  expect(screen.getByText("Кабинет преподавателя")).toBeTruthy();
+});
+
+// Д9 no_tabs_for_teacher_and_notice (правлен в А4) → notice_has_no_tabs (m-6 р2): у преподавателя вкладки теперь есть
+// (тест выше), у студента в фазе предупреждения — по-прежнему нет
+test("notice_has_no_tabs", async () => {
   render(<App api={api({ me: [200, { login: "s", role: "student", place: "03", notice: "teacher-reads-1" }] })}
-              navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);          // m-12 Д9: фаза предупреждения
+              navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
   await screen.findByRole("button", { name: "Понятно" });
   expect(screen.queryByRole("button", { name: "Калькуляторы" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Кабинет" })).toBeNull();
+});
+
+test("teacher_tabs_keep_cabinet_mounted_and_calc_goes_through_gateway", async () => {   // сверх брифа
+  // кабинет на вкладке калькуляторов только спрятан: обзор не спрашивается заново; калькулятор — api.calc (шлюз сам
+  // считает вызывающим teacher, R109), 401 вкладки — на вход; вкладки «Чат» у преподавателя нет
+  const navigate = vi.fn();
+  const a = api({ me: [200, { login: "t", role: "teacher", place: null }], calc: [401, { name: "Unauthorized" }] });
+  const t = teacherApi({ overview: [200, OVERVIEW_READY_03] });
+  render(<App api={a} teacherApi={t} navigate={navigate} ChatImpl={FakeChat} startPolling={okPolling} />);
+  const title = await screen.findByText("Кабинет преподавателя");
+  expect(screen.getByRole("button", { name: "Кабинет" }).getAttribute("aria-pressed")).toBe("true");
+  expect(screen.getByRole("button", { name: "Калькуляторы" }).getAttribute("aria-pressed")).toBe("false");
+  expect(screen.queryByRole("button", { name: "Чат" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  expect(screen.getByRole("button", { name: "Калькуляторы" }).getAttribute("aria-pressed")).toBe("true");
+  expect(title.closest("[hidden]")).not.toBeNull();                                // спрятан, не снят
+  fireEvent.click(screen.getByRole("button", { name: "Кабинет" }));
+  expect(screen.getByText("Кабинет преподавателя")).toBe(title);
+  expect(title.closest("[hidden]")).toBeNull();
+  expect(t.overview).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
+  expect(a.calc).toHaveBeenCalledTimes(1);
+  expect(a.wake).not.toHaveBeenCalled();
+  expect(a.workplace).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "Кабинет" })).toBeNull();          // ушли на вход — вкладок нет
 });
 
 test("calc_tab_crash_reports_and_keeps_chat", async () => {                       // m5 критики р1
@@ -445,4 +486,28 @@ test("calc_tab_signed_out_goes_to_login_and_survives_switch", async () => {
   await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
   expect(a.calc).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("button", { name: "Калькуляторы" })).toBeNull();      // ушли на вход — вкладок нет
+});
+
+// --- итоговая доводка Д10б ---
+
+test("calc_tab_fallback_text_is_for_teacher_only", async () => {        // итоговое ревью Д10б, m-4
+  // ответ без текста на вкладке калькуляторов: у преподавателя — текст кабинета, у студента — прежний текст чата
+  const odd = [418, { odd: true }] as Answer;
+  const t = api({ me: [200, { login: "t", role: "teacher", place: null }], calc: odd });
+  const first = render(<App api={t} teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })} navigate={vi.fn()}
+                            ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText("Кабинет преподавателя");
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(await screen.findByText(T_TCH_UNKNOWN)).toBeTruthy();
+  expect(screen.queryByText(/сообщите преподавателю/)).toBeNull();
+  first.unmount();
+  const s = api({ me: student, workplace: [200, { state: "ready" }], calc: odd });
+  render(<App api={s} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(await screen.findByText(T_UNKNOWN)).toBeTruthy();
 });

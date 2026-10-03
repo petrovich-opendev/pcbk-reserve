@@ -20,7 +20,10 @@
 // перемонтирует только её, чат не трогается.
 // Преподаватель (Д10-R106): фаза teacher рисует кабинет (TeacherPage) в своей ErrorBoundary с текстами кабинета; ни места
 // студента, ни чата, ни одного вызова /pcbk/api/oc; вызовы кабинета — teacherApi (по умолчанию createTeacherApi()).
-// Вкладок шапки у преподавателя в Д10а нет (они придут в Д10б).
+// Вкладки преподавателя (Д10-R110): в фазе teacher — «Кабинет» и «Калькуляторы». Кабинет, как чат студента, не снимается:
+// вкладка калькуляторов его только прячет (окно пароля учётки и открытое место живы). «Калькуляторы» — тот же CalcPage
+// Д9 через api.calc; вызывающего (teacher, канал web) шлюз определяет сам по роли сессии (Д10-R109). Запасной текст
+// вкладки у преподавателя — кабинетный T_TCH_UNKNOWN, не «…сообщите преподавателю» (итоговое ревью Д10б, m-4).
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
 import { CalcPage, type CalcPageProps } from "./components/CalcPage";
@@ -33,7 +36,7 @@ import { WorkplaceScreen } from "./components/WorkplaceScreen";
 import { startStatusPolling } from "./status";
 import { createTeacherApi, type TeacherApi } from "./teacherApi";
 import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TCH_CRASH, T_TCH_RESTART,
-         T_UNKNOWN, T_WAKE } from "./texts";
+         T_TCH_UNKNOWN, T_UNKNOWN, T_WAKE } from "./texts";
 import { placeView, type Timers } from "./workplace";
 
 export interface AppProps {
@@ -88,7 +91,7 @@ export function App(p: AppProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [who, setWho] = useState<Who | null>(null);
   const [attempt, setAttempt] = useState(0);            // «Повторить» после сбоя /me
-  const [view, setView] = useState<View>("chat");        // открытая вкладка (Д9-R88)
+  const [view, setView] = useState<View>("main");        // открытая вкладка (Д9-R88, Д10-R110)
   const [calcOpened, setCalcOpened] = useState(false);   // вкладку калькуляторов уже открывали — она смонтирована
   const props = useRef(p);
   props.current = p;
@@ -252,8 +255,11 @@ export function App(p: AppProps) {
   }
 
   const header = phase.kind !== "loading" && !(phase.kind === "leaving" && who === null);
-  // вкладки — только у студента и только в фазах места и чата: калькуляторы ходят в шлюз, не на место
-  const tabs = who?.role === "student" && (phase.kind === "workplace" || phase.kind === "asleep" || phase.kind === "chat");
+  // вкладки — у студента в фазах места и чата, у преподавателя в фазе кабинета (не в предупреждении, ошибке и уходе):
+  // калькуляторы ходят в шлюз, не на место
+  const teacher = who?.role === "teacher";
+  const tabs = (who?.role === "student" && (phase.kind === "workplace" || phase.kind === "asleep" || phase.kind === "chat"))
+    || (teacher && phase.kind === "teacher");
   const showView = (v: View): void => {
     setView(v);
     if (v === "calc") setCalcOpened(true);
@@ -263,7 +269,7 @@ export function App(p: AppProps) {
       {header && (
         <Header login={who?.login ?? null} ownPlace={who?.place ?? null} startPolling={startPolling}
                 onLogout={() => void logout()} leaving={phase.kind === "leaving"} view={tabs ? view : null}
-                onView={showView} />
+                teacher={teacher} onView={showView} />
       )}
       <main className="main">
         {/* обёртка — во всех фазах: смена фазы не перемонтирует чат, вкладка калькуляторов его только прячет */}
@@ -271,7 +277,7 @@ export function App(p: AppProps) {
         {tabs && calcOpened && (
           <div className="view" hidden={view !== "calc"}>
             <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_CALC_CRASH} restartText={T_CALC_RESTART}>
-              <CalcImpl api={p.api} onSignedOut={goLogin} />
+              <CalcImpl api={p.api} onSignedOut={goLogin} unknownText={teacher ? T_TCH_UNKNOWN : undefined} />
             </ErrorBoundary>
           </div>
         )}

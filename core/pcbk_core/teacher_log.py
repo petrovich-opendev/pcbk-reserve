@@ -3,8 +3,8 @@
 Строка пишется до доступа к данным студента (чтения, пробуждение — requested) или вместе с изменением (доля — в
 транзакции Shares.apply, insert_action). Нет строки — нет действия. В строке только коды, номера мест, id разговоров,
 имена агентов, логины и числа (центы): ни текстов разговоров и агентов, ни паролей — значения проверяются на входе
-(ValueError: это ошибка кода, а не среды). Строки не удаляются никогда; ограничения CHECK на action нет — Д10б добавит
-действия учёток (account_*), не переделывая таблицу.
+(ValueError: это ошибка кода, а не среды). Строки не удаляются никогда; ограничения CHECK на action нет — действия учёток
+Д10б (account_*, Д10-R108) добавлены в ACTIONS без переделки таблицы.
 
 Модуль верхнего уровня, только stdlib: его берут роль llm (доли), шлюз (кабинет) и команда администратора
 (python -m pcbk_core.gateway.accounts journal) — пакет gateway он не тянет.
@@ -37,8 +37,10 @@ JOURNAL_DRILL = "journal_down"
 SQLITE_TIMEOUT_S = 2.0
 RECENT_MAX = 1000                      # строк за одно чтение (команда journal --last — 1…1000)
 
-# действия кабинета Д10а; Д10б добавит account_add, account_passwd, account_disable, account_enable, account_unlock
-ACTIONS = frozenset({"sessions", "read", "agents", "agent", "wake", "shares"})
+# действия кабинета: Д10а — чтения, пробуждение, доли; Д10б (R108) — учётки студентов. Словарь — договор с вебом
+# (ACTION_LABELS кабинета — ровно эти ключи); при записи он не проверяется (ревью Б1+Б2, M-3)
+ACTIONS = frozenset({"sessions", "read", "agents", "agent", "wake", "shares",
+                     "account_add", "account_passwd", "account_disable", "account_enable", "account_unlock"})
 OUTCOMES = frozenset({"requested", "ok", "refused", "error", "started"})
 FINAL_OUTCOMES = frozenset({"ok", "refused", "error"})      # итог finish() строки started
 

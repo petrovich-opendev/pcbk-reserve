@@ -1,6 +1,7 @@
 // @vitest-environment node
 // Кабинет преподавателя (Д10-R106): чистые помощники — разбор ответов R101–R104, деньги, перевод доли — и пути и тела
 // вызовов TeacherApi.
+import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { ACTION_LABELS, fmtCents, parseAgents, parseJournal, parseMoney, parseOverview, parseSessions, parseTranscript,
          transferChanges } from "../src/teacher";
@@ -89,7 +90,11 @@ test("sessions_transcript_agents_journal_shapes", () => {
   expect(parseJournal({ rows: [{ ...JOURNAL_ROWS.rows[1], id: "2" }] })).toBeNull();
   expect(ACTION_LABELS).toEqual({ sessions: "открыл список разговоров", read: "прочитал разговор",
                                   agents: "открыл список агентов", agent: "прочитал инструкцию агента",
-                                  wake: "разбудил место", shares: "перевёл долю" });
+                                  wake: "разбудил место", shares: "перевёл долю",
+                                  // действия учёток Д10б (R108)
+                                  account_add: "завёл учётку студента", account_passwd: "выдал новый пароль",
+                                  account_disable: "отключил учётку", account_enable: "включил учётку",
+                                  account_unlock: "снял замок входа" });
 });
 
 test("teacher_api_paths_and_bodies", async () => {
@@ -128,4 +133,13 @@ test("teacher_api_paths_and_bodies", async () => {
     expect(r.status).toBe(400);
   }
   expect(calls.length).toBe(before);
+});
+
+test("action_labels_are_exactly_core_actions", () => {                // ревью Б1+Б2, M-3: договорный словарь журнала
+  // ACTIONS журнала действий ядра (teacher_log.py) и подписи кабинета — один и тот же набор кодов
+  const src = readFileSync("../core/pcbk_core/teacher_log.py", "utf8");
+  const block = /^ACTIONS = frozenset\(\{([^}]*)\}\)$/m.exec(src)?.[1];
+  expect(block).toBeDefined();
+  const actions = [...block!.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]).sort();
+  expect(actions).toEqual(Object.keys(ACTION_LABELS).sort());
 });

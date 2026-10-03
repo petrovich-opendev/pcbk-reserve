@@ -2,7 +2,10 @@
 // (Д9-R87). При открытии ничего не спрашивает — только по кнопкам «Найти тег» и «Посчитать». Числа — значения ответа
 // службы как есть (fmtNum: ru-RU, не больше 3 знаков, малое ненулевое — 3 значащие цифры, не «0»; нет значения — «—»);
 // под числами всегда — период с поясом, источник, вид среднего и заметки дословно. Отказ службы — её message, элемент
-// не ok — его text; 401 — конец сессии (onSignedOut), прочие не 200 — replyText. Разметка — договор с интеграцией А7:
+// не ok — его text; 401 — конец сессии (onSignedOut), прочие не 200 — replyText. Запасной текст «неожиданный ответ» —
+// пропс unknownText (по умолчанию T_UNKNOWN чата студента «…сообщите преподавателю»): у преподавателя App даёт свой
+// текст кабинета (итоговое ревью Д10б, m-4 — отступление от буквы R110 «CalcPage без правок» ради честного текста).
+// Разметка — договор с интеграцией А7:
 // поля #calc-query, #calc-tag, #calc-mode, #calc-period, #calc-from, #calc-to, #calc-points, список .calc-matches,
 // график svg.profile, итог section.calc-result.
 // Стили — только классы chat.css: атрибутов style нет (CSP style-src 'self').
@@ -18,6 +21,7 @@ import { CALC_LABELS as L, T_CALC_ASOF_LINE, T_CALC_BAD_RANGE, T_CALC_BUSY, T_CA
 export interface CalcPageProps {
   api: Api;
   onSignedOut(): void;
+  unknownText?: string;                 // запасной текст: нет текста ответа или ответ не той формы (T_UNKNOWN)
 }
 
 type Obj = Record<string, unknown>;
@@ -34,10 +38,13 @@ const CHART_H = 160;
 // ответ шлюза → тело службы, текст для человека или конец сессии
 type Outcome = { kind: "body"; body: Obj } | { kind: "text"; text: string } | { kind: "signed_out" };
 
-function outcomeOf(r: Reply): Outcome {
+function outcomeOf(r: Reply, fallback: string): Outcome {
   if (r.status === 401) return { kind: "signed_out" };
-  if (r.status !== 200) return { kind: "text", text: replyText(r) };
-  return isObject(r.body) ? { kind: "body", body: r.body } : { kind: "text", text: T_UNKNOWN };
+  if (r.status !== 200) {
+    const text = replyText(r);
+    return { kind: "text", text: text === T_UNKNOWN ? fallback : text };
+  }
+  return isObject(r.body) ? { kind: "body", body: r.body } : { kind: "text", text: fallback };
 }
 
 const answered = (body: Obj): boolean => body.status === "ok" || body.status === "partial";
@@ -47,9 +54,9 @@ type Search = { kind: "none" } | { kind: "text"; text: string } | { kind: "match
 type Result = { kind: "none" } | { kind: "text"; text: string } | { kind: "answer"; tool: CalcTool; body: Obj };
 
 // ответ catalog_search → строки «тег — описание — единица» (I2)
-function searchOf(o: Outcome): Search {
-  if (o.kind !== "body") return { kind: "text", text: o.kind === "text" ? o.text : T_UNKNOWN };
-  if (!answered(o.body)) return { kind: "text", text: str(o.body.message) ?? T_UNKNOWN };
+function searchOf(o: Outcome, fallback: string): Search {
+  if (o.kind !== "body") return { kind: "text", text: o.kind === "text" ? o.text : fallback };
+  if (!answered(o.body)) return { kind: "text", text: str(o.body.message) ?? fallback };
   const matches: Match[] = [];
   for (const m of objects(o.body.matches)) {
     const tag = str(m.tag);
@@ -177,13 +184,13 @@ function numbersOf(tool: CalcTool, item: Obj): ReactNode {
   }
 }
 
-function Item({ tool, item }: { tool: CalcTool; item: Obj }) {
+function Item({ tool, item, fallback }: { tool: CalcTool; item: Obj; fallback: string }) {
   const tag = str(item.tag) ?? "—";
   if (item.status !== "ok") {
     return (
       <p className="calc-off">
         <span className="calc-tag">{tag}</span>
-        <span>{str(item.text) ?? T_UNKNOWN}</span>
+        <span>{str(item.text) ?? fallback}</span>
       </p>
     );
   }
@@ -225,11 +232,11 @@ function About({ tool, body }: { tool: CalcTool; body: Obj }) {
   );
 }
 
-function Answer({ tool, body }: { tool: CalcTool; body: Obj }) {
+function Answer({ tool, body, fallback }: { tool: CalcTool; body: Obj; fallback: string }) {
   return (
     <>
-      {!answered(body) && <p className="calc-msg" role="alert">{str(body.message) ?? T_UNKNOWN}</p>}
-      {objects(body.items).map((item, i) => <Item key={i} tool={tool} item={item} />)}
+      {!answered(body) && <p className="calc-msg" role="alert">{str(body.message) ?? fallback}</p>}
+      {objects(body.items).map((item, i) => <Item key={i} tool={tool} item={item} fallback={fallback} />)}
       <About tool={tool} body={body} />
     </>
   );
@@ -245,6 +252,7 @@ export function CalcPage(p: CalcPageProps) {
   const [result, setResult] = useState<Result>({ kind: "none" });
   const props = useRef(p);
   props.current = p;
+  const fallback = p.unknownText ?? T_UNKNOWN;
   const alive = useRef(true);
   const inFlight = useRef({ search: false, run: false });       // второе нажатие, пока ответ в пути, не уходит
 
@@ -258,7 +266,7 @@ export function CalcPage(p: CalcPageProps) {
   // вызов шлюза; null — вкладку сняли, пока ответ был в пути: состояние не трогаем
   const call = async (tool: CalcTool, args: Record<string, unknown>): Promise<Outcome | null> => {
     const r = await props.current.api.calc(tool, args).catch(noAnswer);
-    return alive.current ? outcomeOf(r) : null;
+    return alive.current ? outcomeOf(r, fallback) : null;
   };
 
   const find = async (e: FormEvent): Promise<void> => {
@@ -272,7 +280,7 @@ export function CalcPage(p: CalcPageProps) {
     if (o === null) return;
     setSearching(false);
     if (o.kind === "signed_out") return props.current.onSignedOut();
-    setSearch(searchOf(o));
+    setSearch(searchOf(o, fallback));
   };
 
   const run = async (e: FormEvent): Promise<void> => {
@@ -369,7 +377,7 @@ export function CalcPage(p: CalcPageProps) {
         <section className="calc-result" aria-live="polite">
           {result.kind === "text"
             ? <p className="calc-msg" role="alert">{result.text}</p>
-            : <Answer tool={result.tool} body={result.body} />}
+            : <Answer tool={result.tool} body={result.body} fallback={fallback} />}
         </section>
       )}
     </section>

@@ -356,6 +356,89 @@ def test_remove_only_disabled(tmp_path):
     assert s.list() == []
 
 
+# --- Д10б, задача Б1: AccountStore.enable (Д10-R108) ---
+
+def test_enable_rules(tmp_path):
+    s = store(tmp_path)
+    s.add("stu-a", "student", 3, PW)
+    with pytest.raises(ValueError, match="уже включена"):
+        s.enable("stu-a")
+    s.disable("stu-a")
+    assert s.verify("stu-a", PW) is None
+    s.enable("stu-a")
+    assert s.verify("stu-a", PW).place == 3
+    s.add("teach2", "teacher", None, PW)
+    s.disable("teach2")
+    with pytest.raises(ValueError, match="только учётку студента"):
+        s.enable("teach2")
+    with pytest.raises(ValueError, match="учётки nobody нет"):
+        s.enable("nobody")
+
+
+def test_enable_only_own_free_place(tmp_path):                                         # сверх брифа: R108, место — своё
+    s = store(tmp_path)
+    s.add("d10-probe-a", "student", 4, PW)
+    s.disable("d10-probe-a"); s.release_place(4)                                       # закрепление снято
+    with pytest.raises(ValueError, match="место 04 не закреплено за учёткой d10-probe-a"):
+        s.enable("d10-probe-a")
+    s.add("stu-b", "student", 4, PW)                                                   # место отдано другому
+    s.disable("stu-b")
+    with pytest.raises(ValueError, match="место 04 не закреплено за учёткой d10-probe-a"):
+        s.enable("d10-probe-a")
+    s.add("stu-c", "student", 5, PW)
+    s.disable("stu-c")
+    with closing(sqlite3.connect(tmp_path / "core.db")) as con, con:                   # мимо add: действующая на 05
+        con.execute("INSERT INTO gw_accounts (login, role, place, pw_hash, disabled, created_at) SELECT 'stu-x',"
+                    " 'student', 5, pw_hash, 0, created_at FROM gw_accounts WHERE login = 'stu-c'")
+    with pytest.raises(ValueError, match="место 05 занято другой учёткой"):
+        s.enable("stu-c")
+    assert [(a.login, a.disabled) for a in s.list() if a.login in ("d10-probe-a", "stu-b", "stu-c")] == [
+        ("d10-probe-a", True), ("stu-b", True), ("stu-c", True)]                       # отказы ничего не записали
+    assert s.write_failures == 0 and s.read_failures == 0                              # отказ по правилам — не сбой
+
+
+def test_student_only_ops_refuse_other_roles(tmp_path):                                  # ревью Б1+Б2, M-1 (TOCTOU роли)
+    """set_password, disable и unlock с student_only (так их зовёт кабинет) — роль цели сверяется в транзакции изменения:
+    у преподавателя и неизвестного логина ValueError, ничего не меняется (пароль, состояние, замок, сессии), счётчики
+    сбоев не растут. Учётке студента — как без флага; команда администратора (без флага) — как прежде."""
+    s = store(tmp_path)
+    s.add("teach", "teacher", None, PW)
+    s.add("stu-a", "student", 3, PW)
+    token = s.open_session("teach")
+    for login in ("teach", "stu-a"):
+        for _ in range(LOCK_FAILURES):
+            s.failure(login)
+    for login in ("teach", "nobody"):
+        for op in (lambda: s.set_password(login, "другой-пароль-1", student_only=True),
+                   lambda: s.disable(login, student_only=True), lambda: s.unlock(login, student_only=True)):
+            with pytest.raises(ValueError, match=f"^учётки студента {login} нет$"):
+                op()
+    assert s.status("teach") == "active" and s.locked("teach") and s.session(token) is not None
+    assert s.verify("teach", PW) is not None and not s.exists("nobody")
+    assert s.write_failures == 0 and s.read_failures == 0                              # отказ по правилам — не сбой
+    s.unlock("stu-a", student_only=True)
+    assert not s.locked("stu-a")
+    s.set_password("stu-a", "другой-пароль-1", student_only=True)
+    assert s.verify("stu-a", "другой-пароль-1") is not None
+    s.disable("stu-a", student_only=True)
+    assert s.status("stu-a") == "disabled"
+    s.unlock("teach"); s.set_password("teach", "другой-пароль-2"); s.disable("teach")   # команда — без флага
+    assert not s.locked("teach") and s.status("teach") == "disabled" and s.session(token) is None
+
+
+def test_cli_enable(tmp_path, capsys, monkeypatch):                                    # сверх брифа: команда enable
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(PW + "\n"))
+    assert accounts_main(["add", "--login", "ivanov", "--role", "student", "--place", "3"]) == 0
+    assert accounts_main(["disable", "--login", "ivanov"]) == 0
+    assert accounts_main(["enable", "--login", "ivanov"]) == 0
+    assert capsys.readouterr().out == ""
+    assert accounts_main(["enable", "--login", "ivanov"]) == 1
+    err = capsys.readouterr()
+    assert err.err.strip() == "учётка ivanov уже включена" and err.out == ""
+    assert store(tmp_path).verify("ivanov", PW).place == 3
+
+
 def test_cli(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
     assert accounts_main(["add", "--login", "ivanov", "--role", "student", "--place", "3", "--generate"]) == 0

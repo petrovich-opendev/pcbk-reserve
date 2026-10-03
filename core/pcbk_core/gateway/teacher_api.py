@@ -14,7 +14,8 @@ pcbk-front. Отказы (зона, неизвестный метод) — об�
 - GET places/NN/sessions и places/NN/sessions/SES — разговоры места только через само место, тремя GET
   (TEACHER_PLACE_PATHS) паролем шлюза (R102); GET places/NN/agents и places/NN/agents/NAME — агенты места из учёта и
   каталога службы, место не нужно (R103);
-- POST shares — перевод доли (R104), POST shares/floor — «Остановить место» (I-1 р2): пол берёт сервер.
+- POST shares — перевод доли (R104), POST shares/floor — «Остановить место» (I-1 р2): пол берёт сервер;
+- POST accounts, accounts/LOGIN/password, …/disable, …/enable, …/unlock — учётки студентов (Д10б, R108, ниже).
 
 Порядок проверок каждой ручки (R100) — строго: зона (front_only, 404) → настройка (configured, 503) → сессия
 (current_account, 401) → роль: не преподаватель — 403 teacher_only, событие role_refused и строка «gw teacher refused
@@ -42,8 +43,25 @@ Shares.apply / apply_floor в потоке — строка журнала share
 409 Conflict) с текстом дословно и строкой refused без гарантии; SharesStoreError — 503 journal или shares_down,
 change_failed.
 
-Журнал службы — строка «gw teacher login=… action=… place=… outcome=… status=… ms=…» на каждый вызов преподавателя: ни
-тел, ни текстов, ни названий разговоров. В detail строк журнала действий — только целые и коды (TeacherLog).
+Учётки студентов (Д10б, R108) — только студенты: accounts заводит только роль student и без same_person (возврат логина
+— команда администратора), цель прочих ручек — существующая учётка студента; учётка преподавателя или её отсутствие —
+404 no_account до журнала (кабинет их не показывает и не трогает). Порядок: роль → источник → LOGIN пути по LOGIN_RE
+учёток (иначе 404 not_found) → тело вручную (accounts — ровно {"login", "place": "NN"}, логин не того вида — 400 текстом
+правила без логина; прочие — пусто или {}) → цель → строка started (target — логин, place — место; нет строки — 503
+journal, действия нет, change_failed) → операция AccountStore в потоке (правила — только его: ValueError — 400 его
+текстом, StoreError — 503 store; password, disable и unlock — с student_only: роль цели хранилище сверяет ещё раз в
+транзакции изменения, ревью Б1+Б2 M-1; enable сверяет её всегда) → finish(ok | refused | error). Итог не записан
+(finish упал), а действие прошло — ответ удачи всё равно (иначе порождённый пароль пропал бы), change_failed и хвост
+finish=failed строки журнала службы; строка started остаётся следом попытки. Пароль —
+secrets.token_urlsafe(GENERATED_PW_BYTES), как --generate команды, только в теле ответа с Cache-Control: no-store и
+Pragma: no-cache; ни в журнал действий, ни в журнал службы он не идёт.
+Счётчики: удача — change; сбой SQLite или журнала — change_failed; отказ правил — без счётчика. Выданный пароль
+известен преподавателю (I-10): вход по нему — вход студентом; след — строки account_add/account_passwd журнала действий
+и «gw login ok» журнала службы.
+
+Журнал службы — строка «gw teacher login=… action=… place=… outcome=… status=… ms=…» на каждый вызов преподавателя (у
+учёток — с хвостом target=<логин>): ни тел, ни текстов, ни названий разговоров, ни паролей. В detail строк журнала
+действий — только целые и коды (TeacherLog).
 
 Модуль импортируется лениво, как api, proxy и agents_api (команда администратора accounts).
 """
@@ -53,6 +71,7 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -69,7 +88,7 @@ from ..agents.store import StoreError as AgentsStoreError
 from ..llm.ledger import OPS
 from ..llm.shares import ShareRefused, SharesStoreError
 from ..teacher_log import TeacherLogError
-from .accounts import NOTICE, Account, StoreError, login_key
+from .accounts import GENERATED_PW_BYTES, LOGIN_RE, NOTICE, _LOGIN_RULE, Account, StoreError, login_key
 from .api import (ERROR_NAMES, GW_MESSAGES, PREFIX, GatewayRefusal, _RolledLines, _unique_keys, configured,
                   current_account, front_only, gw_error, origin_checked)
 from .places import PLACES, TEACHER_PARALLEL, PlaceAnswer, PlaceAnswerTooLarge, WakeRefused
@@ -104,6 +123,7 @@ TEACHER_TEXTS = {
     "no_llm": "Доли бюджета недоступны — LLM-прокси не подключён",
     "shares_down": "Доли бюджета недоступны — повторите позже",
     "busy": PROXY_MESSAGES["busy"],
+    "no_account": "Учётки студента с таким логином нет",           # Д10-R108: и у учётки преподавателя
 }
 # код и имя ответа каждого отказа кабинета; 503 asleep и no_answer — WorkplaceNotReady: по нему веб рисует «Разбудить
 # для просмотра» (R106), прочие 503 — Unavailable, занятость — WorkplaceBusy, как у прокси
@@ -121,7 +141,10 @@ _REFUSALS = {
     "no_llm": (503, ERROR_NAMES[503]),
     "shares_down": (503, ERROR_NAMES[503]),
     "busy": (503, "WorkplaceBusy"),
+    "no_account": (404, ERROR_NAMES[404]),
 }
+# ответ с паролем учётки (R108): ни браузер, ни посредник его не кэширует
+NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
 # Д10-R102: к месту — ровно эти три вида, только GET; путь собирается из шаблона и проверенного id разговора
 TEACHER_PLACE_PATHS: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
@@ -180,11 +203,13 @@ class TeacherGate:
 
 @dataclass
 class _Call:
-    """Поля строки журнала службы вызова кабинета: логин, действие, место, начало (monotonic)."""
+    """Поля строки журнала службы вызова кабинета: логин, действие, место, начало (monotonic); у учёток (R108) — логин
+    цели (target), только проверенный по LOGIN_RE."""
     login: str
     action: str
     place: int | None
     started: float = field(default_factory=time.monotonic)
+    target: str | None = None
 
 
 def _nn(place: int | None) -> str:
@@ -193,6 +218,8 @@ def _nn(place: int | None) -> str:
 
 def _line(call: _Call, outcome: str, status: int, tail: str = "") -> None:
     ms = round((time.monotonic() - call.started) * 1000)
+    if call.target is not None:
+        tail += f" target={call.target}"
     (log.warning if status >= 500 else log.info)(
         "gw teacher login=%s action=%s place=%s outcome=%s status=%d ms=%d%s", call.login, call.action,
         _nn(call.place), outcome, status, ms, tail)
@@ -347,6 +374,24 @@ def floor_body_of(raw: bytes) -> tuple[int, int] | None:
     return None if place is None or to is None else (place, to)
 
 
+def new_student_of(raw: bytes) -> tuple[str, int] | None:
+    """Тело заведения студента ровно {"login": строка, "place": "NN"} (без повтора и лишних ключей — роли, same_person)
+    → (логин как есть, место); иначе None. Вид логина и правила места — дальше (LOGIN_RE, AccountStore.add)."""
+    body = _json_body(raw)
+    if not isinstance(body, dict) or set(body) != {"login", "place"}:
+        return None
+    login, nn = body["login"], body["place"]
+    if not isinstance(login, str) or not isinstance(nn, str):
+        return None
+    place = place_of(nn)
+    return None if place is None else (login, place)
+
+
+def empty_body(raw: bytes) -> bool:
+    """Тело ручек учётки (password, disable, enable, unlock): пусто или ровно {}."""
+    return raw == b"" or _json_body(raw) == {}
+
+
 # --- обзор и деньги ---
 
 def _llm_ready(role: "GatewayRole") -> "LlmRole | None":
@@ -481,6 +526,40 @@ class _Cabinet:
             self.role.teacher_stats.event("read_failed")
             return _fail(call, "journal")
         return None
+
+    async def student_account(self, call: _Call, login: str) -> Account | JSONResponse:
+        """Цель ручки учётки (R108): существующая учётка студента (действующая или отключённая); учётка преподавателя
+        или её отсутствие — 404 no_account, сбой учёток — 503 store и change_failed. Место цели — в call.place."""
+        try:
+            accounts = await asyncio.to_thread(self.role.store.list)
+        except StoreError:
+            self.role.teacher_stats.event("change_failed")
+            return _fail_text(call, 503, ERROR_NAMES[503], GW_MESSAGES["store"], "store")
+        found = next((a for a in accounts if a.login == login and a.role == "student"), None)
+        if found is None:
+            return _fail(call, "no_account")
+        call.place = found.place
+        return found
+
+    async def started(self, call: _Call) -> int | JSONResponse:
+        """Строка started до изменения учётки (R108): id строки; журнал не открыт или запись не прошла — 503 journal и
+        change_failed, действия нет."""
+        log_ = self.role.teacher_log
+        try:
+            if not log_.opened:
+                raise TeacherLogError("журнал действий не открыт")
+            return await asyncio.to_thread(log_.started, call.login, call.action, call.place, call.target)
+        except TeacherLogError:
+            self.role.teacher_stats.event("change_failed")
+            return _fail(call, "journal")
+
+    async def finish(self, row_id: int, outcome: str) -> bool:
+        """Итог строки started; сбой записи — False (действие уже прошло или отклонено — ответ от него не зависит)."""
+        try:
+            await asyncio.to_thread(self.role.teacher_log.finish, row_id, outcome)
+        except TeacherLogError:
+            return False
+        return True
 
     def refused_place(self, call: _Call, exc: _Refused) -> JSONResponse:
         """Отказ чтения места: счётчики (read_failed, upstream_failed, place_auth_failed); нет ответа — место
@@ -687,5 +766,97 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
             _Call(login, "shares_floor", None), request, floor_body_of,
             lambda llm, pair: llm.shares.apply_floor(*pair, by=login, now=role.wallclock()),
             lambda pair, kind: {"kind": "floor", "reason": kind, "from": f"{pair[0]:02d}", "to": f"{pair[1]:02d}"})
+
+    # --- учётки студентов (Д10б, R108) ---
+
+    async def account_change(call: _Call, run: Callable[[], None],
+                             reply: Callable[[], tuple[int, dict]] | None) -> Response:
+        """Изменение учётки после проверок пути, тела и цели: started → операция AccountStore в потоке → finish. Ответ —
+        reply() (код и тело с паролем, без кэша) или 204."""
+        row = await cab.started(call)
+        if isinstance(row, Response):
+            return row
+        try:
+            await asyncio.to_thread(run)
+        except ValueError as exc:                   # правило хранилища: текст без пароля — дословно, без счётчика
+            if not await cab.finish(row, "refused"):
+                role.teacher_stats.event("change_failed")
+            return _fail_text(call, 400, ERROR_NAMES[400], str(exc), "refused")
+        except StoreError:                          # текст — класс и код SQLite; наружу — общий текст учёток
+            await cab.finish(row, "error")
+            role.teacher_stats.event("change_failed")
+            return _fail_text(call, 503, ERROR_NAMES[503], GW_MESSAGES["store"], "store")
+        except Exception:                           # непредвиденное — итог error, дальше обработчик приложения
+            await cab.finish(row, "error")
+            role.teacher_stats.event("change_failed")
+            raise
+        finished = await cab.finish(row, "ok")
+        if reply is None:
+            status, response = 204, Response(status_code=204)
+        else:
+            status, body = reply()
+            response = JSONResponse(body, status_code=status, headers=NO_STORE)
+        role.teacher_stats.event("change")
+        if not finished:                            # действие прошло, итог не записан: started — след попытки
+            role.teacher_stats.event("change_failed")
+        _line(call, "ok", status, "" if finished else " finish=failed")
+        return response
+
+    async def account_op(request: Request, account: Account, login: str, action: str, run: Callable[[], None],
+                         reply: Callable[[], tuple[int, dict]] | None = None) -> Response:
+        """Ручка учётки студента по логину пути (R108): роль → источник → LOGIN → тело → цель → account_change."""
+        if (refused := cab.not_teacher(account)) is not None:
+            return refused
+        call = _Call(account.login, action, None)
+        await cab.origin(request, call)
+        if LOGIN_RE.fullmatch(login) is None:       # строка журнала службы — без непроверенного логина (target нет)
+            return _not_found(call)
+        call.target = login
+        if not empty_body(await request.body()):
+            return _fail_text(call, 400, ERROR_NAMES[400], GW_MESSAGES["bad_body"], "bad_body")
+        target = await cab.student_account(call, login)
+        if isinstance(target, Response):
+            return target
+        return await account_change(call, run, reply)
+
+    @router.post(P + "accounts", dependencies=guarded)
+    async def account_add(request: Request, account: Account = Depends(account_of)) -> Response:
+        if (refused := cab.not_teacher(account)) is not None:
+            return refused
+        call = _Call(account.login, "account_add", None)
+        await cab.origin(request, call)
+        body = new_student_of(await request.body())
+        if body is None:
+            return _fail_text(call, 400, ERROR_NAMES[400], GW_MESSAGES["bad_body"], "bad_body")
+        login, place = body
+        call.place = place
+        if LOGIN_RE.fullmatch(login) is None:       # логин не того вида — ни в журнал, ни в текст отказа
+            return _fail_text(call, 400, ERROR_NAMES[400], _LOGIN_RULE, "refused")
+        call.target = login
+        password = secrets.token_urlsafe(GENERATED_PW_BYTES)
+        return await account_change(
+            call, lambda: role.store.add(login, "student", place, password),     # same_person — никогда
+            lambda: (201, {"login": login, "place": f"{place:02d}", "password": password}))
+
+    @router.post(P + "accounts/{login}/password", dependencies=guarded)
+    async def account_passwd(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
+        password = secrets.token_urlsafe(GENERATED_PW_BYTES)     # set_password закрывает сессии и снимает замок
+        return await account_op(request, account, login, "account_passwd",
+                                lambda: role.store.set_password(login, password, student_only=True),
+                                lambda: (200, {"password": password}))
+
+    @router.post(P + "accounts/{login}/disable", dependencies=guarded)
+    async def account_disable(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
+        return await account_op(request, account, login, "account_disable",
+                                lambda: role.store.disable(login, student_only=True))
+
+    @router.post(P + "accounts/{login}/enable", dependencies=guarded)
+    async def account_enable(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
+        return await account_op(request, account, login, "account_enable", lambda: role.store.enable(login))
+
+    @router.post(P + "accounts/{login}/unlock", dependencies=guarded)
+    async def account_unlock(login: str, request: Request, account: Account = Depends(account_of)) -> Response:
+        return await account_op(request, account, login, "account_unlock",
+                                lambda: role.store.unlock(login, student_only=True))
 
     return router

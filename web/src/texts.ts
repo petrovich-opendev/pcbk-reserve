@@ -94,9 +94,11 @@ export const T_TURN_SILENT =
 export const T_UI_CRASH = "Чат столкнулся с ошибкой. Сбой отмечен для администратора.";
 export const T_UI_RESTART = "Перезапустить чат";
 
-// --- вкладки «Чат» и «Калькуляторы» (Д9-R88): только у студента; калькуляторы — те же инструменты службы, что у агентов ---
+// --- вкладки шапки (Д9-R88, Д10-R110): у студента «Чат» и «Калькуляторы», у преподавателя «Кабинет» и «Калькуляторы»;
+// калькуляторы — те же инструменты службы, что у агентов ---
 export const T_TABS = "Разделы";                       // подпись группы вкладок для чтения с экрана
 export const T_TAB_CHAT = "Чат";
+export const T_TAB_CABINET = "Кабинет";
 export const T_TAB_CALC = "Калькуляторы";
 export const T_CALC_TITLE = "Калькуляторы БДРВ — те же расчёты, что у агентов";
 export const T_CALC_FIND = "Найти тег";
@@ -211,6 +213,7 @@ export const T_TCH_BAD_PART = "Неверный номер места, разг�
 export const T_TCH_PLACES = "Места студентов";
 export const TCH_COLUMNS = {
   place: "Место", student: "Студент", state: "Состояние", share: "Доля", spent: "Потрачено", agents: "Агентов",
+  account: "Учётная запись",
 } as const;
 export const T_TCH_FREE = "свободно";                  // у места нет закрепления (free, m-11)
 export const T_TCH_NO_ACCOUNT = "без учётки";           // закреплено за удалённым логином: учётки нет, но место не свободно
@@ -269,13 +272,60 @@ export const T_TCH_SAME_PLACE = "Выберите два разных места
 export const T_TCH_ZERO = "Сумма должна быть больше нуля";
 export const T_TCH_BAD_AMOUNT = "Сумма — в долларах, не больше двух знаков после запятой";
 export const T_TCH_TAKE_MAX = (nn: string, money: string): string => `У места ${nn} можно взять не больше ${money}`;
+// учётные записи студентов (TeacherAccounts, Д10-R110): отказы ручек учёток (R108) — текстом ответа дословно
+export const T_TCH_ACCOUNTS = "Учётные записи";
+export const T_TCH_ACC_ADD_TITLE = "Завести студента";
+export const T_TCH_ACC_LOGIN = "Логин";
+export const T_TCH_ACC_PLACE = "Место";
+export const T_TCH_ACC_ADD = "Завести";
+// заведение закрепляет место за логином навсегда (Д5а); смены студента в занятом месте нет ни здесь, ни у команды
+// администратора — хранилище отказывает (итоговое ревью Д10б, m-2 и ревью Б1+Б2, M-5)
+export const T_TCH_ACC_ADD_HINT =
+  "Только на свободное место. Логин закрепляется за местом навсегда — проверьте написание. Сменить студента в занятом " +
+  "месте сейчас нельзя; учётки преподавателей и удаление учёток — команда администратора.";
+// логин вида пробных учёток проверок (PROBE_LOGIN учёток шлюза): такое место администратор может освободить
+// (release-place) — живому студенту нужен обычный логин (ревью Б1+Б2, M-4); подсказка не запрещает: сервер их принимает
+export const T_TCH_ACC_PROBE_LOGIN =
+  "Логин вида dN-probe-… — для проверок стенда: такое место администратор может освободить. Студенту дайте обычный логин.";
+export const T_TCH_ACC_NO_FREE = "Свободных мест нет";
+export const T_TCH_ACC_PICK_PLACE = "Выберите свободное место";
+// правило логина — то же, что _LOGIN_RULE учёток шлюза (LOGIN_RE): подсказка до запроса
+export const T_TCH_ACC_LOGIN_RULE = "Логин — 3…32 знака из a-z, 0-9, «.», «_», «-», первый — буква a-z";
+// окно пароля (.password-once): пароль только в состоянии окна, «Я записал пароль» его стирает
+export const T_TCH_ACC_PASSWORD_ONCE = "Пароль показан один раз — запишите его и передайте студенту";
+export const T_TCH_ACC_PASSWORD_FOR = (login: string, nn: string): string => `Учётка ${login}, место ${nn}`;
+export const T_TCH_ACC_COPY = "Скопировать";
+export const T_TCH_ACC_COPIED = "Скопировано";
+export const T_TCH_ACC_COPY_FAILED = "Скопировать не удалось — пароль выделен, нажмите Ctrl+C";
+export const T_TCH_ACC_DONE = "Я записал пароль";
+// кнопки строки места со студентом; aria-label — «<действие> <логин>»
+export const T_TCH_ACC_PASSWD = "Новый пароль";
+export const T_TCH_ACC_DISABLE = "Отключить";
+export const T_TCH_ACC_ENABLE = "Включить";
+export const T_TCH_ACC_UNLOCK = "Снять замок";
+export const T_TCH_ACC_LABEL = (action: string, login: string): string => `${action} ${login}`;
+// подтверждение — окно в странице (не window.confirm): отключение и новый пароль закрывают сессии студента. Чат узнаёт об
+// этом по ответу 401: при следующем действии студента, а при открытом разговоре — и сам, за перепроверку потока; уйти
+// «сразу» он не может (Б3, сомнение 1; итоговое ревью Д10б, m-1) — один честный текст на оба подтверждения
+export const T_TCH_ACC_SIGNS_OUT = "Студент не сможет продолжить: чат закроется не позже его следующего действия";
+export const T_TCH_ACC_ASK_DISABLE = (login: string): string => `Отключить учётку ${login}? ${T_TCH_ACC_SIGNS_OUT}`;
+export const T_TCH_ACC_YES_DISABLE = "Да, отключить";
+export const T_TCH_ACC_ASK_PASSWD = (login: string): string =>
+  `Выдать учётке ${login} новый пароль? Старый перестанет работать. ${T_TCH_ACC_SIGNS_OUT}`;
+export const T_TCH_ACC_YES_PASSWD = "Да, выдать новый пароль";
+export const T_TCH_ACC_CANCEL = "Отмена";
+export const T_TCH_ACC_DISABLED = (login: string): string => `Учётка ${login} отключена`;
+export const T_TCH_ACC_ENABLED = (login: string): string => `Учётка ${login} включена`;
+export const T_TCH_ACC_UNLOCKED = (login: string): string => `Замок входа ${login} снят`;
+// вызов не ушёл: логин в пути ручки учётки не по LOGIN_RE учёток
+export const T_TCH_ACC_BAD_LOGIN = "Неверный логин учётки";
 // журнал действий (TeacherJournal): последние строки, новые первыми
 export const T_TCH_JOURNAL = "Журнал действий";
 export const T_TCH_JOURNAL_RELOAD = "Обновить журнал";
 export const T_TCH_JOURNAL_EMPTY = "Записей пока нет";
 export const T_TCH_JOURNAL_PLACE = (nn: string): string => `место ${nn}`;
 export const T_TCH_JOURNAL_SHARE = (nn: string, from: string, to: string): string => `${nn}: ${from} → ${to}`;
-// подписи действий журнала (ACTIONS, Д10-R99); незнакомое — кодом как есть. Д10б добавит действия учёток
+// подписи действий журнала (ACTIONS, Д10-R99; действия учёток — Д10б, R108); незнакомое — кодом как есть
 export const ACTION_LABELS: Readonly<Record<string, string>> = {
   sessions: "открыл список разговоров",
   read: "прочитал разговор",
@@ -283,6 +333,11 @@ export const ACTION_LABELS: Readonly<Record<string, string>> = {
   agent: "прочитал инструкцию агента",
   wake: "разбудил место",
   shares: "перевёл долю",
+  account_add: "завёл учётку студента",
+  account_passwd: "выдал новый пароль",
+  account_disable: "отключил учётку",
+  account_enable: "включил учётку",
+  account_unlock: "снял замок входа",
 };
 // итоги строк журнала (OUTCOMES, Д10-R99)
 export const OUTCOME_LABELS: Readonly<Record<string, string>> = {

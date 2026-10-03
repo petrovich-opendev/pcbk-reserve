@@ -1,6 +1,7 @@
 // «Журнал действий» в кабинете (Д10-R101, I-1; R106): последние строки журнала действий преподавателя (не больше 50,
 // новые первыми) — время (местное браузера), кто, действие словами, место, итог; у перевода доли — места и центы «было →
-// стало». Текстов разговоров и агентов в журнале нет (R99). Чтение журнала само в журнал не пишется. Список — .journal li.
+// стало»; у действий учёток (account_*, Д10б R108) — логин учётки (target) рядом с действием, текстом. Текстов разговоров
+// и агентов в журнале нет (R99). Чтение журнала само в журнал не пишется. Список — .journal li.
 // Читается при открытии, по кнопке «Обновить журнал» и при каждом новом обзоре (reloadKey): после перевода доли строка
 // уже в журнале. 401 — на вход; прочие отказы — текст ответа.
 import { useEffect, useRef, useState } from "react";
@@ -20,8 +21,12 @@ type View = { kind: "loading" } | { kind: "text"; text: string } | { kind: "rows
 
 const noAnswer = (): Reply => ({ status: 0, body: null });
 
+// у действий учёток target — логин учётки студента (R108): без него «отключил учётку» не говорит, чью
+const ACCOUNT_ACTION = /^account_/;
+
 function Row({ row }: { row: JournalRow }) {
-  const parts = [label(ACTION_LABELS, row.action)];
+  const what = label(ACTION_LABELS, row.action);
+  const parts = [ACCOUNT_ACTION.test(row.action) && row.target !== null ? `${what} ${row.target}` : what];
   if (row.place !== null) parts.push(T_TCH_JOURNAL_PLACE(row.place));
   for (const [nn, was, now] of row.detail ?? []) parts.push(T_TCH_JOURNAL_SHARE(nn, fmtCents(was), fmtCents(now)));
   return (

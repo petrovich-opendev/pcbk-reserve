@@ -7,8 +7,9 @@ DataService, что HTTP /api/data/ и MCP, в процессе, без HTTP к 
 3. сессия current_account — 401 (сбой базы учёток — 503 store);
 4. источник origin_checked — 403; после сессии, как у wake: запрос без учётки — 401 без строки журнала и счётчика;
 5. инструмент не из CALC_TOOLS — 404 not_found (save_agent и прочее службе не передаются);
-6. не студент или у учётки нет места — 403 TEACHER_CALC_TEXT: калькуляторы преподавателю — в Д10; роль
-   проверяется явно, как у прокси: связь «студент ↔ место» держит только AccountStore.add, не схема базы;
+6. вызывающий — по роли учётки сессии, явно (caller_for): преподаватель — TEACHER_CALLER (Д10-R109: прежний отказ
+   преподавателю снят), студент с местом — caller_of(место); иначе (чужая роль или студент без места — только правкой
+   базы мимо AccountStore.add: связь «студент ↔ место» держит он, не схема) — 403 ROLE_CALC_TEXT, как у прокси;
 7. службы нет (role.calc is None) — 503 CALC_DOWN_TEXT;
 8. тело не объект JSON — 400 bad_body, события нет;
 9. аргументы — модели http_api (те же, что у /api/data/): ошибка — refuse_args службы с каналом web (событие refused) и
@@ -16,9 +17,10 @@ DataService, что HTTP /api/data/ и MCP, в процессе, без HTTP к 
 10. иначе — инструмент службы, ответ 200 при любом его статусе.
 
 Тело читается вручную (await request.body()): разбор FastAPI дал бы 422 мимо отказов вида OpenCode. Ключи тела, которых
-нет в модели (place, caller), модель отбрасывает: вызывающий — только caller_of(account.place) учётки сессии, канал —
-web. Ни тело, ни cookie маршрут в журнал не пишет; строку вызова пишет служба, как для http и mcp. Предел тела — общий
-предел шлюза под /pcbk/api/ (BODY_LIMIT, 64 КиБ), как у edge.
+нет в модели (place, caller), модель отбрасывает: вызывающий — только caller_for(учётка сессии), канал — web; место
+преподавателя (даже правкой базы) не действует. Предел частоты службы на вызывающего (PER_CALLER_LIMIT) у
+преподавателя общий для всех его вкладок: вызывающий один. Ни тело, ни cookie маршрут в журнал не пишет; строку вызова
+пишет служба, как для http и mcp. Предел тела — общий предел шлюза под /pcbk/api/ (BODY_LIMIT, 64 КиБ), как у edge.
 
 DataService здесь и в gateway/__init__.py — только под TYPE_CHECKING (m12); модуль импортируется лениво из
 GatewayRole.router, поэтому команда администратора python -m pcbk_core.gateway.accounts не тянет mcp и pytds.
@@ -44,7 +46,8 @@ if TYPE_CHECKING:
 CALC_PREFIX = PREFIX + "/calc/"
 # инструменты вкладки — пять инструментов чтения службы (save_agent — нет); веб: тип CalcTool (web/src/api.ts)
 CALC_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
-TEACHER_CALC_TEXT = "Калькуляторы для преподавателя — в следующих выпусках стенда"
+TEACHER_CALLER = "teacher"              # вызывающий службы у преподавателя (Д10-R109): caller=teacher, channel=web
+ROLE_CALC_TEXT = "Калькуляторы — только для студента с рабочим местом и преподавателя"
 CALC_DOWN_TEXT = "Калькуляторы недоступны — служба данных не подключена"
 CHANNEL: Literal["web"] = "web"
 
@@ -57,6 +60,16 @@ _ARGS: dict[str, type[BaseModel]] = {"catalog_search": CatalogSearchArgs, "tag_n
 def caller_of(place: int) -> str:
     """Вызывающий для службы — место учётки сессии: student-NN (как токен места у /api/data/ и MCP)."""
     return f"student-{place:02d}"
+
+
+def caller_for(account: Account) -> str | None:
+    """Вызывающий по роли учётки, явно (итоговое ревью Д9а, m-5): преподаватель — TEACHER_CALLER, его место (если оно
+    есть правкой базы) не действует; студент с местом — caller_of(место); прочее — None (отказ 403)."""
+    if account.role == "teacher":
+        return TEACHER_CALLER
+    if account.role == "student" and account.place is not None:
+        return caller_of(account.place)
+    return None
 
 
 def _body_object(raw: bytes) -> dict[str, Any] | None:
@@ -93,15 +106,15 @@ def calc_router(role: GatewayRole) -> APIRouter:
         await check_origin(request)         # после сессии: без учётки — 401, ни строки, ни счётчика origin_refused
         if tool not in CALC_TOOLS:
             return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
-        if account.role != "student" or account.place is None:      # итоговое ревью Д9а, m-5: роль — явно
-            return gw_error(403, ERROR_NAMES[403], TEACHER_CALC_TEXT)
+        caller = caller_for(account)                # роль — явно (m-5 Д9а); преподаватель — свой вызывающий (R109)
+        if caller is None:
+            return gw_error(403, ERROR_NAMES[403], ROLE_CALC_TEXT)
         svc = role.calc
         if svc is None:
             return gw_error(503, ERROR_NAMES[503], CALC_DOWN_TEXT)
         body = _body_object(await request.body())
         if body is None:
             return gw_error(400, ERROR_NAMES[400], GW_MESSAGES["bad_body"])
-        caller = caller_of(account.place)
         try:
             args = _ARGS[tool].model_validate(body)
         except ValidationError as exc:
