@@ -9,7 +9,9 @@
 """
 import importlib.util
 import json
+import logging
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -27,7 +29,8 @@ from pcbk_bench.config import load_config
 from pcbk_bench.load import (GATE_LIMIT_5M, LOAD_CHECK_PY, MEM_NOTE_RE, MEM_OOM_OUTSIDE_DETAIL, MEM_PSI_DETAIL,
                              MEM_SWAP_DETAIL, MemPoint, check_verdict, concurrency_minutes, gate_verdict,
                              guard_verdict, mem_point, own_only, price_per_reply)
-from pcbk_bench.runner import STOP_REASONS, RunRefused, status_main, turn_code
+from pcbk_bench.runner import RUN_LIMIT_KEYS, STOP_REASONS, RunRefused, status_main, turn_code
+from pcbk_bench.stand import CALC_RATE_PAUSE_S
 
 REPO = Path(__file__).resolve().parents[2]
 OPENCODE = REPO / "student/config/opencode.json"
@@ -274,7 +277,8 @@ def test_hard_stop_during_prepare_does_not_wake_rest(tmp_path):            # I-6
 def test_load_soft_stop_on_threshold_warn_keeps_turns(tmp_path):
     stand = FakeStand(status_seq=[status(), status("warn", "свободно меньше 2048 МиБ", "свободно 1900 МиБ")],
                       health=health_brake())
-    assert runner(out=tmp_path, places={1: M1}, stand=stand, **TWIN).run() == "memory_warn" and stand.slept == []
+    assert runner(out=tmp_path, places={1: M1}, stand=stand, **TWIN).run() == "memory_warn"
+    assert stand.slept == [[1]]                                             # ходы дошли; сон — только close() (R122)
 
 
 def test_status_main_old_guard_mark_is_silent(tmp_path):
@@ -303,6 +307,7 @@ def test_load_refuses_place_with_live_agents_never_archives(tmp_path):
     with pytest.raises(RunRefused) as e:
         runner(out=tmp_path, places={1: M1}, stand=stand, **TWIN).prepare()
     assert e.value.code == "place_agents" and stand.archived == []
+    assert stand.slept == [[1]]                                             # отказ после замка: места спят (Б1 m-2)
 
 
 def test_own_only():
@@ -965,3 +970,87 @@ def test_drill_note_lost_mid_step_is_hard(tmp_path):                       # m-4
     started = time.monotonic()
     assert r.run() == "data_drill" and [1] in stand.slept and time.monotonic() - started < 10
     assert "data_drill" in STOP_REASONS
+
+
+# --- итоговое ревью Д11б: сон мест после ступени (R122, Б1 m-2), подготовка без пауз калькулятора, шаги в журнал (I-2)
+
+def test_load_close_sleeps_places_after_finished(tmp_path):                # R122: перед ступенью места спят
+    stand = FakeStand(health=health_brake())
+    assert runner(out=tmp_path, places={1: M1, 2: M1}, stand=stand, **TWIN).run() == "finished"
+    assert stand.slept == [[1, 2]]                                          # все места конфига, один раз — close()
+
+
+def test_selection_close_never_sleeps_places(tmp_path):                    # отбор (Д8) — как был: сна нет
+    stand = FakeStand()
+    assert runner(out=tmp_path, places={1: M1}, stand=stand, scenarios=("B3",),
+                  reps={"create": 1, "number": 1, "trap": 1}).run() == "finished"
+    assert stand.slept == []
+
+
+def test_load_close_sleeps_places_after_sigint(tmp_path):                  # Б1 m-2: сигнал оператора — места спят
+    chat = FakeChat.never_idle()
+    stand = FakeStand(health=health_brake())
+    r = runner(out=tmp_path, places={1: M1, 2: M1}, stand=stand, chat=chat, **TWIN, turn_timeout_s=5)
+
+    def fire():
+        deadline = time.monotonic() + 10
+        while not chat.sessions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        r._on_signal(signal.SIGINT, None)
+    threading.Thread(target=fire, daemon=True).start()
+    assert r.run() == "interrupt"
+    assert [1, 2] in stand.slept
+
+
+def test_load_live_agents_refused_before_any_wake(tmp_path):               # Б1 m-2: отказ места не будит
+    stand = FakeStand(health=health_brake()); stand.add_agent(2, "chuzhoy-agent")
+    r = runner(out=tmp_path, places={1: M1, 2: M1}, stand=stand, **TWIN)
+    with pytest.raises(RunRefused) as e:
+        r.prepare()
+    assert e.value.code == "place_agents" and r.chats[1].fake.woke == [] and stand.slept == [[1, 2]]
+
+
+def _note_pause(pauses, s):                                                 # пауза записана, настоящая — короткая
+    pauses.append(s)
+    time.sleep(min(s, 0.01))
+
+
+def test_load_units_one_try_without_rate_pauses(tmp_path):                 # I-2: rate каталога — без 20 пауз по 15 с
+    stand = FakeStand(health=health_brake(), calc_rate=100)
+    pauses = []
+    r = runner(out=tmp_path, places={1: M1}, stand=stand, **TWIN, sleep=lambda s: _note_pause(pauses, s))
+    r.prepare()
+    tags = [args["query"] for tool, args in stand.calc_calls if tool == "catalog_search"]
+    assert tags and len(tags) == len(set(tags)) and CALC_RATE_PAUSE_S not in pauses
+    assert json.loads((tmp_path / "tag_units.json").read_text()) == {}
+
+
+def test_selection_units_keep_rate_patience(tmp_path):                     # отбор: терпение calc_patient как было
+    stand = FakeStand(calc_rate=1)
+    pauses = []
+    r = runner(out=tmp_path, places={1: M1}, stand=stand, scenarios=("B3",), sleep=lambda s: _note_pause(pauses, s))
+    r.prepare()
+    assert CALC_RATE_PAUSE_S in pauses
+
+
+def test_prepare_logs_step_durations(tmp_path, caplog):                    # I-2: медленная подготовка видна в журнале
+    caplog.set_level(logging.INFO, logger="pcbk_bench.runner")
+    runner(out=tmp_path, places={1: M1, 2: M1}, stand=FakeStand(health=health_brake()), **TWIN).prepare()
+    lines = [rec.getMessage() for rec in caplog.records]
+    for step in ("агенты мест", "вход и пробуждение мест", "разговоры до прогона", "прежние сессии",
+                 "пустой /session/status", "модели мест", "единицы тегов"):
+        assert any(re.fullmatch(f"подготовка: {re.escape(step)} — \\d+\\.\\d с", x) for x in lines), step
+    for n in ("01", "02"):
+        assert any(re.fullmatch(f"подготовка: место {n} — /session/status пуст через \\d+\\.\\d с "
+                                f"\\(занятых опросов \\d+\\)", x) for x in lines)
+        assert any(re.fullmatch(f"подготовка: место {n} — вход и пробуждение \\d+\\.\\d с", x) for x in lines)
+
+
+def test_run_limit_keys_are_the_compared_pairs(tmp_path):                  # стык с харнессом стенда (ревью Д11б, m-4)
+    for name, block, key in RUN_LIMIT_KEYS:
+        stand = FakeStand(**({"run": {key: 99.0}} if block == "run" else {}),
+                          health=health_brake(limits={key: 99999} if block == "run_brake" else None))
+        with pytest.raises(RunRefused) as e:
+            runner(out=tmp_path / name, places={1: M1}, stand=stand, **TWIN).prepare()
+        assert (e.value.code, e.value.detail) == ("run_limits", name)

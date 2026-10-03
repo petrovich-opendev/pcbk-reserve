@@ -21,7 +21,9 @@
   компоновки) и ждёт их в /health/llm — иначе прогонщик откажет RunRefused("run_limits"). delay(s) — задержка каждого
   вызова чата двойника OpenRouter (POST /_delay; 0 — DELETE), уборка её снимает. settle() — между учениями тормоза:
   агенты, оставшиеся от оборванных ходов (кроме bench-uzel), — в архив, очередь перезагрузки мест пуста (места, где
-  такие были, — списком, для журнала). StackStand режима нагрузки:
+  такие были, — списком, для журнала). Архив и осушение очереди — по одному месту (спящее место будится учёткой через
+  шлюз и снова засыпает): на пике памяти — одно место, а не десять (итоговое ревью Д11б, I-3, I-4). StackStand режима
+  нагрузки:
   sleep_places — docker stop мест одной командой (как ServerStand), dify_swap_mib — файл двойника dify-swap (нет,
   пусто или не число — StandError: слепота, не ноль), load_check — LOAD_CHECK_PY изнутри pcbk-core, с out — и цена
   реплики OUT/price.json (load.write_price).
@@ -30,10 +32,12 @@
   PCBK_TABLES (twin-table.md, каталог $JOB), снимок страницы проверки с этим Markdown — PCBK_SHOTS/twin-table.png
   (markdown_page → cdp.Browser, file://).
 
-Уборка (cleanup, решение контроллера П2 — порядок test_agents.py): прогонщики закрыты → персоны выключены → учётки
-disable (до этого — пробуждение работающих мест с агентами: архив перезагружает только готовое место) → агенты мест — в
-архив, пока места работают → очередь перезагрузки мест пуста → места без переопределения и остановлены
-(create --force-recreate, тома не трогаются) → учётки remove → release-place → core и сторож — значения test.env (у
+Уборка (cleanup, решение контроллера П2 — порядок test_agents.py, с Д11б — на каждом месте по одному): прогонщики
+закрыты → персоны выключены → по местам: место с агентами или очередью перезагрузки — пробуждение учёткой через шлюз
+(архив перезагружает только место, которое шлюз считает готовым; docker start мимо шлюза его готовым не делает),
+учётка disable, агенты — в архив, очередь перезагрузки места пуста (ожидание по движению очереди), разбуженное место
+снова спит; прочие — только disable → места без переопределения и остановлены (create --force-recreate, тома не
+трогаются) → учётки remove → release-place (только при пустой очереди места) → core и сторож — значения test.env (у
 core — и пороги тормоза LLM_RUN_* как без переменных). Задержка двойника OpenRouter снимается вместе с персонами.
 Каждый шаг смотрит на состояние стенда и идемпотентен; сбой шага не обрывает остальные — первый сбой поднимается в
 конце.
@@ -50,7 +54,8 @@ import re
 import secrets
 import shutil
 import threading
-from collections.abc import Iterable, Mapping
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -81,10 +86,13 @@ SILENT_S = 10
 SILENT_DEFAULT = "300"
 MCP_WAIT_S = 90                     # места переподключают MCP после пересоздания core не сразу (test_conversation)
 PLACE_READY_S = 120
-DRAIN_S = 60                        # очередь перезагрузки мест после архива
-# воркер перезагрузки проходит места по одному (простой 3 с, dispose до 5 с, проверка видимости), а место, поднятое
-# docker start, шлюз видит готовым не сразу: десяти местам нагрузки (Д11б) 60 с мало — срок растёт с числом мест
-DRAIN_PER_PLACE_S = 15
+# очередь перезагрузки мест после архива (итоговое ревью Д11б, I-3) — ожидание по движению, а не срок наугад: воркер
+# идёт по местам по одному (простой 3 с, dispose до 5 с, проверка видимости), после неудачи повторяет не раньше
+# RELOAD_RETRY_S = 30 с, а крючок готовности ставит место заново — без убыли не дольше DRAIN_STALL_S, всего —
+# DRAIN_TOTAL_S
+DRAIN_STALL_S = 90
+DRAIN_TOTAL_S = 900
+DRAIN_POLL_S = 2
 WAKE_S = 120
 # строки очереди перезагрузки мест (argv) — изнутри pcbk-core, только чтение: истина об очереди (QUEUED_PY test_agents)
 QUEUED_PY = ("import sqlite3, sys; "
@@ -256,7 +264,6 @@ class BenchHarness:
         if cfg.places != self.places:
             raise ValueError(f"места модуля — не места {Path(config).name} (m4)")
         self._login = login
-        self.drain_s = max(DRAIN_S, DRAIN_PER_PLACE_S * len(self.places))     # Д8: 4 места — 60 с, как было
         self.cfg: BenchConfig = replace(cfg, out_dir=self.tmp / "out")
         self.cards: CardSet = load_cards(self.cfg.cards)
         self.stand = StackStand(stack)
@@ -393,25 +400,74 @@ class BenchHarness:
         ps = self.places if places is None else places
         return int(self.stack.exec("pcbk-core", "python", "-c", QUEUED_PY, *map(str, ps)))
 
+    def _drain(self, places: Iterable[int]) -> None:
+        """Очередь перезагрузки мест places пуста: ждём, пока она убывает; без убыли дольше DRAIN_STALL_S или всего
+        дольше DRAIN_TOTAL_S — AssertionError с числом строк (итоговое ревью Д11б, I-3)."""
+        ps = sorted(places)
+        start = moved = time.monotonic()
+        left = self.queued(ps)
+        while left:
+            now = time.monotonic()
+            if now - moved > DRAIN_STALL_S or now - start > DRAIN_TOTAL_S:
+                raise AssertionError(f"очередь перезагрузки мест {', '.join(f'{n:02d}' for n in ps)} не пуста: строк "
+                                     f"{left}, без убыли {now - moved:.0f} с, всего {now - start:.0f} с")
+            time.sleep(DRAIN_POLL_S)
+            now_left = self.queued(ps)
+            if now_left < left:
+                moved = time.monotonic()
+            left = now_left
+
+    def _ready_for_reload(self, n: int) -> bool:
+        """Место готово для воркера перезагрузки: он перезагружает только место, которое шлюз считает готовым, а
+        docker start мимо шлюза готовым его не делает (шлюз узнаёт работающее место только при своём пробуждении и в
+        первом проходе после старта core) — отсюда неосушённая очередь уборки в прогоне p1 Б2. Поэтому — пробуждение
+        учёткой места через шлюз (и работающего: так делала уборка Д8); учётки нет или она отключена — docker start
+        (осушение тогда скажет ошибкой). True — место спало и разбужено здесь."""
+        was_running = self._running(n)
+        row = self._account(n)
+        if row is not None and row[3] == "активна":
+            chat = self._chat(n)
+            chat.login()
+            chat.wake(timeout=WAKE_S)
+        elif not was_running:
+            self.stack.start(self._container(n))
+        return not was_running
+
+    def _one_place(self, n: int, archive: Callable[[], None], *, disable: bool = False) -> None:
+        """Одно место (итоговое ревью Д11б, I-3, I-4: на пике — одно место, а не десять): готово для воркера
+        (_ready_for_reload), учётка — disable (уборка, порядок П2), архив, очередь перезагрузки места пуста (_drain);
+        место, разбуженное здесь, снова спит."""
+        woke = self._ready_for_reload(n)
+        try:
+            if disable:
+                self._disable_account(n)
+            archive()
+            self._drain([n])
+        finally:
+            if woke and self._running(n):
+                self.stack.stop(self._container(n))
+
     def settle(self) -> list[int]:
         """Между учениями нагрузки (Д11б): жёсткая остановка рвёт ход, а агент, сохранённый посреди оборванного хода,
         в записи прогона не остаётся (Д8 m-р4-3) и живёт на месте — следующая подготовка отказала бы place_agents
         (R121); агенты, которых прогонщик архивировал при спящем месте, держат место в очереди перезагрузки. Такие
-        агенты (кроме bench-uzel) — в архив, места с ними и с очередью работают (спящее — docker start), очередь пуста
-        (≤ drain_s). Возвращает места, где были такие агенты."""
+        агенты (кроме bench-uzel) — в архив и очередь пуста, по одному месту (_one_place). Идемпотентно; сбой места не
+        обрывает остальных — первый поднимается в конце. Возвращает места, где были такие агенты."""
         strays = {n: [r["name"] for r in _agent_rows(self.stack, n) if r.get("name") != BENCH_AGENT]
                   for n in self.places}
-        strays = {n: names for n, names in strays.items() if names}
-        busy = sorted(set(strays) | {n for n in self.places if self.queued([n])})
-        for n in busy:
-            if not self._running(n):
-                self.stack.start(self._container(n))
-        for n, names in strays.items():
-            for name in names:
-                self.stack.agents_admin("archive", "--place", str(n), "--name", name, "--yes")
-        if busy:
-            wait_for(lambda: self.queued() == 0, self.drain_s)
-        return sorted(strays)
+        errors: list[Exception] = []
+        for n in self.places:
+            names = strays[n]
+            if not names and not self.queued([n]):
+                continue
+            try:
+                self._one_place(n, lambda n=n, names=names: [
+                    self.stack.agents_admin("archive", "--place", str(n), "--name", name, "--yes") for name in names])
+            except Exception as exc:                    # noqa: BLE001 — следующие места всё равно
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+        return sorted(n for n, names in strays.items() if names)
 
     def judge_and_table(self, out: Path) -> list[ModelRow]:
         """Таблица отбора по OUT (Б3): table.build — check_verdicts, aggregate с load_tag_units(out) и планом конфига
@@ -494,36 +550,31 @@ class BenchHarness:
         for runner in self._runners:
             runner.close()
 
-    def _disable(self) -> None:
-        """Работающие места с агентами — пробуждение учёткой места (архив перезагружает только готовое место), затем
-        учётки — disable."""
-        errors: list[Exception] = []
-        for n in self.places:
-            row = self._account(n)
-            if row is None or row[3] != "активна":
-                continue
-            if self._running(n) and self._has_agents(n):
-                try:                                    # не проснулось — учётку всё равно отключить; сбой — в конце
-                    chat = self._chat(n)
-                    chat.login()
-                    chat.wake(timeout=WAKE_S)
-                except Exception as exc:                # noqa: BLE001
-                    errors.append(exc)
+    def _disable_account(self, n: int) -> None:
+        row = self._account(n)
+        if row is not None and row[3] == "активна":
             self.stack.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "disable",
                             "--login", self.login(n))
+
+    def _retire(self) -> None:
+        """Места модуля по одному (порядок П2 — на каждом месте; итоговое ревью Д11б, I-3, I-4): место с агентами или
+        с очередью перезагрузки — готово для воркера (пробуждение учёткой через шлюз), учётка — disable, агенты — в
+        архив, очередь места пуста, разбуженное место снова спит (_one_place); место без них — только disable.
+        Место без агентов и без очереди не будится: archive ставит место в очередь и без агентов. Сбой места не
+        обрывает остальных (учётку тогда отключит _release) — первый поднимается в конце."""
+        errors: list[Exception] = []
+        for n in self.places:
+            try:
+                agents = self._has_agents(n)
+                if agents or self.queued([n]):
+                    self._one_place(n, (lambda n=n: self.stack.agents_admin("archive", "--place", str(n), "--yes"))
+                                    if agents else (lambda: None), disable=True)
+                else:
+                    self._disable_account(n)
+            except Exception as exc:                    # noqa: BLE001 — следующие места всё равно
+                errors.append(exc)
         if errors:
             raise errors[0]
-
-    def _archive(self) -> None:
-        """Агенты мест — в архив, пока места работают; затем очередь перезагрузки мест пуста (≤ drain_s). Место без
-        агентов не трогается: archive ставит место в очередь и без агентов, а спящее место её не снимет."""
-        for n in self.places:
-            if not self._has_agents(n):
-                continue
-            if not self._running(n):
-                self.stack.start(self._container(n))
-            self.stack.agents_admin("archive", "--place", str(n), "--yes")
-        wait_for(lambda: self.queued() == 0, self.drain_s)
 
     def _places_plain(self) -> None:
         """Места без переопределения и остановлены: stop, затем create --force-recreate (тома не трогаются)."""
@@ -539,7 +590,9 @@ class BenchHarness:
                 self.stack.stop(self._container(n))
 
     def _release(self) -> None:
-        """Учётки remove, затем release-place — только мест, закреплённых за учётками модуля."""
+        """Учётки remove, затем release-place — только мест, закреплённых за учётками модуля, и только при пустой
+        очереди перезагрузки места (итоговое ревью Д11б, I-3): иначе — понятная ошибка в конце, а не отказ команды."""
+        errors: list[Exception] = []
         for n in self.places:
             row = self._account(n)
             if row is not None:
@@ -549,8 +602,14 @@ class BenchHarness:
                 self.stack.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "remove",
                                 "--login", self.login(n), "--yes")
             if self._bound(n):
+                if self.queued([n]):
+                    errors.append(AssertionError(f"место {n:02d}: очередь перезагрузки не пуста — release-place не "
+                                                 "зван"))
+                    continue
                 self.stack.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "release-place",
                                 "--place", str(n), "--yes")
+        if errors:
+            raise errors[0]
 
     def _core_plain(self) -> None:
         """core и сторож — значения test.env ({}), если ещё нет: прогона, двойника историана, белого списка отбора,
@@ -570,8 +629,8 @@ class BenchHarness:
     def cleanup(self) -> None:
         """Уборка по README (порядок — П2, см. шапку модуля); идемпотентна. Сбой шага не обрывает следующих."""
         errors: list[BaseException] = []
-        for step in (self._close_runners, lambda: self._bench(on=False), lambda: self.delay(0), self._disable,
-                     self._archive, self._places_plain, self._release, self._core_plain):
+        for step in (self._close_runners, lambda: self._bench(on=False), lambda: self.delay(0), self._retire,
+                     self._places_plain, self._release, self._core_plain):
             try:
                 step()
             except Exception as exc:                # noqa: BLE001 — уборка идёт дальше, первый сбой — в конце
