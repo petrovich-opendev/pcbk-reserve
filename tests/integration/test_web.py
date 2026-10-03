@@ -86,6 +86,21 @@ TEACHER_ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) =
                             "&& e.textContent.trim() === 'Кабинет преподавателя и доли')"
                             ".scrollIntoView({block: 'center'}), 1")
 TRANSCRIPT_INTO_VIEW_JS = "document.querySelector('section.transcript').scrollIntoView({block: 'start'}), 1"
+# итоговое ревью Д10а, m-1: таблица мест не заходит под панель открытого места — правый край таблицы и каждой кнопки
+# «Открыть» левее панели (иначе панель рисуется поверх последнего столбца)
+PLACES_BESIDE_PANEL_JS = """(() => {
+  const panel = document.querySelector('section.tch-place');
+  const table = document.querySelector('table.places');
+  if (!panel || !table) return 'нет панели или таблицы';
+  const left = panel.getBoundingClientRect().left;
+  const over = [...table.querySelectorAll('button.open-place')].filter((b) => b.getBoundingClientRect().right > left + 0.5);
+  return table.getBoundingClientRect().right <= left + 0.5 && over.length === 0 ? 'ok'
+    : `таблица до ${table.getBoundingClientRect().right}, панель с ${left}, кнопок под панелью: ${over.length}`;
+})()"""
+# самая широкая строка таблицы: логин в 32 знака (наибольший по LOGIN_RE) и все пометки учётки — в ячейке «Студент»
+# места 01 (только разметка страницы, React её не перерисует); ширина таблицы на стенде зависит от учёток прогона
+WIDEST_ROW_JS = ("(() => { const td = document.querySelector('tr[data-place=\"01\"] td:nth-child(2)'); "
+                 "td.textContent = 'a'.repeat(32) + ' отключена замок не подтвердил предупреждение'; return 1; })()")
 EVENT = OC + "/event"                           # поток событий вкладки (только у открытого разговора)
 DEFAULT_TITLE = "New session - "               # имя разговора OpenCode до самозаголовка
 TOO_MANY_TABS = r"Открыто слишком много вкладок чата — закройте лишние"
@@ -662,8 +677,11 @@ def test_teacher_cabinet_reads_conversation(stack, page, isolated_page, web_user
     reads = [(r["method"], r["path"]) for r in t.requests("/pcbk/api/teacher/places/")]
     assert reads and {m for m, _ in reads} == {"GET"}, reads                # место открыто и прочитано только GET
     assert t.requests("/pcbk/api/oc/") == []
+    assert t.eval(PLACES_BESIDE_PANEL_JS) == "ok"                           # «Открыть» не под панелью места (m-1)
     t.eval(TRANSCRIPT_INTO_VIEW_JS)
     shot(t, "d10a-02-reader.png")
+    t.eval(WIDEST_ROW_JS)                                                    # и при самой широкой строке (m-1)
+    assert t.eval(PLACES_BESIDE_PANEL_JS) == "ok"
     assert t.csp() == [] and t.console_errors() == []
     assert stack.teacher_health()["reads_1h"] >= reads0 + 2                 # чтения засчитаны сервером
     # студент своё видит по-прежнему, а кабинет ему закрыт — на сервере
@@ -671,6 +689,48 @@ def test_teacher_cabinet_reads_conversation(stack, page, isolated_page, web_user
     code = page.eval("fetch('/pcbk/api/teacher/overview').then(r => r.status)")
     assert code == 403
     assert stack.teacher_health()["role_refused_1h"] == refused0 + 1
+
+
+def teacher_journal(stack) -> list[tuple[str, ...]]:
+    """Журнал действий преподавателя командой администратора (Д10-R99), новые первыми: (логин, действие, место, цель,
+    итог) — как в test_gateway."""
+    out = stack.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "journal", "--last", "1000")
+    return [tuple(line.split("\t")[1:6]) for line in out.splitlines()]
+
+
+def test_teacher_wakes_sleeping_place_to_read(stack, page, isolated_page, web_users):   # успех 1; итоговое ревью, m-3
+    """«Разбудить для просмотра» от начала до конца (Д10а, критерий успеха 1): место 09 со студентом остановлено, его
+    разговор в кабинете не читается, а «Открыть» даёт «спит» и кнопку; нажатие — POST wake (обычный запуск места: sp-ctl
+    start), опрос места кабинета до «готово» и список разговоров. В журнале действий — sessions, wake, sessions с местом
+    09; к /pcbk/api/workplace вкладка не ходила, место будит только кнопка."""
+    ensure_notice_acked(stack, "web-a")
+    login_to_chat(page, "web-a", web_users["web-a"])
+    ask(page, Q)                                                             # у места 09 точно есть разговор
+    t = teacher_client(stack, web_users)
+    stack.stop("pcbk-student-09")
+    wait_for(lambda: t.call("GET", "/pcbk/api/teacher/places/09")[1].get("state") == "sleeping", timeout=90)
+    journal0 = teacher_journal(stack)
+    tab = isolated_page
+    tab.goto(STAND + "/login")
+    tab.type("#login", "web-t"); tab.type("#password", web_users["web-t"]); tab.press_enter("#password")
+    tab.wait_url("/chat/", 30)
+    tab.wait_selector("table.places", 60)
+    tab.click('tr[data-place="09"] button.open-place')
+    tab.wait_selector("button.wake-read", 60)
+    tab.wait_text("Рабочее место студента спит — разбудите его для просмотра", 10, css=".tch-sessions")
+    assert not stack.inspect("pcbk-student-09")["State"]["Running"]         # чтение место не будит
+    tab.click("button.wake-read")
+    tab.wait_selector(".sessions button[data-session-id]", 150)             # проснулось — список разговоров
+    assert stack.inspect("pcbk-student-09")["State"]["Running"]
+    wakes = [(r["method"], r["status"]) for r in tab.requests("/pcbk/api/teacher/places/09/wake")]
+    assert wakes == [("POST", 202)], wakes
+    assert tab.requests("/pcbk/api/workplace") == [] and tab.requests("/pcbk/api/oc/") == []
+    journal = teacher_journal(stack)
+    assert journal[:len(journal) - len(journal0)] == [                      # новые первыми
+        ("web-t", "sessions", "09", "-", "requested"),
+        ("web-t", "wake", "09", "-", "requested"),
+        ("web-t", "sessions", "09", "-", "requested")]
+    assert tab.csp() == []
 
 
 def test_rename_and_archive_through_gateway(stack, page, web_users):                    # Review Focus 4 Д6б
@@ -857,22 +917,36 @@ def test_broken_own_agent_not_loaded(stack, page, web_users):                   
 
 
 def test_teacher_share_flips_student_refusal(stack, page, isolated_page, web_users):   # Review Focus 3; успех 3; B-1
-    """Доля → отказ → ответ в браузере студента (Д10а, критерий успеха 3): после дорогого вызова (FAKEDEAR, $0,5037 —
-    расход не кратен центу) «Остановить место» сводит долю места 09 к полу, и следующий же вызов студента получает «доля
-    израсходована»; возврат $1 — снова ответ. Доли мест 09 и 10 в конце — как были (finally)."""
+    """Доля → отказ → ответ в браузере (Д10а, критерий успеха 3): после дорогого вызова (FAKEDEAR, $0,5037 — расход не
+    кратен центу) преподаватель во вкладке кабинета выбирает 09 → 10 и нажимает «Остановить место» (итоговое ревью Д10а,
+    m-2): доля места 09 сведена к полу, и следующий же вызов студента получает «доля израсходована»; возврат $1 (клиентом
+    шлюза) — снова ответ. Доли мест 09 и 10 в конце — как были (finally)."""
     t = teacher_client(stack, web_users)
     start = shares_of(t)
     try:
         ensure_notice_acked(stack, "web-a")
         login_to_chat(page, "web-a", web_users["web-a"])
+        tab = isolated_page                                                  # кабинет web-t — своими cookie
+        tab.goto(STAND + "/login")
+        tab.type("#login", "web-t"); tab.type("#password", web_users["web-t"]); tab.press_enter("#password")
+        tab.wait_url("/chat/", 30)
+        tab.wait_selector("table.places", 60)
         ask(page, "сколько сейчас 20FAKE_001_PV FAKEDEAR")                  # $0,5037 за вызов: расход не кратен центу
         # «Остановить место» — одна серверная операция (I-1 р2): пол сервер берёт под замком перевода, и вызов
-        # (заголовок разговора), кончившийся между обзором и кнопкой, её не ломает
-        status, body, _ = t.call("POST", "/pcbk/api/teacher/shares/floor", {"place": "09", "to": "10"})
-        assert status == 200, (status, body)
+        # (заголовок разговора), кончившийся между обзором и кнопкой, её не ломает; в теле — только места
+        tab.select("#share-from", "09")
+        tab.select("#share-to", "10")
+        tab.click("button.share-floor")
+        tab.wait_text("Доли обновлены", 30, css=".tch-shares")
+        floors = [(r["method"], r["status"]) for r in tab.requests("/pcbk/api/teacher/shares/floor")]
+        assert floors == [("POST", 200)], floors
+        assert [r for r in tab.requests("/pcbk/api/teacher/shares") if r["path"] == "/pcbk/api/teacher/shares"] == []
+        status, body, _ = t.call("GET", "/pcbk/api/teacher/overview")
+        assert status == 200
         p9 = next(p for p in body["places"] if p["place"] == "09")
         assert p9["share_cents"] <= p9["floor_cents"]                       # доля 09 = пол (пол мог лишь вырасти)
         assert p9["share_cents"] < start["09"] and p9["spent_usd"] >= 0.5037   # расход FAKEDEAR учтён, доля сведена
+        assert tab.csp() == [] and tab.console_errors() == []
         page.type("textarea", "ещё вопрос"); page.press_enter("textarea")   # следующий же вызов — отказ
         page.wait_text("Ваша доля бюджета на модель израсходована", 60)
         shot(page, "d10a-03-share-spent.png")
@@ -893,8 +967,8 @@ def test_teacher_row_drills(stack, page, web_users):                     # Revie
     assert web_reports(stack) == NO_REPORTS
     stack.wait_status(lambda d: row_of(d, "teacher")["state"] == "ok", 90)
     start = shares_of(teacher_client(stack, web_users))
-    stack.recreate("core", {"DRILL_TEACHER": "shares_stale"})
-    try:
+    try:                                        # итоговое ревью Д10а, m-4: и пересоздание под учением — внутри try
+        stack.recreate("core", {"DRILL_TEACHER": "shares_stale"})
         t = teacher_client(stack, web_users)
         assert move(t, "10", "09", 1) == 200
         s = stack.wait_status(lambda d: row_of(d, "teacher")["state"] == "fail", 90)
@@ -919,8 +993,10 @@ def test_teacher_row_drills(stack, page, web_users):                     # Revie
         page.eval(TEACHER_ROW_INTO_VIEW_JS)
         shot(page, "d10a-05-journal-row.png")
     finally:
-        stack.recreate("core", {})
-        restore(teacher_client(stack, web_users), start)                     # m-3 р2: доли — сразу, до ожидания строки
+        try:
+            stack.recreate("core", {})
+        finally:                                # m-4: доли возвращаются, даже если пересоздание упало
+            restore(teacher_client(stack, web_users), start)                 # m-3 р2: доли — сразу, до ожидания строки
     stack.wait_status(lambda d: row_of(d, "teacher")["state"] == "ok", 90)
 
 

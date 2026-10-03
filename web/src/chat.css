@@ -199,7 +199,8 @@ svg.profile circle { fill: var(--accent); }
 .tch-budget { font-weight: 600; }
 .tch-hint { color: var(--muted); }
 .tch-mark { font-size: .85em; color: var(--warn); }
-.tch-main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
+/* колонка таблицы не уже самой таблицы: иначе панель открытого места ложится на «Открыть» (итоговое ревью Д10а, m-1) */
+.tch-main { display: grid; grid-template-columns: minmax(min-content, 1fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
 @media (max-width: 64rem) { .tch-main { grid-template-columns: minmax(0, 1fr); } }
 table.places { border-collapse: collapse; width: 100%; }
 table.places th, table.places td { padding: .3rem .55rem; border-bottom: 1px solid var(--border); text-align: left;
