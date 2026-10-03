@@ -99,3 +99,31 @@ def test_parts_limit_and_session_id_rules():
     v = sessions_view(json.dumps([{"id": SES, "title": None, "time": {"updated": "вчера"}},
                                   {"id": "ses_" + "C" * 26, "time": {"updated": 1}}]).encode())
     assert [(s["id"], s["title"], s["updated"]) for s in v] == [("ses_" + "C" * 26, "", 1), (SES, "", None)]
+
+
+# --- доводка р1, I-1: одиночный суррогат из ответа места — U+FFFD, ответ кодируется в UTF-8 ---
+
+def test_lone_surrogates_become_replacement_char():
+    bad = "\ud83d"                                                           # половина пары эмодзи
+    session = {**SESSION, "title": "Значение " + bad}
+    raw = [msg("user", {"type": "text", "text": "вопрос " + bad}, agent="pomo" + bad),
+           msg("assistant",
+               {"type": "tool", "tool": "pcbk_tag_now", "state": {"status": "completed", "input": {"q": bad},
+                                                                  "output": "вывод " + bad}},
+               {"type": "tool", "tool": "pcbk_tag_now", "state": {"status": "error", "error": "сбой " + bad}},
+               mode="konstruktor" + bad, error={"name": "ProviderError", "data": {"message": "ошибка " + bad}})]
+    session_raw, messages_raw = json.dumps(session).encode(), json.dumps(raw).encode()   # \ud83d — экраном, как у места
+    assert b"\\ud83d" in messages_raw                                         # контроль: суррогат дошёл до разбора
+    t = transcript(session_raw, messages_raw)
+    json.dumps(t, ensure_ascii=False).encode("utf-8")                       # не падает: суррогатов в ответе нет
+    assert t["session"]["title"] == "Значение �" and t["clipped"] is False
+    user, assistant = t["messages"]
+    assert (user["parts"], user["agent"]) == ([{"kind": "text", "text": "вопрос �"}], "pomo�")
+    assert assistant["parts"] == [
+        {"kind": "tool", "tool": "pcbk_tag_now", "status": "completed", "input": '{"q": "�"}',
+         "output": "вывод �"},
+        {"kind": "tool", "tool": "pcbk_tag_now", "status": "error", "input": None, "output": "сбой �"}]
+    assert (assistant["agent"], assistant["error"]) == ("konstruktor�", "ошибка �")
+    v = sessions_view(json.dumps([session, {"id": "ses_" + "B" * 26, "title": bad * 300}]).encode())
+    json.dumps(v, ensure_ascii=False).encode("utf-8")
+    assert [s["title"] for s in v] == ["Значение �", "�" * 200]

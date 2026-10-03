@@ -442,3 +442,43 @@ async def test_teacher_gate_one_reader_two_waiting(monkeypatch):           # в�
     assert late.value.key == "busy"
     hold.set()
     await task
+
+
+# --- доводка р1, I-1: одиночный суррогат в ответе места — 200 с U+FFFD, а не 500 и не «ok» в журнале ---
+
+def test_lone_surrogate_from_place_is_200_with_replacement(tg, caplog):
+    caplog.set_level(logging.INFO, logger="pcbk_core")
+    bad = "\ud83d"                                                           # строка, обрезанная посреди эмодзи
+    places = tg.role.fake_places
+    other = "ses_" + "B" * 26
+    places.sessions[3] = [{**places.sessions[3][0], "title": "Значение " + bad},
+                          {"id": other, "title": "второй", "time": {"created": 1, "updated": 2}}]
+    places.messages[(3, TEACHER_SES)] = [
+        {**TEACHER_HISTORY[0], "parts": [{"type": "text", "text": "вопрос " + bad}]},
+        {**TEACHER_HISTORY[1], "parts": [{"type": "tool", "tool": "pcbk_tag_now",
+                                          "state": {"status": "completed", "input": {"tags": [bad]},
+                                                    "output": "12,5 " + bad}}]}]
+    t = tg.as_("teach")
+    r = t.get(P + "places/03/sessions")                                     # одно «битое» название — весь список
+    assert r.status_code == 200
+    assert [(s["id"], s["title"]) for s in r.json()["sessions"]] == [(TEACHER_SES, "Значение �"),
+                                                                       (other, "второй")]
+    r = t.get(P + f"places/03/sessions/{TEACHER_SES}")
+    assert r.status_code == 200
+    user, assistant = r.json()["messages"]
+    assert user["parts"] == [{"kind": "text", "text": "вопрос �"}]
+    assert assistant["parts"][0]["output"] == "12,5 �" and assistant["parts"][0]["input"] == '{"tags": ["�"]}'
+    assert tg.role.teacher_stats.count_1h("read") == 2
+    lines = [x.getMessage() for x in caplog.records if x.getMessage().startswith("gw teacher login=teach")]
+    assert [line.split(" status=")[1].split()[0] for line in lines] == ["200", "200"]
+
+
+def test_ok_line_only_after_response_is_built(caplog):                    # I-1, п. 2: сбой сборки — не «ok»
+    caplog.set_level(logging.INFO, logger="pcbk_core")
+    counted = []
+    call = teacher_api._Call("teach", "read", 3)
+    with pytest.raises(UnicodeEncodeError):
+        teacher_api._ok(call, {"text": "\ud83d"}, count=lambda: counted.append(1))
+    assert counted == [] and "outcome=ok" not in caplog.text
+    teacher_api._ok(call, {"text": "�"}, count=lambda: counted.append(1))                  # контроль
+    assert counted == [1] and "gw teacher login=teach action=read place=03 outcome=ok status=200" in caplog.text

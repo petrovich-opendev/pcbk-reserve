@@ -24,7 +24,8 @@ agents_after_dispose; см. FakePlaces).
 
 Д10а (задача А3): разговоры места для кабинета преподавателя — sessions[n] (список разговоров вида OpenCode) и
 messages[(n, id)] (сообщения разговора): GET /experimental/session, GET /session/{id} (нет такого у места — 404
-{"name": "NotFoundError"}), GET /session/{id}/message (тоже).
+{"name": "NotFoundError"}), GET /session/{id}/message (тоже). Тела разговоров — как JSON.stringify OpenCode: одиночный
+суррогат уходит экраном \\udXXX (доводка р1, I-1).
 """
 from pathlib import Path
 import asyncio
@@ -75,6 +76,12 @@ def _stamp() -> str:
 
 def _json(status: int, body: object) -> httpx.Response:
     return httpx.Response(status, json=body)
+
+
+def _json_escaped(status: int, body: object) -> httpx.Response:
+    """JSON как у JSON.stringify OpenCode: одиночный суррогат — экраном \\udXXX (json= httpx его не закодировал бы)."""
+    return httpx.Response(status, content=json.dumps(body).encode("ascii"),
+                          headers={"content-type": "application/json"})
 
 
 class FakeDocker:
@@ -391,12 +398,12 @@ class FakePlaces:
         if request.method == "GET" and path == "/permission":
             return _json(200, self.pending.get(n, []))
         if request.method == "GET" and path == "/experimental/session":
-            return _json(200, self.sessions.get(n, []))
+            return _json_escaped(200, self.sessions.get(n, []))
         if request.method == "GET" and (m := _SESSION.fullmatch(path)):
             found = [s for s in self.sessions.get(n, []) if s.get("id") == m[1]]
             if not found:
                 return _json(404, {"name": "NotFoundError", "data": {"message": "Session not found"}})
-            return _json(200, self.messages.get((n, m[1]), []) if m[2] else found[0])
+            return _json_escaped(200, self.messages.get((n, m[1]), []) if m[2] else found[0])
         if request.method == "POST" and _PROMPT_ASYNC.fullmatch(path):
             return httpx.Response(204)
         if request.method == "POST" and path == "/instance/dispose":

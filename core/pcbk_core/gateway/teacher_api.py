@@ -197,9 +197,14 @@ def _line(call: _Call, outcome: str, status: int, tail: str = "") -> None:
         _nn(call.place), outcome, status, ms, tail)
 
 
-def _ok(call: _Call, body: dict, status: int = 200) -> JSONResponse:
+def _ok(call: _Call, body: dict, status: int = 200, *, count: Callable[[], None] | None = None) -> JSONResponse:
+    """Удача: ответ собирается (тело кодируется) до счётчика удачи count и строки «ok» журнала службы — сбой сборки не
+    оставляет ни «ok», ни удачного чтения (доводка р1, I-1)."""
+    response = JSONResponse(body, status_code=status)
+    if count is not None:
+        count()
     _line(call, "ok", status)
-    return JSONResponse(body, status_code=status)
+    return response
 
 
 def _fail(call: _Call, key: str, tail: str = "") -> JSONResponse:
@@ -495,6 +500,9 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
     cab = _Cabinet(role)
     P = TEACHER_PREFIX
 
+    def read_ok() -> None:                          # удачное чтение — после сборки ответа (_ok)
+        role.teacher_stats.event("read")
+
     @router.get(HEALTH_TEACHER_PATH, dependencies=[Depends(front_only)])
     async def health_teacher() -> JSONResponse:
         # только числа и флаги: ни логинов, ни номеров мест
@@ -565,8 +573,7 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
             body = await _read_place(role, call.place, ses)
         except _Refused as exc:
             return cab.refused_place(call, exc)
-        role.teacher_stats.event("read")
-        return _ok(call, body)
+        return _ok(call, body, count=read_ok)
 
     @router.get(P + "places/{nn}/sessions", dependencies=guarded)
     async def sessions(nn: str, account: Account = Depends(account_of)) -> Response:
@@ -596,10 +603,9 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
         except (AgentsStoreError, DirUnavailable):
             role.teacher_stats.event("read_failed")
             return _fail(call, "agents_down")
-        role.teacher_stats.event("read")
         return _ok(call, {"agents": [{"name": c.name, "title": c.title, "node": c.node, "purpose": c.purpose,
                                       "tools": c.tools, "tags": c.tags, "state": c.state, "created_at": c.created_at,
-                                      "visible_at": c.visible_at} for c in cards]})
+                                      "visible_at": c.visible_at} for c in cards]}, count=read_ok)
 
     @router.get(P + "places/{nn}/agents/{name}", dependencies=guarded)
     async def agent(nn: str, name: str, account: Account = Depends(account_of)) -> Response:
@@ -621,8 +627,7 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
         except (AgentsStoreError, DirUnavailable):
             role.teacher_stats.event("read_failed")
             return _fail(call, "agents_down")
-        role.teacher_stats.event("read")
-        return _ok(call, {"name": name, "text": text})
+        return _ok(call, {"name": name, "text": text}, count=read_ok)
 
     async def change(call: _Call, request: Request, parse: Callable[[bytes], object],
                      run: Callable[["LlmRole", object], dict[int, int]],

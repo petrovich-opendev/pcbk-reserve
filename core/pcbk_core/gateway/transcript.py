@@ -14,8 +14,11 @@
 id) — TranscriptError (шлюз отвечает 502 bad_answer). Чужие элементы и чужие виды частей не ломают ответ — пропускаются:
 новые виды частей при смене версии OpenCode не покажутся, но и не уронят чтение (README: сверить виды частей).
 
-Тексты отдаются как есть: экранирует веб, он показывает их только текстом (Д10-R106). Сюда и отсюда — только данные:
-модуль ничего не пишет в журнал службы. Только stdlib.
+Тексты отдаются как есть: экранирует веб, он показывает их только текстом (Д10-R106). Одно исключение (доводка р1,
+I-1): одиночные суррогаты (json.loads пропускает "\\ud83d" — строку, обрезанную посреди пары эмодзи) в каждой строке
+наружу — названии, тексте, вводе и выводе инструмента, ошибке, имени агента — заменяются на U+FFFD: иначе ответ не
+закодировался бы в UTF-8, и шлюз отдал бы 500 вместо разговора. Сюда и отсюда — только данные: модуль ничего не пишет в
+журнал службы. Только stdlib.
 """
 from __future__ import annotations
 
@@ -40,6 +43,13 @@ ROLES = ("user", "assistant")
 TOOL_NAME = re.compile(r"[a-z0-9_]{1,64}")
 TOOL_STATUSES = frozenset({"pending", "running", "completed", "error"})
 _SES = ID_RE["ses"]
+_SURROGATE = re.compile(r"[\ud800-\udfff]")         # как rules._SURROGATE и draft._SURROGATE
+REPLACEMENT = "�"
+
+
+def _clean(text: str) -> str:
+    """Одиночные суррогаты — U+FFFD (доводка р1, I-1): строка всегда кодируется в UTF-8; длина не меняется."""
+    return _SURROGATE.sub(REPLACEMENT, text)
 
 
 class TranscriptError(ValueError):
@@ -76,7 +86,7 @@ def _session_row(obj: object) -> dict | None:
         return None
     title = obj.get("title")
     times = _times(obj)
-    return {"id": sid, "title": title[:TITLE_MAX] if isinstance(title, str) else "",
+    return {"id": sid, "title": _clean(title[:TITLE_MAX]) if isinstance(title, str) else "",
             "created": _time(times.get("created")), "updated": _time(times.get("updated")),
             "archived": times.get("archived") is not None}
 
@@ -93,7 +103,7 @@ def sessions_view(raw: bytes | bytearray | str) -> list[dict]:
 
 
 class _Clip:
-    """Обрезка с отметкой: сработал любой предел — clipped."""
+    """Обрезка с отметкой: сработал любой предел — clipped. Одиночные суррогаты — U+FFFD (это не обрезка)."""
 
     def __init__(self) -> None:
         self.clipped = False
@@ -101,8 +111,8 @@ class _Clip:
     def text(self, value: str, limit: int) -> str:
         if len(value) > limit:
             self.clipped = True
-            return value[:limit]
-        return value
+            value = value[:limit]
+        return _clean(value)
 
 
 def _tool_part(part: dict, clip: _Clip) -> dict:
@@ -172,7 +182,7 @@ def _message(item: object, clip: _Clip) -> dict | None:
     if role == "assistant" and not isinstance(agent, str):
         agent = info.get("mode")
     return {"role": role, "at": _time(_times(info).get("created")),
-            "agent": agent if isinstance(agent, str) and 0 < len(agent) <= AGENT_MAX else None,
+            "agent": _clean(agent) if isinstance(agent, str) and 0 < len(agent) <= AGENT_MAX else None,
             "parts": _parts(item.get("parts"), clip),
             "error": _error(info, clip) if role == "assistant" else None}
 
