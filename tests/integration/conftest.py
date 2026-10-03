@@ -83,6 +83,10 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "PSI_FULL_MAX", "SWAP_GROW_WARN_MIB", "PCBK_TEST_MEM", "VMSTAT_PATH"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
+# адрес историана для проб изоляции — только из окружения (как test_students), иначе адрес стенда из TEST_BDRV_ENV
+HISTORIAN_ADDR = os.environ.get("HISTORIAN_ADDR", "192.0.2.10")
+# одноразовая сеть отрицательного контроля изоляции целиком (Д11-R125): вне сетей стенда 172.31.{1…10}.0/28, .250.0/24
+ISO_CTL_SUBNET = "172.31.249.0/28"
 # белый список стенда — одно синтетическое имя
 TEST_WHITELIST = ("20FAKE_001_PV",)
 # фикстура двойника историана стенда отбора (Д8-R75) и её белый список: все теги каталога, кроме вне списка (C2)
@@ -776,6 +780,17 @@ class Stack:
     def host_lan(self) -> str:
         """Первый адрес IPv4 хоста из hostname -I."""
         return next(a for a in _run(["hostname", "-I"]).stdout.split() if ":" not in a)
+
+    def iso_conf(self) -> dict:
+        """Договор изоляции целиком (Д11-R125, test_isolation_live) для тестового стенда: команды — bash на этой машине,
+        runc (gVisor на стенде нет), места 1–10, свидетели 1 и 2, bdrv.env — TEST_BDRV_ENV; слушатель отрицательного
+        контроля — образ core стенда в своей сети ISO_CTL_SUBNET. Путь к хосту из сети без изолированного шлюза на
+        стенде не проверяется (ctl_host_port None): от sshd машины разработчика тест не зависит (I-3 р2)."""
+        return {"ssh": ["bash", "-c"], "runtime": "runc", "stu_net": self.stu_net, "secrets_dir": str(self.secrets_dir),
+                "places": list(PLACES), "witnesses": [1, 2], "lan_addr": self.host_lan(),
+                "historian_addr": HISTORIAN_ADDR, "remote_dir": str(REPO),
+                "listener_image": self.config()["services"]["core"]["image"], "ctl_subnet": ISO_CTL_SUBNET,
+                "ctl_host_port": None}
 
     # --- запросы к стенду ---
 
