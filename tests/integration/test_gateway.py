@@ -1,6 +1,7 @@
 """Шлюз к OpenCode в компоновке (Д5б): вызовы /pcbk/api/oc/* и поток /event через настоящий edge к настоящему
 OpenCode мест — опасные ручки и близнецы, искажённые пути, вырезанные поля, чужие id и агенты, зависшее и спящее
-место, поток без буфера; edge — путь до «?», пределы соединений, заголовки ответов.
+место, поток без буфера; edge — путь до «?», пределы соединений, заголовки ответов. Д10а: кабинет преподавателя через
+edge читает разговор места 06 только на чтение (разговор в месте не меняется), студенту кабинет закрыт на сервере.
 
 Места этого модуля — 6 (А), 7 (Б), 8 (спит); test_entry — 1, 3, 4, 5. Модули идут по очереди, и каждый гасит свои
 места к концу, в том числе в finally фикстуры users (Ш16). Истина о состоянии места — stack.oc (из сети места, мимо
@@ -32,7 +33,8 @@ EDGE_OC_PER_SESSION = 10
 EDGE_OC_TOTAL = 64
 EDGE_OC_RATE, EDGE_OC_BURST = 20, 200                   # limit_req на cookie (итоговая доводка Д5б, N1)
 EDGE_BODY_TIMEOUT_S = 10                                # client_body_timeout у /pcbk/api/oc/ (N2)
-TEACHER_TEXT = "Просмотр разговоров студентов — в следующих выпусках стенда"
+TEACHER_TEXT = "Преподаватель читает разговоры студентов в кабинете — писать в них нельзя"   # Д10-R100
+TEACHER_ONLY = "Только для преподавателя"                                                      # Д10-R100, teacher_only
 LOG_WAIT_S = 10
 SETTLE_S = 30
 # cookie всех сессий модуля (вход, вторая сессия, преподаватель, место 08) — для проверки журнала core на секреты
@@ -309,6 +311,53 @@ def test_origin_and_teacher(stack, users):
     COOKIES.append(t.cookie)
     code, body, _ = t.call("GET", "/pcbk/api/oc/session/status")
     assert (code, body["name"], body["data"]["message"]) == (403, "Forbidden", TEACHER_TEXT)   # N7: отказ — «преподаватель»
+
+
+def place_truth(stack, n: int, sid: str) -> tuple:
+    """Разговор мимо шлюза: (title, time.updated, число сообщений) — для сверки «до и после» (m-10)."""
+    s = direct_session(stack, n, sid)
+    code, body = stack.oc(n, "GET", f"/session/{sid}/message", n)
+    assert code == 200
+    return s.get("title"), s.get("time", {}).get("updated"), len(json.loads(body))
+
+
+def teacher_journal(stack) -> list[tuple[str, ...]]:
+    """Журнал действий преподавателя командой администратора (Д10-R99), новые первыми: (логин, действие, место, цель,
+    итог) — без времени и деталей."""
+    out = stack.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "journal", "--last", "1000")
+    return [tuple(line.split("\t")[1:6]) for line in out.splitlines()]
+
+
+def test_teacher_api_through_edge(stack, users):                          # Review Focus 1, 2
+    """Кабинет через настоящий edge и настоящий OpenCode места 06: преподаватель читает разговор студента (стенограмма и
+    список), чужое место разговора не отдаёт, писать в место через /pcbk/api/oc нельзя, заглушка edge — JSON; разговор
+    в месте после чтения тот же. Студенту кабинет закрыт на сервере — и обзор, и чтение своего же разговора: 403 без
+    строки журнала действий; каждое чтение преподавателя — строка «requested» с местом и разговором."""
+    a, _ = users
+    status, ses, _ = a.call("POST", "/pcbk/api/oc/session", {})
+    assert status == 200
+    before = place_truth(stack, 6, ses["id"])
+    journal0 = teacher_journal(stack)
+    t = stack.gw_client(); t.login("gw-t", PW["gw-t"])
+    COOKIES.append(t.cookie)
+    assert a.call("GET", "/pcbk/api/teacher/overview")[0] == 403            # студент
+    code, body, _ = a.call("GET", f"/pcbk/api/teacher/places/06/sessions/{ses['id']}")   # и свой разговор — нет
+    assert (code, body["data"]["message"]) == (403, TEACHER_ONLY)
+    status, body, _ = t.call("GET", f"/pcbk/api/teacher/places/06/sessions/{ses['id']}")
+    assert status == 200 and body["session"]["id"] == ses["id"]
+    assert t.call("GET", "/pcbk/api/teacher/places/06/sessions")[0] == 200
+    assert t.call("GET", "/pcbk/api/teacher/places/07/sessions/" + ses["id"])[0] in (404, 503)   # чужое место
+    code, body, _ = t.call("POST", "/pcbk/api/oc/session", {})
+    assert (code, body["data"]["message"]) == (403, TEACHER_TEXT)           # писать в место — нет
+    code, body, h = t.call("GET", "/pcbk/api/teacher")
+    assert (code, body, h["content-type"]) == \
+        (404, {"name": "NotFound", "data": {"message": "не найдено"}}, "application/json")   # заглушка edge, JSON
+    assert place_truth(stack, 6, ses["id"]) == before                       # разговор не изменился (m-10)
+    journal = teacher_journal(stack)
+    assert journal[:len(journal) - len(journal0)] == [                      # новые первыми; строк студента нет
+        ("gw-t", "read", "07", ses["id"], "requested"),
+        ("gw-t", "sessions", "06", "-", "requested"),
+        ("gw-t", "read", "06", ses["id"], "requested")]
 
 
 def test_duplicate_cookies_on_long_path_through_edge(stack, users):                     # Review Focus Д5а 2; Д5-R25, Д5-R30

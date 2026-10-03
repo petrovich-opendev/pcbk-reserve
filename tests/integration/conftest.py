@@ -647,6 +647,11 @@ class Stack:
         """/health/agents серверного слоя изнутри pcbk-watchdog — из pcbk-front, как его читает сторож."""
         return json.loads(self.body_from_watchdog("http://pcbk-core:8000/health/agents"))
 
+    def teacher_health(self) -> dict:
+        """/health/teacher серверного слоя изнутри pcbk-watchdog — из pcbk-front, как его читает сторож (Д10-R96):
+        13 ключей, только числа и флаги — сверка долей, журнал действий, счётчики кабинета за час и учение."""
+        return json.loads(self.body_from_watchdog("http://pcbk-core:8000/health/teacher"))
+
     def env_names(self, name: str) -> set[str]:
         return {e.split("=", 1)[0] for e in self.inspect(name)["Config"]["Env"] or []}
 

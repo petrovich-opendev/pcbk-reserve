@@ -224,8 +224,8 @@ def test_edge_routes_web_report(stack):                                     # Д
 
 def test_edge_routes_my_agents(stack):                                     # Д7б, Д7-R64; preflight П13
     """«Мои агенты» через edge: без cookie — 401 JSON шлюза (тело и текст шлюза, а не страница edge); преподаватель (без
-    места) — 403 JSON с текстом R64; «//» в сыром пути — 400 edge до core. Ответ 200 с cookie студента — в test_web
-    (web-a): своей учётки студента у модуля нет — свободных мест на стенде нет (П13)."""
+    места) — 403 JSON с текстом Д10-R100 (агенты студентов — в кабинете); «//» в сыром пути — 400 edge до core. Ответ
+    200 с cookie студента — в test_web (web-a): своей учётки студента у модуля нет — свободных мест на стенде нет (П13)."""
     gw = stack.gw_client()                                                  # без сессии, Origin стенда
     code, body, h = gw.call("GET", "/pcbk/api/agents")
     assert (code, body, h["content-type"]) == \
@@ -239,8 +239,8 @@ def test_edge_routes_my_agents(stack):                                     # Д7
     try:
         code, body, h = t.call("GET", "/pcbk/api/agents")
         assert (code, body, h["content-type"]) == \
-            (403, {"name": "Forbidden", "data": {"message": "Агенты студентов для преподавателя — в следующих выпусках "
-                                                            "стенда"}}, "application/json"), (code, body)
+            (403, {"name": "Forbidden", "data": {"message": "Агенты студентов — в кабинете преподавателя, только на "
+                                                            "чтение"}}, "application/json"), (code, body)
     finally:
         t.logout()
 

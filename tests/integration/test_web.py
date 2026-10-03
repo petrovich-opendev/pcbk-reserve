@@ -1,5 +1,5 @@
 """Чат в браузере (Д6а, Д6б): вход ведёт в чат, страница чата под CSP в настоящем Chrome (cdp.py); ответ через шлюз, поток
-по HTTP/2, сон места и конец сессии, ошибка модели, преподаватель без чата, баннер и строка «Веб-чат» сторожа. Д6б:
+по HTTP/2, сон места и конец сессии, ошибка модели, кабинет преподавателя (Д10а), баннер и строка «Веб-чат» сторожа. Д6б:
 предупреждение при первом входе (место не будится до «Понятно»), список разговоров (имя OpenCode, переименование и архив
 через шлюз), четвёртая вкладка («закройте лишние»), повторы модели (живая проверка m3 Б3), отчёты браузеров в строке.
 Д7б (Б4): панель «Агенты», первый работающий чат на двойнике (Конструктор сохраняет агента — агент в панели — ответ
@@ -20,13 +20,17 @@
 4. Д7б: панель агентов и первый работающий чат, перезагрузка, сломанный агент. Агенты места 09 — web-proverka (его
    сохраняет Конструктор, остаётся до конца прогона) и web-slomannyj (в архив в finally своего теста). Учётку web-b
    Б4 не заводит (preflight П13: свободных мест на стенде нет) — чужие агенты сверяет test_agents;
-5. учения Д6а (баннер, строка «Веб-чат»): строка ждёт точную тройку ok — ложный отчёт любого теста выше её ловит;
-6. test_reports_reach_row — последним: после него строка «Веб-чат» жёлтая час.
+5. Д10а: кабинет преподавателя читает разговор места 09 (на месте тесту Д6а «преподаватель без чата»); перед учениями
+   Д6а — доля → отказ → ответ (доли 09 и 10 в конце — как были) и учения строки «Кабинет преподавателя и доли» (core
+   пересоздаётся дважды и в конце — без учений: счётчики отчётов браузеров обнуляются до test_reports_reach_row);
+6. учения Д6а (баннер, строка «Веб-чат»): строка ждёт точную тройку ok — ложный отчёт любого теста выше её ловит;
+7. test_reports_reach_row — последним: после него строка «Веб-чат» жёлтая час.
 
 Снимки для владельца (preflight M17): при PCBK_SHOTS=<каталог> тесты кладут туда снимки в своих точках — к концу
 прогона стенд уже опущен, снимать потом не на чем: Д6а — 01-chat-answer, 02-banner-unknown, 03-place-asleep,
 04-status-web-row; Д6б — 01-notice, 02-web-row-warn, 03-sidebar, 04-fourth-tab; Д7б — 02-agents-panel,
-03-konstruktor-saved, 04-own-agent-answer. Данные на снимках — тестовые (тег 20FAKE_…, учётки web-a и web-t).
+03-konstruktor-saved, 04-own-agent-answer; Д10а — d10a-01-cabinet, d10a-02-reader, d10a-03-share-spent,
+d10a-04-drift-row, d10a-05-journal-row. Данные на снимках — тестовые (тег 20FAKE_…, учётки web-a и web-t).
 """
 import html
 import json
@@ -39,7 +43,7 @@ import pytest
 
 import cdp
 import conftest
-from conftest import (NOTICE_RE, REPO, STAND_ORIGIN, Secret, failure, leaks, login_to_chat, shot, system_text,
+from conftest import (NOTICE_RE, REPO, STAND_ORIGIN, Secret, failure, leaks, login_to_chat, row_of, shot, system_text,
                       tool_names_of, turn_bodies, wait_for)
 from fake_openrouter import save_args                                   # core/tests на пути импорта (conftest, П7)
 from gateway_cases import ALLOWED, OC, SES_FAKE, TWINS
@@ -76,6 +80,12 @@ STORE_CLEAN_JS = ("(async () => { localStorage.removeItem('pcbk-probe'); session
 # строка «Веб-чат» страницы состояния — в середину экрана (для снимка 04)
 WEB_ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
                         "&& e.textContent.trim() === 'Веб-чат').scrollIntoView({block: 'center'}), 1")
+# Д10а: строка «Кабинет преподавателя и доли» — последняя, ниже экрана (снимки 04 и 05); стенограмма кабинета — к верху
+# экрана: над ней список разговоров места, к концу прогона он длинный (снимок 02)
+TEACHER_ROW_INTO_VIEW_JS = ("[...document.querySelectorAll('body *')].find((e) => e.children.length === 0 "
+                            "&& e.textContent.trim() === 'Кабинет преподавателя и доли')"
+                            ".scrollIntoView({block: 'center'}), 1")
+TRANSCRIPT_INTO_VIEW_JS = "document.querySelector('section.transcript').scrollIntoView({block: 'start'}), 1"
 EVENT = OC + "/event"                           # поток событий вкладки (только у открытого разговора)
 DEFAULT_TITLE = "New session - "               # имя разговора OpenCode до самозаголовка
 TOO_MANY_TABS = r"Открыто слишком много вкладок чата — закройте лишние"
@@ -597,14 +607,70 @@ def test_model_retries_recorded(stack, page, web_users, record_property):       
     assert page.csp() == []
 
 
-def test_teacher_sees_no_chat(stack, isolated_page, web_users):                           # свои cookie: web-a не задет
-    page = isolated_page
-    page.goto(f"{STAND}/login")
-    page.type("#login", "web-t"); page.type("#password", web_users["web-t"]); page.press_enter("#password")
-    page.wait_text(r"У преподавателя нет рабочего места", 30)                              # страница входа, не чат
-    page.goto(f"{STAND}/chat/"); page.wait_url("/chat/", 10); page.wait_text(r"У преподавателя пока нет чата", 20)
-    assert [r["path"] for r in page.requests("/pcbk/api/oc/")] == []
-    assert page.csp() == [] and page.console_errors() == []
+def teacher_client(stack, web_users):
+    """Клиент шлюза с входом web-t (Д10а); вход — новая сессия, их у учётки не больше трёх (новая вытесняет старую)."""
+    t = stack.gw_client()
+    t.login("web-t", web_users["web-t"])
+    return t
+
+
+def shares_of(t) -> dict[str, int]:
+    """Доли мест в центах из обзора кабинета: {"01": 10000, …}."""
+    status, body, _ = t.call("GET", "/pcbk/api/teacher/overview")
+    assert status == 200
+    return {p["place"]: p["share_cents"] for p in body["places"]}
+
+
+def move(t, src: str, dst: str, cents: int) -> int:
+    """Перевод cents центов доли с места src на место dst со сверкой «было» по нынешнему обзору; код ответа."""
+    s = shares_of(t)
+    status, _, _ = t.call("POST", "/pcbk/api/teacher/shares", {"changes": [
+        {"place": src, "from_cents": s[src], "to_cents": s[src] - cents},
+        {"place": dst, "from_cents": s[dst], "to_cents": s[dst] + cents}]})
+    return status
+
+
+def restore(t, start: dict[str, int]) -> None:
+    """Доли мест 09 и 10 — как в start (CAS по нынешним); вызывается из finally."""
+    now = shares_of(t)
+    changes = [{"place": p, "from_cents": now[p], "to_cents": start[p]} for p in ("09", "10") if now[p] != start[p]]
+    if changes:
+        assert t.call("POST", "/pcbk/api/teacher/shares", {"changes": changes})[0] == 200
+
+
+def test_teacher_cabinet_reads_conversation(stack, page, isolated_page, web_users):     # Review Focus 1, 2, 7
+    """Кабинет преподавателя в браузере (Д10а): web-t входит на /login, страница входа сама ведёт в кабинет (B-2), место
+    преподавателю не будится; таблица мест, место 09 открывается, разговор студента — только на чтение (ни поля, ни
+    кнопки отправки). Студент на той же ручке кабинета получает 403 от сервера — и это событие role_refused."""
+    ensure_notice_acked(stack, "web-a")
+    login_to_chat(page, "web-a", web_users["web-a"])
+    ask(page, Q)                                                             # разговор студента на месте 09
+    reads0 = stack.teacher_health()["reads_1h"]
+    t = isolated_page
+    t.goto(STAND + "/login")
+    t.type("#login", "web-t"); t.type("#password", web_users["web-t"]); t.press_enter("#password")
+    t.wait_url("/chat/", 30)                                                 # B-2: страница входа сама ведёт в кабинет
+    t.wait_selector("table.places", 60)
+    assert [r["path"] for r in t.requests("/pcbk/api/workplace")] == []     # место преподавателю не будится
+    shot(t, "d10a-01-cabinet.png")
+    t.click('tr[data-place="09"] button.open-place')
+    t.wait_selector(".sessions button[data-session-id]", 60)                # место 09 не спит: студент спрашивал
+    t.click(".sessions button[data-session-id]")
+    t.wait_text("что сейчас по тегу 20FAKE_001_PV", 30, css="section.transcript")
+    t.wait_text("Готово", 10, css="section.transcript")
+    assert t.eval("document.querySelectorAll('section.transcript textarea, section.transcript input').length") == 0
+    reads = [(r["method"], r["path"]) for r in t.requests("/pcbk/api/teacher/places/")]
+    assert reads and {m for m, _ in reads} == {"GET"}, reads                # место открыто и прочитано только GET
+    assert t.requests("/pcbk/api/oc/") == []
+    t.eval(TRANSCRIPT_INTO_VIEW_JS)
+    shot(t, "d10a-02-reader.png")
+    assert t.csp() == [] and t.console_errors() == []
+    assert stack.teacher_health()["reads_1h"] >= reads0 + 2                 # чтения засчитаны сервером
+    # студент своё видит по-прежнему, а кабинет ему закрыт — на сервере
+    refused0 = stack.teacher_health()["role_refused_1h"]
+    code = page.eval("fetch('/pcbk/api/teacher/overview').then(r => r.status)")
+    assert code == 403
+    assert stack.teacher_health()["role_refused_1h"] == refused0 + 1
 
 
 def test_rename_and_archive_through_gateway(stack, page, web_users):                    # Review Focus 4 Д6б
@@ -788,6 +854,74 @@ def test_broken_own_agent_not_loaded(stack, page, web_users):                   
     finally:
         stack.agents_admin("archive", "--place", str(PLACE), "--name", BROKEN_AGENT, "--yes")
         wait_for(lambda: stack.agents_health()["pending"] == 0, 30)                         # место перезагружено
+
+
+def test_teacher_share_flips_student_refusal(stack, page, isolated_page, web_users):   # Review Focus 3; успех 3; B-1
+    """Доля → отказ → ответ в браузере студента (Д10а, критерий успеха 3): после дорогого вызова (FAKEDEAR, $0,5037 —
+    расход не кратен центу) «Остановить место» сводит долю места 09 к полу, и следующий же вызов студента получает «доля
+    израсходована»; возврат $1 — снова ответ. Доли мест 09 и 10 в конце — как были (finally)."""
+    t = teacher_client(stack, web_users)
+    start = shares_of(t)
+    try:
+        ensure_notice_acked(stack, "web-a")
+        login_to_chat(page, "web-a", web_users["web-a"])
+        ask(page, "сколько сейчас 20FAKE_001_PV FAKEDEAR")                  # $0,5037 за вызов: расход не кратен центу
+        # «Остановить место» — одна серверная операция (I-1 р2): пол сервер берёт под замком перевода, и вызов
+        # (заголовок разговора), кончившийся между обзором и кнопкой, её не ломает
+        status, body, _ = t.call("POST", "/pcbk/api/teacher/shares/floor", {"place": "09", "to": "10"})
+        assert status == 200, (status, body)
+        p9 = next(p for p in body["places"] if p["place"] == "09")
+        assert p9["share_cents"] <= p9["floor_cents"]                       # доля 09 = пол (пол мог лишь вырасти)
+        assert p9["share_cents"] < start["09"] and p9["spent_usd"] >= 0.5037   # расход FAKEDEAR учтён, доля сведена
+        page.type("textarea", "ещё вопрос"); page.press_enter("textarea")   # следующий же вызов — отказ
+        page.wait_text("Ваша доля бюджета на модель израсходована", 60)
+        shot(page, "d10a-03-share-spent.png")
+        assert move(t, "10", "09", 100) == 200                              # вернули $1
+        ask(page, Q)                                                         # снова ответ «Готово: …»
+        assert page.csp() == []
+    finally:
+        restore(t, start)
+    assert shares_of(t) == start                                             # доли мест — как были
+
+
+def test_teacher_row_drills(stack, page, web_users):                     # Review Focus 6; учения строки
+    """Учения строки «Кабинет преподавателя и доли» (Д10-R96) на странице состояния: shares_stale — перевод 1 цента
+    записан, а память прокси нет: fail «LLM-прокси считает доли не так, как сохранено», мест 2; journal_down — ручка
+    чтения отвечает 503 до доступа, строка fail «журнал … кабинет закрыт». После — core без учений, доли как были,
+    строка снова ok. Пересоздание core обнуляет счётчики отчётов браузеров: ложный отчёт тестов выше сверяется здесь,
+    до первого пересоздания (тот же контроль, что в начале test_reports_reach_row)."""
+    assert web_reports(stack) == NO_REPORTS
+    stack.wait_status(lambda d: row_of(d, "teacher")["state"] == "ok", 90)
+    start = shares_of(teacher_client(stack, web_users))
+    stack.recreate("core", {"DRILL_TEACHER": "shares_stale"})
+    try:
+        t = teacher_client(stack, web_users)
+        assert move(t, "10", "09", 1) == 200
+        s = stack.wait_status(lambda d: row_of(d, "teacher")["state"] == "fail", 90)
+        assert (row_of(s, "teacher")["detail"], row_of(s, "teacher")["note"]) == \
+               ("LLM-прокси считает доли не так, как сохранено", "учения: shares_stale; мест: 2")
+        h = stack.teacher_health()
+        assert (h["drill"], h["shares_loaded"], h["shares_drift"]) == ("shares_stale", True, 2)
+        page.goto(f"{STAND}/status"); page.wait_text("Кабинет преподавателя и доли", 20)
+        page.wait_text("LLM-прокси считает доли не так, как сохранено", 20)
+        page.eval(TEACHER_ROW_INTO_VIEW_JS)                                  # строка — последняя, ниже экрана
+        shot(page, "d10a-04-drift-row.png")
+        stack.recreate("core", {"DRILL_TEACHER": "journal_down"})
+        t = teacher_client(stack, web_users)
+        status, body, _ = t.call("GET", "/pcbk/api/teacher/places/09/sessions")
+        assert (status, body["data"]["message"]) == \
+               (503, "Журнал действий преподавателя не пишется — просмотр и изменения закрыты")
+        stack.wait_status(lambda d: row_of(d, "teacher")["detail"] ==
+                          "журнал действий преподавателя не пишется — кабинет закрыт", 90)
+        h = stack.teacher_health()
+        assert (h["drill"], h["store_ok"]) == ("journal_down", False)
+        page.goto(f"{STAND}/status"); page.wait_text("кабинет закрыт", 20)
+        page.eval(TEACHER_ROW_INTO_VIEW_JS)
+        shot(page, "d10a-05-journal-row.png")
+    finally:
+        stack.recreate("core", {})
+        restore(teacher_client(stack, web_users), start)                     # m-3 р2: доли — сразу, до ожидания строки
+    stack.wait_status(lambda d: row_of(d, "teacher")["state"] == "ok", 90)
 
 
 def test_banner_follows_watchdog(stack, page, web_users):                                 # Review Focus 5; учение — ближе к концу
