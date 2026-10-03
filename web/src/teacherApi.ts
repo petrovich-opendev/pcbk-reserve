@@ -38,12 +38,15 @@ const AGENT_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;    // NAME_RE чернови
 const AGENT_MIN = 3;
 const AGENT_MAX = 40;
 const LOGIN_RE = /^[a-z][a-z0-9._-]{2,31}$/;           // LOGIN_RE учёток шлюза (gateway/accounts.py)
+const PROBE_RE = /^d[0-9]+[a-z]?-probe-[a-z0-9-]+$/;   // PROBE_LOGIN учёток шлюза: пробные учётки проверок
 
 export const isPlace = (nn: string): boolean => PLACE_RE.test(nn);
 export const isSessionId = (id: string): boolean => SES_RE.test(id);
 export const isAgentName = (name: string): boolean =>
   name.length >= AGENT_MIN && name.length <= AGENT_MAX && AGENT_RE.test(name);
 export const isLogin = (login: string): boolean => LOGIN_RE.test(login);
+// логин вида пробной учётки: её место команда администратора освобождает (release-place) — подсказка формы, не запрет
+export const isProbeLogin = (login: string): boolean => PROBE_RE.test(login);
 
 // отказ без запроса — тем же видом, что отказ шлюза
 const refused = async (message = T_TCH_BAD_PART): Promise<Reply> =>

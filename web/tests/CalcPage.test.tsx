@@ -277,3 +277,38 @@ test("calc_page_in_flight_flag_and_late_answer", async () => {                  
   await new Promise((r) => setTimeout(r, 0));
   expect(onSignedOut).not.toHaveBeenCalled();                                      // alive: снятая вкладка не решает
 });
+
+// --- итоговая доводка Д10б ---
+
+test("calc_page_unknown_text_prop_is_every_fallback", async () => {    // итоговое ревью Д10б, m-4
+  // запасной текст пропсом (у преподавателя — кабинетный): отказ без текста, ответ не той формы, поиск без message,
+  // элемент не ok без text, расчёт без message; T_DOWN (502–504) и текст сервера — как есть
+  const OWN = "свой запасной текст";
+  const api = calcApi({
+    catalog_search: [[418, { odd: true }], [200, "не объект"], [200, { status: "refused" }]],
+    tag_now: [[200, { status: "partial", items: [{ tag: "20FAKE_999_PV", status: "unknown" }] }],
+              [200, { status: "refused", items: [] }], [502, null],
+              [400, { name: "BadRequest", data: { message: "текст сервера" } }]] });
+  render(<CalcPage api={api} onSignedOut={vi.fn()} unknownText={OWN} />);
+  fireEvent.change(screen.getByLabelText("Слова для поиска"), { target: { value: "расход" } });
+  const find = screen.getByRole("button", { name: "Найти тег" }) as HTMLButtonElement;
+  for (let i = 0; i < 3; i++) {
+    fireEvent.click(find);
+    expect(find.disabled).toBe(true);                                         // ответ в пути: прежний текст не в счёт
+    await waitFor(() => expect(find.disabled).toBe(false));
+    expect(api.calc).toHaveBeenCalledTimes(i + 1);
+    expect(screen.getByRole("alert").textContent).toBe(OWN);
+  }
+  fireEvent.change(screen.getByLabelText("Режим"), { target: { value: "now" } });
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_999_PV" } });
+  const result = async (): Promise<string> => {
+    fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+    await waitFor(() => expect(document.querySelector("section.calc-result")).not.toBeNull());
+    return document.querySelector("section.calc-result")!.textContent!;
+  };
+  expect(await result()).toContain(OWN);                                      // элемент не ok без text
+  expect(await result()).toContain(OWN);                                      // расчёт без message
+  expect(await result()).toBe(T_DOWN);
+  expect(await result()).toBe("текст сервера");
+  expect(document.body.textContent).not.toMatch(/сообщите преподавателю/);
+});

@@ -8,7 +8,7 @@ import { App } from "../src/App";
 import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import type { startStatusPolling } from "../src/status";
-import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_NOTICE_UNKNOWN } from "../src/texts";
+import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_NOTICE_UNKNOWN, T_TCH_UNKNOWN, T_UNKNOWN } from "../src/texts";
 import { OVERVIEW_READY_03, teacherApi } from "./teacherFixtures";
 
 type Answer = [number, unknown];
@@ -486,4 +486,28 @@ test("calc_tab_signed_out_goes_to_login_and_survives_switch", async () => {
   await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
   expect(a.calc).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("button", { name: "Калькуляторы" })).toBeNull();      // ушли на вход — вкладок нет
+});
+
+// --- итоговая доводка Д10б ---
+
+test("calc_tab_fallback_text_is_for_teacher_only", async () => {        // итоговое ревью Д10б, m-4
+  // ответ без текста на вкладке калькуляторов: у преподавателя — текст кабинета, у студента — прежний текст чата
+  const odd = [418, { odd: true }] as Answer;
+  const t = api({ me: [200, { login: "t", role: "teacher", place: null }], calc: odd });
+  const first = render(<App api={t} teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })} navigate={vi.fn()}
+                            ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText("Кабинет преподавателя");
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(await screen.findByText(T_TCH_UNKNOWN)).toBeTruthy();
+  expect(screen.queryByText(/сообщите преподавателю/)).toBeNull();
+  first.unmount();
+  const s = api({ me: student, workplace: [200, { state: "ready" }], calc: odd });
+  render(<App api={s} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  fireEvent.change(screen.getByLabelText("Тег"), { target: { value: "20FAKE_001_PV" } });
+  fireEvent.click(screen.getByRole("button", { name: "Посчитать" }));
+  expect(await screen.findByText(T_UNKNOWN)).toBeTruthy();
 });

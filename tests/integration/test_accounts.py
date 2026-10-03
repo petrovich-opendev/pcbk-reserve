@@ -193,7 +193,8 @@ def test_teacher_creates_and_disables_student(stack, browser, accounts_t):      
         assert running(stack) is True                                             # вход разбудил место 04
         t.wait_selector(f"{ROW} button.acc-disable", 30)                          # m-8: обзор заново — строка уже есть
         t.click(f"{ROW} button.acc-disable")
-        t.wait_text(rf"Отключить учётку {re.escape(LOGIN)}\? Студент выйдет из чата", 10, css=".acc-confirm")
+        t.wait_text(rf"Отключить учётку {re.escape(LOGIN)}\? Студент не сможет продолжить: чат закроется не позже его"
+                    r" следующего действия", 10, css=".acc-confirm")                   # итоговое ревью Д10б, m-1
         t.click_text("Да, отключить")
         t.wait_text(rf"Учётка {re.escape(LOGIN)} отключена", 30, css=".tch-accounts")   # ответ 204 ручки
         t.wait_selector(f"{ROW} button.acc-enable", 30)                           # обзор заново: учётка отключена

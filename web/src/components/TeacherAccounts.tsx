@@ -8,8 +8,14 @@
 //   перебьёт незаписанный. Состояние живёт в TeacherPage (useAccounts): окно переживает и неудачный обзор после действия.
 // - У строки места со студентом (AccountButtons в tr[data-place] таблицы мест): button.acc-passwd «Новый пароль»,
 //   button.acc-disable «Отключить» или button.acc-enable «Включить» (по пометке disabled), button.acc-unlock «Снять
-//   замок» (если locked); aria-label — «<действие> <логин>». «Отключить» и «Новый пароль» выводят студента из чата —
-//   сначала подтверждение окном в странице (не window.confirm: браузер теста CDP его не видит).
+//   замок» (если locked); aria-label — «<действие> <логин>». «Отключить» и «Новый пароль» закрывают сессии студента —
+//   сначала подтверждение окном в странице (не window.confirm: браузер теста CDP его не видит). Текст подтверждения не
+//   обещает «сразу»: чат студента уходит на вход по ответу 401 — не позже его следующего действия (итоговое ревью Д10б,
+//   m-1).
+// - Форма — подсказка о закреплении навсегда; логин вида пробной учётки (dN-probe-…) — ещё строка .acc-probe: такое место
+//   администратор может освободить (ревью Б1+Б2, M-4). Это подсказка, не запрет — сервер такой логин принимает.
+// - «Скопировать» удалась — «Я записал пароль» ещё и затирает буфер обмена (без гарантии: история буфера ОС не наша;
+//   ревью Б1+Б2, M-7).
 // - После любого ответа, кроме 401, — обзор и журнал заново (m-8): строка нового студента и его кнопки появляются сразу.
 //   Ответ не 2xx — текст ответа дословно, без текста — свой запасной кабинета (tchReplyText, как у прочих ручек
 //   кабинета, Д10а А4 m-4: «…сообщите администратору стенда», не «…преподавателю»); 401 — на вход. Пока ответ в пути,
@@ -18,13 +24,13 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Reply } from "../api";
 import { tchReplyText, type Overview, type PlaceRow } from "../teacher";
-import { isLogin, type TeacherApi } from "../teacherApi";
+import { isLogin, isProbeLogin, type TeacherApi } from "../teacherApi";
 import { T_TCH_ACC_ADD, T_TCH_ACC_ADD_HINT, T_TCH_ACC_ADD_TITLE, T_TCH_ACC_ASK_DISABLE, T_TCH_ACC_ASK_PASSWD,
          T_TCH_ACC_CANCEL, T_TCH_ACC_COPIED, T_TCH_ACC_COPY, T_TCH_ACC_COPY_FAILED, T_TCH_ACC_DISABLE,
          T_TCH_ACC_DISABLED, T_TCH_ACC_DONE, T_TCH_ACC_ENABLE, T_TCH_ACC_ENABLED, T_TCH_ACC_LABEL, T_TCH_ACC_LOGIN,
          T_TCH_ACC_LOGIN_RULE, T_TCH_ACC_NO_FREE, T_TCH_ACC_PASSWD, T_TCH_ACC_PASSWORD_FOR, T_TCH_ACC_PASSWORD_ONCE,
-         T_TCH_ACC_PICK_PLACE, T_TCH_ACC_PLACE, T_TCH_ACC_UNLOCK, T_TCH_ACC_UNLOCKED, T_TCH_ACC_YES_DISABLE,
-         T_TCH_ACC_YES_PASSWD, T_TCH_ACCOUNTS, T_TCH_PICK, T_TCH_UNKNOWN } from "../texts";
+         T_TCH_ACC_PICK_PLACE, T_TCH_ACC_PLACE, T_TCH_ACC_PROBE_LOGIN, T_TCH_ACC_UNLOCK, T_TCH_ACC_UNLOCKED,
+         T_TCH_ACC_YES_DISABLE, T_TCH_ACC_YES_PASSWD, T_TCH_ACCOUNTS, T_TCH_PICK, T_TCH_UNKNOWN } from "../texts";
 
 export type AccountAction = "passwd" | "disable" | "enable" | "unlock";
 
@@ -211,6 +217,18 @@ function PasswordOnce({ secret, onDone }: { secret: Secret; onDone(): void }) {
     setCopied(ok ? "ok" : "fail");
   };
 
+  // «Я записал пароль»: пароль копировали в буфер — буфер затирается пустой строкой (без ожидания и без гарантии)
+  const done = (): void => {
+    if (copied === "ok") {
+      try {
+        void navigator.clipboard.writeText("").catch(() => undefined);
+      } catch {
+        /* буфер не дали — пароль в нём остаётся, как после любого копирования */
+      }
+    }
+    onDone();
+  };
+
   return (
     <section className="password-once" role="dialog" aria-label={T_TCH_ACC_PASSWORD_ONCE}>
       <p className="password-once-title">{T_TCH_ACC_PASSWORD_ONCE}</p>
@@ -218,7 +236,7 @@ function PasswordOnce({ secret, onDone }: { secret: Secret; onDone(): void }) {
       <code ref={code} translate="no">{secret.password}</code>
       <div className="password-once-actions">
         <button type="button" className="acc-copy" autoFocus onClick={() => void copy()}>{T_TCH_ACC_COPY}</button>
-        <button type="button" className="acc-done send" onClick={onDone}>{T_TCH_ACC_DONE}</button>
+        <button type="button" className="acc-done send" onClick={done}>{T_TCH_ACC_DONE}</button>
       </div>
       {copied !== null && (
         <p className="tch-note" data-kind={copied === "ok" ? "ok" : "fail"} role={copied === "fail" ? "alert" : undefined}>
@@ -285,6 +303,7 @@ function AddStudent({ overview, ctl }: { overview: Overview; ctl: AccountsCtl })
       </div>
       <button type="submit" className="acc-add send" disabled={ctl.locked}>{T_TCH_ACC_ADD}</button>
       {hint !== null && <p className="tch-note acc-hint" data-kind="fail" role="alert">{hint}</p>}
+      {isProbeLogin(login.trim()) && <p className="tch-hint acc-hint acc-probe">{T_TCH_ACC_PROBE_LOGIN}</p>}
     </form>
   );
 }

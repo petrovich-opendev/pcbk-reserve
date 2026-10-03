@@ -22,7 +22,8 @@
 // студента, ни чата, ни одного вызова /pcbk/api/oc; вызовы кабинета — teacherApi (по умолчанию createTeacherApi()).
 // Вкладки преподавателя (Д10-R110): в фазе teacher — «Кабинет» и «Калькуляторы». Кабинет, как чат студента, не снимается:
 // вкладка калькуляторов его только прячет (окно пароля учётки и открытое место живы). «Калькуляторы» — тот же CalcPage
-// Д9 через api.calc; вызывающего (teacher, канал web) шлюз определяет сам по роли сессии (Д10-R109).
+// Д9 через api.calc; вызывающего (teacher, канал web) шлюз определяет сам по роли сессии (Д10-R109). Запасной текст
+// вкладки у преподавателя — кабинетный T_TCH_UNKNOWN, не «…сообщите преподавателю» (итоговое ревью Д10б, m-4).
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
 import { CalcPage, type CalcPageProps } from "./components/CalcPage";
@@ -35,7 +36,7 @@ import { WorkplaceScreen } from "./components/WorkplaceScreen";
 import { startStatusPolling } from "./status";
 import { createTeacherApi, type TeacherApi } from "./teacherApi";
 import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TCH_CRASH, T_TCH_RESTART,
-         T_UNKNOWN, T_WAKE } from "./texts";
+         T_TCH_UNKNOWN, T_UNKNOWN, T_WAKE } from "./texts";
 import { placeView, type Timers } from "./workplace";
 
 export interface AppProps {
@@ -276,7 +277,7 @@ export function App(p: AppProps) {
         {tabs && calcOpened && (
           <div className="view" hidden={view !== "calc"}>
             <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_CALC_CRASH} restartText={T_CALC_RESTART}>
-              <CalcImpl api={p.api} onSignedOut={goLogin} />
+              <CalcImpl api={p.api} onSignedOut={goLogin} unknownText={teacher ? T_TCH_UNKNOWN : undefined} />
             </ErrorBoundary>
           </div>
         )}

@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { TeacherPage } from "../src/components/TeacherPage";
-import { createTeacherApi, isLogin } from "../src/teacherApi";
+import { createTeacherApi, isLogin, isProbeLogin } from "../src/teacherApi";
 import { T_TCH_ACC_LOGIN_RULE } from "../src/texts";
 import { OVERVIEW_FREE_04, OVERVIEW_READY_03, teacherApi } from "./teacherFixtures";
 
@@ -37,7 +37,9 @@ test("disable_asks_first_then_reloads_overview", async () => {      // m-8
   const a = teacherApi({ overview: [200, OVERVIEW_READY_03], disable: [204, null] });
   render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
   fireEvent.click(await screen.findByRole("button", { name: "Отключить stu-03" }));
-  expect(screen.getByText("Отключить учётку stu-03? Студент выйдет из чата")).toBeTruthy();
+  // итоговое ревью Д10б, m-1: чат студента закрывается по 401 — не «сразу», а не позже его следующего действия
+  expect(screen.getByText("Отключить учётку stu-03? Студент не сможет продолжить: чат закроется не позже его следующего"
+                          + " действия")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Отмена" }));
   expect(a.disable).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Отключить stu-03" }));
@@ -108,8 +110,8 @@ test("new_password_asks_then_same_window", async () => {
   const a = teacherApi({ overview: [200, OVERVIEW_READY_03], newPassword: [200, { password: "New-Pw-4567" }] });
   const { container } = render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
   fireEvent.click(await screen.findByRole("button", { name: "Новый пароль stu-03" }));
-  expect(screen.getByText("Выдать учётке stu-03 новый пароль? Старый перестанет работать, студент выйдет из чата"))
-    .toBeTruthy();
+  expect(screen.getByText("Выдать учётке stu-03 новый пароль? Старый перестанет работать. Студент не сможет продолжить:"
+                          + " чат закроется не позже его следующего действия")).toBeTruthy();
   expect(a.newPassword).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Да, выдать новый пароль" }));
   const window_ = (await screen.findByText("New-Pw-4567")).closest(".password-once") as HTMLElement;
@@ -301,4 +303,87 @@ test("journal_account_rows_show_target_login_as_text", async () => {
                         "прочитал разговор; место 03"]);
   expect(container.querySelector(".journal b")).toBeNull();                       // текстом, не разметкой
   expect(container.querySelector(".journal")!.textContent).not.toMatch(/account_|null/);
+});
+
+// --- итоговая доводка Д10б ---
+
+test("confirm_texts_do_not_promise_instant_sign_out", async () => {     // итоговое ревью Д10б, m-1
+  // оба подтверждения — один честный текст: ни «выйдет из чата», ни «сразу»
+  const a = teacherApi({ overview: [200, OVERVIEW_READY_03] });
+  const { container } = render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
+  for (const name of ["Отключить stu-03", "Новый пароль stu-03"]) {
+    fireEvent.click(await screen.findByRole("button", { name }));
+    const ask = container.querySelector(".acc-confirm")!;
+    expect(ask.textContent).toContain("Студент не сможет продолжить: чат закроется не позже его следующего действия");
+    expect(ask.textContent).not.toMatch(/выйдет из чата|сразу/);
+    fireEvent.click(screen.getByRole("button", { name: "Отмена" }));
+  }
+  expect(a.disable).not.toHaveBeenCalled();
+  expect(a.newPassword).not.toHaveBeenCalled();
+});
+
+test("add_hint_is_honest_about_place_and_change", async () => {      // итоговое ревью Д10б, m-2; ревью Б1+Б2, M-5
+  // смены студента в занятом месте нет ни в кабинете, ни у команды администратора; логин закрепляется навсегда
+  const { container } = render(<TeacherPage api={teacherApi({ overview: [200, OVERVIEW_FREE_04] })} onSignedOut={vi.fn()} />);
+  await screen.findByLabelText("Логин");
+  const hint = container.querySelector(".tch-accounts > p.tch-hint")!.textContent!;
+  expect(hint).toContain("Логин закрепляется за местом навсегда — проверьте написание");
+  expect(hint).toContain("Сменить студента в занятом месте сейчас нельзя");
+  expect(hint).not.toMatch(/Смена студента[^.]*команда администратора/);
+});
+
+test("probe_like_login_gets_note_not_refusal", async () => {          // ревью Б1+Б2, M-4
+  // логин вида dN-probe-… — подсказка: место такой учётки администратор может освободить; запроса это не держит
+  const a = teacherApi({ overview: [200, OVERVIEW_FREE_04],
+                         addStudent: [201, { login: "d10-probe-n", place: "04", password: "Probe-Pw-001" }] });
+  const { container } = render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
+  const login = await screen.findByLabelText("Логин");
+  const note = (): string | null => container.querySelector(".acc-probe")?.textContent ?? null;
+  fireEvent.change(login, { target: { value: "ivanov" } });
+  expect(note()).toBeNull();
+  fireEvent.change(login, { target: { value: " d10-probe-n " } });
+  expect(note()).toBe("Логин вида dN-probe-… — для проверок стенда: такое место администратор может освободить. "
+                      + "Студенту дайте обычный логин.");
+  expect(container.querySelector(".acc-probe")!.getAttribute("role")).toBeNull();     // не отказ
+  fireEvent.change(screen.getByLabelText("Место"), { target: { value: "04" } });
+  fireEvent.click(screen.getByRole("button", { name: "Завести" }));
+  await waitFor(() => expect(a.addStudent).toHaveBeenCalledWith("d10-probe-n", "04"));
+  fireEvent.click(await screen.findByRole("button", { name: "Я записал пароль" }));
+  expect(note()).toBeNull();                                                          // поле стёрто — подсказки нет
+});
+
+test("probe_rule_same_as_gateway_accounts", () => {                  // ревью Б1+Б2, M-4: копия PROBE_LOGIN шлюза
+  const src = readFileSync("../core/pcbk_core/gateway/accounts.py", "utf8");
+  expect(src).toMatch(/^PROBE_LOGIN = re\.compile\(r"d\[0-9\]\+\[a-z\]\?-probe-\[a-z0-9-\]\+"\)$/m);
+  expect(["d10-probe-n", "d9b-probe-x", "d1-probe-a-b"].map(isProbeLogin)).toEqual([true, true, true]);
+  expect(["d10-probe-", "x10-probe-n", "d-probe-n", "d10ab-probe-n", "stu-03", "d10-probe-N", "d10-probe-n\n"]
+    .map(isProbeLogin)).toEqual([false, false, false, false, false, false, false]);
+});
+
+test("done_wipes_clipboard_only_after_copy", async () => {          // ревью Б1+Б2, M-7
+  const writeText = vi.fn(async (_text: string) => {});
+  Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+  try {
+    const a = teacherApi({ overview: [200, OVERVIEW_READY_03],
+                           newPassword: [[200, { password: "Copy-Pw-0001" }], [200, { password: "Copy-Pw-0002" }]] });
+    render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Новый пароль stu-03" }));
+    fireEvent.click(screen.getByRole("button", { name: "Да, выдать новый пароль" }));
+    await screen.findByText("Copy-Pw-0001");
+    fireEvent.click(screen.getByRole("button", { name: "Скопировать" }));
+    expect(await screen.findByText("Скопировано")).toBeTruthy();
+    expect(writeText.mock.calls).toEqual([["Copy-Pw-0001"]]);
+    fireEvent.click(screen.getByRole("button", { name: "Я записал пароль" }));
+    expect(writeText.mock.calls).toEqual([["Copy-Pw-0001"], [""]]);              // буфер затёрт
+    // не копировал — буфер не трогается (там может быть чужое)
+    await waitFor(() => expect((screen.getByRole("button", { name: "Новый пароль stu-03" }) as HTMLButtonElement)
+      .disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Новый пароль stu-03" }));
+    fireEvent.click(screen.getByRole("button", { name: "Да, выдать новый пароль" }));
+    await screen.findByText("Copy-Pw-0002");
+    fireEvent.click(screen.getByRole("button", { name: "Я записал пароль" }));
+    expect(writeText).toHaveBeenCalledTimes(2);
+  } finally {
+    Reflect.deleteProperty(navigator, "clipboard");
+  }
 });
