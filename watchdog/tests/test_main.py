@@ -13,6 +13,7 @@ from helpers import (CHROME, SETTINGS, T0, NoJournalWrite, chrome_dom, gw, http_
 from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
 from pcbk_watchdog.journal import Journal
+from pcbk_watchdog.memory import MEM_SENSOR_SILENT_DETAIL
 from pcbk_watchdog.main import (LazyJournal, MemState, Settings, WatchState, load_components, run_checks,
                                 run_loop, tick)
 from pcbk_watchdog.page import Snapshot, is_stale
@@ -610,6 +611,38 @@ def test_run_checks_reads_oom_around_inspect(tmp_path):
     run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
     assert run_checks(COMPS, docker, settings, T0, mem=mem)[1].detail.startswith("перезапущен: убит по памяти")
     assert run_checks(COMPS, docker, settings, T0 + timedelta(minutes=1), mem=mem)[0].state == "ok"
+
+
+def test_run_checks_own_kill_not_outside_after_grace(tmp_path):              # доводка р1 (ревью А1, I-2): attribute
+    vm, settings = settings_with(tmp_path)
+    docker, mem = RestartingDocker(vm), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    run_checks(COMPS, docker, settings, T0, mem=mem)
+    run_checks(COMPS, docker, settings, T0 + timedelta(seconds=10), mem=mem)
+    rows = run_checks(COMPS, docker, settings, T0 + timedelta(seconds=40), mem=mem)   # > grace 20 + такт 10
+    assert (rows[0].state, mem.history.outside(T0 + timedelta(seconds=40))) == ("ok", 0)
+
+
+class VmstatLostDocker:
+    """Место работает, к следующему осмотру перезапущено — а /proc/vmstat к этому такту перестал читаться."""
+    def __init__(self):
+        self.n = 0
+    def inspect(self, name):
+        self.n += 1
+        if self.n == 1:
+            return insp(running=True, started=T0 - timedelta(hours=1))
+        return insp(running=True, restarts=1, started=T0 - timedelta(seconds=5))
+
+
+def test_run_checks_vmstat_lost_is_unknown_not_zero(tmp_path):              # доводка р1 (ревью А1, I-1)
+    vm, settings = settings_with(tmp_path)
+    docker, mem = VmstatLostDocker(), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    vm.unlink()
+    memory, place = run_checks(COMPS, docker, settings, T0, mem=mem)
+    assert (memory.state, memory.detail) == ("unknown", MEM_SENSOR_SILENT_DETAIL)
+    assert "нет данных: vmstat" in memory.note.split(" · ")
+    assert place.detail.startswith("перезапущен после сбоя")                 # причина неизвестна, не «0 убийств»
 
 
 def test_run_loop_wires_mem_state(tmp_path):                                # проводка, а не только run_checks

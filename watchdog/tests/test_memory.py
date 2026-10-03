@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from helpers import insp
-from pcbk_watchdog.memory import (MEM_DRILL_NOTE, MEM_OOM_OUTSIDE_DETAIL, MEM_PSI_DETAIL, MEM_SWAP_DETAIL, MemHistory,
-                                  RestartReasons, memory_verdict, parse_sample)
+from pcbk_watchdog.memory import (MEM_DRILL_NOTE, MEM_OOM_OUTSIDE_DETAIL, MEM_PSI_DETAIL, MEM_SENSOR_SILENT_DETAIL,
+                                  MEM_SWAP_DETAIL, MemHistory, RestartReasons, memory_verdict, parse_sample)
 
 T = datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)
 MEMINFO = ("MemTotal:       16384000 kB\nMemAvailable:   {avail} kB\nSwapTotal:       4194304 kB\n"
@@ -159,6 +159,84 @@ def test_details_constant_and_short():
         assert len(d) <= 80 and not any(ch.isdigit() for ch in d)
 
 
+# доводка р1 (ревью А1, I-2): порядок R114 — «сбой» выше каждого жёсткого условия, и каждое из них действительно включено
+@pytest.mark.parametrize("kw", [{"full": 20}, {"oom": 1}, {"swap_used_mib": 900}])
+def test_fail_beats_each_hard_condition(kw):
+    h = MemHistory(grace_s=0, match_s=30)
+    h.observe(T - timedelta(seconds=30), sample(900))
+    at = observe_ticks(h, 3, avail_mib=900, **kw)
+    warn = MemHistory(grace_s=0, match_s=30)                                 # то же при 1500 — жёсткое активно
+    warn.observe(T - timedelta(seconds=30), sample(1500))
+    observe_ticks(warn, 3, avail_mib=1500, **kw)
+    assert verdict(sample(1500, **kw), warn, at)[1] != "свободно меньше 2048 МиБ"
+    assert verdict(sample(900, **kw), h, at)[:2] == ("fail", "свободно меньше 1024 МиБ")
+
+
+def test_counter_reset_is_new_base():                                       # счётчик меньше прежнего — новая база
+    h = MemHistory(grace_s=20, match_s=30)
+    h.observe(T, sample(oom=40)); h.observe(T + timedelta(seconds=10), sample(oom=0))
+    h.observe(T + timedelta(seconds=20), sample(oom=1))
+    assert h.outside(T + timedelta(seconds=80)) == 1
+
+
+# доводка р1 (ревью А1, I-1): молчание датчика — не «норма»
+NO_SWAP = "MemTotal:       16384000 kB\nMemAvailable:   8192000 kB\n"
+
+
+def lost(avail_mib=8000, **files):
+    """Замер, где файлы из files подменены (пусто — не читается; иначе — текст не по формату)."""
+    texts = {"meminfo": MEMINFO.format(avail=avail_mib * 1024, swapfree=4194304), "vmstat": VMSTAT.format(oom=0),
+             "pressure": PSI.format(full=0.4), **files}
+    return parse_sample(texts["meminfo"], texts["vmstat"], texts["pressure"])
+
+
+@pytest.mark.parametrize("files,mark", [
+    ({"vmstat": ""}, "нет данных: vmstat"),
+    ({"vmstat": "pgfault 1\noom_kill x\n"}, "нет данных: vmstat"),                       # не по формату
+    ({"pressure": ""}, "нет данных: давление"),
+    ({"pressure": "some avg10=1.50 avg60=0.80 avg300=0.10 total=123\n"}, "нет данных: давление"),   # нет full
+    ({"meminfo": NO_SWAP}, "нет данных: swap"),
+])
+def test_sensor_lost_on_the_fly_is_unknown(files, mark):
+    h = hist(); h.observe(T, sample())
+    at = T + timedelta(seconds=10); s = lost(**files); h.observe(at, s)
+    state, detail, note = verdict(s, h, at)
+    assert (state, detail) == ("unknown", MEM_SENSOR_SILENT_DETAIL) and mark in note.split(" · ")
+    back = T + timedelta(seconds=20); h.observe(back, sample())
+    assert verdict(sample(), h, back)[0] == "ok"                            # датчик вернулся — норма
+
+
+def test_sensor_details_constant_and_short():
+    assert len(MEM_SENSOR_SILENT_DETAIL) <= 80 and not any(ch.isdigit() for ch in MEM_SENSOR_SILENT_DETAIL)
+
+
+def test_sensor_never_read_marks_note_instead_of_zero():                    # файлы необязательны (R114) — но не «0»
+    s = lost(vmstat="", pressure="")
+    h = hist(); h.observe(T, s)
+    at = T + timedelta(seconds=10); h.observe(at, s)
+    assert verdict(s, h, at) == ("ok", "свободно 8000 МиБ",
+                                 "swap занят 0 МиБ (+0 МиБ за 10 мин) · нет данных: давление · нет данных: vmstat")
+
+
+def test_pressure_warn_not_cleared_by_missing_file():
+    h = hist()
+    at = observe_ticks(h, 3, full=12.5)
+    assert verdict(sample(full=12.5), h, at)[:2] == ("warn", MEM_PSI_DETAIL)
+    gone = lost(pressure="")
+    for i in (3, 4, 5, 6):                                                  # больше удержания — само не снимается
+        at = T + timedelta(seconds=10 * i); h.observe(at, gone)
+        assert verdict(gone, h, at)[0] == "unknown"
+    assert h.psi_high(10.0) is True
+    at = T + timedelta(seconds=70); h.observe(at, sample(full=12.5))
+    assert verdict(sample(full=12.5), h, at)[:2] == ("warn", MEM_PSI_DETAIL)
+
+
+def test_fail_beats_silent_sensor():
+    h = hist(); h.observe(T, sample(900))
+    at = T + timedelta(seconds=10); s = lost(avail_mib=900, vmstat=""); h.observe(at, s)
+    assert verdict(s, h, at)[:2] == ("fail", "свободно меньше 1024 МиБ")
+
+
 START = T - timedelta(hours=1)
 AGAIN = T - timedelta(seconds=5)
 
@@ -202,6 +280,35 @@ def test_wake_by_gateway_is_not_restart():
     r = RestartReasons()
     run(r, "student-04", insp(running=True, restarts=2, started=START), 6, 6)
     assert run(r, "student-04", insp(running=True, restarts=0, started=AGAIN), 7, 7) == (None, 0)
+
+
+# доводка р1 (ревью А1, I-2): договор R115 — окно Restarting, OOMKilled без счётчика, рост RestartCount, база сна
+def test_restarting_window_keeps_base_for_two_kills():
+    r = RestartReasons()
+    run(r, "student-01", insp(running=True, started=START), 5, 5)
+    run(r, "student-01", insp(running=True, restarting=True, restarts=2, oom=True, started=START), 7, 7)
+    assert run(r, "student-01", insp(running=True, restarts=2, started=AGAIN), 7, 7) == ("oom", 2)
+
+
+def test_restarting_window_oomkilled_without_counter():
+    r = RestartReasons()
+    run(r, "student-01", insp(running=True, started=START), None, None)
+    run(r, "student-01", insp(running=True, restarting=True, restarts=1, oom=True, started=START), None, None)
+    assert run(r, "student-01", insp(running=True, restarts=1, started=AGAIN), None, None) == ("oom", 1)
+
+
+def test_one_restart_does_not_explain_dify_kill():
+    r = RestartReasons()
+    run(r, "student-05", insp(running=True, started=START), 5, 5)
+    assert run(r, "student-05", insp(running=True, restarts=1, started=AGAIN), 7, 7) == ("oom", 1)
+
+
+def test_sleeping_place_base_is_fresh():
+    r = RestartReasons()
+    run(r, "student-04", insp(running=True, started=START), 5, 5)            # виден работающим
+    run(r, "student-04", insp(code=0, started=START), 5, 5)                  # уснул
+    run(r, "student-04", insp(code=0, started=START), 9, 9)                  # чужие убийства во сне
+    assert run(r, "student-04", insp(running=True, restarts=1, started=AGAIN), 9, 9) == ("crash", 0)
 
 
 def test_no_counter_no_oom_reason():

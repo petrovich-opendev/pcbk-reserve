@@ -280,7 +280,9 @@ def _check_one(comp: dict, docker: DockerReader, settings: Settings, now: dateti
         if mem is not None:
             return Check(cid, title, *mem.verdict(now))
         with open(settings.MEMINFO_PATH) as f:   # без истории тактов — один замер (тесты и наборы без цикла)
-            c = check_memory(f.read(), settings.MEM_WARN_MIB, settings.MEM_FAIL_MIB)
+            c = check_memory(f.read(), settings.MEM_WARN_MIB, settings.MEM_FAIL_MIB,
+                             _read_optional(settings.VMSTAT_PATH), _read_optional(settings.PRESSURE_PATH),
+                             settings.SWAP_GROW_WARN_MIB, settings.PSI_FULL_MAX)
         return Check(cid, title, c.state, c.detail, c.note)
     if kind == "http":
         return check_http(cid, title, comp["url"], timeout=NET_CHECK_TIMEOUT_S,

@@ -226,3 +226,14 @@ test("drills paragraph follows notes", async () => {                        // �
   await page.update({ checks: [{ component: "llm", title: "LLM-прокси и бюджет", state: "ok", detail: "x", note: "" }] });
   assert.equal(page.byId("drills").hidden, true);
 });
+
+test('drills paragraph is shown, then hidden; «учени» only at word start', async () => {   // доводка р1 (ревью А1)
+  const page = await loadPage({ checks: [{ component: 'gateway', title: 'Шлюз и вход', state: 'ok',
+    detail: 'принимает вход', note: 'Учения: freeze_reaper; работает мест: 0' }] });
+  assert.equal(page.byId('drills').hidden, false);                    // абзац виден, не только с текстом
+  assert.equal(page.byId('drills').textContent, 'Идут учения: Шлюз и вход');
+  await page.update({ checks: [{ component: 'web', title: 'Веб-чат', state: 'fail', detail: 'нет обучения',
+    note: 'время получения ответа' }] });                             // «обучения», «получения» — не учения
+  assert.equal(page.byId('drills').hidden, true);
+  assert.equal(page.byId('drills').textContent, '');
+});

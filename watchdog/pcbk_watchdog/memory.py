@@ -1,7 +1,8 @@
 """«Память сервера» v2 (Д11-R114) и причины перезапуска контейнеров (Д11-R115).
 
 Замер — /proc/meminfo (MemAvailable, MemTotal, SwapTotal, SwapFree), /proc/vmstat (oom_kill) и
-/proc/pressure/memory (some и full avg10); vmstat и давление необязательны. История тактов за час: рост swap
+/proc/pressure/memory (some и full avg10); vmstat и давление необязательны, но без данных датчика note несёт
+пометку «нет данных: …», а датчик, замолчавший на ходу, даёт «неизвестно». История тактов за час: рост swap
 за 10 мин, давление с удержанием, убийства по памяти, которые не объяснил перезапуск строки контейнера
 (места, core, sp-ctl), — «вне мест и core» (Dify, система, edge, прокси сокета, сторож). Модуль без
 зависимостей от остального сторожа: строку собирает checks.check_memory или такт main.MemState.
@@ -27,6 +28,13 @@ MEM_PSI_DETAIL = "сервер ждёт освобождения памяти �
 MEM_SWAP_DETAIL = "сервер вытесняет память в swap"
 # порог памяти выше всей памяти сервера — так ставят учения memory-warn и memory-fail (R116: пометка «учени»)
 MEM_DRILL_NOTE = "учения: порог выше всей памяти"
+# датчик, который в этой истории уже читался, замолчал или отвечает не по формату (доводка р1 А1, решение контроллера
+# к R114): молчание — «неизвестно», не «норма»; тормоза видят его как «память не читается»
+MEM_SENSOR_SILENT_DETAIL = "датчик памяти замолчал — убийства, давление или swap не читаются"
+# датчики замера и пометки note без их данных: часть note не пропадает молча — по договору R114 нет части убийств
+# значит «0 убийств», а нет части давления — «давление не проверено»
+SENSORS = ("swap", "vmstat", "pressure")
+SENSOR_NOTES = {"swap": "нет данных: swap", "vmstat": "нет данных: vmstat", "pressure": "нет данных: давление"}
 NOTE_SEP = " · "
 
 Reason = Literal["oom", "crash"]
@@ -42,6 +50,12 @@ class MemSample:
     oom_kill: int | None
     psi_some10: float | None
     psi_full10: float | None
+
+    def missing(self) -> tuple[str, ...]:
+        """Датчики без данных в этом замере: swap — нет SwapTotal/SwapFree, vmstat — нет oom_kill, давление — нет
+        full avg10 (файл не читается или не по формату)."""
+        values = {"swap": self.swap_used_mib, "vmstat": self.oom_kill, "pressure": self.psi_full10}
+        return tuple(name for name in SENSORS if values[name] is None)
 
 
 def _fields(text: str, sep: str | None) -> dict[str, int]:
@@ -112,10 +126,12 @@ class MemHistory:
         self._psi_new: deque[float | None] = deque(maxlen=max(psi_hold, PSI_BACKLOG))
         self._psi_on = False
         self._psi_run = 0
+        self._sensors_seen: set[str] = set()   # датчики, давшие данные хоть раз в этой истории
 
     def observe(self, now: datetime, sample: MemSample | None) -> None:
         if sample is None:
             return
+        self._sensors_seen.update(set(SENSORS) - set(sample.missing()))
         if sample.swap_used_mib is not None:
             self._swap.append((now, sample.swap_used_mib))
         while self._swap and self._age(self._swap[0][0], now) > self.swap_window_s:
@@ -155,12 +171,18 @@ class MemHistory:
         """Необъяснённые убийства по памяти старше grace_s и не старше window_s."""
         return sum(k[1] for k in self._kills if self.grace_s < self._age(k[0], now) <= self.window_s)
 
+    def silent(self, sample: MemSample) -> tuple[str, ...]:
+        """Датчики, которые в этой истории уже читались, а в этом замере данных не дали, — отказ на ходу."""
+        return tuple(name for name in sample.missing() if name in self._sensors_seen)
+
     def psi_high(self, limit: float) -> bool:
         """Давление full выше limit: psi_hold тактов подряд выше — включить, столько же подряд не выше — снять.
-        Такт без файла давления считается «не выше»."""
+        Такт без данных давления удержание не двигает: «внимание» само не снимается, пока файл молчит."""
         while self._psi_new:
             value = self._psi_new.popleft()
-            above = value is not None and value > limit
+            if value is None:
+                continue
+            above = value > limit
             if above == self._psi_on:
                 self._psi_run = 0
                 continue
@@ -182,8 +204,11 @@ def memory_verdict(sample: MemSample | None, history: MemHistory, now: datetime,
                    swap_grow_warn_mib: int, psi_full_max: float) -> tuple[str, str, str]:
     """(состояние, detail, note) строки по таблице R114: жёсткие для нагрузки условия — выше мягкого порога.
 
+    Порядок: нет MemAvailable — unknown; свободно < fail — fail; датчик, который в этой истории читался, замолчал —
+    unknown (доводка р1); убийства вне мест и core, давление, swap — warn; мягкий порог — warn; иначе ok.
     note — числа по порядку: «свободно N МиБ» (кроме ok), swap и его рост, давление, убийства вне мест и core
-    (только больше нуля), пометка учений при пороге выше всей памяти. Прогонщик решает по числам note (R119).
+    (только больше нуля), пометка учений при пороге выше всей памяти. Датчик без данных — своя пометка
+    «нет данных: …» на месте своей части. Прогонщик решает по числам note (R119).
     """
     if sample is None:
         return "unknown", MEM_NO_DATA_DETAIL, ""
@@ -191,8 +216,11 @@ def memory_verdict(sample: MemSample | None, history: MemHistory, now: datetime,
     growth = history.swap_growth(now)
     kills = history.outside(now)
     psi = history.psi_high(psi_full_max)
+    missing = sample.missing()
     if avail < fail_mib:
         state, detail = "fail", f"свободно меньше {fail_mib} МиБ"
+    elif history.silent(sample):
+        state, detail = "unknown", MEM_SENSOR_SILENT_DETAIL
     elif kills > 0:
         state, detail = "warn", MEM_OOM_OUTSIDE_DETAIL
     elif psi:
@@ -207,12 +235,18 @@ def memory_verdict(sample: MemSample | None, history: MemHistory, now: datetime,
     if sample.swap_used_mib is not None:
         minutes = int(history.swap_window_s // 60)
         parts.append(f"swap занят {sample.swap_used_mib} МиБ (+{growth} МиБ за {minutes} мин)")
-    psi_parts = [f"{kind} {_pct(v)} %" for kind, v in (("some", sample.psi_some10), ("full", sample.psi_full10))
-                 if v is not None]
-    if psi_parts:
+    else:
+        parts.append(SENSOR_NOTES["swap"])
+    if sample.psi_full10 is not None:
+        psi_parts = [f"{kind} {_pct(v)} %" for kind, v in (("some", sample.psi_some10), ("full", sample.psi_full10))
+                     if v is not None]
         parts.append("давление памяти " + ", ".join(psi_parts))
+    else:
+        parts.append(SENSOR_NOTES["pressure"])
     if kills:
         parts.append(f"убийств по памяти вне мест и core за час: {kills}")
+    if "vmstat" in missing:
+        parts.append(SENSOR_NOTES["vmstat"])
     if sample.total_mib is not None and max(warn_mib, fail_mib) > sample.total_mib:
         parts.append(MEM_DRILL_NOTE)
     return state, detail, NOTE_SEP.join(parts)
