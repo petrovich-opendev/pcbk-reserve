@@ -136,3 +136,37 @@ def test_config_scenarios_filter(tmp_path):                                     
     for bad in ([], ["Z9"], ["B3", "B3"], "B3", [3]):
         with pytest.raises(ValueError, match="scenarios"):
             load_config(write_config(tmp_path, scenarios=bad), OC)
+
+
+def test_load_twin_config_matches_integration():                                 # Д11б: Б2 ждёт это дословно
+    cfg = load_config(REPO / "bench" / "config.load.twin.json", OC)
+    assert (cfg.run_id, cfg.load, cfg.load_data) == ("d11-twin", True, "twin")
+    assert cfg.places == {n: "pcbk/z-ai/glm-5.3" for n in range(1, 11)}
+    assert cfg.reps == {"create": 1, "number": 1, "trap": 1} and cfg.scenarios == ("A1", "B4", "C3")
+    assert (cfg.swap_base_mib, cfg.swap_grow_mib, cfg.dify_swap_base_mib, cfg.dify_swap_max_mib) == (0, 512, 0, 256)
+    assert (cfg.mem_fail_mib, cfg.psi_full_max) == (None, None)                    # стенд: умолчания сторожа памяти
+    assert (cfg.cap_usd, cfg.stop_margin_usd) == (5.0, 0.5)
+    assert cfg.out_dir is None and cfg.window_start is None and cfg.stand is None
+
+
+@pytest.mark.parametrize("patch", [
+    {"load_data": "twin"}, {"swap_base_mib": 0}, {"psi_full_max": 10.0},           # поля нагрузки без load: true
+    {"load": "yes", "load_data": "twin"}, {"load": True, "load_data": "server"},
+    {"load": True, "load_data": "none"},                                            # все сценарии — и с bench
+    {"load": True, "load_data": "twin", "swap_base_mib": -1}, {"load": True, "load_data": "twin", "swap_grow_mib": 0},
+    {"load": True, "load_data": "twin", "mem_fail_mib": 1.5},
+    {"load": True, "load_data": "twin", "dify_swap_max_mib": True},
+    {"load": True, "load_data": "twin", "psi_full_max": 0}, {"load": True, "load_data": "twin", "psi_full_max": 101},
+    {"load": True, "load_data": "twin", "dify_swap_base_mib": 1_048_577}])
+def test_load_fields_refused(tmp_path, patch):
+    with pytest.raises(ValueError):
+        load_config(write_config(tmp_path, **patch), OC)
+
+
+def test_load_fields_parsed(tmp_path):
+    cfg = load_config(write_config(tmp_path, load=True, load_data="none", places={"1": M1, "2": M1}, mem_fail_mib=900,
+                                   scenarios=["A1", "A2", "A3", "A4", "B3", "C2"], psi_full_max=7), OC)
+    assert (cfg.load_data, cfg.mem_fail_mib, cfg.psi_full_max, cfg.swap_base_mib) == ("none", 900, 7.0, None)
+    assert cfg.places == {1: M1, 2: M1}
+    plain = load_config(write_config(tmp_path), OC)
+    assert (plain.load, plain.load_data, plain.swap_base_mib) == (False, None, None)

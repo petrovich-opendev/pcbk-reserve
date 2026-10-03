@@ -8,9 +8,15 @@ RUN_TIMEOUT_S), projection_ack, archive_reserve_s, scenarios. Пути — от�
 - scenarios (П14) — фильтр плана: список разных id сценариев (сухой прогон Б4 — ["B3"], слой 0 Б5 — ["B1"]); нет
   ключа или null — все двенадцать. Без сценариев агента bench-uzel прогонщик его не сохраняет (bench_tags может быть
   пуст).
+- Режим нагрузки (Д11-R119, R131): "load": true, "load_data" — none (без данных: только сценарии без агента bench —
+  A1–A4, B3, C2), live (с данными по «да») или twin (только стенд); поля базы окна WINDOW_BASE_KEYS — swap_base_mib и
+  dify_swap_base_mib (МиБ, от 0), swap_grow_mib, dify_swap_max_mib, mem_fail_mib (МиБ, от 1), psi_full_max (%, больше
+  0, не больше 100) — по желанию (null — умолчание сторожа памяти, базы — первое прочитанное), но CLI run в режиме
+  нагрузки без любого из них отказывает RunRefused("window_base"). load_data и поля базы окна без load: true —
+  ValueError. В режиме нагрузки одна модель может стоять на многих местах.
 
 - Ссылка модели места — только из model_refs(student/config/opencode.json): «pcbk/<модель>» или «pcbk-or/<модель>»;
-  одна модель — одно место (m5): иначе в таблице не различить моделей.
+  одна модель — одно место (m5): иначе в таблице не различить моделей (кроме режима нагрузки).
 - window_start — только с поясом (m-р4-2): без пояса — ValueError. null допустим в конфиге (двойник А6, тесты), но CLI
   run без него отказывает RunRefused("window_start").
 - out_dir null — «задаёт тот, кто строит прогонщик» (config.twin.json: А6 подставляет свой каталог); Runner без
@@ -29,17 +35,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .scenarios import RUN_TIMEOUT_S, SCENARIO_IDS
+from .scenarios import BY_ID, RUN_TIMEOUT_S, SCENARIO_IDS
 
 RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")          # RUN_ID_RE LlmSettings (Д8-R69) — значением
 PLACES = range(1, 11)
 PROVIDERS = ("pcbk", "pcbk-or")
 GROUPS = ("create", "number", "trap")
 MAX_REPS = 10
+LOAD_DATA_MODES = ("none", "live", "twin")
+WINDOW_BASE_KEYS = ("swap_base_mib", "swap_grow_mib", "dify_swap_base_mib", "dify_swap_max_mib", "mem_fail_mib",
+                    "psi_full_max")
+MAX_MIB = 1_048_576                                  # предел LLM_RUN_* МиБ тормоза core (R117) — значением
 
 _REQUIRED = frozenset({"run_id", "places", "reps", "cap_usd", "stop_margin_usd", "window_start", "out_dir", "cards"})
 _OPTIONAL = frozenset({"stand", "turn_timeout_s", "heartbeat_s", "run_timeout_s", "projection_ack",
-                       "archive_reserve_s", "scenarios"})
+                       "archive_reserve_s", "scenarios", "load", "load_data", *WINDOW_BASE_KEYS})
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,14 @@ class BenchConfig:
     archive_reserve_s: float = 120.0
     stand: Path | None = None
     scenarios: tuple[str, ...] | None = None        # фильтр плана (П14); None — все сценарии
+    load: bool = False                              # режим нагрузки (Д11-R119)
+    load_data: str | None = None                    # none | live | twin (R131); только с load
+    swap_base_mib: int | None = None                # поля базы окна (R119); None — умолчание сторожа памяти
+    swap_grow_mib: int | None = None
+    dify_swap_base_mib: int | None = None
+    dify_swap_max_mib: int | None = None
+    mem_fail_mib: int | None = None
+    psi_full_max: float | None = None
 
 
 def model_refs(opencode: Mapping[str, Any]) -> frozenset[str]:
@@ -108,7 +126,7 @@ def parse_window_start(value: object) -> datetime | None:
     return parsed
 
 
-def _places(raw: object, refs: frozenset[str]) -> dict[int, str]:
+def _places(raw: object, refs: frozenset[str], load: bool = False) -> dict[int, str]:
     if not isinstance(raw, dict) or not raw:
         raise ValueError("конфиг: places — непустой объект «место: модель»")
     out: dict[int, str] = {}
@@ -121,7 +139,7 @@ def _places(raw: object, refs: frozenset[str]) -> dict[int, str]:
         if not isinstance(ref, str) or ref not in refs:
             raise ValueError("конфиг: places — модель не из opencode.json места (pcbk/… или pcbk-or/…)")
         out[n] = ref
-    if len({ref.split("/", 1)[1] for ref in out.values()}) != len(out):      # и через pcbk, и через pcbk-or (р1 Б2)
+    if not load and len({ref.split("/", 1)[1] for ref in out.values()}) != len(out):    # и pcbk, и pcbk-or (р1 Б2)
         raise ValueError("конфиг: places — одна модель на двух местах")
     return dict(sorted(out.items()))
 
@@ -158,6 +176,36 @@ def _scenarios(raw: object) -> tuple[str, ...] | None:
             or len(set(raw)) != len(raw)):
         raise ValueError("конфиг: scenarios — непустой список разных id сценариев (A1–C4) или null")
     return tuple(raw)
+
+
+def _load_fields(raw: dict, scenarios: tuple[str, ...] | None) -> dict:
+    """Ключи режима нагрузки (R119, R131): load, load_data и поля базы окна; без load: true — ни одного из них."""
+    load = raw.get("load", False)
+    if not isinstance(load, bool):
+        raise ValueError("конфиг: load — true или false")
+    data = raw.get("load_data")
+    given = [k for k in WINDOW_BASE_KEYS if raw.get(k) is not None]
+    if not load:
+        if data is not None or given:
+            raise ValueError("конфиг: load_data и поля базы окна — только с load: true")
+        return {}
+    if data not in LOAD_DATA_MODES:
+        raise ValueError("конфиг: load_data — none, live или twin (режим нагрузки)")
+    if data == "none" and (scenarios is None or any(BY_ID[s].agent == "bench" for s in scenarios)):
+        raise ValueError("конфиг: load_data none — сценарий использует агент bench (без данных — только A1–A4, B3, C2)")
+    out: dict = {"load": True, "load_data": data}
+    for key in given:
+        value = raw[key]
+        if key == "psi_full_max":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100:
+                raise ValueError("конфиг: psi_full_max — больше 0, не больше 100")
+            out[key] = float(value)
+            continue
+        low = 0 if key in ("swap_base_mib", "dify_swap_base_mib") else 1
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= MAX_MIB:
+            raise ValueError(f"конфиг: {key} — целое МиБ от {low} до {MAX_MIB}")
+        out[key] = value
+    return out
 
 
 def _path(base: Path, raw: dict, key: str, required: bool) -> Path | None:
@@ -204,14 +252,16 @@ def load_config(path: Path, opencode_json: Path) -> BenchConfig:
     if not isinstance(ack, bool):
         raise ValueError("конфиг: projection_ack — true или false")
     base = path.resolve().parent
+    scenarios = _scenarios(raw.get("scenarios"))
+    load = _load_fields(raw, scenarios)
     return BenchConfig(
-        run_id=raw["run_id"], places=_places(raw["places"], refs), reps=_reps(raw["reps"]), cap_usd=cap,
-        stop_margin_usd=margin, window_start=parse_window_start(raw["window_start"]),
+        run_id=raw["run_id"], places=_places(raw["places"], refs, load=bool(load)), reps=_reps(raw["reps"]),
+        cap_usd=cap, stop_margin_usd=margin, window_start=parse_window_start(raw["window_start"]),
         out_dir=_path(base, raw, "out_dir", required=False), cards=_path(base, raw, "cards", required=True),
         turn_timeout_s=_positive(raw, "turn_timeout_s", 900.0), heartbeat_s=_positive(raw, "heartbeat_s", 30.0),
         run_timeout_s=timeouts, projection_ack=ack, archive_reserve_s=reserve,
-        stand=_path(base, raw, "stand", required=False), scenarios=_scenarios(raw.get("scenarios")))
+        stand=_path(base, raw, "stand", required=False), scenarios=scenarios, **load)
 
 
-__all__ = ["BenchConfig", "GROUPS", "MAX_REPS", "PLACES", "PROVIDERS", "RUN_ID_RE", "load_config", "model_refs",
-           "parse_window_start"]
+__all__ = ["BenchConfig", "GROUPS", "LOAD_DATA_MODES", "MAX_REPS", "PLACES", "PROVIDERS", "RUN_ID_RE",
+           "WINDOW_BASE_KEYS", "load_config", "model_refs", "parse_window_start"]

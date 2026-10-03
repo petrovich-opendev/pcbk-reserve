@@ -18,6 +18,9 @@ wait_idle(session, timeout_s) опрашивает GET /session/status раз в
 
 calc(tool, args) (Д9а) — калькулятор вкладки «Калькуляторы»: POST /pcbk/api/calc/<tool> (Д9-R87) — тот же DataService,
 место — из учётки, канал web; ответ службы JSON при 200 (любой статус службы), иначе GatewayError.
+
+sessions() (Д11-R121) — все разговоры места, как их видит студент: GET /pcbk/api/oc/experimental/session?roots=true&
+archived=true (session_list белого списка шлюза), объекты сессий; «только своё» прогонщик считает по их id.
 """
 from __future__ import annotations
 
@@ -232,6 +235,11 @@ class GatewayChat:
     def messages(self, session: str) -> list[dict]:
         data = self._call("GET", f"{OC}/session/{session}/message")
         return [m for m in data if isinstance(m, dict)] if isinstance(data, list) else []
+
+    def sessions(self) -> list[dict]:
+        """Разговоры места, в том числе архивные (Д11-R121): объекты сессий OpenCode как есть."""
+        data = self._call("GET", OC + "/experimental/session?roots=true&archived=true")
+        return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
 
     def session_status(self) -> dict:
         data = self._call("GET", OC + "/session/status")

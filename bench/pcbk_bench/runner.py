@@ -48,6 +48,24 @@ pcbk_run_spent в ходе; money — pcbk_money_out, pcbk_key_limit, pcbk_budge
 Журнал сессий OUT/sessions.log — строки «<id>\\t<NN>\\tstart» при создании сессии и «<id>\\t<NN>\\tend» в конце
 прогона, при abort и при уборке (П5). Записи прогонов — OUT/runs.jsonl (RunRecord.to_json, по строке); возобновление
 пропускает ключи с последней записью done. Строки журнала прогонщика (logging) — без текста разговоров и тегов.
+
+Режим нагрузки (cfg.load; Д11-R119…R122, R131; сторож памяти и вердикт — load.py). prepare(): окно → замок → пульс →
+сторож памяти (первая точка) → блок run (места ⊆ вызывающих) и run_brake (watching и свежий, иначе RunRefused("brake"))
+→ строка памяти на старте ok, без пометок «нет данных» (иначе RunRefused("memory")) → режим данных (none — пометка
+«учения: tool_error» в строке историана, иначе RunRefused("data_drill"); live — OUT/real-data-consent.txt, иначе
+RunRefused("consent"), и без пометки учения; twin — только стенд) → OUT/health_start.json → поток сторожа → для каждого
+места: остановка — выход; вход; опрос сторожа (тормоз перед пробуждением, I-6 р2); остановка — выход; пробуждение и
+ensure_ready → живые агенты, кроме bench-uzel, — RunRefused("place_agents") без архива → OUT/pre_sessions.json (id
+разговоров, бывших на местах) → прежние сессии → пустой /session/status → модель → единицы → bench-uzel (если нужен).
+Остановка во время подготовки — выход без исключения: run() вернёт её причину.
+Жёсткая остановка сторожа (memory, blind, brake) и pcbk_run_halted в ходе — _halt_stop: причина (поверх мягкой), abort
+идущих сессий (и на каждом шаге барьера), stand.sleep_places всех мест конфига; пробуждений после неё нет, а
+пробуждение, гонкой прошедшее после неё, сразу снова усыпляет место; close() усыпляет все места ещё раз. Мягкая
+(memory_warn) — новые прогоны не начинаются, идущие доходят. Решения о памяти — только у сторожа (_stand_ok смотрит
+строку LLM из его последнего опроса). Живость сторожа — на каждом шаге барьера (поток жив, опрос не старше
+LOAD_BLIND_S), иначе blind; метка guard_at — в progress.json (status OUT: старая — код 1). «Закончен» — только после
+чистого опроса сторожа в конце плана. В конце плана (и при мягкой остановке) — «только своё» в OUT/isolation.json,
+после жёсткой — пропуск с заметкой; в конце прогона — OUT/load.json (места, начало, конец, причина, числа сторожа).
 """
 from __future__ import annotations
 
@@ -69,6 +87,8 @@ from typing import Any
 from .cards import ALLOWED_TOOLS, CardSet, bench_agent_args
 from .config import BenchConfig
 from .gateway import GatewayChat, GatewayError
+from .load import (BRAKE_SILENT_S, CONSENT_FILE, DRILL_DATA_NOTE, HARD_VERDICTS, ISO_SKIPPED, LOAD_MEM_POLL_S,
+                   MemoryGuard, own_only, write_json)
 from .numbers import TAG_TOKEN_RE
 from .record import RunKey, RunRecord, ToolCall, Turn, parse_turn
 from .scenarios import BENCH_AGENT, BY_ID, SCENARIO_IDS
@@ -77,10 +97,13 @@ from .student import ScriptedStudent
 
 log = logging.getLogger("pcbk_bench.runner")
 
-STOP_REASONS = ("cap", "money", "stand", "window", "interrupt", "projection", "place")
+STOP_REASONS = ("cap", "money", "stand", "window", "interrupt", "projection", "place", "memory", "blind", "brake",
+                "memory_warn")
 MONEY_CODES = frozenset({"pcbk_money_out", "pcbk_key_limit", "pcbk_budget_spent", "pcbk_share_spent"})
 CAP_CODE = "pcbk_run_spent"
 RUN_SPENT_TEXT = "Потолок прогона отбора модели исчерпан"           # LLM_MESSAGES["run_spent"]
+HALT_CODE = "pcbk_run_halted"                                        # тормоз прогона core (Д11-R117)
+RUN_HALTED_TEXT = "Прогон остановлен: сервер на пределе памяти"     # LLM_MESSAGES["run_halted"]
 MODEL_CODES = frozenset({"pcbk_turn_limit"})                         # отказ прокси по вине модели — не стенд
 # имена инструментов службы — не коды отказа прокси: из ALLOWED_TOOLS (тот же источник, что у check_run; с Д9а — и ряд
 # с наработкой, Д9-R89), без своей копии списка
@@ -120,7 +143,7 @@ def card_tags(cards: CardSet) -> list[str]:
 
 class RunRefused(Exception):
     """Отказ запуска прогона: код (locked, run_id, run_callers, place_model, bench_agent, not_ready, place_busy,
-    window_start)."""
+    window_start; нагрузка — brake, memory, data_drill, consent, load_data, place_agents, window_base)."""
 
     def __init__(self, code: str):
         super().__init__(code)
@@ -205,8 +228,9 @@ def load_records(out: Path) -> list[RunRecord]:
 
 def status_main(out: Path, stale_s: float) -> int:
     """Код состояния прогона по OUT/progress.json: 0 — идёт и свеж или закончен; 1 — running, а updated_at старше
-    stale_s (умер прогонщик) или last_turn_at старше turn_timeout_s + 300 (завис главный поток, m-р4-6), или файла
-    нет; 2 — stopped или paused. Печатает одну строку без данных."""
+    stale_s (умер прогонщик) или last_turn_at старше turn_timeout_s + 300 (завис главный поток, m-р4-6), или в режиме
+    нагрузки метка сторожа памяти guard_at старше stale_s (сторож молчит, R119), или файла нет; 2 — stopped или paused.
+    Печатает одну строку без данных."""
     try:
         st = json.loads((Path(out) / "progress.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -232,6 +256,10 @@ def status_main(out: Path, stale_s: float) -> int:
     updated = _parse_ts(st.get("updated_at"))
     if updated is None or (now - updated).total_seconds() > stale_s:
         return 1
+    if st.get("load"):
+        guard = _parse_ts(st.get("guard_at")) or _parse_ts(st.get("started_at"))
+        if guard is None or (now - guard).total_seconds() > stale_s:
+            return 1
     turn = _parse_ts(st.get("last_turn_at")) or _parse_ts(st.get("started_at"))
     limit = float(st.get("turn_timeout_s") or 900.0) + 300.0
     if turn is not None and (now - turn).total_seconds() > limit:
@@ -242,13 +270,16 @@ def status_main(out: Path, stale_s: float) -> int:
 # --- разбор хода ---
 
 def turn_code(error: str | None) -> str | None:
-    """Класс ошибки хода для прогонщика: capped (402 pcbk_run_spent), money, stand_error (прочий отказ прокси) или
-    None — ошибки нет или она модели (MessageAbortedError, pcbk_turn_limit …): та идёт в провал errors check_run."""
+    """Класс ошибки хода для прогонщика: capped (402 pcbk_run_spent), halted (402 pcbk_run_halted — тормоз прогона core,
+    Д11-R119), money, stand_error (прочий отказ прокси) или None — ошибки нет или она модели (MessageAbortedError,
+    pcbk_turn_limit …): та идёт в провал errors check_run."""
     if not error:
         return None
     codes = set(_PCBK_CODE.findall(error)) - TOOL_NAMES
     if CAP_CODE in codes or RUN_SPENT_TEXT in error:
         return "capped"
+    if HALT_CODE in codes or RUN_HALTED_TEXT in error:
+        return "halted"
     if codes & MONEY_CODES:
         return "money"
     if codes - MODEL_CODES:
@@ -295,9 +326,11 @@ def _row_cost(row: Mapping[str, Any]) -> float:
 
 
 class Runner:
-    """Прогонщик отбора (см. шапку модуля). poll_s — шаг опроса ожиданий (место, mcp, агенты, статус сессии)."""
+    """Прогонщик отбора (см. шапку модуля). poll_s — шаг опроса ожиданий (место, mcp, агенты, статус сессии);
+    mem_poll_s — такт сторожа памяти в режиме нагрузки (по часам clock)."""
 
     poll_s = POLL_S
+    mem_poll_s = LOAD_MEM_POLL_S
 
     def __init__(self, cfg: BenchConfig, stand: Stand, chats: Mapping[int, GatewayChat], cards: CardSet,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
@@ -351,6 +384,9 @@ class Runner:
         self._turned: set[str] = set()                  # сессии с законченным ходом (строки журнала — у каждой)
         self._aborted_at: dict[str, float] = {}         # сессия → clock последнего abort главного потока
         self._thread_errors: list[BaseException] = []
+        self._halt = threading.Event()                  # жёсткая остановка тормозом (сторож памяти, pcbk_run_halted)
+        self._guard: MemoryGuard | None = None
+        self._pre: dict[int, set[str]] = {}             # разговоры, бывшие на местах до прогона (R121)
         latest: dict[RunKey, RunRecord] = {}
         for rec in load_records(self.out):
             latest[rec.key] = rec
@@ -390,14 +426,20 @@ class Runner:
         return round(sum(v * self.cfg.reps[g] for g, v in spent.items()), 6)
 
     def progress(self) -> dict:
+        """Состояние для progress.json; в режиме нагрузки — и load, guard_at (последний опрос сторожа памяти)."""
         with self._lock:
-            return {"run_id": self.cfg.run_id, "state": self._state, "started_at": _iso(self._run_started_wall),
-                    "updated_at": _iso(self.now()), "last_turn_at": _iso(self._last_turn_at),
-                    "turn_timeout_s": self.cfg.turn_timeout_s, "done": len(self._done_keys & self._plan_set),
-                    "total": len(self.plan), "rep": self._rep,
-                    "by_place": {str(n): dict(v) for n, v in self._place.items()},
-                    "run_spent_usd": self._run_spent, "projected_usd": self._projected,
-                    "stop_reason": self._stop_reason}
+            state = {"run_id": self.cfg.run_id, "state": self._state, "started_at": _iso(self._run_started_wall),
+                     "updated_at": _iso(self.now()), "last_turn_at": _iso(self._last_turn_at),
+                     "turn_timeout_s": self.cfg.turn_timeout_s, "done": len(self._done_keys & self._plan_set),
+                     "total": len(self.plan), "rep": self._rep,
+                     "by_place": {str(n): dict(v) for n, v in self._place.items()},
+                     "run_spent_usd": self._run_spent, "projected_usd": self._projected,
+                     "stop_reason": self._stop_reason}
+        if self.cfg.load:
+            guard = self._guard
+            state["load"] = True
+            state["guard_at"] = _iso(guard.at_wall) if guard is not None else None
+        return state
 
     def _write_progress(self) -> None:
         write_progress(self.out / "progress.json", self.progress())
@@ -424,7 +466,8 @@ class Runner:
         self._lock_fd = fd
 
     def prepare(self) -> None:
-        """Порядок Д8-R74 (см. шапку); расхождение — RunRefused с кодом, замок и пульс снимаются."""
+        """Порядок Д8-R74 (см. шапку), в режиме нагрузки — Д11-R119 (_prepare_load); расхождение — RunRefused с кодом,
+        замок, пульс и сторож памяти снимаются; остановка во время подготовки нагрузки — выход без исключения."""
         if self._prepared:
             return
         ws = self.cfg.window_start
@@ -440,45 +483,181 @@ class Runner:
             self._pulse = threading.Thread(target=self._pulse_loop, name="пульс", daemon=True)
             self._pulse.start()
             log.info("подготовка: прогон %s, мест %d", self.cfg.run_id, len(self.cfg.places))
-            self._check_run_block()
-            for n in self.cfg.places:
-                try:
-                    self.chats[n].login()
-                    self.ensure_ready(n)
-                except Exception as exc:
-                    log.warning("подготовка: место %02d не готово (%s)", n, type(exc).__name__)
-                    raise RunRefused("not_ready") from None
-            self._resume_sessions()
-            for n in self.cfg.places:                     # чужой прогонщик (другой OUT) на тех же местах (р1, m4)
-                if not self._until(lambda n=n: not self.chats[n].session_status(), IDLE_WAIT_S):
-                    log.warning("подготовка: на месте %02d идёт чужой разговор", n)
-                    raise RunRefused("place_busy")
-            for n, ref in self.cfg.places.items():
-                if self.stand.place_model(n) != ref:
-                    log.warning("подготовка: модель места %02d — не из конфига", n)
-                    raise RunRefused("place_model")
-            self._read_units()
-            for n in self.cfg.places:
-                for row in self.stand.agent_rows(n):
-                    name = row.get("name")
-                    if isinstance(name, str) and name != BENCH_AGENT:
-                        self.stand.archive_agent(n, name)
-            if any(BY_ID[k.scenario].agent == "bench" for k in self.plan):
-                self._bench_agents()                  # без сценариев bench-uzel — не сохраняется (П14)
+            if self.cfg.load:
+                self._prepare_load()
+            else:
+                self._prepare_selection()
             self._prepared = True
-            log.info("подготовка: готово")
+            log.info("подготовка: %s", "остановлена" if self._stop_reason is not None else "готово")
         except BaseException:
             self.close()
             raise
 
-    def _check_run_block(self) -> None:
-        run = self.stand.health_llm().get("run")
+    def _prepare_selection(self) -> None:
+        """Подготовка отбора (Д8-R74): после окна, замка и пульса."""
+        self._check_run_block()
+        for n in self.cfg.places:
+            try:
+                self.chats[n].login()
+                self.ensure_ready(n)
+            except Exception as exc:
+                log.warning("подготовка: место %02d не готово (%s)", n, type(exc).__name__)
+                raise RunRefused("not_ready") from None
+        self._resume_sessions()
+        self._idle_places()
+        self._place_models()
+        self._read_units()
+        for n in self.cfg.places:
+            for row in self.stand.agent_rows(n):
+                name = row.get("name")
+                if isinstance(name, str) and name != BENCH_AGENT:
+                    self.stand.archive_agent(n, name)
+        if any(BY_ID[k.scenario].agent == "bench" for k in self.plan):
+            self._bench_agents()                  # без сценариев bench-uzel — не сохраняется (П14)
+
+    def _idle_places(self) -> None:
+        for n in self.cfg.places:                     # чужой прогонщик (другой OUT) на тех же местах (р1, m4)
+            if not self._until(lambda n=n: not self.chats[n].session_status(), IDLE_WAIT_S):
+                log.warning("подготовка: на месте %02d идёт чужой разговор", n)
+                raise RunRefused("place_busy")
+
+    def _place_models(self) -> None:
+        for n, ref in self.cfg.places.items():
+            if self.stand.place_model(n) != ref:
+                log.warning("подготовка: модель места %02d — не из конфига", n)
+                raise RunRefused("place_model")
+
+    def _stopping(self) -> bool:
+        return self._stop_reason is not None or self._hard.is_set()
+
+    def _prepare_load(self) -> None:
+        """Подготовка нагрузки (Д11-R119, см. шапку): остановка во время неё — выход, дальше места не будятся."""
+        guard = MemoryGuard(self.stand, self.cfg, self.out, clock=self.clock, now=self.now, sleep=self.sleep,
+                            on_verdict=self._on_guard, poll_s=self.mem_poll_s)
+        self._guard = guard
+        first = guard.check(act=False)
+        if guard.dead:                                    # сторож умер на первом опросе — слепой прогон не идёт
+            self._halt_stop("blind")
+            return
+        self._check_run_block(guard.last_health)
+        p = guard.points[-1]
+        if not p.health_ok or p.brake != "watching" or p.brake_age_s is None or p.brake_age_s > BRAKE_SILENT_S:
+            log.warning("подготовка: тормоз прогона core не следит (%s)", p.brake)
+            raise RunRefused("brake")
+        if p.state != "ok" or first != "ok":
+            log.warning("подготовка: строка памяти на старте — %s, сторож — %s", p.state, first)
+            raise RunRefused("memory")
+        self._check_data_mode(guard.last_status)
+        if not (self.out / "health_start.json").exists():
+            write_json(self.out / "health_start.json", guard.first_health)
+        guard.start()
+        try:
+            self._prepare_load_places()
+        except Exception:
+            if not self._halt.is_set():
+                raise
+            log.warning("подготовка: прервана тормозом")      # места усыплены — их ответы уже не отказ подготовки
+
+    def _prepare_load_places(self) -> None:
+        """Места нагрузки: перед каждым входом и пробуждением — остановка? (I-6 р2), затем проверки R121 и Д8-R74."""
+        guard = self._guard
+        for n in self.cfg.places:
+            if self._stopping():
+                return
+            try:
+                self.chats[n].login()
+            except Exception as exc:
+                log.warning("подготовка: вход на место %02d не удался (%s)", n, type(exc).__name__)
+                raise RunRefused("not_ready") from None
+            guard.check()                                 # тормоз перед пробуждением — свежий опрос (I-6 р2)
+            if self._stopping():
+                return
+            try:
+                self._wake(n)
+                self.ensure_ready(n)
+            except Exception as exc:
+                if self._halt.is_set():
+                    return
+                log.warning("подготовка: место %02d не готово (%s)", n, type(exc).__name__)
+                raise RunRefused("not_ready") from None
+        for n in self.cfg.places:                         # чужие агенты: отказ без архива (R121)
+            if any(isinstance(r.get("name"), str) and r["name"] != BENCH_AGENT for r in self.stand.agent_rows(n)):
+                log.warning("подготовка: на месте %02d живые агенты — место не для нагрузки", n)
+                raise RunRefused("place_agents")
+        self._record_pre_sessions()
+        if self._stopping():
+            return
+        self._resume_sessions()
+        self._idle_places()
+        if self._stopping():
+            return
+        self._place_models()
+        self._read_units()
+        if self._stopping():
+            return
+        if any(BY_ID[k.scenario].agent == "bench" for k in self.plan):
+            self._bench_agents()
+
+    def _check_data_mode(self, status: dict | None) -> None:
+        """Режим данных (R131) по строке историана страницы: none — пометка учения tool_error обязательна; live —
+        OUT/real-data-consent.txt и без пометки; twin — только стенд (CLI run его не пускает)."""
+        mode = self.cfg.load_data
+        row = next((c for c in (status or {}).get("checks") or []
+                    if isinstance(c, dict) and c.get("component") == "historian"), None)
+        text = " ".join(str(row.get(k) or "") for k in ("detail", "note")) if row is not None else ""
+        drill = DRILL_DATA_NOTE in text
+        if mode == "none":
+            if not drill:
+                log.warning("подготовка: «без данных», а пометки учения tool_error в строке историана нет")
+                raise RunRefused("data_drill")
+        elif mode == "live":
+            if not (self.out / CONSENT_FILE).is_file():
+                raise RunRefused("consent")
+            if drill:
+                log.warning("подготовка: «с данными», а в строке историана пометка учения")
+                raise RunRefused("data_drill")
+        elif mode != "twin":
+            raise RunRefused("load_data")
+
+    def _record_pre_sessions(self) -> None:
+        """Разговоры, бывшие на местах до прогона (R121), — OUT/pre_sessions.json (только id; при возобновлении —
+        объединение)."""
+        path = self.out / "pre_sessions.json"
+        pre: dict[str, list[str]] = {}
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                pre = {str(k): [str(x) for x in v] for k, v in raw.items() if isinstance(v, list)}
+        for n in self.cfg.places:
+            try:
+                listed = self._gw(n, self.chats[n].sessions)
+            except Exception as exc:
+                log.warning("подготовка: разговоры места %02d не прочитаны (%s)", n, type(exc).__name__)
+                raise RunRefused("not_ready") from None
+            ids = {s["id"] for s in listed if isinstance(s.get("id"), str)}
+            pre[str(n)] = sorted(set(pre.get(str(n), [])) | ids)
+        write_json(path, pre)
+        self._pre = {int(k): set(v) for k, v in pre.items() if k.isdecimal()}
+
+    def _check_run_block(self, health: dict | None = None) -> None:
+        """Блок run этого прогона в /health/llm; вызывающие — ровно места конфига, в режиме нагрузки — места ⊆
+        вызывающих (R119)."""
+        if health is None:
+            health = self.stand.health_llm()
+        run = health.get("run")
         if not isinstance(run, dict) or run.get("id") != self.cfg.run_id:
             raise RunRefused("run_id")
-        if run.get("callers") != len(self.cfg.places):
-            raise RunRefused("run_callers")
-        if self.stand.run_callers() != frozenset(f"student-{n:02d}" for n in self.cfg.places):
-            raise RunRefused("run_callers")
+        places = frozenset(f"student-{n:02d}" for n in self.cfg.places)
+        if self.cfg.load:
+            callers = run.get("callers")
+            if (isinstance(callers, bool) or not isinstance(callers, int) or callers < len(places)
+                    or not places <= self.stand.run_callers()):
+                raise RunRefused("run_callers")
+        else:
+            if run.get("callers") != len(self.cfg.places):
+                raise RunRefused("run_callers")
+            if self.stand.run_callers() != places:
+                raise RunRefused("run_callers")
         with self._lock:
             self._run_spent = run.get("spent_usd")
 
@@ -551,9 +730,15 @@ class Runner:
                 raise RunRefused("bench_agent")
 
     def close(self) -> None:
-        """Снять пульс и замок (идемпотентно); последний progress.json — у владельца замка. pid в OUT/.lock
-        стирается до снятия замка: устаревший pid после конца прогона не назовёт чужой процесс (README, «Аварийная
-        уборка», шаг 2); после смерти процесса pid остаётся, но замок свободен."""
+        """Снять сторож памяти, пульс и замок (идемпотентно); после жёсткой остановки тормозом — ещё раз усыпить все
+        места конфига (I-6 р2); последний progress.json — у владельца замка. pid в OUT/.lock стирается до снятия замка:
+        устаревший pid после конца прогона не назовёт чужой процесс (README, «Аварийная уборка», шаг 2); после смерти
+        процесса pid остаётся, но замок свободен."""
+        guard = self._guard
+        if guard is not None:
+            guard.stop()
+        if self._halt.is_set():
+            self._sleep_places()
         self._pulse_stop.set()
         pulse = self._pulse
         if pulse is not None and pulse is not threading.current_thread():
@@ -590,13 +775,29 @@ class Runner:
 
     def ensure_ready(self, place: int) -> None:
         """GET /workplace; не ready — wake и ожидание ready (≤ WAKE_TIMEOUT_S), затем mcp=connected
-        (≤ MCP_TIMEOUT_S)."""
+        (≤ MCP_TIMEOUT_S). После жёсткой остановки тормозом место не будится (PlaceNotReady)."""
         chat = self.chats[place]
         if chat.workplace().get("state") != "ready":
             log.info("место %02d не готово — пробуждение", place)
-            chat.wake(timeout=WAKE_TIMEOUT_S)
+            self._wake(place)
         if not self._until(lambda: self.stand.place_mcp_ok(place), MCP_TIMEOUT_S):
             raise PlaceNotReady("mcp")
+
+    def _wake(self, place: int) -> None:
+        """POST wake места: после жёсткой остановки — нет; гонкой прошло после неё — место сразу снова усыпляется."""
+        if self._halt.is_set():
+            raise PlaceNotReady("halted")
+        self.chats[place].wake(timeout=WAKE_TIMEOUT_S)
+        self._resleep(place)
+
+    def _resleep(self, place: int) -> None:
+        if not self._halt.is_set():
+            return
+        try:
+            self.stand.sleep_places([place])
+        except Exception as exc:
+            log.error("тормоз: место %02d после пробуждения не усыплено (%s)", place, type(exc).__name__)
+        raise PlaceNotReady("halted")
 
     def _gw(self, place: int, fn: Callable[..., Any], *args: Any) -> Any:
         """Вызов шлюза: 503 (место спит или ворота перезагрузки) — ensure_ready и один повтор (Д8-R74, П6)."""
@@ -619,7 +820,10 @@ class Runner:
         return self._until(seen, AGENT_WAIT_S, deadline)
 
     def _keepalive(self) -> None:
-        """Места, ждущие на барьере, — POST …/wake раз в KEEPALIVE_S по clock (продлевает простой места)."""
+        """Места, ждущие на барьере, — POST …/wake раз в KEEPALIVE_S по clock (продлевает простой места); после жёсткой
+        остановки тормозом — нет."""
+        if self._halt.is_set():
+            return
         due = []
         with self._lock:
             now = self.clock()
@@ -630,6 +834,7 @@ class Runner:
         for place in due:
             try:
                 self.chats[place].wake(timeout=WAKE_TIMEOUT_S)
+                self._resleep(place)
                 log.info("место %02d ждёт на барьере — пробуждение", place)
             except Exception as exc:
                 log.warning("место %02d: пробуждение на барьере не удалось (%s)", place, type(exc).__name__)
@@ -686,14 +891,56 @@ class Runner:
         self._interrupt.set()
         self._set_stop("interrupt", hard=True)
 
-    def _stand_ok(self) -> bool:
+    def _aborting(self) -> bool:
+        """Идущие сессии прерываются: сигнал или жёсткая остановка тормозом."""
+        return self._interrupt.is_set() or self._halt.is_set()
+
+    def _on_guard(self, verdict: str) -> None:
+        """Вердикт сторожа памяти: memory, blind, brake — жёстко; soft — мягко memory_warn."""
+        if verdict in HARD_VERDICTS:
+            self._halt_stop(verdict)
+        elif verdict == "soft":
+            self._set_stop("memory_warn")
+
+    def _halt_stop(self, reason: str) -> None:
+        """Жёсткая остановка тормозом (R119): причина (поверх мягкой; первая жёсткая остаётся), abort идущих сессий,
+        сон всех мест конфига — один раз (close() повторит)."""
+        with self._lock:
+            first = not self._halt.is_set()
+            if self._stop_reason is None or not self._hard.is_set():
+                if self._stop_reason != reason:
+                    log.warning("остановка: %s (тормоз, жёстко)", reason)
+                self._stop_reason = reason
+            self._halt.set()
+            self._hard.set()
+        self._abort_live()
+        if first:
+            self._sleep_places()
+
+    def _sleep_places(self) -> None:
+        places = sorted(self.cfg.places)
         try:
-            st = self.stand.status()
+            self.stand.sleep_places(places)
+            log.warning("тормоз: места прогона усыплены (%d)", len(places))
         except Exception as exc:
-            log.warning("строки стенда не прочитаны (%s)", type(exc).__name__)
-            return False
+            log.error("тормоз: места не усыплены (%s) — их усыпит core", type(exc).__name__)
+
+    def _stand_ok(self) -> bool:
+        """Строки стенда: «LLM-прокси и бюджет» не fail и «Память сервера» ok; в режиме нагрузки — только строка LLM из
+        последнего опроса сторожа памяти (решения о памяти — у него, R119)."""
+        if self._guard is not None:
+            st = self._guard.last_status
+            if st is None:
+                log.warning("строки стенда: сторож памяти ещё не прочитал страницу")
+                return False
+        else:
+            try:
+                st = self.stand.status()
+            except Exception as exc:
+                log.warning("строки стенда не прочитаны (%s)", type(exc).__name__)
+                return False
         rows = {c.get("component"): c.get("state") for c in st.get("checks") or [] if isinstance(c, dict)}
-        ok = rows.get("llm") != "fail" and rows.get("memory") == "ok"
+        ok = rows.get("llm") != "fail" and (self.cfg.load or rows.get("memory") == "ok")
         if not ok:
             log.warning("строки стенда: llm=%s, memory=%s", rows.get("llm"), rows.get("memory"))
         return ok
@@ -797,7 +1044,7 @@ class Runner:
         except _RunStatus as st:
             rec.status = st.status
         except Exception as exc:
-            rec.status = "stand_error"
+            rec.status = "interrupted" if self._halt.is_set() else "stand_error"     # после тормоза — не сбой стенда
             rec.notes.append(f"сбой: {type(exc).__name__}")
             log.warning("место %02d, %s: сбой (%s)", place, key.scenario, type(exc).__name__)
         rec.saw_draft = student.saw_draft
@@ -834,7 +1081,7 @@ class Runner:
                     raise _RunStatus("timeout")
                 self._gw(place, chat.send, session, msg, agent)
                 sent = self.now()
-                if self._interrupt.is_set():              # сигнал пришёл, пока реплика уходила (р1, m2)
+                if self._aborting():                      # сигнал или тормоз пришли, пока реплика уходила (р1, m2)
                     self._abort(place, session)
                     raise _RunStatus("interrupted")
                 messages = self._wait_turn(place, session, deadline)
@@ -850,12 +1097,15 @@ class Runner:
                     rec.bridge = turn
                 else:
                     rec.turns.append(turn)
-                if self._interrupt.is_set():
+                if self._aborting():
                     raise _RunStatus("interrupted")
                 code = turn_code(turn.error)
                 if code == "capped":
                     self._set_stop("cap", hard=True)
                     raise _RunStatus("capped")
+                if code == "halted":                      # тормоз core защёлкнут — жёстко memory (R119)
+                    self._halt_stop("memory")
+                    raise _RunStatus("interrupted")
                 if code == "money":
                     self._set_stop("money", hard=True)
                     raise _RunStatus("stand_error")
@@ -1056,6 +1306,8 @@ class Runner:
             try:
                 self.ensure_ready(place)
             except Exception as exc:
+                if self._halt.is_set():                   # тормоз: место не будится, прогона нет — не сбой места
+                    break
                 self._not_ready(key, exc)
                 continue
             if self._cap_reached():
@@ -1111,7 +1363,11 @@ class Runner:
             if not alive:
                 break
             alive[0].join(BARRIER_TICK_S)
-            if self._interrupt.is_set():                  # каждый такт: реплика могла уйти после прошлого abort
+            guard = self._guard
+            if guard is not None and not self._halt.is_set() and not guard.alive(self.clock()):
+                log.error("сторож памяти молчит или умер — прогонщик слеп")
+                self._halt_stop("blind")
+            if self._aborting():                          # каждый такт: реплика могла уйти после прошлого abort
                 self._abort_live()
             self._keepalive()
             if self.clock() >= next_check:
@@ -1151,6 +1407,13 @@ class Runner:
             self._run_rep(rep, keys)
             if self._stop_reason is not None or self._window_hit:
                 break
+        if self.cfg.load:
+            if self._guard is not None and not self._halt.is_set():
+                self._guard.check()                       # «закончен» — только при чистом последнем опросе сторожа
+            try:
+                self._isolation()
+            except Exception as exc:                      # нет isolation.json — load-check скажет «не проверено»
+                log.warning("только своё: не записано (%s)", type(exc).__name__)
         reason = self._stop_reason
         if reason is None:
             undone = {k.place for k in self.plan if k not in self._done_keys}
@@ -1166,6 +1429,54 @@ class Runner:
             self._state = {"finished": "finished", "projection": "paused"}.get(reason, "stopped")
         log.info("прогон окончен: %s", reason)
         return reason
+
+    def _isolation(self) -> None:
+        """«Только своё» в конце плана (R121): у каждого подготовленного места чужие разговоры (не из sessions.log и не
+        бывшие до прогона) и чужие агенты (не встроенные, не bench-uzel, не сохранённые этим местом) —
+        OUT/isolation.json, только числа; после жёсткой остановки тормозом — пропуск с заметкой."""
+        path = self.out / "isolation.json"
+        if self._halt.is_set():
+            write_json(path, {"skipped": ISO_SKIPPED})
+            log.warning("только своё: %s", ISO_SKIPPED)
+            return
+        own: dict[int, set[str]] = defaultdict(set)
+        log_path = self.out / "sessions.log"
+        for line in log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []:
+            parts = line.split("\t")
+            if len(parts) == 3 and parts[1].isdecimal() and parts[2] == "start":
+                own[int(parts[1])].add(parts[0])
+        saved: dict[int, set[str]] = defaultdict(set)
+        for rec in load_records(self.out):
+            saved[rec.key.place].update(s["name"] for s in rec.saved if isinstance(s.get("name"), str))
+        result: dict[str, dict] = {}
+        for n in self.cfg.places:
+            if n not in self._pre:                        # место не подготовлено — до него прогон не дошёл
+                continue
+            try:
+                listed = [s["id"] for s in self.chats[n].sessions() if isinstance(s.get("id"), str)]
+                agents = self.chats[n].agents()
+            except Exception as exc:
+                log.warning("только своё: место %02d не прочитано (%s)", n, type(exc).__name__)
+                result[str(n)] = {"listed": None, "foreign_sessions": None, "foreign_agents": None}
+                continue
+            foreign = own_only(listed, own[n], self._pre[n])
+            strangers = [a for a in agents if a.get("kind") != "builtin" and a.get("name") != BENCH_AGENT
+                         and a.get("name") not in saved[n]]
+            result[str(n)] = {"listed": len(listed), "foreign_sessions": len(foreign),
+                              "foreign_agents": len(strangers)}
+            if foreign or strangers:
+                log.warning("только своё: на месте %02d чужих разговоров %d, агентов %d", n, len(foreign),
+                            len(strangers))
+        write_json(path, result)
+
+    def _load_summary(self) -> dict:
+        """OUT/load.json (R119): места, начало, конец, причина, база и минимум свободной памяти, swap и swap Dify от
+        базы, наибольшее давление (время остановки и сна — не здесь, R133)."""
+        with self._lock:
+            reason = self._stop_reason or ("finished" if self._state == "finished" else self._state)
+        guard = self._guard
+        return {"places": sorted(self.cfg.places), "started_at": _iso(self._run_started_wall),
+                "ended_at": _iso(self.now()), "reason": reason, **(guard.summary() if guard is not None else {})}
 
     def _install_signals(self) -> dict:
         if threading.current_thread() is not threading.main_thread():
@@ -1194,6 +1505,11 @@ class Runner:
                             self._run_spent = spent
                 except Exception as exc:
                     log.warning("снимок /health/llm не записан (%s)", type(exc).__name__)
+                if self.cfg.load:
+                    try:
+                        write_json(self.out / "load.json", self._load_summary())
+                    except Exception as exc:
+                        log.warning("load.json не записан (%s)", type(exc).__name__)
             self.close()
 
 

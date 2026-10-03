@@ -2,14 +2,25 @@
 [--stale-s N] | judge-pack CONFIG [--real-data] | judge-stage CONFIG [--only-missing] [--root DIR] | judge-audit STAGE
 --batch batch-NN --transcript PATH [--discard] | judge-collect CONFIG [--batch batch-NN …] [--root DIR] | judge-check
 CONFIG | table CONFIG … | calc CONFIG TOOL ARGS | cards-check CONFIG | cards-audit CONFIG --transcript PATH |
-match-cases MCONFIG | match MCONFIG [--only basic] | probe-calc MCONFIG.
+match-cases MCONFIG | match MCONFIG [--only basic] | probe-calc MCONFIG | load-check CONFIG | load-gate OUT --next K
+[--warn-mib 2048].
 
 - override CONFIG — файл переопределения мест (render_override) в stdout;
 - run CONFIG — прогон: load_config → window_start (без него или позже сейчас + 5 мин — RunRefused("window_start")
   до подключения к стенду) → connect (stand.json и secrets/ рядом с ним) → Runner.run(); в stdout — причина конца
   прогона;
 - status OUT — код состояния прогона по OUT/progress.json (status_main): 0 — идёт и свеж или закончен, 1 — молчит
-  или завис, 2 — остановлен или на паузе.
+  или завис (в режиме нагрузки — и молчит сторож памяти), 2 — остановлен или на паузе.
+
+Нагрузка (Д11-R119…R122, R131; конфиг с "load": true):
+- run CONFIG — учётки мест d11-probe-load-NN (LOAD_LOGIN, пробные: место освобождает release-place); до подключения
+  к стенду — load_data twin (только стенд) — RunRefused("load_data"), нет любого поля базы окна (WINDOW_BASE_KEYS) —
+  RunRefused("window_base");
+- load-check CONFIG — успех 4 под нагрузкой (R120) по OUT и стенду: числа журнала службы и прокси за окно прогона
+  (started_at … updated_at progress.json), цена реплики (OUT/price.json), снимки /health/llm начала и конца, «только
+  своё» (OUT/isolation.json); печатает только числа и коды исходов, затем строки нарушений; код 0 — норма, 1 — иначе;
+- load-gate OUT --next K [--warn-mib 2048] — прогноз памяти на K мест по ступени OUT (R122): одна строка чисел; код 0
+  — «можно», 1 — «нельзя» (в том числе: на старте ступени нет данных датчика жёсткого условия).
 
 Судья (Б1, Д8-R78; команды по конфигу — П7: OUT = out_dir, карточки — cards, секреты — secrets/ рядом со stand.json,
 корень каталога судей — каталог stand.json или --root, run_id — из конфига):
@@ -78,6 +89,8 @@ from .match import (BASIC_KINDS, MatchConfig, MatchRunner, build_cases, case_cou
                     load_case_tags, load_match_config, match_failures, probe_calc, render_match, write_case_tags,
                     write_private)
 from .override import render_override
+from .config import WINDOW_BASE_KEYS
+from .load import MEM_WARN_MIB, check_lines, check_verdict, gate_from_out, overrun_usd, run_rows, runs_json
 from .runner import FUTURE_WINDOW_S, Runner, RunRefused, load_records, status_main
 from .secret import Secret
 from .stand import DATA_TOOLS, ServerStand, Stand
@@ -85,6 +98,7 @@ from .stand import DATA_TOOLS, ServerStand, Stand
 REPO = Path(__file__).resolve().parents[2]
 OPENCODE_JSON = REPO / "student" / "config" / "opencode.json"
 PROBE_LOGIN = "d8-probe-bench-{n:02d}"
+LOAD_LOGIN = "d11-probe-load-{n:02d}"   # учётки нагрузки: под PROBE_LOGIN core — место освобождается (B-1 р1)
 MATCH_NOT_PASSED = 3                    # match: прогон прошёл, но автотест — не успех (match_failures, I-2 итога Д9б)
 _STAND_KEYS = frozenset({"ssh", "core_url", "edge_url", "edge_host", "origin", "remote_dir"})
 
@@ -139,6 +153,11 @@ def _parser() -> argparse.ArgumentParser:
     match.add_argument("config", type=Path)
     match.add_argument("--only", choices=["basic"], default=None)
     sub.add_parser("probe-calc", help="проба форм окна: только коды").add_argument("config", type=Path)
+    sub.add_parser("load-check", help="успех 4 под нагрузкой: только числа").add_argument("config", type=Path)
+    gate = sub.add_parser("load-gate", help="прогноз памяти на следующую ступень лестницы")
+    gate.add_argument("out", type=Path)
+    gate.add_argument("--next", type=int, required=True, dest="next_k")
+    gate.add_argument("--warn-mib", type=int, default=MEM_WARN_MIB)
     return p
 
 
@@ -192,7 +211,7 @@ def connect(cfg: BenchConfig) -> tuple[Stand, dict[int, GatewayChat]]:
     stand = server_stand(cfg)
     chats = {}
     for n in cfg.places:
-        login = PROBE_LOGIN.format(n=n)
+        login = (LOAD_LOGIN if cfg.load else PROBE_LOGIN).format(n=n)
         account = {"login": login, "password": Secret((secrets / f"{login}.pw").read_text(encoding="ascii").strip())}
         chats[n] = GatewayChat(raw["edge_url"], raw["edge_host"], raw.get("origin"), **account)   # вход — в prepare()
     return stand, chats
@@ -365,10 +384,56 @@ def _run(config: Path) -> int:
     cfg = load_config(config, OPENCODE_JSON)
     if cfg.window_start is None or cfg.window_start > datetime.now(timezone.utc) + timedelta(seconds=FUTURE_WINDOW_S):
         raise RunRefused("window_start")             # нет начала окна или оно в будущем (р1, m7) — до стенда
+    if cfg.load:
+        if cfg.load_data == "twin":
+            raise RunRefused("load_data")            # двойник — только стенд (R131)
+        if any(getattr(cfg, key) is None for key in WINDOW_BASE_KEYS):
+            raise RunRefused("window_base")          # сервер: база окна и пороги — явно в конфиге ступени (R119)
     stand, chats = connect(cfg)
     runner = Runner(cfg, stand, chats, load_cards(cfg.cards))
     print(runner.run())
     return 0
+
+
+def _json_file(path: Path) -> dict:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{Path(path).name}: нужен объект")
+    return raw
+
+
+def _load_check(config: Path) -> int:
+    """load-check CONFIG (R120): числа — в stdout, затем нарушения по строке; код 0 — норма, 1 — иначе."""
+    cfg = load_config(config, OPENCODE_JSON)
+    if not cfg.load:
+        raise ValueError("конфиг: load-check — только для режима нагрузки")
+    out = _out(cfg)
+    progress = _json_file(out / "progress.json")
+    since, until = progress.get("started_at"), progress.get("updated_at")
+    if not isinstance(since, str) or not isinstance(until, str):
+        raise ValueError("progress.json: нет started_at или updated_at")
+    numbers = server_stand(cfg).load_check([f"student-{n:02d}" for n in cfg.places], since, until, out=out)
+    price = numbers.pop("price", None) or _json_file(out / "price.json")
+    before, end = _json_file(out / "health_start.json"), _json_file(out / "health_end.json")
+    iso = _json_file(out / "isolation.json") if (out / "isolation.json").exists() else {}
+    overrun = overrun_usd(run_rows(runs_json(out)), len(cfg.places))
+    data = cfg.load_data != "none"
+    problems = check_verdict(numbers, before, end, iso, overrun_usd=overrun, data=data)
+    for line in check_lines(numbers, price, before, end, iso, overrun_usd=overrun, data=data):
+        print(line)
+    for line in problems:
+        print(line)
+    print("load-check: норма" if not problems else f"load-check: нарушений {len(problems)}")
+    return 1 if problems else 0
+
+
+def _load_gate(out: Path, next_k: int, warn_mib: int) -> int:
+    """load-gate OUT --next K: одна строка чисел; код 0 — «можно», 1 — «нельзя»."""
+    if not 1 <= next_k <= 10:
+        raise _UsageError("--next")
+    line, code = gate_from_out(out, next_k, warn_mib)
+    print(line)
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -404,6 +469,10 @@ def main(argv: list[str] | None = None) -> int:
             return _match(args.config, args.only)
         if args.command == "probe-calc":
             return _probe_calc(args.config)
+        if args.command == "load-check":
+            return _load_check(args.config)
+        if args.command == "load-gate":
+            return _load_gate(args.out, args.next_k, args.warn_mib)
         return _run(args.config)
     except RunRefused as exc:
         print(f"RunRefused: {exc.code}", file=sys.stderr)

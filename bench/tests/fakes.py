@@ -7,8 +7,10 @@
   (error — код pcbk_* в responseBody; error_place — только у этих мест), B3 с уточнением (b3_asks), место засыпает
   после send (fall_asleep_after_send), сбой ожидания хода (fail_wait — GatewayError из wait_idle), on_send(место, n) —
   после n-й реплики, ignore_aborts — столько первых abort место не видит, slow_new_session — пауза перед сессией,
-  stall_after_turns — после стольких ходов сессии места следующий ход не кончается.
-  Журнал calls, wakes, aborted, sessions; wakes_while_waiting(n) — пробуждения, пока у места нет идущего хода.
+  stall_after_turns — после стольких ходов сессии места следующий ход не кончается; pre_sessions — {место: [id]}
+  разговоров, бывших на месте до прогона (список места — они и созданные сессии, Д11-R121).
+  Журнал calls, wakes, woke (места по порядку пробуждений), aborted, sessions; wakes_while_waiting(n) — пробуждения,
+  пока у места нет идущего хода.
   advance=FakeClock — задержка идёт по общим подставным часам шагами FAKE_STEP_S с короткой настоящей паузой
   (m16: ждущее место видит, как идут часы, и будится по clock).
 - FakeStand — стенд: блок run (расход — по сессиям привязанных FakeChat и cost_per_run группы), вызывающие, модели
@@ -23,9 +25,17 @@
   поиска (catalog_search отдаёт совпадения, в имени которых есть запрос, без регистра; [] — ничего, m-7);
   search_status — статус ответа поиска (не ok — отказ без совпадений, учение — error); seen_tags — теги, которые
   стенд видел во входах калькулятора и отдал в его ответах (положительный контроль «тегов нет в выводе»);
-  agent_files — {(место, имя): текст файла агента}.
+  agent_files — {(место, имя): текст файла агента}. Режим нагрузки (Д11б, Б1): status_seq — ответы /status.json по
+  очереди (последний повторяется), status_fail_after — после стольких ответов чтение падает, fail_after_wakes — до
+  стольких пробуждений мест ответ — первый элемент status_seq, после — второй; dify_swap_seq — ответы dify_swap_mib
+  по очереди (последний повторяется; умолчание 0); health — словарь поверх /health/llm или функция номера вызова
+  (health_brake); historian_note — строка историана с этой note на странице; slept — пачки мест sleep_places.
+- health_brake(halt_after_calls=None, age_after_calls=None) — блок run_brake /health/llm по номеру вызова: после
+  halt_after_calls вызовов — halted, после age_after_calls[0] — age_s = age_after_calls[1].
 - FakeClock — подставные часы: mono, now (с поясом), sleep двигает время.
 - cfg(…), runner(…) — фабрики; out по умолчанию — свой каталог под OUT_BASE (автофикстура test_runner — tmp_path).
+  Такт сторожа памяти нагрузки — MEM_POLL_REAL_S настоящих секунд, на подставных часах (sleep задан) — LOAD_MEM_POLL_S
+  подставных.
   runner(kill_after_session_create=True) — смерть процесса сразу после создания первой сессии (m14): без abort и строк
   конца, замок снимает close() (как система при смерти процесса).
 - write_config(tmp, **patch), fake_stand_raising(exc), T0, M1–M4, now(), iso().
@@ -53,6 +63,7 @@ from helpers import CARDS
 from pcbk_bench.cards import CardSet, load_cards
 from pcbk_bench.config import BenchConfig
 from pcbk_bench.gateway import GatewayError, WorkplaceNotReady
+from pcbk_bench.load import LOAD_MEM_POLL_S
 from pcbk_bench.numbers import tag_tokens
 from pcbk_bench.runner import Runner
 from pcbk_bench.scenarios import BENCH_AGENT, BY_ID, REPS, RUN_TIMEOUT_S
@@ -69,6 +80,7 @@ FAKE_UNITS = {"20FAKE_101_PV": "°C", "20FAKE_102_PV": "°C", "20FAKE_103_PV": "
 BUILTIN = ("konstruktor", "pomoshnik", BENCH_AGENT)
 OUT_BASE: list[Path | None] = [None]
 _RUNNERS: list[Runner] = []
+MEM_POLL_REAL_S = 0.02
 
 
 def now() -> datetime:
@@ -184,7 +196,8 @@ class FakeChat:
                  advance: FakeClock | None = None, error: str | None = None, b3_asks: bool = False,
                  fail_first_send: Exception | None = None, fall_asleep_after_send=(), error_place: dict | None = None,
                  fail_wait: dict | None = None, on_send=None, ignore_aborts: int = 0,
-                 slow_new_session: dict | None = None, stall_after_turns: dict | None = None):
+                 slow_new_session: dict | None = None, stall_after_turns: dict | None = None,
+                 pre_sessions: dict | None = None):
         self.never = never_idle
         self.asleep = set(asleep_until_wake)
         self.deleted = set(deleted_sessions)
@@ -205,6 +218,8 @@ class FakeChat:
         self.fall_asleep_after_send = set(fall_asleep_after_send)
         self.calls: list[tuple] = []
         self.wakes: Counter = Counter()
+        self.woke: list[int] = []
+        self.pre_sessions = {n: list(v) for n, v in (pre_sessions or {}).items()}
         self._idle_wakes: Counter = Counter()
         self.aborted: list[str] = []
         self.abort_places: list[tuple[int, str]] = []
@@ -255,9 +270,19 @@ class FakeChat:
         with self._lock:
             self.calls.append(("wake", place))
             self.wakes[place] += 1
+            self.woke.append(place)
             if not any(s.busy for s in self._sess.values() if s.place == place):
                 self._idle_wakes[place] += 1
             self.asleep.discard(place)
+        if self.stand is not None:
+            self.stand.on_wake(place)
+
+    def _sessions_of(self, place: int) -> list[dict]:
+        """Разговоры места: бывшие до прогона (pre_sessions) и созданные."""
+        self._check(place)
+        with self._lock:
+            return ([{"id": sid} for sid in self.pre_sessions.get(place, [])]
+                    + [{"id": s.id} for s in self._sess.values() if s.place == place])
 
     def _new_session(self, place: int) -> str:
         if place in self.slow_new_session:
@@ -478,6 +503,9 @@ class PlaceChat:
     def session_status(self) -> dict:
         return self.fake._status(self.place)
 
+    def sessions(self) -> list[dict]:
+        return self.fake._sessions_of(self.place)
+
     def sent_at(self, kind: str) -> float | None:
         return self.fake.sent_at(self.place, kind)
 
@@ -495,7 +523,9 @@ class FakeStand:
                  rows_none: bool = False, rows_skip_bridge: bool = False, health_advance: tuple | None = None,
                  health_fail_after_gone: bool = False, health_fail_calls=(), calc_status: dict | None = None,
                  calc_answers: dict | None = None, matches: list | None = None, search_status: str = "ok",
-                 agent_files: dict | None = None):
+                 agent_files: dict | None = None, status_seq: list | None = None,
+                 status_fail_after: int | None = None, fail_after_wakes: int | None = None,
+                 dify_swap_seq: list | None = None, historian_note: str | None = None):
         self.run_over = dict(run or {})
         self.calc_status = dict(calc_status or {})
         self.calc_answers = dict(calc_answers or {})
@@ -513,7 +543,16 @@ class FakeStand:
         self.visible_after_s = visible_after_s
         self.cost_per_run = {"create": 0.01, "number": 0.01, "trap": 0.01, **(cost_per_run or {})}
         self.status_rows = {"llm": "ok", "memory": "ok", **(status_rows or {})}
-        self.health_extra = dict(health or {})
+        self.health_extra = health if callable(health) else dict(health or {})
+        self.status_seq = list(status_seq or [])
+        self.status_fail_after = status_fail_after
+        self.fail_after_wakes = fail_after_wakes
+        self.dify_swap_seq = list(dify_swap_seq or [0])
+        self.historian_note = historian_note
+        self.status_calls = 0
+        self.dify_calls = 0
+        self.wakes = 0
+        self.slept: list[list[int]] = []
         self.calc_rate = calc_rate
         self.archive_delay_s = archive_delay_s
         self.rows_none = rows_none
@@ -623,7 +662,8 @@ class FakeStand:
             if seen:                                    # блок пропал, и /health/llm больше не читается
                 raise RuntimeError("health down")
         run["spent_usd"] = round(float(run["spent_usd"]) + self.spent(), 6)
-        return {"run": run, "spent_usd": run["spent_usd"], "key_spent_usd": None, **self.health_extra}
+        extra = self.health_extra(n) if callable(self.health_extra) else self.health_extra
+        return {"run": run, "spent_usd": run["spent_usd"], "key_spent_usd": None, **extra}
 
     def run_callers(self) -> frozenset[str]:
         if self._run_callers is not None:
@@ -641,7 +681,36 @@ class FakeStand:
         return t - first >= self.mcp_after_s.get(place, 0.0)
 
     def status(self) -> dict:
-        return {"checks": [{"component": c, "state": s} for c, s in self.status_rows.items()]}
+        with self._lock:
+            self.status_calls += 1
+            n, wakes = self.status_calls, self.wakes
+        if self.status_fail_after is not None and n > self.status_fail_after:
+            raise RuntimeError("status read failed")
+        if self.status_seq:
+            if self.fail_after_wakes is not None:
+                return self.status_seq[1 if wakes >= self.fail_after_wakes else 0]
+            return self.status_seq[min(n, len(self.status_seq)) - 1]
+        rows = [{"component": c, "state": s} for c, s in self.status_rows.items()]
+        if self.historian_note is not None:
+            rows.append({"component": "historian", "state": "ok", "detail": "последняя метка 20 с назад",
+                         "note": self.historian_note})
+        return {"checks": rows}
+
+    # --- режим нагрузки ---
+
+    def on_wake(self, place: int) -> None:
+        with self._lock:
+            self.wakes += 1
+
+    def dify_swap_mib(self) -> int:
+        with self._lock:
+            self.dify_calls += 1
+            n = self.dify_calls
+        return self.dify_swap_seq[min(n, len(self.dify_swap_seq)) - 1]
+
+    def sleep_places(self, places: list[int]) -> None:
+        with self._lock:
+            self.slept.append(list(places))
 
     def _seen(self, answer: dict) -> dict:
         """Теги ответа калькулятора (совпадения поиска и элементы) — в seen_tags."""
@@ -761,6 +830,19 @@ def fake_stand_raising(exc: BaseException) -> Iterator[None]:
         cli.connect = original
 
 
+def health_brake(halt_after_calls: int | None = None, age_after_calls: tuple[int, float] | None = None):
+    """Блок run_brake /health/llm по номеру вызова (FakeStand(health=…)): после halt_after_calls вызовов — halted,
+    после age_after_calls[0] — age_s = age_after_calls[1]; иначе watching, 2 с."""
+    def block(n: int) -> dict:
+        halted = halt_after_calls is not None and n > halt_after_calls
+        age = float(age_after_calls[1]) if age_after_calls is not None and n > age_after_calls[0] else 2.0
+        return {"run_brake": {"state": "halted" if halted else "watching", "reason": "memory" if halted else None,
+                              "avail_mib": 8000, "total_mib": 16000, "fail_mib": 1024, "swap_base_mib": 0,
+                              "swap_growth_mib": 0, "swap_grow_mib": 512, "psi_full10": 0.0, "psi_full_max": 10.0,
+                              "oom_kills": 0, "age_s": age, "halted_at": None}}
+    return block
+
+
 # --- фабрики ---
 
 def cfg(**kw: Any) -> BenchConfig:
@@ -842,6 +924,7 @@ def runner(*, out: Path | None = None, chat: FakeChat | None = None, stand: Fake
     r = cls(c, stand, views, cards, sleep=sleep or time.sleep, clock=mono,
             now=now or (lambda: datetime.now(timezone.utc)), only=only)
     r.poll_s = 0.01
+    r.mem_poll_s = LOAD_MEM_POLL_S if sleep is not None else MEM_POLL_REAL_S
     _RUNNERS.append(r)
     return r
 
@@ -863,5 +946,6 @@ def write_config(tmp: Path, **patch: Any) -> Path:
     return path
 
 
-__all__ = ["FakeChat", "FakeClock", "FakeStand", "M1", "M2", "M3", "M4", "OUT_BASE", "PlaceChat", "T0", "cfg",
-           "close_runners", "fake_stand_raising", "iso", "now", "runner", "twin_cards", "write_config"]
+__all__ = ["FakeChat", "FakeClock", "FakeStand", "M1", "M2", "M3", "M4", "MEM_POLL_REAL_S", "OUT_BASE", "PlaceChat",
+           "T0", "cfg", "close_runners", "fake_stand_raising", "health_brake", "iso", "now", "runner", "twin_cards",
+           "write_config"]

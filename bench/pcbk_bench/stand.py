@@ -15,7 +15,11 @@ ServerStand(ssh, core_url, edge_url, edge_host, secrets, remote_dir):
 - place_model — одноразовый curl в сети места (помощник oc Д2) → GET /config → model;
 - place_mcp_ok — запись журнала здоровья места после позднего из StartedAt core и места содержит mcp=connected;
 - calc — POST core_url/api/data/<инструмент> токеном данных ops (secrets/ops.data-token) через туннель к core;
-- health_llm — GET core_url/health/llm; status — GET edge_url/status.json сторожа с Host = edge_host.
+- health_llm — GET core_url/health/llm; status — GET edge_url/status.json сторожа с Host = edge_host;
+- режим нагрузки (Д11-R119, R120): sleep_places — docker stop мест одной командой (места сами не будятся: будит
+  только шлюз); dify_swap_mib — одной командой сумма memory.swap.current cgroup всех контейнеров, чьё имя не начинается
+  с pcbk- (только чтение, как sampler окна), МиБ; load_check — числа нагрузки (load.LOAD_CHECK_PY) изнутри pcbk-core,
+  с out — и цена реплики в OUT/price.json (load.write_price).
 
 calc_patient(stand, tool, args, sleep=…) — калькулятор с паузой и повтором на rate на всё окно частоты службы (Б3):
 его зовут прогонщик (сверка и единицы) и cards_check (Б3).
@@ -42,10 +46,13 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from .load import LOAD_CHECK_PY, write_price
 from .secret import Secret
 
 SSH_TIMEOUT_S = 60.0
 SAVE_TIMEOUT_S = 120.0
+DIFY_SWAP_TIMEOUT_S = 20.0               # опрос сторожа памяти: долгий ответ — слепота, а не ожидание минуты
+SLEEP_STOP_S = 10                        # docker stop -t: мест прогона остановлены не позже 60 с (R133)
 HTTP_TIMEOUT_S = 60.0
 CORE = "pcbk-core"
 CORE_UID = 10003
@@ -70,6 +77,10 @@ if sessions:
     rows = [dict(r) for r in c.execute(q, sessions)]
 print(json.dumps(rows, ensure_ascii=False))
 """
+# swap контейнеров Dify (всех не pcbk-*): пути memory.swap.current их cgroup (v2, драйвер systemd), значения — байты по
+# строке; нет файла — код cat не 0 (xargs 123) и StandError: нечитаемое — не ноль
+DIFY_SWAP_SH = ("docker ps --no-trunc --format '{{.ID}} {{.Names}}' | awk '$2 !~ /^pcbk-/ "
+                "{print \"/sys/fs/cgroup/system.slice/docker-\" $1 \".scope/memory.swap.current\"}' | xargs -r cat")
 # живые (не archived) агенты места: argv — место
 AGENT_ROWS_PY = """\
 import json, sqlite3, sys
@@ -152,6 +163,10 @@ class Stand(Protocol):
     def run_callers(self) -> frozenset[str]: ...
     def place_model(self, place: int) -> str: ...
     def place_mcp_ok(self, place: int) -> bool: ...
+    # режим нагрузки (Д11-R119, R120)
+    def sleep_places(self, places: list[int]) -> None: ...
+    def dify_swap_mib(self) -> int: ...
+    def load_check(self, callers: list[str], since: str, until: str, out: Path | None = None) -> dict: ...
 
 
 def _place(place: int) -> int:
@@ -295,6 +310,34 @@ class ServerStand:
             return False
         return mcp_connected(states[0], states[1])
 
+    # --- режим нагрузки ---
+
+    def sleep_places(self, places: list[int]) -> None:
+        """docker stop мест одной командой (остановленное место — не ошибка)."""
+        names = [f"pcbk-student-{_place(n):02d}" for n in places]
+        if names:
+            self._ssh(shlex.join(["docker", "stop", "-t", str(SLEEP_STOP_S), *names]))
+
+    def dify_swap_mib(self) -> int:
+        """Сумма memory.swap.current cgroup контейнеров не pcbk-*, МиБ; не прочитано — StandError."""
+        total = 0
+        for line in self._ssh(DIFY_SWAP_SH, timeout=DIFY_SWAP_TIMEOUT_S).split():
+            if not line.isdecimal():
+                raise StandError("swap Dify: значение cgroup — не число")
+            total += int(line)
+        return total // (1024 * 1024)
+
+    def load_check(self, callers: list[str], since: str, until: str, out: Path | None = None) -> dict:
+        """Числа нагрузки за [since, until] (LOAD_CHECK_PY, только чтение); с out — и цена реплики в OUT/price.json."""
+        if not all(isinstance(c, str) and re.fullmatch(r"student-\d{2}", c) for c in callers):
+            raise StandError("load_check: вызывающие — student-NN")
+        numbers = self._json(self._core_py(LOAD_CHECK_PY, json.dumps(list(callers)), since, until))
+        if not isinstance(numbers, dict):
+            raise StandError("load_check: ответ — не объект")
+        if out is not None:
+            numbers["price"] = write_price(Path(out))
+        return numbers
+
     # --- HTTP через туннели ---
 
     def _http_json(self, method: str, url: str, body: dict | None = None, token: str | None = None,
@@ -358,5 +401,5 @@ class ServerStand:
         return answer
 
 
-__all__ = ["AGENT_FILE_PY", "AGENT_ROWS_PY", "CALC_RATE_PAUSE_S", "CALC_RATE_WINDOW_S", "CALC_TRIES", "LLM_ROWS_PY",
-           "MCP_SAVE_PY", "ServerStand", "Stand", "StandError", "calc_patient", "mcp_connected"]
+__all__ = ["AGENT_FILE_PY", "AGENT_ROWS_PY", "CALC_RATE_PAUSE_S", "CALC_RATE_WINDOW_S", "CALC_TRIES", "DIFY_SWAP_SH",
+           "LLM_ROWS_PY", "MCP_SAVE_PY", "ServerStand", "Stand", "StandError", "calc_patient", "mcp_connected"]
