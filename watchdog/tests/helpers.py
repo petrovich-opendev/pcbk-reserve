@@ -88,13 +88,22 @@ def put_build(root, build="abc123", files=None, meta=None):
                                                  "files": {p: hashlib.sha256(b).hexdigest() for p, b in files.items()}}))
 
 
-# /proc/meminfo для тестов: памяти с запасом; файл удаляется при выходе
-_fd, MEMINFO_FILE = tempfile.mkstemp(prefix="pcbk-meminfo-")
-with os.fdopen(_fd, "w") as _f:
-    _f.write("MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\n")
-atexit.register(os.remove, MEMINFO_FILE)
+# двойники /proc для тестов (R123а, итог Д11а m-1): meminfo — памяти с запасом, vmstat — убийств 0, давление 0;
+# настоящие /proc машины тесты не открывают. Файлы удаляются при выходе
+def _proc_twin(prefix: str, text: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    atexit.register(os.remove, path)
+    return path
 
-SETTINGS = Settings(MEMINFO_PATH=MEMINFO_FILE)
+
+MEMINFO_FILE = _proc_twin("pcbk-meminfo-", "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\n")
+VMSTAT_FILE = _proc_twin("pcbk-vmstat-", "pgfault 1\noom_kill 0\n")
+PRESSURE_FILE = _proc_twin("pcbk-pressure-", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                                             "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+
+SETTINGS = Settings(MEMINFO_PATH=MEMINFO_FILE, VMSTAT_PATH=VMSTAT_FILE, PRESSURE_PATH=PRESSURE_FILE)
 
 CHROME = shutil.which("google-chrome")
 

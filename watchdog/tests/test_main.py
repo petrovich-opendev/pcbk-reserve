@@ -623,6 +623,33 @@ def test_run_checks_own_kill_not_outside_after_grace(tmp_path):              # �
     assert (rows[0].state, mem.history.outside(T0 + timedelta(seconds=40))) == ("ok", 0)
 
 
+class LongRestartingDocker:
+    """Место убито по памяти и дольше match_s в окне Restarting (откат политики перезапуска), затем работает."""
+    def __init__(self):
+        self.n = 0
+    def inspect(self, name):
+        self.n += 1
+        if self.n == 1:
+            return insp(running=True, started=T0 - timedelta(hours=1))
+        if self.n <= 4:
+            return insp(running=True, restarting=True, restarts=1, oom=True, started=T0 - timedelta(hours=1))
+        return insp(running=True, restarts=1, started=T0 + timedelta(seconds=35))
+
+
+def test_run_checks_late_restart_credit_does_not_hide_next_kill(tmp_path):   # m-5 ревью А1: v_after в attribute
+    vm, settings = settings_with(tmp_path)
+    docker, mem = LongRestartingDocker(), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    vm.write_text("oom_kill 6\n")                                           # место убито: прирост замерен в T0
+    for s in (0, 10, 20):
+        run_checks(COMPS, docker, settings, T0 + timedelta(seconds=s), mem=mem)
+    rows = run_checks(COMPS, docker, settings, T0 + timedelta(seconds=40), mem=mem)   # работает — позже match_s
+    assert rows[1].detail.startswith("перезапущен: убит по памяти")
+    vm.write_text("oom_kill 7\n")                                           # убийство вне мест (Dify)
+    run_checks(COMPS, docker, settings, T0 + timedelta(seconds=50), mem=mem)
+    assert mem.history.outside(T0 + timedelta(seconds=80)) == 2             # кредит его не поглотил
+
+
 class VmstatLostDocker:
     """Место работает, к следующему осмотру перезапущено — а /proc/vmstat к этому такту перестал читаться."""
     def __init__(self):
@@ -652,7 +679,8 @@ def test_run_loop_wires_mem_state(tmp_path):                                # п
                                                 settings, stop))
     t.start()
     try:
-        wait_until(lambda: state.snapshot and state.snapshot.checks[1].detail.startswith("перезапущен: убит по памяти"), 5)
+        wait_until(lambda: state.snapshot
+                   and state.snapshot.checks[1].detail.startswith("перезапущен: убит по памяти"), 5)
     finally:
         stop.set(); t.join(5)
 

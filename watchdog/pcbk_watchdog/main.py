@@ -266,7 +266,7 @@ def _check_container(comp: dict, docker: DockerReader, now: datetime, mem: MemSt
     v_after = mem.oom_kill()
     reason, n = mem.reasons.observe(cid, inspect, v_before, v_after)
     if reason == "oom" and n > 0:
-        mem.history.attribute(n, now)
+        mem.history.attribute(n, now, v_after)
     started = datetime.fromisoformat(inspect["State"]["StartedAt"]) if inspect is not None else None
     return check_container(cid, title, inspect, sleeping_ok=comp["sleeping_ok"], now=now,
                            unhealthy_detail=unhealthy, restart_reason=mem.reasons.reason(cid, started),

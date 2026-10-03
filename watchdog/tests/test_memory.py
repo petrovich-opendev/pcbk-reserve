@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from helpers import insp
+from pcbk_watchdog.checks import CRASH_LOOP_DETAIL, check_container
 from pcbk_watchdog.memory import (MEM_DRILL_NOTE, MEM_OOM_OUTSIDE_DETAIL, MEM_PSI_DETAIL, MEM_SENSOR_SILENT_DETAIL,
                                   MEM_SWAP_DETAIL, MemHistory, RestartReasons, memory_verdict, parse_sample)
 
@@ -93,6 +94,13 @@ def test_swap_growth_in_ten_minutes_warns_then_clears():
     assert verdict(sample(swap_used_mib=700), h, later)[0] == "ok"
 
 
+def test_swap_growth_is_last_minus_lowest_in_window():                     # m-2 ревью А1: не «минус первый»
+    h = hist()
+    for minutes, used in ((0, 500), (3, 100), (6, 700)):
+        h.observe(T + timedelta(minutes=minutes), sample(swap_used_mib=used))
+    assert h.swap_growth(T + timedelta(minutes=6)) == 600
+
+
 def test_swap_decrease_is_not_growth():
     h = hist(); h.observe(T, sample(swap_used_mib=900))
     at = T + timedelta(minutes=1); h.observe(at, sample(swap_used_mib=100))
@@ -138,6 +146,22 @@ def test_attribute_matches_recent_increment_not_old_one():
     h.attribute(1, T + timedelta(minutes=50, seconds=10))
     assert h.outside(T + timedelta(minutes=55)) == 1
     assert h.outside(T + timedelta(minutes=71)) == 0
+
+
+def test_credit_only_for_increment_history_has_not_seen():                 # m-5 ревью А1
+    h = hist()
+    h.observe(T, sample(oom=3)); h.observe(T + timedelta(seconds=10), sample(oom=4))   # убийство уже замерено
+    h.attribute(1, T + timedelta(seconds=50), v_after=4)                    # перезапуск увиден позже match_s
+    h.observe(T + timedelta(seconds=60), sample(oom=5))                     # следующее убийство — вне мест
+    assert h.outside(T + timedelta(seconds=90)) == 2                        # кредит его не поглотил
+
+
+def test_one_unseen_kill_is_credited_once():                                # m-5 ревью А1: две строки за такт
+    h = hist(); h.observe(T, sample(oom=3))
+    h.attribute(1, T + timedelta(seconds=5), v_after=4)                     # место убито после замера такта
+    h.attribute(1, T + timedelta(seconds=5), v_after=4)                     # другая строка — то же убийство
+    h.observe(T + timedelta(seconds=10), sample(oom=5))                     # +2: одно объяснено, второе — вне мест
+    assert h.outside(T + timedelta(minutes=1)) == 1
 
 
 def test_fail_beats_outside_psi_and_swap():
@@ -315,3 +339,29 @@ def test_no_counter_no_oom_reason():
     r = RestartReasons()
     run(r, "core-container", insp(running=True, started=START), None, None)
     assert run(r, "core-container", insp(running=True, restarts=1, started=AGAIN), None, None) == (None, 0)
+
+
+# итоговая доводка Д11а (ревью А1, m-1 и m-4): сон места и последняя причина — через RestartReasons.observe
+def test_woken_and_killed_in_one_tick_after_sleep():                        # m-1: RestartCount равен прежнему
+    r = RestartReasons()
+    run(r, "student-04", insp(running=True, started=START), 5, 5)
+    lived = T - timedelta(minutes=30)
+    assert run(r, "student-04", insp(running=True, restarts=1, started=lived), 6, 6) == ("oom", 1)
+    run(r, "student-04", insp(code=0, restarts=1, started=lived), 6, 6)     # уснул: счётчик Docker прежний
+    assert r.last("student-04") is None                                     # причина прошлой жизни — не новой
+    assert run(r, "student-04", insp(running=True, restarts=1, started=AGAIN), 6, 7) == ("oom", 1)
+
+
+def test_crash_loop_note_through_restart_reasons():                         # m-4: last() и сброс при пробуждении
+    r = RestartReasons()
+    run(r, "student-01", insp(running=True, restarts=2, started=START), 5, 5)
+    run(r, "student-01", insp(running=True, restarting=True, restarts=3, oom=True, started=START), 6, 6)
+    assert r.last("student-01") == "oom"                                    # в окне Restarting — ожидающая причина
+    at = T - timedelta(minutes=3)
+    looping = insp(running=True, restarts=3, started=at)
+    assert run(r, "student-01", looping, 6, 6) == ("oom", 1)
+    row = check_container("student-01", "Рабочее место 01", looping, sleeping_ok=True, now=T,
+                          restart_reason=r.reason("student-01", at), last_reason=r.last("student-01"))
+    assert (row.state, row.detail, row.note) == ("fail", CRASH_LOOP_DETAIL, "последний — убит по памяти")
+    run(r, "student-01", insp(running=True, started=T - timedelta(seconds=30)), 6, 6)   # docker start: пробуждение
+    assert (r.last("student-01"), r.reason("student-01", at)) == (None, None)
