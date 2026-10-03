@@ -339,3 +339,16 @@ def test_account_actions_are_journal_vocabulary(tg):                     # M-3: 
     actions = {r.action for r in tg.role.teacher_log.recent(100)}
     assert actions == {"account_add", "account_passwd", "account_disable", "account_enable", "account_unlock"}
     assert actions <= ACTIONS
+
+
+def test_enable_does_not_revive_old_sessions(tg):                       # m-7: disable сам закрывает сессии
+    """Сессию отключённой учётки не пускает и session() (disabled), поэтому без DELETE сессий в disable набор оставался
+    зелёным. Но после «Включить» прежняя сессия ожила бы — вход с чужого компьютера, где студент не вышел. disable
+    закрывает сессии сам: после enable прежняя cookie — 401, вход паролем — заново."""
+    s5 = tg.as_("stu-05")
+    t = tg.as_("teach")
+    assert s5.get("/pcbk/api/auth/me").status_code == 200
+    assert post(t, "accounts/stu-05/disable", {}).status_code == 204
+    assert post(t, "accounts/stu-05/enable", {}).status_code == 204
+    assert s5.get("/pcbk/api/auth/me").status_code == 401
+    assert tg.as_("stu-05").get("/pcbk/api/auth/me").status_code == 200
