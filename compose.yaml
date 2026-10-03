@@ -213,7 +213,7 @@ services:
   core:
     build: ./core
     # откатный образ — по строке А0, шаг 3 (`core:d9b`, если он есть на сервере, иначе `core:d9a`; deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d10a
+    image: pcbk-reserve/core:d10b
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
