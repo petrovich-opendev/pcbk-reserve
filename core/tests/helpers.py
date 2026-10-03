@@ -429,6 +429,14 @@ def make_llm_app(tmp_path, fake=None, **kw) -> tuple[FastAPI, LlmRole]:
 PW = "пароль-123"
 
 
+class Secret(str):
+    """Порождённый пароль в тестах (Д10б, m-14): значение — как у строки, repr — без значения: pytest печатает
+    аргументы упавшего assert через repr. Копия класса tests/integration/secret.py (core/tests его не видит)."""
+
+    def __repr__(self) -> str:
+        return "<скрыт>"
+
+
 def store(tmp_path, **kw) -> AccountStore:
     """AccountStore на tmp_path/core.db с вызванным open(); kw — в конструктор (clock, ttl_s)."""
     s = AccountStore(str(Path(tmp_path) / "core.db"), **kw)

@@ -31,6 +31,10 @@ core.db делят журналы, их запись ждёт блокировк
 Пароль не попадает ни в базу (только хеш), ни в тексты исключений, ни в журнал. Команда
 администратора — main(): python -m pcbk_core.gateway.accounts. Её journal (Д10-R99) печатает журнал действий
 преподавателя (pcbk_core.teacher_log, только чтение mode=ro): коды, номера мест, логины и числа.
+
+Д10б (Д10-R108): те же операции зовёт кабинет преподавателя (gateway.teacher_api) — add только студентом и без
+same_person, set_password, disable, enable, unlock; правила — только здесь. enable — новое: включает отключённую
+учётку студента на её же место; у команды — enable --login L.
 """
 from __future__ import annotations
 
@@ -452,6 +456,31 @@ class AccountStore:
             db.execute("DELETE FROM gw_sessions WHERE login = ?", (login,))
             db.execute("COMMIT")
 
+    def enable(self, login: str) -> None:
+        """Включает отключённую учётку студента (Д10-R108) — на её же место: место закреплено (gw_places) за этим
+        логином, действующей учётки на нём нет. Учётка преподавателя, действующая или неизвестная — ValueError; отказ
+        ничего не меняет. Сессий у отключённой учётки нет (disable их закрыл), замок не трогается."""
+        _check_login(login)
+        with self._op(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT role, place, disabled FROM gw_accounts WHERE login = ?", (login,)).fetchone()
+            if row is None:
+                raise ValueError(f"учётки {login} нет")
+            role, place, disabled = row
+            if role != "student" or place is None:
+                raise ValueError("включать можно только учётку студента")
+            if not disabled:
+                raise ValueError(f"учётка {login} уже включена")
+            bound = db.execute("SELECT login FROM gw_places WHERE place = ?", (place,)).fetchone()
+            if bound is None or bound[0] != login:
+                # место освободили (release-place) или отдали другому логину — включать некуда
+                raise ValueError(f"место {_nn(place)} не закреплено за учёткой {login} — включить её нельзя")
+            taken = db.execute("SELECT 1 FROM gw_accounts WHERE place = ? AND disabled = 0", (place,)).fetchone()
+            if taken is not None:
+                raise ValueError(f"место {_nn(place)} занято другой учёткой")
+            db.execute("UPDATE gw_accounts SET disabled = 0 WHERE login = ?", (login,))
+            db.execute("COMMIT")
+
     def remove(self, login: str) -> None:
         """Удаляет только отключённую учётку; gw_places не трогает — логин остаётся за местом (надгробие).
         Подтверждения предупреждений логина стираются: новая учётка с тем же логином спросит снова (раунд 2, Minor 6)."""
@@ -731,6 +760,8 @@ def _parser() -> argparse.ArgumentParser:
     passwd.add_argument("--generate", action="store_true", help="породить пароль и напечатать его один раз")
     disable = sub.add_parser("disable", help="отключить учётку: сессии закрываются, место остаётся за ней")
     disable.add_argument("--login", required=True)
+    enable = sub.add_parser("enable", help="включить отключённую учётку студента на её же место (Д10-R108)")
+    enable.add_argument("--login", required=True)
     remove = sub.add_parser("remove", help="удалить отключённую учётку; логин остаётся за местом")
     remove.add_argument("--login", required=True)
     remove.add_argument("--yes", action="store_true")
@@ -818,6 +849,8 @@ def _run(store: AccountStore, args: argparse.Namespace, settings: Settings) -> i
             print(password, flush=True)
     elif command == "disable":
         store.disable(args.login)
+    elif command == "enable":
+        store.enable(args.login)
     elif command == "remove":
         if not args.yes:
             raise ValueError("remove удаляет учётку — повторите с --yes")

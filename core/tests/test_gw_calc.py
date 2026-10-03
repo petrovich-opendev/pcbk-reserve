@@ -1,9 +1,10 @@
 """Калькуляторы страницы (Д9а, Д9-R87): POST /pcbk/api/calc/<tool> — тот же DataService, что у /api/data/ и MCP.
 
 Место — только из учётки сессии (caller_of), канал — web; отказы шлюза — JSON вида OpenCode в порядке R87: зона →
-настройка → сессия → источник → инструмент → преподаватель → служба → тело → аргументы. Служба — make_service на
-двойнике историана (core.db службы — в tmp_path, I1), шлюз — make_gateway(tmp_path / "gw", calc=svc): у них разные
-core.db."""
+настройка → сессия → источник → инструмент → вызывающий → служба → тело → аргументы. Преподаватель считает своим
+вызывающим TEACHER_CALLER (Д10-R109): шаг 6 Д9 (403 преподавателю) снят, отказ остался только учётке без вызывающего.
+Служба — make_service на двойнике историана (core.db службы — в tmp_path, I1), шлюз — make_gateway(tmp_path / "gw",
+calc=svc): у них разные core.db."""
 import asyncio
 import re
 import sqlite3
@@ -15,7 +16,8 @@ from fastapi.testclient import TestClient
 from helpers import (BASE, FRONT, LLM_ENV, ORIGIN, PLACE_NET, REPO, Gw, make_gateway, make_service, park_reload_worker,
                      run_python)
 from pcbk_core.gateway.api import GW_MESSAGES
-from pcbk_core.gateway.calc_api import CALC_DOWN_TEXT, CALC_PREFIX, CALC_TOOLS, TEACHER_CALC_TEXT, caller_of
+from pcbk_core.gateway.calc_api import (CALC_DOWN_TEXT, CALC_PREFIX, CALC_TOOLS, ROLE_CALC_TEXT, TEACHER_CALLER,
+                                        caller_of)
 from pcbk_core.main import build_roles
 from pcbk_core.settings import Settings
 
@@ -48,8 +50,6 @@ def test_calc_route_answers_from_service(gwc):                                  
 def test_calc_route_refusals(gwc):                                                # Review Focus 4
     before = len(gwc.svc.role.events.recent())                                    # ревью А4, m-1
     assert post(gwc.anon(), "tag_now", BODY).status_code == 401
-    r = post(gwc.as_("teach"), "tag_now", BODY)
-    assert (r.status_code, r.json()) == (403, {"name": "Forbidden", "data": {"message": TEACHER_CALC_TEXT}})
     s = gwc.as_("stu-03")
     assert post(s, "tag_now", BODY, origin="https://evil.test").status_code == 403
     assert post(s, "save_agent", BODY).status_code == 404
@@ -63,6 +63,13 @@ def test_calc_route_refusals(gwc):                                              
     assert (e.caller, e.channel, e.outcome) == ("student-03", "web", "refused")
     assert post(s, "tag_now", {**BODY, "place": 5}).status_code == 200          # лишний ключ места не действует
     assert gwc.svc.role.events.recent()[0].caller == "student-03"
+
+
+def test_calc_route_teacher_caller(gwc):                                          # Д10-R109; Review Focus 3 Д10б
+    r = post(gwc.as_("teach"), "tag_now", BODY)
+    assert r.status_code == 200
+    e = gwc.svc.role.events.recent()[0]
+    assert (e.caller, e.channel) == ("teacher", "web")
 
 
 def test_calc_route_without_service(tmp_path):
@@ -84,7 +91,8 @@ def test_build_roles_wires_calc(tmp_path):                       # как test_g
 def test_calc_contract_texts():                                                  # R87 дословно
     assert CALC_PREFIX == "/pcbk/api/calc/"
     assert CALC_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
-    assert TEACHER_CALC_TEXT == "Калькуляторы для преподавателя — в следующих выпусках стенда"
+    assert TEACHER_CALLER == "teacher"                                             # Д10-R109
+    assert ROLE_CALC_TEXT == "Калькуляторы — только для студента с рабочим местом и преподавателя"
     assert CALC_DOWN_TEXT == "Калькуляторы недоступны — служба данных не подключена"
     assert (caller_of(3), caller_of(10)) == ("student-03", "student-10")
 
@@ -141,18 +149,20 @@ def test_calc_route_own_period_and_limit_same_as_service(gwc):    # ревью �
     assert gwc.svc.role.events.recent()[1].channel == "web"
 
 
-def test_calc_route_student_role_only(gwc):                     # итоговое ревью Д9а, m-5: роль — явно, не «нет места»
-    """Связь «студент ↔ место» держит только AccountStore.add: учётка преподавателя с местом и учётка чужой роли
-    (правка базы мимо CHECK) — 403 TEACHER_CALC_TEXT без вызова службы, как у прокси."""
+def test_calc_route_caller_by_role_only(gwc):                   # итоговое ревью Д9а, m-5; Д10-R109: роль — явно
+    """Связь «студент ↔ место» держит только AccountStore.add, вызывающий — только по роли: преподаватель с местом
+    (правка базы) считает за себя (TEACHER_CALLER), а не за место 07 — ни из базы, ни из тела; учётка чужой роли
+    (правка базы мимо CHECK) — 403 ROLE_CALC_TEXT без вызова службы, как у прокси."""
     with closing(sqlite3.connect(gwc.role.store.path)) as db, db:
         db.execute("UPDATE gw_accounts SET place = 7 WHERE login = 'teach'")
         db.execute("PRAGMA ignore_check_constraints = ON")
         db.execute("INSERT INTO gw_accounts (login, role, place, pw_hash, disabled, created_at) SELECT 'oper',"
                    " 'operator', 8, pw_hash, 0, created_at FROM gw_accounts WHERE login = 'stu-05'")
+    r = post(gwc.as_("teach"), "tag_now", {**BODY, "place": "07", "caller": "student-07"})
+    assert r.status_code == 200 and gwc.svc.role.events.recent()[0].caller == TEACHER_CALLER
     before = len(gwc.svc.role.events.recent())
-    for login in ("teach", "oper"):
-        r = post(gwc.as_(login), "tag_now", BODY)
-        assert (r.status_code, r.json()["data"]["message"]) == (403, TEACHER_CALC_TEXT), login
+    r = post(gwc.as_("oper"), "tag_now", BODY)
+    assert (r.status_code, r.json()) == (403, {"name": "Forbidden", "data": {"message": ROLE_CALC_TEXT}})
     assert len(gwc.svc.role.events.recent()) == before
 
 
@@ -169,15 +179,15 @@ def test_calc_route_bad_args_refused_with_web_event(gwc):        # R87, шаг 9
                                                                      ("x",))
 
 
-def test_calc_route_order_tool_before_teacher_and_service(gwc, tmp_path):       # R87: шаги 5 → 6 → 7
-    assert post(gwc.as_("teach"), "save_agent", BODY).status_code == 404          # инструмент — раньше преподавателя
+def test_calc_route_order_tool_before_caller_and_service(gwc, tmp_path):        # R87: шаги 5 → 6 → 7
+    assert post(gwc.as_("teach"), "save_agent", BODY).status_code == 404          # инструмент — и у преподавателя
     app, role = make_gateway(tmp_path / "nosvc")
     park_reload_worker(role)
     with TestClient(app, base_url=BASE, client=FRONT):
         g = Gw(app, role)
         assert post(g.as_("stu-03"), "save_agent", BODY).status_code == 404       # инструмент — раньше службы
-        r = post(g.as_("teach"), "tag_now", BODY)                                 # преподаватель — раньше службы
-        assert (r.status_code, r.json()["data"]["message"]) == (403, TEACHER_CALC_TEXT)
+        r = post(g.as_("teach"), "tag_now", BODY)                                 # преподаватель — к службе (Д10-R109)
+        assert (r.status_code, r.json()["data"]["message"]) == (503, CALC_DOWN_TEXT)
         bad = g.as_("stu-03").post(CALC_PREFIX + "tag_now", content=b"{", headers={"Origin": ORIGIN})
         assert (bad.status_code, bad.json()["data"]["message"]) == (503, CALC_DOWN_TEXT)   # служба — раньше тела
 
