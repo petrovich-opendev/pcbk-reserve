@@ -15,7 +15,8 @@ lifespan). Соединение — на каждую операцию (как A
 и кодом SQLite, без путей и значений.
 
 store_ok — журнал открыт и подряд нет неудачных записей (failures). Любая удачная запись, в том числе пульс ping() в
-такте уборщика, обнуляет счёт — store_ok возвращается сам. Учение journal_down (DRILL_TEACHER) — любая запись (и пульс,
+такте уборщика, обнуляет счёт — store_ok возвращается сам; журнал, не открывшийся при запуске, пульс открывает заново
+(ревью А2, m-6). Учение journal_down (DRILL_TEACHER) — любая запись (и пульс,
 и строка в транзакции доли) не идёт до SQL: TeacherLogError «учения: journal_down», и счёт само не обнуляет."""
 from __future__ import annotations
 
@@ -318,7 +319,13 @@ class TeacherLog:
 
     def ping(self) -> bool:
         """Пульс (такт уборщика шлюза): mode=rw, чтение teacher_actions, BEGIN IMMEDIATE, UPSERT teacher_heartbeat,
-        COMMIT — настоящая запись, как AccountStore.ping. Не бросает; удача обнуляет счёт сбоев."""
+        COMMIT — настоящая запись, как AccountStore.ping. Не бросает; удача обнуляет счёт сбоев. Журнал не открылся при
+        запуске — пульс сначала повторяет open() (ревью А2, m-6): удача ставит opened, и store_ok возвращается без
+        перезапуска core; неудача идёт в счёт сбоев."""
+        if not self.opened and not self.open():
+            self._failed(f"журнал действий не открыт: {self.last_error or 'сбой'}")
+            return False
+
         def beat(db: sqlite3.Connection) -> int:
             db.execute("SELECT max(id) FROM teacher_actions").fetchone()
             db.execute("BEGIN IMMEDIATE")

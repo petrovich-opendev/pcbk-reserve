@@ -159,3 +159,14 @@ def test_recent_reads_only(tmp_path):                                     # mode
     for bad in (0, -1, 1001, True, 2.0):
         with pytest.raises(ValueError):
             log.recent(bad)
+
+
+def test_failed_open_is_retried_by_pulse(tmp_path):                      # ревью А2, m-6: без перезапуска core
+    log = TeacherLog(str(tmp_path / "later" / "core.db"))
+    assert log.open() is False and log.store_ok is False                    # при запуске каталога ещё нет
+    assert log.ping() is False and log.failures == 1                        # неудачное открытие в такте — в счёт сбоев
+    assert log.last_error is not None and "later" not in log.last_error
+    (tmp_path / "later").mkdir()
+    assert log.ping() is True                                               # следующий пульс открыл журнал сам
+    assert (log.opened, log.failures, log.store_ok) == (True, 0, True)
+    assert log.requested("teach", "read", 3, None) > 0

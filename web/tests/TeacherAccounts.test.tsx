@@ -165,19 +165,25 @@ test("checks_before_sending_without_request", async () => {
 });
 
 test("password_window_survives_failed_overview_reload", async () => {
-  // обзор после заведения не пришёл (503) — окно пароля остаётся: второго показа не будет
+  // обзор после заведения не пришёл (503) — окно пароля остаётся: второго показа не будет. Прежний обзор тоже остаётся,
+  // причина — строкой над ним (доводка Д10а, ревью А4 m-1): кнопки учёток в его строках выключены, пока окно открыто
   const a = teacherApi({ overview: [[200, OVERVIEW_FREE_04],
                                     [503, { name: "Unavailable", data: { message: "Учётные записи недоступны — повторите позже" } }]],
                          addStudent: [201, { login: "d10-probe-n", place: "04", password: "Keep-Me-0042" }] });
-  render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
+  const { container } = render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
   fireEvent.change(await screen.findByLabelText("Логин"), { target: { value: "d10-probe-n" } });
   fireEvent.change(screen.getByLabelText("Место"), { target: { value: "04" } });
   fireEvent.click(screen.getByRole("button", { name: "Завести" }));
-  expect(await screen.findByText("Учётные записи недоступны — повторите позже")).toBeTruthy();
+  expect(await screen.findByText("Обзор не обновился: Учётные записи недоступны — повторите позже")).toBeTruthy();
   expect(screen.getByText("Keep-Me-0042").closest(".password-once")).toBeTruthy();
-  expect(screen.queryByRole("table")).toBeNull();                                // таблицы нет, окно есть
+  expect(a.overview).toHaveBeenCalledTimes(2);
+  expect(container.querySelectorAll("table.places tbody tr")).toHaveLength(10);   // прежняя таблица и окно
+  const buttons = [...container.querySelectorAll<HTMLButtonElement>("table.places button[class^='acc-']")];
+  expect(buttons.length).toBeGreaterThan(0);
+  expect(buttons.every((b) => b.disabled)).toBe(true);
   fireEvent.click(screen.getByRole("button", { name: "Я записал пароль" }));
   expect(screen.queryByText("Keep-Me-0042")).toBeNull();
+  expect(buttons.every((b) => !b.disabled)).toBe(true);
 });
 
 test("odd_success_body_is_unknown_not_a_window", async () => {

@@ -441,8 +441,9 @@ class GatewayRole(RoleBase):
         - llm.shares.verify(now, effective) — всегда, когда у роли llm есть доли, в том числе при loaded == False
           (m-4 р2: checked_at ставится, и строка — fail «доли не загружены», а не «неизвестно»); effective — центы, по
           которым отказывает прокси: round(budget.share_of(student-NN) × 100) — сверка сквозная, Budget без долей тоже
-          даёт расхождение (I-7);
-        - teacher_log.ping() — и при сбое сверки (finally): store_ok возвращается сам после сбоя записи.
+          даёт расхождение (I-7); их считает функция, которую verify зовёт под замком перевода (ревью А2, m-1);
+        - teacher_log.ping() — и при сбое сверки (finally): store_ok возвращается сам после сбоя записи, а журнал, не
+          открывшийся при запуске, пульс открывает заново (ревью А2, m-6).
         Строка журнала службы — только на смену итога сверки. Исключение уходит вызывающему (уборщик пишет класс)."""
         with self._teacher_lock:
             try:
@@ -450,8 +451,9 @@ class GatewayRole(RoleBase):
                 shares = None if llm is None else llm.shares
                 if shares is not None:
                     budget = llm.budget
-                    effective = {n: round(budget.share_of(f"student-{n:02d}") * 100) for n in PLACES}
-                    shares.verify(self.wallclock(), effective)
+                    # центы прокси читаются под замком перевода внутри verify (ревью А2, m-1): не вне его
+                    shares.verify(self.wallclock(),
+                                  lambda: {n: round(budget.share_of(f"student-{n:02d}") * 100) for n in PLACES})
                     self._note_shares(shares.ok, shares.drift, shares.last_error)
             finally:
                 self.teacher_log.ping()
@@ -511,7 +513,8 @@ class GatewayRole(RoleBase):
 
     async def _open_teacher_log(self) -> None:
         """Журнал действий преподавателя (CREATE IF NOT EXISTS) в потоке. Неудача — store_ok ложь (строка «Кабинет
-        преподавателя и доли» — fail) и строка ERROR; вход студентов от кабинета не зависит — это не config_error."""
+        преподавателя и доли» — fail) и строка ERROR, пока пульс такта уборщика не откроет журнал заново (ревью А2,
+        m-6); вход студентов от кабинета не зависит — это не config_error."""
         try:
             opened = await asyncio.to_thread(self.teacher_log.open)
         except Exception as exc:

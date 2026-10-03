@@ -35,7 +35,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..teacher_log import TEACHER_SCHEMA, TeacherLogError, insert_action
+from ..teacher_log import LOGIN_RE, TEACHER_SCHEMA, TeacherLogError, insert_action
 
 log = logging.getLogger("pcbk_core.llm.shares")
 
@@ -45,7 +45,6 @@ PLACES = range(1, 11)
 SQLITE_TIMEOUT_S = 2.0                  # запись ждёт блокировку недолго, как AccountStore (Г14)
 FLOOR_SLACK_USD = 1e-9                  # запас пола против шума float (B-1 р2)
 _SQLITE_CODE = re.compile(r"SQLITE_[A-Z_]{1,40}")
-_LOGIN_RE = re.compile(r"[a-z][a-z0-9._-]{2,31}")
 
 BAD_TEXT = "Неверный запрос"
 CONFLICT_TEXT = "Доли изменились, пока страница была открыта, — обновите её"
@@ -230,7 +229,7 @@ class Shares:
         """Под _apply_lock: BEGIN IMMEDIATE, доли с диска, decide(диск) → (новые центы изменённых мест, detail строки
         журнала) или ShareRefused; запись строк, строка журнала shares в той же транзакции, COMMIT; память — новым
         словарём (под shares_stale — нет). Возврат — центы десяти мест по диску после изменения."""
-        if not isinstance(by, str) or _LOGIN_RE.fullmatch(by) is None:
+        if not isinstance(by, str) or LOGIN_RE.fullmatch(by) is None:
             raise ValueError("by: логин преподавателя")
         if not isinstance(now, datetime):
             raise ValueError("now: нужно время")
@@ -311,10 +310,12 @@ class Shares:
 
         return self._transaction(by, now, decide)
 
-    def verify(self, now: datetime, effective: Mapping[int, int]) -> None:
+    def verify(self, now: datetime, effective: Mapping[int, int] | Callable[[], Mapping[int, int]]) -> None:
         """Сверка (I-7, такт уборщика шлюза): под _apply_lock таблица целиком (mode=rw), ожидаемые центы мест (строка
         или умолчание) сравниваются с effective — центами, по которым отказывает прокси ({n: round(budget.share_of(…)
-        × 100)}). Итог: drift — число расхождений, ok — таблица прочлась, checked_at = now (и при сбое), сбой —
+        × 100)}). effective — словарь или функция без аргументов, которая его вернёт: функцию сверка зовёт под тем же
+        замком, что перевод (ревью А2, m-1) — перевод между чтением памяти прокси и диска не даёт ложного расхождения на
+        такт. Итог: drift — число расхождений, ok — таблица прочлась, checked_at = now (и при сбое), сбой —
         last_error. Память не чинит."""
         with self._apply_lock:
             try:
@@ -328,6 +329,7 @@ class Shares:
                 self.last_error = _why(exc)
                 self.checked_at = now
                 return
-            self.drift = sum(1 for n in PLACES if effective.get(n) != disk[n])
+            expected = effective() if callable(effective) else effective
+            self.drift = sum(1 for n in PLACES if expected.get(n) != disk[n])
             self.ok = True
             self.checked_at = now

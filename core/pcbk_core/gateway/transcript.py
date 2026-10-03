@@ -11,7 +11,8 @@
   сработал любой предел или обрезка — clipped.
 
 Ответ места не по договору (не JSON, список разговоров или сообщений — не список, разговор — не объект или без годного
-id) — TranscriptError (шлюз отвечает 502 bad_answer). Чужие элементы и чужие виды частей не ломают ответ — пропускаются:
+id, сообщение user или assistant с info.sessionID не этого разговора — ревью А3, m-1) — TranscriptError (шлюз отвечает
+502 bad_answer). Чужие элементы и чужие виды частей не ломают ответ — пропускаются:
 новые виды частей при смене версии OpenCode не покажутся, но и не уронят чтение (README: сверить виды частей).
 
 Тексты отдаются как есть: экранирует веб, он показывает их только текстом (Д10-R106). Одно исключение (доводка р1,
@@ -189,7 +190,8 @@ def _message(item: object, clip: _Clip) -> dict | None:
 
 def transcript(session_raw: bytes | bytearray | str, messages_raw: bytes | bytearray | str) -> dict:
     """{"session", "messages", "clipped"} (Д10-R102). Разговор — не объект или без годного id, сообщения — не список,
-    любой ответ — не JSON: TranscriptError. Чужие элементы списка сообщений пропускаются."""
+    сообщение user или assistant не этого разговора (info.sessionID), любой ответ — не JSON: TranscriptError. Чужие
+    элементы списка сообщений (не объект, иная роль) пропускаются."""
     session = _session_row(_load(session_raw))
     if session is None:
         raise TranscriptError("разговор места — не объект с годным id")
@@ -202,6 +204,8 @@ def transcript(session_raw: bytes | bytearray | str, messages_raw: bytes | bytea
         message = _message(item, clip)
         if message is None:
             continue
+        if item["info"].get("sessionID") != session["id"]:     # сообщение другого разговора (ревью А3, m-1)
+            raise TranscriptError("сообщение не этого разговора")
         if len(messages) >= MESSAGES_MAX:
             clip.clipped = True
             break

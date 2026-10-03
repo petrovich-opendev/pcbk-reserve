@@ -5,11 +5,11 @@
 // Читается при открытии, по кнопке «Обновить журнал» и при каждом новом обзоре (reloadKey): после перевода доли строка
 // уже в журнале. 401 — на вход; прочие отказы — текст ответа.
 import { useEffect, useRef, useState } from "react";
-import { replyText, type Reply } from "../api";
-import { fmtCents, fmtWhen, parseJournal, type JournalRow } from "../teacher";
+import type { Reply } from "../api";
+import { fmtCents, fmtWhen, label, parseJournal, tchReplyText, type JournalRow } from "../teacher";
 import type { TeacherApi } from "../teacherApi";
 import { ACTION_LABELS, OUTCOME_LABELS, T_TCH_JOURNAL, T_TCH_JOURNAL_EMPTY, T_TCH_JOURNAL_PLACE, T_TCH_JOURNAL_RELOAD,
-         T_TCH_JOURNAL_SHARE, T_TCH_LOADING, T_UNKNOWN } from "../texts";
+         T_TCH_JOURNAL_SHARE, T_TCH_LOADING, T_TCH_UNKNOWN } from "../texts";
 
 export interface TeacherJournalProps {
   api: TeacherApi;
@@ -25,8 +25,8 @@ const noAnswer = (): Reply => ({ status: 0, body: null });
 const ACCOUNT_ACTION = /^account_/;
 
 function Row({ row }: { row: JournalRow }) {
-  const label = ACTION_LABELS[row.action] ?? row.action;
-  const parts = [ACCOUNT_ACTION.test(row.action) && row.target !== null ? `${label} ${row.target}` : label];
+  const what = label(ACTION_LABELS, row.action);
+  const parts = [ACCOUNT_ACTION.test(row.action) && row.target !== null ? `${what} ${row.target}` : what];
   if (row.place !== null) parts.push(T_TCH_JOURNAL_PLACE(row.place));
   for (const [nn, was, now] of row.detail ?? []) parts.push(T_TCH_JOURNAL_SHARE(nn, fmtCents(was), fmtCents(now)));
   return (
@@ -34,7 +34,7 @@ function Row({ row }: { row: JournalRow }) {
       <span className="journal-when">{fmtWhen(row.at)}</span>
       <span className="journal-who">{row.login}</span>
       <span className="journal-what">{parts.join("; ")}</span>
-      <span className="journal-outcome">{OUTCOME_LABELS[row.outcome] ?? row.outcome}</span>
+      <span className="journal-outcome">{label(OUTCOME_LABELS, row.outcome)}</span>
     </li>
   );
 }
@@ -51,9 +51,9 @@ export function TeacherJournal(p: TeacherJournalProps) {
       const r = await props.current.api.journal().catch(noAnswer);
       if (cancelled) return;
       if (r.status === 401) return props.current.onSignedOut();
-      if (r.status !== 200) return setView({ kind: "text", text: replyText(r) });
+      if (r.status !== 200) return setView({ kind: "text", text: tchReplyText(r) });
       const rows = parseJournal(r.body);
-      setView(rows === null ? { kind: "text", text: T_UNKNOWN } : { kind: "rows", rows });
+      setView(rows === null ? { kind: "text", text: T_TCH_UNKNOWN } : { kind: "rows", rows });
     })();
     return () => { cancelled = true; };
   }, [p.reloadKey, attempt]);

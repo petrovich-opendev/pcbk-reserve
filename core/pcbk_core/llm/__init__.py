@@ -34,7 +34,7 @@ from ..settings import LlmSettings, Settings
 from .api import CHAT_DEADLINE_S, LEDGER_DURABLE_S, LlmCall, llm_router, too_large_body
 from .ledger import LEDGER_CHECK_S, OPS, Budget, Ledger, LedgerWriteLost, RunSpec, run_spec
 from .models import select_models
-from .shares import Shares
+from .shares import PLACES, Shares
 from .state import FAIL_STATES, UpstreamState
 from .turns import TurnLimiter
 from .upstream import Upstream, UpstreamError, UpstreamKind
@@ -56,7 +56,6 @@ RUN_BASE_KEY = "run_base_usd:{id}:{caller}"
 RUN_WINDOW_S = 600
 RUN_BASE_ERROR = "прогон: точка отсчёта не записана"
 SHARES_ERROR = "доли бюджета не загружены"           # Д10-R98: закрыто при сбое
-PLACES = range(1, 11)
 
 log = logging.getLogger("pcbk_core.llm")
 

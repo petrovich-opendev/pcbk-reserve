@@ -6,15 +6,16 @@
 Задача А2: поля долей и журнала — из Shares роли llm и TeacherLog шлюза; teacher_tick — сверка долей с теми, по которым
 отказывает прокси (budget.share_of, I-7), и пульс журнала действий — в такте уборщика."""
 import sqlite3
+import threading
 from contextlib import closing
 
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import (FRONT, PLACE_NET, FakeMono, gateway_role, make_gateway, make_llm_role, now_utc,
+from helpers import (FRONT, PLACE_NET, FakeMono, Gw, gateway_role, make_gateway, make_llm_role, now_utc,
                      teacher_gateway, wait_until)
 from pcbk_core.gateway.stats import TEACHER_KINDS, TeacherStats
-from pcbk_core.gateway.teacher_api import HEALTH_TEACHER_PATH
+from pcbk_core.gateway.teacher_api import HEALTH_TEACHER_PATH, TEACHER_PREFIX
 from pcbk_core.hourly import WINDOW_S
 from pcbk_core.llm.shares import Shares
 from pcbk_core.settings import LlmSettings
@@ -263,3 +264,48 @@ def test_shares_sum_is_memory_and_total_from_llm(tmp_path):              # су�
     with TestClient(app, client=FRONT) as c:
         body = c.get("/health/teacher").json()
     assert (body["shares_sum_usd"], body["total_usd"]) == (400.0, 500.0)
+
+
+# --- итоговая доводка Д10а: ревью А2, m-1 и m-6 ---
+
+def test_transfer_mid_tick_gives_no_false_drift(tmp_path, monkeypatch):  # m-1: центы прокси — под замком перевода
+    app, role = teacher_gateway(tmp_path)
+    shares, budget = role.llm.shares, role.llm.budget
+    real = budget.share_of
+    mover: list[threading.Thread] = []
+
+    def share_of(caller: str) -> float:
+        value = real(caller)
+        if caller == "student-03" and not mover:                            # такт прочёл долю места 03 — и тут перевод
+            t = threading.Thread(target=shares.apply, args=([(3, 10000, 9000), (5, 10000, 11000)],),
+                                 kwargs={"by": "teach", "now": now_utc()})
+            mover.append(t)
+            t.start()
+            t.join(0.3)                                                      # вне замка перевод прошёл бы целиком
+        return value
+    monkeypatch.setattr(budget, "share_of", share_of)
+    role.teacher_tick()
+    mover[0].join(5)
+    assert (shares.ok, shares.drift) == (True, 0)                            # ложного fail на такт нет
+    assert (shares.cents(3), shares.cents(5)) == (9000, 11000)               # перевод прошёл — после сверки
+    role.teacher_tick()
+    assert shares.drift == 0
+
+
+def test_journal_not_opened_at_start_reopens_by_tick(tmp_path, monkeypatch, gwlog):   # m-6: без перезапуска core
+    app, role = teacher_gateway(tmp_path)
+    journal = role.teacher_log
+    real_open, opens = journal.open, []
+
+    def flaky_open() -> bool:
+        opens.append(1)
+        if len(opens) == 1:                                                  # при запуске — блокировка дольше срока
+            journal.last_error = "OperationalError"
+            return False
+        return real_open()
+    monkeypatch.setattr(journal, "open", flaky_open)
+    with TestClient(app, client=FRONT) as c:
+        wait_until(lambda: c.get("/health/teacher").json()["store_ok"] is True)   # такт уборщика открыл журнал сам
+        r = Gw(app, role).as_("teach").get(TEACHER_PREFIX + "places/03/sessions")
+        assert r.status_code == 200                                          # кабинет открыт, 503 journal нет
+    assert len(opens) >= 2 and "журнал действий преподавателя не открыт (OperationalError)" in gwlog.text
