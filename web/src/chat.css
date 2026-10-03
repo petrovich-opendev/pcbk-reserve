@@ -237,8 +237,23 @@ table.places button { padding: .2rem .7rem; }
 .agent-file { align-self: stretch; margin: 0; padding: .5rem .7rem; max-height: 24rem; overflow: auto; white-space: pre-wrap;
   overflow-wrap: anywhere; border-radius: 6px; background: var(--code-bg);
   font: .85em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.tch-shares, .tch-journal { display: flex; flex-direction: column; gap: .6rem; padding-top: .6rem;
+.tch-shares, .tch-journal, .tch-accounts { display: flex; flex-direction: column; gap: .6rem; padding-top: .6rem;
   border-top: 1px solid var(--border); }
+/* учётные записи (Д10-R110): кнопки учётки в строке места, форма «Завести студента», окно пароля и подтверждение */
+.acc-actions { display: flex; flex-wrap: wrap; gap: .25rem; }
+table.places .acc-actions button { padding: .15rem .5rem; font-size: .85em; }
+.acc-actions .acc-disable { color: var(--fail); }
+.acc-add-form { align-items: flex-end; }
+.acc-add-form input { min-width: 12rem; }
+.acc-hint { flex: 1 1 100%; }
+.password-once, .acc-confirm { display: flex; flex-direction: column; align-items: flex-start; gap: .5rem;
+  padding: .75rem 1rem; border: 2px solid var(--accent); border-radius: 6px; background: var(--field); }
+.acc-confirm { border-color: var(--fail); }
+.password-once-title { font-weight: 600; }
+.password-once code { padding: .4rem .7rem; border-radius: 6px; background: var(--code-bg); font-size: 1.25em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .05em; user-select: all;
+  overflow-wrap: anywhere; }
+.password-once-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
 .tch-shares select { min-width: 10rem; }
 .tch-note { font-weight: 600; }
 .journal { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; font-size: .9em; }

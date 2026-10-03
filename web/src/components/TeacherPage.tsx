@@ -7,6 +7,9 @@
 //   опрос place(nn) раз в секунду до «готово» или 90 с (wakeAndWait, как WorkplaceScreen) и список заново. Само место
 //   кабинет не будит. Список — .sessions button[data-session-id]; выбор — TeacherReader (только чтение). Агенты —
 //   TeacherAgents: место для них не нужно.
+// - Под таблицей — «Учётные записи» (TeacherAccounts, Д10-R110): форма «Завести студента», окно пароля, подтверждение;
+//   кнопки учётки — в строке места со студентом (AccountButtons). Состояние раздела — здесь (useAccounts), вне обзора:
+//   окно пароля переживает и неудачный обзор после действия. После действия — обзор и журнал заново (refresh, m-8).
 // - Ниже — «Доли бюджета на модель» (TeacherShares) и «Журнал действий» (TeacherJournal).
 // 401 любой ручки — onSignedOut (один раз); прочие отказы — текст ответа (replyText). Роль решает сервер: страница только
 // показывает. Стили — классы chat.css, атрибутов style нет (CSP style-src 'self').
@@ -21,6 +24,7 @@ import { PLACE_STATE_LABELS, T_PLACE_PREPARING, T_TCH_ARCHIVED, T_TCH_BUDGET, T_
          T_TCH_REFRESH, T_TCH_RELOAD_LIST, T_TCH_TAB_AGENTS, T_TCH_TAB_SESSIONS, T_TCH_TITLE, T_TCH_WAKE, T_UNKNOWN,
          T_UNTITLED, TCH_COLUMNS as C } from "../texts";
 import { wakeAndWait, type Timers } from "../workplace";
+import { AccountButtons, TeacherAccounts, useAccounts, type AccountsCtl } from "./TeacherAccounts";
 import { TeacherAgents } from "./TeacherAgents";
 import { TeacherJournal } from "./TeacherJournal";
 import { TeacherReader } from "./TeacherReader";
@@ -49,13 +53,16 @@ function marks(row: PlaceRow): string[] {
   return out;
 }
 
-function PlacesTable({ overview, open, onOpen }: { overview: Overview; open: string | null; onOpen(nn: string): void }) {
+interface PlacesTableProps { overview: Overview; open: string | null; onOpen(nn: string): void; accounts: AccountsCtl }
+
+function PlacesTable({ overview, open, onOpen, accounts }: PlacesTableProps) {
   return (
     <table className="places" aria-label={T_TCH_PLACES}>
       <thead>
         <tr>
           <th scope="col">{C.place}</th><th scope="col">{C.student}</th><th scope="col">{C.state}</th>
           <th scope="col">{C.share}</th><th scope="col">{C.spent}</th><th scope="col">{C.agents}</th><th scope="col" />
+          <th scope="col">{C.account}</th>
         </tr>
       </thead>
       <tbody>
@@ -78,6 +85,7 @@ function PlacesTable({ overview, open, onOpen }: { overview: Overview; open: str
                 </button>
               )}
             </td>
+            <td><AccountButtons row={row} ctl={accounts} /></td>
           </tr>
         ))}
       </tbody>
@@ -304,11 +312,12 @@ export function TeacherPage(p: TeacherPageProps) {
     return () => { alive.current = false; };
   }, [fetchOverview]);
 
-  // «Обновить» и после изменения долей: обзор и журнал заново (журнал сам читается и при открытии)
+  // «Обновить», после изменения долей и действия с учёткой: обзор и журнал заново (журнал сам читается и при открытии)
   const refresh = (): void => {
     setReloadKey((n) => n + 1);
     void fetchOverview();
   };
+  const accounts = useAccounts({ api: p.api, onChanged: refresh, onSignedOut: signOut });
 
   const overview = load.kind === "ready" ? load.overview : null;
   const row = overview?.places.find((r) => r.place === open && r.login !== null) ?? null;
@@ -324,14 +333,15 @@ export function TeacherPage(p: TeacherPageProps) {
         <>
           <BudgetLine overview={overview} />
           <div className="tch-main">
-            <PlacesTable overview={overview} open={row?.place ?? null} onOpen={setOpen} />
+            <PlacesTable overview={overview} open={row?.place ?? null} onOpen={setOpen} accounts={accounts} />
             {row !== null && (
               <PlacePanel key={row.place} api={p.api} row={row} onSignedOut={signOut} pollMs={p.pollMs} timers={p.timers} />
             )}
           </div>
-          <TeacherShares api={p.api} overview={overview} onChanged={refresh} onSignedOut={signOut} />
         </>
       )}
+      <TeacherAccounts ctl={accounts} overview={overview} />
+      {overview !== null && <TeacherShares api={p.api} overview={overview} onChanged={refresh} onSignedOut={signOut} />}
       <TeacherJournal api={p.api} reloadKey={reloadKey} onSignedOut={signOut} />
     </section>
   );
