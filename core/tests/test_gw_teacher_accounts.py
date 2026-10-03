@@ -196,6 +196,25 @@ def test_account_bodies_and_paths(tg):                                    # те
     assert not tg.role.store.exists("x-new")
 
 
+def test_bad_login_in_path_gets_service_log_line(tg, caplog):             # ревью А3, m-4 Д10а: и у ручек учёток
+    # LOGIN пути не по LOGIN_RE — 404 not_found и строка журнала службы, как у прочих ручек кабинета; логин пути не
+    # проверен — в строку он не идёт (target нет); журнала действий и счётчиков нет
+    caplog.set_level(logging.INFO, logger="pcbk_core")
+    t = tg.as_("teach")
+    journal = len(tg.role.teacher_log.recent(100))
+    for path in ("accounts/Stu-05/password", "accounts/s/disable", "accounts/Bad_Login/enable",
+                 "accounts/" + "a" * 33 + "/unlock"):
+        assert post(t, path, {}).status_code == 404, path
+    lines = [m.split(" ms=")[0] for m in caplog.messages if " outcome=not_found " in m]
+    assert lines == [f"gw teacher login=teach action=account_{a} place=- outcome=not_found status=404"
+                     for a in ("passwd", "disable", "enable", "unlock")]
+    assert all(m.endswith(tuple("0123456789")) for m in caplog.messages if " outcome=not_found " in m)   # без target=
+    assert "Stu-05" not in caplog.text and "Bad_Login" not in caplog.text and "a" * 33 not in caplog.text
+    assert len(tg.role.teacher_log.recent(100)) == journal
+    stats = tg.role.teacher_stats
+    assert (stats.count_1h("change"), stats.count_1h("change_failed")) == (0, 0)
+
+
 def test_origin_before_everything(tg):                                    # R100, шаг 5: чужой источник — 403
     t = tg.as_("teach")
     for path, body in (("accounts", {"login": "x-new", "place": "04"}), ("accounts/stu-05/disable", {}),

@@ -803,8 +803,8 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
             return refused
         call = _Call(account.login, action, None)
         await cab.origin(request, call)
-        if LOGIN_RE.fullmatch(login) is None:
-            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
+        if LOGIN_RE.fullmatch(login) is None:       # строка журнала службы — без непроверенного логина (target нет)
+            return _not_found(call)
         call.target = login
         if not empty_body(await request.body()):
             return _fail_text(call, 400, ERROR_NAMES[400], GW_MESSAGES["bad_body"], "bad_body")
