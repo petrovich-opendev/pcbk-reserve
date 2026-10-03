@@ -7,6 +7,7 @@
 трогает — отказывается запускаться.
 """
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
@@ -74,7 +75,12 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         # двойник историана стенда отбора у core — только compose.test.yaml (Д8-R75)
                         "PCBK_TWIN_HISTORIAN",
                         # статика edge тестового стенда со сборкой чата (Д6а): compose.test.yaml, «:?»
-                        "PCBK_TEST_STATIC"})
+                        "PCBK_TEST_STATIC",
+                        # память (Д11а, m-4 р2): пороги тормоза прогона у core и строки «Память сервера» у сторожа,
+                        # каталог двойников /proc (compose.test.yaml, «:?»; R123а) и путь vmstat сторожа — учение
+                        # переполнения места ставит настоящий /proc/vmstat
+                        "LLM_RUN_MEM_FAIL_MIB", "LLM_RUN_SWAP_GROW_MIB", "LLM_RUN_SWAP_BASE_MIB", "LLM_RUN_PSI_FULL_MAX",
+                        "PSI_FULL_MAX", "SWAP_GROW_WARN_MIB", "PCBK_TEST_MEM", "VMSTAT_PATH"})
 # учётные данные историана для стенда: TEST-NET-1 (RFC 5737) недостижим, пароль — заглушка
 TEST_BDRV_ENV = ("BDRV_HOST=192.0.2.10", "BDRV_PORT=1433", "BDRV_USER=test", "BDRV_PW=<test-pw>")
 # белый список стенда — одно синтетическое имя
@@ -231,6 +237,17 @@ print(r.status)
 # настоящий edge (Д5-R25, Д5-R30); имя нигде не разрешается — клиент ходит на 127.0.0.1:18443 с этим Host
 STAND_HOST = "stand.pcbk.test:18443"
 STAND_ORIGIN = f"https://{STAND_HOST}"
+# адрес стенда для браузера (cdp.py: stand.pcbk.test → 127.0.0.1) — тот же, что origin входа
+STAND = STAND_ORIGIN
+# --- двойники памяти (Д11-R123а): файлы /proc в каталоге PCBK_TEST_MEM, внутри core и сторожа — /run/pcbk-test-mem ---
+# кто читает: core (тормоз прогона, LLM_RUN_MEMINFO/VMSTAT/PRESSURE) и сторож (MEMINFO_PATH, VMSTAT_PATH, PRESSURE_PATH);
+# у каждого свои файлы meminfo-<кто>, vmstat-<кто>, pressure-<кто>. dify-swap — swap контейнеров Dify, МиБ числом (Б2)
+MEM_READERS = ("core", "watchdog")
+MEM_TOTAL_MIB = 16000
+MEM_AVAIL_MIB = 8000                    # двойник по умолчанию: свободно 8000 из 16000 МиБ
+SWAP_TOTAL_MIB = 4096                   # swap 4096 МиБ, по умолчанию свободен целиком
+# тело вызова модели токеном места (llm_from_place): без потока — и ответ, и отказ прокси приходят одним JSON
+LLM_CHAT_BODY = {"model": "z-ai/glm-5.3", "stream": False, "messages": [{"role": "user", "content": "вопрос"}]}
 # D1: соединение есть, если curl -v его сообщил
 CONNECTED = re.compile(r"Established connection|Connected to")
 # --- вход в чат браузером (Д6а; из test_web.py — общие помощники с Д9а: вкладка «Калькуляторы» в test_bench) ---
@@ -503,6 +520,61 @@ def make_test_llm(secrets_dir: Path) -> None:
         f.chmod(0o444)
 
 
+def meminfo_text(avail_mib: int, swap_used_mib: int = 0) -> str:
+    """/proc/meminfo двойника: MemTotal MEM_TOTAL_MIB, MemAvailable avail_mib, swap SWAP_TOTAL_MIB, занято swap_used_mib."""
+    if not (0 <= avail_mib <= MEM_TOTAL_MIB and 0 <= swap_used_mib <= SWAP_TOTAL_MIB):
+        raise ValueError("двойник памяти: свободно 0…MEM_TOTAL_MIB, swap 0…SWAP_TOTAL_MIB МиБ")
+    rows = (("MemTotal", MEM_TOTAL_MIB), ("MemFree", avail_mib), ("MemAvailable", avail_mib),
+            ("SwapTotal", SWAP_TOTAL_MIB), ("SwapFree", SWAP_TOTAL_MIB - swap_used_mib))
+    return "".join(f"{name + ':':<16}{mib * 1024:>8} kB\n" for name, mib in rows)
+
+
+def vmstat_text(oom_kill: int) -> str:
+    """/proc/vmstat двойника: счётчик убийств по памяти oom_kill (и соседние строки, как у ядра)."""
+    return f"pgfault 1000\npgmajfault 10\noom_kill {int(oom_kill)}\n"
+
+
+def pressure_text(full: float) -> str:
+    """/proc/pressure/memory двойника: avg10 some и full — full (some не меньше full, как у ядра)."""
+    return "".join(f"{kind} avg10={full:.2f} avg60={full:.2f} avg300={full:.2f} total=0\n" for kind in ("some", "full"))
+
+
+def write_twin(path: Path, text: str) -> None:
+    """Файл двойника целиком и сразу: временный файл рядом, 0644, os.replace — читатель видит прежний или новый файл,
+    а не половину (каталог привязан в контейнеры целиком: замена файла видна внутри)."""
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def make_test_mem(mem_dir: Path) -> None:
+    """Каталог двойников памяти (R123а), 0755: core и сторож читают его не от владельца. По умолчанию у каждого
+    читателя — свободно 8000 из 16000 МиБ, swap 4096 свободен, oom_kill 0, давление 0; dify-swap — 0."""
+    mem_dir.mkdir(mode=0o755)
+    mem_dir.chmod(0o755)
+    for who in MEM_READERS:
+        write_twin(mem_dir / f"meminfo-{who}", meminfo_text(MEM_AVAIL_MIB))
+        write_twin(mem_dir / f"vmstat-{who}", vmstat_text(0))
+        write_twin(mem_dir / f"pressure-{who}", pressure_text(0.0))
+    write_twin(mem_dir / "dify-swap", "0\n")
+
+
+def datetime_now() -> datetime:
+    """Сейчас, UTC с поясом — для сравнения с checked_at сторожа."""
+    return datetime.now(timezone.utc)
+
+
+def iso_s(value: str) -> float:
+    """Время Docker (RFC 3339 с наносекундами, «…Z») — секунды эпохи, как time.time()."""
+    return datetime.fromisoformat(value).timestamp()
+
+
 def locked_image(repo: str) -> str:
     """Имя:тег образа из images.lock — одно место правды для версий."""
     return next(name for name, _, _ in read_lock() if name.rsplit(":", 1)[0] == repo)
@@ -530,6 +602,8 @@ class Stack:
         self.agents_root = Path(values["AGENTS_DIR"])
         # статика edge со сборкой чата этого прогона (build_test_static)
         self.static_dir = Path(values["PCBK_TEST_STATIC"])
+        # каталог двойников памяти core и сторожа (make_test_mem, R123а)
+        self.mem_dir = Path(values["PCBK_TEST_MEM"])
         # токен службы данных места 01 (в core-tokens — его хеш), он же файл student-01.data-token
         self.core_token: str = self.data_token(1)
         # токен LLM администратора, он же файл ops.llm-token (в llm-tokens — его хеш)
@@ -562,6 +636,33 @@ class Stack:
         if self._prod_config is None:
             self._prod_config = self.config(files=("compose.yaml",))
         return self._prod_config
+
+    def compose_config(self, env: Mapping[str, str]) -> dict:
+        """Итоговая компоновка стенда с переменными env поверх test.env (как recreate): что получит служба из .env."""
+        return json.loads(self.compose("config", "--format", "json", env={**self.env, **env}))
+
+    # --- двойники памяти (Д11-R123а): файлы make_test_mem, who — "core" или "watchdog" ---
+
+    def _twin(self, who: str, kind: str) -> Path:
+        if who not in MEM_READERS:
+            raise ValueError(f"двойник памяти: читатель {who!r} — только {MEM_READERS}")
+        return self.mem_dir / f"{kind}-{who}"
+
+    def set_memory(self, who: str, avail_mib: int, swap_used_mib: int = 0) -> None:
+        """meminfo читателя who: свободно avail_mib из MEM_TOTAL_MIB, swap занят swap_used_mib из SWAP_TOTAL_MIB."""
+        write_twin(self._twin(who, "meminfo"), meminfo_text(avail_mib, swap_used_mib))
+
+    def set_oom_kill(self, who: str, n: int) -> None:
+        """vmstat читателя who: счётчик ядра oom_kill = n."""
+        write_twin(self._twin(who, "vmstat"), vmstat_text(n))
+
+    def set_psi(self, who: str, full: float) -> None:
+        """pressure/memory читателя who: avg10 some и full = full, %."""
+        write_twin(self._twin(who, "pressure"), pressure_text(full))
+
+    def set_dify_swap(self, mib: int) -> None:
+        """swap контейнеров Dify двойника, МиБ (для прогонщика Б2)."""
+        write_twin(self.mem_dir / "dify-swap", f"{int(mib)}\n")
 
     def _docker(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return _run(["docker", *args], check=check)
@@ -746,6 +847,29 @@ class Stack:
         body, _, code = r.stdout.rpartition("\n")
         return int(code or 0), body
 
+    def llm_from_place(self, n: int, body: Mapping | None = None) -> tuple[int, str | None]:
+        """Вызов модели токеном места n из его сети (Ш25: токен места — только из своей сети): одноразовый curl в
+        pcbk-stu-NN, POST {stu_net}.n.2:8000/llm/v1/chat/completions с телом body (LLM_CHAT_BODY). Токен — файлом
+        места только для чтения, не в argv. Возвращает (код, error.code ответа или None)."""
+        token = self.secrets_dir / f"student-{n:02d}.llm-token"
+        r = self._docker("run", "--rm", "--pull", "never", "--network", f"pcbk-stu-{n:02d}",
+                         "--label", ONESHOT_LABEL, "--read-only", "--cap-drop", "ALL",
+                         "--security-opt", "no-new-privileges:true",
+                         "--mount", f"type=bind,source={token},target=/tok,readonly", locked_image("curlimages/curl"),
+                         "curl", "-s", "--max-time", "20", "-X", "POST", "--variable", "TOK@/tok",
+                         "--expand-header", "Authorization: Bearer {{TOK}}", "-H", "Content-Type: application/json",
+                         "--data-raw", json.dumps(dict(body or LLM_CHAT_BODY), ensure_ascii=False),
+                         "-w", "\n%{http_code}", f"http://{self.stu_net}.{n}.2:8000/llm/v1/chat/completions",
+                         check=False)
+        if r.returncode in (125, 126, 127):      # сбой docker run, а не ответ core
+            raise RuntimeError(f"вызов модели из сети места {n:02d}: docker run, код {r.returncode}\n{r.stderr[-1000:]}")
+        text, _, code = r.stdout.rpartition("\n")
+        try:
+            error = json.loads(text).get("error")
+        except (ValueError, AttributeError):
+            error = None
+        return int(code or 0), error.get("code") if isinstance(error, dict) else None
+
     def add_account(self, login: str, role: str, place: int | None, password: str) -> None:
         """Учётка шлюза командой администратора в pcbk-core; пароль — в stdin, не в argv."""
         cmd = ["docker", "exec", "-i", "pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "add",
@@ -759,6 +883,29 @@ class Stack:
         _run(["docker", "exec", "-i", "pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "passwd",
               "--login", login], input=Secret(password + "\n"))
         return password
+
+    @staticmethod
+    def new_password() -> Secret:
+        """Пароль новой учётки модуля — Secret: в трассировке pytest «<скрыт>»."""
+        return Secret(secrets.token_urlsafe(12))
+
+    def _accounts_cols(self) -> list[list[str]]:
+        out = self.exec("pcbk-core", "python", "-m", "pcbk_core.gateway.accounts", "list")
+        return [line.split("\t") for line in out.splitlines()]
+
+    def release_probe_places(self, places: Mapping[str, int]) -> None:
+        """Пробные учётки шлюза (PROBE_LOGIN, «d11-probe-…») {логин: место}: disable и remove, затем release-place —
+        только места, закреплённого за этой учёткой (как уборка BenchHarness._release). Идемпотентно: учётки нет — не
+        трогать, место закреплено не за ней — не освобождать."""
+        accounts = ["python", "-m", "pcbk_core.gateway.accounts"]
+        for login, n in places.items():
+            row = next((c for c in self._accounts_cols() if c[0] == login), None)
+            if row is not None:
+                if len(row) > 3 and row[3] == "активна":
+                    self.exec("pcbk-core", *accounts, "disable", "--login", login)
+                self.exec("pcbk-core", *accounts, "remove", "--login", login, "--yes")
+            if any(c[0] == f"место {n:02d}" and len(c) > 1 and c[1] == login for c in self._accounts_cols()):
+                self.exec("pcbk-core", *accounts, "release-place", "--place", str(n), "--yes")
 
     def accounts_list_row(self, login: str) -> str:
         """Строка учётки login в выводе `accounts list` команды администратора (столбцы через табуляцию: логин, роль,
@@ -1081,6 +1228,27 @@ class Stack:
         self.wait_ready(self.config()["services"][service]["container_name"])
         self.wait_snapshot_after(datetime.now(timezone.utc))
 
+    @contextlib.contextmanager
+    def place_override(self, n: int, script: str):
+        """Место n с подменённой точкой входа — bash -c script (учение переполнения места, Д11а): up -d с файлом
+        переопределения во временном каталоге стенда; лимиты памяти, restart: unless-stopped и тома — как у места.
+        На выходе (и при сбое) — место без переопределения и остановлено: stop и create --force-recreate (тома не
+        трогаются, как уборка BenchHarness._places_plain)."""
+        service, name = f"student-{n:02d}", f"{STUDENT_PREFIX}{n:02d}"
+        with tempfile.TemporaryDirectory(prefix="pcbk-place-", dir=self.env_file.parent) as tmp:
+            override = Path(tmp) / "compose.place.yaml"
+            override.write_text(json.dumps({"services": {service: {"entrypoint": ["/bin/bash", "-c", script]}}},
+                                           ensure_ascii=False), encoding="utf-8")
+            try:
+                self.compose("up", "-d", "--no-build", "--no-deps", "--force-recreate", service,
+                             files=(*COMPOSE_FILES, str(override)))
+                yield
+            finally:
+                st = self._state(name)
+                if st["Running"] or st["Restarting"]:
+                    self._docker("stop", name)
+                self.compose("create", "--force-recreate", "--no-build", service)
+
     def stop(self, name: str) -> None:
         self._docker("stop", name)
         if self._state(name)["Running"]:
@@ -1170,6 +1338,7 @@ def stack(tmp_path_factory, student_image):
     make_test_core_data(work / "secrets", work / "data")
     make_test_llm(work / "secrets")
     build_test_static(work / "static", work / "web-src")   # до test.env и compose: у PCBK_TEST_STATIC «:?» (M15)
+    make_test_mem(work / "mem")                            # двойники памяти — до up: у PCBK_TEST_MEM «:?» (R123а)
     env_file = work / "test.env"
     env_file.write_text("\n".join([
         f"DOCKER_GID={docker_gid()}",
@@ -1183,6 +1352,7 @@ def stack(tmp_path_factory, student_image):
         "MEM_FAIL_MIB=32",
         f"GW_ORIGIN={STAND_ORIGIN}",
         f"PCBK_TEST_STATIC={work / 'static'}",
+        f"PCBK_TEST_MEM={work / 'mem'}",
     ]) + "\n", encoding="utf-8")
     s = Stack(env_file)
     s.refuse_foreign()

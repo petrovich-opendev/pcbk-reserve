@@ -16,7 +16,9 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "GW_STALE_S",                                    # строка «Шлюз и вход» (Д5а)
                       "AGENTS_STALE_S",                                # строка «Агенты студентов» (Д7а, П10)
                       "LLM_RUN_SILENT_S",                              # «прогон отбора молчит» (Д8а)
-                      "TEACHER_STALE_S"},                              # «Кабинет преподавателя и доли» (Д10а)
+                      "TEACHER_STALE_S",                               # «Кабинет преподавателя и доли» (Д10а)
+                      # «Память сервера» v2 (Д11а): счётчик убийств и давление, пороги swap и давления
+                      "VMSTAT_PATH", "PRESSURE_PATH", "SWAP_GROW_WARN_MIB", "PSI_FULL_MAX"},
     "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
                   "DRILL_DATA",                                    # учения службы данных (Д9а, Д9-R83)
                   "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
@@ -29,7 +31,9 @@ DECLARED_ENV = {                   # наши переменные сверх п
                   "LLM_RUN_MEM_FAIL_MIB", "LLM_RUN_SWAP_GROW_MIB", "LLM_RUN_SWAP_BASE_MIB", "LLM_RUN_PSI_FULL_MAX",
                   # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
                   # бюджет (учение «бюджет стенда израсходован», Д4б); обёртка запуска и двойник историана (Д8-R75)
-                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD", "PYTHONPATH", "PCBK_TWIN_HISTORIAN"},
+                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD", "PYTHONPATH", "PCBK_TWIN_HISTORIAN",
+                  # двойники /proc тормоза прогона (Д11-R123а) — только тестовый стенд
+                  "LLM_RUN_MEMINFO", "LLM_RUN_VMSTAT", "LLM_RUN_PRESSURE"},
     "pcbk-edge": set(),
     "pcbk-sp-ro": set(),
     "pcbk-sp-ctl": set(),

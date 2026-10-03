@@ -110,6 +110,20 @@ def test_core_secret_and_list_are_readonly_files(stack):
         {f"student-{n:02d}.pw": f"student-{n:02d}-pw" for n in range(1, 11)}
 
 
+def test_prod_compose_has_no_memory_twins(stack):                             # Д11-R123а
+    """Двойники памяти — только в compose.test.yaml: на сервере тормоз core и сторож читают /proc хоста."""
+    prod = stack.prod_config()["services"]
+    assert not {"LLM_RUN_MEMINFO", "LLM_RUN_VMSTAT", "LLM_RUN_PRESSURE"} & set(prod["core"]["environment"])
+    w = prod["watchdog"]["environment"]
+    assert (w["MEMINFO_PATH"], w["VMSTAT_PATH"], w["PRESSURE_PATH"]) == \
+        ("/proc/meminfo", "/proc/vmstat", "/proc/pressure/memory")
+    assert "PCBK_TEST_MEM" not in json.dumps(stack.prod_config())
+    # положительный контроль: в компоновке стенда двойники есть — иначе проверка выше ничего бы не отличала
+    test = stack.config()["services"]
+    assert test["core"]["environment"]["LLM_RUN_MEMINFO"] == "/run/pcbk-test-mem/meminfo-core"
+    assert test["watchdog"]["environment"]["MEMINFO_PATH"] == "/run/pcbk-test-mem/meminfo-watchdog"
+
+
 def test_core_is_the_sp_ctl_client(stack):                         # Д5-R31: клиент sp-ctl — настоящий core
     assert stack.http_from_core("GET", CTL + "/_ping") == 200
     assert stack.http_as("pcbk-intruder", "pcbk-ctl", "GET", CTL + "/_ping") == 403

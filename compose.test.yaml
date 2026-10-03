@@ -37,6 +37,10 @@ services:
   # PCBK_TWIN_HISTORIAN (путь к фикстуре, например /twin/data/bench-historian.json) — двойник историана стенда
   # отбора вместо tds_query, без неё — обычный pcbk_core.main. Только тестовый стенд: compose.yaml и образ core её
   # не знают (test_prod_compose_has_no_twin, test_core_wrapper_healthy_without_twin)
+  # Двойники памяти (Д11-R123а): тормоз прогона core читает не /proc машины разработчика, а файлы …-core каталога
+  # PCBK_TEST_MEM (фикстура stack пишет их до up: свободно 8000 из 16000 МиБ, swap 4096 свободен, oom_kill 0, давление
+  # 0; Stack.set_memory, set_oom_kill, set_psi меняют их через os.replace). Каталог, а не файлы: замена файла видна
+  # внутри. Только тестовый стенд: в compose.yaml путей нет (test_prod_compose_has_no_memory_twins)
   core:
     command: ["python", "-m", "twin_core"]
     environment:
@@ -46,8 +50,25 @@ services:
       LLM_TOTAL_USD: ${LLM_TOTAL_USD:-1000}
       PYTHONPATH: /twin
       PCBK_TWIN_HISTORIAN: ${PCBK_TWIN_HISTORIAN:-}
+      LLM_RUN_MEMINFO: /run/pcbk-test-mem/meminfo-core
+      LLM_RUN_VMSTAT: /run/pcbk-test-mem/vmstat-core
+      LLM_RUN_PRESSURE: /run/pcbk-test-mem/pressure-core
     volumes:
       - {type: bind, source: ./core/tests, target: /twin, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${PCBK_TEST_MEM:?PCBK_TEST_MEM не задан}", target: /run/pcbk-test-mem, read_only: true,
+         bind: {create_host_path: false}}
+
+  # двойники памяти сторожа (Д11-R123а) — файлы …-watchdog того же каталога: строка «Память сервера» и причины
+  # перезапуска мест по счётчику oom_kill. VMSTAT_PATH=/proc/vmstat — настоящий счётчик ядра: только учение
+  # переполнения места (test_memory_watch.py::test_place_oom_restart_reason)
+  watchdog:
+    environment:
+      MEMINFO_PATH: /run/pcbk-test-mem/meminfo-watchdog
+      VMSTAT_PATH: ${VMSTAT_PATH:-/run/pcbk-test-mem/vmstat-watchdog}
+      PRESSURE_PATH: /run/pcbk-test-mem/pressure-watchdog
+    volumes:
+      - {type: bind, source: "${PCBK_TEST_MEM:?PCBK_TEST_MEM не задан}", target: /run/pcbk-test-mem, read_only: true,
+         bind: {create_host_path: false}}
 
   # двойник OpenRouter (core/tests/fake_openrouter.py, только stdlib) в сети выхода рядом с core;
   # с хоста теста — http://172.31.250.84:8080 (ручки /_requests и др.). Адрес вне динамических .88/29.
