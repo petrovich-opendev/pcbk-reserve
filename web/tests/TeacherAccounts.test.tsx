@@ -192,9 +192,29 @@ test("odd_success_body_is_unknown_not_a_window", async () => {
   fireEvent.change(await screen.findByLabelText("Логин"), { target: { value: "d10-probe-n" } });
   fireEvent.change(screen.getByLabelText("Место"), { target: { value: "04" } });
   fireEvent.click(screen.getByRole("button", { name: "Завести" }));
-  expect(await screen.findByText("Неожиданный ответ сервера — сообщите преподавателю.")).toBeTruthy();
+  expect(await screen.findByText("Неожиданный ответ сервера — сообщите администратору стенда.")).toBeTruthy();
+  expect(screen.queryByText(/сообщите преподавателю/)).toBeNull();           // текст кабинета (Д10а А4 m-4)
   expect(container.querySelector(".password-once")).toBeNull();
   await waitFor(() => expect(a.overview).toHaveBeenCalledTimes(2));         // учётка могла завестись — обзор покажет
+});
+
+test("account_fallback_texts_are_for_teacher", async () => {      // Д10а А4 m-4: запасные тексты — кабинетные
+  // отказ без текста сервера и 2xx не той формы — «…сообщите администратору стенда», не текст чата студента
+  const a = teacherApi({ overview: [200, OVERVIEW_READY_03], unlock: [418, { odd: true }],
+                         newPassword: [200, { ok: 1 }] });
+  render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Снять замок stu-08" }));
+  expect(await screen.findByText("Неожиданный ответ сервера — сообщите администратору стенда.")).toBeTruthy();
+  expect(a.unlock).toHaveBeenCalledWith("stu-08");
+  await waitFor(() => expect(a.overview).toHaveBeenCalledTimes(2));
+  fireEvent.click(screen.getByRole("button", { name: "Новый пароль stu-03" }));
+  expect(screen.queryByText(/^Неожиданный ответ сервера/)).toBeNull();       // подтверждение сняло прежний итог
+  fireEvent.click(screen.getByRole("button", { name: "Да, выдать новый пароль" }));
+  expect(await screen.findByText("Неожиданный ответ сервера — сообщите администратору стенда.")).toBeTruthy();
+  expect(a.newPassword).toHaveBeenCalledWith("stu-03");
+  await waitFor(() => expect(a.overview).toHaveBeenCalledTimes(3));
+  expect(screen.queryByText(/сообщите преподавателю/)).toBeNull();
+  expect(document.querySelector(".password-once")).toBeNull();
 });
 
 test("api_paths_bodies_and_login_checked_before_request", async () => {

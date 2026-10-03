@@ -11,18 +11,20 @@
 //   замок» (если locked); aria-label — «<действие> <логин>». «Отключить» и «Новый пароль» выводят студента из чата —
 //   сначала подтверждение окном в странице (не window.confirm: браузер теста CDP его не видит).
 // - После любого ответа, кроме 401, — обзор и журнал заново (m-8): строка нового студента и его кнопки появляются сразу.
-//   Ответ не 2xx — текст ответа дословно (replyText); 401 — на вход. Пока ответ в пути, кнопки выключены.
+//   Ответ не 2xx — текст ответа дословно, без текста — свой запасной кабинета (tchReplyText, как у прочих ручек
+//   кабинета, Д10а А4 m-4: «…сообщите администратору стенда», не «…преподавателю»); 401 — на вход. Пока ответ в пути,
+//   кнопки выключены.
 // Учётки преподавателей обзор не показывает — кабинет их не видит и не трогает. Стили — классы chat.css, атрибутов style нет.
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { replyText, type Reply } from "../api";
-import type { Overview, PlaceRow } from "../teacher";
+import type { Reply } from "../api";
+import { tchReplyText, type Overview, type PlaceRow } from "../teacher";
 import { isLogin, type TeacherApi } from "../teacherApi";
 import { T_TCH_ACC_ADD, T_TCH_ACC_ADD_HINT, T_TCH_ACC_ADD_TITLE, T_TCH_ACC_ASK_DISABLE, T_TCH_ACC_ASK_PASSWD,
          T_TCH_ACC_CANCEL, T_TCH_ACC_COPIED, T_TCH_ACC_COPY, T_TCH_ACC_COPY_FAILED, T_TCH_ACC_DISABLE,
          T_TCH_ACC_DISABLED, T_TCH_ACC_DONE, T_TCH_ACC_ENABLE, T_TCH_ACC_ENABLED, T_TCH_ACC_LABEL, T_TCH_ACC_LOGIN,
          T_TCH_ACC_LOGIN_RULE, T_TCH_ACC_NO_FREE, T_TCH_ACC_PASSWD, T_TCH_ACC_PASSWORD_FOR, T_TCH_ACC_PASSWORD_ONCE,
          T_TCH_ACC_PICK_PLACE, T_TCH_ACC_PLACE, T_TCH_ACC_UNLOCK, T_TCH_ACC_UNLOCKED, T_TCH_ACC_YES_DISABLE,
-         T_TCH_ACC_YES_PASSWD, T_TCH_ACCOUNTS, T_TCH_PICK, T_UNKNOWN } from "../texts";
+         T_TCH_ACC_YES_PASSWD, T_TCH_ACCOUNTS, T_TCH_PICK, T_TCH_UNKNOWN } from "../texts";
 
 export type AccountAction = "passwd" | "disable" | "enable" | "unlock";
 
@@ -94,9 +96,9 @@ export function useAccounts(p: UseAccountsProps): AccountsCtl {
     let ok = false;
     if (r.status >= 200 && r.status < 300) {
       ok = done(r);
-      if (!ok) setNote({ kind: "fail", text: T_UNKNOWN });
+      if (!ok) setNote({ kind: "fail", text: T_TCH_UNKNOWN });
     } else {
-      setNote({ kind: "fail", text: replyText(r) });
+      setNote({ kind: "fail", text: tchReplyText(r) });
     }
     props.current.onChanged();
     return ok;
