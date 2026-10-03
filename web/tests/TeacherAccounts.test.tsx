@@ -253,3 +253,26 @@ test("journal_shows_account_actions_in_words", async () => {
   expect(items[0]).toContain("отключил учётку");
   expect(items[0]).not.toContain("account_disable");
 });
+
+test("journal_account_rows_show_target_login_as_text", async () => {
+  // у account_* — логин учётки (target) рядом с действием; без target — без него; разметка в логине — только текстом;
+  // у прочих действий target (id разговора) не показывается
+  const rows = { rows: [
+    { id: 4, at: "2026-10-11T09:07:00+00:00", login: "t", action: "account_disable", place: null, target: "stu-03",
+      outcome: "ok" },
+    { id: 3, at: "2026-10-11T09:06:00+00:00", login: "t", action: "account_enable", place: null, target: null,
+      outcome: "refused" },
+    { id: 2, at: "2026-10-11T09:05:00+00:00", login: "t", action: "account_unlock", place: null, target: "<b>stu-08</b>",
+      outcome: "ok" },
+    { id: 1, at: "2026-10-11T09:04:00+00:00", login: "t", action: "read", place: "03", target: "ses_" + "A1".repeat(13),
+      outcome: "requested" },
+  ] };
+  const a = teacherApi({ overview: [200, OVERVIEW_FREE_04], journal: [200, rows] });
+  const { container } = render(<TeacherPage api={a} onSignedOut={vi.fn()} />);
+  await waitFor(() => expect(container.querySelectorAll(".journal li")).toHaveLength(4));
+  const what = [...container.querySelectorAll(".journal li .journal-what")].map((s) => s.textContent);
+  expect(what).toEqual(["отключил учётку stu-03", "включил учётку", "снял замок входа <b>stu-08</b>",
+                        "прочитал разговор; место 03"]);
+  expect(container.querySelector(".journal b")).toBeNull();                       // текстом, не разметкой
+  expect(container.querySelector(".journal")!.textContent).not.toMatch(/account_|null/);
+});
