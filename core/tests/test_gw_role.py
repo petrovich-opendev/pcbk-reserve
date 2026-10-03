@@ -483,7 +483,7 @@ def test_build_roles_wires_brake_into_gateway(tmp_path):                  # ро
     assert plain["llm"].brake is None and plain["gateway"].workplaces.halted() == frozenset()
 
 
-def test_halt_watch_follows_reaper_rules(tmp_path):                       # при config_error не стартует; остановка снимает
+def test_halt_watch_starts_even_with_config_error(tmp_path):               # остановка снимает; config_error — не помеха
     run = {"LLM_RUN_ID": "d11-test", "LLM_RUN_USD": 5.0, "LLM_RUN_CALLERS": "student-03"}
     llm = make_llm_role(tmp_path / "a", key=None, **run)
     app, role = make_gateway(tmp_path / "a", llm=llm)
@@ -492,5 +492,7 @@ def test_halt_watch_follows_reaper_rules(tmp_path):                       # пр
         assert task is not None and not task.done() and task.get_name() == "gw-halt-watch"
     assert role._halt_task is None and task.done()
     app, role = make_gateway(tmp_path / "b", llm=llm, config_error="проба")
-    with TestClient(app):
-        assert role._halt_task is None and role._reaper is None
+    with TestClient(app):                                                   # уборщика нет, тормоз смотрит (m-3 ревью А2)
+        task = role._halt_task
+        assert task is not None and not task.done() and role._reaper is None
+    assert role._halt_task is None and task.done()
