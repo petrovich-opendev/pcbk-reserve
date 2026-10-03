@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from pcbk_core.gateway.transcript import (MESSAGES_MAX, TEXT_MAX, TOOL_TEXT_MAX, TranscriptError, sessions_view,
-                                          transcript)
+from pcbk_core.gateway.transcript import (ERROR_MAX, MESSAGES_MAX, TEXT_MAX, TOOL_TEXT_MAX, TranscriptError,
+                                          sessions_view, transcript)
 
 SES = "ses_" + "A" * 26
 SESSION = {"id": SES, "title": "Значение 20FAKE_001_PV", "time": {"created": 1, "updated": 3}}
@@ -73,9 +73,10 @@ def test_message_fields_agent_error_and_odd_values():
     raw = [msg("user", agent="pomoshnik", error={"name": "X"}),                      # error у студента не показывается
            msg("assistant", {"type": "tool", "tool": "pcbk_tag_now", "state": {"status": "error", "error": "нет тега"}},
                mode="konstruktor"),
-           {"info": {"role": "assistant", "time": {"created": 2 ** 60}, "agent": "x" * 65, "error": {"name": "Abort"}},
-            "parts": "не список"},
-           {"info": {"role": "user", "time": {"created": True}}, "parts": [{"type": "text", "text": 5}, "мусор"]}]
+           {"info": {"role": "assistant", "sessionID": SES, "time": {"created": 2 ** 60}, "agent": "x" * 65,
+                     "error": {"name": "Abort"}}, "parts": "не список"},
+           {"info": {"role": "user", "sessionID": SES, "time": {"created": True}},
+            "parts": [{"type": "text", "text": 5}, "мусор"]}]
     t = transcript(json.dumps(SESSION).encode(), json.dumps(raw).encode())
     assert [(m["role"], m["at"], m["agent"], m["error"]) for m in t["messages"]] == [
         ("user", 1, "pomoshnik", None), ("assistant", 1, "konstruktor", None), ("assistant", None, None, "Abort"),
@@ -127,3 +128,25 @@ def test_lone_surrogates_become_replacement_char():
     v = sessions_view(json.dumps([session, {"id": "ses_" + "B" * 26, "title": bad * 300}]).encode())
     json.dumps(v, ensure_ascii=False).encode("utf-8")
     assert [s["title"] for s in v] == ["Значение �", "�" * 200]
+
+
+# --- итоговая доводка Д10а: ревью А3, m-1 и m-2 ---
+
+def test_message_of_other_session_is_bad_answer():                       # m-1: sessionID сообщений сверяется
+    other = "ses_" + "O" * 26
+    for bad in ([msg("user", {"type": "text", "text": "свой"}), msg("assistant", sessionID=other)],
+                [msg("user", {"type": "text", "text": "без id"}, sessionID=None)]):
+        with pytest.raises(TranscriptError):
+            transcript(json.dumps(SESSION).encode(), json.dumps(bad).encode())
+    ok = [msg("user", {"type": "text", "text": "свой"}), {"info": {"role": "system", "sessionID": other}, "parts": []}]
+    assert len(transcript(json.dumps(SESSION).encode(), json.dumps(ok).encode())["messages"]) == 1   # чужая роль — пропуск
+
+
+def test_tool_input_and_error_have_own_limits():                         # m-2: пределы ввода инструмента и ошибки
+    raw = [msg("assistant", {"type": "tool", "tool": "pcbk_tag_now",
+                             "state": {"status": "completed", "input": "y" * (TOOL_TEXT_MAX + 5), "output": "ok"}})]
+    t = transcript(json.dumps(SESSION).encode(), json.dumps(raw).encode())
+    assert len(t["messages"][0]["parts"][0]["input"]) == TOOL_TEXT_MAX and t["clipped"] is True
+    raw = [msg("assistant", error={"name": "ProviderError", "data": {"message": "e" * (ERROR_MAX + 5)}})]
+    t = transcript(json.dumps(SESSION).encode(), json.dumps(raw).encode())
+    assert t["messages"][0]["error"] == "e" * ERROR_MAX and t["clipped"] is True

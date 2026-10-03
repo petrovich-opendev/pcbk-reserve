@@ -218,6 +218,12 @@ def _fail_text(call: _Call, status: int, name: str, message: str, outcome: str) 
     return gw_error(status, name, message)
 
 
+def _not_found(call: _Call) -> JSONResponse:
+    """Часть пути не по шаблону (R100): 404 not_found и строка журнала службы, как у каждого вызова кабинета (ревью А3,
+    m-4), — без запроса к месту и без строки журнала действий."""
+    return _fail_text(call, 404, ERROR_NAMES[404], GW_MESSAGES["not_found"], "not_found")
+
+
 def place_of(nn: str) -> int | None:
     """Номер места из части пути: только «01»…«10»."""
     return int(nn) if _NN.fullmatch(nn) else None
@@ -534,13 +540,12 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
     async def place(nn: str, account: Account = Depends(account_of)) -> Response:
         if (refused := cab.not_teacher(account)) is not None:
             return refused
-        n = place_of(nn)
-        if n is None:
-            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
-        call = _Call(account.login, "place", n)
+        call = _Call(account.login, "place", place_of(nn))
+        if call.place is None:
+            return _not_found(call)
         if (refused := await cab.student_place(call)) is not None:
             return refused
-        return _ok(call, role.workplaces.view(n).to_json())     # память, не будит
+        return _ok(call, role.workplaces.view(call.place).to_json())     # память, не будит
 
     @router.post(P + "places/{nn}/wake", dependencies=guarded)
     async def wake(nn: str, request: Request, account: Account = Depends(account_of)) -> Response:
@@ -549,7 +554,7 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
         call = _Call(account.login, "wake", place_of(nn))
         await cab.origin(request, call)
         if call.place is None:
-            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
+            return _not_found(call)
         if (refused := await cab.student_place(call)) is not None:
             return refused
         if (refused := await cab.journal(call)) is not None:
@@ -562,7 +567,7 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
         """Список разговоров места (ses None) или стенограмма разговора ses: R100, шаги 6–10."""
         call = _Call(account.login, "sessions" if ses is None else "read", place_of(nn))
         if call.place is None or (ses is not None and _SES.fullmatch(ses) is None):
-            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
+            return _not_found(call)
         if (refused := await cab.student_place(call)) is not None:
             return refused
         if (refused := await cab.journal(call, ses)) is not None:
@@ -593,7 +598,7 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
             return refused
         call = _Call(account.login, "agents", place_of(nn))
         if call.place is None:
-            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
+            return _not_found(call)
         if (refused := await cab.student_place(call)) is not None:
             return refused
         if (refused := await cab.journal(call)) is not None:
@@ -613,7 +618,7 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
             return refused
         call = _Call(account.login, "agent", place_of(nn))
         if call.place is None or not _agent_name_ok(name):
-            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
+            return _not_found(call)
         if (refused := await cab.student_place(call)) is not None:
             return refused
         if (refused := await cab.journal(call, name)) is not None:
@@ -664,7 +669,10 @@ def teacher_router(role: "GatewayRole") -> APIRouter:
         return await change(
             _Call(login, "shares", None), request, changes_of,
             lambda llm, plan: llm.shares.apply(plan, by=login, now=role.wallclock()),
-            lambda plan, kind: {**{f"{n:02d}": [was, to] for n, was, to in plan}, "reason": kind})
+            # bad — числа клиента любого размера и знака в журнал не идут (ревью А3, m-3); прочие отказы — после
+            # формы Shares, числа в них — от 0 до total_cents
+            lambda plan, kind: ({"reason": kind} if kind == "bad"
+                                else {**{f"{n:02d}": [was, to] for n, was, to in plan}, "reason": kind}))
 
     @router.post(P + "shares/floor", dependencies=guarded)
     async def shares_floor(request: Request, account: Account = Depends(account_of)) -> Response:

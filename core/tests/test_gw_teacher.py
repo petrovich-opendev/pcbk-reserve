@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from helpers import (AGENT_DRAFT, BASE, FRONT, ORIGIN, PLACE_NET, PW, TEACHER_HISTORY, TEACHER_SES, Gw, agent_text,
                      login, make_gateway, now_utc, park_reload_worker, teacher_gateway, wait_until)
 from pcbk_core.gateway import teacher_api
+from pcbk_core.gateway.api import GW_MESSAGES
 from pcbk_core.gateway.places import PlaceAnswer
 from pcbk_core.gateway.teacher_api import JOURNAL_ROWS, TEACHER_PREFIX as P, TEACHER_TEXTS
 from pcbk_core.gateway.teacher_api import TEACHER_PLACE_PATHS, TeacherGate, changes_of, floor_body_of, teacher_path
@@ -18,7 +19,7 @@ READS = ("overview", "journal", "places/03", "places/03/sessions", f"places/03/s
          "places/03/agents", f"places/03/agents/{AGENT_DRAFT.name}")
 MOVE = {"changes": [{"place": "03", "from_cents": 10000, "to_cents": 9000},
                     {"place": "05", "from_cents": 10000, "to_cents": 11000}]}
-WRITES = (("places/03/wake", {}), ("shares", MOVE))
+WRITES = (("places/03/wake", {}), ("shares", MOVE), ("shares/floor", {"place": "03", "to": "05"}))   # m-2 ревью А3
 
 
 @pytest.fixture
@@ -102,10 +103,13 @@ def test_no_student_place_and_bad_paths(tg):
     for path in ("places/07/sessions", "places/07/agents", "places/07"):
         r = t.get(P + path)
         assert (r.status_code, r.json()["data"]["message"]) == (404, TEACHER_TEXTS["no_student"]), path
+    journal = len(tg.role.teacher_log.recent(100))
     for path in ("places/11/sessions", "places/3/sessions", "places/03/sessions/ses_short",
                  f"places/03/sessions/{TEACHER_SES}x", "places/03/agents/..%2Fx", "places/03/agents/Bad_Name"):
-        assert t.get(P + path).status_code == 404, path
+        r = t.get(P + path)
+        assert (r.status_code, r.json()["data"]["message"]) == (404, GW_MESSAGES["not_found"]), path
     assert len(tg.role.fake_places.requests) == before
+    assert len(tg.role.teacher_log.recent(100)) == journal                  # m-2 ревью А3: имя агента — в маршруте
 
 
 def test_session_of_other_place_is_404(tg):
@@ -482,3 +486,37 @@ def test_ok_line_only_after_response_is_built(caplog):                    # I-1,
     assert counted == [] and "outcome=ok" not in caplog.text
     teacher_api._ok(call, {"text": "�"}, count=lambda: counted.append(1))                  # контроль
     assert counted == [1] and "gw teacher login=teach action=read place=03 outcome=ok status=200" in caplog.text
+
+
+# --- итоговая доводка Д10а: ревью А3, m-3 и m-4 ---
+
+def test_refused_bad_body_keeps_no_client_numbers(tg):                  # m-3: числа клиента любого размера — не в журнал
+    t = tg.as_("teach")
+    r = post(t, "shares", {"changes": [{"place": "03", "from_cents": 10 ** 40, "to_cents": -5}]})
+    assert r.status_code == 400
+    row = tg.role.teacher_log.recent(1)[0]
+    assert (row.action, row.outcome, row.detail) == ("shares", "refused", {"reason": "bad"})
+    assert t.get(P + "journal").json()["rows"][0]["detail"] == {"reason": "bad"}
+    r = post(t, "shares", {"changes": [{"place": "03", "from_cents": 9999, "to_cents": 9000}]})   # не bad — числа есть
+    assert r.status_code == 409
+    assert tg.role.teacher_log.recent(1)[0].detail == {"03": [9999, 9000], "reason": "conflict"}
+
+
+def test_bad_path_parts_get_service_log_line(tg, caplog):                 # m-4: строка gw teacher и на 404 not_found
+    caplog.set_level(logging.INFO, logger="pcbk_core")
+    t = tg.as_("teach")
+    journal = len(tg.role.teacher_log.recent(100))
+    gets = ("places/11", "places/11/sessions", "places/03/sessions/ses_short", "places/3/agents",
+            "places/03/agents/Bad_Name")
+    for path in gets:
+        assert t.get(P + path).status_code == 404, path
+    assert post(t, "places/11/wake", {}).status_code == 404
+    lines = [x.getMessage() for x in caplog.records if " outcome=not_found " in x.getMessage()]
+    assert [line.split(" ms=")[0] for line in lines] == [
+        "gw teacher login=teach action=place place=- outcome=not_found status=404",
+        "gw teacher login=teach action=sessions place=- outcome=not_found status=404",
+        "gw teacher login=teach action=read place=03 outcome=not_found status=404",
+        "gw teacher login=teach action=agents place=- outcome=not_found status=404",
+        "gw teacher login=teach action=agent place=03 outcome=not_found status=404",
+        "gw teacher login=teach action=wake place=- outcome=not_found status=404"]
+    assert len(tg.role.teacher_log.recent(100)) == journal and "Bad_Name" not in caplog.text
