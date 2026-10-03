@@ -1,10 +1,12 @@
 // «Учётные записи» кабинета преподавателя (Д10-R110): завести студента на свободное место, пароль один раз, новый пароль,
 // отключить с подтверждением, включить, снять замок. api — заглушка TeacherApi (teacherFixtures.ts); ручек учёток на
 // сервере тест не ждёт — договор R108. Пароли — выдуманные строки тестов.
+import { readFileSync } from "node:fs";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { TeacherPage } from "../src/components/TeacherPage";
-import { createTeacherApi } from "../src/teacherApi";
+import { createTeacherApi, isLogin } from "../src/teacherApi";
+import { T_TCH_ACC_LOGIN_RULE } from "../src/texts";
 import { OVERVIEW_FREE_04, OVERVIEW_READY_03, teacherApi } from "./teacherFixtures";
 
 afterEach(() => {
@@ -218,4 +220,16 @@ test("api_paths_bodies_and_login_checked_before_request", async () => {
   expect((await api.addStudent("d10-probe-n", "4")).status).toBe(400);
   expect((await api.addStudent("Иванов", "04")).status).toBe(400);
   expect(calls).toHaveLength(5);                                               // отказы — без запроса
+});
+
+test("login_rule_same_as_gateway_accounts", () => {
+  // подсказка и проверка до запроса — копия правила учёток шлюза (LOGIN_RE и _LOGIN_RULE accounts.py): разойдутся — тест
+  const src = readFileSync("../core/pcbk_core/gateway/accounts.py", "utf8");
+  expect(src).toMatch(/^LOGIN_RE = re\.compile\(r"\[a-z\]\[a-z0-9\._-\]\{2,31\}"\)$/m);
+  const rule = /^_LOGIN_RULE = "логин: (.+)"$/m.exec(src)?.[1];
+  expect(T_TCH_ACC_LOGIN_RULE).toBe(`Логин — ${rule}`);
+  // fullmatch шлюза: 3…32 знака, первый — буква a-z
+  expect(["abc", "d10-probe-n", "a.b_c-d", "a" + "b".repeat(31)].map(isLogin)).toEqual([true, true, true, true]);
+  expect(["ab", "a" + "b".repeat(32), "-abc", "1abc", "Abc", "ab c", "abc\n", "абв"].map(isLogin))
+    .toEqual([false, false, false, false, false, false, false, false]);
 });
