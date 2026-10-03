@@ -491,8 +491,8 @@ class GatewayRole(RoleBase):
                 log.warning("gw halt place=%02d error=%s", n, type(result).__name__)
 
     async def _halt_watch(self) -> None:
-        """Раз в HALT_WATCH_S — флаг защёлки тормоза (llm.brake.event); новая защёлка — _halt_once. Защёлка снята в
-        процессе (RunBrake.clear) — следующая снова даст проход. Исключение — строка журнала, цикл живёт."""
+        """Раз в HALT_WATCH_S — флаг защёлки тормоза (llm.brake.event); новая защёлка — _halt_once. Работает и при
+        ошибке настройки шлюза (без уборщика). Исключение — строка журнала, цикл живёт."""
         brake = self.llm.brake
         handled = False
         while True:
@@ -552,8 +552,10 @@ class GatewayRole(RoleBase):
             else:
                 self._reaper = asyncio.create_task(self._reaper_loop(), name="gw-reaper")   # не ожидается
                 self._reload_task = asyncio.create_task(self.reloads.run(), name="gw-agents-reload")
-                if self.llm is not None and self.llm.brake is not None:      # тормоз прогона (Д11-R117)
-                    self._halt_task = asyncio.create_task(self._halt_watch(), name="gw-halt-watch")
+            # тормоз прогона (Д11-R117) — и при ошибке настройки шлюза: ему нужен только sp-ctl, а места прогона, которые
+            # работали до перезапуска core, без него никто не усыпит (закрыто при сомнении, m-3 ревью А2)
+            if self.llm is not None and self.llm.brake is not None:
+                self._halt_task = asyncio.create_task(self._halt_watch(), name="gw-halt-watch")
         except Exception as exc:                # запуск шлюза не роняет core: причина — на страницу
             self._add_config_error(f"запуск шлюза: {type(exc).__name__}")
             log.error("шлюз: ошибка настройки: %s", self.config_error)

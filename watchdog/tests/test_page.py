@@ -135,8 +135,10 @@ def test_note_is_escaped():
 def test_page_lists_rows_under_drills():                                       # Д11-R116
     rows = (Check("llm", "LLM-прокси и бюджет", "fail", "На счёте…", "учения DRILL_LLM=402"),
             Check("gateway", "Шлюз и вход", "ok", "принимает вход", "учения: freeze_reaper; работает мест: 0"),
-            Check("memory", "Память сервера", "ok", "свободно 8000 МиБ", ""))
+            Check("memory", "Память сервера", "ok", "свободно 8000 МиБ", ""),
+            Check("web", "Веб-чат", "fail", "нет обучения", "время получения ответа"))   # не учения (m-3 ревью А1)
     assert drill_titles(rows) == ["LLM-прокси и бюджет", "Шлюз и вход"]
     html = render_html(Snapshot(T0, rows), [], T0, 30, ZoneInfo("UTC"))
     assert '<p id="drills" class="drills">Идут учения: LLM-прокси и бюджет, Шлюз и вход</p>' in html
-    assert '<p id="drills" class="drills" hidden></p>' in render_html(Snapshot(T0, rows[2:]), [], T0, 30, ZoneInfo("UTC"))
+    quiet = render_html(Snapshot(T0, rows[2:]), [], T0, 30, ZoneInfo("UTC"))
+    assert '<p id="drills" class="drills" hidden></p>' in quiet

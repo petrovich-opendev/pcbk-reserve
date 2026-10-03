@@ -150,8 +150,12 @@ class MemHistory:
         self._kills = [k for k in self._kills if k[1] > 0 and self._age(k[0], now) <= self.window_s]
         self._psi_new.append(sample.psi_full10)
 
-    def attribute(self, n: int, now: datetime) -> None:
-        """n убийств по памяти объяснены перезапуском своей строки контейнера в now."""
+    def attribute(self, n: int, now: datetime, v_after: int | None = None) -> None:
+        """n убийств по памяти объяснены перезапуском своей строки контейнера в now; v_after — счётчик oom_kill после
+        осмотра этого контейнера. Остаток, не найденный в истории, ждёт приростов как кредит — но не больше приростов,
+        которых история ещё не видела и которые не ждут другие кредиты (v_after минус последний замер и кредиты, m-5
+        ревью А1): иначе кредит за убийство, замеренное раньше match_s назад или уже объяснённое перезапуском другой
+        строки, поглотил бы следующее настоящее убийство вне мест."""
         for k in self._kills:
             if n <= 0:
                 return
@@ -159,6 +163,8 @@ class MemHistory:
                 take = min(n, k[1])
                 k[1] -= take
                 n -= take
+        if n > 0 and v_after is not None and self._oom_last is not None:
+            n = min(n, v_after - self._oom_last - sum(c[1] for c in self._credits))
         if n > 0:
             self._credits.append([now + timedelta(seconds=self.match_s), n])
 
@@ -298,6 +304,12 @@ class RestartReasons:
                 elif restarts < rec.restarts:        # docker start обнуляет счётчик: пробуждение, не сбой
                     rec.reason = rec.reason_started = rec.last = None
             rec.started, rec.restarts, rec.pending = started, restarts, None
+        else:
+            # остановлен (не работает и не в окне Restarting): следующий старт — docker start, он обнуляет
+            # RestartCount, а прошлые причины к новой жизни не относятся (m-1 ревью А1: пробуждение и убийство места
+            # за один такт дают RestartCount, равный прежнему, — перезапуск всё равно виден)
+            rec.restarts, rec.pending = 0, None
+            rec.reason = rec.reason_started = rec.last = None
         rec.base = v_before
         return result
 

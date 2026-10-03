@@ -51,7 +51,7 @@ from .. import zones
 from ..hooks import safe_path
 from . import clip
 from .accounts import NOTICE, Account, AccountStore, StoreError, login_key
-from .places import WakeRefused
+from .places import PLACE_TEXTS, WakeRefused
 
 if TYPE_CHECKING:
     from . import GatewayRole
@@ -78,8 +78,9 @@ GW_MESSAGES = {
     "not_found": "Не найдено",
     "unavailable": "Шлюз не настроен: ",
     "store": "Учётные записи недоступны — повторите позже",
-    # тормоз прогона (Д11-R117): место прогона под защёлкой не будится — ни входом студента, ни кабинетом
-    "run_halted": "Прогон остановлен: сервер на пределе памяти — место не будится.",
+    # тормоз прогона (Д11-R117): место прогона под защёлкой не будится — ни входом студента, ни кабинетом; текст — тот
+    # же, что на экране места (m-5 ревью А2: одна строка)
+    "run_halted": PLACE_TEXTS["run_halted"],
 }
 ERROR_NAMES = {400: "BadRequest", 401: "Unauthorized", 403: "Forbidden", 404: "NotFound", 405: "MethodNotAllowed",
                409: "Conflict", 429: "TooManyAttempts", 502: "BadGateway", 503: "Unavailable"}   # 409, 502 — Д10-R100

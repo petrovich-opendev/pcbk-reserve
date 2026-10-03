@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from fake_places import FakeDocker, FakePlaces
 from helpers import (BASE, FRONT, ORIGIN_HEADERS, Gw, Secret, gateway_role, make_gateway, make_llm_role,
-                     park_reload_worker, wait_until, wait_until_async)
+                     park_reload_worker, ready_place, wait_until, wait_until_async)
 from pcbk_core import gateway as gateway_module
 from pcbk_core.gateway.api import GW_MESSAGES
 from pcbk_core.gateway.places import PLACE_TEXTS, WakeRefused
@@ -62,6 +62,7 @@ def test_halted_wake_refused_for_student_and_teacher(tmp_path):
     with g.as_("stu-03") as c:
         r = c.post("/pcbk/api/workplace/wake", headers=ORIGIN_HEADERS)
     assert (r.status_code, r.json()["data"]["message"]) == (503, GW_MESSAGES["run_halted"])
+    assert GW_MESSAGES["run_halted"] == PLACE_TEXTS["run_halted"]           # тот же текст — на экране места
     with g.as_("teach") as c:
         assert c.post("/pcbk/api/teacher/places/03/wake", headers=ORIGIN_HEADERS).status_code == 503
     with g.as_("stu-05") as c:
@@ -225,3 +226,62 @@ def test_halt_refuses_cabinet_wake_and_keeps_account_routes(tmp_path, caplog):
             ("account_add", "ok")]
         assert "start" not in {a for a, _ in docker.calls} and w.halted() == frozenset({3, 4})
         assert t.post(TEACHER_PREFIX + "places/05/wake", headers=ORIGIN_HEADERS).status_code == 202
+
+
+# --- итоговая доводка Д11а (ревью А2, m-3 и m-4) ---
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("busy", ["lock", "task"])
+async def test_tick_stops_busy_run_place(tmp_path, busy):                   # P4b, P4c: и занятое место прогона
+    docker = FakeDocker(running={3})
+    llm = make_llm_role(tmp_path, key=None, **RUN)
+    gw = gateway_role(tmp_path, docker=docker, llm=llm)
+    w = gw.workplaces
+    llm.brake.halt("memory")
+    if busy == "lock":                                                      # замок держит воркер перезагрузки агентов
+        lock = w.lock(3)
+        await lock.acquire()
+        asyncio.get_running_loop().call_later(0.2, lock.release)
+    else:                                                                   # идёт задача места, running шлюза пуст
+        w._tasks[3] = asyncio.create_task(asyncio.sleep(0.2))
+    assert 3 not in w.running
+    await w.tick()
+    assert docker.containers[3]["running"] is False
+
+
+@pytest.mark.anyio
+async def test_wake_task_of_ready_place_refused_under_latch(tmp_path, gwlog):   # P3b: проверка — до «уже готово»
+    docker = FakeDocker()
+    llm = make_llm_role(tmp_path, key=None, **RUN)
+    gw = gateway_role(tmp_path, docker=docker, llm=llm)
+    w = gw.workplaces
+    ready_place(w, docker, 3)
+    llm.brake.halt("memory")
+    await w._wake(3)                                                        # задача, поставленная до защёлки
+    assert gw.stats.count_1h("wake_ok") == 0 and ("inspect", 3) not in docker.calls
+    assert "gw wake place=03 result=refused kind=run_halted" in gwlog.text
+
+
+@pytest.mark.anyio
+async def test_stop_now_waits_for_place_lock(tmp_path):                     # P12: stop — под замком места
+    docker = FakeDocker(running={3})
+    llm = make_llm_role(tmp_path, key=None, **RUN)
+    gw = gateway_role(tmp_path, docker=docker, llm=llm)
+    w = gw.workplaces
+    async with w.lock(3):                                                   # замок держит воркер перезагрузки агентов
+        stop = asyncio.create_task(w.stop_now(3))
+        await asyncio.sleep(0.1)
+        assert ("stop", 3) not in docker.calls
+    assert await asyncio.wait_for(stop, 5) is True and docker.containers[3]["running"] is False
+
+
+def test_halt_watch_runs_with_gateway_config_error(tmp_path, monkeypatch):  # m-3: закрыто при сомнении
+    monkeypatch.setattr(gateway_module, "HALT_WATCH_S", 0.01)
+    docker = FakeDocker(running={3, 4, 5})
+    llm = make_llm_role(tmp_path, key=None, **RUN)
+    app, role = make_gateway(tmp_path, docker=docker, llm=llm, config_error="проба")
+    with TestClient(app):
+        assert role._reaper is None and role._halt_task is not None         # уборщика нет — тормоз смотрит
+        llm.brake.halt("memory")
+        wait_until(lambda: not docker.containers[3]["running"] and not docker.containers[4]["running"])
+    assert docker.containers[5]["running"] is True

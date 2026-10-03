@@ -497,7 +497,10 @@ class LlmRole(RoleBase):
         if error is not None:
             self.config_error = f"{self.config_error}; {error}" if self.config_error else error
         if self.brake is not None:          # защёлка и базы тормоза прогона — из llm_meta (память журнала)
-            self.brake.load()
+            if self.ledger.opened:
+                self.brake.load()
+            else:                           # мету не прочесть — защёлка прогона могла быть: закрыто при сомнении,
+                self.brake.halt("blind")    # только в памяти (журнал не открыт), места прогона спят (m-3 ревью А2)
         llm = self.llm
         allocated = (len(PLACES) * llm.LLM_SHARE_USD if shares is None else shares.sum_cents() / 100)
         log.info("LLM-прокси: моделей %d, доли мест: распределено $%g из $%g, по умолчанию $%g", len(self.models),

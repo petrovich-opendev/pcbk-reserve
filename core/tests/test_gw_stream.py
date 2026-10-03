@@ -316,10 +316,14 @@ def test_tab_race_after_place_answered(tmp_path):                               
         cookie = login_cookie(url, "stu-03")
         tabs = [open_stream(url, cookie) for _ in range(2)]
         heads = [s.__enter__() for _, s in tabs]
-        fp.hang_for[3] = 0.3                                                             # обе новые вкладки прошли шаг 1
+        gate = fp.event_gate[3] = threading.Event()                                      # место молчит, пока не открыты
         racers = [threading.Thread(target=tab) for _ in range(2)]
         for t in racers:
             t.start()
+        # обе новые вкладки прошли шаг 1 и ждут ответа места — по событию, не по окну времени (флак под нагрузкой)
+        wait_until(lambda: fp.event_waiting[3] == 2, timeout=5)
+        assert statuses == [] and role.stats.streams_of("stu-03") == 2
+        gate.set()
         wait_until(lambda: len(statuses) == 2, timeout=5)
         assert sorted(statuses) == [200, 429] and fp.event_starts[3] == 4
         wait_until(lambda: fp.event_open[3] == 3, timeout=3)                             # поток проигравшей закрыт

@@ -34,6 +34,7 @@ import gzip
 import itertools
 import json
 import re
+import threading
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -271,6 +272,8 @@ class FakePlaces:
     - GET /event — 200 text/event-stream с потоком по сценарию events[n] (_EventBody; по умолчанию —
       server.connected и конец); event_starts[n] — сколько потоков место отдало, event_open[n] — сколько открыто
       сейчас, event_closed[n] — закрыт ли хоть один (False, пока не закрыт ни один); пауза до заголовков — hang_for;
+      ворота до заголовков — event_gate[n] (threading.Event теста): ответ ждёт, пока тест их не откроет, а
+      event_waiting[n] — сколько запросов /event места ждёт у ворот сейчас (гонка вкладок — по событию, не по времени);
     - POST /session/{id}/prompt_async — 204;
     - POST /instance/dispose (Д7а) — dispose_calls[n] += 1; при dispose_status[n] — этот код и {"name": "Dispose"},
       иначе 200 true, место «перезагружено» и зовётся on_dispose(n) (если задан); после первого удачного dispose GET
@@ -310,6 +313,8 @@ class FakePlaces:
         self.event_starts: Counter[int] = Counter()
         self.event_open: Counter[int] = Counter()
         self.event_closed: defaultdict[int, bool] = defaultdict(bool)
+        self.event_gate: dict[int, threading.Event] = {}
+        self.event_waiting: Counter[int] = Counter()
         self.dispose_calls: Counter[int] = Counter()
         self.dispose_status: dict[int, int] = {}
         self.on_dispose: Callable[[int], None] | None = None
@@ -332,6 +337,18 @@ class FakePlaces:
             bad = self.bad_files.get(n)
             state = self._instance[n] = "broken" if bad is not None and bad[1].exists() else "ok"
         return state
+
+    async def _event_gate(self, n: int) -> None:
+        """Ворота /event места n (event_gate): ждать, пока тест их не откроет; ждущие — в event_waiting[n]."""
+        gate = self.event_gate.get(n)
+        if gate is None:
+            return
+        self.event_waiting[n] += 1
+        try:
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        finally:
+            self.event_waiting[n] -= 1
 
     async def _big_body(self, n: int, size: int):
         while size > 0:
@@ -376,6 +393,7 @@ class FakePlaces:
                                   content=self._big_body(n, self.big[n]))
         path = request.url.path
         if request.method == "GET" and path == "/event":
+            await self._event_gate(n)
             return httpx.Response(200, headers={"content-type": "text/event-stream"},
                                   stream=_EventBody(self, n, self.events.get(n, [sse("server.connected")])))
         if request.method == "GET" and path in ("/agent", "/permission") and n in self.check_status:

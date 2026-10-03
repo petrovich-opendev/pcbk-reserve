@@ -4,12 +4,16 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import CORE_DIR, OPS_LLM_TOKEN, FakeMono, chat_body, make_llm_app, make_llm_role, wait_until
+from helpers import (BRAKE_PROC, CORE_DIR, LLM_SETTINGS, LLM_TOKENS, OPS_LLM_TOKEN, SETTINGS, FakeMono, chat_body,
+                     make_llm_app, make_llm_role, wait_until)
+from pcbk_core.app import create_app
+from pcbk_core.llm import LlmRole
 from pcbk_core.llm import brake as brake_module
 from pcbk_core.llm.api import LLM_MESSAGES, REFUSALS
 from pcbk_core.llm.brake import (BRAKE_HOLD_CHECKS, BRAKE_KEYS, BRAKE_REASONS, RunBrake, read_meminfo, read_oom_kill,
@@ -410,3 +414,53 @@ def test_clear_command(tmp_path):                                           # к
     assert not [k for k in keys if k.startswith("brake:")]
     missing = _clear(str(tmp_path / "нет" / "core.db"), "--run", "d11-test", "--yes")
     assert missing.returncode == 1 and "core.db не открывается" in missing.stderr
+
+
+# --- итоговая доводка Д11а (ревью А2, m-3 и m-4) ---
+
+@pytest.mark.parametrize("edge,over", [                                     # B17–B19: граница — не причина / причина
+    (lambda mi, vm, ps: mi.write_text(MEM.format(1024 * 1024, 4194304)),
+     lambda mi, vm, ps: mi.write_text(MEM.format(1023 * 1024, 4194304))),            # свободно ровно порог — норма
+    (lambda mi, vm, ps: ps.write_text(PSI.format("10.00")),
+     lambda mi, vm, ps: ps.write_text(PSI.format("10.01"))),                         # давление ровно порог — норма
+    (lambda mi, vm, ps: mi.write_text(MEM.format(5000 * 1024, 4194304 - 511 * 1024)),
+     lambda mi, vm, ps: mi.write_text(MEM.format(5000 * 1024, 4194304 - 512 * 1024))),   # swap: ровно порог — причина
+], ids=["memory", "psi", "swap"])
+def test_thresholds_exact_edges(tmp_path, edge, over):
+    clock = FakeMono(100.0)
+    b, mi, vm, ps, _ = make(tmp_path, clock)
+    b.check()                                                               # база swap 0
+    edge(mi, vm, ps)
+    for _ in range(BRAKE_HOLD_CHECKS + 1):
+        clock.advance(5); b.check()
+    assert b.halted is False
+    over(mi, vm, ps)
+    for _ in range(BRAKE_HOLD_CHECKS):
+        clock.advance(5); b.check()
+    assert b.halted is True
+
+
+def test_age_counts_from_last_check_not_start(tmp_path):                   # B20: брат раньше первой проверки
+    clock = FakeMono(100.0)
+    b, *_ = make(tmp_path, clock)
+    clock.advance(20); b.check(); clock.advance(3)
+    assert b.json(clock())["age_s"] == 3.0
+
+
+def test_swap_window_forgets_old_samples(tmp_path):                         # B23: окно 10 мин чистится
+    clock = FakeMono(100.0)
+    b, mi, *_ = make(tmp_path, clock, swap_base=2000)                       # база выше занятого — от базы роста нет
+    b.check()                                                               # swap 0
+    mi.write_text(MEM.format(5000 * 1024, 4194304 - 600 * 1024)); clock.advance(660)
+    for _ in range(BRAKE_HOLD_CHECKS):                                      # +600 МиБ, но за 11 мин
+        b.check(); clock.advance(5)
+    assert b.halted is False
+
+
+def test_run_with_ledger_not_opened_latches_blind(tmp_path, fake_or):      # m-3: мету прогона не прочесть
+    llm = replace(LLM_SETTINGS, OPENROUTER_BASE_URL=fake_or.url, **BRAKE_PROC, **RUN)
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "нет" / "core.db"))  # каталога нет — журнал не откроется
+    role = LlmRole(settings, llm, tokens=LLM_TOKENS, upstream=None, ledger=Ledger(settings.DB_PATH))
+    with TestClient(create_app(settings, [role])):
+        assert role.config_error.startswith("журнал вызовов не открылся")
+        assert (role.brake.halted, role.brake.reason, role.run_halted()) == (True, "blind", True)
