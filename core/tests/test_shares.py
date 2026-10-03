@@ -273,23 +273,71 @@ def test_bad_row_on_disk_closes_loading(tmp_path):                       # пр�
 
 
 def test_concurrent_transfers_do_not_lose_a_cent(tmp_path):              # CAS под замком: две вкладки в один миг
+    """Чередование наверняка (ревью А2, m-5): первая вкладка стоит внутри перевода (считается пол её места), а вторая в
+    этот миг начинает свой. Вторая ждёт замка и сверяет «было» уже с новым диском — conflict, а не сбой SQLite и не
+    потерянный цент. Без замка и с отложенным BEGIN вторая прошла бы целиком, а первая упала бы на устаревшем снимке."""
     s = make(tmp_path)
-    results: list[str] = []
+    inside, second_done = threading.Event(), threading.Event()
+
+    def settled_of(caller: str) -> float:
+        if threading.current_thread().name == "first" and caller == "student-03":
+            inside.set()
+            second_done.wait(0.5)                                            # вторая успела бы, если бы её пустили
+        return 0.0
+    s.settled_of = settled_of
+    results: dict[str, str] = {}
 
     def move(to: int) -> None:
+        name = threading.current_thread().name
         try:
             s.apply([(3, 10000, 9000), (to, 10000, 11000)], by="teach", now=NOW)
-            results.append("ok")
+            results[name] = "ok"
         except ShareRefused as exc:
-            results.append(exc.kind)
-    threads = [threading.Thread(target=move, args=(to,)) for to in (5, 6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert sorted(results) == ["conflict", "ok"] and s.sum_cents() == 100000
+            results[name] = exc.kind
+        except SharesStoreError:
+            results[name] = "store_error"
+        finally:
+            if name == "second":
+                second_done.set()
+    first = threading.Thread(target=move, args=(5,), name="first")
+    first.start()
+    assert inside.wait(5)                                                    # первая — внутри перевода
+    second = threading.Thread(target=move, args=(6,), name="second")
+    second.start()
+    first.join(10)
+    second.join(10)
+    assert results == {"first": "ok", "second": "conflict"} and s.sum_cents() == 100000
     again = make(tmp_path)
-    assert (again.cents(3), again.sum_cents()) == (9000, 100000)
+    assert (again.cents(3), again.cents(5), again.cents(6), again.sum_cents()) == (9000, 11000, 10000, 100000)
+
+
+def test_cas_compares_with_disk_not_memory(tmp_path):                    # ревью А2, m-3: «было» — по диску (R97, п. 3)
+    s = make(tmp_path, drill=STALE_DRILL)
+    s.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=NOW)    # диск — новый, память прокси — прежняя
+    assert (s.cents(3), s.cents(5)) == (10000, 10000)
+    with pytest.raises(ShareRefused) as e:
+        s.apply([(3, 10000, 9500), (5, 10000, 10500)], by="teach", now=NOW)   # «было» из памяти — не то, что на диске
+    assert e.value.kind == "conflict"
+    s.apply([(3, 9000, 8000), (5, 11000, 12000)], by="teach", now=NOW)    # «было» с диска — проходит
+    with closing(sqlite3.connect(tmp_path / "core.db")) as db:
+        assert dict(db.execute("SELECT place, cents FROM llm_shares")) == {3: 8000, 5: 12000}
+
+
+def test_transfer_keeps_memory_of_untouched_places(tmp_path):           # ревью А2, m-4: память = прежняя + изменённые
+    s = make(tmp_path)
+    with closing(sqlite3.connect(tmp_path / "core.db")) as db, db:
+        db.execute("INSERT INTO llm_shares (place, cents, updated_at, updated_by) VALUES (4, 3999, 'x', 'x')")
+    s.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=NOW)    # правка мимо кабинета — у места 04
+    assert (s.cents(3), s.cents(4), s.cents(5)) == (9000, 10000, 11000)    # перевод расхождение 04 молча не лечит
+    s.verify(NOW, memory(s))
+    assert s.drift == 1
+
+
+def test_one_source_for_login_rule_and_places():                         # ревью А2, m-7: без дублей
+    from pcbk_core import llm, teacher_log
+    from pcbk_core.llm import shares
+    assert shares.LOGIN_RE is teacher_log.LOGIN_RE and not hasattr(shares, "_LOGIN_RE")
+    assert llm.PLACES is shares.PLACES
 
 
 def test_store_error_text_has_code_not_values(tmp_path, monkeypatch):    # текст — класс и код SQLite
