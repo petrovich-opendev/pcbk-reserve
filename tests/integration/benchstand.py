@@ -16,7 +16,9 @@
   cleanup() закрывает и его (агент — в архив), если тест не закрыл сам.
 - agents_left(stack, places) — имена живых (не archived) агентов мест по порядку мест.
 - Нагрузка (Д11б, Б2; Д11-R119, R120): BenchHarness(stack, tmp, places, config=…, login=…) — конфиг прогонщика
-  (bench/config.load.twin.json) и вид учёток (d11-probe-load-NN — пробные, место освобождается); у конфига нагрузки
+  (bench/config.load.twin.json) и вид учёток (d11-probe-load-NN — пробные, место освобождается); start() у конфига
+  нагрузки места только создаёт с переопределением — они спят, будит их прогонщик по одному через шлюз (доводка по
+  прогону 0 Б2: десять холодных стартов разом — пик памяти машины до первого теста); у конфига нагрузки
   recreate_core выставляет пороги тормоза core LLM_RUN_* ровно по полям базы окна конфига (brake_env; null — умолчание
   компоновки) и ждёт их в /health/llm — иначе прогонщик откажет RunRefused("run_limits"). delay(s) — задержка каждого
   вызова чата двойника OpenRouter (POST /_delay; 0 — DELETE), уборка её снимает. settle() — между учениями тормоза:
@@ -290,7 +292,13 @@ class BenchHarness:
     def start(self) -> None:
         """1) core — двойник историана, белый список отбора и прогон cfg (run_id, cap; у нагрузки — и пороги тормоза);
         сторож — порог тишины SILENT_S; 2) персоны двойника OpenRouter, места с переопределением модели; 3) учётки
-        мест (login) и прогонщик."""
+        мест (login) и прогонщик.
+
+        Отбор (Д8): места подняты и healthy. Нагрузка (Д11б): места только созданы с переопределением и спят (работавшее
+        — остановлено); будит их прогонщик в prepare() по одному, через шлюз, уже со своим сторожем памяти (R119) — как
+        на сервере. Десять мест одной командой up — десять холодных стартов разом: в прогоне 0 Б2 свободная память
+        машины за 25 с упала с 3670 до 1453 МиБ (swap +617 МиБ), и сторож памяти машины теста остановил места ещё до
+        первого теста."""
         self.data_dir = bench_data(self.tmp)
         self.recreate_core(self.cfg.run_id, self.cfg.cap_usd)
         twin = self.stack.exec("pcbk-core", "python", "-c", TWIN_WHITELIST_PY).split()
@@ -298,11 +306,18 @@ class BenchHarness:
         self.stack.recreate("watchdog", {"LLM_RUN_SILENT_S": str(SILENT_S)})
         self._bench(on=True)
         self.override.write_text(render_override(self.places), encoding="utf-8")
-        self.stack.compose("up", "-d", "--no-build", "--no-deps", "--force-recreate", *self._services(),
-                           files=(*COMPOSE_FILES, str(self.override)))
-        for n in self.places:
-            self.stack.wait_ready(self._container(n), PLACE_READY_S)
-        self._wait_mcp()
+        files = (*COMPOSE_FILES, str(self.override))
+        if self.cfg.load:
+            for n in self.places:
+                if self._running(n):
+                    self.stack.stop(self._container(n))
+            self.stack.compose("create", "--force-recreate", "--no-build", *self._services(), files=files)
+        else:
+            self.stack.compose("up", "-d", "--no-build", "--no-deps", "--force-recreate", *self._services(),
+                               files=files)
+            for n in self.places:
+                self.stack.wait_ready(self._container(n), PLACE_READY_S)
+            self._wait_mcp()
         for n in self.places:
             self.stack.add_account(self.login(n), "student", n, self._pw[n])
         self.runner = self.runner_for(self.cfg.out_dir)

@@ -10,10 +10,17 @@
 модулям места свободны.
 
 Память машины разработчика (итоговое ревью Д11б, I-4; решение контроллера). Десять мест бодрствуют только в прогоне
-десяти мест: после «закончен» прогонщик сам их усыпляет (R122). Учения тормоза — на трёх местах (DRILL; отступление от
-брифа, где TEN), цена реплики — на двух; уборка и settle() будят по одному месту. Сторож настоящей памяти машины
-(HostMemory): тормоз прогонщика на стенде смотрит на двойник памяти, а настоящую не видит никто — раз в 2 с MemAvailable
-хоста; меньше HOST_FLOOR_MIB — места модуля усыплены, тест остановлен понятной ошибкой.
+десяти мест: фикстура места только создаёт (спят), будит их прогонщик по одному через шлюз (R119), после «закончен» он
+сам их усыпляет (R122). Учения тормоза — на трёх местах (DRILL; отступление от брифа, где TEN), цена реплики — на двух;
+уборка и settle() будят по одному месту. Сторож настоящей памяти машины (HostMemory): тормоз прогонщика на стенде
+смотрит на двойник памяти, а настоящую не видит никто — раз в 2 с MemAvailable хоста; меньше HOST_FLOOR_MIB — места
+модуля остановлены, тест остановлен понятной ошибкой с числами (и при сбое подготовки фикстуры). Следующий тест
+начинается, только когда свободно снова не меньше HOST_REARM_MIB: срабатывание в прогоне десяти мест не роняет учения
+на трёх местах.
+
+Доводка по прогону 0 Б2 (05.10, интеграцией не проверено): фикстура поднимала все десять мест одной командой up —
+свободная память машины за 25 с упала с 3670 до 1453 МиБ, сторож машины остановил места (SIGTERM, код 143), и все семь
+тестов дали ERROR в подготовке как «место 01 exited 143», без слова о памяти.
 
 Каскад (итоговое ревью Д11б, I-1): поток прогонщика — в runner_bg (не остановился — SIGINT, как Ctrl+C оператора; и
 тогда не остановился — места усыплены, тест падает); RunRefused — кодом в сообщении проверки, а не KeyError; после
@@ -31,10 +38,12 @@
 """
 import contextlib
 import json
+import logging
 import re
 import signal
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -50,24 +59,48 @@ FAKE_CALL_USD = 0.0012                          # цена вызова двой
 TURN_DELAY_S = 2.0                              # ход двойника — вызовы по 2 с (R133)
 CALL_LATE_S, ASLEEP_S = 30, 60                  # R133, стенд: вызовов после t0 + 30 с нет, места спят ≤ t0 + 60 с
 FIRST_CALL_S = 300                              # подготовка трёх мест; шаги — в журнале прогонщика (I-2)
+# десять мест до «работает мест: 10» и до первых вызовов прогона — от старта прогонщика. Места спят, и прогонщик будит
+# их по одному: холодный старт места до первого 200 — 4,4 с (D2), пробуждение со входом через шлюз — 2,0–2,3 с на
+# место (p2 Б2, места уже работали) — ≈ 10 × 7 с ≈ 70 с и проверки подготовки; срок прежний, запас ≈ ×3
+TEN_AWAKE_S = 300
 MEM_ROW_S = 60                                  # давление — «внимание» и снятие за три такта сторожа по 10 с
 STOP_JOIN_S = 180                               # прогонщик после SIGINT: abort ходов, сон мест, close()
 CALLS_10M = re.compile(r"прогон d11-twin: [^·]*вызовов за 10 мин: [1-9]")   # строка LLM: вызовы прогона уже идут
 HOST_MEMINFO = Path("/proc/meminfo")            # настоящая память машины разработчика — не двойник
 HOST_FLOOR_MIB = 1536
 HOST_POLL_S = 2.0
+# снова на страже после срабатывания: та же планка свободной памяти, что перед любым интеграционным прогоном на этой
+# машине (правило контроллера); ждём не дольше HOST_REARM_S — после остановки мест память вернулась за ≤ 5 с (прогон 0
+# Б2: 1453 → 4038 МиБ между соседними строками журнала памяти с шагом 5 с)
+HOST_REARM_MIB = 3500
+HOST_REARM_S = 60
+
+log = logging.getLogger("pcbk.test.load")
+
+
+def _utc() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
 
 
 class HostMemory:
-    """Сторож настоящей памяти машины (см. шапку): поток раз в HOST_POLL_S читает MemAvailable хоста; ниже floor_mib —
-    docker stop мест модуля (один раз) и метка; check() в главном потоке превращает метку в pytest.fail. low_mib —
-    наименьшее увиденное значение (для «Б2 журнал»)."""
+    """Сторож настоящей памяти машины (см. шапку). Поток раз в HOST_POLL_S читает MemAvailable хоста; ниже floor_mib —
+    метка tripped (МиБ, время UTC), строка журнала WARNING и docker stop мест модуля (один раз на срабатывание).
+    check() (в ожиданиях теста и при сбое подготовки фикстуры) и after() (конец теста) превращают метку в pytest.fail с
+    числами — один отчёт на срабатывание. begin(тест) перед тестом: отчитанное срабатывание снимается, когда свободно
+    снова ≥ HOST_REARM_MIB (≤ HOST_REARM_S, иначе тест не начинается) — строкой «Б2 журнал» и в trips. low_mib —
+    наименьшее за модуль; test_base_mib и test_low_mib — в начале теста и наименьшее за тест."""
 
     def __init__(self, places, floor_mib: int = HOST_FLOOR_MIB):
         self.names = [f"pcbk-student-{n:02d}" for n in sorted(places)]
         self.floor_mib = floor_mib
         self.low_mib: int | None = None
-        self.tripped: int | None = None
+        self.test_base_mib: int | None = None
+        self.test_low_mib: int | None = None
+        self.tripped: tuple[int, str] | None = None
+        self.trips: list[str] = []
+        self._reported = False
+        self._test = "подготовка фикстуры load"
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="память-машины", daemon=True)
 
@@ -79,6 +112,7 @@ class HostMemory:
         raise RuntimeError("/proc/meminfo: нет MemAvailable")
 
     def start(self) -> None:
+        self.test_base_mib = self.available_mib()
         self.poll()
         self._thread.start()
 
@@ -88,22 +122,66 @@ class HostMemory:
 
     def poll(self) -> None:
         mib = self.available_mib()
-        self.low_mib = mib if self.low_mib is None else min(self.low_mib, mib)
-        if mib < self.floor_mib and self.tripped is None:
-            self.tripped = mib
+        with self._lock:
+            self.low_mib = mib if self.low_mib is None else min(self.low_mib, mib)
+            self.test_low_mib = mib if self.test_low_mib is None else min(self.test_low_mib, mib)
+            trip = mib < self.floor_mib and self.tripped is None
+            if trip:
+                self.tripped = (mib, _utc())
+            test = self._test
+        if trip:
+            log.warning("память машины: свободно %d МиБ < %d МиБ (%s) — места модуля останавливаются", mib,
+                        self.floor_mib, test)
             _run(["docker", "stop", "-t", "10", *self.names], check=False)
 
     def _loop(self) -> None:
         while not self._stop.wait(HOST_POLL_S):
             try:
                 self.poll()
-            except Exception:                        # noqa: BLE001 — нечитаемо: следующий опрос
-                pass
+            except Exception as exc:                 # noqa: BLE001 — нечитаемо: следующий опрос
+                log.warning("память машины: опрос не удался (%s)", type(exc).__name__)
+
+    def reason(self) -> str:
+        mib, at = self.tripped
+        return (f"машине не хватает памяти: в {at} свободно {mib} МиБ при пороге {self.floor_mib} МиБ ({self._test}; в "
+                f"начале — {self.test_base_mib} МиБ) — места модуля остановлены, тест остановлен (не тормоз "
+                "прогонщика: тот смотрит на двойник памяти)")
 
     def check(self) -> None:
         if self.tripped is not None:
-            pytest.fail(f"машине не хватает памяти: свободно {self.tripped} МиБ при пороге {self.floor_mib} МиБ — "
-                        "места модуля усыплены, тест остановлен (не тормоз прогонщика: тот смотрит на двойник)")
+            self._reported = True
+            pytest.fail(self.reason())
+
+    def after(self) -> None:
+        """Конец теста: срабатывание, о котором тест не сказал (вне ожиданий со сторожем), — ошибкой; отчитанное —
+        нет."""
+        if self.tripped is not None and not self._reported:
+            self.check()
+
+    def begin(self, test: str) -> None:
+        """Перед тестом: неотчитанное срабатывание — ошибкой этого теста; отчитанное снимается, когда свободно снова
+        ≥ HOST_REARM_MIB (ожидание ≤ HOST_REARM_S, иначе тест не начинается); затем отсчёт теста."""
+        seen = self.tripped
+        if seen is not None:
+            if not self._reported:
+                self.check()
+            deadline = time.monotonic() + HOST_REARM_S
+            mib = self.available_mib()
+            while mib < HOST_REARM_MIB and time.monotonic() < deadline:
+                time.sleep(HOST_POLL_S)
+                mib = self.available_mib()
+            if mib < HOST_REARM_MIB:
+                pytest.fail(f"память машины не вернулась после срабатывания сторожа ({self._test}): свободно {mib} МиБ "
+                            f"< {HOST_REARM_MIB} МиБ за {HOST_REARM_S} с — тест не начат")
+            self.trips.append(f"{self._test} — {seen[0]} МиБ в {seen[1]}")
+            print(f"Б2 журнал: сторож памяти машины сработал ({self._test} — {seen[0]} МиБ в {seen[1]}); свободно "
+                  f"снова {mib} МиБ — {test} идёт")
+        mib = self.available_mib()
+        with self._lock:
+            if self.tripped is seen:            # снимается только разобранное здесь; новое срабатывание остаётся
+                self.tripped, self._reported = None, False
+            self._test = test
+            self.test_base_mib = self.test_low_mib = mib
 
 
 @pytest.fixture(scope="module")
@@ -113,7 +191,11 @@ def load(stack, tmp_path_factory):
     h.host = HostMemory(TEN)
     h.host.start()
     try:
-        h.start()
+        try:
+            h.start()                           # места нагрузки созданы и спят — будит их прогонщик (R119)
+        except Exception:
+            h.host.check()                      # сработал сторож машины — его причина, а не «место exited 143»
+            raise
         yield h
     finally:
         h.host.stop()
@@ -124,11 +206,11 @@ def load(stack, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def host_memory(load):
-    """Память машины — до и после каждого теста модуля."""
-    load.host.check()
+def host_memory(load, request):
+    """Память машины — до (begin: и снятие отчитанного срабатывания прошлого теста) и после каждого теста модуля."""
+    load.host.begin(request.node.name)
     yield
-    load.host.check()
+    load.host.after()
 
 
 def watched(load, pred):
@@ -225,12 +307,30 @@ def memory_ok(load, timeout=MEM_ROW_S * 1.5):
 
 
 def test_load_ten_places_twin(load):                                        # Review Focus 4
+    """После теста — и при падении (сторож памяти машины, отказ прогонщика) — агенты оборванных ходов в архиве
+    (settle(), как после учения): иначе первое учение откажет place_agents, и одно падение уронит следующие тесты."""
+    steps = [("агенты оборванных ходов", lambda: print(f"Б2 журнал: после десяти мест агенты оборванных ходов — мест "
+                                                       f"{len(load.settle())}"))]
+    try:
+        _ten_places(load)
+    except BaseException:
+        restore(steps, failing=True)
+        raise
+    restore(steps, failing=False)
+
+
+def _ten_places(load):
     out = load.tmp / "ten"
     begun = time.monotonic()
     with runner_bg(load, load.runner_for(out), TEN) as (t, result):
-        s = load.stack.wait_status(watched(load, lambda d: "работает мест: 10" in row_of(d, "gateway")["note"]), 300)
+        # места спят, прогонщик будит их по одному: его отказ кончает ожидание сразу — причина его, а не срок
+        s = load.stack.wait_status(watched(load, lambda d: not t.is_alive()
+                                           or "работает мест: 10" in row_of(d, "gateway")["note"]), TEN_AWAKE_S)
+        assert t.is_alive(), f"прогонщик кончил до десяти работающих мест: {outcome(result)}"
         assert "прогон d11-twin" in row_of(s, "llm")["note"]
-        load.stack.wait_status(watched(load, lambda d: CALLS_10M.search(row_of(d, "llm")["note"]) is not None), 300)
+        load.stack.wait_status(watched(load, lambda d: not t.is_alive()
+                                       or CALLS_10M.search(row_of(d, "llm")["note"]) is not None), TEN_AWAKE_S)
+        assert t.is_alive(), f"прогонщик кончил до вызовов модели: {outcome(result)}"
         load.shot("d11b-01-load-ten.png", row="gateway")                    # под нагрузкой: вызовы прогона идут
         join_watching(load, t, 900)
     assert result.get("reason") == "finished", outcome(result)
@@ -245,8 +345,9 @@ def test_load_ten_places_twin(load):                                        # Re
     print(f"Б2 журнал: десять мест — прогонов {len(recs)} done за {time.monotonic() - begun:.0f} с; событий службы "
           f"{numbers['events']}, с SQL {numbers['sql_events']}, вне списка в SQL {numbers['sent_unlisted']}, "
           f"наибольшее с SQL за 5 мин {numbers['max_sql_5m']}; вызовов модели {numbers['llm_calls']}, минут "
-          f"одновременной работы {numbers['concurrency_minutes']}; свободно на машине не меньше "
-          f"{load.host.low_mib} МиБ")
+          f"одновременной работы {numbers['concurrency_minutes']}; свободно на машине в начале "
+          f"{load.host.test_base_mib} МиБ, не меньше {load.host.test_low_mib} МиБ — на место ≈ "
+          f"{(load.host.test_base_mib - load.host.test_low_mib) / len(TEN):.0f} МиБ")
 
 
 def test_note_numbers_parse_from_real_watchdog(load):                       # I-1 р3: формат note не разошёлся
@@ -335,4 +436,5 @@ def test_load_cleanup_restores(load):                                       # п
     assert agents_left(load.stack, range(1, 11)) == []
     assert running(load, range(1, 11)) == []
     print(f"Б2 журнал: свободно на машине за модуль не меньше {load.host.low_mib} МиБ (порог сторожа "
-          f"{HOST_FLOOR_MIB} МиБ)")
+          f"{HOST_FLOOR_MIB} МиБ); срабатываний сторожа {len(load.host.trips)}"
+          + "".join(f"; {trip}" for trip in load.host.trips))
