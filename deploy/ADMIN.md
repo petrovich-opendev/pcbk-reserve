@@ -44,7 +44,7 @@
 | `core` | Служба данных | «не отвечает» / «отвечает ошибкой HTTP N» | `docker compose logs core`; проверить секреты (токены данных) | «Служба данных» |
 | `core-container` | Серверный слой — контейнер | то же, что у места (контейнер); «процесс core не отвечает на проверку здоровья» | `docker compose logs core`; если не стартует вовсе — проверить `.env` и секреты (ключи OpenRouter — оба файла) | «Выкладка и обновление» |
 | `historian` | Историан БДРВ | «служба данных не отвечает — свежесть неизвестна» / «последняя метка старше N с» / текст ошибки учётки | сначала строка «Служба данных» выше; ошибка учётки — обновить копию `bdrv.env` | «Служба данных» |
-| `llm` | LLM-прокси и бюджет | «LLM-прокси не отвечает» / «нет ключа OpenRouter» / «токены LLM не читаются» / «бюджет $N исчерпан» / «прогон остановлен тормозом памяти» | ключи и токены — README «LLM-прокси»; тормоз — «Тормоз прогона по памяти» | «LLM-прокси» |
+| `llm` | LLM-прокси и бюджет | «LLM-прокси не отвечает» / «нет ключа OpenRouter» / «токены LLM не читаются» / «бюджет $N исчерпан — модель не отвечает» / «прогон остановлен тормозом памяти» | ключи и токены — README «LLM-прокси»; тормоз — «Тормоз прогона по памяти» | «LLM-прокси» |
 | `gateway` | Шлюз и вход | «шлюз не отвечает» / «учётные записи недоступны» / «нет связи с прокси сокета — места не будятся» / «вход отклоняется проверкой источника — проверьте GW_ORIGIN» | проверить `.env` (`GW_ORIGIN`), затем строку `sp-ctl` выше | «Вход и рабочие места» |
 | `web` | Веб-чат | «страница чата не отдаётся» / «сборка чата неполная» / «не отвечает» | пересобрать и выложить статику заново | «Статика чата» |
 | `agents` | Агенты студентов | «настройка рабочего места сломана — место не поднимается» / «каталог агентов недоступен — агенты не сохраняются» / «перезагрузка агентов молчит» | смотреть README «Карантин» и «Файл агента вручную» | «Агенты студентов» |
@@ -140,25 +140,25 @@ README «Порт 3389» — там же три варианта решения 
 
 ```bash
 cd /opt/pcbk-reserve
-L=<логин> && PWF=<файл с паролем одной строкой> && C=<имя сертификата edge>
-python3 -c 'import json,sys; print(json.dumps({"login": sys.argv[1], "password": open(sys.argv[2]).read().rstrip(chr(10))}))' "$L" "$PWF" > /tmp/pcbk-login.json
-curl -sk --resolve "$C:8443:127.0.0.1" -c /tmp/pcbk-cookie.txt -H 'Content-Type: application/json' \
-  -H 'Sec-Fetch-Site: same-origin' --data-binary @/tmp/pcbk-login.json "https://$C:8443/pcbk/api/auth/login"
+L=<логин> && PWF=<файл с паролем одной строкой> && C=<имя сертификата edge> && T=$(umask 077; mktemp -d)
+python3 -c 'import json,sys; print(json.dumps({"login": sys.argv[1], "password": open(sys.argv[2]).read().rstrip(chr(10))}))' "$L" "$PWF" > "$T/login.json"
+curl -sk --resolve "$C:8443:127.0.0.1" -c "$T/cookie.txt" -H 'Content-Type: application/json' \
+  -H 'Sec-Fetch-Site: same-origin' --data-binary "@$T/login.json" "https://$C:8443/pcbk/api/auth/login"
 ```
 Что увидите: JSON учётки (`login`, `role`, `place`, …); `401 bad_credentials` — неверный логин или пароль; `429` —
 замок входа (раздел 2, строка «Шлюз и вход»).
 
 ```bash
-curl -sk --resolve "$C:8443:127.0.0.1" -b /tmp/pcbk-cookie.txt "https://$C:8443/pcbk/api/auth/me"
+curl -sk --resolve "$C:8443:127.0.0.1" -b "$T/cookie.txt" "https://$C:8443/pcbk/api/auth/me"
 ```
-Что увидите: ту же учётку и `notice` (у студента — номер непрочитанного предупреждения или `null`; у преподавателя
+Что увидите: ту же учётку и `notice` (у студента — метка непрочитанного предупреждения, например `teacher-reads-1`, или `null`; у преподавателя
 — всегда `null`). Заголовок источника здесь не нужен.
 
 ```bash
-curl -sk --resolve "$C:8443:127.0.0.1" -b /tmp/pcbk-cookie.txt -H 'Sec-Fetch-Site: same-origin' \
+curl -sk --resolve "$C:8443:127.0.0.1" -b "$T/cookie.txt" -H 'Sec-Fetch-Site: same-origin' \
   -X POST "https://$C:8443/pcbk/api/workplace/wake"
 ```
 Что увидите: у студента — `202` и `{"state":"starting",…}`, повторный `GET` того же пути до `"state":"ready"`; у
 преподавателя места нет — `403 no_place`, это ожидаемо.
 
-Убрать за собой: `rm -f /tmp/pcbk-login.json /tmp/pcbk-cookie.txt`.
+Убрать за собой: `rm -rf "$T"` (пароль и cookie лежали только в личном временном каталоге `0700`).

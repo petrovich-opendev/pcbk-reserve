@@ -1741,7 +1741,7 @@ chmod 0600 "$B"/* && chmod 0700 "$B"
 **Хранятся две последние копии.** После того как новая проверена, старые свои каталоги `backup/<ГГГГММДД-ЧЧММ>`,
 кроме двух последних, удаляются:
 ```bash
-ls -1d /opt/pcbk-reserve/backup/2*/ | head -n -2 | while read -r old; do
+ls -1d /opt/pcbk-reserve/backup/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]/ | head -n -2 | while read -r old; do
   echo "удаляю старую копию: $old"; rm -rf "$old"
 done
 ```
