@@ -1898,7 +1898,7 @@ docker inspect -f '{{.ID}}|{{.Name}}|{{.Config.Image}}|{{.State.Status}}|{{if .S
 # watchcond — одна проверка условий R143 по файлам в ~/pcbk-d12: «ok» и код 0 или «ТРЕВОГА: …» и код 1.
 # Флаги: dify-off — Dify выключен (ждём 0 работающих); pause — плановое пересоздание (≤ 180 с);
 # allowed — пары «строка:состояние», допустимые вне ok (edge:fail при истёкшем сертификате, edge:warn).
-# fail/unknown вне allowed — ТРЕВОГА (код 1) со второй строки pulse подряд; warn вне allowed дольше 300 с — ВНИМАНИЕ
+# строка вне ok и вне allowed два такта подряд, хотя бы раз fail/unknown (по имени строки: fail↔warn — тоже) — ТРЕВОГА (код 1); warn вне allowed дольше 300 с — ВНИМАНИЕ
 # (код 2, один раз на непрерывный warn: отметка warn-noted) — запись и разбор, не откат (I-4 р2).
 d=${PCBK_D12:-$HOME/pcbk-d12}; now=$(date +%s)
 alarm() { echo "ТРЕВОГА: $*"; exit 1; }
@@ -1915,28 +1915,31 @@ fi
 [ "$(awk -F'\t' '$2 != "fresh" || $4 != "200" || $5 != "401"' <<<"$p" | wc -l)" -lt 2 ] || alarm "pulse — два отказа подряд"
 last=$(tail -n 1 <<<"$p" | cut -f3 | tr ',' '\n'); prev=$(head -n 1 <<<"$p" | cut -f3 | tr ',' '\n')
 mkdir -p "$d/warn-since"; notice=
+bad() { [ -n "$1" ] && [ "$1" != "-" ] && ! grep -qx "$1" "$d/allowed" 2>/dev/null; }   # строка вне ok и вне allowed
 for r in $last; do
-  [ "$r" = "-" ] && continue
-  grep -qx "$r" "$d/allowed" 2>/dev/null && continue
-  c=${r%%:*}
-  if [ "${r##*:}" = warn ]; then
+  bad "$r" || continue
+  c=${r%%:*}; s=${r##*:}
+  pr=$(awk -F: -v c="$c" '$1 == c' <<<"$prev")     # тот же компонент такт назад — по имени, не по точной строке
+  if bad "$pr" && { [ "$s" != warn ] || [ "${pr##*:}" != warn ]; }; then
+    alarm "строка $c не ok два такта подряд: $pr → $r"   # fail/unknown хотя бы в одном из двух (и чередование fail↔warn)
+  fi
+  if [ "$s" = warn ]; then
     [ -f "$d/warn-since/$c" ] || echo "$now" > "$d/warn-since/$c"
     if [ $((now - $(cat "$d/warn-since/$c"))) -gt 300 ] && [ ! -f "$d/warn-since/$c.noted" ]; then
       touch "$d/warn-since/$c.noted"; notice="ВНИМАНИЕ: строка $c — warn дольше 5 мин"
     fi
-  else
-    grep -qx "$r" <<<"$prev" && alarm "строка $r два такта подряд"
   fi
 done
-for f in "$d"/warn-since/*; do                      # warn ушёл — отметки снять
+for f in "$d"/warn-since/*; do                      # строка вернулась в ok (или в allowed) — отметки снять
   [ -e "$f" ] || continue; c=$(basename "${f%.noted}")
-  grep -qx "$c:warn" <<<"$last" || rm -f "$f"
+  for r in $last; do bad "$r" && [ "${r%%:*}" = "$c" ] && continue 2; done
+  rm -f "$f"
 done
 [ -z "$notice" ] || { echo "$notice"; exit 2; }      # ТРЕВОГИ (выше) проверены раньше ВНИМАНИЯ
 echo ok
 ```
 
-Самопроверка `watchcond` на подставных файлах (7 случаев) и проверка на двойнике Dify — пройдены, журнал в
+Самопроверка `watchcond` на подставных файлах (15 случаев, в том числе чередование `fail`↔`warn` одной строки — тревога: строки сравниваются по имени, а не по точному «строка:состояние») и проверка на двойнике Dify — пройдены, журнал в
 `docs/checks/D12a.md`.
 
 **Запуск на сервере** (В1, помощники уже скопированы в `~/pcbk-d12/`, `chmod 0700`):
@@ -1964,6 +1967,13 @@ ssh -o BatchMode=yes -o ConnectTimeout=10 <сервер, из разведки �
 
 ### Порядок окна (В-часть, Д12в)
 
+0. **Ворота: наблюдение раньше остановки.** Первый `stop` не нажимается, пока не выполнено всё: `pulse` и
+   `difywatch` пишут строки **≥ 5 мин** без пропусков (`tail -n 25 ~/pcbk-d12/pulse.tsv`, `tail -n 35
+   ~/pcbk-d12/difywatch.tsv` — первые столбцы идут через 15 и 10 с, последняя строка не старше 45 и 30 с);
+   `~/pcbk-d12/allowed` на месте (строки ниже, «Таблица ожидаемых строк»); `~/pcbk-d12/watchcond` печатает `ok`;
+   тихий фоновый наблюдатель запущен и молчит; положительные контроли помощников пройдены до окна (двойник Dify —
+   Д12а, `pulse` при остановленном `edge` — стенд «чистых рук», Д12б; числа — `docs/checks/D12a.md`, `D12b.md`).
+   Не выполнено — `stop` не нажимается, разбор.
 1. **R141 — пробный цикл.** `stop -t 120` → коды выхода (не `137` у базы, Redis, хранилища векторов) →
    `difywatch` `0/N` → ждать ≥ 2 мин → `start` → сверка R144 за ≤ 10 мин. Ворота: прошёл — есть основной прогон;
    не прошёл — Dify к владельцу (аварийный путь ниже), резерв не трогаем. Худший случай недоступности в пробном
@@ -2017,7 +2027,8 @@ ssh -o BatchMode=yes -o ConnectTimeout=10 <сервер, из разведки �
 `down -v`, `up` (кроме крайней меры ниже, только словом владельца), `restart`, `pull`, `exec`, `run`, `kill`,
 `stop` компоновки Dify и `docker stop` без явного `pcbk-student-NN`, любая запись в `/opt/dify` (`sed -i`, `tee`,
 `>`, `rm`, `mv`, `cp` туда). Перезапуск демона Docker (`systemctl restart docker`) не делается никогда — гасит
-все контейнеры, включая Dify (см. «Один раз»). `docker pause`, блокировка сети к Dify и «выключить только nginx
+все контейнеры, включая Dify (см. «Один раз»). Не читать `.env` Dify целиком и не выводить `Cmd`/`Env`/`Args`/`Config` контейнеров Dify целиком — там его
+секреты; только узкие поля через `docker inspect -f` (как в `snap` и `difywatch`). `docker pause`, блокировка сети к Dify и «выключить только nginx
 Dify» — не считаются «Dify выключен целиком» (R136, отклонено).
 
 ### Команда остановки/включения (R139)
