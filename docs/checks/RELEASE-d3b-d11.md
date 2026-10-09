@@ -80,3 +80,21 @@
 - Весь `tests/integration` одним прогоном на новой голове `57cd8e8` — не повторялся (вне рамок этой правки: прогнан
   только изменившийся модуль `test_bench.py`, см. выше); остальные модули — как в полном прогоне на `5bdd053`.
 - Сервер, историан, деньги, `push` и теги — не трогались, вне рамок этой записи.
+
+## Образы
+
+Собраны из чистого дерева (`git archive`) головы `1f5bed2` (`release/d3b-d11`, worktree `pcbk-reserve-rel11`), по
+регламенту прошлого окна (Д3б–Д7б) — `docker build`, затем `docker save | gzip`; `sha256sum -c` по всем файлам —
+OK, `gzip -t` — OK. `pcbk-probe/tds:d3b` не пересобирался: этим выпуском не менялся.
+
+| образ | id (короткий) | файл | байт |
+| --- | --- | --- | --- |
+| `pcbk-reserve/core:d11a` | `7ab27096e368` | `pcbk-reserve_core_d11a.tar.gz` | 56 571 241 |
+| `pcbk-reserve/watchdog:d11a` | `2b1a8c27dce1` | `pcbk-reserve_watchdog_d11a.tar.gz` | 42 963 870 |
+| `pcbk-reserve/student:d9a` | `77cfa3b1099a` | `pcbk-reserve_student_d9a.tar.gz` | 93 505 342 |
+| статика чата (`PCBK_BUILD=1f5bed216d14`) | — | `chat-1f5bed216d14.tar.gz` | 292 671 |
+
+Слои (`rootfs_layers_sha256`) у `core:d11a`, `watchdog:d11a` и `student:d9a` — те же, что и у образов с этими
+тегами, пересобранных по ходу интеграционных прогонов Д9а/Д11б на предыдущих головах: код `core/`, `watchdog/`,
+`student/` этим выпуском (правка судьи) не менялся. `MANIFEST.txt` и `SHA256SUMS` (id, sha256 файлов, слои) — в
+каталоге сборки на машине разработчика; пути и секреты в журнал не выносятся.
