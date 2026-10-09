@@ -64,10 +64,13 @@ PACKET_ID_RE = re.compile(r"[a-z]{12}")
 # имена моделей и провайдеров финалистов и запасных research/08 §8 (z-ai/glm-5.3, deepseek/deepseek-v4.1-flash,
 # google/gemini-3.8-flash, openai/gpt-6-sol; glm-5.3-flash, gpt-6-luna, anthropic/claude-sonnet-5.5) и их точек
 # (fireworks, together, google-vertex, azure, z-ai; InferenceNet, Novita, DeepInfra, Bedrock — §3); склеенные и
-# вендорские написания (m1 итоговой доводки Д8б): ChatGLM, ZhipuAI, GPT4o
-_MODEL_LATIN = ("chatglm", "glm", "zhipuai", "zhipu", r"z[-.]ai", "deepseek", "gemini", "google", "chatgpt", "gpt",
-                "openai", "codex", "claude", "anthropic", "sonnet", "opus", "sol", "luna", "flash", "mimo", "xiaomi",
-                "fireworks", "azure", "vertex", "together", "inferencenet", "novita", "deepinfra", "bedrock")
+# вендорские написания (m1 итоговой доводки Д8б): ChatGLM, ZhipuAI, GPT4o; прочие вендоры/семейства вне финалистов,
+# на случай смены состава (m14: тот же список — и для id пакетов, см. _ID_MARKERS у pack_batches): llama, qwen,
+# mistral, grok, fable, haiku, zai
+_MODEL_LATIN = ("chatglm", "glm", "zhipuai", "zhipu", r"z[-.]ai", "zai", "deepseek", "gemini", "google", "chatgpt",
+                "gpt", "openai", "codex", "claude", "anthropic", "sonnet", "opus", "sol", "luna", "flash", "mimo",
+                "xiaomi", "fireworks", "azure", "vertex", "together", "inferencenet", "novita", "deepinfra",
+                "bedrock", "llama", "qwen", "mistral", "grok", "fable", "haiku")
 _MODEL_CYRILLIC = ("чатглм", "глм", "чжипу", "дипсик", "джемини", "гемини", "гугл", "чатгпт", "джипити", "гпт",
                    "опенаи", "клод", "антропик", "сонет", "опус", "ксяоми", "сяоми")
 MODEL_WORDS: tuple[str, ...] = _MODEL_LATIN + _MODEL_CYRILLIC
@@ -1472,6 +1475,27 @@ def _write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
+# id пакета — 12 латинских букв (PACKET_ID_RE), сам по себе случайный от соли (m12) и не должен совпасть с именем
+# модели/вендора: один источник со сканером/blind — MODEL_WORDS; из него годятся только буквальные латинские
+# подстроки (кириллица и регэксп-вставка «z[-.]ai» — не подстрока строчных букв id, отфильтрованы сами, re.fullmatch
+# не проходят). m14: иначе совпадение в ~15 % прогонов (случайная строка 12 букв против короткого маркера типа «glm»,
+# «gpt») выглядит слепотой пакета, хоть в нём и нет имени модели.
+_ID_MARKERS: tuple[str, ...] = tuple(w for w in MODEL_WORDS if re.fullmatch(r"[a-z]+", w))
+
+
+def _next_packet_id(salt: str, seed: str, base: str, used: set[str]) -> str:
+    """Первый кандидат _letters(f"{salt}|{seed}|{base}|{n}"), n = 0, 1, …, которого нет в used и который не содержит
+    (без учёта регистра — id уже lower) ни одного маркера _ID_MARKERS; добавляет его в used и возвращает. Пакеты
+    остаются детерминированными по соли — просто перебор n пропускает кандидатов с совпадением."""
+    n = 0
+    while True:
+        pid = _letters(f"{salt}|{seed}|{base}|{n}")
+        if pid not in used and not any(m in pid for m in _ID_MARKERS):
+            used.add(pid)
+            return pid
+        n += 1
+
+
 def _salt_of(judge: Path, seed: str) -> str:
     """Соль id пакетов (m12): из прежней карты того же seed (повторная упаковка даёт те же id), иначе — новая."""
     try:
@@ -1490,7 +1514,8 @@ def pack_batches(out: Path, records: list[RunRecord], cards: CardSet, secrets: I
     карта OUT/judge/map.json. Сканер — до записи: отказанный пакет не пишется, в карте — вид отказа. real_data — только
     с файлом согласия OUT/judge/real-data-consent.txt, иначе RunRefused("consent"). id пакета — от соли карты (salt;
     нет — из прежней карты того же seed или новая случайная, m12): по run_id и именам моделей id не пересчитать, и
-    контрольный пакет по id не узнать."""
+    контрольный пакет по id не узнать; кандидат со случайным совпадением на маркер модели/вендора (_ID_MARKERS, m14)
+    пропускается — id остаётся детерминированным по соли, но слепоты пакета не выдаёт."""
     judge = Path(out) / "judge"
     if real_data:
         _check_consent(judge)
@@ -1503,13 +1528,7 @@ def pack_batches(out: Path, records: list[RunRecord], cards: CardSet, secrets: I
     used: set[str] = set()
 
     def new_id(base: str) -> str:
-        n = 0
-        while True:
-            pid = _letters(f"{salt}|{seed}|{base}|{n}")
-            if pid not in used:
-                used.add(pid)
-                return pid
-            n += 1
+        return _next_packet_id(salt, seed, base, used)
 
     runs: dict[str, dict] = {}
     refused: dict[str, str] = {}

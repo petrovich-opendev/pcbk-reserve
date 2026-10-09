@@ -900,3 +900,41 @@ def test_packet_ids_salted(tmp_path):                                           
     pack_batches(tmp_path / "b", [r], cards(), [], seed="d8-test")                  # другой OUT — другая соль
     other = json.loads((tmp_path / "b" / "judge" / "map.json").read_text())
     assert other["salt"] != first["salt"] and set(other["packets"]) != set(first["packets"])
+
+
+def test_id_markers_cover_required_vendor_names():                               # m14: минимум маркеров задачи
+    from pcbk_bench.judge import _ID_MARKERS
+    required = {"glm", "gpt", "gemini", "deepseek", "claude", "llama", "qwen", "mistral", "grok", "sonnet", "opus",
+                "fable", "haiku", "openai", "google", "zai"}
+    assert required <= set(_ID_MARKERS)
+
+
+def test_packet_id_skips_model_marker_candidate(tmp_path):                       # m14: id пакета без имени модели
+    """Соль «salt1703» подложена так, что кандидат n=0 для записи rec("B1") по умолчанию (place 7, seed «d8-test»)
+    случайно содержит «gpt» (как в прогоне 09.10: случайные id батчей на /z-ai/glm-5.3 и /openai/gpt-6-sol задевали
+    «glm»/«gpt» — не имя модели в самом пакете, Б3 журнал). id пакета должен пропустить этот кандидат и взять
+    следующий — без маркеров _ID_MARKERS; без пропуска (мутация — убрать условие) id остался бы «gpt…», тест красный."""
+    from pcbk_bench.judge import _ID_MARKERS, _letters, run_ref
+    salt, seed = "salt1703", "d8-test"
+    r = rec("B1")
+    base = run_ref(r)
+    candidate0 = _letters(f"{salt}|{seed}|{base}|0")
+    candidate1 = _letters(f"{salt}|{seed}|{base}|1")
+    assert "gpt" in candidate0 and not any(m in candidate1 for m in _ID_MARKERS)      # подлог верен сам по себе
+    pack_batches(tmp_path, [r], cards(), [], seed=seed, salt=salt)
+    pid = next(iter(json.loads((tmp_path / "judge" / "map.json").read_text())["packets"]))
+    assert pid == candidate1                                                         # n=0 пропущен, взят n=1
+    assert not any(m in pid for m in _ID_MARKERS)
+
+
+def test_packet_ids_never_carry_model_marker_at_scale():                         # m14: 2000 id — без маркеров
+    """Без стенда и карточек — сам перебор new_id (_next_packet_id), как в pack_batches: 2000 разных пакетов одной
+    соли, ни один id не несёт маркер модели/вендора. Мутация (убрать проверку маркера) красит тест: на этих же 2000
+    кандидатах необработанные _letters(...) совпадают с маркером несколько раз (не вакуумная проверка)."""
+    from pcbk_bench.judge import _ID_MARKERS, _letters, _next_packet_id
+    used: set[str] = set()
+    ids = [_next_packet_id("fixed-salt-2000", "d8-test", f"pcbk/model-{i}|7|B1|1", used) for i in range(2000)]
+    assert len(ids) == len(set(ids)) == 2000
+    assert not any(m in pid for pid in ids for m in _ID_MARKERS)
+    raw = [_letters(f"fixed-salt-2000|d8-test|pcbk/model-{i}|7|B1|1|0") for i in range(2000)]
+    assert any(m in pid for pid in raw for m in _ID_MARKERS)                         # без пропуска — есть совпадения
