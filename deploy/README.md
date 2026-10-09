@@ -1626,6 +1626,196 @@ pause`, `DRILL_FRESHNESS`, `DRILL_FREEZE_LOOP`, `LLM_RUN_SILENT_S`, правка
 значений — той же командой. Свидетель, который спал, после проверки снова остановлен (`docker stop`). Ни учёток, ни
 томов, ни `DRILL_*` модуль не трогает.
 
+## Резервная копия и восстановление (с Д12)
+
+Копия — на том же сервере, только для своих же аварий (том удалён, файл испорчен, диск не трогая); от потери самого
+сервера или диска она не защищает (раздел «Без резервирования» ниже). Когда — перед каждым обновлением (раздел
+«Выкладка и обновление», п. 1 ниже) и перед каждым окном владельца.
+
+### Размер раньше копии (I-10)
+
+Копия не начинается, если на разделе `/opt` не хватит места: сначала посчитать, сколько займёт копия, и свериться со
+свободным местом. Тома **спящих** мест меряет тот же одноразовый контейнер, что потом их копирует (ниже), только с
+`du` вместо `tar`; работающее место в счёт не входит — у него копии не будет вовсе (строка «работает — в размер не
+входит»).
+
+```bash
+cd /opt/pcbk-reserve
+SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && DD=$(grep '^DATA_DIR=' .env | cut -d= -f2) &&
+need=$(
+  docker exec pcbk-core du -sk /var/lib/pcbk-core /srv/agents
+  du -sk "$SD" "$DD" .env compose.yaml edge
+  for n in $(seq -w 1 10); do
+    docker ps --filter "name=pcbk-student-$n" --format '{{.Names}}' | grep -q . && { echo "0 место-$n-работает"; continue; }
+    docker run --rm --network none --user 10001:10001 \
+      -v "pcbk-student-$n-state:/s:ro" -v "pcbk-student-$n-work:/w:ro" \
+      --entrypoint du pcbk-reserve/student:d9a -sk /s /w
+  done
+) && printf '%s\n' "$need" &&
+total=$(awk '{s+=$1} END{print s+0}' <<<"$need") &&
+read -r avail size < <(df --output=avail,size /opt | tail -n 1) &&
+limit=$((size / 10)); [ "$limit" -lt 5242880 ] && limit=5242880
+if [ $((avail - total)) -ge "$limit" ]; then
+  echo "места достаточно: свободно $avail КиБ, нужно $total КиБ, порог $limit КиБ — копия начинается"
+else
+  echo "МЕСТА НЕ ХВАТАЕТ: свободно $avail КиБ, нужно $total КиБ, порог $limit КиБ — копия НЕ делается; строка владельцу (полный диск — отказ и у баз Dify)"
+fi
+```
+
+Дальше — только если строка «копия начинается».
+
+### Что, куда, как
+
+```bash
+cd /opt/pcbk-reserve && B=/opt/pcbk-reserve/backup/$(date +%Y%m%d-%H%M) && install -d -m 0700 "$B"
+```
+
+| Что | Как | В копии |
+|---|---|---|
+| `core.db` | `sqlite3.backup()` из `file:…/core.db?mode=ro` в `/var/lib/pcbk-core/backup.db`, `docker cp`, удаление временного файла | согласованная копия даже при WAL |
+| агенты, архив, карантин | `tar` каталога `/srv` внутри `core` | от владельца 10003 |
+| секреты | `tar` каталога `SECRETS_DIR` снаружи | ключи, пароли, `bdrv.env` |
+| `.env`, `compose.yaml*`, `edge/`, `DATA_DIR` | `tar` от пользователя выкладки | белый список — производственные данные |
+| разговоры **спящих** мест | одноразовый контейнер образа места, том только на чтение | OpenCode пишет SQLite — читается только у спящего |
+| не входит | `key.pem` (root, берётся заново у Dify), журнал сторожа | |
+
+```bash
+# core.db — согласованная копия даже при WAL
+docker exec pcbk-core python -c '
+import sqlite3
+src = sqlite3.connect("file:/var/lib/pcbk-core/core.db?mode=ro", uri=True)
+dst = sqlite3.connect("/var/lib/pcbk-core/backup.db")
+with dst:
+    src.backup(dst)
+dst.close(); src.close()'
+docker cp pcbk-core:/var/lib/pcbk-core/backup.db "$B/core.db"
+docker exec pcbk-core rm /var/lib/pcbk-core/backup.db
+
+# агенты, архив, карантин — от владельца 10003
+docker exec pcbk-core tar -C /srv -cf - agents > "$B/agents.tar"
+
+# секреты
+SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) &&
+tar -C "$(dirname "$SD")" -cf "$B/secrets.tar" "$(basename "$SD")"
+
+# .env, compose.yaml и его прежние копии отката, edge/, DATA_DIR
+DD=$(grep '^DATA_DIR=' .env | cut -d= -f2) &&
+files=(.env compose.yaml edge "$DD") &&
+for f in compose.yaml.*; do [ -e "$f" ] && files+=("$f"); done &&
+tar -cf "$B/config.tar" "${files[@]}"
+
+# разговоры спящих мест; работающее — пропуск со строкой в manifest.txt
+for n in $(seq -w 1 10); do
+  if docker ps --filter "name=pcbk-student-$n" --format '{{.Names}}' | grep -q .; then
+    echo "место $n работает — копии нет" >> "$B/manifest.txt"; continue
+  fi
+  docker run --rm --network none --user 10001:10001 \
+    -v "pcbk-student-$n-state:/s:ro" -v "pcbk-student-$n-work:/w:ro" \
+    --entrypoint tar pcbk-reserve/student:d9a -cf - /s /w > "$B/student-$n.tar"
+done
+```
+
+**Проверка** — обязательна перед тем, как копию можно считать годной:
+
+```bash
+# PRAGMA integrity_check — читает уже снятую копию, без сети и без доступа к текущим данным тома
+docker run --rm --network none --user 10003:10003 -v "$B:/b:ro" --entrypoint python pcbk-reserve/core:d11a -c '
+import sqlite3
+c = sqlite3.connect("file:/b/core.db?mode=ro", uri=True)
+print(c.execute("PRAGMA integrity_check").fetchone()[0])'
+```
+Ожидается `ok`.
+
+```bash
+for f in "$B"/*.tar; do tar -tf "$f" > /dev/null && echo "$f ok" || echo "$f ПОВРЕЖДЁН — копию повторить"; done
+```
+
+```bash
+cd "$B" &&
+for f in *; do [ "$f" = manifest.txt ] && continue
+  printf '%s %s %s\n' "$(stat -c %s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
+done >> manifest.txt &&
+chmod 0600 "$B"/* && chmod 0700 "$B"
+```
+
+**Хранятся две последние копии.** После того как новая проверена, старые свои каталоги `backup/<ГГГГММДД-ЧЧММ>`,
+кроме двух последних, удаляются:
+```bash
+ls -1d /opt/pcbk-reserve/backup/2*/ | head -n -2 | while read -r old; do
+  echo "удаляю старую копию: $old"; rm -rf "$old"
+done
+```
+Копия не покидает сервер (перенос вовне — решение владельца, вопрос 8).
+
+### Восстановление — ничего не удаляется, текущее уходит в сторону
+
+`B` — каталог нужной копии (`/opt/pcbk-reserve/backup/<ГГГГММДД-ЧЧММ>`), `T` — одна метка времени на весь заход.
+
+**`core.db`:**
+```bash
+cd /opt/pcbk-reserve && B=<каталог копии> && docker compose stop core && T=$(date -u +%Y%m%dT%H%M%SZ)
+docker run --rm --network none --user 0 \
+  -v pcbk-reserve_pcbk-core-data:/d \
+  -v "$B/core.db:/src/core.db:ro" \
+  --entrypoint sh pcbk-reserve/core:d11a -c \
+  "mkdir -p /d/before-restore-$T && for f in core.db core.db-wal core.db-shm; do [ -e /d/\$f ] && mv /d/\$f /d/before-restore-$T/; done; chown -R 10003:10003 /d/before-restore-$T; cp /src/core.db /d/core.db && chown 10003:10003 /d/core.db && chmod 0600 /d/core.db"
+docker compose up -d --no-build core
+curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["stale"])'
+docker exec pcbk-core python -m pcbk_core.gateway.accounts list
+```
+Ожидается: `stale` → `False`; `accounts list` — прежние учётки и закрепления мест. Том не создавался отдельно: если
+он был удалён целиком, `docker run -v` заводит его пустым сам, и команда выше заполняет его той же копией.
+`before-restore-$T/` на томе — данные, не удалять без решения владельца.
+
+**Агенты — из той же копии, обменом каталогов** (корень `/srv/agents` у `core` — только для чтения, пишется лишь
+сама привязка; распаковка — рядом, не на место):
+```bash
+RT=restore-$T && BR=before-restore-$T &&
+docker exec -i pcbk-core sh -c "mkdir /srv/agents/.$RT && tar -C /srv/agents/.$RT -xf -" < "$B/agents.tar"
+for n in $(seq -w 1 10); do
+  docker exec pcbk-core sh -c "[ -e /srv/agents/.$RT/agents/student-$n ]" || continue
+  docker exec -u 10003 pcbk-core sh -c "
+    mkdir -p /srv/agents/.$BR &&
+    { [ ! -e /srv/agents/student-$n ] || mv /srv/agents/student-$n /srv/agents/.$BR/student-$n; } &&
+    mv /srv/agents/.$RT/agents/student-$n /srv/agents/student-$n"
+  docker exec pcbk-core python -m pcbk_core.agents.admin reload --place "${n#0}"
+  docker exec pcbk-core python -m pcbk_core.agents.admin list --place "${n#0}"
+done
+```
+Ожидается у каждого восстановленного места — последняя строка `list` «расхождений нет» (не сразу: перезагрузка идёт,
+когда на месте стихнет ход — раздел «Файл агента вручную»). `.restore-*` и `.before-restore-*` — данные студентов,
+удаляются только решением владельца.
+
+**Секреты** — распаковать рядом, сравнить, заменить только недостающее:
+```bash
+cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && RS="${SD}.restore-$T" &&
+mkdir -m 0700 "$RS" && tar -C "$RS" -xf "$B/secrets.tar" &&
+diff -rq "$SD" "$RS/$(basename "$SD")"
+```
+Для каждого файла из вывода `diff` вида «Only in `$RS/<имя SD>`: …» (в `$SD` его не хватает) — вернуть сам файл:
+```bash
+cp -p "$RS/$(basename "$SD")/<имя файла>" "$SD/" && docker compose up -d --no-build --force-recreate core
+```
+Новый файл токена (не просто восстановленный прежний) — пересоздание `core`, а если менялся токен места — и самого
+места («Пересоздание мест с сохранением томов»). Каталог `$RS` — данные, удаляется только решением владельца.
+
+**Том места** — восстанавливается только у спящего (у работающего места копии не было вовсе — см. manifest.txt
+копии); потерянный том — завести как в «Рабочие места», п. 1, затем распаковать:
+```bash
+n=<NN, номер места> &&
+docker volume create --label pcbk.role=student "pcbk-student-$n-state" &&
+docker volume create --label pcbk.role=student "pcbk-student-$n-work" &&
+docker run --rm --network none --user 0 \
+  -v "pcbk-student-$n-state:/s" -v "pcbk-student-$n-work:/w" \
+  -v "<каталог копии>/student-$n.tar:/src.tar:ro" \
+  --entrypoint sh pcbk-reserve/student:d9a -c "tar -C / -xf /src.tar && chown -R 10001:10001 /s /w"
+```
+
+### Без резервирования (принятый риск постановки)
+
+Копия лежит на том же сервере, что данные: от потери самого сервера или его диска она не спасает. Это принятый
+риск постановки, не дефект процедуры.
+
 ## Прогон без Dify (с Д12)
 
 Критерий успеха 3 постановки: **«Dify выключен целиком — контур работает»**. Резерв (этот стенд) ничем не
@@ -1856,6 +2046,58 @@ $(cat dify.ids)` в журнал; код `137` у базы, Redis или хра�
 владелец, сессия логов Dify не выводит), решение — владельца. Крайняя мера — `… up -d --no-recreate --pull never
 --no-build` (создаёт только отсутствующие контейнеры, без выхода в интернет) — только словом владельца.
 
+## После перезагрузки сервера (с Д12)
+
+[Д] — живой перезагрузкой хоста не проверено; ниже — ожидание по политике `restart: unless-stopped`, которая стоит
+у всех служб `compose.yaml` (`docker compose config` — читать, не поднимать).
+
+**Что поднимается само** — при условии, что демон Docker сам встаёт при загрузке хоста (это проверяется один раз,
+раздел «Один раз», и дальше не трогается): `edge`, `watchdog`, `sp-ro`, `sp-ctl`, `core` — они были в состоянии
+«работает» перед выключением, и Engine возвращает такие контейнеры при своём старте; `unless-stopped` не поднимает
+только то, что было явно остановлено (`docker stop`) до выключения. Рабочие места, которые спали до перезагрузки,
+спящими и останутся — это ожидаемо: разбудит их следующий вход студента или преподавателя. Место, которое было
+разбужено в момент перезагрузки, вернётся запущенным — с тем же логином, но без разговора в памяти процесса
+OpenCode (сам разговор и агенты на томах не теряются).
+
+**Проверка:**
+```bash
+curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["stale"], [c["component"]+":"+c["state"] for c in d["checks"] if c["state"] != "ok"])'
+docker compose ps
+```
+Ожидается: `False []` (ничего не красное, кроме допустимых строк — раздел «Перед занятием»); у нужных служб в
+`docker compose ps` — `State` `running`.
+
+**Не поднялось** — то же первое действие, что у любой красной строки контейнера (раздел «Перед занятием»): для
+каждой отсутствующей службы — `docker compose up -d --no-build <имя службы>`, по имени, никогда без имён (без имён
+служб команда создаёт ещё и профиль `students`, которого в обычной выкладке нет в этой команде). Рабочие места эта
+команда не поднимает — профиль `students` только создаёт их, не запускает (раздел «Рабочие места»); спящее место
+будит вход, место, работавшее до перезагрузки, — только `docker start pcbk-student-NN`, если само не поднялось.
+
+## Порт 3389 (с Д12)
+
+**Решается в окне В4 плана Д12в — на момент этой правки ещё не проведено.** Ниже — форма по решению Д12-R145: что
+окно сделает и как вернуть; факты о текущем сервере (слушает ли сейчас 3389, включён ли `xrdp`, точный текст
+правила `ufw`) появляются только после разведки А1 и самого окна — здесь заранее не предполагаются.
+
+Выбирает заказчик (через владельца) один из трёх вариантов; исходный текст снимаемого правила — дословно из
+`sudo ufw show added`, записывается в окне, до снятия.
+
+- **Вариант А — выключить `xrdp`** (рекомендация, если подключений за 30 дней не было): `sudo systemctl disable
+  --now xrdp xrdp-sesman`; правило, если было, — `sudo ufw delete <исходный текст из "ufw show added">` (снимает
+  сразу v4 и v6). Проверка: `ss -ltnH '( sport = :3389 )'` — пусто; `systemctl is-enabled xrdp xrdp-sesman` —
+  `disabled`; **новое** SSH-соединение входит, текущее не закрывается. Возврат: `sudo systemctl enable --now xrdp
+  xrdp-sesman`; `sudo ufw <исходный текст правила>`.
+- **Вариант Б — только `127.0.0.1`** (если RDP всё же нужен): копия `xrdp.ini` в `xrdp.ini.pre-d12`, в рабочей —
+  `port=tcp://127.0.0.1:3389`, `sudo systemctl restart xrdp`; правило `ufw` снимается тем же `delete <исходный
+  текст>`. Доступ к RDP — туннелем: `ssh -L 13389:127.0.0.1:3389 <сервер>`. Возврат: вернуть `xrdp.ini.pre-d12`,
+  `sudo systemctl restart xrdp`, `sudo ufw <исходный текст правила>`.
+- **Вариант В — не закрывать.** Ничего не меняется на сервере; этот раздел тогда и остаётся отметкой «не закрыто
+  по решению заказчика», без команд выше.
+
+Во всех вариантах: правило **22** не трогается, пакет `xrdp` не удаляется, текущая SSH-сессия не закрывается, пока
+новая не подтверждена. После окна здесь появляется: дата, какой вариант выбран, дословное согласие заказчика (роль,
+без имени), результат проверки — со ссылкой на `docs/checks/D12c.md`.
+
 ## Что открывается наружу
 
 - Порт **8443** контейнера `edge` — Docker публикует его **в обход ufw**.
@@ -1895,6 +2137,17 @@ $(cat dify.ids)` в журнал; код `137` у базы, Redis или хра�
   которого байт приходит чаще раза в 10 с, срок между чтениями не обрывает:
   такое соединение держит слот сколько угодно. Окончательно — предел по адресу
   клиента после замера `$remote_addr` на сервере (Б7).
+- **Экран сети выхода `pcbk-egress` — предложение (с Д12), по умолчанию не применяется.** Сеть `pcbk-egress`
+  сейчас открывает с `core` любой адрес (строка «Сеть выхода», раздел «Служба данных»): направления держит только
+  охрана выхода в процессе (Д3б), не сетевой экран — остаточный риск Д3а. Готовое решение (не применено, решает
+  заказчик отдельным «да», окно В4, вопрос 9) — блок `*filter … COMMIT` в `/etc/ufw/after.rules` по образцу
+  ufw-docker, только на интерфейсе `pcbk-egress`: пропускает уже установленные соединения, DNS и историан по их
+  адресам, HTTPS (443) кроме частных сетей (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) — и запрещает
+  остальное; плюс `sudo ufw insert 1 deny in on pcbk-egress`. Откат — снять блок, `sudo ufw reload`, `sudo ufw
+  delete deny in on pcbk-egress`. Проверка после применения — строки «Служба данных» и «LLM-прокси и бюджет» в
+  норме, и одноразовым контейнером образа `core` в сети `pcbk-egress`: адрес OpenRouter резолвится и открыт на 443,
+  историан открыт на своём порту, посторонние адреса и DNS вне списка — закрыты. Применено или нет — здесь
+  появится после окна В4 (тот же `docs/checks/D12c.md`).
 
 ## Замена сертификата
 
