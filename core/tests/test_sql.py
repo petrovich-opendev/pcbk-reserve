@@ -8,10 +8,11 @@ from pathlib import Path
 import pytest
 
 import pcbk_core.data.sql as sql_module
-from pcbk_core.data.sql import (DATE_FMT, HAS_LAST, MAX_NAMES, PIN_INTERPOLATION, SHAPE, SUMMARY_COLUMNS,
-                                TEMPLATE_FORMS, SummaryShape, allowed_literal, catalog_sql, clock_sql, lit_dt,
-                                lit_name, literals, live_all_sql, live_sql, names_in, plain, scan_literals,
-                                summary_form, summary_sql, template_of)
+from pcbk_core.data.sql import (DATE_FMT, HAS_LAST, MAX_NAMES, PIN_INTERPOLATION, SERIES_COLUMNS, SERIES_MAX_POINTS,
+                                SERIES_MAX_TAGS, SERIES_MIN_POINTS, SHAPE, STATE_COLUMNS, SUMMARY_COLUMNS,
+                                TEMPLATE_FORMS, WW_CONSTANTS, SummaryShape, allowed_literal, catalog_sql, clock_sql,
+                                lit_dt, lit_name, literals, live_all_sql, live_sql, names_in, plain, scan_literals,
+                                series_sql, state_sql, summary_form, summary_sql, template_of)
 
 SAMPLES = [clock_sql(), catalog_sql(), live_all_sql(), live_sql(["20FAKE_001_PV", "20FAKE_002_SP"])]
 
@@ -183,8 +184,94 @@ def test_bad_probe_constants_fail_at_import(tmp_path, line, bad):
 
 
 def test_pin_outside_ww_constants_refused():
-    for bad in ("Delta", "STAIRSTEP' OR 1=1 --"):
+    for bad in ("Delta", "STAIRSTEP' OR 1=1 --", "Cyclic"):            # Cyclic — режим ряда (ревью А2, m-3)
         with pytest.raises(ValueError):
             summary_form(SummaryShape(pin=bad))
         with pytest.raises(ValueError):
             summary_sql(["20FAKE_001_PV"], T6, T14, SummaryShape(pin=bad))
+
+
+# Д9а, задача А2: ряд на сетке Cyclic и наработка StateSummaryHistory (Д9-R84, Д9-R85)
+
+S, E = datetime(2026, 10, 1, 4), datetime(2026, 10, 1, 12)
+
+
+def test_series_sql_form():                                                       # Review Focus 1
+    sql = series_sql(["20FAKE_001_PV", "20FAKE_004_PV"], S, E, 24)
+    assert sql == ("SELECT TagName, DateTime, Value, Quality FROM AnalogHistory WHERE TagName IN ('20FAKE_001_PV', "
+                   "'20FAKE_004_PV') AND DateTime >= '2026-10-01 04:00:00.000' AND DateTime <= "
+                   "'2026-10-01 12:00:00.000' AND wwRetrievalMode = 'Cyclic' AND wwCycleCount = 24")
+    assert template_of(sql) == "series" and plain(sql)
+    assert literals(sql)[-1] == "Cyclic" and allowed_literal("Cyclic")
+
+
+def test_state_sql_form():
+    sql = state_sql(["25FAKE_007_CLS"], datetime(2026, 9, 30), datetime(2026, 10, 1))
+    assert sql == ("SELECT TagName, vValue, StateTimeTotal, StateTimePercent, StateCount FROM StateSummaryHistory "
+                   "WHERE TagName IN ('25FAKE_007_CLS') AND StartDateTime >= '2026-09-30 00:00:00.000' "
+                   "AND EndDateTime <= '2026-10-01 00:00:00.000' AND wwCycleCount = 1")
+    assert template_of(sql) == "state"
+
+
+@pytest.mark.parametrize("points", [0, 1, 97, -1])
+def test_series_points_out_of_range(points):
+    with pytest.raises(ValueError):
+        series_sql(["20FAKE_001_PV"], S, E, points)
+
+
+def test_new_forms_reject_variants():                                             # Review Focus 1
+    base = series_sql(["20FAKE_001_PV"], S, E, 24)
+    state = state_sql(["25FAKE_007_CLS"], S, E)
+    for bad in (base.replace("wwCycleCount = 24", "wwCycleCount = 97"), base.replace("'Cyclic'", "'Full'"),
+                base + " OR 1 = 1", base.replace("TagName IN", "TagName NOT IN"),
+                base.replace(" AND wwRetrievalMode", " AND wwResolution = 60000 AND wwRetrievalMode"),
+                base + "; SELECT 1", state.replace("wwCycleCount = 1", "wwCycleCount = 2"),
+                state.replace("StateSummaryHistory", "AnalogSummaryHistory")):
+        assert template_of(bad) is None, bad
+
+
+# сверх брифа: форма ряда — ровно числа 2–96 без нулей впереди, строкой и логическим SQL не строится;
+# столбцы, представления и имена — те же правила, что у live и сводки
+
+
+def test_series_form_points_exactly_two_to_ninety_six():
+    base = series_sql(["20FAKE_001_PV"], S, E, 24)
+    good = [n for n in range(-5, 200) if template_of(base.replace("wwCycleCount = 24", f"wwCycleCount = {n}"))]
+    assert good == list(range(SERIES_MIN_POINTS, SERIES_MAX_POINTS + 1)) == list(range(2, 97))
+    for bad in ("024", "2.0", "1e1", "24 ", " 24", "+24", "٢٤"):
+        assert template_of(base.replace("wwCycleCount = 24", f"wwCycleCount = {bad}")) is None, bad
+    for bad_points in ("24", 24.0, True):
+        with pytest.raises(ValueError):
+            series_sql(["20FAKE_001_PV"], S, E, bad_points)
+
+
+def test_new_templates_names_and_columns():
+    assert (SERIES_COLUMNS, STATE_COLUMNS) == (("DateTime", "Value", "Quality"),
+                                               ("vValue", "StateTimeTotal", "StateTimePercent", "StateCount"))
+    assert WW_CONSTANTS == {"STAIRSTEP", "Cyclic"} and not allowed_literal("cyclic") and not allowed_literal("Full")
+    four = [f"20FAKE_{i:03d}_PV" for i in range(SERIES_MAX_TAGS)]
+    assert names_in(series_sql(four, S, E, 72)) == tuple(four)
+    assert template_of(state_sql([f"25FAKE_{i:03d}_CLS" for i in range(MAX_NAMES)], S, E)) == "state"
+    for bad in ([], "20FAKE_001_PV", four + ["20FAKE_099_PV"]):
+        with pytest.raises(ValueError):
+            series_sql(bad, S, E, 24)
+    for bad in ([], "25FAKE_007_CLS", [f"25FAKE_{i:03d}_CLS" for i in range(MAX_NAMES + 1)]):
+        with pytest.raises(ValueError):
+            state_sql(bad, S, E)
+    with pytest.raises(ValueError):
+        series_sql(["20FAKE_001_PV' OR 1=1 --"], S, E, 24)
+    with pytest.raises(ValueError):
+        state_sql(["25FAKE_007_CLS"], S.replace(tzinfo=timezone.utc), E)
+    for s in (series_sql(["20FAKE_001_PV"], S, E, 24), state_sql(["25FAKE_007_CLS"], S, E)):
+        assert not re.search(r"\?|%s|@|;|\bLIKE\b|\bOR\b", s) and not re.search(r"\bww\w+\s+IN\b", s)
+
+
+def test_series_form_names_not_more_than_series_max_tags():     # итоговое ревью Д9а, m-3: ворота — как series_sql
+    four = [f"20FAKE_{i:03d}_PV" for i in range(SERIES_MAX_TAGS)]
+    sql = series_sql(four, S, E, 72)
+    assert template_of(sql) == "series"
+    five = sql.replace("'20FAKE_003_PV')", "'20FAKE_003_PV', '20FAKE_004_PV')")
+    sixteen = sql.replace("'20FAKE_003_PV')", ", ".join(f"'20FAKE_{i:03d}_PV'" for i in range(3, MAX_NAMES)) + ")")
+    for bad in (five, sixteen):
+        assert bad != sql and template_of(bad) is None
+    assert template_of(live_sql([f"20FAKE_{i:03d}_PV" for i in range(MAX_NAMES)])) == "live"   # live — по-прежнему 16

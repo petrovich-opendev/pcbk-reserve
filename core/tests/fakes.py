@@ -44,6 +44,17 @@ SUMMARY = {
     "20FAKE_002_SP": {"Minimum": None, "Maximum": None, "Average": None, "StdDev": None, "PercentGood": 0.0,
                       "Last": None, "LastDateTime": None},
 }
+# ряд AnalogHistory на сетке (Д9-R86): имя → (DateTime, Value, Quality) за любой период и любое число точек
+SERIES = {
+    "20FAKE_001_PV": [(datetime(2026, 10, 1, 4), 10.0, 0), (datetime(2026, 10, 1, 8), 15.0, 0),
+                      (datetime(2026, 10, 1, 12), 12.5, 0)],
+    "20FAKE_004_PV": [(datetime(2026, 10, 1, 4), None, 0), (datetime(2026, 10, 1, 8), 3.2, 64),
+                      (datetime(2026, 10, 1, 12), 3.4, 0)],
+}
+# наработка StateSummaryHistory: имя → (vValue, StateTimeTotal мс, StateTimePercent, StateCount); последняя — шум
+STATES = {
+    "25FAKE_007_CLS": [(1.0, 64_800_000, 75.0, 3), (0.0, 21_600_000, 25.0, 3), (None, 0, 0.0, 0)],
+}
 
 
 def auth_operational_error(msg_no: int, text: str = "Login failed") -> pytds.OperationalError:
@@ -136,6 +147,13 @@ _LIVE_IN = re.compile(r"SELECT TagName, DateTime, Value, Quality FROM Live WHERE
 _SUMMARY_IN = re.compile(r"SELECT TagName, (?P<columns>\w+(?:, \w+)*) FROM AnalogSummaryHistory "
                          r"WHERE TagName IN \((?P<names>'[^()]*')\) AND StartDateTime >= '[^']*' "
                          r"AND EndDateTime <= '[^']*' AND wwCycleCount = 1(?: AND wwInterpolationType = '[^']*')?")
+# ряд и наработка (Д9-R86): даты — любые литералы, wwCycleCount ряда — любое число (двойник его не толкует)
+_SERIES_IN = re.compile(r"SELECT TagName, DateTime, Value, Quality FROM AnalogHistory "
+                        r"WHERE TagName IN \((?P<names>'[^()]*')\) AND DateTime >= '[^']*' AND DateTime <= '[^']*' "
+                        r"AND wwRetrievalMode = 'Cyclic' AND wwCycleCount = [0-9]+")
+_STATE_IN = re.compile(r"SELECT TagName, vValue, StateTimeTotal, StateTimePercent, StateCount FROM StateSummaryHistory "
+                       r"WHERE TagName IN \((?P<names>'[^()]*')\) AND StartDateTime >= '[^']*' "
+                       r"AND EndDateTime <= '[^']*' AND wwCycleCount = 1")
 
 
 class FakeHistorian:
@@ -155,6 +173,8 @@ class FakeHistorian:
         self.live: dict[str, tuple[datetime, float | None, int]] = {r[0]: r[1:] for r in LIVE_ROWS}
         self.clock: list[Row] = list(CLOCK_ROWS)
         self.summary: dict[str, dict] = {name: dict(row) for name, row in SUMMARY.items()}
+        self.series: dict[str, list[tuple]] = {name: list(rows) for name, rows in SERIES.items()}
+        self.states: dict[str, list[tuple]] = {name: list(rows) for name, rows in STATES.items()}
         self._active = 0
         self._lock = threading.Lock()
 
@@ -192,4 +212,14 @@ class FakeHistorian:
             if not all(c in row for row in self.summary.values() for c in columns):
                 raise AssertionError("двойник историана: столбец сводки вне SUMMARY")
             return [(name, *(self.summary[name][c] for c in columns)) for name in names if name in self.summary]
+        if m := _SERIES_IN.fullmatch(sql):
+            return self._rows_of(self.series, m.group("names"))
+        if m := _STATE_IN.fullmatch(sql):
+            return self._rows_of(self.states, m.group("names"))
         raise AssertionError("двойник историана: SQL вне шаблонов службы")
+
+    @staticmethod
+    def _rows_of(table: dict[str, list[tuple]], names_sql: str) -> list[Row]:
+        """Строки запрошенных имён как есть, в порядке имён в SQL и строк в таблице."""
+        names = [lit.replace("''", "'") for lit in _LIT.findall(names_sql)]
+        return [(name, *row) for name in names for row in table.get(name, ())]

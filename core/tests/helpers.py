@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +27,7 @@ import pytest
 import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel
@@ -43,17 +44,21 @@ from pcbk_core.data.service import DataService
 from pcbk_core.data.sql import catalog_sql, clock_sql, live_all_sql, names_in
 from pcbk_core.gateway import GatewayRole
 from pcbk_core.gateway.accounts import AccountStore
+from pcbk_core.gateway.api import COOKIE
 from pcbk_core.gateway.places import SpCtl, Workplaces
 from pcbk_core.gateway.stats import GatewayStats
 from pcbk_core.hooks import hooks_of
 from pcbk_core.llm import LlmRole
 from pcbk_core.llm.ledger import Ledger
+from pcbk_core.llm.shares import Shares
 from pcbk_core.llm.upstream import Upstream
 from pcbk_core.secrets import BdrvConfig, TokenTable, key_fingerprint
 from pcbk_core.settings import GatewaySettings, LlmSettings, Settings
 
 # каталог core/: из него подпроцессы импортируют pcbk_core
 CORE_DIR = Path(__file__).resolve().parent.parent
+# корень репозитория: compose.yaml, bench/ (Д8а)
+REPO = CORE_DIR.parent
 
 _files = itertools.count(1)
 
@@ -81,6 +86,18 @@ for _name, _file in (("LLM_TOKENS_FILE", "llm-tokens"), ("OPENROUTER_KEY_FILE", 
                      ("OPENROUTER_MGMT_KEY_FILE", "openrouter-mgmt.key")):
     (SESSION_DIR / _file).write_text("", encoding="utf-8")
     LLM_ENV[_name] = str(SESSION_DIR / _file)
+
+# тормоз прогона (Д11-R117): двойники /proc для ролей llm тестов — свободно 8000 из 16000 МиБ, swap свободен, убийств и
+# давления нет. Настоящий /proc машины тестов в тормоз не идёт: её память и убийства — не повод для 402 в тестах Д8
+BRAKE_PROC: dict[str, str] = {}
+for _name, _file, _text in (
+        ("LLM_RUN_MEMINFO", "meminfo",
+         "MemTotal: 16384000 kB\nMemAvailable: 8192000 kB\nSwapTotal: 4194304 kB\nSwapFree: 4194304 kB\n"),
+        ("LLM_RUN_VMSTAT", "vmstat", "oom_kill 0\n"),
+        ("LLM_RUN_PRESSURE", "pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                                         "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")):
+    (SESSION_DIR / f"brake-{_file}").write_text(_text, encoding="utf-8")
+    BRAKE_PROC[_name] = str(SESSION_DIR / f"brake-{_file}")
 
 # тестовые токены LLM — не 48 шестнадцатеричных знаков (шаблон проверки на секреты)
 LLM_TOKEN = "test-llm-token-student-01"
@@ -385,20 +402,30 @@ def auth(token: str | None, session: str | None = None, parent: str | None = Non
 
 
 def make_llm_role(tmp_path, fake=None, *, key: str | None = "test-openrouter-key", mgmt: str | None = None,
-                  wallclock: Callable[[], datetime] | None = None, **llm_overrides) -> LlmRole:
+                  wallclock: Callable[[], datetime] | None = None, shares: bool = False, shares_drill: str = "",
+                  **llm_overrides) -> LlmRole:
     """Роль llm на двойнике OpenRouter (fake — фикстура fake_or): журнал — tmp_path/core.db, открыт, как в
-    lifespan; LlmSettings — replace без проверок from_env; таблица из двух токенов; дозапрос цены — 3 × 0,01 с."""
+    lifespan; LlmSettings — replace без проверок from_env; таблица из двух токенов; дозапрос цены — 3 × 0,01 с.
+
+    shares (Д10а, задача А2) — доли мест Shares на том же core.db (бюджет и доля по умолчанию — из LlmSettings, учение —
+    shares_drill), как в build_llm_role. Доли не открыты: их открывает lifespan роли — так тест «доли не загрузились»
+    проверяет настоящий путь.
+
+    Тормоз прогона (Д11а): пути /proc — двойники BRAKE_PROC, если тест не задал свои LLM_RUN_MEMINFO/VMSTAT/PRESSURE."""
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
+    llm_overrides = {**BRAKE_PROC, **llm_overrides}
     if fake is not None:
         llm_overrides = {"OPENROUTER_BASE_URL": fake.url, **llm_overrides}
     llm = replace(LLM_SETTINGS, **llm_overrides)
     settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
     clock = {} if wallclock is None else {"wallclock": wallclock}
     upstream = Upstream(llm.OPENROUTER_BASE_URL, key, mgmt, drill=llm.DRILL_LLM) if key else None
+    places_shares = (Shares(settings.DB_PATH, total_usd=llm.LLM_TOTAL_USD, default_usd=llm.LLM_SHARE_USD,
+                            drill=shares_drill) if shares else None)
     role = LlmRole(settings, llm, tokens=LLM_TOKENS, upstream=upstream, ledger=Ledger(settings.DB_PATH, **clock),
                    key_fingerprint=key_fingerprint(key) if key else None, cost_retry_delays=(0.01, 0.01, 0.01),
-                   **clock)
+                   shares=places_shares, **clock)
     assert role.ledger.open(), role.ledger.last_error
     return role
 
@@ -415,6 +442,14 @@ def make_llm_app(tmp_path, fake=None, **kw) -> tuple[FastAPI, LlmRole]:
 
 # тестовый пароль учёток: не секрет, 10 знаков — проходит PASSWORD_MIN
 PW = "пароль-123"
+
+
+class Secret(str):
+    """Порождённый пароль в тестах (Д10б, m-14): значение — как у строки, repr — без значения: pytest печатает
+    аргументы упавшего assert через repr. Копия класса tests/integration/secret.py (core/tests его не видит)."""
+
+    def __repr__(self) -> str:
+        return "<скрыт>"
 
 
 def store(tmp_path, **kw) -> AccountStore:
@@ -512,19 +547,25 @@ def ready_place(workplaces: Workplaces, docker: FakeDocker, n: int) -> None:
 BDRV_CFG = BdrvConfig("h", 1433, "Runtime", "u", "p")
 # публичный origin страницы входа в тестах (GW_ORIGIN)
 ORIGIN = "https://stand.test:8443"
+# заголовки источника записи со своей страницы — у POST ручек шлюза (Д11а, тормоз прогона: вход студента и кабинет)
+ORIGIN_HEADERS = {"Origin": ORIGIN}
 
 
 def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),
                  stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
-                 accounts: bool = True, agents_root: Path | None = None, **gw_overrides) -> GatewayRole:
+                 accounts: bool = True, agents_root: Path | None = None, calc: DataService | None = None,
+                 llm: LlmRole | None = None, **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
-    GatewaySettings (без проверок from_env). stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
+    GatewaySettings (без проверок from_env), в том числе учения DRILL_GATEWAY, DRILL_AGENTS и DRILL_TEACHER (Д10а, m-6).
+    stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
 
     tmp_path создаётся; база — db_path или tmp_path/core.db. accounts — завести отдельным AccountStore с open()
     учётки stu-03 (место 3), stu-05 (место 5) и teach (преподаватель), у всех пароль PW; иначе база заранее не
     открывается. Места из ready работают в двойнике Docker и готовы без пробуждения: первый такт их не трогает.
     Корень агентов (Settings.AGENTS_ROOT, Д7а, предпроверка П3) — agents_root как есть, по умолчанию
     tmp_path/agents, подготовленный make_agents_root: воркер перезагрузки проверяет каталог первым тактом.
+    calc — служба данных калькуляторов страницы (Д9-R87, обычно make_service), None — маршрут отвечает 503.
+    llm — роль LLM-прокси с долями мест (Д10а, задача А2: make_llm_role(…, shares=True)), None — шлюз без неё.
     Роли для тестов добавлены fake_docker, fake_places, mono.
     """
     tmp_path = Path(tmp_path)
@@ -549,7 +590,8 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
         ready_place(workplaces, docker, n)
     role = GatewayRole(replace(SETTINGS, DB_PATH=str(db), AGENTS_ROOT=str(root)), gw,
                        store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S), workplaces=workplaces, stats=stats,
-                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s)
+                       config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s, calc=calc,
+                       llm=llm)
     role.fake_docker, role.fake_places, role.mono = docker, oc, mono
     return role
 
@@ -570,11 +612,78 @@ def make_gateway(tmp_path, **kw) -> tuple[FastAPI, GatewayRole]:
     return app, role
 
 
+# разговор места 03 для кабинета преподавателя (Д10а, задача А3): один вопрос и один ответ, вид — как у
+# web/tests/chatGateway.ts (OpenCode 1.18.33); теги — только 20FAKE_*
+TEACHER_SES = "ses_" + "teacher0123456789abcdefgh".ljust(26, "Z")
+TEACHER_SESSION = {"id": TEACHER_SES, "slug": "s", "projectID": "p", "directory": "/work",
+                   "title": "Значение 20FAKE_001_PV", "version": "1.18.33", "time": {"created": 1, "updated": 3}}
+TEACHER_HISTORY = [
+    {"info": {"id": "msg_t1", "sessionID": TEACHER_SES, "role": "user", "time": {"created": 1}, "agent": "pomoshnik",
+              "model": {"providerID": "openrouter", "modelID": "m"}},
+     "parts": [{"id": "prt_msg_t1", "sessionID": TEACHER_SES, "messageID": "msg_t1", "type": "text",
+                "text": "что сейчас на 20FAKE_001_PV"}]},
+    {"info": {"id": "msg_t2", "sessionID": TEACHER_SES, "role": "assistant", "time": {"created": 2, "completed": 3},
+              "parentID": "msg_t1", "modelID": "m", "providerID": "openrouter", "mode": "pomoshnik",
+              "agent": "pomoshnik", "path": {"cwd": "/work", "root": "/work"}, "cost": 0,
+              "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "finish": "stop"},
+     "parts": [{"id": "prt_msg_t2", "sessionID": TEACHER_SES, "messageID": "msg_t2", "type": "text",
+                "text": "Готово: 12,5"}]},
+]
+
+
+def teacher_gateway(tmp_path, *, ready: Sequence[int] = (3,), oc: FakePlaces | None = None,
+                    **gw_overrides) -> tuple[FastAPI, GatewayRole]:
+    """Шлюз кабинета преподавателя (Д10а, задача А2; m-1): роль llm с долями мест на том же core.db (без ключа
+    OpenRouter, учение долей — DRILL_TEACHER из gw_overrides, как в build_roles), доли открыты здесь (роль llm в
+    приложение шлюза не входит, её lifespan не идёт; итог open() не проверяется — тест «доли не загрузились» его
+    подменяет), затем make_gateway(…, llm=…, ready=ready, **gw_overrides). Место 03 по умолчанию готово.
+
+    Задача А3: у двойника мест (oc или новый FakePlaces) место 03 держит разговор TEACHER_SES с сообщениями
+    TEACHER_HISTORY — его читает кабинет."""
+    llm = make_llm_role(tmp_path, key=None, shares=True, shares_drill=gw_overrides.get("DRILL_TEACHER", ""))
+    llm.shares.open()
+    oc = FakePlaces() if oc is None else oc
+    oc.sessions.setdefault(3, [TEACHER_SESSION])
+    oc.messages.setdefault((3, TEACHER_SES), TEACHER_HISTORY)
+    return make_gateway(tmp_path, llm=llm, ready=ready, oc=oc, **gw_overrides)
+
+
 def login(c, name: str, pw: str = PW, **headers) -> httpx.Response:
     """POST /pcbk/api/auth/login; Origin: ORIGIN, если не передан другой; заголовок с пустым значением не шлётся."""
     sent = {"Origin": ORIGIN, **headers}
     return c.post("/pcbk/api/auth/login", json={"login": name, "password": pw},
                   headers={k: v for k, v in sent.items() if v != ""})
+
+
+# --- Шлюз: клиенты по зонам и учёткам (Д7б «Мои агенты»; общие с калькуляторами Д9а) ---
+
+BASE = "https://stand.test:8443"                # cookie сессии — Secure: клиент тестов шлёт её только по https
+FRONT = ("172.31.250.35", 40000)                # edge в pcbk-front
+PLACE_NET = ("172.31.3.3", 5000)                # сеть места 03
+
+
+class Gw:
+    """Шлюз на двойниках под lifespan: as_(login, client) — клиент с cookie сессии этой учётки (вход — из front),
+    anon(client) — без cookie, store_save — строка учёта агента напрямую в core.db."""
+
+    def __init__(self, app, role):
+        self.app, self.role = app, role
+
+    def as_(self, name: str, client=FRONT) -> TestClient:
+        r = login(TestClient(self.app, base_url=BASE, client=FRONT), name)
+        assert r.status_code == 200, (name, r.status_code)
+        return TestClient(self.app, base_url=BASE, client=client, headers={"Cookie": f"{COOKIE}={r.cookies[COOKIE]}"})
+
+    def anon(self, client=FRONT) -> TestClient:
+        return TestClient(self.app, base_url=BASE, client=client)
+
+    def store_save(self, place: int, name: str, state: str, title: str = "", purpose: str = "") -> None:
+        at = AGENT_NOW.isoformat()
+        with closing(sqlite3.connect(self.role.agents.db_path)) as db, db:
+            db.execute("INSERT INTO agents (place, name, title, node, purpose, tools, tags, digest, sha256,"
+                       " student_reply, flags, state, created_at, state_at, visible_at)"
+                       " VALUES (?, ?, ?, 'узел', ?, '[]', '[]', 'd', 's', 'да', '[]', ?, ?, ?, NULL)",
+                       (place, name, title or f"Агент {name}", purpose or f"назначение {name}", state, at, at))
 
 
 # --- Шлюз: прокси /pcbk/api/oc (Д5б, задача Б3) ---

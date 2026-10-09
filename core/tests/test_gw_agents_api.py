@@ -4,48 +4,19 @@ own и limit. Место — только из учётки сессии; зон
 нужен); воркер перезагрузки припаркован — его проход менял бы состояния строк посреди теста."""
 import json
 import re
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import fail_connect, login, make_gateway, park_reload_worker
+from helpers import BASE, FRONT, PLACE_NET, Gw, fail_connect, make_gateway, park_reload_worker   # Gw — общий с Д9а
 from pcbk_core.agents.store import MAX_AGENTS
 from pcbk_core.gateway.agents_api import AGENTS_PATH, IMAGE_AGENTS
-from pcbk_core.gateway.api import COOKIE, GW_MESSAGES
+from pcbk_core.gateway.api import GW_MESSAGES
 
 REPO = Path(__file__).resolve().parents[2]      # m11: в helpers его нет; чистая копия — с student (и web)
-BASE = "https://stand.test:8443"                # cookie сессии — Secure: клиент тестов шлёт её только по https
-FRONT = ("172.31.250.35", 40000)                # edge в pcbk-front
-PLACE_NET = ("172.31.3.3", 5000)                # сеть места 03
 EGRESS = ("172.31.250.81", 40000)               # pcbk-egress — не front
-AT = "2026-10-07T09:00:00+00:00"
-TEACHER_TEXT = "Агенты студентов для преподавателя — в следующих выпусках стенда"
-
-
-class Gw:
-    """Шлюз на двойниках под lifespan: as_(login, client) — клиент с cookie сессии этой учётки (вход — из front),
-    anon(client) — без cookie, store_save — строка учёта агента напрямую в core.db."""
-
-    def __init__(self, app, role):
-        self.app, self.role = app, role
-
-    def as_(self, name: str, client=FRONT) -> TestClient:
-        r = login(TestClient(self.app, base_url=BASE, client=FRONT), name)
-        assert r.status_code == 200, (name, r.status_code)
-        return TestClient(self.app, base_url=BASE, client=client, headers={"Cookie": f"{COOKIE}={r.cookies[COOKIE]}"})
-
-    def anon(self, client=FRONT) -> TestClient:
-        return TestClient(self.app, base_url=BASE, client=client)
-
-    def store_save(self, place: int, name: str, state: str, title: str = "", purpose: str = "") -> None:
-        with closing(sqlite3.connect(self.role.agents.db_path)) as db, db:
-            db.execute("INSERT INTO agents (place, name, title, node, purpose, tools, tags, digest, sha256,"
-                       " student_reply, flags, state, created_at, state_at, visible_at)"
-                       " VALUES (?, ?, ?, 'узел', ?, '[]', '[]', 'd', 's', 'да', '[]', ?, ?, ?, NULL)",
-                       (place, name, title or f"Агент {name}", purpose or f"назначение {name}", state, AT, AT))
+TEACHER_TEXT = "Агенты студентов — в кабинете преподавателя, только на чтение"      # Д10-R100
 
 
 @pytest.fixture

@@ -20,7 +20,7 @@ Host. Номер места — только из учётки сессии.
 предупреждения не несёт. Подтверждение — POST /pcbk/api/auth/notice с телом ровно {"notice": NOTICE}: 204 (повтор —
 тоже 204), иной номер или тело — 400 bad_body, строка журнала «gw notice ack login=… notice=…» — только на первое
 подтверждение (итоговая доводка Д6б, Б2-m2). Место ни «кто я», ни подтверждение не будят: будит только
-POST /pcbk/api/workplace/wake.
+POST /pcbk/api/workplace/wake. Место прогона под защёлкой тормоза core (Д11-R117) не будится: 503 Unavailable run_halted.
 
 Вход: замок (store.locked вместе с незаписанными неудачами логина) → очередь сверок (не больше
 LOGIN_PARALLEL попыток разом, ждущих — не больше LOGIN_QUEUE, незаписанных неудач — не больше LOGIN_BACKLOG,
@@ -51,6 +51,7 @@ from .. import zones
 from ..hooks import safe_path
 from . import clip
 from .accounts import NOTICE, Account, AccountStore, StoreError, login_key
+from .places import PLACE_TEXTS, WakeRefused
 
 if TYPE_CHECKING:
     from . import GatewayRole
@@ -77,9 +78,12 @@ GW_MESSAGES = {
     "not_found": "Не найдено",
     "unavailable": "Шлюз не настроен: ",
     "store": "Учётные записи недоступны — повторите позже",
+    # тормоз прогона (Д11-R117): место прогона под защёлкой не будится — ни входом студента, ни кабинетом; текст — тот
+    # же, что на экране места (m-5 ревью А2: одна строка)
+    "run_halted": PLACE_TEXTS["run_halted"],
 }
 ERROR_NAMES = {400: "BadRequest", 401: "Unauthorized", 403: "Forbidden", 404: "NotFound", 405: "MethodNotAllowed",
-               429: "TooManyAttempts", 503: "Unavailable"}
+               409: "Conflict", 429: "TooManyAttempts", 502: "BadGateway", 503: "Unavailable"}   # 409, 502 — Д10-R100
 CONFIG_ERROR_SHOWN = 60                 # знаков причины в ответе 503 «Шлюз не настроен: …»
 
 # удаления cookie (Д5-R25, Д5-R30): пути не длиннее самого длинного пути белого списка, не больше трёх
@@ -542,7 +546,11 @@ def workplace_router(role: "GatewayRole") -> APIRouter:
         await check_origin(request)     # после сессии (остаток Д5б): без учётки — 401, ни строки, ни счётчика
         if account.place is None:
             return _error(403, "no_place")
-        return JSONResponse((await role.workplaces.wake(account.place)).to_json(), status_code=202)
+        try:
+            view = await role.workplaces.wake(account.place)
+        except WakeRefused:             # тормоз прогона (Д11-R117): строку журнала пишет Workplaces.wake
+            return _error(503, "run_halted")
+        return JSONResponse(view.to_json(), status_code=202)
 
     return router
 

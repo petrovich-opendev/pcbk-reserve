@@ -1,5 +1,5 @@
-// Вызовы шлюза вне OpenCode (Д6-R39, R49, R50, Д7-R64): вход, выход, подтверждение предупреждения, рабочее место,
-// список агентов места и отчёты браузера о молчании чата. Тот же вид запроса, что call() страницы
+// Вызовы шлюза вне OpenCode (Д6-R39, R49, R50, Д7-R64, Д9-R87): вход, выход, подтверждение предупреждения, рабочее
+// место, список агентов места, калькуляторы службы данных и отчёты браузера о молчании чата. Тот же вид запроса, что call() страницы
 // входа: cookie сессии своего сайта (HttpOnly — её ставит и стирает шлюз), Accept JSON, тело — только JSON.
 // Ответ — всегда Reply: сеть оборвалась — status 0, тело не JSON — текст как есть.
 import { T_DOWN, T_UNKNOWN } from "./texts";
@@ -35,6 +35,9 @@ export async function callJson(method: "GET" | "POST", path: string, body?: unkn
 // виды отчётов браузера (R50): boot_failed шлёт загрузчик boot.js, прочие — чат
 export type ReportKind = "boot_failed" | "ui_crash" | "turn_silent" | "stream_down";
 
+// инструменты службы данных, которые шлюз отдаёт вкладке «Калькуляторы» (CALC_TOOLS шлюза, Д9-R87)
+export type CalcTool = "catalog_search" | "tag_now" | "tag_period" | "tag_series" | "calc_runtime";
+
 export interface Api {
   me(): Promise<Reply>;
   logout(): Promise<Reply>;
@@ -43,6 +46,8 @@ export interface Api {
   ackNotice(notice: string): Promise<Reply>;          // тело ровно {"notice": N}; ответ — 204 (R49)
   agents(): Promise<Reply>;                           // агенты места учётки (Д7-R64); старый core — 404 (R65)
   report(kind: ReportKind): Promise<void>;            // тело ровно {"kind": K}; ответ не читается, ошибки глушатся (R51)
+  // ответ службы как есть: 200 при любом статусе инструмента, отказы шлюза — {"name", "data": {"message"}} (Д9-R87)
+  calc(tool: CalcTool, args: Record<string, unknown>): Promise<Reply>;
 }
 
 export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
@@ -53,6 +58,7 @@ export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
     workplace: () => callJson("GET", "/pcbk/api/workplace", undefined, fetchImpl),
     ackNotice: (notice) => callJson("POST", "/pcbk/api/auth/notice", { notice }, fetchImpl),
     agents: () => callJson("GET", "/pcbk/api/agents", undefined, fetchImpl),
+    calc: (tool, args) => callJson("POST", `/pcbk/api/calc/${tool}`, args, fetchImpl),
     // отчёт не повторяется (в том числе 404 старого core и 503 WorkplaceBusy предела edge — 509 → busy.json): потерянный
     // отчёт дешевле шторма
     report: async (kind) => {

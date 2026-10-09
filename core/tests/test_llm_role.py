@@ -19,6 +19,7 @@ from pcbk_core.llm import LLM_TOKENS_ERROR, LlmRole
 from pcbk_core.llm.api import LLM_MESSAGES, LlmCall, LlmStream, forward
 from pcbk_core.llm.ledger import Ledger
 from pcbk_core.llm.request import body_bytes, rebuild_body, turn_mark
+from pcbk_core.llm.shares import Shares
 from pcbk_core.llm.state import UPSTREAM_TEXTS, UpstreamState
 from pcbk_core.llm.turns import COMPACTION_CONTINUE
 from pcbk_core.llm.upstream import Upstream, UpstreamError, classify
@@ -457,7 +458,10 @@ def test_health_json_keys_and_no_secrets(tmp_path, fake_or):
                              "spent_usd", "reserved_usd", "ledger_usd", "estimated_usd", "key_spent_usd", "key_usage_usd",
                              "total_usd", "ops_usd", "shares", "pending", "pending_stuck", "cost_unknown_24h",
                              "provider_mismatch_24h", "account_remaining_usd", "models",
-                             "ledger_queue", "ledger_fresh", "ledger_reset", "egress", "refresh_started_age_s"}
+                             "ledger_queue", "ledger_fresh", "ledger_reset", "egress", "refresh_started_age_s",
+                             "run", "run_brake"}                                 # Д8-R69, Д11-R117: 32 ключа
+    assert len(r.json()) == 32 and r.json()["run"] is None                      # без LLM_RUN_* прогона нет
+    assert r.json()["run_brake"] is None                                        # и тормоза прогона нет
     assert r.json()["egress"] == {"alive": None, "last_ok_age_s": None}        # в pytest потока обновления нет
     assert (r.json()["refresh_started_age_s"], r.json()["ledger_error"]) == (None, None)
     assert set(r.json()["upstream"]) == {"state", "text", "since"}
@@ -894,3 +898,102 @@ def test_health_llm_redacted_off_admin(tmp_path, fake_or):                      
         with TestClient(app, base_url=base) as c:
             keys = set(c.get("/health/llm").json())
             assert (money & keys) == (money if full else set()) and "spent_usd" in keys, base
+
+
+# --- Д10а, задача А2: LLM-прокси по долям мест (Д10-R98, B-1); FAKEDEAR — ответ двойника с ценой $0,5037 ---
+
+def test_floor_share_refuses_next_call_uneven_spend(tmp_path, fake_or):  # Review Focus 3
+    app, role = make_llm_app(tmp_path, fake_or, shares=True)
+    with TestClient(app) as c:
+        assert post(c, chat_body(text="q FAKEDEAR")).status_code == 200
+        wait_until(lambda: not role.ledger.has_open_or_pending())
+        assert role.ledger.spent("student-01") == pytest.approx(0.5037)     # 50,37 цента — не кратно центу
+        floor = role.shares.floor_of(1)
+        assert floor == 50
+        role.shares.apply([(1, 10000, floor), (2, 10000, 20000 - floor)], by="teach", now=now_utc())
+        r = post(c, chat_body(text="ещё вопрос"))                            # 0,5037 >= 0,50 — следующий же вызов
+        assert (r.status_code, r.json()["error"]["code"]) == (402, "pcbk_share_spent")
+        role.shares.apply([(1, floor, floor + 10), (2, 20000 - floor, 19990 - floor)], by="teach", now=now_utc())
+        assert post(c, chat_body(text="и ещё")).status_code == 200          # 0,5037 < 0,60
+        wait_until(lambda: not role.ledger.has_open_or_pending())
+        assert role.health_json(now_utc())["shares"] == {"over_80": 1, "spent": 0}   # 0,5049 из 0,60
+    assert len(fake_or.requests) == 2
+
+
+def test_stop_place_during_inflight_call_refuses_next(tmp_path, fake_or):  # B-1, I-1 р2: «Остановить место» во время вызова
+    app, role = make_llm_app(tmp_path, fake_or, shares=True)
+    with serve_app(app) as url, httpx.Client(trust_env=False) as a, httpx.Client(trust_env=False) as b:
+        assert b.post(url + "/llm/v1/chat/completions", json=chat_body(text="q FAKEDEAR"),
+                      headers=auth(LLM_TOKEN, SES)).status_code == 200
+        wait_until(lambda: not role.ledger.has_open_or_pending())
+        with a.stream("POST", url + "/llm/v1/chat/completions", json=chat_body(text="q FAKESLOW"),
+                      headers=auth(LLM_TOKEN, "ses_" + "B" * 26)) as r1:
+            chunks = r1.iter_raw()
+            next(chunks)                                                     # вызов идёт: его оценка в spent
+            assert role.ledger.has_open_or_pending_of("student-01")
+            role.shares.apply_floor(1, 2, by="teach", now=now_utc())         # пол берёт сервер: 50, без оценки идущего
+            assert (role.shares.cents(1), role.shares.cents(2)) == (50, 19950)
+            for _ in chunks:                                                 # медленный вызов досчитан
+                pass
+        wait_until(lambda: not role.ledger.has_open_or_pending())
+        r = b.post(url + "/llm/v1/chat/completions", json=chat_body(text="после"), headers=auth(LLM_TOKEN, SES))
+    assert (r.status_code, r.json()["error"]["code"]) == (402, "pcbk_share_spent")   # спент 0,5049 >= 0,50
+    assert len(fake_or.requests) == 2
+
+
+def test_shares_load_failure_closes_llm(tmp_path, fake_or, monkeypatch):  # закрыто при сбое
+    monkeypatch.setattr(Shares, "open", lambda self: False)
+    app, role = make_llm_app(tmp_path, fake_or, shares=True)
+    with TestClient(app) as c:
+        r = post(c, chat_body())
+    assert (r.status_code, r.json()["error"]["code"]) == (403, "pcbk_config")
+    assert "доли бюджета не загружены" in role.config_error and fake_or.requests == []
+
+
+# --- сверх брифа ---
+
+def test_role_wires_shares_into_budget_and_lifespan_loads_them(tmp_path, fake_or):   # R98
+    app, role = make_llm_app(tmp_path, fake_or, shares=True, shares_drill="shares_stale")
+    assert role.budget.shares is role.shares and role.shares.settled_of == role.ledger.settled
+    assert role.shares.drill == "shares_stale" and role.shares.loaded is False         # конструктор ничего не открывает
+    with TestClient(app) as c:
+        assert role.shares.loaded is True and role.config_error is None
+        assert post(c, chat_body()).status_code == 200
+    plain = make_llm_role(tmp_path / "plain", fake_or)
+    assert plain.shares is None and plain.budget.shares is None
+
+
+def test_shares_counters_follow_each_place_share(tmp_path, fake_or):      # счётчики /health/llm — от своей доли
+    app, role = make_llm_app(tmp_path, fake_or, shares=True)
+    with TestClient(app) as c:
+        assert post(c, chat_body(text="q FAKEDEAR")).status_code == 200
+        wait_until(lambda: not role.ledger.has_open_or_pending())
+        assert role.health_json(now_utc())["shares"] == {"over_80": 0, "spent": 0}      # 0,5037 из 100
+        role.shares.apply([(1, 10000, 60), (2, 10000, 19940)], by="teach", now=now_utc())
+        assert role.health_json(now_utc())["shares"] == {"over_80": 1, "spent": 0}      # из 0,60 — больше 80 %
+        role.shares.apply_floor(1, 2, by="teach", now=now_utc())
+        assert role.health_json(now_utc())["shares"] == {"over_80": 0, "spent": 1}      # пол — исчерпана
+
+
+def test_startup_line_names_allocated_shares(tmp_path, fake_or, caplog):
+    app, role = make_llm_app(tmp_path, fake_or, shares=True)
+    with caplog.at_level(logging.INFO, logger="pcbk_core.llm"), TestClient(app):
+        pass
+    assert "LLM-прокси: моделей 7, доли мест: распределено $1000 из $1000, по умолчанию $100" in caplog.text
+
+
+def test_fake_dear_word_prices_body_stream_and_generation(fake_or):       # двойник: FAKEDEAR — $0,5037 везде
+    head = {"Authorization": "Bearer test-openrouter-key"}
+    with httpx.Client(trust_env=False, timeout=10) as c:
+        body = c.post(fake_or.url + "/chat/completions", headers=head,
+                      json=chat_body(text="q FAKEDEAR", stream=False)).json()
+        assert body["usage"]["cost"] == 0.5037
+        streamed = c.post(fake_or.url + "/chat/completions", headers=head, json=chat_body(text="q FAKEDEAR")).text
+        assert '"cost": 0.5037' in streamed and streamed.rstrip().endswith("data: [DONE]")
+        gen = body["id"]
+        found = [c.get(fake_or.url + "/generation", params={"id": gen}, headers=head) for _ in range(3)]
+        assert [r.status_code for r in found] == [404, 404, 200] and found[2].json()["data"]["total_cost"] == 0.5037
+        plain = c.post(fake_or.url + "/chat/completions", headers=head, json=chat_body(stream=False)).json()
+        assert plain["usage"]["cost"] == 0.0012                              # прочие слова не меняются
+        usage = c.get(fake_or.url + "/key", headers=head).json()["data"]["usage"]
+        assert usage == pytest.approx(3 * 0.5037 + 0.0012)                   # тело, поток, найденный дозапрос, обычный

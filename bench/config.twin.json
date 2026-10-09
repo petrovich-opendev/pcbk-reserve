@@ -1,0 +1,16 @@
+{
+  "run_id": "d8-twin",
+  "places": {
+    "5": "pcbk/z-ai/glm-5.3",
+    "6": "pcbk/deepseek/deepseek-v4.1-flash",
+    "7": "pcbk/google/gemini-3.8-flash",
+    "8": "pcbk/openai/gpt-6-sol"
+  },
+  "reps": {"create": 2, "number": 3, "trap": 3},
+  "cap_usd": 5.0,
+  "stop_margin_usd": 0.5,
+  "window_start": null,
+  "out_dir": null,
+  "cards": "cards.twin.json",
+  "stand": null
+}

@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 from contextlib import closing
+from datetime import datetime, timezone
 
 import pytest
 
@@ -17,6 +18,8 @@ from pcbk_core.gateway import accounts
 from pcbk_core.gateway.accounts import (LOCK_FAILURES, LOCK_WINDOW_S, MAX_SESSIONS_PER_LOGIN, NOTICE, UNKNOWN_KEYS,
                                         AccountStore, StoreError, hash_password, verify_password)
 from pcbk_core.gateway.accounts import main as accounts_main
+from pcbk_core.llm.shares import Shares
+from pcbk_core.teacher_log import TeacherLog
 
 
 def db_bytes(tmp_path) -> bytes:                                                        # WAL: все три файла
@@ -353,6 +356,89 @@ def test_remove_only_disabled(tmp_path):
     assert s.list() == []
 
 
+# --- Д10б, задача Б1: AccountStore.enable (Д10-R108) ---
+
+def test_enable_rules(tmp_path):
+    s = store(tmp_path)
+    s.add("stu-a", "student", 3, PW)
+    with pytest.raises(ValueError, match="уже включена"):
+        s.enable("stu-a")
+    s.disable("stu-a")
+    assert s.verify("stu-a", PW) is None
+    s.enable("stu-a")
+    assert s.verify("stu-a", PW).place == 3
+    s.add("teach2", "teacher", None, PW)
+    s.disable("teach2")
+    with pytest.raises(ValueError, match="только учётку студента"):
+        s.enable("teach2")
+    with pytest.raises(ValueError, match="учётки nobody нет"):
+        s.enable("nobody")
+
+
+def test_enable_only_own_free_place(tmp_path):                                         # сверх брифа: R108, место — своё
+    s = store(tmp_path)
+    s.add("d10-probe-a", "student", 4, PW)
+    s.disable("d10-probe-a"); s.release_place(4)                                       # закрепление снято
+    with pytest.raises(ValueError, match="место 04 не закреплено за учёткой d10-probe-a"):
+        s.enable("d10-probe-a")
+    s.add("stu-b", "student", 4, PW)                                                   # место отдано другому
+    s.disable("stu-b")
+    with pytest.raises(ValueError, match="место 04 не закреплено за учёткой d10-probe-a"):
+        s.enable("d10-probe-a")
+    s.add("stu-c", "student", 5, PW)
+    s.disable("stu-c")
+    with closing(sqlite3.connect(tmp_path / "core.db")) as con, con:                   # мимо add: действующая на 05
+        con.execute("INSERT INTO gw_accounts (login, role, place, pw_hash, disabled, created_at) SELECT 'stu-x',"
+                    " 'student', 5, pw_hash, 0, created_at FROM gw_accounts WHERE login = 'stu-c'")
+    with pytest.raises(ValueError, match="место 05 занято другой учёткой"):
+        s.enable("stu-c")
+    assert [(a.login, a.disabled) for a in s.list() if a.login in ("d10-probe-a", "stu-b", "stu-c")] == [
+        ("d10-probe-a", True), ("stu-b", True), ("stu-c", True)]                       # отказы ничего не записали
+    assert s.write_failures == 0 and s.read_failures == 0                              # отказ по правилам — не сбой
+
+
+def test_student_only_ops_refuse_other_roles(tmp_path):                                  # ревью Б1+Б2, M-1 (TOCTOU роли)
+    """set_password, disable и unlock с student_only (так их зовёт кабинет) — роль цели сверяется в транзакции изменения:
+    у преподавателя и неизвестного логина ValueError, ничего не меняется (пароль, состояние, замок, сессии), счётчики
+    сбоев не растут. Учётке студента — как без флага; команда администратора (без флага) — как прежде."""
+    s = store(tmp_path)
+    s.add("teach", "teacher", None, PW)
+    s.add("stu-a", "student", 3, PW)
+    token = s.open_session("teach")
+    for login in ("teach", "stu-a"):
+        for _ in range(LOCK_FAILURES):
+            s.failure(login)
+    for login in ("teach", "nobody"):
+        for op in (lambda: s.set_password(login, "другой-пароль-1", student_only=True),
+                   lambda: s.disable(login, student_only=True), lambda: s.unlock(login, student_only=True)):
+            with pytest.raises(ValueError, match=f"^учётки студента {login} нет$"):
+                op()
+    assert s.status("teach") == "active" and s.locked("teach") and s.session(token) is not None
+    assert s.verify("teach", PW) is not None and not s.exists("nobody")
+    assert s.write_failures == 0 and s.read_failures == 0                              # отказ по правилам — не сбой
+    s.unlock("stu-a", student_only=True)
+    assert not s.locked("stu-a")
+    s.set_password("stu-a", "другой-пароль-1", student_only=True)
+    assert s.verify("stu-a", "другой-пароль-1") is not None
+    s.disable("stu-a", student_only=True)
+    assert s.status("stu-a") == "disabled"
+    s.unlock("teach"); s.set_password("teach", "другой-пароль-2"); s.disable("teach")   # команда — без флага
+    assert not s.locked("teach") and s.status("teach") == "disabled" and s.session(token) is None
+
+
+def test_cli_enable(tmp_path, capsys, monkeypatch):                                    # сверх брифа: команда enable
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
+    monkeypatch.setattr("sys.stdin", io.StringIO(PW + "\n"))
+    assert accounts_main(["add", "--login", "ivanov", "--role", "student", "--place", "3"]) == 0
+    assert accounts_main(["disable", "--login", "ivanov"]) == 0
+    assert accounts_main(["enable", "--login", "ivanov"]) == 0
+    assert capsys.readouterr().out == ""
+    assert accounts_main(["enable", "--login", "ivanov"]) == 1
+    err = capsys.readouterr()
+    assert err.err.strip() == "учётка ivanov уже включена" and err.out == ""
+    assert store(tmp_path).verify("ivanov", PW).place == 3
+
+
 def test_cli(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "core.db"))
     assert accounts_main(["add", "--login", "ivanov", "--role", "student", "--place", "3", "--generate"]) == 0
@@ -583,3 +669,44 @@ def test_release_place_refused_when_agent_store_does_not_open(probe_off_on_10, a
     err = capsys.readouterr().err
     assert "учёт агентов не открывается — освобождать место нельзя" in err and len(err.splitlines()) == 1
     assert probe_off_on_10.bindings() == [(10, "d7-probe-a", True)]                            # закрепление на месте
+
+
+# --- Д10а, задача А2: команда journal (I-9); DB_PATH — через monkeypatch.setenv (раунд 2 Д7, m-н2) ---
+
+def test_journal_command_prints_codes_only(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "core.db"
+    monkeypatch.setenv("DB_PATH", str(db))
+    s = Shares(str(db), total_usd=1000.0, default_usd=100.0)
+    assert s.open()
+    s.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=datetime(2026, 10, 11, 9, tzinfo=timezone.utc))
+    log = TeacherLog(str(db))
+    assert log.open()
+    log.requested("teach", "read", 3, "ses_" + "A" * 26)
+    assert accounts_main(["journal", "--last", "5"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split("\t")[1:] == ["teach", "read", "03", "ses_" + "A" * 26, "requested", "-"]
+    assert lines[1].split("\t")[1:] == ["teach", "shares", "-", "-", "ok", '{"03": [10000, 9000], "05": [10000, 11000]}']
+    assert len(lines) == 2
+    assert accounts_main(["journal", "--last", "0"]) == 1                     # число строк — от 1
+
+
+def test_journal_command_reads_only_and_limits(tmp_path, monkeypatch, capsys):   # сверх брифа: mode=ro, 1…1000, 50
+    db = tmp_path / "core.db"
+    monkeypatch.setenv("DB_PATH", str(db))
+    assert accounts_main(["journal"]) == 1                                    # базы нет — не заводит пустую
+    err = capsys.readouterr().err
+    assert not db.exists() and len(err.splitlines()) == 1 and err.startswith("журнал действий: ")
+    log = TeacherLog(str(db))
+    assert log.open()
+    for i in range(60):
+        log.requested("teach", "sessions", 1 + i % 10, None)
+    assert accounts_main(["journal"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 50 and out[0].split("\t")[0].endswith("+00:00")       # по умолчанию 50, время — UTC
+    assert [line.split("\t")[3] for line in out[:2]] == ["10", "09"]          # новые первыми
+    for bad in (["--last", "1001"], ["--last", "-1"], ["--last", "x"]):
+        assert accounts_main(["journal", *bad]) == 1, bad
+    assert len(capsys.readouterr().err.splitlines()) == 3
+    assert accounts_main(["journal", "--last", "1000"]) == 0
+    with closing(sqlite3.connect(db)) as c:                                    # учётки команда не трогала
+        assert c.execute("SELECT count(*) FROM sqlite_master WHERE name = 'gw_accounts'").fetchone()[0] == 0

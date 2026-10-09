@@ -28,7 +28,8 @@ from datetime import datetime
 from typing import Literal
 
 Outcome = Literal["ok", "partial", "refused", "budget", "rate", "busy", "timeout", "unavailable", "error"]
-Channel = Literal["mcp", "http", "system"]
+# web — вкладка «Калькуляторы» через шлюз (Д9-R83): caller — student-NN, у преподавателя — teacher (Д10-R109)
+Channel = Literal["mcp", "http", "web", "system"]
 CacheState = Literal["hit", "miss", "shared", "none"]
 
 # одна таблица для инструментов и служебных событий (F11): код ошибки → исход; сырой код — в summary

@@ -1,20 +1,35 @@
 """Роль llm (Д4а): LLM-прокси перед OpenRouter — отказы словами, резерв и предел одновременных вызовов, учёт
-денег через журнал вызовов, опрос /key и /credits, выключатель и учение 402.
+денег через журнал вызовов, опрос /key и /credits, выключатель и учение 402; прогон отбора модели под своим
+потолком (Д8-R69).
 
 Конструктор без ввода-вывода (П22, договор Role Д3а): файлов не читает, core.db не открывает, сети не трогает,
 клиента httpx не создаёт. Журнал открывается в начале lifespan через asyncio.to_thread; health() и
 health_json() читают только запомненное. Состояние роли меняется только в цикле событий; SQLite — поток-писатель
 журнала, flush/check/open/close — только через asyncio.to_thread.
-"""
+
+Доли мест (Д10а, Д10-R98): shares — Shares на том же core.db (build_llm_role); роль ставит ему settled_of =
+ledger.settled (пол доли, B-1) и отдаёт его Budget — отказ «доля израсходована» идёт по доле своего места. Доли
+открываются в lifespan сразу после журнала (asyncio.to_thread); не открылись — config_error «доли бюджета не загружены»:
+все вызовы /llm/ — 403 pcbk_config (закрыто при сбое: иначе студент с урезанной долей снова получил бы долю по
+умолчанию).
+
+Тормоз прогона (Д11, Д11-R117): brake — RunBrake при прогоне (LLM_RUN_*), иначе None (тормоза нет вовсе). lifespan после
+открытия журнала читает его защёлку и базы из llm_meta (brake.load), а без config_error ставит задачу llm-run-brake:
+проверка сразу и раз в RUN_BRAKE_POLL_S, в потоке (чтение /proc и flush журнала при защёлке); исключение — строка журнала
+и проверка без данных (blind). Под защёлкой Budget отказывает вызывающим прогона 402 pcbk_run_halted (budget.halted —
+чтение флага), шлюз усыпляет места прогона и не будит их (gateway: Workplaces.halted, _halt_watch). /health/llm — блок
+run_brake (32-й ключ): null без прогона. Модуль brake импортируется только внутри методов: python -m
+pcbk_core.llm.brake иначе давал бы RuntimeWarning runpy."""
 import asyncio
 import logging
 import math
 import re
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, FastAPI
@@ -25,11 +40,15 @@ from ..hooks import hooks_of
 from ..secrets import TokenTable
 from ..settings import LlmSettings, Settings
 from .api import CHAT_DEADLINE_S, LEDGER_DURABLE_S, LlmCall, llm_router, too_large_body
-from .ledger import LEDGER_CHECK_S, OPS, Budget, Ledger
+from .ledger import LEDGER_CHECK_S, OPS, Budget, Ledger, LedgerWriteLost, RunSpec, run_spec
 from .models import select_models
+from .shares import PLACES, Shares
 from .state import FAIL_STATES, UpstreamState
 from .turns import TurnLimiter
 from .upstream import Upstream, UpstreamError, UpstreamKind
+
+if TYPE_CHECKING:
+    from .brake import RunBrake
 
 # llm-tokens не прочитан: это не config_error — всем 401, но опрос /key, дозапрос цен и проверка журнала идут
 LLM_TOKENS_ERROR = "токены LLM не читаются"
@@ -43,6 +62,11 @@ LEDGER_ERROR_CHARS = 53                 # 27 + 53 ≤ 80
 LEDGER_DROPPED = "строка журнала вызовов потеряна — перезапустите core"
 SHARE_WARN = 0.8                        # «доля больше 80 %»
 STUDENT = re.compile(r"student-[0-9]+")
+# прогон отбора модели (Д8-R69): точка отсчёта вызывающего в llm_meta — расход до прогона; окно счёта вызовов, с
+RUN_BASE_KEY = "run_base_usd:{id}:{caller}"
+RUN_WINDOW_S = 600
+RUN_BASE_ERROR = "прогон: точка отсчёта не записана"
+SHARES_ERROR = "доли бюджета не загружены"           # Д10-R98: закрыто при сбое
 
 log = logging.getLogger("pcbk_core.llm")
 
@@ -60,7 +84,13 @@ def _number(value: object) -> float | None:
 class LlmRole(RoleBase):
     """upstream None — ключа OpenRouter нет (или настройка с ошибкой); key_fingerprint — первые 12 знаков sha256
     ключа, сам ключ живёт только внутри Upstream. config_error — настройка с ошибкой: /llm/ — 403 pcbk_config,
-    фоновых циклов, кроме проверки журнала, нет. tokens_error — llm-tokens не прочитан (П23)."""
+    фоновых циклов, кроме проверки журнала, нет. tokens_error — llm-tokens не прочитан (П23).
+
+    Прогон отбора (Д8-R69): run — RunSpec или None; run_calls — монотонные метки begin_call вызывающих прогона за
+    RUN_WINDOW_S, last_run_call_mono — последняя из них, started_mono — запуск роли (тишина без вызовов — от него).
+    LLM_RUN_* с ошибкой (настройки без from_env) — config_error: закрыто при сомнении.
+
+    shares (Д10-R98) — доли мест или None (у всех мест одна LLM_SHARE_USD, как до Д10)."""
 
     name = "llm"
 
@@ -69,7 +99,7 @@ class LlmRole(RoleBase):
                  tokens_error: str | None = None, monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  cost_retry_delays: Sequence[float] = COST_RETRY_DELAYS_S,
-                 chat_deadline_s: float = CHAT_DEADLINE_S):
+                 chat_deadline_s: float = CHAT_DEADLINE_S, shares: Shares | None = None):
         self.settings = settings
         self.llm = llm
         self.tokens = tokens
@@ -83,10 +113,34 @@ class LlmRole(RoleBase):
         self.cost_retry_delays = tuple(cost_retry_delays)
         self.chat_deadline_s = chat_deadline_s
         self.models = select_models(llm.LLM_MODELS)
+        run: RunSpec | None = None
+        try:
+            run = run_spec(llm)
+        except ValueError as exc:           # from_env это уже отсёк; здесь — настройки, построенные мимо него
+            why = f"настройки: {exc}"
+            self.config_error = f"{self.config_error}; {why}" if self.config_error else why
+        self.run = run
+        self.run_calls: deque[float] = deque()
+        self.last_run_call_mono: float | None = None
+        self.started_mono = monotonic()
         # хост OpenRouter, как его разрешает охрана выхода (egress_targets): живость адресов — только по нему
         self.egress_name = urlsplit(llm.OPENROUTER_BASE_URL).hostname
+        # доли мест (Д10-R98): пол доли — от оплаченного по журналу вызовов (B-1), отказ — по доле своего места
+        self.shares = shares
+        if shares is not None:
+            shares.settled_of = ledger.settled
+        # тормоз прогона (Д11-R117): только при прогоне; конструктор без ввода-вывода — мету читает load() в lifespan
+        self.brake: "RunBrake | None" = None
+        if run is not None:
+            from .brake import RunBrake
+            self.brake = RunBrake(
+                (llm.LLM_RUN_MEMINFO, llm.LLM_RUN_VMSTAT, llm.LLM_RUN_PRESSURE),
+                (llm.LLM_RUN_MEM_FAIL_MIB, llm.LLM_RUN_SWAP_GROW_MIB, llm.LLM_RUN_SWAP_BASE_MIB,
+                 llm.LLM_RUN_PSI_FULL_MAX),
+                meta=ledger, run_id=run.id, monotonic=monotonic, wallclock=wallclock, started_mono=self.started_mono)
         self.budget = Budget(ledger, total_usd=llm.LLM_TOTAL_USD, share_usd=llm.LLM_SHARE_USD,
-                             ops_share_usd=llm.LLM_OPS_SHARE_USD, key_spent=self.key_spent_usd)
+                             ops_share_usd=llm.LLM_OPS_SHARE_USD, key_spent=self.key_spent_usd, run=run,
+                             shares=shares, halted=self.run_halted)
         self.turns = TurnLimiter(limit=llm.LLM_TURN_CALLS, monotonic=monotonic)
         self.state = UpstreamState(drill=self.drill)
         self.inflight: dict[str, int] = {}
@@ -107,6 +161,11 @@ class LlmRole(RoleBase):
     @property
     def stopped(self) -> bool:
         return self.llm.LLM_STATE == "stopped"
+
+    def run_halted(self) -> bool:
+        """Защёлка тормоза прогона (Д11-R117): чтение флага, без ввода-вывода; без прогона — ложь."""
+        brake = self.brake
+        return brake is not None and brake.halted
 
     def key_spent_usd(self) -> float | None:
         """Расход по ключу с точки отсчёта этого ключа (Д4а-R13); без точки, usage или при off — None."""
@@ -191,15 +250,32 @@ class LlmRole(RoleBase):
             "ledger_reset": self.ledger_reset(),
             "egress": refresh_status(self.egress_name),
             "refresh_started_age_s": refresh_started_age_s(),
+            "run": self.run_json(self.monotonic()),
+            "run_brake": None if self.brake is None else self.brake.json(self.monotonic()),
         }
 
+    def run_json(self, now_mono: float) -> dict | None:
+        """Блок run /health/llm (Д8-R69): None без прогона, иначе ровно шесть ключей — id, потолок, расход прогона
+        (с резервами идущих вызовов, как у отказа), число вызывающих, вызовов за RUN_WINDOW_S и тишина, с: от
+        последнего вызова прогона, а без вызовов — от запуска роли; один знак. Без ввода-вывода."""
+        run = self.run
+        if run is None:
+            return None
+        last = self.last_run_call_mono
+        since = self.started_mono if last is None else last
+        return {"id": run.id, "cap_usd": run.cap_usd, "spent_usd": self.budget.run_spent(),
+                "callers": len(run.callers),
+                "calls_10m": sum(1 for mark in self.run_calls if now_mono - mark < RUN_WINDOW_S),
+                "idle_s": round(max(0.0, now_mono - since), 1)}
+
     def _shares(self, by_caller: dict[str, float]) -> dict[str, int]:
-        """Места student-NN: доля больше 80 % (ещё не исчерпана) и исчерпана — только счётчики."""
-        share = self.budget.share_usd
+        """Места student-NN: доля больше 80 % (ещё не исчерпана) и исчерпана — только счётчики. Доля — своя у каждого
+        места (budget.share_of, Д10-R98): после перевода счётчики не врут."""
         over = spent = 0
         for caller, amount in by_caller.items():
             if not STUDENT.fullmatch(caller):
                 continue
+            share = self.budget.share_of(caller)
             if amount >= share:
                 spent += 1
             elif amount > SHARE_WARN * share:
@@ -217,10 +293,17 @@ class LlmRole(RoleBase):
 
     def begin_call(self, *, caller: str, session: str | None, parent: str | None, model: str, step: int,
                    estimate: float) -> LlmCall:
-        """Синхронно: резерв в журнале (open_call) и место одновременности; LlmCall.finish() делает обратное."""
+        """Синхронно: резерв в журнале (open_call) и место одновременности; LlmCall.finish() делает обратное.
+        Вызывающему прогона — метка активности прогона (Д8-R69): и под учением 402, раньше open_chat."""
         call_id = self.ledger.open_call(ts=self.wallclock(), caller=caller, session=session, model=model, step=step,
                                         estimate=estimate)
         self.inflight[caller] = self.inflight.get(caller, 0) + 1
+        if self.run is not None and caller in self.run.callers:
+            mark = self.monotonic()
+            self.run_calls.append(mark)
+            self.last_run_call_mono = mark
+            while self.run_calls and mark - self.run_calls[0] >= RUN_WINDOW_S:
+                self.run_calls.popleft()
         return LlmCall(self, call_id, caller=caller, session=session, parent=parent, model=model, step=step,
                        estimate=estimate)
 
@@ -266,6 +349,56 @@ class LlmRole(RoleBase):
                     return
         self.ledger.set_cost(call_id, None, "unknown")
         log.warning("LLM-прокси: цена вызова id=%d не нашлась — в расходе по верхней оценке", call_id)
+
+    # --- прогон отбора (Д8-R69) ---
+
+    def ensure_run_base(self) -> tuple[dict[str, float], str | None]:
+        """Точки отсчёта прогона в llm_meta — в потоке, сразу после открытия журнала, до первого вызова; роль не
+        меняет: точки и ошибку присваивает lifespan в цикле событий (доводка р1, m4).
+
+        У вызывающего прогона без ключа RUN_BASE_KEY точка — оплаченное им сейчас (Ledger.settled: цены и
+        окончательные оценки, без идущих и ждущих цены вызовов). Цена идущих и ждущих вызовов войдёт в прогон —
+        завышение в безопасную сторону, а отказа нет: вызов без цены у места на старте не закрывает прокси (доводка
+        р1, I1 — отступление от Д8-R69). Записанная точка не меняется: перезапуск core продолжает тот же прогон, новый
+        id — новая точка. Новые точки — на диск через _flush_run_base. Возврат — (точки по вызывающим, ошибка или
+        None)."""
+        run = self.run
+        if run is None:
+            return {}, None
+        led = self.ledger
+        keys = {caller: RUN_BASE_KEY.format(id=run.id, caller=caller) for caller in sorted(run.callers)}
+        missing = [caller for caller, key in keys.items() if led.meta_get(key) is None]
+        unpriced = sum(1 for caller in missing if led.has_open_or_pending_of(caller))
+        if unpriced:
+            log.warning("LLM-прокси: прогон %s: вызовы без цены у мест прогона без точки отсчёта, мест: %d — их цена "
+                        "войдёт в прогон", run.id, unpriced)
+        for caller in missing:
+            led.meta_set(keys[caller], led.settled(caller))
+        error = self._flush_run_base(run) if missing else None
+        bases = {caller: base for caller, key in keys.items() if (base := led.meta_get(key)) is not None}
+        if error is None:
+            log.info("LLM-прокси: прогон %s: потолок $%g, вызывающих %d, новых точек отсчёта %d", run.id,
+                     run.cap_usd, len(run.callers), len(missing))
+        return bases, error
+
+    def _flush_run_base(self, run: RunSpec) -> str | None:
+        """Новые точки — на диск: flush до LEDGER_DURABLE_S, без повторов (доводка р1б).
+
+        Не дождались диска (TimeoutError) — WARNING, а не ошибка: точку допишет писатель, а строка каждого вызова
+        ложится на диск до OpenRouter (Д4а-R19) — очередь FIFO не выпустит вызов раньше точки, и денег мимо прогона
+        нет. Брошенная операция (LedgerWriteLost) или закрытый журнал — RUN_BASE_ERROR: записи точки не будет."""
+        led = self.ledger
+        try:
+            if not led.opened:                  # журнал закрыт: flush() без очереди вернулся бы сразу
+                raise LedgerWriteLost("журнал вызовов закрыт")
+            led.flush(LEDGER_DURABLE_S)
+        except LedgerWriteLost as exc:          # дыра в файле держится до нового open()
+            log.error("LLM-прокси: прогон %s: точка отсчёта не записана (%s)", run.id, type(exc).__name__)
+            return RUN_BASE_ERROR
+        except TimeoutError as exc:
+            log.warning("LLM-прокси: прогон %s: точка отсчёта ещё не на диске (%s) — вызовы ждут записи журнала",
+                        run.id, type(exc).__name__)
+        return None
 
     # --- опрос OpenRouter ---
 
@@ -351,9 +484,27 @@ class LlmRole(RoleBase):
         if not await asyncio.to_thread(self.ledger.open):
             why = f"журнал вызовов не открылся: {self.ledger.last_error}"
             self.config_error = f"{self.config_error}; {why}" if self.config_error else why
+        shares = self.shares
+        if shares is not None and not await asyncio.to_thread(shares.open):   # закрыто при сбое (Д10-R98)
+            why = SHARES_ERROR + (f": {shares.last_error}" if shares.last_error else "")
+            self.config_error = f"{self.config_error}; {why}" if self.config_error else why
+        try:                                # точка отсчёта прогона — до первого вызова и до дозапроса цен
+            bases, error = await asyncio.to_thread(self.ensure_run_base)
+        except Exception as exc:            # закрыто при сомнении; в журнал — только класс
+            log.error("LLM-прокси: точка отсчёта прогона не поставлена (%s)", type(exc).__name__)
+            bases, error = {}, RUN_BASE_ERROR
+        self.budget.run_base = bases        # состояние роли — в цикле событий (m4)
+        if error is not None:
+            self.config_error = f"{self.config_error}; {error}" if self.config_error else error
+        if self.brake is not None:          # защёлка и базы тормоза прогона — из llm_meta (память журнала)
+            if self.ledger.opened:
+                self.brake.load()
+            else:                           # мету не прочесть — защёлка прогона могла быть: закрыто при сомнении,
+                self.brake.halt("blind")    # только в памяти (журнал не открыт), места прогона спят (m-3 ревью А2)
         llm = self.llm
-        log.info("LLM-прокси: моделей %d, доля $%g, бюджет $%g", len(self.models), llm.LLM_SHARE_USD,
-                 llm.LLM_TOTAL_USD)
+        allocated = (len(PLACES) * llm.LLM_SHARE_USD if shares is None else shares.sum_cents() / 100)
+        log.info("LLM-прокси: моделей %d, доли мест: распределено $%g из $%g, по умолчанию $%g", len(self.models),
+                 allocated, llm.LLM_TOTAL_USD, llm.LLM_SHARE_USD)
         if self.drill:
             log.warning("УЧЕНИЯ: DRILL_LLM=%s", llm.DRILL_LLM)
         if self.stopped:
@@ -370,6 +521,8 @@ class LlmRole(RoleBase):
                 for call_id, gen_id in self.ledger.pending_to_resolve():     # цена, которую не дождался прошлый запуск
                     self.spawn_resolve(call_id, gen_id)
             tasks.append(asyncio.create_task(self._poll_loop(), name="llm-poll"))
+            if self.brake is not None:      # тормоз прогона (Д11-R117) — только при прогоне и без config_error
+                tasks.append(asyncio.create_task(self._brake_loop(), name="llm-run-brake"))
         try:
             yield
         finally:
@@ -398,6 +551,26 @@ class LlmRole(RoleBase):
             elif now and was is False:
                 log.info("LLM-прокси: журнал вызовов: запись снова проходит")
             await asyncio.sleep(LEDGER_CHECK_S)
+
+    async def _brake_loop(self) -> None:
+        """Тормоз прогона: проверка сразу и раз в RUN_BRAKE_POLL_S (читается каждый раз), в потоке. Исключение — строка
+        журнала с классом и проверка без данных (blind): цикл не умирает, а молчание видно по age_s."""
+        from . import brake as brake_module
+
+        brake = self.brake
+        log.info("LLM-прокси: тормоз прогона %s: свободно меньше %d МиБ, swap +%d МиБ (база %s), давление full > %g %%",
+                 brake.run_id, brake.fail_mib, brake.swap_grow_mib,
+                 "первая проверка" if brake.swap_base_cfg < 0 else f"{brake.swap_base_cfg} МиБ", brake.psi_full_max)
+        while True:
+            try:
+                await asyncio.to_thread(brake.check)
+            except Exception as exc:
+                log.error("LLM-прокси: тормоз прогона: проверка упала (%s)", type(exc).__name__)
+                try:
+                    await asyncio.to_thread(brake.failed)
+                except Exception as again:
+                    log.error("LLM-прокси: тормоз прогона: учёт сбоя упал (%s)", type(again).__name__)
+            await asyncio.sleep(brake_module.RUN_BRAKE_POLL_S)
 
     async def _poll_loop(self) -> None:
         while True:

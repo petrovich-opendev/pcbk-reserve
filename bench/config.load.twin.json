@@ -1,0 +1,17 @@
+{
+  "run_id": "d11-twin",
+  "load": true,
+  "load_data": "twin",
+  "places": {"1": "pcbk/z-ai/glm-5.3", "2": "pcbk/z-ai/glm-5.3", "3": "pcbk/z-ai/glm-5.3", "4": "pcbk/z-ai/glm-5.3",
+             "5": "pcbk/z-ai/glm-5.3", "6": "pcbk/z-ai/glm-5.3", "7": "pcbk/z-ai/glm-5.3", "8": "pcbk/z-ai/glm-5.3",
+             "9": "pcbk/z-ai/glm-5.3", "10": "pcbk/z-ai/glm-5.3"},
+  "reps": {"create": 1, "number": 1, "trap": 1},
+  "scenarios": ["A1", "B4", "C3"],
+  "swap_base_mib": 0, "swap_grow_mib": 512, "dify_swap_base_mib": 0, "dify_swap_max_mib": 256,
+  "cap_usd": 5.0,
+  "stop_margin_usd": 0.5,
+  "window_start": null,
+  "out_dir": null,
+  "cards": "cards.twin.json",
+  "stand": null
+}

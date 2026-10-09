@@ -21,6 +21,11 @@ agents_after_dispose; см. FakePlaces).
 удачного POST /instance/dispose; если файл в этот момент есть на диске, экземпляр сломан и на все ручки, кроме
 /global/health, отвечает 400 ConfigInvalidError с этим путём. Чинит его только следующий start без файла: ни dispose, ни
 удаление файла не чинят. Пароль места (401) проверяется раньше экземпляра (предпроверка Д7б, m23).
+
+Д10а (задача А3): разговоры места для кабинета преподавателя — sessions[n] (список разговоров вида OpenCode) и
+messages[(n, id)] (сообщения разговора): GET /experimental/session, GET /session/{id} (нет такого у места — 404
+{"name": "NotFoundError"}), GET /session/{id}/message (тоже). Тела разговоров — как JSON.stringify OpenCode: одиночный
+суррогат уходит экраном \\udXXX (доводка р1, I-1).
 """
 from pathlib import Path
 import asyncio
@@ -29,6 +34,7 @@ import gzip
 import itertools
 import json
 import re
+import threading
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -44,6 +50,7 @@ _DOCKER_GET = re.compile(r"/v1\.44/(_ping|containers/pcbk-student-(0[1-9]|10)/js
 _DOCKER_POST = re.compile(r"/v1\.44/containers/pcbk-student-(0[1-9]|10)/(start|stop)")
 _PLACE_TAIL = re.compile(r"([1-9]|10)\.3")         # после префикса STU_NET: N.3, номер без нуля впереди
 _PROMPT_ASYNC = re.compile(r"/session/[^/]+/prompt_async")
+_SESSION = re.compile(r"/session/(ses_[^/]+)(/message)?")      # разговор и его сообщения (Д10а, кабинет)
 BIG_CHUNK = 1024                                   # кусок большого тела big: предел читается с точностью до КиБ
 PULSE_S = 0.05                                     # пульс потока "endless"
 # "silent" молчит столько, а не вечно: поломка, при которой шлюз тишину не видит, роняет тест, а не вешает прогон
@@ -70,6 +77,12 @@ def _stamp() -> str:
 
 def _json(status: int, body: object) -> httpx.Response:
     return httpx.Response(status, json=body)
+
+
+def _json_escaped(status: int, body: object) -> httpx.Response:
+    """JSON как у JSON.stringify OpenCode: одиночный суррогат — экраном \\udXXX (json= httpx его не закодировал бы)."""
+    return httpx.Response(status, content=json.dumps(body).encode("ascii"),
+                          headers={"content-type": "application/json"})
 
 
 class FakeDocker:
@@ -253,10 +266,14 @@ class FakePlaces:
     - GET /session/status — {} (после status_delay), у мест из busy — одна занятая сессия, у мест из status_raw —
       эти байты как тело 200 (неверный ответ места);
     - GET /permission — pending[n] (по умолчанию []);
+    - Д10а: GET /experimental/session — sessions[n] (по умолчанию []); GET /session/{id} — разговор id из sessions[n],
+      GET /session/{id}/message — messages[(n, id)] (по умолчанию []); разговора id у места нет — 404 NotFoundError;
     - check_status[n] — этот код и {"name": "Check"} на GET /agent и GET /permission (сверки прокси);
     - GET /event — 200 text/event-stream с потоком по сценарию events[n] (_EventBody; по умолчанию —
       server.connected и конец); event_starts[n] — сколько потоков место отдало, event_open[n] — сколько открыто
       сейчас, event_closed[n] — закрыт ли хоть один (False, пока не закрыт ни один); пауза до заголовков — hang_for;
+      ворота до заголовков — event_gate[n] (threading.Event теста): ответ ждёт, пока тест их не откроет, а
+      event_waiting[n] — сколько запросов /event места ждёт у ворот сейчас (гонка вкладок — по событию, не по времени);
     - POST /session/{id}/prompt_async — 204;
     - POST /instance/dispose (Д7а) — dispose_calls[n] += 1; при dispose_status[n] — этот код и {"name": "Dispose"},
       иначе 200 true, место «перезагружено» и зовётся on_dispose(n) (если задан); после первого удачного dispose GET
@@ -296,6 +313,8 @@ class FakePlaces:
         self.event_starts: Counter[int] = Counter()
         self.event_open: Counter[int] = Counter()
         self.event_closed: defaultdict[int, bool] = defaultdict(bool)
+        self.event_gate: dict[int, threading.Event] = {}
+        self.event_waiting: Counter[int] = Counter()
         self.dispose_calls: Counter[int] = Counter()
         self.dispose_status: dict[int, int] = {}
         self.on_dispose: Callable[[int], None] | None = None
@@ -303,6 +322,8 @@ class FakePlaces:
         self._disposed: set[int] = set()                # места, где dispose уже удался
         self.bad_files: dict[int, tuple[str, Path]] = {}
         self._instance: dict[int, str | None] = {}      # "ok", "broken"; None — создаст первый запрос; нет — "ok"
+        self.sessions: dict[int, list[dict]] = {}       # разговоры места (Д10а): вид OpenCode
+        self.messages: dict[tuple[int, str], list] = {}    # сообщения разговора места (Д10а)
 
     def started(self, n: int) -> None:
         """Новый процесс места (FakeDocker.on_start): экземпляр создаст первый запрос."""
@@ -316,6 +337,18 @@ class FakePlaces:
             bad = self.bad_files.get(n)
             state = self._instance[n] = "broken" if bad is not None and bad[1].exists() else "ok"
         return state
+
+    async def _event_gate(self, n: int) -> None:
+        """Ворота /event места n (event_gate): ждать, пока тест их не откроет; ждущие — в event_waiting[n]."""
+        gate = self.event_gate.get(n)
+        if gate is None:
+            return
+        self.event_waiting[n] += 1
+        try:
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        finally:
+            self.event_waiting[n] -= 1
 
     async def _big_body(self, n: int, size: int):
         while size > 0:
@@ -360,6 +393,7 @@ class FakePlaces:
                                   content=self._big_body(n, self.big[n]))
         path = request.url.path
         if request.method == "GET" and path == "/event":
+            await self._event_gate(n)
             return httpx.Response(200, headers={"content-type": "text/event-stream"},
                                   stream=_EventBody(self, n, self.events.get(n, [sse("server.connected")])))
         if request.method == "GET" and path in ("/agent", "/permission") and n in self.check_status:
@@ -381,6 +415,13 @@ class FakePlaces:
             return _json(200, {"ses_" + "B" * 26: {"type": "busy"}} if n in self.busy else {})
         if request.method == "GET" and path == "/permission":
             return _json(200, self.pending.get(n, []))
+        if request.method == "GET" and path == "/experimental/session":
+            return _json_escaped(200, self.sessions.get(n, []))
+        if request.method == "GET" and (m := _SESSION.fullmatch(path)):
+            found = [s for s in self.sessions.get(n, []) if s.get("id") == m[1]]
+            if not found:
+                return _json(404, {"name": "NotFoundError", "data": {"message": "Session not found"}})
+            return _json_escaped(200, self.messages.get((n, m[1]), []) if m[2] else found[0])
         if request.method == "POST" and _PROMPT_ASYNC.fullmatch(path):
             return httpx.Response(204)
         if request.method == "POST" and path == "/instance/dispose":

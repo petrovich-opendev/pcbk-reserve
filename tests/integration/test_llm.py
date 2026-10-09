@@ -1,12 +1,14 @@
 """LLM-прокси в компоновке: вызов через двойника OpenRouter, число на странице, отказы, выключатель, учения,
 ключи и токены файлами, OpenRouter недоступен."""
 import json
+import math
 
 import pytest
 
 from conftest import TEST_OPENROUTER_KEY, wait_for
 
 CORE = "http://172.31.250.82:8000"
+FAKE_CALL_USD = 0.0012                          # цена вызова двойника OpenRouter (USAGE fake_openrouter.py)
 CHAT = {"model": "z-ai/glm-5.3", "stream": True, "messages": [{"role": "user", "content": "вопрос"}]}
 
 
@@ -25,11 +27,16 @@ def usd(x: float) -> str:                       # правило fmt_usd сто�
 
 def test_llm_call_counted_on_status_page(stack):                                    # блокер раунда 1
     before = stack.llm_health()["spent_usd"]
-    assert before < 0.99                           # тестовый стенд: меньше $1 — на странице четыре знака
-    code, text = chat(stack, stack.llm_token(1))
-    assert code == 200 and text.rstrip().endswith("data: [DONE]")
-    wait_for(lambda: stack.llm_health()["spent_usd"] == pytest.approx(before + 0.0012), timeout=15)
-    want = f"расход {usd(before + 0.0012)} из $1000"
+    # меньше $1 — на странице четыре знака, хватает одного вызова. Расход стенда копится по модулям сессии (отбор Д8
+    # на двойниках — больше доллара): от $1 на странице два знака, и вызовов столько, чтобы прирост был больше цента —
+    # округлённая до цента сумма тогда обязательно сменится
+    calls = 1 if before < 0.99 else math.ceil(0.01 / FAKE_CALL_USD)
+    for _ in range(calls):
+        code, text = chat(stack, stack.llm_token(1))
+        assert code == 200 and text.rstrip().endswith("data: [DONE]")
+    added = calls * FAKE_CALL_USD
+    wait_for(lambda: stack.llm_health()["spent_usd"] == pytest.approx(before + added), timeout=15)
+    want = f"расход {usd(before + added)} из $1000"
     assert want != f"расход {usd(before)} из $1000"                                 # иначе сверка пустая
     stack.wait_status(lambda d: row(d, "llm")[:2] == ("ok", "OpenRouter отвечает")
                       and row(d, "llm")[2].split(" · ")[0] == want, timeout=40)

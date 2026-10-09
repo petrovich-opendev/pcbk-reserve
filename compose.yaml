@@ -12,10 +12,10 @@ name: pcbk-reserve
 # Профиль students: команды выкладки без имён служб места не поднимают — их создают
 # create и будит серверный слой (с Д5) или администратор.
 # Секции build нет: образ один на десять мест, собирается локально и едет docker save/load;
-# :d6a остаётся на сервере для отката Д7б (:d4 — для отката Д6а).
+# :d7b (или :d8b) остаётся на сервере для отката Д9а (:d6a — для отката Д7б).
 # healthcheck не задаётся: работает проверка образа (GET /agent и слово MCP: «200 mcp=connected»).
 x-student: &student
-  image: pcbk-reserve/student:d7b
+  image: pcbk-reserve/student:d9a
   pull_policy: never
   runtime: runsc
   profiles: [students]
@@ -90,8 +90,8 @@ services:
 
   watchdog:
     build: ./watchdog
-    # :d6a остаётся на сервере для отката Д6б (:d5b — для отката Д6а)
-    image: pcbk-reserve/watchdog:d7a
+    # откатный образ — `watchdog:d10a` (Д11а, А0)
+    image: pcbk-reserve/watchdog:d11a
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog
@@ -107,6 +107,9 @@ services:
       TLS_CAFILE: /app/tls/cert.pem
       JOURNAL_PATH: /var/lib/pcbk-watchdog/journal.db
       MEMINFO_PATH: /proc/meminfo
+      # «Память сервера» (Д11): счётчик убийств по памяти oom_kill и давление памяти; под runc — значения хоста
+      VMSTAT_PATH: /proc/vmstat
+      PRESSURE_PATH: /proc/pressure/memory
       COMPONENTS_PATH: /app/components.json
       # настраиваются из .env или оболочки (учения меняют TICK_S и MEM_WARN_MIB)
       TICK_S: ${TICK_S:-10}
@@ -115,6 +118,10 @@ services:
       DISPLAY_TZ: ${DISPLAY_TZ:-UTC}
       MEM_WARN_MIB: ${MEM_WARN_MIB:-2048}
       MEM_FAIL_MIB: ${MEM_FAIL_MIB:-1024}
+      # «Память сервера» (Д11): swap вырос за 10 мин на SWAP_GROW_WARN_MIB, МиБ, — «вытесняет память в swap»;
+      # давление full avg10 выше PSI_FULL_MAX, %, 3 такта подряд — «давление выше порога» (В1 правит оба по базе)
+      SWAP_GROW_WARN_MIB: ${SWAP_GROW_WARN_MIB:-512}
+      PSI_FULL_MAX: ${PSI_FULL_MAX:-10}
       # учения «цикл молчит при живом HTTP»: 1 — цикл замирает после первого такта
       DRILL_FREEZE_LOOP: ${DRILL_FREEZE_LOOP:-0}
       # свежесть историана (Д3а): возраст метки — «внимание» / «сбой»; опрос службы данных
@@ -128,6 +135,12 @@ services:
       # строка «Агенты студентов» (Д7а): метка прохода воркера перезагрузки агентов старше AGENTS_STALE_S —
       # «перезагрузка агентов молчит»; воркер ставит её раз в 2 с и перед каждым местом прохода
       AGENTS_STALE_S: ${AGENTS_STALE_S:-60}
+      # строка «LLM-прокси и бюджет» (Д8а): к модели прогона отбора не обращались дольше LLM_RUN_SILENT_S —
+      # «прогон отбора молчит»; учения тишины ставят меньше
+      LLM_RUN_SILENT_S: ${LLM_RUN_SILENT_S:-300}
+      # строка «Кабинет преподавателя и доли» (Д10а): сверка долей (такт уборщика шлюза) старше TEACHER_STALE_S —
+      # «сверка долей молчит»; не меньше 4 × GW_REAPER_TICK_S у core
+      TEACHER_STALE_S: ${TEACHER_STALE_S:-120}
     volumes:
       # только сертификат: им сторож проверяет, что edge отдаёт именно его
       - type: bind
@@ -206,8 +219,8 @@ services:
   # на адресе core в pcbk-front (Д5-R31). Порт 8000 не публикуется.
   core:
     build: ./core
-    # :d7a остаётся на сервере для отката Д7б, :d6b — для отката Д7а (deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d7b
+    # откатный образ — `core:d10b` (Д11а, А0; deploy/README.md, «Откат»)
+    image: pcbk-reserve/core:d11a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -231,6 +244,9 @@ services:
       CATALOG_DEADLINE_S: ${CATALOG_DEADLINE_S:-60}
       # учения свежести: freeze_stamps — метки не растут, freeze_poll — опрос встаёт; пусто — нет
       DRILL_FRESHNESS: ${DRILL_FRESHNESS:-}
+      # учения службы данных (Д9а): tool_error — инструменты чтения отвечают ошибкой без SQL и без данных
+      # историана (выкладка без окна владельца); пусто — нет
+      DRILL_DATA: ${DRILL_DATA:-}
       # LLM-прокси (Д4а): список моделей (пусто — все семь), выключатель (stopped), учения
       # «кончились деньги» (402) без OpenRouter, доля администратора, $; ключ только у резервного
       # контура (on — сверка расхода с /key; off — ключ общий, сверки нет)
@@ -239,6 +255,18 @@ services:
       DRILL_LLM: ${DRILL_LLM:-}
       LLM_OPS_SHARE_USD: ${LLM_OPS_SHARE_USD:-100}
       LLM_KEY_DEDICATED: ${LLM_KEY_DEDICATED:-on}
+      # прогон отбора модели (Д8-R69): id, потолок, $, и места прогона через запятую — все три или ни одного;
+      # пусто — прогона нет. Задаются только на время прогона, потолок — поверх долей и общего бюджета
+      LLM_RUN_ID: ${LLM_RUN_ID:-}
+      LLM_RUN_USD: ${LLM_RUN_USD:-}
+      LLM_RUN_CALLERS: ${LLM_RUN_CALLERS:-}
+      # тормоз прогона (Д11): только при LLM_RUN_* core сам раз в 5 с читает /proc хоста и под защёлкой отказывает
+      # вызовам мест прогона и усыпляет их; пороги — свои, иначе пороги сторожа (MEM_FAIL_MIB, SWAP_GROW_WARN_MIB,
+      # PSI_FULL_MAX); база swap −1 — от первой проверки прогона. Пути к /proc здесь не задаются (двойники — compose.test.yaml)
+      LLM_RUN_MEM_FAIL_MIB: ${LLM_RUN_MEM_FAIL_MIB:-${MEM_FAIL_MIB:-1024}}
+      LLM_RUN_SWAP_GROW_MIB: ${LLM_RUN_SWAP_GROW_MIB:-${SWAP_GROW_WARN_MIB:-512}}
+      LLM_RUN_SWAP_BASE_MIB: ${LLM_RUN_SWAP_BASE_MIB:--1}
+      LLM_RUN_PSI_FULL_MAX: ${LLM_RUN_PSI_FULL_MAX:-${PSI_FULL_MAX:-10}}
       # шлюз (Д5а). STU_NET — те же сети мест, что ниже: по нему core сверяет токен места с его сетью
       # (Ш25) и зовёт место на STU.N.3; без него при нестандартной подсети отказ получило бы каждое место
       STU_NET: ${STU_NET:-172.31}
@@ -254,6 +282,10 @@ services:
       # учения агентов студентов (Д7а): freeze_reload — воркер перезагрузки мест замирает после первого
       # прохода; пусто — нет
       DRILL_AGENTS: ${DRILL_AGENTS:-}
+      # учения кабинета преподавателя (Д10а): shares_stale — перевод доли пишет диск и журнал действий, а память
+      # LLM-прокси не обновляет; journal_down — журнал действий не пишется (кабинет закрыт); пусто — нет. Опечатка —
+      # ошибка настройки шлюза и закрытый LLM-прокси, процесс жив
+      DRILL_TEACHER: ${DRILL_TEACHER:-}
     volumes:
       - {type: bind, source: "${DATA_DIR:?DATA_DIR не задан}/whitelist.txt", target: /app/data/whitelist.txt,
          read_only: true, bind: {create_host_path: false}}

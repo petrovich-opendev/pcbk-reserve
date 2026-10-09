@@ -10,12 +10,14 @@ export const STAND_WARNING =
 export const MAX_TEXT = 20000;                          // поле ввода — MAX_TEXT правил шлюза Д5б (R42)
 
 // имена инструментов в строке вызова (R42); прочие — своим именем. pcbk_save_agent — инструмент Конструктора (Д7б,
-// итоговая доводка, замечание Б4): системное имя студенту не показывается
+// итоговая доводка, замечание Б4): системное имя студенту не показывается. Ряд и наработка — с Д9а (Д9-R88)
 export const TOOL_LABELS: Readonly<Record<string, string>> = {
   pcbk_tag_now: "текущее значение",
   pcbk_tag_period: "сводка за период",
   pcbk_catalog_search: "поиск тегов",
   pcbk_save_agent: "сохранение агента",
+  pcbk_tag_series: "ряд и профиль",
+  pcbk_calc_runtime: "наработка",
 };
 
 // --- шапка и фазы чата (R39) ---
@@ -23,7 +25,6 @@ export const T_LOADING = "Чат загружается…";
 export const T_SIGNED_IN = (login: string): string => `Вы вошли как ${login}`;
 export const T_LOGOUT = "Выйти";
 export const T_RETRY = "Повторить";
-export const T_TEACHER = "У преподавателя пока нет чата — он появится в следующих выпусках стенда.";
 
 // --- предупреждение при первом входе (R49) ---
 // Номер редакции живёт в core (NOTICE accounts.py), текст — здесь. Новый текст — новый номер в обоих местах: иначе
@@ -93,6 +94,83 @@ export const T_TURN_SILENT =
 export const T_UI_CRASH = "Чат столкнулся с ошибкой. Сбой отмечен для администратора.";
 export const T_UI_RESTART = "Перезапустить чат";
 
+// --- вкладки шапки (Д9-R88, Д10-R110): у студента «Чат» и «Калькуляторы», у преподавателя «Кабинет» и «Калькуляторы»;
+// калькуляторы — те же инструменты службы, что у агентов ---
+export const T_TABS = "Разделы";                       // подпись группы вкладок для чтения с экрана
+export const T_TAB_CHAT = "Чат";
+export const T_TAB_CABINET = "Кабинет";
+export const T_TAB_CALC = "Калькуляторы";
+export const T_CALC_TITLE = "Калькуляторы БДРВ — те же расчёты, что у агентов";
+export const T_CALC_FIND = "Найти тег";
+export const T_CALC_RUN = "Посчитать";
+export const T_CALC_BUSY = "Считаю…";
+export const T_CALC_NO_TAG = "Выберите тег — найдите его по словам или впишите имя";
+export const T_CALC_NO_RANGE = "Укажите начало и конец своего периода";
+export const T_CALC_BAD_RANGE = "Конец своего периода — позже начала";
+export const T_CALC_SIMILAR = "Точного совпадения нет — вот похожие теги";   // вместо заметки службы для агента
+export const T_CALC_NOTHING = "Ничего не найдено — попробуйте другие слова";
+export const T_CALC_PERIOD_LINE = (start: string, end: string, tz: string): string => `Период: ${start} — ${end} (${tz})`;
+export const T_CALC_ASOF_LINE = (asof: string, tz: string): string => `Прочитано: ${asof} (${tz})`;   // у текущего значения
+export const T_CALC_COVERED = (percent: string): string => `Данные покрывают ${percent} % периода`;
+export const T_CALC_SECONDS = (s: string): string => `${s} с`;
+export const T_CALC_PERCENT = (p: string): string => `${p} %`;
+export const T_CALC_STATE_VALUE = (v: string): string => `значение ${v}`;   // состояние без подписи по суффиксу
+// сбой вкладки — своя граница ошибок (m5); тексты — не чата (m-3)
+export const T_CALC_CRASH = "Вкладка калькуляторов столкнулась с ошибкой. Сбой отмечен для администратора.";
+export const T_CALC_RESTART = "Перезапустить калькуляторы";
+// подписи полей, режимов, периодов и чисел вкладки (R88). Ключи режимов — CalcMode, ключи периодов — PRESETS службы
+// (periods.py) и custom; значения полей и порядок — calc.ts
+export const CALC_LABELS = {
+  query: "Слова для поиска",
+  tag: "Тег",
+  mode: "Режим",
+  period: "Период",
+  from: "С",
+  to: "По",
+  points: "Точек на графике",
+  modes: {
+    now: "Текущее значение",
+    period: "Сводка за период: среднее, минимум, максимум, размах",
+    profile: "Профиль: как менялся параметр",
+    runtime: "Наработка по тегу состояния",
+  },
+  periods: {
+    last_hour: "Последний час",
+    last_8h: "Последние 8 часов",
+    last_24h: "Последние сутки",
+    current_shift: "Текущая смена",
+    prev_shift: "Прошлая смена",
+    today: "Сегодня",
+    yesterday: "Вчера",
+    last_7d: "Последние 7 суток",
+    last_30d: "Последние 30 суток",
+    custom: "Свой период (время историана)",
+  },
+  matches: "Найденные теги",
+  value: "Значение",
+  time: "Время замера",
+  age: "Возраст",
+  quality: "Качество",
+  avg: "Среднее",
+  min: "Минимум",
+  max: "Максимум",
+  range: "Размах",
+  good: "Доля достоверных",
+  first: "В начале",
+  last: "В конце",
+  change: "Изменение",
+  gridMin: "Минимум сетки",
+  gridMax: "Максимум сетки",
+  chart: "График профиля",
+  state: "Состояние",
+  hours: "Часов",
+  percent: "% периода",
+  count: "Переходов",
+  source: "Источник",
+  pointsPerTag: "Точек на тег",                       // у профиля — рядом с источником (его текст: «N точек»)
+  avgKind: "Вид среднего",
+} as const;
+
 // --- отказы шлюза (таблица R43) ---
 export const T_SIGNED_OUT = "Сессия закончилась — войдите снова";
 // запасные тексты: в ответе шлюза или edge свой data.message, эти — когда его нет (равны текстам шлюза)
@@ -112,3 +190,159 @@ export const T_STATUS_ROWS_UNKNOWN = "Состояние неизвестно"; 
 export const T_STATUS_UNKNOWN = "Состояние стенда неизвестно — сторож не отвечает";   // сама страница молчит
 export const T_STATUS_MORE = (n: number): string => ` и ещё ${n}`;
 export const T_STATUS_DETAILS = "Подробнее";           // ссылка на /status
+
+// --- кабинет преподавателя (Д10-R106): места и доли, разговоры и агенты студентов только на чтение, журнал действий ---
+// Отказы ручек кабинета (TEACHER_TEXTS шлюза, Д10-R100) и правил долей (Д10-R97) приходят в ответе и показываются
+// дословно (replyText) — здесь только свои строки страницы.
+export const T_TCH_TITLE = "Кабинет преподавателя";
+export const T_TCH_REFRESH = "Обновить";
+export const T_TCH_LOADING = "Загружаю…";
+export const T_TCH_BUDGET = (spent: string, total: string, allocated: string, free: string, ops: string): string =>
+  `Общий бюджет: потрачено ${spent} из ${total}; распределено по местам ${allocated}, свободно ${free}; отбор и проверки ${ops}`;
+export const T_TCH_NO_SHARES = "Доли бюджета недоступны — перевод закрыт";   // обзор без LLM-прокси или без долей (R101)
+// кабинет говорит с преподавателем: «…сообщите преподавателю» из текстов чата здесь не к месту (ревью А4, m-4)
+export const T_TCH_UNKNOWN = "Неожиданный ответ сервера — сообщите администратору стенда.";
+export const T_TCH_PLACE_GAVE_UP =
+  "Рабочее место не ответило за полторы минуты — повторите или сообщите администратору стенда.";
+export const T_TCH_PLACE_ODD = "Непонятный ответ о рабочем месте — повторите или сообщите администратору стенда.";
+// обзор после изменения не пришёл: прежний остаётся на экране, причина — строкой над ним (ревью А4, m-1)
+export const T_TCH_OVERVIEW_FAILED = (why: string): string => `Обзор не обновился: ${why}`;
+export const T_TCH_NONE = "—";                         // нет числа (доли не загружены)
+export const T_TCH_BAD_PART = "Неверный номер места, разговора или имя агента";   // вызов не ушёл: часть пути не по шаблону
+// таблица мест
+export const T_TCH_PLACES = "Места студентов";
+export const TCH_COLUMNS = {
+  place: "Место", student: "Студент", state: "Состояние", share: "Доля", spent: "Потрачено", agents: "Агентов",
+  account: "Учётная запись",
+} as const;
+export const T_TCH_FREE = "свободно";                  // у места нет закрепления (free, m-11)
+export const T_TCH_NO_ACCOUNT = "без учётки";           // закреплено за удалённым логином: учётки нет, но место не свободно
+export const T_TCH_MARK_DISABLED = "отключена";
+export const T_TCH_MARK_LOCKED = "замок";
+export const T_TCH_MARK_NOT_NOTICED = "не подтвердил предупреждение";
+export const T_TCH_OPEN = "Открыть";
+export const T_TCH_OPEN_LABEL = (nn: string): string => `Открыть место ${nn}`;
+// состояние места (workplaces.view, Д5): незнакомое — как пришло
+export const PLACE_STATE_LABELS: Readonly<Record<string, string>> = {
+  sleeping: "спит", starting: "просыпается", ready: "работает", failed: "сбой",
+};
+// открытое место: вкладки «Разговоры» и «Агенты»
+export const T_TCH_PLACE_TITLE = (nn: string, login: string): string => `Место ${nn} — ${login}`;
+export const T_TCH_PLACE_TABS = "Разговоры и агенты места";
+export const T_TCH_TAB_SESSIONS = "Разговоры";
+export const T_TCH_TAB_AGENTS = "Агенты";
+export const T_TCH_WAKE = "Разбудить для просмотра";
+export const T_TCH_RELOAD_LIST = "Обновить список";
+export const T_TCH_NO_SESSIONS = "Разговоров нет";
+export const T_TCH_ARCHIVED = "в архиве";
+// разговор студента (TeacherReader): только текст, ни полей, ни кнопок отправки
+export const T_TCH_READ_ONLY = "Только чтение: писать в разговор студента нельзя";
+export const T_TCH_STUDENT = "Студент";
+export const T_TCH_AGENT = (title: string): string => `Агент «${title}»`;
+export const T_TCH_AGENT_NONAME = "Агент";
+export const T_TCH_CLIPPED = "Разговор показан не целиком — он слишком длинный";
+export const T_TCH_NO_MESSAGES = "В разговоре нет сообщений";
+export const T_TCH_TOOL_UNKNOWN = "состояние неизвестно";
+// агенты места (TeacherAgents): карточки из учёта и текст файла
+export const T_TCH_NO_AGENTS = "Своих агентов у студента нет";
+export const T_TCH_SHOW_TEXT = "Показать инструкцию";
+export const T_TCH_HIDE_TEXT = "Скрыть инструкцию";
+export const TCH_AGENT_LABELS = {
+  node: "Узел", purpose: "Назначение", tools: "Инструменты", tags: "Теги", state: "Состояние",
+} as const;
+// состояния учёта агентов (AgentState, Д7-R60; архивных в ответе нет): незнакомое — как пришло
+export const AGENT_STATE_LABELS: Readonly<Record<string, string>> = {
+  saved: "сохранён — появится после перезагрузки места",
+  visible: "работает",
+  not_visible: "не появился в рабочем месте",
+  quarantined: "в карантине — файл не загрузился",
+};
+// доли бюджета на модель (TeacherShares)
+export const T_TCH_SHARES = "Доли бюджета на модель";
+export const T_TCH_FROM = "С места";
+export const T_TCH_TO = "На место";
+export const T_TCH_AMOUNT = "Сумма, $";
+export const T_TCH_PICK = "выберите место";
+export const T_TCH_MOVE = "Перевести";
+export const T_TCH_FLOOR = "Остановить место";
+export const T_TCH_FLOOR_HINT =
+  "«Остановить место» сводит долю места «С места» к уже оплаченному, разницу отдаёт месту «На место»: следующий вызов модели студента получит отказ «доля израсходована».";
+export const T_TCH_SHARES_DONE = "Доли обновлены";
+export const T_TCH_SAME_PLACE = "Выберите два разных места";
+export const T_TCH_ZERO = "Сумма должна быть больше нуля";
+export const T_TCH_BAD_AMOUNT = "Сумма — в долларах, не больше двух знаков после запятой";
+export const T_TCH_TAKE_MAX = (nn: string, money: string): string => `У места ${nn} можно взять не больше ${money}`;
+// учётные записи студентов (TeacherAccounts, Д10-R110): отказы ручек учёток (R108) — текстом ответа дословно
+export const T_TCH_ACCOUNTS = "Учётные записи";
+export const T_TCH_ACC_ADD_TITLE = "Завести студента";
+export const T_TCH_ACC_LOGIN = "Логин";
+export const T_TCH_ACC_PLACE = "Место";
+export const T_TCH_ACC_ADD = "Завести";
+// заведение закрепляет место за логином навсегда (Д5а); смены студента в занятом месте нет ни здесь, ни у команды
+// администратора — хранилище отказывает (итоговое ревью Д10б, m-2 и ревью Б1+Б2, M-5)
+export const T_TCH_ACC_ADD_HINT =
+  "Только на свободное место. Логин закрепляется за местом навсегда — проверьте написание. Сменить студента в занятом " +
+  "месте сейчас нельзя; учётки преподавателей и удаление учёток — команда администратора.";
+// логин вида пробных учёток проверок (PROBE_LOGIN учёток шлюза): такое место администратор может освободить
+// (release-place) — живому студенту нужен обычный логин (ревью Б1+Б2, M-4); подсказка не запрещает: сервер их принимает
+export const T_TCH_ACC_PROBE_LOGIN =
+  "Логин вида dN-probe-… — для проверок стенда: такое место администратор может освободить. Студенту дайте обычный логин.";
+export const T_TCH_ACC_NO_FREE = "Свободных мест нет";
+export const T_TCH_ACC_PICK_PLACE = "Выберите свободное место";
+// правило логина — то же, что _LOGIN_RULE учёток шлюза (LOGIN_RE): подсказка до запроса
+export const T_TCH_ACC_LOGIN_RULE = "Логин — 3…32 знака из a-z, 0-9, «.», «_», «-», первый — буква a-z";
+// окно пароля (.password-once): пароль только в состоянии окна, «Я записал пароль» его стирает
+export const T_TCH_ACC_PASSWORD_ONCE = "Пароль показан один раз — запишите его и передайте студенту";
+export const T_TCH_ACC_PASSWORD_FOR = (login: string, nn: string): string => `Учётка ${login}, место ${nn}`;
+export const T_TCH_ACC_COPY = "Скопировать";
+export const T_TCH_ACC_COPIED = "Скопировано";
+export const T_TCH_ACC_COPY_FAILED = "Скопировать не удалось — пароль выделен, нажмите Ctrl+C";
+export const T_TCH_ACC_DONE = "Я записал пароль";
+// кнопки строки места со студентом; aria-label — «<действие> <логин>»
+export const T_TCH_ACC_PASSWD = "Новый пароль";
+export const T_TCH_ACC_DISABLE = "Отключить";
+export const T_TCH_ACC_ENABLE = "Включить";
+export const T_TCH_ACC_UNLOCK = "Снять замок";
+export const T_TCH_ACC_LABEL = (action: string, login: string): string => `${action} ${login}`;
+// подтверждение — окно в странице (не window.confirm): отключение и новый пароль закрывают сессии студента. Чат узнаёт об
+// этом по ответу 401: при следующем действии студента, а при открытом разговоре — и сам, за перепроверку потока; уйти
+// «сразу» он не может (Б3, сомнение 1; итоговое ревью Д10б, m-1) — один честный текст на оба подтверждения
+export const T_TCH_ACC_SIGNS_OUT = "Студент не сможет продолжить: чат закроется не позже его следующего действия";
+export const T_TCH_ACC_ASK_DISABLE = (login: string): string => `Отключить учётку ${login}? ${T_TCH_ACC_SIGNS_OUT}`;
+export const T_TCH_ACC_YES_DISABLE = "Да, отключить";
+export const T_TCH_ACC_ASK_PASSWD = (login: string): string =>
+  `Выдать учётке ${login} новый пароль? Старый перестанет работать. ${T_TCH_ACC_SIGNS_OUT}`;
+export const T_TCH_ACC_YES_PASSWD = "Да, выдать новый пароль";
+export const T_TCH_ACC_CANCEL = "Отмена";
+export const T_TCH_ACC_DISABLED = (login: string): string => `Учётка ${login} отключена`;
+export const T_TCH_ACC_ENABLED = (login: string): string => `Учётка ${login} включена`;
+export const T_TCH_ACC_UNLOCKED = (login: string): string => `Замок входа ${login} снят`;
+// вызов не ушёл: логин в пути ручки учётки не по LOGIN_RE учёток
+export const T_TCH_ACC_BAD_LOGIN = "Неверный логин учётки";
+// журнал действий (TeacherJournal): последние строки, новые первыми
+export const T_TCH_JOURNAL = "Журнал действий";
+export const T_TCH_JOURNAL_RELOAD = "Обновить журнал";
+export const T_TCH_JOURNAL_EMPTY = "Записей пока нет";
+export const T_TCH_JOURNAL_PLACE = (nn: string): string => `место ${nn}`;
+export const T_TCH_JOURNAL_SHARE = (nn: string, from: string, to: string): string => `${nn}: ${from} → ${to}`;
+// подписи действий журнала (ACTIONS, Д10-R99; действия учёток — Д10б, R108); незнакомое — кодом как есть
+export const ACTION_LABELS: Readonly<Record<string, string>> = {
+  sessions: "открыл список разговоров",
+  read: "прочитал разговор",
+  agents: "открыл список агентов",
+  agent: "прочитал инструкцию агента",
+  wake: "разбудил место",
+  shares: "перевёл долю",
+  account_add: "завёл учётку студента",
+  account_passwd: "выдал новый пароль",
+  account_disable: "отключил учётку",
+  account_enable: "включил учётку",
+  account_unlock: "снял замок входа",
+};
+// итоги строк журнала (OUTCOMES, Д10-R99)
+export const OUTCOME_LABELS: Readonly<Record<string, string>> = {
+  requested: "запрошено", ok: "выполнено", refused: "отказ", error: "ошибка", started: "начато",
+};
+// сбой отрисовки кабинета — своя граница ошибок, тексты — не чата (Д9 m-3)
+export const T_TCH_CRASH = "Кабинет преподавателя столкнулся с ошибкой. Сбой отмечен для администратора.";
+export const T_TCH_RESTART = "Перезапустить кабинет";

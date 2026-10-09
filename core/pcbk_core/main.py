@@ -19,6 +19,7 @@ from .settings import Settings
 if TYPE_CHECKING:
     from .agents.stats import AgentStats
     from .app import Role
+    from .data.service import DataService
     from .gateway import GatewayRole
     from .llm import LlmRole
     from .secrets import BdrvConfig
@@ -79,13 +80,20 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
     таблица (всем 401), причина TOKENS_ERROR на странице, фоновые циклы идут.
 
     Счётчики агентов студентов (Д7-R53) — один AgentStats на процесс у обеих ролей: «данные» пишет итоги save_agent,
-    шлюз отдаёт их на /health/agents.
+    шлюз отдаёт их на /health/agents. Калькуляторы страницы (Д9-R87) — тот же DataService роли «данные» у шлюза.
+
+    Доли мест (Д10-R98) — одни у LLM-прокси и шлюза: шлюз получает роль llm (llm=…) и сверяет её доли в такте уборщика.
+    Учение долей — DRILL_TEACHER из GW_* (поле GatewaySettings, m-7): значение — из полей, прошедших проверку
+    (GatewaySettings._parse, как valid_from_env), а признак «учение с ошибкой» — из всего списка ошибок _parse (m-1 р2:
+    ошибка в GW_* раньше по полям его не прячет). Учение с ошибкой — роль llm закрыта (drill_error), иначе опечатка
+    тихо работала бы по умолчанию.
     """
     from .agents.stats import AgentStats
     from .data import CONFIG_ERRORS, TOKENS_ERROR, DataRole
     from .data.historian import HistorianError, QueryFn, tds_query
     from .data.names import load_names
     from .secrets import TokenTable
+    from .settings import GatewaySettings
 
     log = logging.getLogger("pcbk_core.main")
     problems: list[str] = []
@@ -121,21 +129,31 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
     agent_stats = AgentStats()
     data = DataRole(settings, query, whitelist, config_error="; ".join(problems) or None,
                     tokens=tokens, tokens_error=tokens_error, agent_stats=agent_stats)
-    return [data, build_llm_role(settings, env), build_gateway_role(settings, env, agent_stats=agent_stats)]
+    gw_values, gw_errors = GatewaySettings._parse(env)
+    shares_drill = str(gw_values.get("DRILL_TEACHER", GatewaySettings.DRILL_TEACHER))
+    drill_error = any(error.startswith("DRILL_TEACHER:") for error in gw_errors)
+    llm = build_llm_role(settings, env, shares_drill=shares_drill, drill_error=drill_error)
+    return [data, llm, build_gateway_role(settings, env, agent_stats=agent_stats, calc=data.service, llm=llm)]
 
 
-def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> LlmRole:
+def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None, *, shares_drill: str = "",
+                   drill_error: bool = False) -> LlmRole:
     """Роль llm по образцу роли «данные»: ошибка — причина на странице, процесс жив (П6, Д3а I2).
 
     LLM_* с ошибкой — умолчания (пути к файлам — свои) и config_error «настройки: …»; нечитаемый файл ключа
     или ключ не из печатных знаков ASCII — ключа нет, config_error; llm-tokens не читается — пустая таблица и
     tokens_error, это не config_error (П23). Ключ управления необязателен (Д4а-R16): нечитаемый или негодный —
     опрос /credits выключен, mgmt_key «error», строка WARNING, прокси работает. Строки журнала начинаются с
-    «LLM-прокси: » — проверка журнала службы данных «токены <файл>» их не спутает. Ledger и Upstream в
+    «LLM-прокси: » — проверка журнала службы данных «токены <файл>» их не спутает. Ledger, Shares и Upstream в
     конструкторах ничего не открывают.
+
+    Доли мест (Д10-R98) — Shares на DB_PATH: бюджет — LLM_TOTAL_USD, доля по умолчанию — LLM_SHARE_USD, учение —
+    shares_drill (DRILL_TEACHER). drill_error — DRILL_TEACHER с ошибкой: config_error «учения DRILL_TEACHER с ошибкой —
+    доли закрыты», все вызовы — 403.
     """
     from .llm import LLM_TOKENS_ERROR, LlmRole
     from .llm.ledger import Ledger
+    from .llm.shares import Shares
     from .llm.upstream import Upstream
     from .secrets import KeyFileError, TokenTable, key_fingerprint, read_key_file
     from .settings import LlmSettings
@@ -182,20 +200,27 @@ def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None) -> 
                 except ValueError as exc:     # негоден только ключ управления: основной уже проверен
                     log.warning("LLM-прокси: %s — остаток счёта не опрашивается", exc)
                     mgmt_failed = True
+    if drill_error:                         # учение с опечаткой не работает молча по умолчанию (m-7)
+        log.error("LLM-прокси: учения DRILL_TEACHER с ошибкой — доли закрыты")
+        problems.append("учения DRILL_TEACHER с ошибкой — доли закрыты")
+    shares = Shares(settings.DB_PATH, total_usd=llm.LLM_TOTAL_USD, default_usd=llm.LLM_SHARE_USD, drill=shares_drill)
     role = LlmRole(settings, llm, tokens=tokens, upstream=upstream, ledger=Ledger(settings.DB_PATH),
                    key_fingerprint=key_fingerprint(key) if key else None,
-                   config_error="; ".join(problems) or None, tokens_error=tokens_error)
+                   config_error="; ".join(problems) or None, tokens_error=tokens_error, shares=shares)
     if mgmt_failed:
         role.mgmt_key = "error"
     return role
 
 
 def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None, *,
-                       agent_stats: AgentStats | None = None) -> GatewayRole:
+                       agent_stats: AgentStats | None = None, calc: DataService | None = None,
+                       llm: LlmRole | None = None) -> GatewayRole:
     """Роль gateway по образцу build_llm_role (Ш9): GW_* с ошибкой — запасные настройки (gateway_settings) и
     config_error «настройки шлюза: …» (имя поля и правило, без значения); процесс жив. Ни один конструктор
     ничего не открывает: core.db — в lifespan роли, клиенты sp-ctl и мест — при первом запросе. agent_stats —
-    общие с ролью «данные» счётчики агентов (build_roles); None — роль создаёт свои."""
+    общие с ролью «данные» счётчики агентов (build_roles); None — роль создаёт свои. calc — служба данных роли «данные»
+    для калькуляторов страницы (Д9-R87); None — маршрут /pcbk/api/calc/ отвечает 503. llm — роль LLM-прокси с долями
+    мест (Д10-R98): их сверяет такт уборщика шлюза; None — шлюз без долей."""
     from .gateway import GatewayRole
     from .gateway.accounts import AccountStore
     from .gateway.places import SpCtl, Workplaces
@@ -208,7 +233,7 @@ def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None,
     return GatewayRole(settings, gw, store=AccountStore(settings.DB_PATH, ttl_s=gw.GW_SESSION_TTL_S),
                        workplaces=Workplaces(gw, SpCtl(gw.SP_CTL_URL), stats=stats), stats=stats,
                        config_error=None if problem is None else f"настройки шлюза: {problem}",
-                       agent_stats=agent_stats)
+                       agent_stats=agent_stats, calc=calc, llm=llm)
 
 
 def gateway_settings(env: Mapping[str, str] | None = None) -> tuple[GatewaySettings, str | None]:

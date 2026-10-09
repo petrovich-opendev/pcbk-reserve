@@ -1,10 +1,12 @@
-"""Служба данных: инструменты catalog_search, tag_now, tag_period поверх ворот и каталога Д3а.
+"""Служба данных: инструменты catalog_search, tag_now, tag_period и калькуляторы tag_series (ряд и профиль,
+Д9-R84) и calc_runtime (наработка, Д9-R85) поверх ворот и каталога Д3а.
 
 Порядок в каждом инструменте:
 0. ошибка настройки (F5) — ответ unavailable с причиной; ни частоты, ни каталога, ни ворот;
-1. частота вызывающего; 2. аргументы; 3. каталог загружен; 4. разбор имён (повторы схлопываются,
-   порядок — как во вводе); 5. период и бюджет (tag_period); 6. кэш → single-flight → ворота;
-7. ответ → событие → строка журнала.
+1. частота вызывающего; 1а. учение DRILL_DATA=tool_error — ответ error без SQL (Д9-R83); 2. аргументы;
+3. каталог загружен; 4. разбор имён (повторы схлопываются, порядок — как во вводе); 5. период и бюджет
+(tag_period, tag_series, calc_runtime — общий путь _period_scope; у tag_series затем точки ряда); 6. кэш →
+single-flight → ворота; 7. ответ → событие → строка журнала.
 
 Любой отказ до ворот SQL не шлёт. Событие пишется на каждый вызов: requested — сырой ввод, tags —
 канонические имена со статусами ok/no_value/no_data, sent — только от ворот (GateResult.sent,
@@ -16,9 +18,13 @@ HistorianError.sent). У попадания в кэш, у ожидающего s
 «Сейчас историана» — последние часы (каталог, опрос свежести раз в 30 с) плюс прошедшее по
 монотонным часам роли; часы старше CLOCK_STALE_S сначала обновляются запросом [clock_sql()].
 
-Исходы последних TOOL_WINDOW вызовов каналов http и mcp служба держит в памяти (tools_stats): ручка
+Исходы последних TOOL_WINDOW вызовов каналов http, mcp и web служба держит в памяти (tools_stats): ручка
 /health/historian идёт в цикле событий, журнал событий там не читается (F9, К7). После перезапуска
-окно пустое.
+окно пустое. Там же — серии ошибок подряд по имени инструмента (Д9-R83): инструмент с серией не меньше
+FAIL_STREAK — в tools_stats()["failing"], пока его звали не дольше FAIL_STALE_S назад.
+
+Учение DRILL_DATA=tool_error (Д9-R83): каждый инструмент чтения сразу после частоты вызывающего отвечает
+ошибкой с summary DRILL_SUMMARY — SQL не уходит, данных (и каталога) в ответе нет.
 """
 from __future__ import annotations
 
@@ -33,14 +39,16 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
-from .budget import PER_CALLER_LIMIT, check_budget, cost_tag_days
+from .budget import PER_CALLER_LIMIT, check_budget, check_points, cost_tag_days
 from .cache import SingleFlight, TTLCache, cache_key, round_now, ttl_for
-from .catalog import Catalog, Lookup, TagInfo
+from .catalog import Catalog, Kind, Lookup, TagInfo
 from .events import REQUESTED_LINES, CacheState, CallEvent, Channel, Outcome, outcome_for
 from .gate import RATE_WINDOW_S, GateRefused, SlidingWindow
 from .historian import HistClock, HistorianError, Row, parse_clock
 from .periods import PRESETS, Period, PeriodError, resolve_period
-from .sql import HAS_LAST, MAX_NAMES, SUMMARY_COLUMNS, clock_sql, live_sql, summary_sql
+from .sql import (HAS_LAST, MAX_NAMES, SERIES_COLUMNS, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS,
+                  SERIES_MIN_POINTS, STATE_COLUMNS, SUMMARY_COLUMNS, clock_sql, live_sql, series_sql, state_sql,
+                  summary_sql)
 
 if TYPE_CHECKING:
     from . import DataRole
@@ -57,6 +65,10 @@ KIND_TEXTS = {"step": "взвешено по времени (ступенчат�
 
 SOURCE_LIVE = "текущее значение из таблицы Live историана"
 SOURCE_SUMMARY = "сводка историана по сырым данным: AnalogSummaryHistory, одна корзина на весь период"
+SOURCE_SERIES = "равномерная сетка историана (Cyclic): N точек с равным шагом от начала периода"
+SOURCE_STATE = "время в каждом состоянии по сырым данным историана (StateSummaryHistory)"
+GRID_NOTE = ("сетка равномерная: всплески короче шага не видны — истинные минимум, максимум и среднее "
+             "даёт tag_period")
 SHIFT_NOTE = "границы смен 06:00, 14:00, 22:00 — допущение, технологом не подтверждено"
 OPEN_NOTE = "период ещё идёт — числа изменятся"
 CLAMP_NOTE = "конец периода ограничен текущим временем историана"
@@ -67,7 +79,9 @@ ITEM_TEXTS = {"no_value": "нет текущего значения",
               "no_data": "за период данных нет",
               "unlisted": "тег не входит в белый список стенда",
               "unknown": "такого тега нет в каталоге историана",
-              "discrete": "дискретный тег: сводка не считается, наработка — в следующих слайсах"}
+              "discrete": "дискретный тег: сводка не считается — наработку даёт calc_runtime",
+              "discrete_series": "тег состояния: ряд не строится — наработку даёт calc_runtime",
+              "analog": "аналоговый тег: наработка считается только по тегам состояний — сводку даёт tag_period"}
 MESSAGES = {"rate": "слишком часто: не больше 60 вызовов за 5 минут — подождите минуту",
             "global_rate": "общий предел запросов к историану исчерпан — повторите через несколько минут",
             "busy": "историан занят другими запросами — повторите через минуту",
@@ -86,6 +100,8 @@ STATE_LABELS = {"_RUN": ("работает", "стоит"), "_OPN": ("откры
 # непредвиденный сбой самой службы (и отказ ворот unlisted — его быть не должно): своего текста в MESSAGES нет
 ERROR_MESSAGE = "сбой службы данных — вызов записан в журнал"
 CONFIG_SUMMARY = "ошибка настройки"
+# summary события под учением DRILL_DATA=tool_error (Д9-R83)
+DRILL_SUMMARY = "учения: tool_error"
 
 CLOCK_STALE_S = 300.0           # часы старше — сначала [clock_sql()]
 TAG_CHARS = 128                 # строка тега (Global Constraints)
@@ -95,8 +111,13 @@ TRUNCATED_CHARS = 50            # Description в историане режетс
 AHEAD_NOTE_S = 60               # метка впереди часов историана — заметка
 STILL_NOTE_S = 600              # значение не менялось — заметка
 GOOD_PERCENT = 99.0
+COVERAGE_MIN = 99.0             # наработка: часы состояний покрывают меньше — заметка coverage_note (Д9-R85)
+MS_PER_HOUR = 3_600_000         # StateTimeTotal — миллисекунды [П плагина]; проба окна Б4 сверяет
+NO_DATA_LABEL = "нет данных"    # подпись состояния с vValue NULL и часами > 0 (m2)
 CALLER_LOG_CHARS = 64
-TOOL_WINDOW = 50                # tools_stats: столько последних вызовов инструментов (http и mcp)
+TOOL_WINDOW = 50                # tools_stats: столько последних вызовов инструментов (http, mcp и web)
+FAIL_STREAK = 3                 # столько ошибок инструмента подряд — он в tools_stats()["failing"] (Д9-R83)
+FAIL_STALE_S = 1800.0           # инструмент не звали дольше (монотонные часы роли) — из failing уходит сам
 
 # код ошибки ворот или историана → текст для людей; исход — outcome_for (OUTCOME_BY_CODE, F11)
 _CODE_MESSAGES = {"connect": MESSAGES["connect"], "auth": MESSAGES["auth"], "timeout": MESSAGES["timeout"],
@@ -106,7 +127,7 @@ _DATA_STATUSES = frozenset({"ok", "no_value", "no_data"})
 _QUIET_OUTCOMES = frozenset({"ok", "partial", "refused", "budget", "rate"})
 # «инструменты отвечают ошибкой» (Д4б-R22): ошибка, срок или недоступность; отказы по правилам — не ошибка
 _TOOL_ERRORS = frozenset({"error", "timeout", "unavailable"})
-_TOOL_CHANNELS = frozenset({"http", "mcp"})
+_TOOL_CHANNELS = frozenset({"http", "mcp", "web"})
 _CLOCK_FLIGHT = "clock"         # ключ single-flight обновления часов; ключи кэша — sha256, не совпадут
 
 log = logging.getLogger("pcbk_core.data.service")
@@ -116,12 +137,13 @@ log = logging.getLogger("pcbk_core.data.service")
 class Snapshot:
     """Ответ историана на один запрос — общий для кэша и всех ожидающих single-flight; не правится.
 
-    rows — строка историана по имени тега в верхнем регистре (только для чтения); count — строк
-    прочитано; sent — имена от ворот. asof и tz — у tag_now: «сейчас историана» в момент ответа;
-    open — у tag_period: период ещё шёл, когда числа читались.
+    rows — по имени тега в верхнем регистре (только для чтения): у tag_now и tag_period одна строка историана, у
+    tag_series и calc_runtime — кортеж строк (ряд — по времени); count — строк прочитано; sent — имена от ворот.
+    asof и tz — у tag_now: «сейчас историана» в момент ответа; open — у инструментов за период: период ещё шёл,
+    когда числа читались.
     """
 
-    rows: Mapping[str, Row]
+    rows: Mapping[str, Any]
     sent: tuple[str, ...]
     count: int
     asof: datetime | None = None
@@ -207,13 +229,13 @@ def _args_refusal(reason: str) -> _Refusal:
     return _Refusal("refused", MESSAGES["args"] + reason, "args: " + reason)
 
 
-def _tags_problem(tags: object) -> str | None:
+def _tags_problem(tags: object, most: int = MAX_NAMES) -> str | None:
     if not isinstance(tags, (list, tuple)):
         return "tags: нужен список имён тегов"
     if not tags:
         return "tags: нужен хотя бы один тег"
-    if len(tags) > MAX_NAMES:
-        return f"tags: не больше {MAX_NAMES} тегов за вызов"
+    if len(tags) > most:
+        return f"tags: не больше {most} тегов за вызов"
     if not all(isinstance(t, str) for t in tags):
         return "tags: каждый тег — строка"
     if any(len(t) > TAG_CHARS for t in tags):
@@ -227,6 +249,13 @@ def _period_problem(period: object, start: object, end: object) -> str | None:
     for name, value in (("start", start), ("end", end)):
         if value is not None and not isinstance(value, str):
             return f"{name}: нужна строка ISO 8601"
+    return None
+
+
+def _points_problem(points: object) -> str | None:
+    """Точки ряда на тег — целое SERIES_MIN_POINTS…SERIES_MAX_POINTS; bool и строка — тоже отказ."""
+    if isinstance(points, bool) or not isinstance(points, int) or not SERIES_MIN_POINTS <= points <= SERIES_MAX_POINTS:
+        return f"points: от {SERIES_MIN_POINTS} до {SERIES_MAX_POINTS}"
     return None
 
 
@@ -293,6 +322,15 @@ def _percent(value: float) -> str:
     return f"{math.floor(value * 10) / 10:g}".replace(".", ",")
 
 
+def _whole(value: float | None) -> float | int | None:
+    """Целое число — int (значение состояния 1, а не 1.0; число переходов), прочее — как есть."""
+    return int(value) if value is not None and value.is_integer() else value
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float, Decimal))         # bool — подкласс int: _num даёт 0.0 или 1.0
+
+
 class _BadAnswer(ValueError):
     """Ответ историана не того вида; code — для события и журнала (без строк ответа)."""
 
@@ -316,6 +354,49 @@ def _rows_by_name(rows: object, width: int) -> Mapping[str, Row]:
             raise _BadAnswer("duplicate_tag")
         out[key] = row
     return MappingProxyType(out)
+
+
+def _rows_grouped(rows: object, width: int, row_ok: Callable[[Row], bool]) -> dict[str, list[Row]]:
+    """Строки ряда и наработки по имени тега в верхнем регистре — у тега их несколько. Не список — _BadAnswer
+    («not_list»); строка не той ширины, имя не строка или row_ok ложно — _BadAnswer («row_shape»)."""
+    if not isinstance(rows, list):
+        raise _BadAnswer("not_list")
+    out: dict[str, list[Row]] = {}
+    for row in rows:
+        row = tuple(row)
+        if len(row) != width or not isinstance(row[0], str) or not row_ok(row):
+            raise _BadAnswer("row_shape")
+        out.setdefault(row[0].upper(), []).append(row)
+    return out
+
+
+def _series_row_ok(row: Row) -> bool:
+    """Строка ряда: метка — дата и время (по ней служба упорядочивает точки), значение — число или NULL."""
+    return isinstance(row[1], datetime) and (row[2] is None or _is_number(row[2]))
+
+
+def _state_row_ok(row: Row) -> bool:
+    """Строка наработки: значение состояния — число или NULL. Строка вместо числа молча стала бы «нет данных»."""
+    return row[1] is None or _is_number(row[1])
+
+
+def _state_noise(value: float | None, total: float | None) -> bool:
+    """vValue NULL при StateTimeTotal 0 или NULL — шум историана, строка отбрасывается [П]."""
+    return value is None and not total
+
+
+def _state_rows(rows: list[Row]) -> tuple[Row, ...]:
+    """Строки наработки одного тега: повтор значения состояния (и второе «нет данных») — _BadAnswer: какую из
+    двух строк считать ответом, служба не выбирает, а сумма часов задвоилась бы. Шум не сверяется."""
+    seen: set[float | None] = set()
+    for row in rows:
+        value = _num(row[1])
+        if _state_noise(value, _num(row[2])):
+            continue
+        if value in seen:
+            raise _BadAnswer("duplicate_state")
+        seen.add(value)
+    return tuple(rows)
 
 
 def _after_send(result: Any, keep: Callable[[], Snapshot]) -> Snapshot:
@@ -355,12 +436,20 @@ def _other_item(entry: _Entry) -> dict[str, Any]:
     return {"tag": entry.shown, "status": "unlisted", "text": ITEM_TEXTS["unlisted"]}
 
 
-def _discrete_item(info: TagInfo) -> dict[str, Any]:
-    return {"tag": info.name, "status": "discrete", "text": ITEM_TEXTS["discrete"]}
+def _discrete_item(info: TagInfo, text: str = "discrete") -> dict[str, Any]:
+    return {"tag": info.name, "status": "discrete", "text": ITEM_TEXTS[text]}
+
+
+def _analog_item(info: TagInfo) -> dict[str, Any]:
+    return {"tag": info.name, "status": "analog", "text": ITEM_TEXTS["analog"]}
+
+
+def _no_data_item(info: TagInfo) -> dict[str, Any]:
+    return {"tag": info.name, "status": "no_data", "text": ITEM_TEXTS["no_data"]}
 
 
 def _counts(items: list[dict[str, Any]]) -> str:
-    order = ("ok", "no_value", "no_data", "discrete", "unlisted", "unknown")
+    order = ("ok", "no_value", "no_data", "discrete", "analog", "unlisted", "unknown")
     return ", ".join(f"{s} {n}" for s in order if (n := sum(1 for i in items if i["status"] == s)))
 
 
@@ -369,8 +458,19 @@ def _safe(text: str, limit: int) -> str:
     return ascii(text)[1:-1][:limit]
 
 
+@dataclass(frozen=True)
+class _Scope:
+    """Общее у инструментов за период после бюджета: разбор имён, имена в SQL, часы, «сейчас» и период."""
+
+    entries: list[_Entry]
+    names: tuple[str, ...]
+    clock: HistClock
+    now_r: datetime             # «сейчас историана», округлённое один раз: и в resolve_period, и в ttl_for (F21)
+    period: Period
+
+
 class DataService:
-    """Три инструмента роли «данные». Ворота, каталог, часы, журнал событий и monotonic — из роли
+    """Пять инструментов чтения роли «данные». Ворота, каталог, часы, журнал событий и monotonic — из роли
     в момент вызова; конструктор без ввода-вывода."""
 
     def __init__(self, role: DataRole, *, cache: TTLCache | None = None, flight: SingleFlight | None = None,
@@ -381,11 +481,23 @@ class DataService:
         self.per_caller = SlidingWindow(PER_CALLER_LIMIT, RATE_WINDOW_S) if per_caller is None else per_caller
         # исходы последних вызовов инструментов — только в памяти (К7); пополняет _finish в цикле событий
         self._tool_outcomes: deque[Outcome] = deque(maxlen=TOOL_WINDOW)
+        # ошибок подряд и момент последнего вызова по имени инструмента (Д9-R83) — тоже только в памяти
+        self._streaks: dict[str, int] = {}
+        self._last_called: dict[str, float] = {}
 
-    def tools_stats(self) -> dict[str, int]:
-        """{"recent": n, "errors": k} по последним TOOL_WINDOW вызовам каналов http и mcp; без ввода-вывода."""
+    def tools_stats(self) -> dict[str, Any]:
+        """{"recent": n, "errors": k, "failing": [...]} по вызовам каналов http, mcp и web; без ввода-вывода.
+
+        recent и errors — по последним TOOL_WINDOW вызовам; failing — инструменты с ошибками не меньше FAIL_STREAK
+        подряд, по алфавиту, кроме тех, кого не звали дольше FAIL_STALE_S (после обрыва и учений строка сторожа
+        не держит «внимание» до первого удачного вызова редкого калькулятора).
+        """
+        now = self.role.monotonic()
+        failing = sorted(tool for tool, streak in self._streaks.items()
+                         if streak >= FAIL_STREAK and now - self._last_called[tool] <= FAIL_STALE_S)
         return {"recent": len(self._tool_outcomes),
-                "errors": sum(1 for outcome in self._tool_outcomes if outcome in _TOOL_ERRORS)}
+                "errors": sum(1 for outcome in self._tool_outcomes if outcome in _TOOL_ERRORS),
+                "failing": failing}
 
     # --- инструменты ---
 
@@ -407,6 +519,23 @@ class DataService:
             return await self.config_unavailable(caller, channel, "tag_period", tags)
         call = self._call(caller, channel, "tag_period", tags)
         return await self._run(call, self._tag_period(call, tags, period, start, end))
+
+    async def tag_series(self, caller: str, channel: Channel, tags: list[str], period: str | None = None,
+                         start: str | None = None, end: str | None = None,
+                         points: int = SERIES_DEFAULT_POINTS) -> dict[str, Any]:
+        """Ряд аналоговых тегов на равномерной сетке историана и профиль по каждому (Д9-R84)."""
+        if self.role.config_error:          # F5
+            return await self.config_unavailable(caller, channel, "tag_series", tags)
+        call = self._call(caller, channel, "tag_series", tags)
+        return await self._run(call, self._tag_series(call, tags, period, start, end, points))
+
+    async def calc_runtime(self, caller: str, channel: Channel, tags: list[str], period: str | None = None,
+                           start: str | None = None, end: str | None = None) -> dict[str, Any]:
+        """Наработка тегов состояний: часы, доля периода и переходы в каждом состоянии (Д9-R85)."""
+        if self.role.config_error:          # F5
+            return await self.config_unavailable(caller, channel, "calc_runtime", tags)
+        call = self._call(caller, channel, "calc_runtime", tags)
+        return await self._run(call, self._calc_runtime(call, tags, period, start, end))
 
     async def refuse_args(self, caller: str, channel: Channel, tool: str, requested: Sequence[str],
                           reason: str) -> dict[str, Any]:
@@ -436,6 +565,7 @@ class DataService:
 
     async def _catalog_search(self, call: _Call, query: str, limit: int) -> dict[str, Any]:
         self._check_rate(call)
+        self._check_drill()
         reason = _query_problem(query, limit)
         if reason:
             raise _args_refusal(reason)
@@ -456,6 +586,7 @@ class DataService:
 
     async def _tag_now(self, call: _Call, tags: list[str]) -> dict[str, Any]:
         self._check_rate(call)
+        self._check_drill()
         reason = _tags_problem(tags)
         if reason:
             raise _args_refusal(reason)
@@ -478,9 +609,87 @@ class DataService:
     async def _tag_period(self, call: _Call, tags: list[str], preset: str | None, start: str | None,
                           end: str | None) -> dict[str, Any]:
         self._check_rate(call)
+        self._check_drill()
         reason = _tags_problem(tags) or _period_problem(preset, start, end)
         if reason:
             raise _args_refusal(reason)
+        scope = await self._period_scope(call, tags, preset, start, end, "analog",
+                                         lambda e: self._period_item(e, None, None))
+        names, period, clock = scope.names, scope.period, scope.clock
+        key = cache_key("tag_period", names, period.start, period.end)
+        ttl = ttl_for("tag_period", period.end, scope.now_r)
+        snap = await self._fetch(call, key, lambda: self._read_summary(names, period, key, ttl))
+        items = [self._period_item(e, snap, clock.tz) for e in scope.entries]
+        # числа читались, пока период шёл, — заметка остаётся и у попадания в кэш чуть позже
+        is_open = period.open or snap.open
+        notes = self._period_notes(period, is_open)
+        if not HAS_LAST:
+            notes.append(NO_LAST_NOTE)
+        call.tags = tuple(i["tag"] for i in items if i["status"] in _DATA_STATUSES)
+        call.summary = f"{period.preset or 'свой период'}: {_counts(items)}"
+        return {"tool": "tag_period", "status": "ok" if all(i["status"] == "ok" for i in items) else "partial",
+                "notes": notes, "cache": call.cache, "period": self._period_json(period, clock, is_open),
+                "source": SOURCE_SUMMARY, "avg_kind": {"code": AVG_KIND, "text": KIND_TEXTS[AVG_KIND]},
+                "std_kind": {"code": STD_KIND, "text": KIND_TEXTS[STD_KIND]},
+                "cost_tag_days": round(call.cost, 3), "items": items}
+
+    async def _tag_series(self, call: _Call, tags: list[str], preset: str | None, start: str | None,
+                          end: str | None, points: int) -> dict[str, Any]:
+        """Ряд и профиль (Д9-R84): только аналоговые теги, до SERIES_MAX_TAGS; точки — после бюджета периода."""
+        self._check_rate(call)
+        self._check_drill()
+        reason = (_tags_problem(tags, SERIES_MAX_TAGS) or _period_problem(preset, start, end)
+                  or _points_problem(points))
+        if reason:
+            raise _args_refusal(reason)
+        scope = await self._period_scope(call, tags, preset, start, end, "analog",
+                                         lambda e: self._series_item(e, None, None))
+        names, period, clock = scope.names, scope.period, scope.clock
+        # точки — после окна и тего-суток и до series_sql на каждом пути
+        problem = check_points(len(names), points)
+        if problem is not None:
+            raise self._budget_refusal(problem, "budget: points", call, period, clock)
+        key = cache_key("tag_series", names, period.start, period.end, extra=str(points))
+        ttl = ttl_for("tag_series", period.end, scope.now_r)
+        snap = await self._fetch(call, key, lambda: self._read_series(names, period, points, key, ttl))
+        items = [self._series_item(e, snap, clock.tz) for e in scope.entries]
+        is_open = period.open or snap.open
+        notes = [GRID_NOTE, *self._period_notes(period, is_open)]
+        call.tags = tuple(i["tag"] for i in items if i["status"] in _DATA_STATUSES)
+        call.summary = f"{period.preset or 'свой период'}, точек {points}: {_counts(items)}"
+        return {"tool": "tag_series", "status": "ok" if all(i["status"] == "ok" for i in items) else "partial",
+                "notes": notes, "cache": call.cache, "period": self._period_json(period, clock, is_open),
+                "points": points, "source": SOURCE_SERIES, "cost_tag_days": round(call.cost, 3), "items": items}
+
+    async def _calc_runtime(self, call: _Call, tags: list[str], preset: str | None, start: str | None,
+                            end: str | None) -> dict[str, Any]:
+        """Наработка (Д9-R85): только теги состояний, до MAX_NAMES; окно и тего-сутки — как у tag_period."""
+        self._check_rate(call)
+        self._check_drill()
+        reason = _tags_problem(tags) or _period_problem(preset, start, end)
+        if reason:
+            raise _args_refusal(reason)
+        scope = await self._period_scope(call, tags, preset, start, end, "discrete",
+                                         lambda e: self._runtime_item(e, None, 0.0))
+        names, period, clock = scope.names, scope.period, scope.clock
+        key = cache_key("calc_runtime", names, period.start, period.end)
+        ttl = ttl_for("calc_runtime", period.end, scope.now_r)
+        snap = await self._fetch(call, key, lambda: self._read_states(names, period, key, ttl))
+        hours = (period.end - period.start) / timedelta(hours=1)
+        items = [self._runtime_item(e, snap, hours) for e in scope.entries]
+        is_open = period.open or snap.open
+        call.tags = tuple(i["tag"] for i in items if i["status"] in _DATA_STATUSES)
+        call.summary = f"{period.preset or 'свой период'}: {_counts(items)}"
+        return {"tool": "calc_runtime", "status": "ok" if all(i["status"] == "ok" for i in items) else "partial",
+                "notes": self._period_notes(period, is_open), "cache": call.cache,
+                "period": self._period_json(period, clock, is_open), "source": SOURCE_STATE,
+                "cost_tag_days": round(call.cost, 3), "items": items}
+
+    async def _period_scope(self, call: _Call, tags: list[str], preset: str | None, start: str | None,
+                            end: str | None, kind: Kind, refused_item: Callable[[_Entry], dict[str, Any]]) -> _Scope:
+        """Общий путь инструментов за период после разбора аргументов: каталог → синтаксис периода → разбор имён
+        (в SQL — только годные теги вида kind) → часы → период → окно и тего-сутки. Отказ здесь SQL не шлёт (кроме
+        запроса часов); refused_item — элемент ответа «ни один тег нельзя запросить»."""
         catalog = self._loaded_catalog()
         # ошибки периода, которым не нужно «сейчас», — до запроса часов: такой отказ не шлёт SQL
         known = self.role.clock
@@ -488,10 +697,9 @@ class DataService:
         if reason:
             raise _args_refusal(reason)
         entries = _resolve(catalog, tags)
-        names = tuple(e.lookup.info.name for e in entries
-                      if e.lookup.status == "ok" and e.lookup.info.kind == "analog")
+        names = tuple(e.lookup.info.name for e in entries if e.lookup.status == "ok" and e.lookup.info.kind == kind)
         if not names:
-            items = [self._period_item(e, None, None) for e in entries]
+            items = [refused_item(e) for e in entries]
             raise _Refusal("refused", MESSAGES["none"], "none: " + _counts(items), extra={"items": items})
         try:
             clock = await self._fresh_clock()
@@ -506,40 +714,27 @@ class DataService:
             raise _args_refusal(str(err)) from None
         call.start, call.end = clock.aware(period.start), clock.aware(period.end)
         call.cost = cost_tag_days(len(names), period.start, period.end)
-        # бюджет — до summary_sql на каждом пути: ворота сверяют форму SQL, а не длину окна
+        # бюджет — до SQL на каждом пути: ворота сверяют форму SQL, а не длину окна
         problem = check_budget(len(names), period.start, period.end)
         if problem is not None:
-            raise _Refusal("budget", problem, "budget",
-                           extra={"period": self._period_json(period, clock, period.open),
-                                  "cost_tag_days": round(call.cost, 3)})
-        key = cache_key("tag_period", names, period.start, period.end)
-        ttl = ttl_for("tag_period", period.end, now_r)
-        snap = await self._fetch(call, key, lambda: self._read_summary(names, period, key, ttl))
-        items = [self._period_item(e, snap, clock.tz) for e in entries]
-        # числа читались, пока период шёл, — заметка остаётся и у попадания в кэш чуть позже
-        is_open = period.open or snap.open
-        notes = []
-        if period.shift_assumed:
-            notes.append(SHIFT_NOTE)
-        if is_open:
-            notes.append(OPEN_NOTE)
-        if period.clamped:
-            notes.append(CLAMP_NOTE)
-        if not HAS_LAST:
-            notes.append(NO_LAST_NOTE)
-        call.tags = tuple(i["tag"] for i in items if i["status"] in _DATA_STATUSES)
-        call.summary = f"{period.preset or 'свой период'}: {_counts(items)}"
-        return {"tool": "tag_period", "status": "ok" if all(i["status"] == "ok" for i in items) else "partial",
-                "notes": notes, "cache": call.cache, "period": self._period_json(period, clock, is_open),
-                "source": SOURCE_SUMMARY, "avg_kind": {"code": AVG_KIND, "text": KIND_TEXTS[AVG_KIND]},
-                "std_kind": {"code": STD_KIND, "text": KIND_TEXTS[STD_KIND]},
-                "cost_tag_days": round(call.cost, 3), "items": items}
+            raise self._budget_refusal(problem, "budget", call, period, clock)
+        return _Scope(entries, names, clock, now_r, period)
 
     # --- шаги ---
 
     def _check_rate(self, call: _Call) -> None:
         if not self.per_caller.allow(call.caller, self.role.monotonic()):
             raise _Refusal("rate", MESSAGES["rate"], "rate: частота вызывающего")
+
+    def _check_drill(self) -> None:
+        """Учение DRILL_DATA=tool_error (Д9-R83) — сразу после частоты: ни аргументов, ни каталога, ни ворот."""
+        if self.role.settings.DRILL_DATA == "tool_error":
+            raise _Refusal("error", ERROR_MESSAGE, DRILL_SUMMARY, error="drill")
+
+    def _budget_refusal(self, problem: str, summary: str, call: _Call, period: Period, clock: HistClock) -> _Refusal:
+        """Исход budget: текст проверки, период с поясом и цена — чтобы было видно, что сокращать."""
+        return _Refusal("budget", problem, summary, extra={"period": self._period_json(period, clock, period.open),
+                                                           "cost_tag_days": round(call.cost, 3)})
 
     def _loaded_catalog(self) -> Catalog:
         """До загрузки каталог отвечает unknown на любое имя — поэтому сначала loaded."""
@@ -631,6 +826,41 @@ class DataService:
 
         return _after_send(result, keep)
 
+    async def _read_series(self, names: tuple[str, ...], period: Period, points: int, key: str,
+                           ttl: float) -> Snapshot:
+        """Работа полёта tag_series: ряд на сетке; строки — по тегу и по времени; удачный снимок — в кэш на ttl."""
+        if (check_budget(len(names), period.start, period.end) is not None
+                or check_points(len(names), points) is not None):          # защита: только после бюджета и точек
+            raise RuntimeError("ряд без проверки бюджета")
+        result = await self.role.gate.run([series_sql(names, period.start, period.end, points)])
+
+        def keep() -> Snapshot:
+            grouped = _rows_grouped(result.rows[0], 1 + len(SERIES_COLUMNS), _series_row_ok)
+            # порядок точек задаёт служба: ORDER BY в SQL нет (Д9-R84)
+            rows = {name: tuple(sorted(group, key=lambda row: row[1])) for name, group in grouped.items()}
+            snap = Snapshot(rows=MappingProxyType(rows), sent=tuple(result.sent), count=len(result.rows[0]),
+                            open=period.open)
+            self.cache.put(key, snap, ttl, self.role.monotonic())
+            return snap
+
+        return _after_send(result, keep)
+
+    async def _read_states(self, names: tuple[str, ...], period: Period, key: str, ttl: float) -> Snapshot:
+        """Работа полёта calc_runtime: наработка одной корзиной; удачный снимок — в кэш на ttl."""
+        if check_budget(len(names), period.start, period.end) is not None:   # защита: только после бюджета
+            raise RuntimeError("наработка без проверки бюджета")
+        result = await self.role.gate.run([state_sql(names, period.start, period.end)])
+
+        def keep() -> Snapshot:
+            grouped = _rows_grouped(result.rows[0], 1 + len(STATE_COLUMNS), _state_row_ok)
+            rows = {name: _state_rows(group) for name, group in grouped.items()}
+            snap = Snapshot(rows=MappingProxyType(rows), sent=tuple(result.sent), count=len(result.rows[0]),
+                            open=period.open)
+            self.cache.put(key, snap, ttl, self.role.monotonic())
+            return snap
+
+        return _after_send(result, keep)
+
     # --- сборка ответа ---
 
     @staticmethod
@@ -688,6 +918,80 @@ class DataService:
         return item
 
     @staticmethod
+    def _series_item(entry: _Entry, snap: Snapshot | None, tz: tzinfo | None) -> dict[str, Any]:
+        """Точки ряда по времени и профиль по точкам со значением: начало, конец, изменение, минимум и максимум
+        сетки с моментами (первый из равных)."""
+        if entry.lookup.status != "ok":
+            return _other_item(entry)
+        info = entry.lookup.info
+        if info.kind == "discrete":
+            return _discrete_item(info, "discrete_series")
+        rows = snap.rows.get(info.name.upper(), ()) if snap is not None else ()
+        points = [[_iso(_aware(row[1], tz)), _num(row[2])] for row in rows]
+        valued = [(when, value) for when, value in points if value is not None]
+        if not valued:
+            return _no_data_item(info)
+        (first_time, first), (last_time, last) = valued[0], valued[-1]
+        min_time, low = min(valued, key=lambda p: p[1])
+        max_time, high = max(valued, key=lambda p: p[1])
+        item: dict[str, Any] = {"tag": info.name, "status": "ok", "description": info.description,
+                                "unit": info.unit, "points": points,
+                                "profile": {"first": first, "first_time": first_time, "last": last,
+                                            "last_time": last_time, "change": last - first, "min": low,
+                                            "min_time": min_time, "max": high, "max_time": max_time}}
+        bad = sum(1 for row in rows if _num(row[3]) != 0)          # Quality NULL — тоже не «хорошее»
+        if bad:
+            item["quality_note"] = f"точек с недостоверным качеством: {bad} из {len(rows)}"
+        return item
+
+    @staticmethod
+    def _runtime_item(entry: _Entry, snap: Snapshot | None, period_hours: float) -> dict[str, Any]:
+        """Состояния по убыванию значения («нет данных» — последним): часы, доля периода, переходы;
+        covered_percent — сумма долей состояний со значением. Доли нет у состояния с часами (не ноль или NULL) —
+        покрытие неизвестно: covered_percent null и без coverage_note (ревью А2, m-2: иначе «покрывают 0 %» при
+        часах в ответе — ложное утверждение)."""
+        if entry.lookup.status != "ok":
+            return _other_item(entry)
+        info = entry.lookup.info
+        if info.kind == "analog":
+            return _analog_item(info)
+        valued: list[dict[str, Any]] = []
+        unknown: list[dict[str, Any]] = []
+        for row in snap.rows.get(info.name.upper(), ()) if snap is not None else ():
+            value, total = _num(row[1]), _num(row[2])
+            if _state_noise(value, total):
+                continue
+            state = {"value": _whole(value),
+                     "label": NO_DATA_LABEL if value is None else _state_label(info.name, value),
+                     "hours": None if total is None else total / MS_PER_HOUR, "percent": _num(row[3]),
+                     "count": _whole(_num(row[4]))}
+            (unknown if value is None else valued).append(state)
+        if not valued:
+            return _no_data_item(info)
+        valued.sort(key=lambda state: state["value"], reverse=True)
+        known = all(state["percent"] is not None or state["hours"] == 0 for state in valued)
+        covered = sum((state["percent"] for state in valued if state["percent"] is not None), 0.0) if known else None
+        item: dict[str, Any] = {"tag": info.name, "status": "ok", "description": info.description,
+                                "states": valued + unknown, "covered_percent": covered,
+                                "period_hours": period_hours}
+        if covered is not None and covered < COVERAGE_MIN:
+            item["coverage_note"] = (f"данные покрывают {_percent(covered)} % периода — часы состояний в сумме "
+                                     "меньше периода")
+        return item
+
+    @staticmethod
+    def _period_notes(period: Period, is_open: bool) -> list[str]:
+        """Заметки периода — общие у tag_period, tag_series и calc_runtime: смены, «ещё идёт», ограничен «сейчас»."""
+        notes = []
+        if period.shift_assumed:
+            notes.append(SHIFT_NOTE)
+        if is_open:
+            notes.append(OPEN_NOTE)
+        if period.clamped:
+            notes.append(CLAMP_NOTE)
+        return notes
+
+    @staticmethod
     def _period_json(period: Period, clock: HistClock, is_open: bool) -> dict[str, Any]:
         return {"start": _iso(clock.aware(period.start)), "end": _iso(clock.aware(period.end)),
                 "tz": clock.tz_label, "preset": period.preset, "shift_grid_assumed": period.shift_assumed,
@@ -716,9 +1020,16 @@ class DataService:
         return await self._finish(call, answer, error)
 
     async def _finish(self, call: _Call, answer: dict[str, Any], error: str | None = None) -> dict[str, Any]:
-        """Событие — в потоке (asyncio.to_thread роли), SQLite не в цикле; сбой записи ответ не ломает."""
+        """Событие — в потоке (asyncio.to_thread роли), SQLite не в цикле; сбой записи ответ не ломает.
+
+        Окно исходов и серия ошибок инструмента — только у каналов http, mcp и web: ошибка, срок или недоступность
+        продлевают серию, любой другой исход её обнуляет (Д9-R83).
+        """
         if call.channel in _TOOL_CHANNELS:
-            self._tool_outcomes.append(answer["status"])
+            status = answer["status"]
+            self._tool_outcomes.append(status)
+            self._streaks[call.tool] = (self._streaks.get(call.tool, 0) + 1) if status in _TOOL_ERRORS else 0
+            self._last_called[call.tool] = self.role.monotonic()
         event = self._event(call, answer["status"])
         if event is not None:
             await self.role._write_event(event)

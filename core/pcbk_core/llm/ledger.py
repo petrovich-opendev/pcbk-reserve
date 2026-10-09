@@ -41,7 +41,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+from ..settings import LlmSettings, run_parts
+
+if TYPE_CHECKING:
+    from .shares import Shares
 
 log = logging.getLogger("pcbk_core.llm.ledger")
 
@@ -56,7 +61,7 @@ COUNTERS_WINDOW = timedelta(hours=24)
 WRITER_NAME = "pcbk-ledger-writer"
 OPS = "ops"
 
-Refusal = Literal["budget_spent", "share_spent"]
+Refusal = Literal["budget_spent", "run_halted", "run_spent", "share_spent"]
 STATUSES = ("open", "ok", "upstream_error", "money", "refused", "cancelled", "lost", "unknown")
 CLOSED_STATUSES = tuple(s for s in STATUSES if s != "open")   # закрытая строка open быть не может
 COST_SOURCES = ("stream", "body", "generation", "pending", "unknown", "none")
@@ -710,6 +715,13 @@ class Ledger:
         with self._lock:
             return self._mem.spent(caller)
 
+    def settled(self, caller: str) -> float:
+        """Оплаченное вызывающим: пришедшие цены и окончательные оценки (unknown, lost) — без идущих и ждущих цены
+        вызовов. Точка отсчёта прогона (Д8-R69, доводка р1): будущая цена идущих и ждущих войдёт в прогон."""
+        with self._lock:
+            m = self._mem
+            return m.priced.get(caller, 0.0) + m.estimated.get(caller, 0.0)
+
     def estimated(self, caller: str | None = None) -> float:
         """Часть spent, которая стоит оценкой."""
         with self._lock:
@@ -723,6 +735,12 @@ class Ledger:
     def has_open_or_pending(self) -> bool:
         with self._lock:
             return bool(self._mem.open or self._mem.pending)
+
+    def has_open_or_pending_of(self, caller: str) -> bool:
+        """Идущие или ждущие дозапроса цены вызовы одного вызывающего (точка отсчёта прогона, Д8-R69)."""
+        with self._lock:
+            m = self._mem
+            return any(r.caller == caller for rows in (m.open, m.pending) for r in rows.values())
 
     def totals(self, now: datetime) -> dict:
         """Итоги для health_json — только из памяти: зовётся в цикле событий."""
@@ -742,20 +760,63 @@ class Ledger:
             }
 
 
+@dataclass(frozen=True)
+class RunSpec:
+    """Прогон отбора модели (Д8-R69): id, потолок, $, и вызывающие под ним."""
+
+    id: str
+    cap_usd: float
+    callers: frozenset[str]
+
+
+def run_spec(llm: LlmSettings) -> RunSpec | None:
+    """Прогон из настроек (settings.run_parts): None — прогона нет; ошибка в LLM_RUN_* — ValueError без значения."""
+    parts = run_parts(llm)
+    return None if parts is None else RunSpec(*parts)
+
+
 class Budget:
-    """Доли вызывающих и общий бюджет. Оценку нового вызова проверка не прибавляет (Д4а-R13)."""
+    """Доли вызывающих, общий бюджет и потолок прогона отбора (Д8-R69). Оценку нового вызова проверка не
+    прибавляет (Д4а-R13).
+
+    run_base — точки отсчёта прогона по вызывающим (llm_meta, ставит lifespan роли по LlmRole.ensure_run_base до
+    первого вызова). shares — доли мест (Д10-R98, Shares: память, без SQLite); None — у всех мест одна share_usd, как
+    до Д10. halted — защёлка тормоза прогона (Д11-R117, RunBrake.halted: чтение флага, без ввода-вывода).
+    """
 
     def __init__(self, ledger: Ledger, *, total_usd: float, share_usd: float, ops_share_usd: float,
-                 key_spent: Callable[[], float | None] = lambda: None):
+                 key_spent: Callable[[], float | None] = lambda: None, run: RunSpec | None = None,
+                 shares: "Shares | None" = None, halted: Callable[[], bool] = lambda: False):
         self.ledger = ledger
         self.total_usd = total_usd
         self.share_usd = share_usd
         self.ops_share_usd = ops_share_usd
         self.key_spent = key_spent
+        self.run = run
+        self.shares = shares
+        self.halted = halted
+        self.run_base: dict[str, float] = {}
+
+    def run_spent(self) -> float:
+        """Потрачено прогоном: Σ max(0, spent(c) − base[c]) по вызывающим прогона. spent уже держит резервы идущих
+        вызовов и оценки вызовов без цены (Д4а-R13). Точки нет — отсчёт от нуля: при сомнении расход больше, а не
+        меньше. Прогона нет — 0."""
+        run = self.run
+        if run is None:
+            return 0.0
+        return sum((max(0.0, self.ledger.spent(c) - self.run_base.get(c, 0.0)) for c in sorted(run.callers)), 0.0)
 
     def share_of(self, caller: str) -> float:
-        """ops_share_usd для ops, иначе share_usd. Перераспределение долей — Д10."""
-        return self.ops_share_usd if caller == OPS else self.share_usd
+        """Доля вызывающего (Д10-R98): ops — ops_share_usd; место student-NN — его доля из shares (центы / 100, память,
+        без SQLite: отказ — синхронный участок без await); прочие и без shares — share_usd."""
+        if caller == OPS:
+            return self.ops_share_usd
+        shares = self.shares
+        if shares is not None:
+            usd = shares.usd(caller)
+            if usd is not None:
+                return usd
+        return self.share_usd
 
     def total_spent(self) -> float:
         """Итог для отказов: при расходе по ключу выше журнала резервы идущих вызовов тоже в итоге."""
@@ -766,9 +827,16 @@ class Budget:
         return max(self.ledger.spent() - self.ledger.reserved_open(), self.key_spent() or 0.0)
 
     def refusal(self, caller: str) -> Refusal | None:
-        """Сначала общий бюджет, потом доля вызывающего."""
+        """Сначала общий бюджет, потом тормоз прогона и потолок прогона (только вызывающим прогона, Д11-R117), потом
+        доля вызывающего."""
         if self.total_spent() >= self.total_usd:
             return "budget_spent"
+        run = self.run
+        if run is not None and caller in run.callers:
+            if self.halted():
+                return "run_halted"
+            if self.run_spent() >= run.cap_usd:
+                return "run_spent"
         if self.ledger.spent(caller) >= self.share_of(caller):
             return "share_spent"
         return None

@@ -1,4 +1,5 @@
-"""HTTP-оболочка службы данных: POST /api/data/catalog_search, /api/data/tag_now, /api/data/tag_period.
+"""HTTP-оболочка службы данных: POST /api/data/catalog_search, /api/data/tag_now, /api/data/tag_period и
+калькуляторы /api/data/tag_series, /api/data/calc_runtime (Д9-R85).
 
 Порядок обработчика: токен → ошибка настройки → инструмент.
 - Нет или неверный Bearer — 401 {"detail": "нужен токен"} и строка журнала без токена, без события.
@@ -27,7 +28,7 @@ from ..hooks import DEFAULT_BODY_LIMIT, BodyLimit, safe_path, size_text  # noqa:
 from ..secrets import TokenTable
 from .periods import PRESETS
 from .service import QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
-from .sql import MAX_NAMES
+from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
 if TYPE_CHECKING:
     from . import DataRole
@@ -37,7 +38,8 @@ UNAUTHORIZED = {"detail": "нужен токен"}
 REASON_ERRORS = 3                       # ошибок разбора в тексте 422 — не больше
 # путь → инструмент
 DATA_TOOLS = {"/api/data/catalog_search": "catalog_search", "/api/data/tag_now": "tag_now",
-              "/api/data/tag_period": "tag_period"}
+              "/api/data/tag_period": "tag_period", "/api/data/tag_series": "tag_series",
+              "/api/data/calc_runtime": "calc_runtime"}
 
 log = logging.getLogger("pcbk_core.data.http")
 
@@ -54,6 +56,25 @@ class TagNowArgs(BaseModel):
 
 
 class TagPeriodArgs(BaseModel):
+    tags: Annotated[list[Tag], Field(min_length=1, max_length=MAX_NAMES)]
+    period: Literal[PRESETS] | None = None
+    start: str | None = None
+    end: str | None = None
+
+
+class TagSeriesArgs(BaseModel):
+    """Ряд и профиль (Д9-R84): до SERIES_MAX_TAGS тегов, точек на тег SERIES_MIN_POINTS…SERIES_MAX_POINTS."""
+
+    tags: Annotated[list[Tag], Field(min_length=1, max_length=SERIES_MAX_TAGS)]
+    period: Literal[PRESETS] | None = None
+    start: str | None = None
+    end: str | None = None
+    points: Annotated[int, Field(ge=SERIES_MIN_POINTS, le=SERIES_MAX_POINTS)] = SERIES_DEFAULT_POINTS
+
+
+class CalcRuntimeArgs(BaseModel):
+    """Наработка (Д9-R85): до MAX_NAMES тегов состояний."""
+
     tags: Annotated[list[Tag], Field(min_length=1, max_length=MAX_NAMES)]
     period: Literal[PRESETS] | None = None
     start: str | None = None
@@ -124,6 +145,28 @@ def data_router(role: "DataRole") -> APIRouter:
         return JSONResponse(await role.service.tag_period(caller, "http", args.tags, args.period, args.start,
                                                           args.end))
 
+    @router.post("/api/data/tag_series")
+    async def tag_series(args: TagSeriesArgs, request: Request) -> JSONResponse:
+        caller, refusal = authorize(request)
+        if refusal is not None:
+            return refusal
+        if role.config_error:
+            return JSONResponse(await role.service.config_unavailable(caller, "http", "tag_series", args.tags),
+                                status_code=503)
+        return JSONResponse(await role.service.tag_series(caller, "http", args.tags, args.period, args.start,
+                                                          args.end, args.points))
+
+    @router.post("/api/data/calc_runtime")
+    async def calc_runtime(args: CalcRuntimeArgs, request: Request) -> JSONResponse:
+        caller, refusal = authorize(request)
+        if refusal is not None:
+            return refusal
+        if role.config_error:
+            return JSONResponse(await role.service.config_unavailable(caller, "http", "calc_runtime", args.tags),
+                                status_code=503)
+        return JSONResponse(await role.service.calc_runtime(caller, "http", args.tags, args.period, args.start,
+                                                            args.end))
+
     return router
 
 
@@ -166,9 +209,22 @@ def _error_field(err: dict[str, Any]) -> str:
     return ".".join(str(part) for part in loc) or "тело"
 
 
+def _reason(err: dict[str, Any]) -> str:
+    """«поле: текст»; пределы тегов и точек — словами службы (_tags_problem, _points_problem): у HTTP, MCP и вкладки
+    отказ тот же, что у прямого вызова службы (итоговая доводка Д9а, сомнение 2 исполнителя А2)."""
+    field, kind = _error_field(err), err.get("type", "")
+    if field == "points" and kind in ("less_than_equal", "greater_than_equal"):
+        return f"points: от {SERIES_MIN_POINTS} до {SERIES_MAX_POINTS}"
+    if field == "tags" and kind == "too_long":
+        return f"tags: не больше {(err.get('ctx') or {}).get('max_length', MAX_NAMES)} тегов за вызов"
+    if field == "tags" and kind == "too_short":
+        return "tags: нужен хотя бы один тег"
+    return f"{field}: {_error_text(err)}"
+
+
 def validation_reason(errors: list[dict[str, Any]]) -> str:
-    """«tags: не больше 16 элементов; limit: не больше 50» — не больше REASON_ERRORS ошибок."""
-    return "; ".join(f"{_error_field(e)}: {_error_text(e)}" for e in errors[:REASON_ERRORS]) or "тело: неверное"
+    """«tags: не больше 16 тегов за вызов; limit: не больше 50» — не больше REASON_ERRORS ошибок."""
+    return "; ".join(_reason(e) for e in errors[:REASON_ERRORS]) or "тело: неверное"
 
 
 def requested_from_body(body: object) -> tuple[str, ...]:

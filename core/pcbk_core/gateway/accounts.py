@@ -29,7 +29,15 @@ asyncio.to_thread в начале lifespan). Соединение — на ка�
 core.db делят журналы, их запись ждёт блокировку не дольше 0,5 с (Г14).
 
 Пароль не попадает ни в базу (только хеш), ни в тексты исключений, ни в журнал. Команда
-администратора — main(): python -m pcbk_core.gateway.accounts.
+администратора — main(): python -m pcbk_core.gateway.accounts. Её journal (Д10-R99) печатает журнал действий
+преподавателя (pcbk_core.teacher_log, только чтение mode=ro): коды, номера мест, логины и числа.
+
+Д10б (Д10-R108): те же операции зовёт кабинет преподавателя (gateway.teacher_api) — add только студентом и без
+same_person, set_password, disable, enable, unlock; правила — только здесь. enable — новое: включает отключённую
+учётку студента на её же место; у команды — enable --login L. set_password, disable и unlock кабинет зовёт с
+student_only: роль цели сверяется в той же транзакции, что и изменение (ревью Б1+Б2, M-1 — шлюз проверяет цель раньше,
+отдельным чтением); не студент или учётки нет — ValueError, ничего не меняется. Команда администратора зовёт их без
+student_only, как прежде.
 """
 from __future__ import annotations
 
@@ -37,6 +45,7 @@ import argparse
 import getpass
 import hashlib
 import hmac
+import json
 import logging
 import re
 import secrets
@@ -55,6 +64,7 @@ from typing import Literal
 from pcbk_core.agents.store import AgentStore, DirUnavailable
 from pcbk_core.agents.store import StoreError as AgentStoreError
 from pcbk_core.settings import Settings
+from pcbk_core.teacher_log import RECENT_MAX, TeacherLog, TeacherLogError
 
 log = logging.getLogger("pcbk_core.gateway.accounts")
 
@@ -75,6 +85,7 @@ NOTICE = "teacher-reads-1"
 SESSION_TOKEN_BYTES = 32           # secrets.token_urlsafe(32) — 43 знака
 MAX_SESSIONS_PER_LOGIN = 3         # живых сессий на учётку (N2): 3 × 10 запросов edge — меньше половины общих 64
 GENERATED_PW_BYTES = 9             # --generate: secrets.token_urlsafe(9) — 12 знаков
+JOURNAL_LAST = 50                  # journal: строк по умолчанию (--last 1…RECENT_MAX)
 # scrypt по Д5-R24: n = 2**14, r = 8, p = 1, соль 16 байт, хеш 32 байта
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 16384, 8, 1
 SALT_BYTES = 16
@@ -424,28 +435,65 @@ class AccountStore:
             log.info("gw account readd login=%s place=%s", login, _nn(place))
         return Account(login, role, place, False)
 
-    def set_password(self, login: str, password: str) -> None:
-        """Новый пароль: сессии учётки закрываются, замок снимается."""
+    @staticmethod
+    def _target(login: str, student_only: bool) -> tuple[str, tuple[str, ...]]:
+        """Условие WHERE цели операции и его параметры: student_only — только учётка студента (в той же транзакции)."""
+        return ("login = ? AND role = 'student'", (login,)) if student_only else ("login = ?", (login,))
+
+    @staticmethod
+    def _missing(login: str, student_only: bool) -> ValueError:
+        return ValueError(f"учётки студента {login} нет" if student_only else f"учётки {login} нет")
+
+    def set_password(self, login: str, password: str, *, student_only: bool = False) -> None:
+        """Новый пароль: сессии учётки закрываются, замок снимается. student_only — только учётка студента."""
         _check_login(login)
         _check_password(password)
         pw_hash = hash_password(password)           # scrypt — до транзакции записи (Г14)
+        where, args = self._target(login, student_only)
         with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("UPDATE gw_accounts SET pw_hash = ? WHERE login = ?", (pw_hash, login)).rowcount != 1:
-                raise ValueError(f"учётки {login} нет")
+            if db.execute(f"UPDATE gw_accounts SET pw_hash = ? WHERE {where}", (pw_hash, *args)).rowcount != 1:
+                raise self._missing(login, student_only)
             db.execute("DELETE FROM gw_sessions WHERE login = ?", (login,))
             db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
             db.execute("COMMIT")
         self._forget_unknown(login)
 
-    def disable(self, login: str) -> None:
-        """Учётка отключается, её сессии закрываются; закрепление места остаётся."""
+    def disable(self, login: str, *, student_only: bool = False) -> None:
+        """Учётка отключается, её сессии закрываются; закрепление места остаётся. student_only — только учётка
+        студента."""
+        _check_login(login)
+        where, args = self._target(login, student_only)
+        with self._op(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(f"UPDATE gw_accounts SET disabled = 1 WHERE {where}", args).rowcount != 1:
+                raise self._missing(login, student_only)
+            db.execute("DELETE FROM gw_sessions WHERE login = ?", (login,))
+            db.execute("COMMIT")
+
+    def enable(self, login: str) -> None:
+        """Включает отключённую учётку студента (Д10-R108) — на её же место: место закреплено (gw_places) за этим
+        логином, действующей учётки на нём нет. Учётка преподавателя, действующая или неизвестная — ValueError; отказ
+        ничего не меняет. Сессий у отключённой учётки нет (disable их закрыл), замок не трогается."""
         _check_login(login)
         with self._op(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("UPDATE gw_accounts SET disabled = 1 WHERE login = ?", (login,)).rowcount != 1:
+            row = db.execute("SELECT role, place, disabled FROM gw_accounts WHERE login = ?", (login,)).fetchone()
+            if row is None:
                 raise ValueError(f"учётки {login} нет")
-            db.execute("DELETE FROM gw_sessions WHERE login = ?", (login,))
+            role, place, disabled = row
+            if role != "student" or place is None:
+                raise ValueError("включать можно только учётку студента")
+            if not disabled:
+                raise ValueError(f"учётка {login} уже включена")
+            bound = db.execute("SELECT login FROM gw_places WHERE place = ?", (place,)).fetchone()
+            if bound is None or bound[0] != login:
+                # место освободили (release-place) или отдали другому логину — включать некуда
+                raise ValueError(f"место {_nn(place)} не закреплено за учёткой {login} — включить её нельзя")
+            taken = db.execute("SELECT 1 FROM gw_accounts WHERE place = ? AND disabled = 0", (place,)).fetchone()
+            if taken is not None:
+                raise ValueError(f"место {_nn(place)} занято другой учёткой")
+            db.execute("UPDATE gw_accounts SET disabled = 0 WHERE login = ?", (login,))
             db.execute("COMMIT")
 
     def remove(self, login: str) -> None:
@@ -683,9 +731,19 @@ class AccountStore:
         key, _ = queue.popitem(last=False)
         del self.unknown_failures[key]
 
-    def unlock(self, login: str) -> None:
-        """Снимает замок логина: строки таблицы и счётчик в памяти."""
-        if isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
+    def unlock(self, login: str, *, student_only: bool = False) -> None:
+        """Снимает замок логина: строки таблицы и счётчик в памяти. student_only — только существующая учётка студента
+        (сверка и снятие — в одной транзакции; иначе ValueError и замок остаётся)."""
+        if student_only:
+            _check_login(login)
+            where, args = self._target(login, student_only)
+            with self._op(write=True) as db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute(f"SELECT 1 FROM gw_accounts WHERE {where}", args).fetchone() is None:
+                    raise self._missing(login, student_only)
+                db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
+                db.execute("COMMIT")
+        elif isinstance(login, str) and LOGIN_RE.fullmatch(login) is not None:
             with self._op(write=True) as db:
                 db.execute("DELETE FROM gw_login_failures WHERE login = ?", (login,))
         self._forget_unknown(login)
@@ -727,6 +785,8 @@ def _parser() -> argparse.ArgumentParser:
     passwd.add_argument("--generate", action="store_true", help="породить пароль и напечатать его один раз")
     disable = sub.add_parser("disable", help="отключить учётку: сессии закрываются, место остаётся за ней")
     disable.add_argument("--login", required=True)
+    enable = sub.add_parser("enable", help="включить отключённую учётку студента на её же место (Д10-R108)")
+    enable.add_argument("--login", required=True)
     remove = sub.add_parser("remove", help="удалить отключённую учётку; логин остаётся за местом")
     remove.add_argument("--login", required=True)
     remove.add_argument("--yes", action="store_true")
@@ -738,6 +798,10 @@ def _parser() -> argparse.ArgumentParser:
     release.add_argument("--yes", action="store_true")
     sub.add_parser("list", help="учётки (последний столбец — предупреждён: да/нет, у преподавателя «-») и закрепления"
                                 " мест, без хешей")
+    journal = sub.add_parser("journal", help="журнал действий преподавателя, новые первыми: время, логин, действие,"
+                                             " место, разговор/агент/логин, итог, подробности (только коды и числа)")
+    journal.add_argument("--last", type=int, default=JOURNAL_LAST, metavar="N",
+                         help=f"строк: 1…{RECENT_MAX}, по умолчанию {JOURNAL_LAST}")
     return p
 
 
@@ -782,6 +846,22 @@ def _refuse_if_agents(settings: Settings, place: int) -> None:
         raise ValueError(_AGENTS_LEFT.format(place=place))
 
 
+def _journal(db_path: str, last: int) -> int:
+    """journal (Д10-R99): строки журнала действий преподавателя, новые первыми, по одной на строку через табуляцию —
+    <at> <login> <action> <NN или -> <target или -> <outcome> <detail JSON или ->. Базу открывает TeacherLog только на
+    чтение (mode=ro): пропавшую пустой не заводит, учётки не трогает. N вне 1…RECENT_MAX или сбой чтения — код 1."""
+    if not 1 <= last <= RECENT_MAX:
+        return _fail(f"journal: --last от 1 до {RECENT_MAX}")
+    try:
+        rows = TeacherLog(db_path).recent(last)
+    except TeacherLogError as exc:
+        return _fail(str(exc))
+    for r in rows:
+        detail = "-" if r.detail is None else json.dumps(r.detail, ensure_ascii=False)
+        print("\t".join((r.at, r.login, r.action, _nn(r.place), r.target or "-", r.outcome, detail)))
+    return 0
+
+
 def _run(store: AccountStore, args: argparse.Namespace, settings: Settings) -> int:
     command = args.command
     if command in ("add", "passwd"):
@@ -794,6 +874,8 @@ def _run(store: AccountStore, args: argparse.Namespace, settings: Settings) -> i
             print(password, flush=True)
     elif command == "disable":
         store.disable(args.login)
+    elif command == "enable":
+        store.enable(args.login)
     elif command == "remove":
         if not args.yes:
             raise ValueError("remove удаляет учётку — повторите с --yes")
@@ -821,7 +903,8 @@ def main(argv: list[str] | None = None) -> int:
     сверяет агентов места по Settings.from_env().AGENTS_ROOT (Д7-R61).
 
     Удача — код 0; ошибка — код 1 и одна строка в stderr без пароля. Пароль порождённый (--generate)
-    печатается в stdout один раз, после удачи; больше ничего в stdout не идёт (кроме вывода list).
+    печатается в stdout один раз, после удачи; больше ничего в stdout не идёт (кроме вывода list и journal).
+    journal учётки не открывает: журнал действий — только чтение (Д10-R99).
     """
     try:
         args = _parser().parse_args(argv)
@@ -831,6 +914,8 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
     except ValueError as exc:
         return _fail(f"настройки: {exc}")
+    if args.command == "journal":                   # только чтение: учётки не открываются
+        return _journal(settings.DB_PATH, args.last)
     store = AccountStore(settings.DB_PATH)
     if not store.open():
         return _fail(f"база учётных записей не открывается: {store.last_error}")

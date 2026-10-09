@@ -13,8 +13,8 @@ from fastapi.testclient import TestClient
 
 from fakes import CATALOG_ROWS, CLOCK_ROWS, LIVE_ROWS, SUMMARY, WHITELIST, FakeHistorian
 from helpers import EVENT as E
-from helpers import (LLM_ENV, SETTINGS, TEST_TOKENS, TOKEN, make_role, non_root, wait_until, wait_until_async,
-                     write)
+from helpers import (LLM_ENV, SETTINGS, TEST_TOKENS, TOKEN, make_app, make_role, non_root, wait_until,
+                     wait_until_async, write)
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS, TOKENS_ERROR, DataRole
 from pcbk_core.data.catalog import Catalog
@@ -101,10 +101,21 @@ def test_health_historian_shows_tools_and_gate_load(tmp_path):                # 
         assert r.json()["status"] == "ok"
         r = c.get("/health/historian")
     j = r.json()
-    assert j["tools"] == {"recent": 1, "errors": 0}                          # фоновые опросы — не инструменты
+    assert j["tools"] == {"recent": 1, "errors": 0, "failing": []}           # фоновые опросы — не инструменты
     assert {k: j["gate"][k] for k in ("p95_ms", "timeouts_5m", "busy_5m", "user_paused")} == \
            {"p95_ms": None, "timeouts_5m": 0, "busy_5m": 0, "user_paused": False}
     assert not any(n in r.text for n in WHITELIST)
+
+
+# Д9а, задача А1: ключ drill в /health/historian (m4 критики р1)
+
+def test_health_historian_drill_key(tmp_path):
+    for drill, want in (("", None), ("tool_error", "tool_error")):
+        d = tmp_path / (drill or "plain")
+        d.mkdir()                                                                 # make_app каталог не создаёт
+        app, role = make_app(d, settings=replace(SETTINGS, DRILL_DATA=drill))
+        with TestClient(app) as c:
+            assert c.get("/health/historian").json()["drill"] == want
 
 
 # --- сверх брифа ---
@@ -234,6 +245,14 @@ async def test_lifespan_drill_freeze_stamps_logs_and_cancels_loops(capfd, restor
     assert polls >= 2 and len([c for c in fake.calls if c == [live_all_sql()]]) == 1
     await anyio.sleep(0.2)
     assert poll_calls(fake) == polls                                    # на выходе циклы отменены
+
+
+async def test_lifespan_drill_data_logs(capfd, restore_logging):                  # сверх брифа: Д9-R83
+    setup_logging()
+    role, _ = make_role(settings=replace(SETTINGS, FRESH_POLL_S=0.05, DRILL_DATA="tool_error"))
+    async with role.lifespan():
+        await anyio.sleep(0.05)
+    assert "УЧЕНИЯ: DRILL_DATA=tool_error" in capfd.readouterr().err
 
 
 async def test_lifespan_without_drill_polls_after_catalog_attempt(capfd, restore_logging):

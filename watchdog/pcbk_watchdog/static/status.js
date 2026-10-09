@@ -18,6 +18,14 @@ function detailText(c, label) {
   return [c.detail === label ? '' : c.detail, c.note].filter((part) => part).join(' · ');
 }
 
+// пометка учений в detail или note (Д11-R116) — как DRILL_MARK в page.py: слово на «учени», не «обучения»
+const DRILL_MARK = /(?<![а-яё])учени/iu;
+
+export function drillTitles(checks) {
+  return (checks || []).filter((c) => DRILL_MARK.test(c.detail || '') || DRILL_MARK.test(c.note || ''))
+    .map((c) => c.title);
+}
+
 function span(doc, cls, text) {
   const el = doc.createElement('span');
   el.className = cls;
@@ -65,6 +73,12 @@ export function startPolling({ fetchImpl, doc, setIntervalImpl, staleAfterS,
     }
     const at = doc.getElementById('checked-at');
     if (at) at.textContent = fmtTime(data.checked_at);
+    const drills = doc.getElementById('drills');
+    if (drills) {   // абзац «Идут учения» — тот же вид, что в page.py
+      const titles = drillTitles(data.checks);
+      drills.textContent = titles.length ? `Идут учения: ${titles.join(', ')}` : '';
+      drills.hidden = titles.length === 0;
+    }
     const list = doc.getElementById('checks');
     if (!list) return;
     list.replaceChildren(...(data.checks || []).map((c) => {

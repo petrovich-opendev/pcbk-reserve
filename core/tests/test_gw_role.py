@@ -401,3 +401,98 @@ def test_gw_origin_port_rules():                                                
             GatewaySettings.from_env({"GW_ORIGIN": bad})
     for good in ("https://stand.example", "https://stand.example:8443", "https://127.0.0.1:28443"):
         assert GatewaySettings.from_env({"GW_ORIGIN": good}).GW_ORIGIN == good
+
+
+# --- задача А1 Д10а: учения кабинета преподавателя ---
+
+def test_drill_teacher_gateway_setting():                                               # m-7: опечатка — config_error шлюза
+    assert GatewaySettings.from_env({"DRILL_TEACHER": "shares_stale"}).DRILL_TEACHER == "shares_stale"
+    assert GatewaySettings.from_env({}).DRILL_TEACHER == ""
+    with pytest.raises(ValueError, match="DRILL_TEACHER: пусто, shares_stale или journal_down"):
+        GatewaySettings.from_env({"DRILL_TEACHER": "drop"})
+    gw, problem = gateway_settings({"DRILL_TEACHER": "drop"})
+    assert (gw.DRILL_TEACHER, problem.startswith("DRILL_TEACHER:")) == ("", True)
+    assert Settings.from_env({"DRILL_TEACHER": "drop"}).DB_PATH                      # ядро Settings её не видит
+
+
+def test_drill_teacher_modes_and_text():                                                # сверх брифа
+    from pcbk_core.settings import DRILL_TEACHER_MODES, _GW_FIELD_CHECKS
+
+    assert DRILL_TEACHER_MODES == {"", "shares_stale", "journal_down"}
+    assert "DRILL_TEACHER" in _GW_FIELD_CHECKS and GatewaySettings().DRILL_TEACHER == ""
+    for mode in ("shares_stale", "journal_down"):
+        assert GatewaySettings.from_env({"DRILL_TEACHER": mode}).DRILL_TEACHER == mode
+    for bad in ("SHARES_STALE", "shares_stale ", "freeze_reload", "journal", "tool_error", "x" * 200):
+        with pytest.raises(ValueError) as e:
+            GatewaySettings.from_env({"DRILL_TEACHER": bad})
+        assert str(e.value) == "DRILL_TEACHER: пусто, shares_stale или journal_down"     # без сырого значения (Ш9)
+        assert len(str(e.value)) <= GW_ERROR_CHARS
+    gw = GatewaySettings.valid_from_env({"DRILL_TEACHER": "drop", "DRILL_AGENTS": "freeze_reload"})
+    assert (gw.DRILL_TEACHER, gw.DRILL_AGENTS) == ("", "freeze_reload")                # прочие поля — прошедшие
+    errors = GatewaySettings._parse({"GW_ORIGIN": "http://x", "DRILL_TEACHER": "drop"})[1]
+    assert any(e.startswith("DRILL_TEACHER:") for e in errors)                          # признак виден и не первым (m-1 р2)
+
+
+def test_drill_teacher_typo_closes_gateway_keeps_core(tmp_path):                        # m-7: процесс жив
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "DRILL_TEACHER": "drop"})}   # не бросает
+    gw = roles["gateway"]
+    assert gw.config_error == "настройки шлюза: DRILL_TEACHER: пусто, shares_stale или journal_down"
+    assert gw.gw.DRILL_TEACHER == "" and "data" in roles
+
+
+# --- Д10а, задача А2: m-7 — опечатка в учении закрывает шлюз и LLM-прокси, процесс жив ---
+
+def test_bad_drill_teacher_closes_gateway_and_llm(tmp_path):
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "DRILL_TEACHER": "drop"})}
+    assert roles["gateway"].config_error.startswith("настройки шлюза: DRILL_TEACHER:")
+    assert "учения DRILL_TEACHER с ошибкой" in roles["llm"].config_error
+    assert roles["llm"].shares.drill == ""                                   # учение не включилось молча
+    # m-1 р2: ошибка раньше по полям (GW_ORIGIN) не прячет опечатку в учении — признак из всего списка _parse
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_ORIGIN": "https://x/path",
+                                                        "DRILL_TEACHER": "drop"})}
+    assert roles["gateway"].config_error.startswith("настройки шлюза: GW_ORIGIN:")
+    assert "учения DRILL_TEACHER с ошибкой" in roles["llm"].config_error
+
+
+def test_good_drill_teacher_reaches_shares_and_journal(tmp_path):         # сверх брифа: учение дошло до обоих
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    for mode in ("shares_stale", "journal_down"):
+        roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "DRILL_TEACHER": mode})}
+        assert (roles["llm"].shares.drill, roles["gateway"].teacher_log.drill) == (mode, mode)
+        assert roles["gateway"].config_error is None and roles["llm"].config_error is None
+    roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "GW_ORIGIN": "https://x/path"})}
+    assert "DRILL_TEACHER" not in (roles["llm"].config_error or "")         # чужая ошибка шлюза доли не закрывает
+
+
+# --- Д11а, задача А2: тормоз прогона (Д11-R117) — крючок мест и задача наблюдения, как у уборщика ---
+
+def test_build_roles_wires_brake_into_gateway(tmp_path):                  # роль llm build_roles — та же, что у шлюза
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    env = {**LLM_ENV, "LLM_RUN_ID": "d11-test", "LLM_RUN_USD": "5", "LLM_RUN_CALLERS": "student-02,ops",
+           "LLM_RUN_MEM_FAIL_MIB": "2048", "LLM_RUN_PSI_FULL_MAX": "7.5"}
+    roles = {r.name: r for r in build_roles(settings, env)}
+    llm, gw = roles["llm"], roles["gateway"]
+    assert llm.config_error is None and gw.llm is llm and (llm.brake.fail_mib, llm.brake.psi_full_max) == (2048, 7.5)
+    assert gw.workplaces.halted() == frozenset()
+    llm.brake.clear()                                                        # память процесса; мета не тронута
+    llm.brake.halt("memory")
+    assert gw.workplaces.halted() == frozenset({2})                          # ops — не место
+    plain = {r.name: r for r in build_roles(settings, LLM_ENV)}
+    assert plain["llm"].brake is None and plain["gateway"].workplaces.halted() == frozenset()
+
+
+def test_halt_watch_starts_even_with_config_error(tmp_path):               # остановка снимает; config_error — не помеха
+    run = {"LLM_RUN_ID": "d11-test", "LLM_RUN_USD": 5.0, "LLM_RUN_CALLERS": "student-03"}
+    llm = make_llm_role(tmp_path / "a", key=None, **run)
+    app, role = make_gateway(tmp_path / "a", llm=llm)
+    with TestClient(app):
+        task = role._halt_task
+        assert task is not None and not task.done() and task.get_name() == "gw-halt-watch"
+    assert role._halt_task is None and task.done()
+    app, role = make_gateway(tmp_path / "b", llm=llm, config_error="проба")
+    with TestClient(app):                                                   # уборщика нет, тормоз смотрит (m-3 ревью А2)
+        task = role._halt_task
+        assert task is not None and not task.done() and role._reaper is None
+    assert role._halt_task is None and task.done()

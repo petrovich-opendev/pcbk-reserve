@@ -29,6 +29,7 @@ from pcbk_core.gateway.reload import (DIR_CHECK_S, IDLE_SETTLE_S, RELOAD_DELAYED
                                       TURN_START_GRACE_S, VISIBLE_TRIES, AgentReloads)
 from pcbk_core.gateway.rules import EXAMPLE_IDS
 from pcbk_core.gateway.stats import MAX_STREAMS_PER_LOGIN
+from pcbk_core.gateway.teacher_api import TEACHER_PARALLEL
 
 # агент шаблона службы в GET /agent места: primary и описание (итоговая доводка Д7б, I-1: без них — не видим)
 AGENT = {"name": "proverka", "native": False, "mode": "primary", "description": "Проверка: сводка узла"}
@@ -480,8 +481,9 @@ async def test_heartbeat_after_pending_and_per_place(env, monkeypatch):    # I-�
     assert len(stamps) == 3 and None not in stamps and len(set(stamps)) == 3     # и перед каждым местом
 
 
-def test_place_connections_include_worker():                               # m4
-    assert PLACE_CONNECTIONS == MAX_STREAMS_PER_LOGIN + PROXY_PARALLEL + 2
+def test_place_connections_include_worker():                               # m4; Д10а, А3: и чтения кабинета
+    assert PLACE_CONNECTIONS == MAX_STREAMS_PER_LOGIN + PROXY_PARALLEL + 2 + TEACHER_PARALLEL
+    assert TEACHER_PARALLEL == 1
 
 
 def test_health_reports_pending(env_sync):                                 # TestClient: GET /health/agents

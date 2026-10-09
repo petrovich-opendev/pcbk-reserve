@@ -14,24 +14,35 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "JOURNAL_PATH", "MEMINFO_PATH", "COMPONENTS_PATH", "DRILL_FREEZE_LOOP",
                       "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
                       "GW_STALE_S",                                    # строка «Шлюз и вход» (Д5а)
-                      "AGENTS_STALE_S"},                               # строка «Агенты студентов» (Д7а, П10)
+                      "AGENTS_STALE_S",                                # строка «Агенты студентов» (Д7а, П10)
+                      "LLM_RUN_SILENT_S",                              # «прогон отбора молчит» (Д8а)
+                      "TEACHER_STALE_S",                               # «Кабинет преподавателя и доли» (Д10а)
+                      # «Память сервера» v2 (Д11а): счётчик убийств и давление, пороги swap и давления
+                      "VMSTAT_PATH", "PRESSURE_PATH", "SWAP_GROW_WARN_MIB", "PSI_FULL_MAX"},
     "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
+                  "DRILL_DATA",                                    # учения службы данных (Д9а, Д9-R83)
                   "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
                   # шлюз (Д5а): сети мест для сверки токенов и адресов мест, origin входа, простой, такт, учения
                   "STU_NET", "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY",
                   "DRILL_AGENTS",                                  # учения агентов студентов (Д7а, П10)
+                  "DRILL_TEACHER",                                 # учения кабинета преподавателя (Д10а)
+                  "LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS",  # прогон отбора модели (Д8-R69)
+                  # тормоз прогона (Д11-R117): пороги — вложенным умолчанием compose.yaml
+                  "LLM_RUN_MEM_FAIL_MIB", "LLM_RUN_SWAP_GROW_MIB", "LLM_RUN_SWAP_BASE_MIB", "LLM_RUN_PSI_FULL_MAX",
                   # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
-                  # бюджет (учение «бюджет стенда израсходован», Д4б)
-                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD"},
+                  # бюджет (учение «бюджет стенда израсходован», Д4б); обёртка запуска и двойник историана (Д8-R75)
+                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD", "PYTHONPATH", "PCBK_TWIN_HISTORIAN",
+                  # двойники /proc тормоза прогона (Д11-R123а) — только тестовый стенд
+                  "LLM_RUN_MEMINFO", "LLM_RUN_VMSTAT", "LLM_RUN_PRESSURE"},
     "pcbk-edge": set(),
     "pcbk-sp-ro": set(),
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d7a", "pcbk-core": "pcbk-reserve/core:d7b",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d11a", "pcbk-core": "pcbk-reserve/core:d11a",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
-          "pcbk-student-01": "pcbk-reserve/student:d7b"}
+          "pcbk-student-01": "pcbk-reserve/student:d9a"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 # CSP страницы чата — строка Global Constraints Д6 (Д6-R41)
 CHAT_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "
@@ -219,8 +230,8 @@ def test_edge_routes_web_report(stack):                                     # Д
 
 def test_edge_routes_my_agents(stack):                                     # Д7б, Д7-R64; preflight П13
     """«Мои агенты» через edge: без cookie — 401 JSON шлюза (тело и текст шлюза, а не страница edge); преподаватель (без
-    места) — 403 JSON с текстом R64; «//» в сыром пути — 400 edge до core. Ответ 200 с cookie студента — в test_web
-    (web-a): своей учётки студента у модуля нет — свободных мест на стенде нет (П13)."""
+    места) — 403 JSON с текстом Д10-R100 (агенты студентов — в кабинете); «//» в сыром пути — 400 edge до core. Ответ
+    200 с cookie студента — в test_web (web-a): своей учётки студента у модуля нет — свободных мест на стенде нет (П13)."""
     gw = stack.gw_client()                                                  # без сессии, Origin стенда
     code, body, h = gw.call("GET", "/pcbk/api/agents")
     assert (code, body, h["content-type"]) == \
@@ -234,8 +245,8 @@ def test_edge_routes_my_agents(stack):                                     # Д7
     try:
         code, body, h = t.call("GET", "/pcbk/api/agents")
         assert (code, body, h["content-type"]) == \
-            (403, {"name": "Forbidden", "data": {"message": "Агенты студентов для преподавателя — в следующих выпусках "
-                                                            "стенда"}}, "application/json"), (code, body)
+            (403, {"name": "Forbidden", "data": {"message": "Агенты студентов — в кабинете преподавателя, только на "
+                                                            "чтение"}}, "application/json"), (code, body)
     finally:
         t.logout()
 

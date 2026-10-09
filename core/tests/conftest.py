@@ -87,7 +87,8 @@ class FakeOpenRouter:
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"Content-Type": "application/json"} if data is not None else {})
         with self._opener.open(req, timeout=5) as r:
-            return json.loads(r.read())
+            raw = r.read()
+        return json.loads(raw) if raw else None         # 204 без тела (/_bench, П10)
 
     @property
     def requests(self) -> list[dict]:
@@ -106,6 +107,14 @@ class FakeOpenRouter:
     def set_price(self, model: str, prompt: float, completion: float) -> None:
         """Нынешняя цена точки модели, $ за 1 млн: выше provider.max_price запроса — 404 max_price."""
         self._call("POST", "/_price", {"model": model, "prompt": prompt, "completion": completion})
+
+    def bench_on(self, personas: dict) -> None:
+        """Персоны стенда отбора (fake_bench.PERSONAS — модель → персона): чат этих моделей отвечает персоной."""
+        self._call("POST", "/_bench", {"personas": dict(personas)})
+
+    def bench_off(self) -> None:
+        """Персоны выключены: чат — снова по словам FAKE…."""
+        self._call("DELETE", "/_bench")
 
 
 @pytest.fixture

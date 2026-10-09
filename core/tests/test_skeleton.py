@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from helpers import LLM_ENV, SETTINGS, DummyRole, dummy, sha, write
 from pcbk_core.app import create_app
+from pcbk_core.llm.ledger import RunSpec, run_spec
 from pcbk_core.logs import setup_logging
 from pcbk_core.main import build_roles, healthcheck, main
 from pcbk_core.secrets import BdrvConfig, KeyFileError, TokenTable, read_env_file, read_key_file
@@ -79,6 +80,13 @@ def test_settings_errors_name_the_field():
                       ("CATALOG_DEADLINE_S", "9.9"), ("DRILL_FRESHNESS", "freeze")):
         with pytest.raises(ValueError, match=name):
             Settings.from_env({name: raw})
+
+
+def test_drill_data_setting():                                                  # Д9-R83
+    assert Settings.from_env({"DRILL_DATA": "tool_error"}).DRILL_DATA == "tool_error"
+    assert Settings.from_env({}).DRILL_DATA == ""
+    with pytest.raises(ValueError, match="DRILL_DATA"):
+        Settings.from_env({"DRILL_DATA": "calc"})
 
 
 def test_install_hook_exact_mounts_and_no_docs():                     # Review Focus 4
@@ -292,6 +300,73 @@ def test_llm_settings_error_names_variable_without_value(name, raw):            
     assert str(e.value).startswith(name) and "zq-raw" not in str(e.value) and "0.25" not in str(e.value)
 
 
+@pytest.mark.parametrize("env", [
+    {"LLM_RUN_ID": "d8"},
+    {"LLM_RUN_ID": "D8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-07"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "2000", "LLM_RUN_CALLERS": "student-07"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-7"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-07,student-07"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-11"},
+])
+def test_llm_run_settings_refused(env):                                           # Review Focus 1
+    with pytest.raises(ValueError, match=r"^LLM_RUN_") as e:
+        LlmSettings.from_env(env)
+    assert "student-7" not in str(e.value) and "D8" not in str(e.value)
+
+
+def test_llm_run_settings_ok():
+    s = LlmSettings.from_env({"LLM_RUN_ID": "d8-1008", "LLM_RUN_USD": "80",
+                              "LLM_RUN_CALLERS": "student-07, student-10"})
+    assert run_spec(s) == RunSpec("d8-1008", 80.0, frozenset({"student-07", "student-10"}))
+    assert run_spec(LlmSettings.from_env({})) is None
+
+
+# сверх брифа: прочие опечатки и края LLM_RUN_* — текст с именем, без значения
+@pytest.mark.parametrize("env", [
+    {"LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "ops"},                               # без id
+    {"LLM_RUN_ID": "d8", "LLM_RUN_CALLERS": "ops"},                                # без потолка
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "0", "LLM_RUN_CALLERS": "ops"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "nan", "LLM_RUN_CALLERS": "ops"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "zq-raw", "LLM_RUN_CALLERS": "ops"},
+    {"LLM_RUN_ID": "zq_raw", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "ops"},
+    {"LLM_RUN_ID": "a" * 33, "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "ops"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "ops,"},          # пустой элемент
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-00"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "Student-01"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "zq-raw"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": " , "},
+])
+def test_llm_run_settings_refused_more(env):
+    with pytest.raises(ValueError, match=r"^LLM_RUN_") as e:
+        LlmSettings.from_env(env)
+    assert "zq" not in str(e.value) and "Student" not in str(e.value) and "student-00" not in str(e.value)
+
+
+@pytest.mark.parametrize("env", [{"LLM_RUN_ID": "d8"}, {"LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "ops"},
+                                 {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10"}, {"LLM_RUN_CALLERS": "ops"}])
+def test_llm_run_settings_all_or_none(env):                                        # своя причина, а не соседняя
+    with pytest.raises(ValueError, match=r"^LLM_RUN_\*: нужны все три переменные или ни одной$"):
+        LlmSettings.from_env(env)
+
+
+def test_llm_run_settings_edges():
+    full = {"LLM_RUN_ID": "a" * 32, "LLM_RUN_USD": "1000", "LLM_RUN_CALLERS": " ops ,student-01,student-10 "}
+    assert run_spec(LlmSettings.from_env(full)) == RunSpec("a" * 32, 1000.0,
+                                                            frozenset({"ops", "student-01", "student-10"}))
+    with pytest.raises(ValueError, match=r"^LLM_RUN_USD"):                          # потолок — не выше бюджета
+        LlmSettings.from_env({**full, "LLM_TOTAL_USD": "500"})
+    assert LlmSettings.from_env({**full, "LLM_TOTAL_USD": "500", "LLM_RUN_USD": "500"}).LLM_RUN_USD == 500.0
+
+
+def test_build_roles_llm_run_typo_is_config_error(tmp_path):                       # опечатка — 403 всем
+    from pcbk_core.main import build_llm_role
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
+    role = build_llm_role(settings, {**LLM_ENV, "LLM_RUN_ID": "d8", "LLM_RUN_USD": "10",
+                                     "LLM_RUN_CALLERS": "student-07,student-7"})
+    assert role.config_error.startswith("настройки: LLM_RUN_CALLERS") and role.run is None
+    assert "student-7" not in role.config_error
+
+
 def test_read_key_file(tmp_path):
     assert read_key_file(write(tmp_path, "  sk-test-key\n")) == "sk-test-key"
     assert read_key_file(write(tmp_path, "\n  \n")) is None and read_key_file(str(tmp_path / "нет")) is None
@@ -358,3 +433,26 @@ def test_bad_management_key_disables_only_credits(tmp_path, capfd, restore_loggi
 def test_build_roles_share_agent_stats(monkeypatch, tmp_path):                  # Д7-R53, задача А1 Д7а
     data, _, gw = build_roles(SETTINGS, env={})
     assert data.agent_stats is gw.agent_stats
+
+
+# --- Д10а, задача А2: доли мест — одни у LLM-прокси и шлюза (Д10-R98) ---
+
+def test_build_roles_share_shares_with_gateway(tmp_path):
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    roles = {r.name: r for r in build_roles(settings, LLM_ENV)}
+    assert roles["gateway"].llm is roles["llm"] and roles["llm"].budget.shares is roles["llm"].shares
+    assert roles["llm"].shares.settled_of == roles["llm"].ledger.settled
+
+
+def test_build_llm_role_shares_from_settings(tmp_path):                   # сверх брифа: бюджет, доля, учение
+    from pcbk_core.main import build_llm_role
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "core.db")})
+    role = build_llm_role(settings, {**LLM_ENV, "LLM_TOTAL_USD": "300", "LLM_SHARE_USD": "25.5"},
+                          shares_drill="shares_stale")
+    s = role.shares
+    assert (s.path, s.total_cents, s.default_cents, s.drill, s.cents(7)) == \
+           (str(tmp_path / "core.db"), 30000, 2550, "shares_stale", 2550)
+    assert s.loaded is False and not (tmp_path / "core.db").exists()           # конструкторы ничего не открывают
+    assert role.config_error is None
+    closed = build_llm_role(settings, LLM_ENV, drill_error=True)
+    assert closed.config_error == "учения DRILL_TEACHER с ошибкой — доли закрыты" and closed.shares.drill == ""

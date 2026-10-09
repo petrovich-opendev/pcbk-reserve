@@ -1,7 +1,7 @@
 """Места шлюза (Д5-R27, Д5-R28): прокси сокета, замок места, пробуждение одно на место, «упало» по Restarting и
 StartedAt, готовность, уборщик простоя с перепроверкой под замком. Места и sp-ctl — двойники httpx.MockTransport."""
 import asyncio
-import importlib.util
+import importlib
 import logging
 import re
 import sys
@@ -424,14 +424,12 @@ async def test_inspect_refused_while_ping_alive_is_down(tmp_path, caplog):      
 
 def watchdog_checks():
     """Правила сторожа (watchdog/pcbk_watchdog/checks.py, только stdlib) — из соседнего каталога репозитория,
-    как тест моделей читает student/: стык с настоящим health_json без копии правил."""
-    name = "pcbk_watchdog_checks_for_core_tests"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, CORE_DIR.parent / "watchdog" / "pcbk_watchdog" / "checks.py")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module                                                     # dataclass ищет свой модуль
-        spec.loader.exec_module(module)
-    return sys.modules[name]
+    как тест моделей читает student/: стык с настоящим health_json без копии правил. Пакетом, а не отдельным файлом:
+    с Д11а (А1) checks импортирует соседний модуль относительно (from .memory import …)."""
+    root = str(CORE_DIR.parent / "watchdog")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return importlib.import_module("pcbk_watchdog.checks")
 
 
 async def test_long_session_ready_places_keep_row_from_fail(tmp_path):                  # M-1 (вариант «а»)

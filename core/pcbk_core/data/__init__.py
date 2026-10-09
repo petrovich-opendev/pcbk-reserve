@@ -341,6 +341,8 @@ class DataRole(RoleBase):
             body["catalog_error"] = self.catalog_error
             body["gate"] = self.gate.stats()
             body["tools"] = self.service.tools_stats()      # из памяти службы, не из журнала событий (К7)
+            # учение службы данных (Д9-R83, m4): сторож дописывает его в note строки — забытое учение видно
+            body["drill"] = self.settings.DRILL_DATA or None
             return JSONResponse(body)
 
         router.include_router(data_router(self))
@@ -381,6 +383,8 @@ class DataRole(RoleBase):
             mode = self.settings.DRILL_FRESHNESS
             if mode:
                 log.warning("УЧЕНИЯ: DRILL_FRESHNESS=%s", mode)
+            if self.settings.DRILL_DATA:
+                log.warning("УЧЕНИЯ: DRILL_DATA=%s", self.settings.DRILL_DATA)
             tried = asyncio.Event()
             tasks = [asyncio.create_task(self._catalog_loop(tried), name="data-catalog"),
                      asyncio.create_task(self._freshness_loop(tried), name="data-freshness"),

@@ -8,12 +8,13 @@ from datetime import timedelta
 import pytest
 
 import pcbk_watchdog.main
-from helpers import (CHROME, SETTINGS, T0, chrome_dom, gw, http_get, http_status, insp, llm_obj, now_utc,
-                     put_build, start_test_server)
+from helpers import (CHROME, SETTINGS, T0, NoJournalWrite, chrome_dom, gw, http_get, http_status, insp, llm_obj,
+                     now_utc, put_build, start_test_server, wait_until)
 from pcbk_watchdog.checks import HTTP_CHECK_SPANS, NET_CHECK_TIMEOUT_S, Check
 from pcbk_watchdog.docker_api import DockerReader
 from pcbk_watchdog.journal import Journal
-from pcbk_watchdog.main import (LazyJournal, Settings, WatchState, load_components, run_checks,
+from pcbk_watchdog.memory import MEM_SENSOR_SILENT_DETAIL
+from pcbk_watchdog.main import (LazyJournal, MemState, Settings, WatchState, load_components, run_checks,
                                 run_loop, tick)
 from pcbk_watchdog.page import Snapshot, is_stale
 
@@ -263,7 +264,7 @@ def test_components_file_d4a():                    # было test_components_fi
 def test_components_file_d4b():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
-    assert ids[-7:-2] == ["core", "core-container", "historian", "llm", "gateway"]
+    assert ids[-8:-3] == ["core", "core-container", "historian", "llm", "gateway"]       # Д10а: строка teacher — последней
     cc = comps[ids.index("core-container")]
     assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
            ("container", "pcbk-core", False, "Серверный слой — контейнер")
@@ -277,19 +278,59 @@ def test_components_file_d5a():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
     g = comps[ids.index("gateway")]
-    assert ids[-3] == "gateway"
+    assert ids[-4] == "gateway"
     assert (g["title"], g["kind"], g["url"]) == ("Шлюз и вход", "gateway", "http://pcbk-core:8000/health/gateway")
 
 
 def test_components_have_web_row():
     comps = load_components("components.json")
-    assert comps[-2] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
+    assert comps[-3] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
                          "reports_url": "http://pcbk-core:8000/health/web"}                # Д6б: отчёты браузеров
 
 
 def test_components_have_agents_row():
-    assert load_components("components.json")[-1] == {"id": "agents", "title": "Агенты студентов", "kind": "agents",
+    assert load_components("components.json")[-2] == {"id": "agents", "title": "Агенты студентов", "kind": "agents",
                                                       "url": "http://pcbk-core:8000/health/agents"}
+
+
+def test_components_have_teacher_row():                                        # задача А1 Д10а (Д10-R96)
+    assert load_components("components.json")[-1] == {"id": "teacher", "title": "Кабинет преподавателя и доли",
+                                                      "kind": "teacher", "url": "http://pcbk-core:8000/health/teacher"}
+
+
+def test_teacher_stale_setting():
+    assert Settings.from_env({}).TEACHER_STALE_S == 120
+    with pytest.raises(ValueError, match="TEACHER_STALE_S"):
+        Settings.from_env({"TEACHER_STALE_S": "0"})
+
+
+def test_teacher_stale_bounds_and_tick_budget():                               # сверх брифа
+    assert Settings.from_env({"TEACHER_STALE_S": "20"}).TEACHER_STALE_S == 20   # ручка учения
+    for bad in ({"TEACHER_STALE_S": "-5"}, {"TEACHER_STALE_S": "abc"}, {"TEACHER_STALE_S": "1.5"}):
+        with pytest.raises(ValueError):
+            Settings.from_env(bad)
+    # как AGENTS_STALE_S: проверка кабинета — один HTTP-запрос, правило срока такта порог не затрагивает
+    assert Settings(TEACHER_STALE_S=1).tick_budget_s == Settings().tick_budget_s
+
+
+def test_run_checks_teacher_kind(json_site):
+    # вид teacher идёт через _check_one в check_teacher с порогом TEACHER_STALE_S; note доходит до снимка
+    assert pcbk_watchdog.main.KINDS["teacher"] == ("url",)
+    assert "teacher" not in pcbk_watchdog.main.LOCAL_KINDS
+    reply = {"checked_at": (T0 - timedelta(seconds=30)).isoformat(), "shares_loaded": True, "shares_ok": True,
+             "shares_drift": 0, "shares_sum_usd": 999.5, "total_usd": 1000.0, "store_ok": True, "reads_1h": 2,
+             "read_failed_1h": 0, "changes_1h": 4, "change_failed_1h": 0, "role_refused_1h": 0, "drill": ""}
+    comps = [{"id": "teacher", "title": "Кабинет преподавателя и доли", "kind": "teacher",
+              "url": json_site(200, reply)}]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert [(c.component, c.title, c.state, c.detail, c.note) for c in checks] == [
+        ("teacher", "Кабинет преподавателя и доли", "ok", "доли сходятся, журнал действий пишется",
+         "распределено $999.50 из $1000; прочитано за час: 2; изменений за час: 4")]
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), replace(SETTINGS, TEACHER_STALE_S=20), T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "сверка долей молчит")
+    comps[0]["url"] = "http://127.0.0.1:9/health/teacher"
+    checks = run_checks(comps, DockerReader("http://127.0.0.1:9", 0.5), SETTINGS, T0)
+    assert (checks[0].state, checks[0].detail) == ("fail", "кабинет преподавателя не отвечает")
 
 
 def test_run_checks_web_kind(web_site):                                        # M2 предпроверки Д6а
@@ -325,6 +366,28 @@ def test_agents_stale_setting():                                               #
             Settings.from_env(bad)
     # как GW_STALE_S: проверка агентов — один HTTP-запрос, правило срока такта порог не затрагивает
     assert Settings(AGENTS_STALE_S=1).tick_budget_s == Settings().tick_budget_s
+
+
+def test_run_silent_setting():                                                  # задача А1 Д8а
+    assert Settings().LLM_RUN_SILENT_S == 300
+    assert Settings.from_env({"LLM_RUN_SILENT_S": "10"}).LLM_RUN_SILENT_S == 10
+    for bad in ({"LLM_RUN_SILENT_S": "0"}, {"LLM_RUN_SILENT_S": "abc"}, {"LLM_RUN_SILENT_S": "1.5"}):
+        with pytest.raises(ValueError):
+            Settings.from_env(bad)
+
+
+def test_run_checks_llm_passes_run_silent(fake_core):                            # сверх брифа: _check_one → check_llm
+    fake_core.set_llm(llm_obj(run={"id": "d8-drill", "cap_usd": 1.0, "spent_usd": 0.0, "callers": 1,
+                                   "calls_10m": 0, "idle_s": 11.0}))
+    comps = [{"id": "llm", "title": "LLM-прокси и бюджет", "kind": "llm", "url": fake_core.base + "/health/llm"}]
+    reader = DockerReader("http://127.0.0.1:9", 0.5)
+    note = "расход $12.35 из $1000 · прогон d8-drill: $0.00 из $1.00, вызовов за 10 мин: 0"
+    quick = replace(SETTINGS, LLM_RUN_SILENT_S=10)
+    assert [(c.state, c.detail, c.note) for c in run_checks(comps, reader, quick, T0)] == \
+        [("warn", "прогон отбора молчит — к модели давно никто не обращался", note)]
+    assert [(c.state, c.note) for c in run_checks(comps, reader, SETTINGS, T0)] == [("ok", note)]
+    with pytest.raises(ValueError):
+        replace(SETTINGS, LLM_RUN_SILENT_S=-1)
 
 
 def test_run_checks_agents_kind(json_site):
@@ -512,3 +575,120 @@ def test_browser_on_real_server_with_csp():
     srv = start_test_server(Flip())
     dom = chrome_dom(f"http://127.0.0.1:{srv.server_port}/status", virtual_time_ms=8000)
     assert re.search(r'id="silence"(?![^>]*hidden)', dom)
+
+
+# Д11-R115, m-10 р1: счётчик oom_kill — до и после осмотра, проводка MemState через run_loop → tick → run_checks
+class RestartingDocker:
+    """Первый осмотр — место работает; дальше — перезапущено, и за этот осмотр счётчик oom_kill вырос.
+
+    at — «сейчас» проверок: T0 для run_checks, часы машины для run_loop (свежий перезапуск — моложе 15 мин)."""
+    def __init__(self, vm, at=T0):
+        self.vm, self.n, self.at = vm, 0, at
+    def inspect(self, name):
+        self.n += 1
+        if self.n == 1:
+            return insp(running=True, started=self.at - timedelta(hours=1))
+        if self.n == 2:
+            self.vm.write_text("oom_kill 6\n")
+        return insp(running=True, restarts=1, started=self.at - timedelta(seconds=5))
+    def ping(self):
+        pass
+
+
+COMPS = [{"id": "memory", "title": "Память сервера", "kind": "memory"},
+         {"id": "student-01", "title": "Рабочее место 01", "kind": "container", "container": "pcbk-student-01",
+          "sleeping_ok": True}]
+
+
+def settings_with(tmp_path, **kw):
+    vm = tmp_path / "vmstat"; vm.write_text("oom_kill 5\n")
+    return vm, replace(SETTINGS, VMSTAT_PATH=str(vm), PRESSURE_PATH=str(tmp_path / "none"), **kw)
+
+
+def test_run_checks_reads_oom_around_inspect(tmp_path):
+    vm, settings = settings_with(tmp_path)
+    docker, mem = RestartingDocker(vm), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    assert run_checks(COMPS, docker, settings, T0, mem=mem)[1].detail.startswith("перезапущен: убит по памяти")
+    assert run_checks(COMPS, docker, settings, T0 + timedelta(minutes=1), mem=mem)[0].state == "ok"
+
+
+def test_run_checks_own_kill_not_outside_after_grace(tmp_path):              # доводка р1 (ревью А1, I-2): attribute
+    vm, settings = settings_with(tmp_path)
+    docker, mem = RestartingDocker(vm), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    run_checks(COMPS, docker, settings, T0, mem=mem)
+    run_checks(COMPS, docker, settings, T0 + timedelta(seconds=10), mem=mem)
+    rows = run_checks(COMPS, docker, settings, T0 + timedelta(seconds=40), mem=mem)   # > grace 20 + такт 10
+    assert (rows[0].state, mem.history.outside(T0 + timedelta(seconds=40))) == ("ok", 0)
+
+
+class LongRestartingDocker:
+    """Место убито по памяти и дольше match_s в окне Restarting (откат политики перезапуска), затем работает."""
+    def __init__(self):
+        self.n = 0
+    def inspect(self, name):
+        self.n += 1
+        if self.n == 1:
+            return insp(running=True, started=T0 - timedelta(hours=1))
+        if self.n <= 4:
+            return insp(running=True, restarting=True, restarts=1, oom=True, started=T0 - timedelta(hours=1))
+        return insp(running=True, restarts=1, started=T0 + timedelta(seconds=35))
+
+
+def test_run_checks_late_restart_credit_does_not_hide_next_kill(tmp_path):   # m-5 ревью А1: v_after в attribute
+    vm, settings = settings_with(tmp_path)
+    docker, mem = LongRestartingDocker(), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    vm.write_text("oom_kill 6\n")                                           # место убито: прирост замерен в T0
+    for s in (0, 10, 20):
+        run_checks(COMPS, docker, settings, T0 + timedelta(seconds=s), mem=mem)
+    rows = run_checks(COMPS, docker, settings, T0 + timedelta(seconds=40), mem=mem)   # работает — позже match_s
+    assert rows[1].detail.startswith("перезапущен: убит по памяти")
+    vm.write_text("oom_kill 7\n")                                           # убийство вне мест (Dify)
+    run_checks(COMPS, docker, settings, T0 + timedelta(seconds=50), mem=mem)
+    assert mem.history.outside(T0 + timedelta(seconds=80)) == 2             # кредит его не поглотил
+
+
+class VmstatLostDocker:
+    """Место работает, к следующему осмотру перезапущено — а /proc/vmstat к этому такту перестал читаться."""
+    def __init__(self):
+        self.n = 0
+    def inspect(self, name):
+        self.n += 1
+        if self.n == 1:
+            return insp(running=True, started=T0 - timedelta(hours=1))
+        return insp(running=True, restarts=1, started=T0 - timedelta(seconds=5))
+
+
+def test_run_checks_vmstat_lost_is_unknown_not_zero(tmp_path):              # доводка р1 (ревью А1, I-1)
+    vm, settings = settings_with(tmp_path)
+    docker, mem = VmstatLostDocker(), MemState(settings)
+    run_checks(COMPS, docker, settings, T0 - timedelta(seconds=10), mem=mem)
+    vm.unlink()
+    memory, place = run_checks(COMPS, docker, settings, T0, mem=mem)
+    assert (memory.state, memory.detail) == ("unknown", MEM_SENSOR_SILENT_DETAIL)
+    assert "нет данных: vmstat" in memory.note.split(" · ")
+    assert place.detail.startswith("перезапущен после сбоя")                 # причина неизвестна, не «0 убийств»
+
+
+def test_run_loop_wires_mem_state(tmp_path):                                # проводка, а не только run_checks
+    vm, settings = settings_with(tmp_path, TICK_S=0.05)
+    state, stop = WatchState(), threading.Event()
+    t = threading.Thread(target=run_loop, args=(state, NoJournalWrite(), COMPS, RestartingDocker(vm, now_utc()),
+                                                settings, stop))
+    t.start()
+    try:
+        wait_until(lambda: state.snapshot
+                   and state.snapshot.checks[1].detail.startswith("перезапущен: убит по памяти"), 5)
+    finally:
+        stop.set(); t.join(5)
+
+
+def test_memory_settings():
+    s = Settings.from_env({})
+    assert (s.VMSTAT_PATH, s.PRESSURE_PATH, s.SWAP_GROW_WARN_MIB, s.PSI_FULL_MAX) == \
+           ("/proc/vmstat", "/proc/pressure/memory", 512, 10.0)
+    for name, bad in (("SWAP_GROW_WARN_MIB", "0"), ("PSI_FULL_MAX", "0"), ("PSI_FULL_MAX", "101")):
+        with pytest.raises(ValueError, match=name):
+            Settings.from_env({name: bad})

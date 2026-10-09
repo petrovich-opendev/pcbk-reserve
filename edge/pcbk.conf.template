@@ -336,6 +336,32 @@ server {
         proxy_pass http://$pcbk_core;
     }
 
+    # калькуляторы вкладки чата (Д9а, Д9-R87): POST /pcbk/api/calc/<tool> — префикс, имя инструмента сверяет core;
+    # копия location = /pcbk/api/workplace — зона ручек места, 509 → busy.json, тело 64k, срок 30 с, сверка сырого пути
+    location /pcbk/api/calc/ {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    # кабинет преподавателя (Д10а, Д10-R105): /pcbk/api/teacher/… — префикс, роль и части пути сверяет core; копия
+    # location = /pcbk/api/workplace — зона ручек места, 509 → busy.json, тело 64k, срок 30 с, сверка сырого пути
+    location /pcbk/api/teacher/ {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
     # отчёты браузеров (Д6б, Д6-R50): тело ровно {"kind": …} — core сам режет до 256 Б, edge — до 1 КиБ (413 JSON);
     # предел частоты на cookie сессии — 509 → busy.json, как у прочих пределов Д5б (ответ отчёта веб не показывает)
     location = /pcbk/api/web/report {
@@ -401,6 +427,8 @@ server {
     location = /pcbk/api      { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
     location = /pcbk/api/auth { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
     location = /pcbk/api/oc   { default_type application/json; return 403 '{"name":"Forbidden","data":{"message":"Вызов не разрешён"}}'; }
+    location = /pcbk/api/calc { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
+    location = /pcbk/api/teacher { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
 
     # прочее под /pcbk/api/ — 404 JSON; сюда же попадает /pcbk/api/auth/%2e%2e/… после нормализации
     location /pcbk/api/ {

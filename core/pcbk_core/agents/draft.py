@@ -25,9 +25,10 @@ if TYPE_CHECKING:
     from ..data.catalog import Lookup, TagInfo
 
 TEMPLATE_VERSION = 1
-# инструменты агента студента в Д7; save_agent у агента студента — никогда (Global Constraints Д7)
-AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period")
-_NUMBER_TOOLS = frozenset({"tag_now", "tag_period"})
+# инструменты агента студента; save_agent у агента студента — никогда (Global Constraints Д7). Ряд и наработка Д9а
+# (Д9-R89) — в конце: строки allow и дайджест черновика идут в порядке AGENT_TOOLS, файлы и дайджесты агентов Д7 прежние
+AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
+_NUMBER_TOOLS = frozenset({"tag_now", "tag_period", "tag_series", "calc_runtime"})
 _TOOL_PREFIX = "pcbk_"
 
 NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", re.ASCII)
@@ -106,7 +107,8 @@ PROBLEM_TEXTS: dict[str, str] = {
                  "на стенде запрещены",
     "tools_empty": f"Агенту нужен хотя бы один инструмент: {_TOOLS_LIST}",
     "tool_not_allowed": f"Инструмента «{{v}}» на стенде нет. Можно: {_TOOLS_LIST}.",
-    "tools_useless": "Агенту нужен tag_now или tag_period, а без тегов — ещё catalog_search",
+    "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series или calc_runtime), а без тегов — "
+                     "ещё catalog_search",
     "tags_too_many": f"Тегов не больше {MAX_TAGS}",
     "tag_unknown": "Такого тега нет в каталоге историана",
     "tag_unlisted": "Тег не входит в белый список стенда",

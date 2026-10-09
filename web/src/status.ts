@@ -4,6 +4,7 @@
 // - У общих строк владельца (OWNER_ROWS) warn не считается — только fail и unknown (итоговое ревью Д6а, P1): их
 //   warn — о стенде в целом, а не о чате студента, и держится долго, у всех десяти студентов сразу.
 // - fail из OWNER_FAILS — тоже только владельцу (Д7б, А6): см. константу.
+// - Строка кабинета преподавателя (TEACHER_ROW, Д10-R106, I-3) — только владельцу, кроме одного fail: см. константы.
 // - «Состояние стенда неизвестно — сторож не отвечает» — только когда молчит сама страница: stale, не 200,
 //   не JSON, повисший запрос и молчание дольше stale_after_s по монотонным часам браузера (как status.js
 //   сторожа). Строки в unknown при живом стороже — «Состояние неизвестно: <названия>» (F7).
@@ -40,6 +41,15 @@ const OWNER_ROWS: ReadonlySet<string> = new Set(["gateway", "edge", "memory", "l
 const OWNER_FAILS: ReadonlyMap<string, string> = new Map([
   ["agents", "настройка рабочего места сломана — место не поднимается"],
 ]);
+// Строка «Кабинет преподавателя и доли» (Д10-R96): доли мест и журнал действий преподавателя. Её warn (сумма долей, отказы
+// роли, которые набивают сами студенты, открывая кабинет), unknown (выкладка, первая сверка) и почти все fail (журнал не
+// пишется, прокси считает доли не так, как сохранено) — о кабинете, а не о чате студента: всем десяти студентам это
+// ложная тревога. Студенту видна строка только с одним fail — «доли не загружены»: тогда LLM-прокси закрыт и молчит модель
+// (Д10-R98), студент должен знать почему. У OWNER_FAILS одно значение на строку и сверка словаря целиком
+// (test_web_owner_fails_match_agents_row), поэтому правило — своё. detail — дословно из сторожа (checks.TEACHER_STUDENT_FAIL):
+// сверяет тест сторожа test_web_teacher_student_fail_matches_row.
+export const TEACHER_ROW = "teacher";
+export const TEACHER_STUDENT_FAIL = "доли бюджета не загружены — LLM-прокси закрыт для студентов";
 const STALE_AFTER_S = 30;               // если в ответе нет stale_after_s (как у status.js по умолчанию)
 const SILENT: StatusView = { level: "unknown", text: T_STATUS_UNKNOWN };
 
@@ -64,6 +74,7 @@ export function statusView(data: unknown, ownPlace: string | null): StatusView {
     const level: Level = SEVERITY.includes(row.state as Level) ? row.state as Level : "unknown";
     if (level === "warn" && OWNER_ROWS.has(component)) continue;                      // warn — для владельца
     if (level === "fail" && OWNER_FAILS.get(component) === row.detail) continue;     // одно сломанное место — владельцу
+    if (component === TEACHER_ROW && !(level === "fail" && row.detail === TEACHER_STUDENT_FAIL)) continue;   // кабинет — владельцу
     byLevel[level].push(typeof row.title === "string" && row.title ? row.title : component);
   }
   const worst = SEVERITY.find((l) => l !== "ok" && byLevel[l].length > 0);

@@ -36,7 +36,7 @@ PW = {login: Secret(secrets.token_urlsafe(12)) for login in OWN}
 SAVER = ('---\ndescription: "probe-save"\nmode: primary\npermission:\n  "*": deny\n'
          '  pcbk_save_agent: allow\n  pcbk_tag_now: allow\n---\nprobe\n')
 PCBK2 = {"pcbk_catalog_search", "pcbk_tag_now"}
-PCBK3 = PCBK2 | {"pcbk_tag_period"}                                     # агент по умолчанию места (Д6-R45)
+PCBK5 = PCBK2 | {"pcbk_tag_period", "pcbk_tag_series", "pcbk_calc_runtime"}   # агент места по умолчанию (Д9-R89)
 RELOAD_TICK_S = 2.0                                                     # такт воркера перезагрузки (Д7-R58)
 # строк очереди перезагрузки у мест модуля — изнутри pcbk-core, только чтение: истина об очереди, а не pending
 # /health/agents (тот считает только готовые места)
@@ -147,7 +147,7 @@ def test_service_file_parsed_by_opencode(stack, users):                # Review 
     assert set(req) == set(ctrl)                                          # лишних полей (options) в теле нет
     assert "Правила стенда (добавлены службой" in system_text(req)
     # А4, сомнение 6: места :d6a видят pcbk_save_agent в списке MCP, но у pomoshnik "*": deny — модели его не дают
-    assert tool_names_of(ctrl) - {"invalid"} == PCBK3
+    assert tool_names_of(ctrl) - {"invalid"} == PCBK5
     assert not any("pcbk_save_agent" in tool_names_of(b) for b in turn_bodies(stack, 10, c["session"]))
 
 

@@ -11,10 +11,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from helpers import AGENT_DRAFT, agent_text, make_agents_root, non_root, run_python
+from helpers import AGENT_DRAFT, AGENT_NOW, agent_text, make_agents_root, non_root, run_python
 from pcbk_core.agents import store as store_module
-from pcbk_core.agents.store import (MAX_AGENTS, AgentStore, DirUnavailable, NameTaken, PendingReload, StoreError,
-                                    TooManyAgents, place_of_caller)
+from pcbk_core.agents.draft import MAX_FILE_BYTES
+from pcbk_core.agents.store import (MAX_AGENTS, AgentMissing, AgentStore, DirUnavailable, NameTaken, PendingReload,
+                                    StoreError, TooManyAgents, place_of_caller)
 
 NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
 TEXT = agent_text()
@@ -445,3 +446,64 @@ def test_mark_visible_keeps_quarantined(store, draft):                      # M1
     store.mark_visible(3, ["sushka-bdm2", "davlenie"], NOW + timedelta(seconds=7))
     rows = {r.name: (r.state, r.visible_at) for r in store.list_place(3)}
     assert rows == {"sushka-bdm2": ("quarantined", None), "davlenie": ("visible", "2026-10-07T09:00:07+00:00")}
+
+
+# --- Д10а, задача А3: кабинет преподавателя читает учёт и файлы (Д10-R103, I-9, m-12) ---
+
+def test_cards_read_file_and_live_counts(tmp_path):
+    root = make_agents_root(tmp_path / "agents")
+    s = AgentStore(str(tmp_path / "core.db"), root)
+    assert s.open(), s.last_error
+    other = replace(AGENT_DRAFT, name="sushka-bdm3", title="Сушка БДМ-3")
+    for place, draft in ((3, AGENT_DRAFT), (3, other), (5, AGENT_DRAFT)):
+        assert s.save(place, draft, agent_text(draft, f"student-{place:02d}"), AGENT_NOW) == "saved"
+    s.archive(3, other.name, AGENT_NOW)
+    assert [(c.name, c.node, c.tools, c.tags, c.state) for c in s.cards(3)] == \
+           [(AGENT_DRAFT.name, AGENT_DRAFT.node, list(AGENT_DRAFT.tools), [], "saved")]
+    assert s.live_counts() == {3: 1, 5: 1}
+    assert s.read_file(3, AGENT_DRAFT.name) == agent_text(AGENT_DRAFT, "student-03")
+    for place, name in ((3, other.name), (3, "net-takogo")):               # архивный и неизвестный
+        with pytest.raises(AgentMissing):
+            s.read_file(place, name)
+    f = s.place_dir(5) / f"{AGENT_DRAFT.name}.md"
+    for broken in (b"\xff\xfe" + b"x" * 10, b"x" * (MAX_FILE_BYTES + 1)):  # не UTF-8; больше 16 КиБ
+        f.write_bytes(broken)
+        with pytest.raises(AgentMissing):
+            s.read_file(5, AGENT_DRAFT.name)
+    f.unlink()
+    f.mkdir()                                                                # каталог вместо файла
+    with pytest.raises(AgentMissing):
+        s.read_file(5, AGENT_DRAFT.name)
+    f.rmdir()
+    f.symlink_to(s.place_dir(3) / f"{AGENT_DRAFT.name}.md")                  # ссылка на файл соседа
+    with pytest.raises(AgentMissing):
+        s.read_file(5, AGENT_DRAFT.name)
+    base = s.place_dir(5)                                                    # каталог места — ссылка (m-12)
+    base.rename(tmp_path / "moved")
+    base.symlink_to(tmp_path / "moved")
+    with pytest.raises(DirUnavailable):
+        s.read_file(5, AGENT_DRAFT.name)
+
+
+def test_read_file_odd_marks_and_card_columns(store, draft):              # сверх брифа: odd — только у кривого файла
+    store.save(3, draft, TEXT, NOW)
+    f = store.place_dir(3) / f"{draft.name}.md"
+    f.unlink()                                                              # строка есть, файла нет (как карантин)
+    with pytest.raises(AgentMissing) as e:
+        store.read_file(3, draft.name)
+    assert e.value.odd is False and draft.name not in str(e.value)
+    os.mkfifo(f)                                                            # FIFO не держит чтение
+    with pytest.raises(AgentMissing) as e:
+        store.read_file(3, draft.name)
+    assert e.value.odd is True
+    f.unlink()
+    f.write_bytes(b"x" * MAX_FILE_BYTES)                                    # ровно предел — читается
+    assert store.read_file(3, draft.name) == "x" * MAX_FILE_BYTES
+    for bad in ("Bad_Name", "../x", "x" * 41, 3):                            # имя вне правил — как неизвестное
+        with pytest.raises(AgentMissing):
+            store.read_file(3, bad)
+    with sqlite3.connect(store.db_path) as db:                              # правка мимо службы: столбцы не того вида
+        db.execute("UPDATE agents SET tools = 'не json', tags = '[1, 2]' WHERE place = 3")
+    assert [(c.tools, c.tags, c.created_at, c.visible_at) for c in store.cards(3)] == \
+           [([], [], "2026-10-07T09:00:00+00:00", None)]
+    assert store.cards(4) == [] and store.live_counts() == {3: 1}

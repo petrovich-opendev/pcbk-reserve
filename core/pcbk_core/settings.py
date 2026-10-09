@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 # режимы учений свежести: "" — учений нет
 DRILL_MODES = frozenset({"", "freeze_stamps", "freeze_poll"})
+# учения службы данных (Д9-R83): tool_error — все инструменты чтения отвечают ошибкой без SQL; "" — учений нет
+DRILL_DATA_MODES = frozenset({"", "tool_error"})
 # два запаса ворот по 5 с: при меньшем сроке каталог не загрузится никогда
 MIN_CATALOG_DEADLINE_S = 10.0
 
@@ -26,6 +28,8 @@ class Settings:
     CATALOG_DEADLINE_S: float = 60.0
     # учения: freeze_stamps — метки не растут, freeze_poll — опрос встаёт после первого
     DRILL_FRESHNESS: str = ""
+    # учения службы данных: tool_error — инструменты чтения отвечают ошибкой, SQL не уходит (Д9-R83)
+    DRILL_DATA: str = ""
     # агенты студентов (Д7-R53): ${AGENTS_DIR} хоста на запись; student-NN — каталоги мест (их точки монтирования),
     # quarantine и archive — в корне, вне каталогов мест
     AGENTS_ROOT: str = "/srv/agents"
@@ -62,6 +66,8 @@ class Settings:
         if settings.DRILL_FRESHNESS not in DRILL_MODES:
             raise ValueError(f"DRILL_FRESHNESS: неизвестный режим {settings.DRILL_FRESHNESS!r}, "
                              "допустимо: пусто, freeze_stamps, freeze_poll")
+        if settings.DRILL_DATA not in DRILL_DATA_MODES:
+            raise ValueError(f"DRILL_DATA: неизвестный режим {settings.DRILL_DATA!r}, допустимо: пусто, tool_error")
         return settings
 
 
@@ -73,12 +79,50 @@ DRILL_LLM_MODES = frozenset({"", "402"})
 # (поле, наименьшее, наибольшее) — целые пределы; предел шагов стоит в тексте отказа — не больше 100
 # (OpenCode ищет в тексте 429|500|502|503|504|524)
 _LLM_INT_RANGES = (("LLM_MAX_TOKENS", 1, 16000), ("LLM_TURN_CALLS", 1, 100),
-                   ("LLM_MAX_BODY_BYTES", 65536, 4194304), ("LLM_CALLER_CONCURRENCY", 1, 16))
+                   ("LLM_MAX_BODY_BYTES", 65536, 4194304), ("LLM_CALLER_CONCURRENCY", 1, 16),
+                   # тормоз прогона (Д11-R117), МиБ: порог свободной памяти и роста swap; база swap −1 — от первой проверки
+                   ("LLM_RUN_MEM_FAIL_MIB", 1, 1048576), ("LLM_RUN_SWAP_GROW_MIB", 1, 1048576),
+                   ("LLM_RUN_SWAP_BASE_MIB", -1, 1048576))
 # наименьшее у дробных, кроме «больше нуля»: опрос OpenRouter не чаще раза в 5 с
 _LLM_FLOAT_MIN = {"LLM_POLL_S": 5.0}
+# наибольшее у дробных: давление памяти full avg10 — проценты (Д11-R117)
+_LLM_FLOAT_MAX = {"LLM_RUN_PSI_FULL_MAX": 100.0}
 _LLM_CHOICES = (("LLM_KEY_DEDICATED", LLM_KEY_MODES), ("LLM_STATE", LLM_STATES), ("DRILL_LLM", DRILL_LLM_MODES))
 # пути к файлам секретов роли llm: без проверок, их берёт и запасная настройка при ошибке в LLM_*
 _LLM_FILE_FIELDS = ("OPENROUTER_KEY_FILE", "OPENROUTER_MGMT_KEY_FILE", "LLM_TOKENS_FILE")
+# прогон отбора модели (Д8-R69): id прогона и вызывающие под его потолком; ops — для ботов Д11
+RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
+RUN_CALLER_RE = re.compile(r"student-(0[1-9]|10)|ops")
+
+
+def parse_run_callers(raw: str) -> frozenset[str]:
+    """LLM_RUN_CALLERS (m11): через запятую, пробелы по краям срезаются; каждый — RUN_CALLER_RE, без повторов и
+    пустых. Ошибка — ValueError с именем переменной, без значения (текст идёт в config_error и на страницу)."""
+    items = [item.strip() for item in raw.split(",")]
+    if not all(RUN_CALLER_RE.fullmatch(item) for item in items):
+        raise ValueError("LLM_RUN_CALLERS: только student-01…student-10 и ops")
+    if len(set(items)) != len(items):
+        raise ValueError("LLM_RUN_CALLERS: вызывающий повторяется")
+    return frozenset(items)
+
+
+def run_parts(llm: "LlmSettings") -> tuple[str, float, frozenset[str]] | None:
+    """Прогон отбора (Д8-R69) из настроек: None — прогона нет (все три LLM_RUN_* пусты), иначе (id, потолок,
+    вызывающие). Задаются все три или ни одного; потолок — больше нуля и не больше LLM_TOTAL_USD. Ошибка —
+    ValueError, текст начинается с LLM_RUN_ и значения не содержит. Зовут from_env и ledger.run_spec: настройки
+    тестов строятся replace без from_env, а роль проверяет их сама — закрыто при сомнении."""
+    given = (llm.LLM_RUN_ID != "", llm.LLM_RUN_USD != 0, llm.LLM_RUN_CALLERS != "")
+    if not any(given):
+        return None
+    if not all(given):
+        raise ValueError("LLM_RUN_*: нужны все три переменные или ни одной")
+    if not RUN_ID_RE.fullmatch(llm.LLM_RUN_ID):
+        raise ValueError("LLM_RUN_ID: только a-z, 0-9 и дефис, до 32 знаков")
+    cap = llm.LLM_RUN_USD
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not (
+            math.isfinite(cap) and 0 < cap <= llm.LLM_TOTAL_USD):
+        raise ValueError("LLM_RUN_USD: больше нуля, не больше LLM_TOTAL_USD")
+    return llm.LLM_RUN_ID, float(cap), parse_run_callers(llm.LLM_RUN_CALLERS)
 
 
 @dataclass(frozen=True)
@@ -101,6 +145,19 @@ class LlmSettings:
     LLM_KEY_DEDICATED: str = "on"           # ключ только у резервного контура: сверка с /key
     LLM_STATE: str = "on"                   # stopped — выключатель администратора
     DRILL_LLM: str = ""                     # 402 — учение «кончились деньги» без OpenRouter
+    # прогон отбора модели (Д8-R69): все три или ни одного; потолок — поверх долей и общего бюджета
+    LLM_RUN_ID: str = ""                    # RUN_ID_RE; новый id — новая точка отсчёта
+    LLM_RUN_USD: float = 0.0                # потолок прогона, $: больше нуля и не больше LLM_TOTAL_USD
+    LLM_RUN_CALLERS: str = ""               # места прогона через запятую (RUN_CALLER_RE)
+    # тормоз прогона (Д11-R117, llm/brake.py): работает только при LLM_RUN_*; пороги — у core вложенным умолчанием
+    # compose.yaml (от MEM_FAIL_MIB, SWAP_GROW_WARN_MIB, PSI_FULL_MAX сторожа), пути — только двойники стенда
+    LLM_RUN_MEM_FAIL_MIB: int = 1024        # свободно меньше — причина memory
+    LLM_RUN_SWAP_GROW_MIB: int = 512        # swap вырос от базы или за 10 мин на столько — причина swap
+    LLM_RUN_SWAP_BASE_MIB: int = -1         # база swap прогона, МиБ; −1 — первая проверка (хранится в llm_meta)
+    LLM_RUN_PSI_FULL_MAX: float = 10.0      # давление full avg10 выше, % — причина psi
+    LLM_RUN_MEMINFO: str = "/proc/meminfo"
+    LLM_RUN_VMSTAT: str = "/proc/vmstat"
+    LLM_RUN_PRESSURE: str = "/proc/pressure/memory"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "LlmSettings":
@@ -128,9 +185,12 @@ class LlmSettings:
             except ValueError:
                 raise ValueError(f"{f.name}: не {'целое ' if kind is int else ''}число") from None
             if kind is float:
-                low = _LLM_FLOAT_MIN.get(f.name)
-                if not (math.isfinite(value) and value > 0 and (low is None or value >= low)):
+                low, high = _LLM_FLOAT_MIN.get(f.name), _LLM_FLOAT_MAX.get(f.name)
+                if not (math.isfinite(value) and value > 0 and (low is None or value >= low)
+                        and (high is None or value <= high)):
                     need = "больше нуля" if low is None else f"не меньше {low:g}"
+                    if high is not None:
+                        need += f" и не больше {high:g}"
                     raise ValueError(f"{f.name}: нужно число {need}")
             values[f.name] = value
         llm = cls(**values)
@@ -146,6 +206,7 @@ class LlmSettings:
             select_models(llm.LLM_MODELS)
         except ValueError as exc:           # «LLM_MODELS: неизвестная модель «имя»» — имя не повторяется
             raise ValueError(re.sub(r"«[^»]*»", "«…»", str(exc))) from None
+        run_parts(llm)                      # LLM_RUN_*: все три или ни одного (Д8-R69)
         return llm
 
     @classmethod
@@ -162,6 +223,10 @@ class LlmSettings:
 DRILL_GATEWAY_MODES = frozenset({"", "freeze_reaper", "bad_place_pw"})
 # учения агентов студентов (Д7-R53, Д7-R58): freeze_reload — воркер перезагрузки замирает после первого прохода
 DRILL_AGENTS_MODES = frozenset({"", "freeze_reload"})
+# учения кабинета преподавателя (Д10-R96): shares_stale — перевод доли пишет диск и журнал действий, а память LLM-прокси
+# не обновляет; journal_down — любая запись журнала действий (и пульс) падает до SQL. Поле GatewaySettings, а не Settings
+# (m-7): опечатка — config_error шлюза при живом процессе, а не падение всего core
+DRILL_TEACHER_MODES = frozenset({"", "shares_stale", "journal_down"})
 _GW_ORIGIN = re.compile(r"https://[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::(?P<port>[1-9][0-9]{0,4}))?")
 _OCTET = r"(0|[1-9][0-9]{0,2})"
 _STU_NET = re.compile(_OCTET + r"\." + _OCTET)
@@ -227,6 +292,12 @@ def _drill_agents(raw: str) -> str:
     return raw
 
 
+def _drill_teacher(raw: str) -> str:
+    if raw not in DRILL_TEACHER_MODES:
+        raise ValueError("DRILL_TEACHER: пусто, shares_stale или journal_down")
+    return raw
+
+
 # проверка каждого поля по отдельности: значение из env → значение поля или ValueError (имя и правило)
 _GW_FIELD_CHECKS: dict[str, Callable[[str], object]] = {
     "GW_ORIGIN": _gw_origin,
@@ -240,6 +311,7 @@ _GW_FIELD_CHECKS: dict[str, Callable[[str], object]] = {
     "DRILL_GATEWAY": _drill_gateway,
     "GW_MAX_BODY_BYTES": _gw_max_body,
     "DRILL_AGENTS": _drill_agents,
+    "DRILL_TEACHER": _drill_teacher,
 }
 
 
@@ -258,6 +330,7 @@ class GatewaySettings:
     DRILL_GATEWAY: str = ""                   # учения: freeze_reaper, bad_place_pw
     GW_MAX_BODY_BYTES: int = 524288           # предел тела /pcbk/api/oc/ (Д5-R36; у edge — client_max_body_size 512k)
     DRILL_AGENTS: str = ""                    # учения агентов студентов (Д7а): freeze_reload
+    DRILL_TEACHER: str = ""                   # учения кабинета преподавателя (Д10а): shares_stale, journal_down
 
     @classmethod
     def _parse(cls, env: Mapping[str, str] | None) -> tuple[dict[str, object], list[str]]:

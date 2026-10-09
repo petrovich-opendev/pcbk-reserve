@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from helpers import BIG_TAGS, agent_catalog
-from pcbk_core.agents.draft import (AGENT_TOOLS, FORBIDDEN, MAX_FILE_BYTES, MAX_TAGS, NAME_RE, PROMPT_MAX,
-                                    PROMPT_MAX_BYTES, RESERVED_NAMES, Problem, check_draft, draft_digest,
+from helpers import AGENT_DRAFT, BIG_TAGS, agent_catalog, agent_text
+from pcbk_core.agents.draft import (AGENT_TOOLS, FORBIDDEN, MAX_FILE_BYTES, MAX_TAGS, NAME_RE, PROBLEM_TEXTS,
+                                    PROMPT_MAX, PROMPT_MAX_BYTES, RESERVED_NAMES, Problem, check_draft, draft_digest,
                                     render_agent_file)
 from pcbk_core.data.catalog import TagInfo
 from pcbk_core.data.sql import SAFE_NAME
@@ -355,3 +355,36 @@ def test_forbidden_only_within_limit():                                 # I1: с
     assert codes({**OK, "title": "Сушка" + " " * 60 + "{env:X}"}) == {("title", "text_field")}
     assert codes({**OK, "prompt": "п" * 4000 + " http://x"}) == {("prompt", "prompt_length")}
     assert codes({**OK, "title": "Сушка {env:X}" + "ж" * 60}) == {("title", "text_field"), ("title", "forbidden")}
+
+
+# --- Д9а, А6: ряд и наработка в инструментах агента (Д9-R89) ---
+
+# draft_digest(AGENT_DRAFT) на голове 35ebd60, до правки AGENT_TOOLS: новые имена — в конец, дайджесты Д7 прежние (I-1)
+AGENT_DRAFT_DIGEST_D7 = "10db742d614cc3ce32a8fddb265e26db065b4169295e0559b60e04a0793fb60c"
+# сверх брифа: дайджест черновика check_draft со всеми тремя инструментами Д7 в обратном порядке — там же, до правки.
+# Порядок tools в Draft задаёт AGENT_TOOLS; AGENT_DRAFT собран вручную и его не видит
+CHECKED_DIGEST_D7 = "cf436d9510f82c15ac3aeffdde5b748e64070fcfe3143b93f5f0e928c3d743bf"
+
+
+def test_agent_tools_d9():                                                        # Review Focus 5
+    assert AGENT_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
+    for tools in (["tag_series"], ["calc_runtime"], ["pcbk_calc_runtime", "catalog_search"]):
+        draft, problems = check_draft({**OK, "tools": tools}, CAT.lookup)
+        assert problems == [] and draft is not None, tools
+    assert check_draft({**OK, "tools": ["calc_runtime", "tag_now"]}, CAT.lookup)[0].tools == ("tag_now", "calc_runtime")
+    assert codes({**OK, "tools": ["catalog_search"]}) == {("tools", "tools_useless")}
+    assert PROBLEM_TEXTS["tools_useless"] == ("Агенту нужен инструмент чисел (tag_now, tag_period, tag_series или "
+                                              "calc_runtime), а без тегов — ещё catalog_search")
+
+
+def test_render_new_tools_permission_order():
+    text = agent_text(replace(AGENT_DRAFT, tools=("tag_now", "tag_series", "calc_runtime")))
+    assert text.splitlines()[7:11] == ['  "*": deny', "  pcbk_tag_now: allow", "  pcbk_tag_series: allow",
+                                       "  pcbk_calc_runtime: allow"]
+
+
+def test_agent_digest_d7_unchanged():                                             # дайджест агентов Д7 — прежний (I-1)
+    # файл Д7 охраняет test_render_golden; здесь — дайджест, его считает порядок AGENT_TOOLS
+    assert draft_digest(AGENT_DRAFT) == AGENT_DRAFT_DIGEST_D7
+    d7, _ = check_draft({**OK, "tools": ["tag_period", "tag_now", "catalog_search"]}, CAT.lookup)
+    assert draft_digest(d7) == CHECKED_DIGEST_D7

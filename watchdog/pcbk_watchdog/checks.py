@@ -1,5 +1,5 @@
 """Чистые функции проверок сторожа: память, контейнеры, HTTP, сертификат, свежесть историана,
-LLM-прокси и бюджет, шлюз и вход, веб-чат, агенты студентов."""
+LLM-прокси и бюджет, шлюз и вход, веб-чат, агенты студентов, кабинет преподавателя и доли."""
 import http.client
 import io
 import json
@@ -15,6 +15,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from typing import Literal
 from urllib.parse import urljoin, urlsplit
 
+from .memory import MEM_DRILL_NOTE, MemHistory, memory_verdict, parse_sample
+
 State = Literal["ok", "warn", "fail", "absent", "unknown"]
 
 # запуск моложе этого считается свежим перезапуском
@@ -23,6 +25,8 @@ RECENT_RESTART = timedelta(minutes=15)
 CRASH_LOOP_RESTARTS = 3
 # текст постоянный: с числом перезапусков журнал писал бы событие на каждый
 CRASH_LOOP_DETAIL = "падает в цикле (перезапуски подряд)"
+# причина перезапуска контейнера (Д11-R115, memory.RestartReasons): oom — убит по памяти, crash — сбой не по памяти
+RESTART_REASON_TEXTS = {"oom": "убит по памяти", "crash": "сбой не по памяти"}
 # проверка здоровья места: интервал 30 с + срок 5 с с запасом
 HEALTH_SILENCE = timedelta(minutes=2)
 HEALTH_SILENT_DETAIL = "проверка здоровья молчит"
@@ -68,6 +72,13 @@ USER_PAUSED_DETAIL = "запросы людей к историану на па�
 # порог — из SLOW_P95_MS: при его смене текст не соврёт (5000 → «5 с», 5500 → «5,5 с»)
 SLOW_P95_DETAIL = f"историан отвечает медленно: p95 больше {format(SLOW_P95_MS / 1000, 'g').replace('.', ',')} с"
 TOOL_ERRORS_DETAIL = "инструменты отвечают ошибкой"
+# серия ошибок по инструменту (Д9-R83): необязательное поле tools.failing службы Д9а — имена в note
+TOOL_FAILING_DETAIL = "инструменты службы данных отвечают ошибкой подряд"
+FAILING_MAX = 8
+TOOL_NAME_RE = re.compile(r"[a-z_]{1,32}")
+# учение службы данных (необязательное поле drill): дописывается к note строки любого состояния
+DATA_DRILL_MODES = frozenset({"tool_error"})
+DRILL_NOTE = "учения: tool_error"
 
 # строка «LLM-прокси и бюджет» (задача 7 Д4а)
 LLM_DOWN_DETAIL = "LLM-прокси не отвечает"
@@ -96,6 +107,26 @@ USD_NOISE = 1e-9
 USD_TINY = Decimal("0.0001")
 # что пишет core в ledger_error (задача 6 Д4а): dropped — операция журнала брошена, write — запись не идёт
 LEDGER_ERRORS = frozenset({"dropped", "write"})
+# прогон отбора модели (Д8-R69): блок run ответа /health/llm — null или ровно эти ключи; id — как LLM_RUN_ID core
+RUN_KEYS = frozenset({"id", "cap_usd", "spent_usd", "callers", "calls_10m", "idle_s"})
+RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
+# к модели прогона не обращались дольше этого, с — «прогон отбора молчит» (умолчание Settings.LLM_RUN_SILENT_S)
+LLM_RUN_SILENT_S = 300
+RUN_CAP_DETAIL = "потолок прогона отбора исчерпан — вызовы прогона получают отказ"
+RUN_SILENT_DETAIL = "прогон отбора молчит — к модели давно никто не обращался"
+# потолок прогона меньше этого, $, или не целый — в note с центами ($5.00, $80.50), иначе целым, как бюджет ($80)
+RUN_CAP_CENTS_BELOW_USD = 10.0
+# тормоз прогона в core (Д11-R117, R118): блок run_brake ответа /health/llm — null (прогона нет; ключа нет — core старше
+# Д11) или ровно эти ключи (llm/brake.py BRAKE_KEYS core); причины — коды BRAKE_REASONS core
+BRAKE_KEYS = frozenset({"state", "reason", "avail_mib", "total_mib", "fail_mib", "swap_base_mib", "swap_growth_mib",
+                        "swap_grow_mib", "psi_full10", "psi_full_max", "oom_kills", "age_s", "halted_at"})
+BRAKE_STATES = frozenset({"watching", "halted"})
+BRAKE_REASON_WORDS = {"memory": "мало памяти", "swap": "растёт swap", "psi": "давление", "oom": "убийство по памяти",
+                      "blind": "память не читается"}
+# тормоз не проверял память дольше этого, с, — «молчит» (опрос core — 5 с: шесть пропусков подряд)
+RUN_BRAKE_SILENT_S = 30
+RUN_HALT_DETAIL = "прогон остановлен тормозом памяти — вызовы прогона получают отказ"
+RUN_BRAKE_SILENT_DETAIL = "тормоз прогона по памяти молчит — прогон без защиты"
 
 # строка «Шлюз и вход» (задача А1 Д5а, Д5-R29); счётчики /health/gateway — за час в памяти core
 GW_DOWN_DETAIL = "шлюз не отвечает"
@@ -150,6 +181,46 @@ AGENTS_DELAYED_S = 900
 # столько отказов save_agent за час без единого сохранения — «внимание»
 AGENTS_REFUSED_WARN = 6
 
+# строка «Кабинет преподавателя и доли» (задача А1 Д10а, Д10-R96): ответ /health/teacher core — ровно эти 13 ключей,
+# только числа и флаги; drill — "" или режим DRILL_TEACHER. Одна строка на две вещи — доли мест и журнал действий
+# преподавателя; ключи раздельные: понадобятся две строки — делится без переделки договора
+TEACHER_KEYS = frozenset({"checked_at", "shares_loaded", "shares_ok", "shares_drift", "shares_sum_usd", "total_usd",
+                          "store_ok", "reads_1h", "read_failed_1h", "changes_1h", "change_failed_1h", "role_refused_1h",
+                          "drill"})
+TEACHER_DRILL_MODES = frozenset({"shares_stale", "journal_down"})
+# мест в стенде: shares_drift — число мест с расхождением, больше — не по договору (длина note ограничена)
+TEACHER_PLACES = 10
+TEACHER_DOWN_DETAIL = "кабинет преподавателя не отвечает"
+TEACHER_NOT_DEPLOYED_DETAIL = "кабинет преподавателя ещё не выложен"   # 404: core старше сторожа (выкладка)
+TEACHER_OFF_CONTRACT_DETAIL = "кабинет преподавателя ответил не по договору"
+# единственный detail строки, который видит баннер чата студентов (Д10-R106): ему нужно знать, почему молчит модель.
+# web/src/status.ts держит его дословно (TEACHER_STUDENT_FAIL) — сверяет тест сторожа
+TEACHER_STUDENT_FAIL = "доли бюджета не загружены — LLM-прокси закрыт для студентов"
+# тексты строк таблицы вердикта R96 по порядку (1–11)
+TEACHER_JOURNAL_DOWN_DETAIL = "журнал действий преподавателя не пишется — кабинет закрыт"
+TEACHER_NOT_CHECKED_DETAIL = "сверка долей ещё не проходила"
+TEACHER_SHARES_UNREAD_DETAIL = "сверка долей не прочла таблицу — расхождение не видно"
+TEACHER_DRIFT_DETAIL = "LLM-прокси считает доли не так, как сохранено"
+TEACHER_SILENT_DETAIL = "сверка долей молчит"
+TEACHER_OVER_TOTAL_DETAIL = "сумма долей мест больше общего бюджета — держит общий бюджет"
+TEACHER_CHANGES_DETAIL = "изменения преподавателя не проходят"
+TEACHER_READS_DETAIL = "разговоры студентов не читаются"
+TEACHER_ROLE_DETAIL = "кабинет преподавателя открывают без роли преподавателя"
+TEACHER_OK_DETAIL = "доли сходятся, журнал действий пишется"
+# все тексты detail строки — для проверки длины и постоянства (правило журнала Д1)
+TEACHER_DETAILS = (TEACHER_JOURNAL_DOWN_DETAIL, TEACHER_NOT_CHECKED_DETAIL, TEACHER_STUDENT_FAIL,
+                   TEACHER_SHARES_UNREAD_DETAIL, TEACHER_DRIFT_DETAIL, TEACHER_SILENT_DETAIL, TEACHER_OVER_TOTAL_DETAIL,
+                   TEACHER_CHANGES_DETAIL, TEACHER_READS_DETAIL, TEACHER_ROLE_DETAIL, TEACHER_OK_DETAIL,
+                   TEACHER_DOWN_DETAIL, TEACHER_NOT_DEPLOYED_DETAIL, TEACHER_OFF_CONTRACT_DETAIL)
+# сумма долей больше общего бюджета больше чем на полцента — «внимание» (доли — целые центы, бюджет — доллары)
+TEACHER_SUM_SLACK_USD = 0.005
+# столько неудачных изменений за час без единого удачного — «внимание»
+TEACHER_CHANGE_FAILS_WARN = 3
+# столько неудачных чтений за час — «внимание»
+TEACHER_READ_FAILS_WARN = 3
+# столько обращений к кабинету не-преподавателя за час — «внимание»
+TEACHER_ROLE_REFUSED_WARN = 10
+
 
 @dataclass(frozen=True)
 class Check:
@@ -166,33 +237,33 @@ def not_installed(component: str, title: str) -> Check:
     return Check(component, title, "absent", "ещё не установлен")
 
 
-def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024) -> Check:
-    """Свободная память по полю MemAvailable из /proc/meminfo."""
-    title = "Память сервера"
-    for line in meminfo.splitlines():
-        key, _, value = line.partition(":")
-        if key.strip() == "MemAvailable":
-            mib = int(value.split()[0]) // 1024
-            break
-    else:
-        return Check("memory", title, "unknown", "нет данных о свободной памяти")
-    # в warn/fail текст постоянный: иначе журнал пишет событие каждый такт
-    if mib < fail_mib:
-        return Check("memory", title, "fail", f"свободно меньше {fail_mib} МиБ")
-    if mib < warn_mib:
-        return Check("memory", title, "warn", f"свободно меньше {warn_mib} МиБ")
-    return Check("memory", title, "ok", f"свободно {mib} МиБ")
+def check_memory(meminfo: str, warn_mib: int = 2048, fail_mib: int = 1024, vmstat: str = "", pressure: str = "",
+                 swap_grow_warn_mib: int = 512, psi_full_max: float = 10.0) -> Check:
+    """«Память сервера» по одному замеру — memory_verdict на пустой истории (Д11-R114).
+
+    Пороги и тексты Д1 и числа note; роста swap, удержания давления и убийств вне мест у одного замера нет — их
+    видит история тактов (main.MemState). В warn/fail текст постоянный: иначе журнал пишет событие каждый такт.
+    """
+    now = datetime.now(timezone.utc)
+    sample = parse_sample(meminfo, vmstat, pressure)
+    history = MemHistory()
+    history.observe(now, sample)
+    state, detail, note = memory_verdict(sample, history, now, warn_mib, fail_mib, swap_grow_warn_mib, psi_full_max)
+    return Check("memory", "Память сервера", state, detail, note)
 
 
 def check_container(component: str, title: str, inspect: dict | None, *,
-                    sleeping_ok: bool, now: datetime, unhealthy_detail: str = UNHEALTHY_DETAIL) -> Check:
+                    sleeping_ok: bool, now: datetime, unhealthy_detail: str = UNHEALTHY_DETAIL,
+                    restart_reason: str | None = None, last_reason: str | None = None) -> Check:
     """Вердикт по inspect Docker; порядок правил — таблица задачи 1 Д1, задачи 2 Д2 и задачи 3 Д4б.
 
     unhealthy_detail — текст строки при Health.Status unhealthy: по умолчанию — про OpenCode места,
     у контейнеров с другой проверкой здоровья (core) — свой из components.json.
+    restart_reason — причина перезапуска с этим StartedAt (Д11-R115): «oom» или «crash», None — неизвестна (текст
+    Д2); last_reason — последняя известная причина, в note строки «падает в цикле».
     """
-    def result(state: State, detail: str) -> Check:
-        return Check(component, title, state, detail)
+    def result(state: State, detail: str, note: str = "") -> Check:
+        return Check(component, title, state, detail, note)
 
     if inspect is None:
         return result("fail", "нет контейнера")
@@ -205,7 +276,8 @@ def check_container(component: str, title: str, inspect: dict | None, *,
         return result("fail", "приостановлен")
     if st["Running"] or st["Restarting"]:
         if restarts >= CRASH_LOOP_RESTARTS and recent:
-            return result("fail", CRASH_LOOP_DETAIL)
+            last = RESTART_REASON_TEXTS.get(last_reason or "")
+            return result("fail", CRASH_LOOP_DETAIL, f"последний — {last}" if last else "")
         if st["Restarting"]:
             return result("warn", "перезапускается")
         health = st.get("Health")
@@ -223,6 +295,9 @@ def check_container(component: str, title: str, inspect: dict | None, *,
         if restarts > 0 and recent:
             # время — в поясе now и с явным смещением
             at = started.astimezone(now.tzinfo).strftime("%H:%M UTC%:z")
+            why = RESTART_REASON_TEXTS.get(restart_reason or "")
+            if why:
+                return result("warn", f"перезапущен: {why} в {at} ({restarts} с последнего запуска)")
             return result("warn", f"перезапущен после сбоя в {at} ({restarts} с последнего запуска)")
         if restarts > 0:
             return result("ok", f"работает, сбоев с последнего запуска: {restarts}")
@@ -367,11 +442,28 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
-    """Строки нагрузки историана (задача 1 Д4б): пауза людей, медленный p95, ошибки инструментов.
+def _failing(tools: dict) -> list[str] | None:
+    """tools.failing (Д9-R83): нет ключа — None (служба старше Д9а); иначе список не длиннее FAILING_MAX из имён
+    TOOL_NAME_RE — или TypeError/ValueError (ответ не по договору)."""
+    if "failing" not in tools:
+        return None
+    failing = tools["failing"]
+    if not isinstance(failing, list):
+        raise TypeError("tools.failing — не список")
+    if len(failing) > FAILING_MAX:
+        raise ValueError(f"tools.failing: больше {FAILING_MAX} имён")
+    if not all(isinstance(name, str) and TOOL_NAME_RE.fullmatch(name) for name in failing):
+        raise ValueError("tools.failing: не имя инструмента")
+    return failing
 
-    Нет ключа tools или новых полей gate (служба :d4a) — строка не срабатывает; поле не того вида —
-    TypeError или ValueError (ответ не по договору). «k из N» — в note: detail постоянный.
+
+def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
+    """Строки нагрузки историана (задача 1 Д4б): пауза людей, медленный p95, ошибки инструментов; после доли
+    ошибок — серия ошибок по инструменту (Д9-R83).
+
+    Нет ключа tools или новых полей gate (служба :d4a), нет tools.failing (служба старше Д9а) — строка не
+    срабатывает; поле не того вида — TypeError или ValueError (ответ не по договору). «k из N» и имена
+    инструментов — в note: detail постоянный.
     """
     gate = reply.get("gate")
     if gate is not None:
@@ -394,20 +486,43 @@ def _load_verdict(reply: dict) -> tuple[State, str, str] | None:
         recent, errors = _count(tools, "recent"), _count(tools, "errors")
         if not 0 <= errors <= recent:
             raise ValueError("tools: число ошибок вне 0…recent")
+        failing = _failing(tools)           # вид — до вердикта доли: поле не по договору не прячется за долей
         if recent >= TOOL_ERRORS_MIN_CALLS and errors / recent >= TOOL_ERRORS_SHARE:
             return "warn", TOOL_ERRORS_DETAIL, f"{errors} из {recent}"
+        if failing:
+            return "warn", TOOL_FAILING_DETAIL, ", ".join(failing)
     return None
+
+
+def _drill(reply: dict) -> bool:
+    """Поле drill (Д9-R83): нет, null или пусто — учений нет; иначе только "tool_error", прочее — ValueError."""
+    drill = reply.get("drill")
+    if drill is None or drill == "":
+        return False
+    if not isinstance(drill, str) or drill not in DATA_DRILL_MODES:
+        raise ValueError("drill — неизвестное учение")
+    return True
 
 
 def historian_verdict(reply, now: datetime, warn_s: int, fail_s: int,
                       stale_s: int) -> tuple[State, str, str]:
     """Вердикт по ответу /health/historian: (состояние, detail, note); первая подходящая строка таблицы
-    задачи 6 Д3а со строками нагрузки задачи 1 Д4б перед каталогом.
+    задачи 6 Д3а со строками нагрузки задачи 1 Д4б перед каталогом. Под учением службы данных (drill) к note
+    строки любого состояния дописывается DRILL_NOTE через «; »: забытое учение видно на странице.
 
     Ответ не по договору — ValueError, TypeError, KeyError или OverflowError.
     """
     if not isinstance(reply, dict):
         raise TypeError("ответ — не объект JSON")
+    drill = _drill(reply)
+    state, detail, note = _historian_row(reply, now, warn_s, fail_s, stale_s)
+    if drill:
+        note = f"{note}; {DRILL_NOTE}" if note else DRILL_NOTE
+    return state, detail, note
+
+
+def _historian_row(reply: dict, now: datetime, warn_s: int, fail_s: int, stale_s: int) -> tuple[State, str, str]:
+    """Строка таблицы без учения; reply — уже объект JSON."""
     checked_raw = reply["checked_at"]
     if checked_raw is None:
         return "unknown", "служба ещё не опрашивала историан", ""
@@ -535,8 +650,91 @@ def _part(obj, key: str) -> dict:
 
 
 @dataclass(frozen=True)
+class RunInfo:
+    """Блок run ответа /health/llm (Д8-R69): прогон отбора модели — потолок, расход, вызовы за 10 мин, тишина."""
+    id: str
+    cap_usd: float
+    spent_usd: float
+    callers: int
+    calls_10m: int
+    idle_s: float
+
+    @classmethod
+    def parse(cls, obj) -> "RunInfo | None":
+        """null — прогона нет; объект — ровно RUN_KEYS, числа не меньше нуля, потолок больше нуля; иначе
+        ValueError, TypeError или KeyError."""
+        if obj is None:
+            return None
+        if not isinstance(obj, dict):
+            raise TypeError("run — не объект JSON")
+        if set(obj) != RUN_KEYS:
+            raise ValueError("run: ключи не по договору")
+        run = cls(id=_text(obj, "id"), cap_usd=_usd(obj, "cap_usd"), spent_usd=_usd(obj, "spent_usd"),
+                  callers=_count(obj, "callers"), calls_10m=_count(obj, "calls_10m"), idle_s=_usd(obj, "idle_s"))
+        if not RUN_ID_RE.fullmatch(run.id):
+            raise ValueError("run: id не по договору")
+        if min(run.spent_usd, run.callers, run.calls_10m, run.idle_s) < 0:
+            raise ValueError("run: число меньше нуля")
+        if run.cap_usd <= 0:
+            raise ValueError("run: потолок не больше нуля")
+        return run
+
+
+@dataclass(frozen=True)
+class BrakeInfo:
+    """Блок run_brake ответа /health/llm (Д11-R117): тормоз прогона в core — состояние, причина, замер и пороги. Замер
+    до первой проверки (и у молчащего датчика) — None."""
+    state: str
+    reason: str | None
+    avail_mib: int | None
+    total_mib: int | None
+    fail_mib: int
+    swap_base_mib: int | None
+    swap_growth_mib: int | None
+    swap_grow_mib: int
+    psi_full10: float | None
+    psi_full_max: float
+    oom_kills: int | None
+    age_s: float
+    halted_at: datetime | None
+
+    @classmethod
+    def parse(cls, obj) -> "BrakeInfo | None":
+        """null — прогона нет; объект — ровно BRAKE_KEYS, state и reason — из своих наборов и согласованы (halted ⇔
+        причина ⇔ время защёлки), числа не меньше нуля, пороги больше нуля; иначе ValueError, TypeError или KeyError."""
+        if obj is None:
+            return None
+        if not isinstance(obj, dict):
+            raise TypeError("run_brake — не объект JSON")
+        if set(obj) != BRAKE_KEYS:
+            raise ValueError("run_brake: ключи не по договору")
+
+        def count(key: str) -> int | None:
+            return None if obj[key] is None else _count(obj, key)
+
+        b = cls(state=_text(obj, "state"), reason=_text(obj, "reason", nullable=True), avail_mib=count("avail_mib"),
+                total_mib=count("total_mib"), fail_mib=_count(obj, "fail_mib"), swap_base_mib=count("swap_base_mib"),
+                swap_growth_mib=count("swap_growth_mib"), swap_grow_mib=_count(obj, "swap_grow_mib"),
+                psi_full10=_usd(obj, "psi_full10", nullable=True), psi_full_max=_usd(obj, "psi_full_max"),
+                oom_kills=count("oom_kills"), age_s=_usd(obj, "age_s"), halted_at=_time(obj, "halted_at"))
+        if b.state not in BRAKE_STATES:
+            raise ValueError("run_brake: неизвестное состояние")
+        if b.reason is not None and b.reason not in BRAKE_REASON_WORDS:
+            raise ValueError("run_brake: неизвестная причина")
+        if (b.state == "halted") != (b.reason is not None) or (b.reason is None) != (b.halted_at is None):
+            raise ValueError("run_brake: состояние, причина и время защёлки не согласованы")
+        numbers = (b.avail_mib, b.total_mib, b.swap_base_mib, b.swap_growth_mib, b.psi_full10, b.oom_kills, b.age_s)
+        if any(v is not None and v < 0 for v in numbers):
+            raise ValueError("run_brake: число меньше нуля")
+        if min(b.fail_mib, b.swap_grow_mib, b.psi_full_max) <= 0:
+            raise ValueError("run_brake: порог не больше нуля")
+        return b
+
+
+@dataclass(frozen=True)
 class LlmReply:
-    """Поля ответа /health/llm, которые читает сторож; типы проверены при разборе."""
+    """Поля ответа /health/llm, которые читает сторож; типы проверены при разборе. run — прогон отбора (Д8а):
+    ключа нет (core старше сторожа во время выкладки) или null — None. run_brake — тормоз прогона (Д11а), так же."""
     checked_at: datetime | None
     stopped: bool
     config_error: str | None
@@ -565,6 +763,8 @@ class LlmReply:
     egress_alive: bool | None
     egress_last_ok_age_s: float | None
     refresh_started_age_s: float | None
+    run: RunInfo | None = None
+    run_brake: BrakeInfo | None = None
 
     @classmethod
     def parse(cls, reply) -> "LlmReply":
@@ -590,7 +790,8 @@ class LlmReply:
             account_remaining_usd=_usd(reply, "account_remaining_usd", nullable=True),
             egress_alive=_flag(egress, "alive", nullable=True),
             egress_last_ok_age_s=_usd(egress, "last_ok_age_s", nullable=True),
-            refresh_started_age_s=_usd(reply, "refresh_started_age_s", nullable=True))
+            refresh_started_age_s=_usd(reply, "refresh_started_age_s", nullable=True),
+            run=RunInfo.parse(reply.get("run")), run_brake=BrakeInfo.parse(reply.get("run_brake")))
         if r.upstream_state not in UPSTREAM_STATES:
             raise ValueError("неизвестное состояние OpenRouter")
         if not r.upstream_text.strip():
@@ -618,6 +819,13 @@ def llm_note(r: LlmReply) -> str:
         parts.append(f"по ключу OpenRouter {fmt_usd(r.key_spent_usd)}")
     if r.ops_usd > 0:
         parts.append(f"отбор и проверки {fmt_usd(r.ops_usd)}")
+    if r.run is not None:
+        run = r.run
+        whole = run.cap_usd >= RUN_CAP_CENTS_BELOW_USD and float(run.cap_usd).is_integer()
+        cap = fmt_total(run.cap_usd) if whole else fmt_usd(run.cap_usd)   # 80.50 — «из $80.50», не «из $80»
+        # округление расхода не переходит потолка: «$80.00 из $80» — только при исчерпанном потолке
+        parts.append(f"прогон {run.id}: {fmt_usd(run.spent_usd, keep=(run.cap_usd,))} из {cap}, "
+                     f"вызовов за 10 мин: {run.calls_10m}")
     if r.over_80 > 0:
         parts.append(f"доля больше 80 %: {r.over_80}")
     if r.shares_spent > 0:
@@ -628,14 +836,37 @@ def llm_note(r: LlmReply) -> str:
         parts.append("остаток счёта не виден")   # /credits не ответил; rejected — своя строка detail
     if r.drill:
         parts.append(f"учения DRILL_LLM={r.drill}")
+    if r.run_brake is not None:
+        parts.extend(_brake_note(r.run_brake))
     return " · ".join(parts)
 
 
-def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
-    """Первая подходящая строка таблицы задачи 7 Д4а: сбои, «неизвестно», деньги мимо учёта
-    и провайдер, полосы бюджета — последними, чтобы полоса после $500 не прятала остальное.
+def _brake_note(b: BrakeInfo) -> list[str]:
+    """Части note о тормозе прогона (Д11-R118): числа замера и пороги, причина словами; порог выше всей памяти —
+    пометка учений (последней частью). Число без данных — «нет данных»."""
+    def pct(x: float) -> str:
+        return f"{round(x, 2):g}"
 
-    В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
+    avail = "свободно: нет данных" if b.avail_mib is None else f"свободно {b.avail_mib} МиБ"
+    swap = "swap: нет данных" if b.swap_growth_mib is None else f"swap +{b.swap_growth_mib} МиБ от базы"
+    psi = "давление: нет данных" if b.psi_full10 is None else f"давление {pct(b.psi_full10)} %"
+    kills = "убийств: нет данных" if b.oom_kills is None else f"убийств {b.oom_kills}"
+    text = (f"тормоз: {avail} (порог {b.fail_mib}), {swap} (порог {b.swap_grow_mib}), {psi} (порог "
+            f"{pct(b.psi_full_max)}), {kills}")
+    if b.reason is not None:
+        text += f" — остановлен: {BRAKE_REASON_WORDS[b.reason]}"
+    parts = [text]
+    if b.total_mib is not None and b.fail_mib > b.total_mib:
+        parts.append(MEM_DRILL_NOTE)
+    return parts
+
+
+def llm_verdict(r: LlmReply, now: datetime, run_silent_s: float = LLM_RUN_SILENT_S) -> tuple[State, str]:
+    """Первая подходящая строка таблицы задачи 7 Д4а: сбои, «неизвестно», прогон отбора (Д8-R69), деньги мимо
+    учёта и провайдер, полосы бюджета — последними, чтобы полоса после $500 не прятала остальное.
+
+    Строки прогона — после fail и unknown (учения 402 и сбой OpenRouter их перекрывают), до errors: защёлка тормоза
+    прогона и его молчание дольше RUN_BRAKE_SILENT_S (Д11-R118), исчерпанный потолок, затем тишина дольше run_silent_s. В warn/fail текст постоянный — числа идут в note (правило журнала Д1).
     """
     upstream_text = _reason(r.upstream_text)
     if r.stopped:
@@ -666,6 +897,16 @@ def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
         return "unknown", "OpenRouter ещё ни разу не ответил на опрос"
     if (now - r.checked_at).total_seconds() > LLM_STALE_S:
         return "unknown", "LLM-прокси давно не опрашивал OpenRouter"
+    if r.run_brake is not None:                 # тормоз прогона (Д11-R118) — раньше потолка и тишины прогона
+        if r.run_brake.state == "halted":
+            return "warn", RUN_HALT_DETAIL
+        if r.run_brake.age_s > RUN_BRAKE_SILENT_S:
+            return "warn", RUN_BRAKE_SILENT_DETAIL
+    if r.run is not None:
+        if r.run.spent_usd >= r.run.cap_usd:
+            return "warn", RUN_CAP_DETAIL
+        if r.run.idle_s > run_silent_s:
+            return "warn", RUN_SILENT_DETAIL
     if r.upstream_state == "errors":
         return "warn", upstream_text
     if r.account_remaining_usd is not None and r.account_remaining_usd < ACCOUNT_WARN_USD:
@@ -691,8 +932,9 @@ def llm_verdict(r: LlmReply, now: datetime) -> tuple[State, str]:
 
 
 def check_llm(component: str, title: str, url: str, now: datetime,
-              timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
-    """LLM-прокси и бюджет по ручке /health/llm службы; сама служба OpenRouter заново не опрашивает."""
+              timeout: float = NET_CHECK_TIMEOUT_S, run_silent_s: float = LLM_RUN_SILENT_S) -> Check:
+    """LLM-прокси и бюджет по ручке /health/llm службы; сама служба OpenRouter заново не опрашивает. run_silent_s —
+    порог «прогон отбора молчит» (Settings.LLM_RUN_SILENT_S)."""
     try:
         status, body = _http_get(url, timeout, lambda code: code == 200)
     except (OSError, http.client.HTTPException):
@@ -705,7 +947,7 @@ def check_llm(component: str, title: str, url: str, now: datetime,
         return Check(component, title, "fail", LLM_DOWN_DETAIL)
     try:
         parsed = LlmReply.parse(reply)
-        state, detail = llm_verdict(parsed, now)
+        state, detail = llm_verdict(parsed, now, run_silent_s)
         note = llm_note(parsed)
     except (KeyError, TypeError, ValueError, ArithmeticError):   # ArithmeticError — Overflow, Decimal
         return Check(component, title, "fail", LLM_OFF_CONTRACT_DETAIL)
@@ -958,6 +1200,119 @@ def check_agents(component: str, title: str, url: str, now: datetime, stale_s: i
     except ValueError:
         return Check(component, title, "fail", AGENTS_OFF_CONTRACT_DETAIL)
     state, detail, note = agents_verdict(parsed, now, stale_s)
+    if parsed.drill:
+        note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
+    return Check(component, title, state, detail, note)
+
+
+@dataclass(frozen=True)
+class TeacherReply:
+    """Ответ /health/teacher (Д10-R96): все 13 ключей, типы проверены при разборе."""
+    checked_at: datetime | None
+    shares_loaded: bool
+    shares_ok: bool
+    shares_drift: int
+    shares_sum_usd: float
+    total_usd: float
+    store_ok: bool
+    reads_1h: int
+    read_failed_1h: int
+    changes_1h: int
+    change_failed_1h: int
+    role_refused_1h: int
+    drill: str
+
+    @classmethod
+    def parse(cls, reply) -> "TeacherReply":
+        """Ответ не по договору — только ValueError (Ш8), как у AgentsReply: не объект JSON, лишний или недостающий
+        ключ, тип не тот, счётчик или сумма долей меньше нуля, shares_drift больше TEACHER_PLACES, total_usd не больше
+        нуля, деньги — не конечное число, drill не "" и не из TEACHER_DRILL_MODES."""
+        if not isinstance(reply, dict):
+            raise ValueError("ответ — не объект JSON")
+        if set(reply) != TEACHER_KEYS:
+            raise ValueError("в ответе кабинета преподавателя лишний или недостающий ключ")
+        try:
+            r = cls(checked_at=_time(reply, "checked_at"),           # не ISO — ValueError из fromisoformat
+                    shares_loaded=_flag(reply, "shares_loaded"), shares_ok=_flag(reply, "shares_ok"),
+                    shares_drift=_gw_count(reply, "shares_drift"),
+                    shares_sum_usd=_usd(reply, "shares_sum_usd"), total_usd=_usd(reply, "total_usd"),
+                    store_ok=_flag(reply, "store_ok"),
+                    **{key: _gw_count(reply, key) for key in sorted(TEACHER_KEYS) if key.endswith("_1h")},
+                    drill=_text(reply, "drill"))
+        except (KeyError, TypeError, ArithmeticError) as e:     # ArithmeticError — целое больше float в isfinite
+            raise ValueError(f"ответ кабинета преподавателя не по договору: {type(e).__name__} {e}") from e
+        if r.shares_sum_usd < 0:
+            raise ValueError("shares_sum_usd — меньше нуля")
+        if r.shares_drift > TEACHER_PLACES:
+            raise ValueError("shares_drift — больше числа мест")
+        if r.total_usd <= 0:
+            raise ValueError("бюджет не больше нуля")
+        if r.drill and r.drill not in TEACHER_DRILL_MODES:
+            raise ValueError("неизвестный режим учений")
+        return r
+
+
+def _budget_text(x: float) -> str:
+    """Общий бюджет в note: целый — fmt_total ($1000), иначе с центами (fmt_usd): малый бюджет учения «бюджет стенда
+    израсходован» (LLM_TOTAL_USD = 0.001) не показывается как «$0» — как потолок прогона в llm_note."""
+    return fmt_total(x) if float(x).is_integer() else fmt_usd(x)
+
+
+def teacher_verdict(r: TeacherReply, now: datetime, stale_s: int) -> tuple[State, str, str]:
+    """Первая подходящая строка таблицы Д10-R96: (состояние, detail, note без учений).
+
+    В warn/fail текст постоянный — числа идут в note (правило журнала Д1); деньги — fmt_usd и fmt_total, как в llm_note.
+    """
+    if not r.store_ok:
+        return "fail", TEACHER_JOURNAL_DOWN_DETAIL, ""
+    if r.checked_at is None:
+        return "unknown", TEACHER_NOT_CHECKED_DETAIL, ""
+    if not r.shares_loaded:
+        return "fail", TEACHER_STUDENT_FAIL, ""
+    if not r.shares_ok:
+        return "fail", TEACHER_SHARES_UNREAD_DETAIL, ""
+    if r.shares_drift > 0:
+        return "fail", TEACHER_DRIFT_DETAIL, f"мест: {r.shares_drift}"
+    if (now - r.checked_at).total_seconds() > stale_s:
+        return "fail", TEACHER_SILENT_DETAIL, ""
+    allocated = f"распределено {fmt_usd(r.shares_sum_usd)} из {_budget_text(r.total_usd)}"
+    if r.shares_sum_usd > r.total_usd + TEACHER_SUM_SLACK_USD:
+        return "warn", TEACHER_OVER_TOTAL_DETAIL, allocated
+    if r.change_failed_1h >= TEACHER_CHANGE_FAILS_WARN and r.changes_1h == 0:
+        return "warn", TEACHER_CHANGES_DETAIL, f"{r.change_failed_1h} за час"
+    if r.read_failed_1h >= TEACHER_READ_FAILS_WARN:
+        return "warn", TEACHER_READS_DETAIL, f"{r.read_failed_1h} за час"
+    if r.role_refused_1h >= TEACHER_ROLE_REFUSED_WARN:
+        return "warn", TEACHER_ROLE_DETAIL, f"{r.role_refused_1h} за час"
+    return "ok", TEACHER_OK_DETAIL, f"{allocated}; прочитано за час: {r.reads_1h}; изменений за час: {r.changes_1h}"
+
+
+def check_teacher(component: str, title: str, url: str, now: datetime, stale_s: int,
+                  timeout: float = NET_CHECK_TIMEOUT_S) -> Check:
+    """Кабинет преподавателя и доли по ручке /health/teacher службы (только числа и флаги, без логинов и номеров мест).
+
+    Нет ответа, срок, не JSON, код не 200 и не 404 — «кабинет преподавателя не отвечает»; 404 (core старше сторожа во
+    время выкладки) — «неизвестно»; JSON не по договору — свой текст (Ш8). При учениях к note любой строки таблицы первым
+    добавляется «учения: <режим>». Сумма, которую не форматирует fmt_usd (Decimal: от 1e26 — больше 28 знаков), — тоже
+    «не по договору», а не «ошибка проверки» (как у check_llm, доводка р1 А1, I-1).
+    """
+    try:
+        status, body = _http_get(url, timeout, lambda code: code == 200)
+    except (OSError, http.client.HTTPException):
+        return Check(component, title, "fail", TEACHER_DOWN_DETAIL)
+    if status == 404:
+        return Check(component, title, "unknown", TEACHER_NOT_DEPLOYED_DETAIL)
+    if status != 200:
+        return Check(component, title, "fail", TEACHER_DOWN_DETAIL)
+    try:
+        reply = json.loads(body)
+    except (ValueError, RecursionError):   # не JSON, в том числе тело, не дочитанное к сроку
+        return Check(component, title, "fail", TEACHER_DOWN_DETAIL)
+    try:
+        parsed = TeacherReply.parse(reply)
+        state, detail, note = teacher_verdict(parsed, now, stale_s)
+    except (ValueError, ArithmeticError):   # ArithmeticError — Decimal fmt_usd (InvalidOperation), как у check_llm
+        return Check(component, title, "fail", TEACHER_OFF_CONTRACT_DETAIL)
     if parsed.drill:
         note = "; ".join(part for part in (f"учения: {parsed.drill}", note) if part)
     return Check(component, title, state, detail, note)

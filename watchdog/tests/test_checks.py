@@ -10,14 +10,20 @@ from pathlib import Path
 import pytest
 
 from helpers import T0, gw, insp, llm_obj, now_utc, put_build
-from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_KEYS, BUDGET_STEPS, DRIFT_WARN_USD,
+from pcbk_watchdog.checks import (ACCOUNT_WARN_USD, AGENTS_DRILL_MODES, AGENTS_KEYS, BUDGET_STEPS, CRASH_LOOP_DETAIL,
+                                  DRIFT_WARN_USD,
                                   EGRESS_STALE_S, AgentsReply, agents_verdict, check_agents,
                                   GW_DRILL_MODES, GW_KEYS_D5A, GW_KEYS_D5B, GW_OFF_CONTRACT_DETAIL,
                                   GW_SP_CTL_STATES, LLM_STALE_S, MAX_BODY_BYTES,
                                   LOGIN_FAILS_WARN, REASON_CHARS, WAKE_FAILS_FAIL, Check, GatewayReply, _http_get,
                                   check_container, check_gateway,
                                   check_historian, check_http, check_llm, check_memory, check_tls, check_web,
-                                  fmt_total, fmt_usd, not_installed, tls_verdict)
+                                  fmt_total, fmt_usd, not_installed, tls_verdict,
+                                  LLM_RUN_SILENT_S, RUN_CAP_DETAIL, RUN_KEYS, RUN_SILENT_DETAIL, LlmReply,
+                                  DRILL_NOTE, FAILING_MAX, TOOL_FAILING_DETAIL, llm_note, llm_verdict,
+                                  TEACHER_DETAILS, TEACHER_DRILL_MODES, TEACHER_KEYS, TEACHER_STUDENT_FAIL,
+                                  TeacherReply, check_teacher, teacher_verdict,
+                                  BRAKE_KEYS, RUN_BRAKE_SILENT_DETAIL, RUN_BRAKE_SILENT_S, RUN_HALT_DETAIL, BrakeInfo)
 from pcbk_watchdog import checks as checks_module
 from pcbk_watchdog.journal import Journal
 
@@ -88,6 +94,19 @@ def test_crash_loop_detail_is_constant(tmp_path):
     journal = Journal(str(tmp_path / "journal.db"))
     assert sum(len(journal.record([c], T0 + timedelta(seconds=10 * i)))
                for i, c in enumerate(loops)) == 1
+
+
+def test_restart_detail_names_reason():                                      # Д11-R115
+    fresh = insp(running=True, restarts=1, started=T0 - timedelta(minutes=3))
+    def row(reason, i=fresh, last=None):
+        return check_container("student-01", "Рабочее место 01", i, sleeping_ok=True, now=T0, restart_reason=reason,
+                               last_reason=last)
+    assert (row("oom").state, row("oom").detail) == ("warn", "перезапущен: убит по памяти в 11:57 UTC+00:00 (1 с последнего запуска)")
+    assert row("crash").detail == "перезапущен: сбой не по памяти в 11:57 UTC+00:00 (1 с последнего запуска)"
+    assert row(None).detail == "перезапущен после сбоя в 11:57 UTC+00:00 (1 с последнего запуска)"
+    loop = row(None, insp(running=True, restarts=3, started=T0 - timedelta(minutes=3)), last="oom")
+    assert (loop.state, loop.detail, loop.note) == ("fail", CRASH_LOOP_DETAIL, "последний — убит по памяти")
+    assert all(len(row(r).detail) <= 80 for r in ("oom", "crash", None))
 
 
 def test_health_unhealthy_is_fail():
@@ -408,6 +427,68 @@ def test_historian_off_contract_reply_has_own_text(fake_core):
                 fresh(5, catalog_age_s="много"), fresh(float("-inf")), fresh(float("nan"))):
         fake_core.set(obj)
         r = check_historian("historian", "Историан БДРВ", fake_core.url, T0, 300, 900, 120, 0.5)
+        assert (r.state, r.detail) == OFF_CONTRACT, obj
+
+
+# Д9а, задача А1: серия ошибок по инструменту и учение DRILL_DATA (Д9-R83)
+
+def test_historian_failing_tools_row(fake_core):                                  # Review Focus 3
+    gate = {"user_paused": False, "p95_ms": 100}
+    cases = [(fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": ["tag_series"]}),
+              ("warn", TOOL_FAILING_DETAIL, "tag_series")),                       # мало вызовов — доля молчит, серия нет
+             (fresh(10, gate=gate, tools={"recent": 40, "errors": 6, "failing": ["calc_runtime", "tag_series"]}),
+              ("warn", TOOL_FAILING_DETAIL, "calc_runtime, tag_series")),
+             (fresh(10, gate=gate, tools={"recent": 50, "errors": 12, "failing": ["tag_now"]}),
+              ("warn", "инструменты отвечают ошибкой", "12 из 50")),             # доля — раньше серии
+             (fresh(10, gate=gate, tools={"recent": 40, "errors": 0, "failing": []}),
+              ("ok", "последняя метка 10 с назад", "")),
+             (fresh(10, gate=gate, tools={"recent": 40, "errors": 0}),
+              ("ok", "последняя метка 10 с назад", ""))]                          # core старше Д9а
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+        assert len(r.detail) <= 80
+    for bad in ({"recent": 3, "errors": 3, "failing": "tag_now"}, {"recent": 3, "errors": 3, "failing": [1]},
+                {"recent": 3, "errors": 3, "failing": ["DROP TABLE"]},
+                {"recent": 3, "errors": 3, "failing": ["tag_now"] * 9}):
+        assert (hist(fake_core, fresh(10, gate=gate, tools=bad)).state,
+                hist(fake_core, fresh(10, gate=gate, tools=bad)).detail) == OFF_CONTRACT, bad
+
+
+def test_historian_drill_note(fake_core):                                         # m4 критики р1
+    gate = {"user_paused": False, "p95_ms": 100}
+    r = hist(fake_core, fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": ["tag_series"]},
+                              drill="tool_error"))
+    assert (r.state, r.detail, r.note) == ("warn", TOOL_FAILING_DETAIL, "tag_series; учения: tool_error")
+    r = hist(fake_core, fresh(10, gate=gate, tools={"recent": 0, "errors": 0, "failing": []}, drill="tool_error"))
+    assert (r.state, r.note) == ("ok", "учения: tool_error")
+    assert hist(fake_core, fresh(10, drill=None)).note == ""
+    assert (hist(fake_core, fresh(10, drill="other")).state,) == ("unknown",)
+
+
+# сверх брифа: учение — в note строки любого состояния; вид failing проверяется и при сработавшей доле
+
+
+def test_historian_drill_note_any_state_and_failing_edges(fake_core):
+    gate = {"user_paused": False, "p95_ms": 100}
+    cases = [(fresh(901, drill="tool_error"), ("fail", "последняя метка старше 900 с", DRILL_NOTE)),
+             (fresh(None, checked_at=None, drill="tool_error"),
+              ("unknown", "служба ещё не опрашивала историан", DRILL_NOTE)),
+             (fresh(10, gate=gate, tools={"recent": 50, "errors": 12, "failing": ["tag_now"]}, drill="tool_error"),
+              ("warn", "инструменты отвечают ошибкой", f"12 из 50; {DRILL_NOTE}")),
+             (fresh(10, drill=""), ("ok", "последняя метка 10 с назад", "")),
+             (fresh(10, gate=gate, tools={"recent": 8, "errors": 8, "failing": [f"tool_{c}" for c in "abcdefgh"]}),
+              ("warn", TOOL_FAILING_DETAIL, ", ".join(f"tool_{c}" for c in "abcdefgh")))]
+    assert FAILING_MAX == 8
+    for obj, want in cases:
+        r = hist(fake_core, obj)
+        assert (r.state, r.detail, r.note) == want, obj
+    for obj in (fresh(10, gate=gate, tools={"recent": 50, "errors": 12, "failing": "tag_now"}),
+                fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": ["t" * 33]}),
+                fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": [""]}),
+                fresh(10, gate=gate, tools={"recent": 3, "errors": 3, "failing": None}),
+                fresh(10, drill=5), fresh(10, drill=["tool_error"]), fresh(None, checked_at=None, drill="other")):
+        r = hist(fake_core, obj)
         assert (r.state, r.detail) == OFF_CONTRACT, obj
 
 
@@ -785,11 +866,24 @@ def test_llm_junction_with_real_health_json(fake_core):                         
             "working": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · по ключу OpenRouter $0.0024"
                         " · отбор и проверки $0.0012 · на счёте $30.00"),
             "drill_402": ("fail", "на счёте OpenRouter кончились деньги (учения)",
-                          "расход $0.00 из $1000 · по ключу OpenRouter $0.00 · на счёте $30.00 · учения DRILL_LLM=402")}
+                          "расход $0.00 из $1000 · по ключу OpenRouter $0.00 · на счёте $30.00 · учения DRILL_LLM=402"),
+            # Д8а: LLM_RUN_* заданы (d8-test, $1, student-01 и ops), два вызова
+            "run_active": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · по ключу OpenRouter $0.0024"
+                           " · отбор и проверки $0.0012 · прогон d8-test: $0.0024 из $1.00, вызовов за 10 мин: 2"
+                           " · на счёте $30.00"),
+            # Д11а (А2): то же с тормозом прогона на двойниках /proc — свободно 8000 из 16000 МиБ, swap и давления нет
+            "run_active_brake": ("ok", "OpenRouter отвечает", "расход $0.0024 из $1000 · прогон d8-test: $0.0024 из"
+                                 " $1.00, вызовов за 10 мин: 2 · на счёте $30.00 · тормоз: свободно 8000 МиБ (порог"
+                                 " 1024), swap +0 МиБ от базы (порог 512), давление 0 % (порог 10), убийств 0")}
     assert set(samples) == set(want)
+    keys = set(llm_obj())
+    assert len(keys) == 32 and set(samples["run_active_brake"]) == keys        # образец Д11 — все 32 ключа (m-5 р3)
     for name, obj in samples.items():
-        # помощник тестов сторожа держит тот же договор, что и настоящий ответ: 30 ключей и вложенные
-        assert set(obj) == set(llm_obj()) and len(obj) == 30, name
+        # помощник тестов сторожа держит тот же договор, что и настоящий ответ: 32 ключа (без run_brake — «core старше
+        # Д11», 31) и вложенные
+        assert set(obj) in (keys, keys - {"run_brake"}) and len(obj) in (31, 32), name
+        assert obj["run"] is None or set(obj["run"]) == RUN_KEYS, name
+        assert obj.get("run_brake") is None or set(obj["run_brake"]) == BRAKE_KEYS, name
         assert (set(obj["upstream"]), set(obj["egress"]), set(obj["shares"])) == \
                ({"state", "text", "since"}, {"alive", "last_ok_age_s"}, {"over_80", "spent"}), name
         at = datetime.fromisoformat(obj["checked_at"]) if obj["checked_at"] else T0
@@ -797,6 +891,101 @@ def test_llm_junction_with_real_health_json(fake_core):                         
         r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", at + timedelta(seconds=5),
                       timeout=0.5)
         assert (r.state, r.detail, r.note) == want[name], name
+
+
+# --- прогон отбора модели в строке «LLM-прокси и бюджет» (задача А1 Д8а, Д8-R69) ---
+
+RUN = {"id": "d8-1008", "cap_usd": 80.0, "spent_usd": 12.4, "callers": 4, "calls_10m": 37, "idle_s": 3.0}
+
+
+def test_llm_run_note():
+    assert "прогон d8-1008: $12.40 из $80, вызовов за 10 мин: 37" in llm_note(LlmReply.parse(llm_obj(run=RUN)))
+    small = {**RUN, "cap_usd": 1.0, "spent_usd": 0.0, "calls_10m": 0}
+    assert "прогон d8-1008: $0.00 из $1.00" in llm_note(LlmReply.parse(llm_obj(run=small)))
+
+
+@pytest.mark.parametrize("patch,want", [
+    ({}, "ok"),
+    ({"spent_usd": 80.0}, ("warn", RUN_CAP_DETAIL)),
+    ({"idle_s": 301.0}, ("warn", RUN_SILENT_DETAIL)),
+])
+def test_llm_run_verdicts(patch, want):                                           # Review Focus 3
+    state, detail = llm_verdict(LlmReply.parse(llm_obj(run={**RUN, **patch})), T0, 300.0)
+    assert (state if want == "ok" else (state, detail)) == want
+
+
+def test_llm_run_silence_threshold_param():
+    r = LlmReply.parse(llm_obj(run={**RUN, "idle_s": 11.0}))
+    assert llm_verdict(r, T0, 10.0) == ("warn", RUN_SILENT_DETAIL) and llm_verdict(r, T0, 300.0)[0] == "ok"
+
+
+@pytest.mark.parametrize("bad", [{**RUN, "extra": 1}, {k: v for k, v in RUN.items() if k != "idle_s"},
+                                 {**RUN, "cap_usd": 0}, {**RUN, "calls_10m": -1}, []])
+def test_llm_run_off_contract(bad):
+    with pytest.raises((ValueError, TypeError, KeyError)):
+        LlmReply.parse(llm_obj(run=bad))
+
+
+def test_llm_without_run_key_is_none():                                           # core :d7b во время выкладки
+    obj = llm_obj()
+    del obj["run"]
+    assert LlmReply.parse(obj).run is None
+
+
+# сверх брифа
+
+def test_llm_run_rows_order():                                       # Д8-R69: после fail и unknown, до errors
+    silent, capped = {**RUN, "idle_s": 999.0}, {**RUN, "spent_usd": 80.0, "idle_s": 999.0}
+    cases = [
+        # учения 402 и сбои — раньше строк прогона (учение Д8-R77, шаг 2)
+        (llm_obj(drill="402", run=silent, upstream=up("money_out", "на счёте OpenRouter кончились деньги (учения)")),
+         ("fail", "на счёте OpenRouter кончились деньги (учения)")),
+        (llm_obj(config_error="прогон: точка отсчёта не записана", run=capped),
+         ("fail", "ошибка настройки: прогон: точка отсчёта не записана")),
+        (spent(1000.0, run=capped), ("fail", "бюджет $1000 исчерпан — модель не отвечает")),
+        (llm_obj(checked_at=None, run=silent), ("unknown", "OpenRouter ещё не опрашивался")),
+        (llm_obj(checked_at=(T0 - timedelta(seconds=LLM_STALE_S + 1)).isoformat(), run=silent),
+         ("unknown", "LLM-прокси давно не опрашивал OpenRouter")),
+        # потолок раньше тишины; оба — раньше errors, счёта, провайдера и полос бюджета
+        (llm_obj(run=capped), ("warn", RUN_CAP_DETAIL)),
+        (llm_obj(run=silent, upstream=up("errors", "OpenRouter отвечает с ошибками")), ("warn", RUN_SILENT_DETAIL)),
+        (spent(960.0, run=silent, account_remaining_usd=1.0, provider_mismatch_24h=2), ("warn", RUN_SILENT_DETAIL)),
+        (spent(960.0, run={**RUN, "spent_usd": 79.99}), ("warn", "израсходовано больше 95 % бюджета")),
+        (llm_obj(run={**RUN, "idle_s": 300.0}), ("ok", "OpenRouter отвечает")),       # ровно порог — ещё не «дольше»
+    ]
+    for obj, want in cases:
+        assert llm_verdict(LlmReply.parse(obj), T0, 300.0) == want, obj
+    assert LLM_RUN_SILENT_S == 300
+    assert llm_verdict(LlmReply.parse(llm_obj(run={**RUN, "idle_s": 300.5})), T0) == ("warn", RUN_SILENT_DETAIL)
+
+
+def test_llm_run_note_place_and_rounding():
+    full = spent(900.0, ops_usd=1.5, shares={"over_80": 3, "spent": 0}, account_remaining_usd=250.0,
+                 run={**RUN, "spent_usd": 79.996})
+    assert llm_note(LlmReply.parse(full)) == ("расход $900.00 из $1000 · отбор и проверки $1.50"
+                                              " · прогон d8-1008: $79.99 из $80, вызовов за 10 мин: 37"
+                                              " · доля больше 80 %: 3 · на счёте $250.00")   # не «$80.00 из $80»
+    odd = LlmReply.parse(llm_obj(run={**RUN, "cap_usd": 80.5, "spent_usd": 80.4}))      # доводка р1, m1
+    assert "прогон d8-1008: $80.40 из $80.50, " in llm_note(odd)                   # не «из $80»
+    for cap, shown in ((5.0, "$5.00"), (9.99, "$9.99"), (10.0, "$10"), (0.002, "$0.0020"), (10.5, "$10.50"),
+                       (80, "$80")):
+        r = LlmReply.parse(llm_obj(run={**RUN, "cap_usd": cap, "spent_usd": 0.0}))
+        assert f"прогон d8-1008: $0.00 из {shown}, " in llm_note(r), cap
+    assert "прогон" not in llm_note(LlmReply.parse(llm_obj()))
+
+
+def test_llm_run_through_check(fake_core):                                        # тот же договор по HTTP
+    fake_core.set_llm(llm_obj(run={**RUN, "idle_s": 11.0}))
+    url = fake_core.base + "/health/llm"
+    r = check_llm("llm", "LLM-прокси и бюджет", url, T0, timeout=0.5, run_silent_s=10)
+    assert (r.state, r.detail) == ("warn", RUN_SILENT_DETAIL) and "вызовов за 10 мин: 37" in r.note
+    assert check_llm("llm", "LLM-прокси и бюджет", url, T0, timeout=0.5).state == "ok"   # умолчание — 300 с
+    for bad in ({**RUN, "id": "D8"}, {**RUN, "id": ""}, {**RUN, "id": 5}, {**RUN, "callers": True},
+                {**RUN, "spent_usd": "1"}, {**RUN, "idle_s": float("nan")}, {**RUN, "spent_usd": -0.01},
+                {**RUN, "callers": 1.0}, "run"):
+        fake_core.set_llm(llm_obj(run=bad))
+        r = check_llm("llm", "LLM-прокси и бюджет", url, T0, timeout=0.5)
+        assert (r.state, r.detail, r.note) == ("fail", "LLM-прокси ответил не по договору", ""), bad
 
 
 # строка «Шлюз и вход» (задача А1 Д5а); gw — ответ /health/gateway из helpers
@@ -1417,3 +1606,333 @@ def test_web_owner_fails_match_agents_row():
     ids = [c["id"] for c in COMPONENTS if c["kind"] == "agents"]
     assert state == "fail" and ids == ["agents"]
     assert web_owner_fails((web / "src/status.ts").read_text("utf-8")) == {"agents": detail}
+
+
+# --- строка «Кабинет преподавателя и доли» (задача А1 Д10а, Д10-R96): ответ /health/teacher core -------------------
+
+NOW_T = datetime(2026, 10, 11, 9, tzinfo=timezone.utc)
+T_BASE = {"checked_at": NOW_T.isoformat(), "shares_loaded": True, "shares_ok": True, "shares_drift": 0,
+          "shares_sum_usd": 1000.0, "total_usd": 1000.0, "store_ok": True, "reads_1h": 3, "read_failed_1h": 0,
+          "changes_1h": 1, "change_failed_1h": 0, "role_refused_1h": 0, "drill": ""}
+
+
+@pytest.mark.parametrize("patch,want", [
+    ({}, ("ok", "доли сходятся, журнал действий пишется",
+          "распределено $1000.00 из $1000; прочитано за час: 3; изменений за час: 1")),
+    ({"store_ok": False, "checked_at": None}, ("fail", "журнал действий преподавателя не пишется — кабинет закрыт", "")),
+    ({"checked_at": None, "shares_loaded": False}, ("unknown", "сверка долей ещё не проходила", "")),
+    ({"shares_loaded": False}, ("fail", "доли бюджета не загружены — LLM-прокси закрыт для студентов", "")),
+    ({"shares_ok": False}, ("fail", "сверка долей не прочла таблицу — расхождение не видно", "")),     # m-3
+    ({"shares_drift": 2}, ("fail", "LLM-прокси считает доли не так, как сохранено", "мест: 2")),
+    ({"checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}, ("fail", "сверка долей молчит", "")),
+    ({"shares_sum_usd": 1000.02}, ("warn", "сумма долей мест больше общего бюджета — держит общий бюджет",
+                                   "распределено $1000.02 из $1000")),
+    ({"changes_1h": 0, "change_failed_1h": 3}, ("warn", "изменения преподавателя не проходят", "3 за час")),
+    ({"read_failed_1h": 3}, ("warn", "разговоры студентов не читаются", "3 за час")),
+    ({"role_refused_1h": 10}, ("warn", "кабинет преподавателя открывают без роли преподавателя", "10 за час")),
+])
+def test_teacher_verdicts(patch, want):
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, **patch}), NOW_T, 120) == want
+
+
+@pytest.mark.parametrize("bad", [{**T_BASE, "extra": 1}, {k: v for k, v in T_BASE.items() if k != "drill"},
+                                 {**T_BASE, "reads_1h": -1}, {**T_BASE, "drill": "other"}, {**T_BASE, "total_usd": 0},
+                                 {**T_BASE, "shares_sum_usd": -0.01}, {**T_BASE, "shares_ok": "yes"},
+                                 {**T_BASE, "shares_loaded": None}, []])
+def test_teacher_off_contract(bad):
+    with pytest.raises(ValueError):
+        TeacherReply.parse(bad)
+
+
+def test_teacher_student_fail_is_a_row_detail():                        # I-3: этот текст видит баннер студента
+    assert TEACHER_STUDENT_FAIL in TEACHER_DETAILS
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_loaded": False}), NOW_T, 120)[1] == TEACHER_STUDENT_FAIL
+
+
+def test_web_teacher_student_fail_matches_row():
+    """I-3 (Д10-R106): баннер студента показывает строку кабинета только с этим detail — текст в вебе дословно равен тексту
+    сторожа, иначе студенты не узнают, почему молчит модель. id строки вида teacher в components.json — тот, что ждёт веб
+    (TEACHER_ROW)."""
+    web = REPO / "web"
+    if not web.is_dir():
+        pytest.skip("в копии нет web/ — сверка с вебом идёт в копии с web")
+    status_ts = (web / "src/status.ts").read_text("utf-8")
+    m = re.search(r'export const TEACHER_STUDENT_FAIL = "([^"]+)";', status_ts)
+    assert m is not None, "TEACHER_STUDENT_FAIL не найден в web/src/status.ts"
+    assert m.group(1) == TEACHER_STUDENT_FAIL
+    assert [c["id"] for c in COMPONENTS if c["kind"] == "teacher"] == ["teacher"]
+    assert re.search(r'export const TEACHER_ROW = "teacher";', status_ts) is not None
+
+
+def test_check_teacher_codes(json_site):
+    c = check_teacher("teacher", "Кабинет преподавателя и доли", json_site(404, {"name": "NotFound"}), NOW_T, 120)
+    assert (c.state, c.detail) == ("unknown", "кабинет преподавателя ещё не выложен")
+    c = check_teacher("teacher", "Кабинет преподавателя и доли",
+                      json_site(200, {**T_BASE, "shares_drift": 2, "drill": "shares_stale"}), NOW_T, 120)
+    assert (c.state, c.note) == ("fail", "учения: shares_stale; мест: 2")
+    c = check_teacher("teacher", "Кабинет преподавателя и доли", json_site(200, {**T_BASE, "x": 1}), NOW_T, 120)
+    assert (c.state, c.detail) == ("fail", "кабинет преподавателя ответил не по договору")
+    c = check_teacher("teacher", "Кабинет преподавателя и доли", "http://127.0.0.1:9/x", NOW_T, 120)
+    assert (c.state, c.detail) == ("fail", "кабинет преподавателя не отвечает")
+
+
+def test_teacher_details_fit_80_chars():                                 # правило журнала Д1
+    for detail in TEACHER_DETAILS:
+        assert len(detail) <= 80 and not any(ch.isdigit() for ch in detail), detail
+
+
+# --- сверх брифа ---
+
+TEACHER_DOWN = ("fail", "кабинет преподавателя не отвечает", "")
+TEACHER_OFF = ("fail", "кабинет преподавателя ответил не по договору", "")
+
+
+def teacher_row(json_site, obj, code=200, stale_s=120):
+    return row(check_teacher("teacher", "Кабинет преподавателя и доли", json_site(code, obj), NOW_T, stale_s,
+                             timeout=0.5))
+
+
+def test_teacher_contract_constants():
+    assert TEACHER_KEYS == set(T_BASE) and len(TEACHER_KEYS) == 13
+    assert TEACHER_KEYS == {f.name for f in fields(TeacherReply)}                  # договор = поля разбора
+    assert TEACHER_DRILL_MODES == {"shares_stale", "journal_down"}                 # DRILL_TEACHER, кроме ""
+    r = TeacherReply.parse({**T_BASE, "shares_sum_usd": 0, "total_usd": 50, "checked_at": None})
+    assert (r.checked_at, r.shares_sum_usd, r.total_usd, r.store_ok) == (None, 0, 50, True)   # целые деньги — тоже числа
+    assert len(TEACHER_DETAILS) == len(set(TEACHER_DETAILS)) == 14               # 11 строк таблицы и 3 ответа ручки
+
+
+def test_teacher_verdict_order_and_bounds():                                   # первая подходящая строка таблицы R96
+    every = {"store_ok": False, "checked_at": None, "shares_loaded": False, "shares_ok": False, "shares_drift": 3,
+             "shares_sum_usd": 2000.0, "changes_1h": 0, "change_failed_1h": 5, "read_failed_1h": 4,
+             "role_refused_1h": 11}
+    order = [("store_ok", "журнал действий преподавателя не пишется — кабинет закрыт"),
+             ("checked_at", "сверка долей ещё не проходила"),
+             ("shares_loaded", "доли бюджета не загружены — LLM-прокси закрыт для студентов"),
+             ("shares_ok", "сверка долей не прочла таблицу — расхождение не видно"),
+             ("shares_drift", "LLM-прокси считает доли не так, как сохранено"),
+             ("shares_sum_usd", "сумма долей мест больше общего бюджета — держит общий бюджет"),
+             ("change_failed_1h", "изменения преподавателя не проходят"),
+             ("read_failed_1h", "разговоры студентов не читаются"),
+             ("role_refused_1h", "кабинет преподавателя открывают без роли преподавателя")]
+    obj = {**T_BASE, **every}
+    for key, detail in order:                                                      # снимаем по одной сверху вниз
+        assert teacher_verdict(TeacherReply.parse(obj), NOW_T, 120)[1] == detail, key
+        obj[key] = T_BASE[key]
+    assert teacher_verdict(TeacherReply.parse(obj), NOW_T, 120)[:2] == ("ok", "доли сходятся, журнал действий пишется")
+    stale = {**T_BASE, "checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}
+    assert teacher_verdict(TeacherReply.parse({**stale, "shares_drift": 1}), NOW_T, 120)[1] == \
+           "LLM-прокси считает доли не так, как сохранено"                         # расхождение выше молчания
+    assert teacher_verdict(TeacherReply.parse({**stale, "read_failed_1h": 9}), NOW_T, 120)[1] == \
+           "сверка долей молчит"                                                   # молчание выше warn
+    assert teacher_verdict(TeacherReply.parse({**stale, "store_ok": False}), NOW_T, 120)[1] == \
+           "журнал действий преподавателя не пишется — кабинет закрыт"
+    for patch, state in (({"checked_at": (NOW_T - timedelta(seconds=120)).isoformat()}, "ok"),   # ровно порог
+                         ({"checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}, "fail"),
+                         ({"shares_sum_usd": 1000.005}, "ok"),                    # запас полцента: ещё не больше
+                         ({"shares_sum_usd": 1000.0051}, "warn"),
+                         ({"shares_sum_usd": 999.99}, "ok"),
+                         ({"changes_1h": 0, "change_failed_1h": 2}, "ok"),
+                         ({"changes_1h": 1, "change_failed_1h": 30}, "ok"),       # хоть одно изменение прошло
+                         ({"changes_1h": 0, "change_failed_1h": 3}, "warn"),
+                         ({"read_failed_1h": 2}, "ok"), ({"read_failed_1h": 3}, "warn"),
+                         ({"role_refused_1h": 9}, "ok"), ({"role_refused_1h": 10}, "warn")):
+        assert teacher_verdict(TeacherReply.parse({**T_BASE, **patch}), NOW_T, 120)[0] == state, patch
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "checked_at": (NOW_T - timedelta(seconds=121)).isoformat()}),
+                           NOW_T, 300)[0] == "ok"                                  # порог — из TEACHER_STALE_S
+
+
+def test_teacher_notes_money_and_numbers():
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_sum_usd": 812.34, "reads_1h": 0, "changes_1h": 7}),
+                           NOW_T, 120) == ("ok", "доли сходятся, журнал действий пишется",
+                                           "распределено $812.34 из $1000; прочитано за час: 0; изменений за час: 7")
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_sum_usd": 0}), NOW_T, 120)[2].startswith(
+        "распределено $0.00 из $1000;")
+    # учение «бюджет стенда израсходован» (compose.test.yaml, LLM_TOTAL_USD=0.001): бюджет не целый — с центами
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "total_usd": 0.001}), NOW_T, 120) == \
+           ("warn", "сумма долей мест больше общего бюджета — держит общий бюджет", "распределено $1000.00 из $0.0010")
+    assert teacher_verdict(TeacherReply.parse({**T_BASE, "shares_sum_usd": 1000, "total_usd": 1000}), NOW_T, 120)[2] \
+        .startswith("распределено $1000.00 из $1000;")                              # целые из JSON — как дробные
+
+
+def test_teacher_details_constant_numbers_only_in_note(tmp_path):              # правило журнала Д1
+    objs = [{**T_BASE, **p} for p in ({"store_ok": False}, {"checked_at": None}, {"shares_loaded": False},
+                                       {"shares_ok": False}, {"shares_drift": 1},
+                                       {"checked_at": "2026-10-11T08:00:00+00:00"}, {"shares_sum_usd": 1500.0},
+                                       {"changes_1h": 0, "change_failed_1h": 3}, {"read_failed_1h": 3},
+                                       {"role_refused_1h": 10}, {})]
+    details = [teacher_verdict(TeacherReply.parse(o), NOW_T, 120)[1] for o in objs]
+    assert set(details) | {"кабинет преподавателя не отвечает", "кабинет преподавателя ещё не выложен",
+                           "кабинет преподавателя ответил не по договору"} == set(TEACHER_DETAILS)
+    journal = Journal(str(tmp_path / "j.db"))
+    rows = [Check("teacher", "Кабинет преподавателя и доли",
+                  *teacher_verdict(TeacherReply.parse({**T_BASE, "shares_drift": k}), NOW_T, 120)) for k in (1, 2, 7)]
+    rows += [Check("teacher", "Кабинет преподавателя и доли",
+                   *teacher_verdict(TeacherReply.parse({**T_BASE, "reads_1h": k}), NOW_T, 120)) for k in (0, 3, 9)]
+    assert len({r.note for r in rows}) == 6
+    assert sum(len(journal.record([r], NOW_T + timedelta(seconds=10 * i))) for i, r in enumerate(rows)) == 2
+
+
+def test_teacher_off_contract_reply_has_own_text(json_site):                   # Ш8: как у строки агентов
+    missing = [{k: v for k, v in T_BASE.items() if k != key} for key in T_BASE]
+    counts = [k for k in T_BASE if k.endswith("_1h")] + ["shares_drift"]
+    for obj in (*missing, "строка", 7, None, {}, [T_BASE], {**T_BASE, "extra": 0}, {**T_BASE, "pending": 0},
+                {**T_BASE, "checked_at": 12}, {**T_BASE, "checked_at": "вчера"}, {**T_BASE, "checked_at": True},
+                *({**T_BASE, k: v} for k in ("shares_loaded", "shares_ok", "store_ok") for v in (None, 1, 0, "true")),
+                *({**T_BASE, k: v} for k in counts for v in (-1, True, 1.5, "1", None)),
+                *({**T_BASE, k: v} for k in ("shares_sum_usd", "total_usd") for v in ("1000", None, True, [], 10 ** 400)),
+                {**T_BASE, "shares_sum_usd": -0.01}, {**T_BASE, "total_usd": 0}, {**T_BASE, "total_usd": -5},
+                {**T_BASE, "shares_drift": 11}, {**T_BASE, "shares_drift": 10 ** 4000},   # мест больше десяти (р1, m-1)
+                {**T_BASE, "drill": None}, {**T_BASE, "drill": "SHARES_STALE"}, {**T_BASE, "drill": "freeze_reload"},
+                {**T_BASE, "drill": "journal_down "}, {**T_BASE, "drill": " "}):
+        assert teacher_row(json_site, obj) == TEACHER_OFF, obj
+        with pytest.raises(ValueError):                                            # не KeyError и не TypeError
+            TeacherReply.parse(obj)
+    assert len(missing) == 13
+    for key in ("shares_sum_usd", "total_usd"):
+        for bad in (float("nan"), float("inf")):                                   # json.dumps пишет NaN/Infinity
+            with pytest.raises(ValueError):
+                TeacherReply.parse({**T_BASE, key: bad})
+
+
+def test_teacher_http_errors_are_down(json_site, raw_http):
+    for code in (500, 503, 401, 302):                                              # 404 — своя строка
+        assert teacher_row(json_site, T_BASE, code=code) == TEACHER_DOWN, code
+
+    def text_reply(conn, stop):
+        body = "не json".encode()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+    r = check_teacher("teacher", "Кабинет преподавателя и доли", raw_http(text_reply) + "/health/teacher", NOW_T, 120,
+                      timeout=0.5)
+    assert row(r) == TEACHER_DOWN
+    r, took = timed(check_teacher, "teacher", "Кабинет преподавателя и доли",
+                    raw_http(headers_then_stall) + "/health/teacher", NOW_T, 120, timeout=SOCK_S)
+    assert row(r) == TEACHER_DOWN and took < BOUND_S                               # тело оборвал общий срок
+    assert teacher_row(json_site, {"detail": "Not Found"}, code=404) == \
+           ("unknown", "кабинет преподавателя ещё не выложен", "")                    # core :d9a — 404 FastAPI
+
+
+def test_teacher_drill_goes_first_in_note(json_site):
+    stale = {**T_BASE, "drill": "shares_stale"}
+    assert teacher_row(json_site, stale) == \
+           ("ok", "доли сходятся, журнал действий пишется",
+            "учения: shares_stale; распределено $1000.00 из $1000; прочитано за час: 3; изменений за час: 1")
+    down = {**T_BASE, "drill": "journal_down", "store_ok": False}
+    assert teacher_row(json_site, down) == \
+           ("fail", "журнал действий преподавателя не пишется — кабинет закрыт", "учения: journal_down")
+    assert teacher_row(json_site, {**down, "store_ok": True, "checked_at": None}) == \
+           ("unknown", "сверка долей ещё не проходила", "учения: journal_down")
+
+
+def test_teacher_huge_money_is_off_contract_not_check_error(json_site):          # доводка р1, I-1: как у check_llm
+    # fmt_usd (Decimal, 28 знаков) не форматирует сумму от 1e26: строка — «не по договору», а не «ошибка проверки»
+    for obj in ({**T_BASE, "shares_sum_usd": 1e30}, {**T_BASE, "shares_sum_usd": 1e26},
+                {**T_BASE, "shares_sum_usd": 1e30, "total_usd": 1e300}):
+        TeacherReply.parse(obj)                                                    # разбор пропускает: число по договору
+        assert teacher_row(json_site, obj) == TEACHER_OFF, obj
+    assert teacher_row(json_site, {**T_BASE, "shares_sum_usd": 5e-324, "total_usd": 1e300})[:2] == \
+           ("ok", "доли сходятся, журнал действий пишется")                         # малые и большие, но форматируемые
+    assert teacher_row(json_site, {**T_BASE, "shares_sum_usd": 1e25})[:2] == \
+           ("warn", "сумма долей мест больше общего бюджета — держит общий бюджет")
+
+
+def test_teacher_drift_bounded_by_places(json_site):                             # доводка р1, m-1: note не растёт
+    assert teacher_row(json_site, {**T_BASE, "shares_drift": 10}) == \
+           ("fail", "LLM-прокси считает доли не так, как сохранено", "мест: 10")       # все десять мест — по договору
+    for drift in (11, 10 ** 4000):
+        assert teacher_row(json_site, {**T_BASE, "shares_drift": drift}) == TEACHER_OFF, drift
+
+
+# --- тормоз прогона в строке «LLM-прокси и бюджет» (задача А2 Д11а, Д11-R118) ---
+
+BRAKE = {"state": "watching", "reason": None, "avail_mib": 8000, "total_mib": 16000, "fail_mib": 1024, "swap_base_mib": 0,
+         "swap_growth_mib": 0, "swap_grow_mib": 512, "psi_full10": 0.5, "psi_full_max": 10.0, "oom_kills": 0,
+         "age_s": 3.0, "halted_at": None}
+RUN_D11 = {"id": "d11-1012", "cap_usd": 33.0, "spent_usd": 1.0, "callers": 10, "calls_10m": 40, "idle_s": 2.0}
+
+
+@pytest.mark.parametrize("brake,want", [
+    (BRAKE, "ok"),
+    ({**BRAKE, "state": "halted", "reason": "psi", "psi_full10": 12.0, "halted_at": T0.isoformat()}, ("warn", RUN_HALT_DETAIL)),
+    ({**BRAKE, "age_s": 31.0}, ("warn", RUN_BRAKE_SILENT_DETAIL)),
+])
+def test_brake_rows_in_llm_line(brake, want):
+    r = LlmReply.parse(llm_obj(run=RUN_D11, run_brake=brake))
+    state, detail = llm_verdict(r, T0)
+    assert (state if want == "ok" else (state, detail)) == want and "тормоз: свободно" in llm_note(r)
+
+
+def test_brake_drill_note_and_contract():
+    r = LlmReply.parse(llm_obj(run=RUN_D11, run_brake={**BRAKE, "fail_mib": 1_000_000, "state": "halted",
+                                                       "reason": "memory", "halted_at": T0.isoformat()}))
+    assert llm_note(r).endswith("учения: порог выше всей памяти")
+    for bad in ({**BRAKE, "x": 1}, {**BRAKE, "state": "on"}, {**BRAKE, "reason": "dify"}, []):
+        with pytest.raises((KeyError, TypeError, ValueError)):
+            LlmReply.parse(llm_obj(run=RUN_D11, run_brake=bad))
+    assert LlmReply.parse({k: v for k, v in llm_obj().items() if k != "run_brake"}).run_brake is None
+    assert BRAKE_KEYS == set(BRAKE)
+
+
+def test_brake_details_fit_80_chars():
+    for d in (RUN_HALT_DETAIL, RUN_BRAKE_SILENT_DETAIL):
+        assert len(d) <= 80 and not any(ch.isdigit() for ch in d)
+
+
+# сверх брифа
+
+def test_brake_note_text_reasons_and_no_data():
+    r = LlmReply.parse(llm_obj(run=RUN_D11, run_brake={**BRAKE, "swap_growth_mib": 130, "psi_full10": 2.345}))
+    assert llm_note(r).endswith(" · тормоз: свободно 8000 МиБ (порог 1024), swap +130 МиБ от базы (порог 512),"
+                                " давление 2.35 % (порог 10), убийств 0")
+    words = {"memory": "мало памяти", "swap": "растёт swap", "psi": "давление", "oom": "убийство по памяти",
+             "blind": "память не читается"}
+    for reason, word in words.items():
+        halted = {**BRAKE, "state": "halted", "reason": reason, "halted_at": T0.isoformat()}
+        assert llm_note(LlmReply.parse(llm_obj(run=RUN_D11, run_brake=halted))).endswith(f"— остановлен: {word}")
+    silent = {**BRAKE, **dict.fromkeys(("avail_mib", "total_mib", "swap_base_mib", "swap_growth_mib", "psi_full10",
+                                         "oom_kills")), "age_s": 31.0}
+    note = llm_note(LlmReply.parse(llm_obj(run=RUN_D11, run_brake=silent)))
+    assert note.endswith("тормоз: свободно: нет данных (порог 1024), swap: нет данных (порог 512), давление: нет данных"
+                         " (порог 10), убийств: нет данных")
+    assert "учения" not in note                                                  # всей памяти не знаем — не учения
+
+
+@pytest.mark.parametrize("bad", [
+    {**BRAKE, "state": "halted"},                                                # защёлка без причины
+    {**BRAKE, "reason": "memory"},                                               # причина без защёлки
+    {**BRAKE, "state": "halted", "reason": "memory"},                            # без времени защёлки
+    {**BRAKE, "halted_at": T0.isoformat()},                                      # время без защёлки
+    {**BRAKE, "state": "halted", "reason": "dify", "halted_at": T0.isoformat()},  # причина не из кодов core
+    {**BRAKE, "avail_mib": -1}, {**BRAKE, "age_s": -0.1}, {**BRAKE, "fail_mib": 0}, {**BRAKE, "psi_full_max": 0},
+    {**BRAKE, "avail_mib": 1.5}, {**BRAKE, "oom_kills": True}, {**BRAKE, "age_s": "3"}, {**BRAKE, "psi_full10": float("nan")},
+    {**BRAKE, "halted_at": 5}, {k: v for k, v in BRAKE.items() if k != "age_s"},
+])
+def test_brake_off_contract(bad):
+    with pytest.raises((KeyError, TypeError, ValueError)):
+        BrakeInfo.parse(bad)
+
+
+def test_brake_rows_order():                                                     # после fail и unknown, раньше прогона
+    halted = {**BRAKE, "state": "halted", "reason": "oom", "halted_at": T0.isoformat()}
+    capped = {**RUN_D11, "spent_usd": 33.0, "idle_s": 999.0}
+    cases = [
+        (llm_obj(config_error="проба", run=capped, run_brake=halted), ("fail", "ошибка настройки: проба")),
+        (llm_obj(checked_at=None, run=capped, run_brake=halted), ("unknown", "OpenRouter ещё не опрашивался")),
+        (llm_obj(run=capped, run_brake=halted), ("warn", RUN_HALT_DETAIL)),
+        (llm_obj(run=capped, run_brake={**halted, "age_s": 99.0}), ("warn", RUN_HALT_DETAIL)),   # защёлка раньше молчания
+        (llm_obj(run=capped, run_brake={**BRAKE, "age_s": 99.0}), ("warn", RUN_BRAKE_SILENT_DETAIL)),
+        (llm_obj(run=capped, run_brake=BRAKE), ("warn", RUN_CAP_DETAIL)),
+        (llm_obj(run=RUN_D11, run_brake={**BRAKE, "age_s": float(RUN_BRAKE_SILENT_S)}), ("ok", "OpenRouter отвечает")),
+    ]
+    for obj, want in cases:
+        assert llm_verdict(LlmReply.parse(obj), T0) == want, obj
+    assert RUN_BRAKE_SILENT_S == 30
+
+
+def test_brake_through_check(fake_core):                                         # тот же договор по HTTP
+    halted = {**BRAKE, "state": "halted", "reason": "swap", "swap_growth_mib": 600, "halted_at": T0.isoformat()}
+    fake_core.set_llm(llm_obj(run=RUN_D11, run_brake=halted))
+    r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", T0, timeout=0.5)
+    assert (r.state, r.detail) == ("warn", RUN_HALT_DETAIL) and r.note.endswith("— остановлен: растёт swap")
+    fake_core.set_llm(llm_obj(run=RUN_D11, run_brake={**BRAKE, "state": "on"}))
+    r = check_llm("llm", "LLM-прокси и бюджет", fake_core.base + "/health/llm", T0, timeout=0.5)
+    assert (r.state, r.detail) == ("fail", "LLM-прокси ответил не по договору")

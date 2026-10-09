@@ -1,8 +1,9 @@
-// Сбой интерфейса чата (Д6-R51, ui_crash): граница ошибок вокруг чата. Сбой отрисовки — отчёт (один на сбой), текст
-// и «Перезапустить чат»: потомки монтируются заново (новый клиент, рантайм и поток). С onRestart перезапуск решает
-// владелец границы (App: новое монтирование с последним открытым разговором — доводка 1, I1), без него граница
-// перемонтирует потомков сама. Шапка с «Выйти» — вне границы и остаётся. После старта загрузчик boot.js молчит, так
-// что сбои React ловит только эта граница.
+// Сбой интерфейса (Д6-R51, ui_crash): граница ошибок вокруг чата и, с Д9а, вокруг вкладки «Калькуляторы» (своя, m5).
+// Сбой отрисовки — отчёт (один на сбой), текст и «Перезапустить»: потомки монтируются заново (у чата — новый клиент,
+// рантайм и поток). С onRestart перезапуск решает владелец границы (App: новое монтирование чата с последним открытым
+// разговором — доводка 1, I1), без него граница перемонтирует потомков сама. Тексты — пропсами crashText и
+// restartText (m-3), по умолчанию — чата. Шапка с «Выйти» — вне границы и остаётся. После старта загрузчик boot.js
+// молчит, так что сбои React ловит только граница.
 // Граница ошибок в React — только классом.
 import { Component, Fragment, type ReactNode } from "react";
 import { T_UI_CRASH, T_UI_RESTART } from "../texts";
@@ -10,6 +11,8 @@ import { T_UI_CRASH, T_UI_RESTART } from "../texts";
 export interface ErrorBoundaryProps {
   onCrash(error: unknown): void;
   onRestart?(): void;             // «Перезапустить чат»: новое монтирование у владельца границы
+  crashText?: string;             // текст сбоя; по умолчанию — чата (T_UI_CRASH)
+  restartText?: string;           // кнопка перезапуска; по умолчанию — «Перезапустить чат» (T_UI_RESTART)
   children: ReactNode;
 }
 
@@ -49,8 +52,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, State> {
     if (this.state.crashed) {
       return (
         <section className="phase crash">
-          <p data-kind="fail" role="alert">{T_UI_CRASH}</p>
-          <button type="button" onClick={this.restart}>{T_UI_RESTART}</button>
+          <p data-kind="fail" role="alert">{this.props.crashText ?? T_UI_CRASH}</p>
+          <button type="button" onClick={this.restart}>{this.props.restartText ?? T_UI_RESTART}</button>
         </section>
       );
     }

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -47,7 +48,8 @@ def insp(running=False, oom=False, code=0, restarts=0, restarting=False, paused=
 
 
 def llm_obj(**kw):
-    """Ответ /health/llm (договор задачи 6 Д4а, 30 ключей — сверяет тест стыка): всё в норме, расход $12.3456."""
+    """Ответ /health/llm (договор задачи 6 Д4а, run Д8а и run_brake Д11а, 32 ключа — сверяет тест стыка): всё в норме,
+    расход $12.3456, прогона отбора и тормоза прогона нет."""
     base = {"checked_at": (T0 - timedelta(seconds=10)).isoformat(), "config_error": None, "tokens_error": None,
             "stopped": False, "key": "ok",
             "mgmt_key": "missing", "drill": "", "ledger_ok": True, "ledger_error": None,
@@ -57,7 +59,8 @@ def llm_obj(**kw):
             "pending": 0, "pending_stuck": 0, "cost_unknown_24h": 0, "provider_mismatch_24h": 0,
             "account_remaining_usd": None, "models": ["z-ai/glm-5.3"],
             "ledger_queue": 0, "ledger_fresh": False, "ledger_reset": False,
-            "egress": {"alive": True, "last_ok_age_s": 12.0}, "refresh_started_age_s": 3600.0}
+            "egress": {"alive": True, "last_ok_age_s": 12.0}, "refresh_started_age_s": 3600.0, "run": None,
+            "run_brake": None}
     return {**base, **kw}
 
 
@@ -85,13 +88,22 @@ def put_build(root, build="abc123", files=None, meta=None):
                                                  "files": {p: hashlib.sha256(b).hexdigest() for p, b in files.items()}}))
 
 
-# /proc/meminfo для тестов: памяти с запасом; файл удаляется при выходе
-_fd, MEMINFO_FILE = tempfile.mkstemp(prefix="pcbk-meminfo-")
-with os.fdopen(_fd, "w") as _f:
-    _f.write("MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\n")
-atexit.register(os.remove, MEMINFO_FILE)
+# двойники /proc для тестов (R123а, итог Д11а m-1): meminfo — памяти с запасом, vmstat — убийств 0, давление 0;
+# настоящие /proc машины тесты не открывают. Файлы удаляются при выходе
+def _proc_twin(prefix: str, text: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    atexit.register(os.remove, path)
+    return path
 
-SETTINGS = Settings(MEMINFO_PATH=MEMINFO_FILE)
+
+MEMINFO_FILE = _proc_twin("pcbk-meminfo-", "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\n")
+VMSTAT_FILE = _proc_twin("pcbk-vmstat-", "pgfault 1\noom_kill 0\n")
+PRESSURE_FILE = _proc_twin("pcbk-pressure-", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                                             "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+
+SETTINGS = Settings(MEMINFO_PATH=MEMINFO_FILE, VMSTAT_PATH=VMSTAT_FILE, PRESSURE_PATH=PRESSURE_FILE)
 
 CHROME = shutil.which("google-chrome")
 
@@ -101,6 +113,25 @@ class NoJournal:
 
     def recent(self, limit: int = 50) -> list:
         return []
+
+
+class NoJournalWrite(NoJournal):
+    """Журнал для такта без записи: проба проходит, переходов нет (цикл run_loop в тестах, Д11 А1)."""
+
+    def probe(self) -> None:
+        pass
+
+    def record(self, checks, now) -> list:
+        return []
+
+
+def wait_until(cond, timeout_s: float, step_s: float = 0.02) -> None:
+    """Ждать, пока cond() истинно; не дождались за timeout_s — AssertionError."""
+    deadline = time.monotonic() + timeout_s
+    while not cond():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"условие не выполнилось за {timeout_s} с")
+        time.sleep(step_s)
 
 
 def start_test_server(state, journal=None, settings=SETTINGS):
