@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 
+from conftest import REPO
 from secret import Secret
 
 DECLARED_ENV = {                   # наши переменные сверх переменных базового образа — ровно эти
@@ -278,3 +279,45 @@ def test_edge_limits_me_and_notice_by_cookie_or_address(stack):            # и�
     assert (code, body) == (200, {}), (code, body)                          # корзина входа по IP не тронута
     assert 'by zone "pcbk_auth_session"' in stack.logs("pcbk-edge")        # отказы — этой зоны, а не входа
     time.sleep(10)      # корзина адреса опустеет (запас 40, 5 r/s): следующие модули открывают /login без cookie
+
+
+# Д12-R137: компоновка сервера ничем не держится за Dify (успех 3)
+
+
+def dify_ties(cfg: dict, roots: list[str]) -> list[str]:
+    """Что в итоговой компоновке связывает стенд с чужим: сети, тома, привязки, env_file, configs, секреты, режим сети."""
+    inside = lambda p: any(p == r or p.startswith(r.rstrip("/") + "/") for r in roots)
+    out = []
+    for name, s in cfg["services"].items():
+        if s.get("network_mode") or s.get("external_links") or s.get("links"):
+            out.append(f"{name}: сеть хоста или ссылки")
+        if s.get("env_file"):
+            out.append(f"{name}: env_file")
+        out += [f"{name}: зависит от {d}" for d in set(s.get("depends_on") or {}) - set(cfg["services"])]
+        for v in s.get("volumes") or []:
+            if v["type"] == "bind" and v["source"] != "/var/run/docker.sock" and not inside(v["source"]):
+                out.append(f"{name}: привязка {v['source']}")
+            if v["type"] == "volume" and not v["source"].startswith("pcbk-"):
+                out.append(f"{name}: том {v['source']}")
+    out += [f"сеть {n}" for n, net in cfg["networks"].items()
+            if net.get("external") or not (net.get("name") or n).startswith("pcbk-")]
+    out += [f"том {n}" for n, v in cfg["volumes"].items()
+            if v.get("external") and not re.fullmatch(r"pcbk-student-(0[1-9]|10)-(state|work)", v.get("name") or n)]
+    out += [f"секрет {n}" for n, sec in (cfg.get("secrets") or {}).items() if not inside(sec.get("file", ""))]
+    out += [f"configs {n}" for n in (cfg.get("configs") or {})]
+    return out
+
+
+def test_production_config_independent_of_dify(stack, tmp_path):
+    """Сети, тома, привязки, секреты compose.yaml — только свои; env_file и configs нет; слова dify нет вне комментариев."""
+    env = stack.test_env()
+    roots = [env[k] for k in ("TLS_DIR", "DATA_DIR", "AGENTS_DIR", "SECRETS_DIR")] + [str(REPO / "edge")]
+    assert dify_ties(stack.prod_config(), roots) == []
+    text = "\n".join(line.split("#", 1)[0] for line in (REPO / "compose.yaml").read_text(encoding="utf-8").splitlines())
+    assert "dify" not in text.lower()
+    bad = tmp_path / "compose.bad.yaml"                                   # положительный контроль
+    bad.write_text("services:\n  core:\n    networks: {dify: {}}\n"
+                   "    volumes: [{type: bind, source: /opt/dify/docker/volumes, target: /x}]\n"
+                   "networks:\n  dify: {name: docker_default, external: true}\n", encoding="utf-8")
+    ties = dify_ties(stack.config(files=("compose.yaml", str(bad))), roots)
+    assert "сеть dify" in ties and any("/opt/dify" in t for t in ties), ties
