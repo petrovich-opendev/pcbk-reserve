@@ -1718,10 +1718,12 @@ done
 **Проверка** — обязательна перед тем, как копию можно считать годной:
 
 ```bash
-# PRAGMA integrity_check — читает уже снятую копию, без сети и без доступа к текущим данным тома
-docker run --rm --network none --user 10003:10003 -v "$B:/b:ro" --entrypoint python pcbk-reserve/core:d11a -c '
+# PRAGMA integrity_check — читает уже снятую копию, без сети и без доступа к текущим данным тома;
+# от пользователя выкладки (каталог копии — 0700) и с immutable=1: на томе только для чтения SQLite иначе
+# не открывает файл («unable to open database file», окно 1, 12.10)
+docker run --rm --network none --user "$(id -u):$(id -g)" -v "$B:/b:ro" --entrypoint python pcbk-reserve/core:<день> -c '
 import sqlite3
-c = sqlite3.connect("file:/b/core.db?mode=ro", uri=True)
+c = sqlite3.connect("file:/b/core.db?mode=ro&immutable=1", uri=True)
 print(c.execute("PRAGMA integrity_check").fetchone()[0])'
 ```
 Ожидается `ok`.
