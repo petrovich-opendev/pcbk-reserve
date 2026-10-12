@@ -1626,6 +1626,28 @@ pause`, `DRILL_FRESHNESS`, `DRILL_FREEZE_LOOP`, `LLM_RUN_SILENT_S`, правка
 значений — той же командой. Свидетель, который спал, после проверки снова остановлен (`docker stop`). Ни учёток, ни
 томов, ни `DRILL_*` модуль не трогает.
 
+## Самолечение и учётка историана (с 12.10)
+
+Критерий владельца 12.10: резерв работает, отвечает и связан с БДРВ. Два сценария `deploy/ops/` в `cron` пользователя
+выкладки (на сервере — `/opt/pcbk-reserve/ops/`, журналы — `/opt/pcbk-reserve/logs/`):
+- `pcbk-bdrv-sync.sh` — раз в 10 мин сверяет копию учётки историана (`SECRETS_DIR/bdrv.env`) с файлом Dify
+  (`/opt/dify/scripts/.bdrv.env`, только чтение). Сменили пароль у Dify — копия обновляется, `core` пересоздаётся
+  (`up -d --no-build --force-recreate core`): связь с БДРВ восстанавливается сама, без ручного шага «Учётка историана».
+  Журнал — `logs/bdrv-sync.log` (строка на каждое обновление).
+- `pcbk-autoheal.sh` — раз в 2 мин: `pcbk-core`, `pcbk-edge`, `pcbk-watchdog` в состоянии `unhealthy` 3 проверки подряд
+  (≈ 6 мин) — `docker restart`, не чаще раза в 30 мин на контейнер. Упавший контейнер поднимает сам Docker
+  (`restart: unless-stopped`); остановленный администратором — не трогается. Журнал — `logs/autoheal.log`.
+
+Установка (один раз, от пользователя выкладки; строки `cron` добавляются к существующим):
+```bash
+install -d -m 0755 /opt/pcbk-reserve/ops && install -d -m 0750 /opt/pcbk-reserve/logs
+install -m 0755 ops/pcbk-bdrv-sync.sh ops/pcbk-autoheal.sh /opt/pcbk-reserve/ops/
+( crontab -l 2>/dev/null; echo "*/10 * * * * /opt/pcbk-reserve/ops/pcbk-bdrv-sync.sh"; echo "*/2 * * * * /opt/pcbk-reserve/ops/pcbk-autoheal.sh" ) | crontab -
+crontab -l
+```
+Проверка — `tail /opt/pcbk-reserve/logs/autoheal.log /opt/pcbk-reserve/logs/bdrv-sync.log` (пусто — значит, вмешиваться
+не пришлось). Снять — удалить две строки из `crontab -e`.
+
 ## Модели по ролям (с 12.10)
 
 Решение владельца 12.10 по итогам сравнения на живом стенде (те же пять сценариев демонстрации, оценка ответов —
