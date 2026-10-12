@@ -220,7 +220,7 @@ services:
   core:
     build: ./core
     # откатный образ — `core:d10b` (Д11а, А0; deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d13b
+    image: pcbk-reserve/core:d14a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
