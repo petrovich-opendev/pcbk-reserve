@@ -25,6 +25,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp
 
+from ..agents.findings import AgentFindings
 from ..agents.stats import AgentStats
 from ..agents.store import AgentStore, StoreError
 from ..app import RoleBase
@@ -38,6 +39,8 @@ from .gate import GateRefused, GateResult, HistorianGate
 from .historian import HistClock, HistorianError, QueryFn, parse_clock
 from .http_api import data_router, validation_handler
 from .mcp_server import MCP_PATH, build_mcp, mcp_auth
+from .my_agents import MyAgents
+from .report_event import ReportEvent
 from .save_agent import SaveAgent
 from .service import DataService
 from .sql import allowed_literal, catalog_sql, clock_sql, live_all_sql, live_sql
@@ -72,7 +75,8 @@ class DataRole(RoleBase):
     agent_stats — счётчики агентов студентов (Д7-R53, Д7-R60): один объект на процесс, его создаёт
     main.build_roles и отдаёт и шлюзу (/health/agents); не передан — свой (тесты). agents — учёт и файлы агентов
     (Д7-R56): не передан — AgentStore(settings.DB_PATH, settings.AGENTS_ROOT), конструктор только запоминает пути;
-    save_agent — инструмент MCP save_agent (Д7-R57).
+    save_agent — инструмент MCP save_agent (Д7-R57). findings — находки агентов (agent_findings, Д13): не передан —
+    AgentFindings(settings.DB_PATH), тот же core.db, что и у шлюза; report_event и my_agents — инструменты MCP Д13.
     """
 
     name = "data"
@@ -82,7 +86,8 @@ class DataRole(RoleBase):
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  config_error: str | None = None,
                  tokens: TokenTable | None = None, tokens_error: str | None = None,
-                 agents: AgentStore | None = None, agent_stats: AgentStats | None = None):
+                 agents: AgentStore | None = None, agent_stats: AgentStats | None = None,
+                 findings: AgentFindings | None = None):
         self.settings = settings
         self.config_error = config_error
         self.tokens = TokenTable.empty() if tokens is None else tokens
@@ -93,6 +98,7 @@ class DataRole(RoleBase):
         self.wallclock = wallclock
         self.agent_stats = AgentStats(monotonic=monotonic) if agent_stats is None else agent_stats
         self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT) if agents is None else agents
+        self.findings = AgentFindings(settings.DB_PATH) if findings is None else findings
         # вне TagName IN (…) ворота пускают только даты сводки и закрытый набор ww-значений
         self.gate = HistorianGate(query, allowed=whitelist, literal_ok=allowed_literal, monotonic=monotonic)
         self.catalog = Catalog.empty()
@@ -106,6 +112,8 @@ class DataRole(RoleBase):
         self.clock_mono: float | None = None
         self.service = DataService(self)
         self.save_agent = SaveAgent(self)
+        self.report_event = ReportEvent(self)
+        self.my_agents = MyAgents(self)
         self.mcp = build_mcp(self)
         self.mcp_app = mcp_auth(self.mcp.streamable_http_app(), self)
 
@@ -376,6 +384,10 @@ class DataRole(RoleBase):
             else:
                 self.agent_stats.store_failed(self.agents.last_error or "Error")
                 log.error("учёт агентов: не открыт (%s)", self.agents.last_error)
+            # находки агентов (Д13): сбой — строка журнала, report_event ответит unavailable сам при записи; не
+            # config_error — вход и прочие инструменты от находок не зависят
+            if not await asyncio.to_thread(self.findings.open):
+                log.error("находки агентов: не открыты (%s)", self.findings.last_error)
             if self.config_error:
                 log.error("служба данных: фоновые циклы не запущены — %s", self.config_error)
                 yield

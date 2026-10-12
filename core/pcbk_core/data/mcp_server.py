@@ -1,6 +1,6 @@
 """MCP службы данных: catalog_search, tag_now, tag_period и калькуляторы tag_series, calc_runtime (Д9-R85) — вторая
-тонкая оболочка над той же DataService; save_agent (Д7а, Д7-R57) — только здесь, без HTTP-ручки: тонкая оболочка над
-SaveAgent роли.
+тонкая оболочка над той же DataService; save_agent (Д7а, Д7-R57), my_agents и report_event (Д13) — только здесь,
+без HTTP-ручки: тонкие оболочки над SaveAgent, MyAgents и ReportEvent роли.
 
 mcp 1.30.0 (FastMCP), Streamable HTTP без сессий (stateless), ответ JSON, точный маршрут /mcp.
 
@@ -41,6 +41,7 @@ from .. import zones
 from .http_api import (UNAUTHORIZED, CalcRuntimeArgs, CatalogSearchArgs, TagNowArgs, TagPeriodArgs, TagSeriesArgs,
                        bearer_caller, unauthorized, validation_reason)
 from .periods import PRESETS
+from .report_event import REPORT_DESCRIPTION, REPORT_PROPERTIES, REPORT_REQUIRED
 from .save_agent import SAVE_DESCRIPTION, SAVE_PROPERTIES, SAVE_REQUIRED
 from .service import QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
 from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
@@ -71,10 +72,16 @@ TOOL_DESCRIPTIONS = {
                     "от окончания тега (_RUN 1 — работает, _CLS 1 — закрыт): в ответе есть подпись. Аналоговые теги "
                     "не считаются.",
     "save_agent": SAVE_DESCRIPTION,         # одно место правды — save_agent.py (research/09 §4.1, дословно)
+    "my_agents": "Ваши сохранённые агенты этого места (без архивных и отправленных на карантин), с их инструкцией "
+                "— чтобы найти агента и предложить студенту правку. Без аргументов.",
+    "report_event": REPORT_DESCRIPTION,     # одно место правды — report_event.py (Д13)
 }
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 # Д7-R57: пишет, но не разрушает; повтор того же черновика — already, не второй агент
 SAVE_ANNOTATIONS = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+# Д13: report_event пишет, не разрушает; не идемпотентен — каждый вызов создаёт новую строку находки
+REPORT_ANNOTATIONS = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+                                     openWorldHint=False)
 
 Tags = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "string", "maxLength": TAG_CHARS},
                                                "minItems": 1, "maxItems": MAX_NAMES})]
@@ -95,6 +102,16 @@ AgentTools = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["tools"])]
 AgentTags = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["tags"])]
 AgentPrompt = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["prompt"])]
 StudentReply = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["student_reply"])]
+AgentReplace = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["replace"])]
+ReportAgent = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["agent"])]
+ReportKind = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["kind"])]
+ReportTitle = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["title"])]
+ReportTags = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["tags"])]
+ReportPeriodStart = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["period_start"])]
+ReportPeriodEnd = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["period_end"])]
+ReportValue = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["value"])]
+ReportSetpoint = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["setpoint"])]
+ReportText = Annotated[Any, Field(json_schema_extra=REPORT_PROPERTIES["text"])]
 
 log = logging.getLogger("pcbk_core.data.mcp")
 
@@ -111,8 +128,9 @@ def _caller(ctx: Context, role: "DataRole") -> str | None:
 
 
 def build_mcp(role: "DataRole") -> FastMCP:
-    """Сервер MCP роли: пять инструментов только для чтения (служба — role.service в момент вызова) и save_agent
-    (role.save_agent, Д7-R57).
+    """Сервер MCP роли: пять инструментов только для чтения (служба — role.service в момент вызова) и my_agents
+    (role.my_agents, Д13) — читают; save_agent (role.save_agent, Д7-R57) и report_event (role.report_event, Д13) —
+    пишут.
 
     log_level="WARNING": без корневого обработчика (setup_logging его ставит) FastMCP настроил бы корень
     сам (basicConfig), и на INFO pytds писал бы адрес историана и начало SQL.
@@ -185,7 +203,8 @@ def build_mcp(role: "DataRole") -> FastMCP:
     @mcp.tool(name="save_agent", description=TOOL_DESCRIPTIONS["save_agent"], annotations=SAVE_ANNOTATIONS)
     async def save_agent(ctx: Context, name: AgentName = None, title: AgentTitle = None, node: AgentNode = None,
                          purpose: AgentPurpose = None, tools: AgentTools = None, tags: AgentTags = None,
-                         prompt: AgentPrompt = None, student_reply: StudentReply = None) -> dict[str, Any]:
+                         prompt: AgentPrompt = None, student_reply: StudentReply = None,
+                         replace: AgentReplace = False) -> dict[str, Any]:
         caller = _caller(ctx, role)
         if caller is None:              # мимо mcp_auth (вызов без запроса HTTP): отказ без события
             log.warning("outcome=unauthorized channel=mcp tool=save_agent")
@@ -194,10 +213,35 @@ def build_mcp(role: "DataRole") -> FastMCP:
         # место — только из токена: в аргументах его нет, лишние ключи FastMCP уже отбросил
         return await role.save_agent.call(caller, {"name": name, "title": title, "node": node, "purpose": purpose,
                                                    "tools": tools, "tags": tags, "prompt": prompt,
-                                                   "student_reply": student_reply})
+                                                   "student_reply": student_reply, "replace": replace})
 
     # m8: все восемь полей обязательны — в схеме для модели; FastMCP по ней не отказывает (validate_input=False)
     mcp._tool_manager.get_tool("save_agent").parameters["required"] = list(SAVE_REQUIRED)
+
+    @mcp.tool(name="my_agents", description=TOOL_DESCRIPTIONS["my_agents"], annotations=READ_ONLY)
+    async def my_agents_tool(ctx: Context) -> dict[str, Any]:
+        caller = _caller(ctx, role)
+        if caller is None:
+            log.warning("outcome=unauthorized channel=mcp tool=my_agents")
+            return {"tool": "my_agents", "status": "refused", "message": UNAUTHORIZED["detail"], "notes": []}
+        return await role.my_agents.call(caller)
+
+    @mcp.tool(name="report_event", description=TOOL_DESCRIPTIONS["report_event"], annotations=REPORT_ANNOTATIONS)
+    async def report_event(ctx: Context, agent: ReportAgent = None, kind: ReportKind = None,
+                           title: ReportTitle = None, tags: ReportTags = None,
+                           period_start: ReportPeriodStart = None, period_end: ReportPeriodEnd = None,
+                           value: ReportValue = None, setpoint: ReportSetpoint = None,
+                           text: ReportText = None) -> dict[str, Any]:
+        caller = _caller(ctx, role)
+        if caller is None:
+            log.warning("outcome=unauthorized channel=mcp tool=report_event")
+            return {"tool": "report_event", "status": "refused", "message": UNAUTHORIZED["detail"], "notes": []}
+        return await role.report_event.call(caller, {"agent": agent, "kind": kind, "title": title, "tags": tags,
+                                                     "period_start": period_start, "period_end": period_end,
+                                                     "value": value, "setpoint": setpoint, "text": text})
+
+    # все пять обязательны — в схеме для модели (как save_agent, m8); лишние ключи FastMCP отбрасывает до функции
+    mcp._tool_manager.get_tool("report_event").parameters["required"] = list(REPORT_REQUIRED)
     return mcp
 
 

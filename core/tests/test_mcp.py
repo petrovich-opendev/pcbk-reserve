@@ -45,15 +45,23 @@ def raw(url, method="POST", body=INIT, **headers):
 async def test_mcp_lists_tools(core_server):
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
         tools = {t.name: t for t in (await s.list_tools()).tools}
-    assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "save_agent"}
+    assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "save_agent",
+                          "my_agents", "report_event"}                                       # Д13: восемь
     assert all(tools[name].annotations.readOnlyHint is True
-               for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime"))
+               for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "my_agents"))
     saver = tools["save_agent"]
     assert (saver.annotations.readOnlyHint, saver.annotations.destructiveHint, saver.annotations.idempotentHint,
             saver.annotations.openWorldHint) == (False, False, True, False)                  # Д7-R57
     assert sorted(saver.inputSchema["required"]) == sorted(SAVE_REQUIRED) and len(SAVE_REQUIRED) == 8   # m8
     props = saver.inputSchema["properties"]
-    assert set(props) == set(SAVE_REQUIRED) and "mode" not in props and "steps" not in props
+    assert set(props) == set(SAVE_REQUIRED) | {"replace"} and "mode" not in props and "steps" not in props
+    assert (props["replace"]["type"], props["replace"]["default"]) == ("boolean", False)      # Д13: необязательный
+    reporter = tools["report_event"]
+    assert (reporter.annotations.readOnlyHint, reporter.annotations.destructiveHint,
+            reporter.annotations.idempotentHint) == (False, False, False)                     # Д13
+    assert sorted(reporter.inputSchema["required"]) == sorted(
+        ("agent", "kind", "title", "tags", "text"))
+    assert tools["my_agents"].inputSchema["properties"] == {}
     assert (props["name"]["pattern"], props["name"]["minLength"], props["name"]["maxLength"]) == (
         "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", 3, 40)
     assert props["tools"]["items"]["enum"] == list(AGENT_TOOLS)                       # Д9а: пять (Д9-R89)

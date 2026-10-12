@@ -11,6 +11,11 @@
 5. AgentStore.save в потоке под замком: повтор того же черновика — already, другое имя занято — name_taken.
    Учёт ответил (любой исход, кроме StoreError) — флаг сбоя учёта роли снят (итоговое ревью Д7а, I-1).
 
+Аргумент replace (Д13, необязательный, по умолчанию false): true и у места есть живая строка с этим name —
+AgentStore.replace вместо save, под тем же замком места и в том же шаге 5 (прежняя версия в архив, новая пишется
+как обычный save; сбой записи новой — откат архива); true, а такой строки нет — refused replace_missing. Ответ ok
+несёт replaced: true (не already).
+
 Место — только из вызывающего (токен, Ш25): в аргументах места нет, лишние ключи FastMCP отбрасывает до функции.
 Отказ — обычный результат, не isError (research/09 §4.3). Каждый вызов — событие agent_events и строка журнала
 «tool=save_agent caller=… channel=mcp outcome=… codes=… ms=N»: без имени агента, тегов, текста полей и путей —
@@ -33,7 +38,7 @@ import anyio
 
 from ..agents.draft import (AGENT_TOOLS, MAX_TAGS, NAME_MAX, NAME_MIN, PROMPT_MAX, PROMPT_MIN, TEXT_LIMITS, Draft,
                             Problem, check_draft, render_agent_file)
-from ..agents.store import DirUnavailable, NameTaken, StoreError, TooManyAgents, place_of_caller
+from ..agents.store import DirUnavailable, NameTaken, ReplaceMissing, StoreError, TooManyAgents, place_of_caller
 from .events import CallEvent, Outcome
 from .gate import SlidingWindow
 from .service import ERROR_MESSAGE, MESSAGES, TAG_CHARS, requested_of
@@ -51,7 +56,7 @@ SAVE_DESCRIPTION = ("Сохраняет агента студента после
                     "исправьте и повторите не больше двух раз.")
 SAVE_REQUIRED = ("name", "title", "node", "purpose", "tools", "tags", "prompt", "student_reply")
 # схема аргументов для модели — research/09 §4.1 без mode и steps (Д7-R54): пределы она только показывает, проверяет
-# служба (check_draft); числа — из draft.py, одно место правды
+# служба (check_draft); числа — из draft.py, одно место правды. replace (Д13) — необязательный, не в SAVE_REQUIRED
 SAVE_PROPERTIES: dict[str, dict[str, Any]] = {
     "name": {"type": "string", "minLength": NAME_MIN, "maxLength": NAME_MAX, "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
              "description": "Имя для системы: строчные латинские буквы, цифры, дефисы; 2–4 слова, "
@@ -73,6 +78,9 @@ SAVE_PROPERTIES: dict[str, dict[str, Any]] = {
     "student_reply": {"type": "string", "minLength": TEXT_LIMITS["student_reply"][0],
                       "maxLength": TEXT_LIMITS["student_reply"][1],
                       "description": "Дословный ответ студента с согласием на последний черновик"},
+    "replace": {"type": "boolean", "default": False,
+               "description": "Заменить прежнюю версию агента с тем же name (после явного согласия студента на "
+                              "замену); агента с этим именем у места нет — отказ replace_missing"},
 }
 # тексты ответа (Д7-R57); их читает модель. refused собирает refused_message, каталог — MESSAGES["catalog"] службы
 SAVE_MESSAGES = {
@@ -110,7 +118,9 @@ def refused_message(n: int) -> str:
 
 @dataclass
 class _Result:
-    """Итог вызова: статус ответа, коды (в summary события и в строку журнала), текст и замечания для модели."""
+    """Итог вызова: статус ответа, коды (в summary события и в строку журнала), текст и замечания для модели.
+
+    replaced — Д13: replace=true и запись удалась (ответ несёт replaced, не already; always already is False)."""
 
     status: Outcome
     codes: tuple[str, ...]
@@ -118,18 +128,20 @@ class _Result:
     problems: list[Problem] = field(default_factory=list)
     draft: Draft | None = None
     already: bool = False
+    replaced: bool = False
 
     def answer(self) -> dict[str, object]:
         out: dict[str, object] = {"tool": TOOL, "status": self.status, "message": self.message,
                                   "problems": [p.to_json() for p in self.problems], "notes": []}
         if self.status == "ok" and self.draft is not None:
-            out.update(name=self.draft.name, title=self.draft.title, already=self.already)
+            out.update(name=self.draft.name, title=self.draft.title)
+            out["replaced" if self.replaced else "already"] = True if self.replaced else self.already
         return out
 
     def summary(self) -> str:
-        """saved | already | refused: <коды> | <исход>: <код>; признаки черновика — через «; flags: …» (Д7-R57)."""
+        """saved | already | replaced | refused: <коды> | <исход>: <код>; признаки — через «; flags: …» (Д7-R57)."""
         if self.status == "ok":
-            text = "already" if self.already else "saved"
+            text = "replaced" if self.replaced else "already" if self.already else "saved"
         elif self.status == "rate":
             text = "rate"
         else:
@@ -138,7 +150,10 @@ class _Result:
         return text + (f"; flags: {', '.join(flags)}" if flags else "")
 
     def log_codes(self) -> str:
-        codes = (("already" if self.already else "saved"),) if self.status == "ok" else self.codes
+        if self.status == "ok":
+            codes = ("replaced" if self.replaced else "already" if self.already else "saved",)
+        else:
+            codes = self.codes
         flags = self.draft.flags if self.draft is not None else ()
         return ",".join((*codes, *flags)) or "-"
 
@@ -213,40 +228,46 @@ class SaveAgent:
             text = render_agent_file(draft, infos, caller=caller, created_at=now)
         except ValueError:                                  # больше MAX_FILE_BYTES и т. п. — не запись (Д7-R55)
             return _Result("error", ("render_failed",), SAVE_MESSAGES["error"], draft=draft)
+        replace = raw.get("replace") is True                            # Д13: только явный True включает замену
+        op = role.agents.replace if replace else role.agents.save
         lock = self._locks.setdefault(place, asyncio.Lock())
         async with lock:                                                # 5. учёт и файл — в потоке под замком места
-            work = asyncio.ensure_future(asyncio.to_thread(role.agents.save, place, draft, text, now))
+            work = asyncio.ensure_future(asyncio.to_thread(op, place, draft, text, now))
             try:
                 await asyncio.shield(work)
             except asyncio.CancelledError:
                 # m3: поток всё равно дописывает — замок места держится до его конца (следующий вызов места иначе
                 # прочёл бы учёт посреди записи), итог записи — событию вызова; затем отмена идёт дальше
                 await _wait_out(work)
-                late.append(self._stored(work, draft))
+                late.append(self._stored(work, draft, replace))
                 raise
             except Exception:                       # отказ учёта или сбой записи — исход разбирает _stored
                 pass
-        return self._stored(work, draft)
+        return self._stored(work, draft, replace)
 
-    def _stored(self, work: asyncio.Future[str], draft: Draft) -> _Result:
-        """Итог AgentStore.save (поток уже кончился); не бросает. Учёт ответил — любой исход, кроме StoreError, — флаг
-        сбоя учёта роли снят (I-1): already, NameTaken и TooManyAgents идут после чтения строк учёта, DirUnavailable —
-        тоже (save читает строки раньше каталога), это сбой каталога, а не учёта."""
+    def _stored(self, work: asyncio.Future[str], draft: Draft, replace: bool = False) -> _Result:
+        """Итог AgentStore.save/replace (поток уже кончился); не бросает. Учёт ответил — любой исход, кроме
+        StoreError, — флаг сбоя учёта роли снят (I-1): already/replaced, NameTaken, TooManyAgents и ReplaceMissing
+        (Д13) идут после чтения строк учёта, DirUnavailable — тоже (save/replace читает строки раньше каталога),
+        это сбой каталога, а не учёта."""
         stats = self.role.agent_stats
         exc = work.exception()
         if isinstance(exc, StoreError):
             stats.store_failed(str(exc))                                # текст StoreError — без пути и значений
             return _Result("unavailable", ("store_error",), SAVE_MESSAGES["store"], draft=draft)
-        if exc is not None and not isinstance(exc, (NameTaken, TooManyAgents, DirUnavailable)):
+        if exc is not None and not isinstance(exc, (NameTaken, TooManyAgents, DirUnavailable, ReplaceMissing)):
             return _Result("error", (type(exc).__name__,), SAVE_MESSAGES["error"], draft=draft)   # только класс
         stats.store_ok()
         if isinstance(exc, NameTaken):
             return _refused([Problem.make("name", "name_taken", draft.name, existing=exc.existing)], draft)
         if isinstance(exc, TooManyAgents):
             return _refused([Problem.make("name", "too_many_agents")], draft)
+        if isinstance(exc, ReplaceMissing):
+            return _refused([Problem.make("name", "replace_missing", draft.name)], draft)
         if isinstance(exc, DirUnavailable):
             return _Result("unavailable", ("dir_unavailable",), SAVE_MESSAGES["dir"], draft=draft)
-        return _Result("ok", (), SAVE_MESSAGES["ok"], draft=draft, already=work.result() == "already")
+        return _Result("ok", (), SAVE_MESSAGES["ok"], draft=draft,
+                       already=(not replace and work.result() == "already"), replaced=replace)
 
     async def _finish(self, caller: str, raw: Mapping[str, object], result: _Result, began: float) -> None:
         """Счётчик → событие (запись в потоке; сбой записи ответ не ломает) → строка журнала."""
