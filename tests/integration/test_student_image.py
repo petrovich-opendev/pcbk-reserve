@@ -38,7 +38,7 @@ FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 2
 K_FRONT = ('# pcbk-reserve: встроенный агент образа, редакция 1 (Д7); меняется только пересборкой образа\n'
            'description: "Конструктор агентов: за один разговор собирает с технологом его агента по узлу"\n'
            'mode: primary\nsteps: 12\npermission:\n  "*": deny\n  pcbk_catalog_search: allow\n'
-           '  pcbk_tag_now: allow\n  pcbk_save_agent: allow\n')
+           '  pcbk_tag_now: allow\n  pcbk_save_agent: allow\n  pcbk_my_agents: allow\n')   # Д13: правка агента
 # пробный агент теста external_directory — только в тесте, не в образе: без блока permission наследует правила
 # opencode.json — образа (точка монтирования агентов Д7) или копии без правил (у pomoshnik read нет вовсе,
 # охрану проверяет он)
@@ -204,19 +204,21 @@ def test_konstruktor_file():                                                    
                  "служба отклоняет такие слова и в запрете",                         # доводка р1, I1: prompt_forbidden
                  "В инструкции и назначении агента НЕЛЬЗЯ",                          # m3: норма-число и в purpose
                  "«konstruktor» и не с «pcbk» в начале",                             # m1: name_reserved службы
-                 "Сохранённого агента поменять нельзя",                              # m2: name_taken — только новый
-                 "умеет только пять вещей", "tag_series", "calc_runtime",            # Д9а (Д9-R89, m8, I-1)
+                 "ПРАВКА АГЕНТА", "replace", "pcbk_my_agents",                       # Д13: правка — та же name, replace
+                 "КОНТРОЛЬНАЯ ТОЧКА", "порог технолога, не норматив ПЦБК", "pcbk_report_event",   # Д13: точка против _SP
+                 "умеет только шесть вещей", "tag_series", "calc_runtime",            # Д9а (Д9-R89, m8, I-1)
                  "как менялся параметр, наработка, поиск тегов",                     # строка «Что умеет» черновика
                  "Выясни три вещи",                                                  # шаг 1 не трогается
                  # доводка А6 р1, I-1: шаг 5 и строки плана инструкции — то, что даёт агенту новые инструменты
-                 "tools — короткие имена: catalog_search, tag_now, tag_period, tag_series, calc_runtime (обычно "
+                 "tools — короткие имена: catalog_search, tag_now, tag_period, tag_series, calc_runtime, report_event (обычно "
                  "catalog_search, tag_now и tag_period; tag_series — если технолог спрашивает, как менялся "
-                 "параметр; calc_runtime — если в тегах есть теги состояний _RUN, _OPN, _CLS и нужна наработка)",
+                 "параметр; calc_runtime — если в тегах есть теги состояний _RUN, _OPN, _CLS и нужна наработка; report_event — "
+                 "только для контрольной точки",
                  "вопрос „как менялся …“ → pcbk_tag_series за <период>; назови значение в начале, в конце и "
                  "изменение.",
                  "вопрос о наработке → pcbk_calc_runtime за <период>; назови часы в каждом состоянии с подписью.",
-                 "Строки про pcbk_tag_series и pcbk_calc_runtime необязательны: пиши их, только если они есть в "
-                 "tools агента.",
+                 "Строки про pcbk_tag_series, pcbk_calc_runtime и контрольную точку необязательны: пиши их, только "
+                 "если соответствующий инструмент (tag_series, calc_runtime, report_event) есть в tools агента.",
                  # доводка А6 р1, I-2: черновик обещает только то, что агент получит
                  "В строке «Что умеет» называй только то, что агент получит в tools: «как менялся параметр» — "
                  "только с tag_series, «наработка» — только с calc_runtime."):
