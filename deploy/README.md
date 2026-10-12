@@ -1679,7 +1679,9 @@ services:
 `LLM_FALLBACK` (неизвестное имя, основная совпадает с запасной или повторена, запасная не входит в `LLM_MODELS`,
 когда тот не пуст) — ошибка настройки LLM-прокси, как у `LLM_MODELS`. Срабатывания — не в `/health/llm` (ключей
 не добавлено), а в строке журнала `core` (`docker compose logs core`): `llm caller=… model=<запасная модель> …
-fallback_from=<основная> fallback_reason=<rate|in_flight|server|unreachable>`.
+fallback_from=<основная> fallback_reason=<rate|in_flight|server|unreachable>`. На сервере ПЦБК с 12.10 (вечер,
+`core:d14a`) — `LLM_FALLBACK=z-ai/glm-5.3=z-ai/glm-5.3-flash`, Конструктор снова на `glm-5.3` (временный перевод всех
+агентов на `flash` снят; его конфиг — `compose.override.yaml.flash-all` рядом).
 
 **Нагрузка 12.10** (10 студентов одновременно через веб: вход, Помощник, Конструктор, калькулятор): сервер — с запасом
 (свободно не меньше 7026 МиБ из 11 610, swap +1 МиБ, давление памяти ≤ 1,83 %); узкое место — частота у провайдера
