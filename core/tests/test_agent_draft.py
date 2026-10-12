@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 
 from helpers import AGENT_DRAFT, BIG_TAGS, agent_catalog, agent_text
-from pcbk_core.agents.draft import (AGENT_TOOLS, FORBIDDEN, MAX_FILE_BYTES, MAX_TAGS, NAME_RE, PROBLEM_TEXTS,
-                                    PROMPT_MAX, PROMPT_MAX_BYTES, RESERVED_NAMES, Problem, check_draft, draft_digest,
+from pcbk_core.agents.draft import (AGENT_TOOLS, FORBIDDEN, MAX_FILE_BYTES, MAX_TAGS, NAME_LINE, NAME_RE,
+                                    PROBLEM_TEXTS, PROMPT_MAX, PROMPT_MAX_BYTES, RESERVED_NAMES, TEMPLATE_VERSION,
+                                    Problem, check_draft, draft_digest, extract_prompt, one_line_problem,
                                     render_agent_file)
 from pcbk_core.data.catalog import TagInfo
 from pcbk_core.data.sql import SAFE_NAME
@@ -367,7 +368,7 @@ CHECKED_DIGEST_D7 = "cf436d9510f82c15ac3aeffdde5b748e64070fcfe3143b93f5f0e928c3d
 
 
 def test_agent_tools_d9():                                                        # Review Focus 5
-    assert AGENT_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
+    assert AGENT_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "report_event")
     for tools in (["tag_series"], ["calc_runtime"], ["pcbk_calc_runtime", "catalog_search"]):
         draft, problems = check_draft({**OK, "tools": tools}, CAT.lookup)
         assert problems == [] and draft is not None, tools
@@ -388,3 +389,47 @@ def test_agent_digest_d7_unchanged():                                           
     assert draft_digest(AGENT_DRAFT) == AGENT_DRAFT_DIGEST_D7
     d7, _ = check_draft({**OK, "tools": ["tag_period", "tag_now", "catalog_search"]}, CAT.lookup)
     assert draft_digest(d7) == CHECKED_DIGEST_D7
+
+
+# --- Д13: строка имени (NAME_LINE) и извлечение инструкции для my_agents (extract_prompt) ---
+
+def test_render_includes_name_line_right_after_title():
+    d, _ = check_draft(OK, CAT.lookup)
+    text = render_agent_file(d, {"20FAKE_001_PV": CAT.lookup("20FAKE_001_PV").info}, caller="student-03", created_at=AT)
+    lines = text.splitlines()
+    title_i = next(i for i, l in enumerate(lines) if l.startswith("Ты — агент «"))
+    assert lines[title_i + 1] == NAME_LINE.format(name="sushka-bdm2") == (
+        "Твоё имя в системе: `sushka-bdm2` (его передавай в pcbk_report_event как agent).")
+    assert f"шаблон {TEMPLATE_VERSION}" in lines[1] and TEMPLATE_VERSION == 2
+
+
+@pytest.mark.parametrize("tags", [[], ["20FAKE_001_PV"], ["20FAKE_001_PV", "20FAKE_003_PV"]])
+def test_extract_prompt_round_trips(tags):                                # с тегами и без — секция «Теги узла»
+    tools = ["catalog_search", "tag_now"] if not tags else ["tag_now"]
+    d, problems = check_draft({**OK, "tags": tags, "tools": tools}, CAT.lookup)
+    assert problems == []
+    infos = {t: CAT.lookup(t).info for t in d.tags}
+    text = render_agent_file(d, infos, caller="student-03", created_at=AT)
+    assert extract_prompt(text, d.name) == d.prompt
+
+
+def test_extract_prompt_round_trips_multiline_prompt():                   # внутренние пустые строки инструкции
+    prompt = BODY + "\n\nВторой абзац.\n\nТретий."
+    d, problems = check_draft({**OK, "prompt": prompt}, CAT.lookup)
+    assert problems == [] and d.prompt == prompt
+    text = render_agent_file(d, {"20FAKE_001_PV": CAT.lookup("20FAKE_001_PV").info}, caller="student-03", created_at=AT)
+    assert extract_prompt(text, d.name) == prompt
+
+
+def test_extract_prompt_missing_marker_is_empty():                        # файл не того вида (ручная правка, шаблон 1)
+    assert extract_prompt("Ты — агент «Старый». Узел: x.\n\nИнструкция.\n", "sushka-bdm2") == ""
+    text = render_agent_file(check_draft(OK, CAT.lookup)[0], {"20FAKE_001_PV": CAT.lookup("20FAKE_001_PV").info},
+                             caller="student-03", created_at=AT)
+    assert extract_prompt(text, "chuzhoe-imya") == ""                     # имя другого агента — не найдено
+
+
+def test_one_line_problem_matches_text_field():
+    assert one_line_problem("ok", 1, 10) is False
+    assert one_line_problem("a", 2, 10) is True                            # короче low
+    assert one_line_problem("a" * 11, 1, 10) is True                       # длиннее high
+    assert one_line_problem("a\nb", 1, 10) is True                         # перевод строки — отказ

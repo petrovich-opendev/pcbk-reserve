@@ -24,10 +24,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..data.catalog import Lookup, TagInfo
 
-TEMPLATE_VERSION = 1
+TEMPLATE_VERSION = 2
 # инструменты агента студента; save_agent у агента студента — никогда (Global Constraints Д7). Ряд и наработка Д9а
-# (Д9-R89) — в конце: строки allow и дайджест черновика идут в порядке AGENT_TOOLS, файлы и дайджесты агентов Д7 прежние
-AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime")
+# (Д9-R89) и report_event Д13 — в конце: строки allow и дайджест черновика идут в порядке AGENT_TOOLS, файлы и
+# дайджесты агентов Д7/Д9 прежние
+AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "report_event")
 _NUMBER_TOOLS = frozenset({"tag_now", "tag_period", "tag_series", "calc_runtime"})
 _TOOL_PREFIX = "pcbk_"
 
@@ -117,6 +118,8 @@ PROBLEM_TEXTS: dict[str, str] = {
     # уровень учёта: их ставит SaveAgent по исключениям AgentStore.save (Д7-R56)
     "name_taken": "Агент с именем «{v}» уже есть — возьмите другое имя",
     "too_many_agents": "У этого рабочего места уже 20 агентов — новый не сохранить; обратитесь к преподавателю",
+    # replace: true, а живого агента с этим именем нет (Д13: ставит SaveAgent по AgentStore.ReplaceMissing)
+    "replace_missing": "Агента с таким именем у вас нет — сохраните как нового",
 }
 
 _RULES = (
@@ -125,6 +128,13 @@ _RULES = (
     "допуски и пороги, которых нет в данных, не называй; общие знания помечай «общие знания, не норматив",
     "ПЦБК». Отказ службы или «нет данных» — сообщай как есть, число не подставляй.",
 )
+# сразу после строки «Ты — агент «…»…» (Д13, render_agent_file): имя для pcbk_report_event; my_agents (extract_prompt)
+# ищет эту же строку, чтобы найти начало инструкции
+NAME_LINE = "Твоё имя в системе: `{name}` (его передавай в pcbk_report_event как agent)."
+_RULES_MARKER = "\n\n" + _RULES[0]
+# начало раздела тегов без даты (она в render_agent_file динамическая): extract_prompt ищет, что из двух разделов
+# идёт первым после инструкции — раздел тегов (если он есть) или сразу правила стенда
+_TAGS_MARKER = "\n\n## Теги узла"
 
 
 @dataclass(frozen=True)
@@ -178,6 +188,12 @@ def _string(value: object) -> str | None:
     return value
 
 
+def clean_string(value: object) -> str | None:
+    """Строка без одиночных суррогатов, иначе None — публичная копия _string (Д13: report_event применяет ту же
+    проверку к title и text до one_line_problem — суррогат не дошёл бы до SQLite и уронил бы запись)."""
+    return _string(value)
+
+
 def _strings(value: object) -> list[str] | None:
     """Список строк без одиночных суррогатов, иначе None."""
     if not isinstance(value, (list, tuple)):
@@ -199,6 +215,33 @@ def _forbidden(field: str, text: str) -> list[Problem]:
         if m and m.group(0) not in found:
             found.append(m.group(0))
     return [Problem.make(field, "forbidden", v) for v in found]
+
+
+def one_line_problem(text: str, low: int, high: int) -> bool:
+    """Поле одной строкой: длина low…high и без управляющих/форматных знаков — та же проверка, что у text_field
+    черновика (Д13: report_event применяет её к своим текстовым полям, «как у полей черновика»)."""
+    return not low <= len(text) <= high or bool(_ONE_LINE_BAD.search(text))
+
+
+def extract_prompt(text: str, name: str) -> str:
+    """Инструкция агента из текста файла (my_agents, Д13): между строкой имени (NAME_LINE) и разделом «## Правила
+    стенда» — ровно то, что сохранил студент в prompt, без строк шаблона. Файл не того вида (ручная правка,
+    старый шаблон без строки имени) — пустая строка: my_agents не должен отдавать служебные строки шаблона вместо
+    инструкции."""
+    marker = NAME_LINE.format(name=name)
+    pos = text.find(marker)
+    if pos == -1:
+        return ""
+    rest = text[pos + len(marker):]
+    rules_at = rest.rfind(_RULES_MARKER)
+    if rules_at == -1:
+        return ""
+    tags_at = rest.find(_TAGS_MARKER)
+    # раздел тегов (если есть) идёт раньше правил — границу инструкции задаёт первый из двух разделов
+    idx = tags_at if 0 <= tags_at < rules_at else rules_at
+    if idx < 2:
+        return ""
+    return rest[2:idx]
 
 
 def check_draft(raw: Mapping[str, object], lookup: Callable[[str], Lookup] | None
@@ -240,7 +283,7 @@ def check_draft(raw: Mapping[str, object], lookup: Callable[[str], Lookup] | Non
         if field not in values:
             continue
         text = texts[field] = values[field].strip()
-        if not low <= len(text) <= high or _ONE_LINE_BAD.search(text):
+        if one_line_problem(text, low, high):
             add(Problem.make(field, "text_field", text))
         if field in _FORBIDDEN_FIELDS:
             for p in _forbidden(field, text[:high]):        # сверх предела — уже text_field (I1)
@@ -324,6 +367,8 @@ def _check_for_render(draft: Draft, infos: Mapping[str, TagInfo], caller: str, c
         raise ValueError("вызывающий вне шаблона")
     if created_at.tzinfo is None or created_at.utcoffset() is None:
         raise ValueError("время записи без пояса")
+    if not NAME_MIN <= len(draft.name) <= NAME_MAX or not NAME_RE.fullmatch(draft.name):   # Д13: имя — в строке NAME_LINE
+        raise ValueError("имя черновика вне NAME_RE")
     for value in (draft.title, draft.node, draft.purpose):
         if not value or _ONE_LINE_BAD.search(value):
             raise ValueError("поле черновика не одной строкой")
@@ -356,6 +401,7 @@ def render_agent_file(draft: Draft, infos: Mapping[str, TagInfo], *, caller: str
         *(f"  {_TOOL_PREFIX}{tool}: allow" for tool in AGENT_TOOLS if tool in draft.tools),
         "---",
         f"Ты — агент «{draft.title}» учебного стенда ПЦБК. Узел: {draft.node}.",
+        NAME_LINE.format(name=draft.name),
         "",
         draft.prompt,
         "",

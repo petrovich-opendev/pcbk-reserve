@@ -15,7 +15,7 @@ from helpers import AGENT_DRAFT, AGENT_NOW, agent_text, make_agents_root, non_ro
 from pcbk_core.agents import store as store_module
 from pcbk_core.agents.draft import MAX_FILE_BYTES
 from pcbk_core.agents.store import (MAX_AGENTS, AgentMissing, AgentStore, DirUnavailable, NameTaken, PendingReload,
-                                    StoreError, TooManyAgents, place_of_caller)
+                                    ReplaceMissing, StoreError, TooManyAgents, place_of_caller)
 
 NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
 TEXT = agent_text()
@@ -483,6 +483,86 @@ def test_cards_read_file_and_live_counts(tmp_path):
     base.symlink_to(tmp_path / "moved")
     with pytest.raises(DirUnavailable):
         s.read_file(5, AGENT_DRAFT.name)
+
+
+# --- Д13: save_agent replace=true — AgentStore.replace и title_of ---
+
+def test_replace_archives_old_and_saves_new(store, draft):
+    store.save(3, draft, TEXT, NOW)
+    before = (store.place_dir(3) / f"{draft.name}.md").stat().st_mtime_ns
+    new_draft = replace(draft, title="Сушка БДМ-2 (правка)")
+    new_text = agent_text(new_draft)
+    at = NOW + timedelta(seconds=5)
+    assert store.replace(3, new_draft, new_text, at) == "replaced"
+    rows = store.list_place(3)
+    assert len(rows) == 1 and rows[0].title == "Сушка БДМ-2 (правка)" and rows[0].state == "saved"
+    assert store.live_count(3) == 1                                     # замена не прибавила живых строк
+    assert (store.place_dir(3) / f"{draft.name}.md").read_text("utf-8") == new_text
+    assert (store.place_dir(3) / f"{draft.name}.md").stat().st_mtime_ns != before
+    archived = list((store.root / "archive").glob(f"student-03-*/{draft.name}.md"))
+    assert len(archived) == 1 and archived[0].read_text("utf-8") == TEXT    # прежняя версия цела в архиве
+    assert store.pending()[3].since == NOW                                 # since — прежний (save не двигает его)
+
+
+def test_replace_missing_raises_and_changes_nothing(store, draft):
+    with pytest.raises(ReplaceMissing):
+        store.replace(3, draft, TEXT, NOW)
+    assert store.live_count(3) == 0 and list(store.place_dir(3).iterdir()) == []
+    assert list((store.root / "archive").iterdir()) == []                  # ничего не создано
+    # положительный контроль: то же имя, но архивное (не живое) — тоже «нет такого»
+    store.save(3, draft, TEXT, NOW); store.archive(3, draft.name, NOW)
+    with pytest.raises(ReplaceMissing):
+        store.replace(3, draft, TEXT, NOW + timedelta(seconds=1))
+
+
+def test_replace_at_cap_succeeds_but_not_beyond(store, draft):            # предел MAX_AGENTS при замене
+    store.save(3, draft, TEXT, NOW)
+    for i in range(MAX_AGENTS - 1):
+        (store.place_dir(3) / f"m{i:02d}.md").write_text("x")              # файлы без строки — тоже считаются (taken)
+    assert store.replace(3, replace(draft, title="Другое"), TEXT, NOW + timedelta(seconds=1)) == "replaced"
+    assert store.live_count(3) == 1 and store.list_place(3)[0].title == "Другое"
+    (store.place_dir(3) / "extra.md").write_text("x")                      # теперь занято ровно MAX_AGENTS именами
+    with pytest.raises(TooManyAgents):
+        store.replace(3, replace(draft, title="Третье"), TEXT, NOW + timedelta(seconds=2))
+    rows = store.list_place(3)                                             # откат: прежняя (после первой замены) жива
+    assert len(rows) == 1 and rows[0].title == "Другое" and rows[0].state == "saved"
+    assert (store.place_dir(3) / f"{draft.name}.md").exists()
+
+
+def test_replace_rolls_back_on_save_failure(store, draft, monkeypatch):   # откат при сбое записи
+    store.save(3, draft, TEXT, NOW)
+    original = (store.place_dir(3) / f"{draft.name}.md").read_text("utf-8")
+
+    def boom(*a, **k):
+        raise StoreError("учёт агентов: OperationalError SQLITE_BUSY")
+
+    monkeypatch.setattr(store, "save", boom)
+    with pytest.raises(StoreError):
+        store.replace(3, replace(draft, title="Другое"), TEXT, NOW + timedelta(seconds=1))
+    rows = store.list_place(3)
+    assert len(rows) == 1 and rows[0].title == draft.title and rows[0].state == "saved"    # прежняя версия жива
+    assert (store.place_dir(3) / f"{draft.name}.md").read_text("utf-8") == original
+    assert list((store.root / "archive").glob("student-03-*/*")) == []     # файл вернулся из архива на место
+
+
+def test_replace_quarantined_leaves_quarantine_file_alone(store, draft):  # замена без файла места (карантин)
+    store.save(3, draft, TEXT, NOW)
+    store.quarantine(3, f"{draft.name}.md", NOW)
+    new_draft = replace(draft, title="Новое")
+    assert store.replace(3, new_draft, agent_text(new_draft), NOW + timedelta(seconds=1)) == "replaced"
+    rows = store.list_place(3)
+    assert len(rows) == 1 and rows[0].title == "Новое" and rows[0].state == "saved"
+    moved = list((store.root / "quarantine" / "student-03").iterdir())
+    assert len(moved) == 1 and moved[0].read_text("utf-8") == TEXT         # карантинный файл не тронут
+
+
+def test_title_of_archived_and_missing(store, draft):
+    store.save(3, draft, TEXT, NOW)
+    assert store.title_of(3, draft.name) == draft.title
+    store.archive(3, draft.name, NOW)
+    assert store.title_of(3, draft.name) == draft.title                    # архивный — прежнее название
+    assert store.title_of(3, "net-takogo") is None                        # не найден вовсе
+    assert store.title_of(4, draft.name) is None                          # другое место — не найден
 
 
 def test_read_file_odd_marks_and_card_columns(store, draft):              # сверх брифа: odd — только у кривого файла

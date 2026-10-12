@@ -114,6 +114,13 @@ class TooManyAgents(Exception):
         super().__init__(f"у места уже {MAX_AGENTS} агентов")
 
 
+class ReplaceMissing(Exception):
+    """save_agent replace=true, а живой (не archived) строки с этим именем у места нет (Д13)."""
+
+    def __init__(self) -> None:
+        super().__init__("агента с таким именем нет")
+
+
 class AgentMissing(Exception):
     """read_file: агента у места нет (нет живой строки, архивный, файла нет) или файл не годится — odd: ссылка, не
     обычный файл, больше MAX_FILE_BYTES, не UTF-8 (шлюз пишет строку WARNING). Текст — без имени и пути."""
@@ -505,6 +512,63 @@ class AgentStore:
             raise
         return "saved"
 
+    def replace(self, place: int, draft: Draft, text: str, now: datetime) -> Literal["replaced"]:
+        """save, но вместо отказа «имя занято живым агентом» прежняя живая (не archived) строка с тем же именем
+        сперва уходит в архив — тем же механизмом, что admin archive с --name, только этот агент (Д13: save_agent
+        replace=true); новая версия пишется под тем же именем уже как обычный save (имя свободно: архивная строка
+        и перенесённый файл не мешают).
+
+        Нет живой строки с этим именем (архивной тоже) — ReplaceMissing, ничего не меняется. Запись новой версии не
+        удалась (любое исключение save, включая StoreError/DirUnavailable/TooManyAgents) — откат: файл возвращается
+        из архива на место, строка — в прежнее состояние, исключение save идёт дальше. Вызывающий держит тот же
+        замок места, что и у save — промежутка без агента другой вызов места не увидит.
+        """
+        _check_place(place)
+        name = _check_name(draft.name)
+        with self._op() as db:
+            row = db.execute(f"SELECT id, state FROM agents WHERE name = ? AND {_LIVE}", (name, place)).fetchone()
+        if row is None:
+            raise ReplaceMissing()
+        row_id, prev_state = row
+        at, since = _iso(now), _utc(now).isoformat()
+        found = self._locate(place, [f"{name}.md"])
+        src = found[0] if found is not None else None
+        adir = self._side_dir(ARCHIVE_DIR, f"student-{place:02d}-{_utc(now):{_STAMP}}")
+        moved: Path | None = None
+        if src is not None:
+            try:
+                moved = _move_no_clobber(src, adir, f"{name}.md", always_suffix=False)
+            except OSError as exc:
+                raise DirUnavailable(f"{DIR_PLACE} ({type(exc).__name__})") from None
+        try:
+            with self._op() as db:
+                db.execute("BEGIN IMMEDIATE")
+                # по id, не по (place, name): старых архивных строк этого имени может быть несколько (прежние
+                # замены) — WHERE по имени задел бы и их, а откат ниже вернул бы сразу несколько строк в 'saved' и
+                # упёрся бы в agents_live (m: раунд отладки Д13)
+                db.execute("UPDATE agents SET state = 'archived', state_at = ? WHERE id = ?", (at, row_id))
+                db.execute(_UPSERT_RELOAD, (place, since, 0))
+                db.execute("COMMIT")
+        except BaseException:
+            if moved is not None:
+                with suppress(OSError):
+                    os.replace(moved, src)
+            raise
+        try:
+            self.save(place, draft, text, now)
+        except BaseException:
+            with suppress(StoreError):             # откат по месту важнее отказа журнала учёта (прежняя версия жива)
+                with self._op() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("UPDATE agents SET state = ?, state_at = ? WHERE id = ? AND state = 'archived'",
+                               (prev_state, at, row_id))
+                    db.execute("COMMIT")
+            if moved is not None:
+                with suppress(OSError):
+                    os.replace(moved, src)
+            raise
+        return "replaced"
+
     @staticmethod
     def _write_new(base: Path, final: Path, tmp_name: str, data: bytes, taken: set[str]) -> None:
         """Шаг 2 save: временный файл → fsync → os.link (без перезаписи) → unlink временного → fsync каталога."""
@@ -696,6 +760,18 @@ class AgentStore:
         with self._op() as db:
             row = db.execute(f"SELECT flags FROM agents WHERE name = ? AND {_LIVE}", (name, place)).fetchone()
         return () if row is None else tuple(json.loads(row[0]))
+
+    def title_of(self, place: int, name: str) -> str | None:
+        """Название строки этого имени места — любого состояния (архивной тоже), последней по id; имени не было —
+        None (Д13: подпись находок GET /pcbk/api/events — «агент в архиве, его прежнее название», «не найден —
+        name» вызывающий решает сам по None)."""
+        _check_place(place)
+        if not _valid_name(name):
+            return None
+        with self._op() as db:
+            row = db.execute("SELECT title FROM agents WHERE place = ? AND name = ? ORDER BY id DESC LIMIT 1",
+                             (place, name)).fetchone()
+        return None if row is None else row[0]
 
     def list_place(self, place: int) -> list[AgentRow]:
         """Неархивные строки места в порядке записи."""
