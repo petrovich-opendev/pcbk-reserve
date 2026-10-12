@@ -119,6 +119,7 @@ CALLER_LOG_CHARS = 64
 TOOL_WINDOW = 50                # tools_stats: столько последних вызовов инструментов (http, mcp и web)
 FAIL_STREAK = 3                 # столько ошибок инструмента подряд — он в tools_stats()["failing"] (Д9-R83)
 FAIL_STALE_S = 1800.0           # инструмент не звали дольше (монотонные часы роли) — из failing уходит сам
+DEVIATION_DEFAULT_POINTS = 72   # calc_deviation (Д13): по умолчанию 72 точки на тег — крупнее, чем у tag_series
 
 # код ошибки ворот или историана → текст для людей; исход — outcome_for (OUTCOME_BY_CODE, F11)
 _CODE_MESSAGES = {"connect": MESSAGES["connect"], "auth": MESSAGES["auth"], "timeout": MESSAGES["timeout"],
@@ -260,6 +261,27 @@ def _points_problem(points: object) -> str | None:
     return None
 
 
+def _deviation_tag_problem(field: str, value: object) -> str | None:
+    """measure_tag/setpoint_tag (Д13): один тег строкой, как элемент tags у прочих инструментов."""
+    if not isinstance(value, str):
+        return f"{field}: нужен тег строкой"
+    if len(value) > TAG_CHARS:
+        return f"{field}: строка тега длиннее {TAG_CHARS} знаков"
+    return None
+
+
+def _deviation_tags_problem(measure_tag: object, setpoint_tag: object) -> str | None:
+    return _deviation_tag_problem("measure_tag", measure_tag) or _deviation_tag_problem("setpoint_tag", setpoint_tag)
+
+
+def _threshold_problem(value: object) -> str | None:
+    """threshold (Д13): число больше 0, конечное — порог технолога, не bool."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float, Decimal))
+            or not math.isfinite(float(value)) or not float(value) > 0):
+        return "threshold: число больше 0"
+    return None
+
+
 def _query_problem(query: object, limit: object) -> str | None:
     if not isinstance(query, str) or not 0 < len(query) <= QUERY_CHARS:
         return f"query: нужна строка от 1 до {QUERY_CHARS} знаков"
@@ -280,6 +302,63 @@ def _resolve(catalog: Catalog, tags: Sequence[str]) -> list[_Entry]:
         found = catalog.lookup(raw)
         out.append(_Entry(found.info.name if found.info is not None else raw.strip(), found))
     return out
+
+
+def _lookup_entry(catalog: Catalog, raw: str) -> _Entry:
+    """Разбор одного имени без схлопывания повторов (calc_deviation, Д13): измерение и задание — разные роли,
+    даже если студент ошибся и прислал один и тот же тег в обе."""
+    found = catalog.lookup(raw)
+    return _Entry(found.info.name if found.info is not None else raw.strip(), found)
+
+
+def _deviation_ready(entry: _Entry) -> bool:
+    """Тег готов измерением или заданием calc_deviation: в белом списке и аналоговый — как у ряда."""
+    return entry.lookup.status == "ok" and entry.lookup.info is not None and entry.lookup.info.kind == "analog"
+
+
+def _deviation_pairs(measure_rows: Sequence[Row], setpoint_rows: Sequence[Row]) -> list[tuple[datetime, float, float]]:
+    """Пары (метка, измерение, задание) ряда calc_deviation — по совпадающим меткам времени; без значения у
+    любого из тегов в паре — точка в пару не входит (Д13)."""
+    by_time = {row[1]: row for row in setpoint_rows}
+    pairs: list[tuple[datetime, float, float]] = []
+    for row in measure_rows:
+        other = by_time.get(row[1])
+        if other is None:
+            continue
+        measure, setpoint = _num(row[2]), _num(other[2])
+        if measure is None or setpoint is None:
+            continue
+        pairs.append((row[1], measure, setpoint))
+    return pairs
+
+
+def _deviation_interval(run: list[tuple[datetime, float, float, float]], tz: tzinfo) -> dict[str, Any]:
+    """Интервал подряд идущих пар сверх порога (Д13): start/end — метки первой и последней, at/value/setpoint —
+    у пары с наибольшим |изм − зад| (первая из равных)."""
+    at, value, setpoint, dev = max(run, key=lambda p: p[3])
+    return {"start": _iso(_aware(run[0][0], tz)), "end": _iso(_aware(run[-1][0], tz)), "points": len(run),
+            "max_abs_dev": dev, "at": _iso(_aware(at, tz)), "value": value, "setpoint": setpoint}
+
+
+def _deviation_stats(pairs: list[tuple[datetime, float, float]], threshold: float,
+                     tz: tzinfo) -> tuple[float | None, float | None, int, list[dict[str, Any]]]:
+    """max/mean |изм − зад| по всем парам, число пар строго сверх порога и их интервалы (подряд идущие пары, Д13)."""
+    devs = [abs(m - s) for _, m, s in pairs]
+    over_count = sum(1 for d in devs if d > threshold)
+    intervals: list[dict[str, Any]] = []
+    run: list[tuple[datetime, float, float, float]] = []
+    for (when, measure, setpoint), dev in zip(pairs, devs):
+        if dev > threshold:
+            run.append((when, measure, setpoint, dev))
+            continue
+        if run:
+            intervals.append(_deviation_interval(run, tz))
+            run = []
+    if run:
+        intervals.append(_deviation_interval(run, tz))
+    max_abs_dev = max(devs) if devs else None
+    mean_abs_dev = (sum(devs) / len(devs)) if devs else None
+    return max_abs_dev, mean_abs_dev, over_count, intervals
 
 
 def _num(value: object) -> float | None:
@@ -484,8 +563,8 @@ class _Scope:
 
 
 class DataService:
-    """Пять инструментов чтения роли «данные». Ворота, каталог, часы, журнал событий и monotonic — из роли
-    в момент вызова; конструктор без ввода-вывода."""
+    """Шесть инструментов чтения роли «данные» (с calc_deviation, Д13). Ворота, каталог, часы, журнал событий и
+    monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
 
     def __init__(self, role: DataRole, *, cache: TTLCache | None = None, flight: SingleFlight | None = None,
                  per_caller: SlidingWindow | None = None):
@@ -550,6 +629,16 @@ class DataService:
             return await self.config_unavailable(caller, channel, "calc_runtime", tags)
         call = self._call(caller, channel, "calc_runtime", tags)
         return await self._run(call, self._calc_runtime(call, tags, period, start, end))
+
+    async def calc_deviation(self, caller: str, channel: Channel, measure_tag: str, setpoint_tag: str,
+                             threshold: float, period: str | None = None, start: str | None = None,
+                             end: str | None = None, points: int = DEVIATION_DEFAULT_POINTS) -> dict[str, Any]:
+        """Отклонение измерения от задания регулятора (Д13): контрольная точка считается службой — не агентом."""
+        if self.role.config_error:          # F5
+            return await self.config_unavailable(caller, channel, "calc_deviation", [measure_tag, setpoint_tag])
+        call = self._call(caller, channel, "calc_deviation", [measure_tag, setpoint_tag])
+        return await self._run(call, self._calc_deviation(call, measure_tag, setpoint_tag, threshold, period, start,
+                                                           end, points))
 
     async def refuse_args(self, caller: str, channel: Channel, tool: str, requested: Sequence[str],
                           reason: str) -> dict[str, Any]:
@@ -715,12 +804,19 @@ class DataService:
         if not names:
             items = [refused_item(e) for e in entries]
             raise _Refusal("refused", MESSAGES["none"], "none: " + _counts(items), extra={"items": items})
+        clock, now_r, period = await self._clock_period(call, preset, start, end, names)
+        return _Scope(entries, names, clock, now_r, period)
+
+    async def _clock_period(self, call: _Call, preset: str | None, start: str | None, end: str | None,
+                            names: tuple[str, ...]) -> tuple[HistClock, datetime, Period]:
+        """Часы, «сейчас» (округлено один раз — то же now_r в resolve_period и ttl_for, F21) и период — общий шаг
+        после разбора имён; бюджет тего-суток — здесь же, до SQL на каждом пути (общий путь _period_scope и
+        calc_deviation, Д13)."""
         try:
             clock = await self._fresh_clock()
         except (HistorianError, GateRefused) as err:
             call.sent = err.sent if isinstance(err, HistorianError) else ()      # у часов имён нет
             raise _refusal(err) from None
-        # «сейчас» округляется один раз: то же now_r — в resolve_period и в ttl_for (F21)
         now_r = round_now(self._hist_now())
         try:
             period = resolve_period(now_r, clock.offset, preset, start, end)
@@ -728,11 +824,67 @@ class DataService:
             raise _args_refusal(str(err)) from None
         call.start, call.end = clock.aware(period.start), clock.aware(period.end)
         call.cost = cost_tag_days(len(names), period.start, period.end)
-        # бюджет — до SQL на каждом пути: ворота сверяют форму SQL, а не длину окна
         problem = check_budget(len(names), period.start, period.end)
         if problem is not None:
             raise self._budget_refusal(problem, "budget", call, period, clock)
-        return _Scope(entries, names, clock, now_r, period)
+        return clock, now_r, period
+
+    async def _calc_deviation(self, call: _Call, measure_tag: str, setpoint_tag: str, threshold: float,
+                              preset: str | None, start: str | None, end: str | None, points: int) -> dict[str, Any]:
+        """Отклонение измерения от задания регулятора (Д13): чтение — тем же путём, что tag_series (ворота, белый
+        список, бюджет, точки, кэш — тот же tool "tag_series", один запрос за оба тега); порог технолога — только
+        аргумент вызова, строгое >. Пары — по совпадающим меткам времени ряда; точка без значения у любого из
+        тегов в пару не входит. Интервал — подряд идущие пары сверх порога."""
+        self._check_rate(call)
+        self._check_drill()
+        reason = (_deviation_tags_problem(measure_tag, setpoint_tag) or _threshold_problem(threshold)
+                  or _period_problem(preset, start, end) or _points_problem(points))
+        if reason:
+            raise _args_refusal(reason)
+        catalog = self._loaded_catalog()
+        # ошибки периода, которым не нужно «сейчас», — до запроса часов: такой отказ не шлёт SQL (как у ряда)
+        known = self.role.clock
+        reason = _period_syntax(preset, start, end, known.offset if known is not None else timedelta(0))
+        if reason:
+            raise _args_refusal(reason)
+        measure_entry = _lookup_entry(catalog, measure_tag)
+        setpoint_entry = _lookup_entry(catalog, setpoint_tag)
+        if not (_deviation_ready(measure_entry) and _deviation_ready(setpoint_entry)):
+            # тег вне белого списка, неизвестен или не аналоговый — отказ как у ряда («ни один тег нельзя
+            # запросить»): без обоих ролей считать отклонение нечем, SQL не шлётся
+            items = [self._series_item(measure_entry, None, None), self._series_item(setpoint_entry, None, None)]
+            raise _Refusal("refused", MESSAGES["none"], "none: " + _counts(items), extra={"items": items})
+        names = ((measure_entry.shown,) if measure_entry.shown.upper() == setpoint_entry.shown.upper()
+                 else (measure_entry.shown, setpoint_entry.shown))
+        clock, now_r, period = await self._clock_period(call, preset, start, end, names)
+        # точки — после окна и тего-суток и до series_sql, как у tag_series
+        problem = check_points(len(names), points)
+        if problem is not None:
+            raise self._budget_refusal(problem, "budget: points", call, period, clock)
+        key = cache_key("tag_series", names, period.start, period.end, extra=str(points))
+        ttl = ttl_for("tag_series", period.end, now_r)
+        snap = await self._fetch(call, key, lambda: self._read_series(names, period, points, key, ttl))
+        measure_rows = snap.rows.get(measure_entry.shown.upper(), ())
+        setpoint_rows = snap.rows.get(setpoint_entry.shown.upper(), ())
+        pairs = _deviation_pairs(measure_rows, setpoint_rows)
+        max_abs_dev, mean_abs_dev, over_count, intervals = _deviation_stats(pairs, float(threshold), clock.tz)
+        measure_has_data = any(_num(r[2]) is not None for r in measure_rows)
+        setpoint_has_data = any(_num(r[2]) is not None for r in setpoint_rows)
+        is_open = period.open or snap.open
+        notes = [GRID_NOTE, *self._period_notes(period, is_open)]
+        if not measure_has_data:
+            notes.append(f"{measure_entry.shown}: {ITEM_TEXTS['no_data']}")
+        if not setpoint_has_data:
+            notes.append(f"{setpoint_entry.shown}: {ITEM_TEXTS['no_data']}")
+        call.tags = (measure_entry.shown, setpoint_entry.shown)
+        call.summary = (f"{period.preset or 'свой период'}, точек {points}: пар {len(pairs)}, "
+                        f"сверх порога {over_count}")
+        status = "ok" if measure_has_data and setpoint_has_data else "partial"
+        return {"tool": "calc_deviation", "status": status, "notes": notes, "cache": call.cache,
+                "period": self._period_json(period, clock, is_open), "measure_tag": measure_entry.shown,
+                "setpoint_tag": setpoint_entry.shown, "threshold": float(threshold), "points": len(pairs),
+                "max_abs_dev": max_abs_dev, "mean_abs_dev": mean_abs_dev, "over_count": over_count,
+                "intervals": intervals}
 
     # --- шаги ---
 

@@ -9,9 +9,9 @@ from helpers import (LLM_TOKEN, SETTINGS, TOKEN, chat_body, gateway_role, make_a
                      wait_until, wait_until_async)
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS
-from pcbk_core.data.http_api import (MAX_BODY_BYTES, BodyLimit, CalcRuntimeArgs, TagNowArgs, TagSeriesArgs,
-                                     validation_reason)
-from pcbk_core.data.service import _points_problem, _tags_problem
+from pcbk_core.data.http_api import (MAX_BODY_BYTES, BodyLimit, CalcDeviationArgs, CalcRuntimeArgs, TagNowArgs,
+                                     TagSeriesArgs, validation_reason)
+from pcbk_core.data.service import _points_problem, _tags_problem, _threshold_problem
 from pcbk_core.data.sql import SERIES_MAX_TAGS
 from pcbk_core.logs import setup_logging
 
@@ -231,6 +231,12 @@ def test_http_series_and_runtime(tmp_path):
         r = c.post("/api/data/tag_series", json={"tags": ["20FAKE_001_PV"], "points": 1, "period": "last_8h"},
                    headers=auth)
         assert r.status_code == 422 and r.json()["status"] == "refused" and "points" in r.json()["message"]
+        r = c.post("/api/data/calc_deviation",
+                   json={"measure_tag": "20FAKE_001_PV", "setpoint_tag": "20FAKE_004_PV", "threshold": 5,
+                         "period": "last_8h", "points": 3}, headers=auth)
+        body = r.json()
+        assert r.status_code == 200 and body["tool"] == "calc_deviation" and body["status"] == "ok"
+        assert (body["points"], body["over_count"]) == (2, 2)                   # Д13: 04:00 — у задания нет значения
 
 
 # сверх брифа: пределы моделей, 422 с событием, точки по умолчанию, ошибка настройки — 503
@@ -246,7 +252,13 @@ def test_http_calculator_models(tmp_path):
               "points: нужно целое число"),
              ("calc_runtime", {"tags": [f"25FAKE_{i:03d}_CLS" for i in range(17)], "period": "yesterday"},
               "tags: не больше 16 тегов за вызов"),
-             ("calc_runtime", {"tags": ["25FAKE_007_CLS"], "period": "last_year"}, "period: неизвестное значение")]
+             ("calc_runtime", {"tags": ["25FAKE_007_CLS"], "period": "last_year"}, "period: неизвестное значение"),
+             ("calc_deviation", {"measure_tag": "20FAKE_001_PV", "setpoint_tag": "20FAKE_002_SP", "threshold": 0,
+                                 "period": "last_8h"}, "threshold: число больше 0"),
+             ("calc_deviation", {"measure_tag": "20FAKE_001_PV", "setpoint_tag": "20FAKE_002_SP", "threshold": -1,
+                                 "period": "last_8h"}, "threshold: число больше 0"),
+             ("calc_deviation", {"measure_tag": "20FAKE_001_PV", "setpoint_tag": "20FAKE_002_SP", "threshold": "x",
+                                 "period": "last_8h"}, "threshold: число больше 0")]
     with TestClient(app) as c:
         wait_until(lambda: role.catalog.loaded)
         for tool, body, reason in cases:
@@ -267,7 +279,10 @@ def test_model_refusal_texts_same_as_service():                 # итогова
              (TagSeriesArgs, {"tags": ["A"], "points": 1}, _points_problem(1)),
              (TagSeriesArgs, {"tags": ["A"] * 5}, _tags_problem(["A"] * 5, SERIES_MAX_TAGS)),
              (CalcRuntimeArgs, {"tags": ["A"] * 17}, _tags_problem(["A"] * 17)),
-             (TagNowArgs, {"tags": []}, _tags_problem([])))
+             (TagNowArgs, {"tags": []}, _tags_problem([])),
+             (CalcDeviationArgs, {"measure_tag": "A", "setpoint_tag": "B", "threshold": 0}, _threshold_problem(0)),
+             (CalcDeviationArgs, {"measure_tag": "A", "setpoint_tag": "B", "threshold": 1, "points": 97},
+              _points_problem(97)))
     for model, body, direct in cases:
         with pytest.raises(ValidationError) as exc:
             model.model_validate(body)
@@ -280,7 +295,9 @@ def test_http_calculators_config_error_is_503(tmp_path):
     with TestClient(create_app(SETTINGS, [role])) as c:
         for tool, body in (("tag_series", {"tags": ["20FAKE_001_PV"], "period": "last_8h"}),
                            ("calc_runtime", {"tags": ["25FAKE_007_CLS"], "period": "yesterday"}),
-                           ("tag_series", {"tags": ["20FAKE_001_PV"], "points": 1})):
+                           ("tag_series", {"tags": ["20FAKE_001_PV"], "points": 1}),
+                           ("calc_deviation", {"measure_tag": "20FAKE_001_PV", "setpoint_tag": "20FAKE_002_SP",
+                                               "threshold": 1.0, "period": "last_8h"})):
             r = c.post(f"/api/data/{tool}", json=body, headers=auth)
             assert (r.status_code, r.json()["status"], r.json()["tool"]) == (503, "unavailable", tool), body
     assert fake.calls == []

@@ -368,20 +368,27 @@ CHECKED_DIGEST_D7 = "cf436d9510f82c15ac3aeffdde5b748e64070fcfe3143b93f5f0e928c3d
 
 
 def test_agent_tools_d9():                                                        # Review Focus 5
-    assert AGENT_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "report_event")
-    for tools in (["tag_series"], ["calc_runtime"], ["pcbk_calc_runtime", "catalog_search"]):
+    assert AGENT_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
+                           "calc_deviation", "report_event")                      # Д13: калькулятор отклонения
+    for tools in (["tag_series"], ["calc_runtime"], ["pcbk_calc_runtime", "catalog_search"],
+                 ["calc_deviation", "tag_now"], ["pcbk_calc_deviation", "pcbk_report_event", "tag_now"]):
         draft, problems = check_draft({**OK, "tools": tools}, CAT.lookup)
         assert problems == [] and draft is not None, tools
     assert check_draft({**OK, "tools": ["calc_runtime", "tag_now"]}, CAT.lookup)[0].tools == ("tag_now", "calc_runtime")
+    assert check_draft({**OK, "tools": ["calc_deviation", "tag_now"]}, CAT.lookup)[0].tools == (
+        "tag_now", "calc_deviation")                                             # Д13: порядок — как в AGENT_TOOLS
     assert codes({**OK, "tools": ["catalog_search"]}) == {("tools", "tools_useless")}
+    # Д13: calc_deviation сам по себе — не инструмент чисел check_draft (нужны measure_tag/setpoint_tag вызова, а
+    # не tags черновика); на стенде он всегда идёт с tag_now — так его даёт Конструктор
+    assert codes({**OK, "tools": ["calc_deviation"]}) == {("tools", "tools_useless")}
     assert PROBLEM_TEXTS["tools_useless"] == ("Агенту нужен инструмент чисел (tag_now, tag_period, tag_series или "
                                               "calc_runtime), а без тегов — ещё catalog_search")
 
 
 def test_render_new_tools_permission_order():
-    text = agent_text(replace(AGENT_DRAFT, tools=("tag_now", "tag_series", "calc_runtime")))
-    assert text.splitlines()[7:11] == ['  "*": deny', "  pcbk_tag_now: allow", "  pcbk_tag_series: allow",
-                                       "  pcbk_calc_runtime: allow"]
+    text = agent_text(replace(AGENT_DRAFT, tools=("tag_now", "tag_series", "calc_runtime", "calc_deviation")))
+    assert text.splitlines()[7:12] == ['  "*": deny', "  pcbk_tag_now: allow", "  pcbk_tag_series: allow",
+                                       "  pcbk_calc_runtime: allow", "  pcbk_calc_deviation: allow"]      # Д13
 
 
 def test_agent_digest_d7_unchanged():                                             # дайджест агентов Д7 — прежний (I-1)

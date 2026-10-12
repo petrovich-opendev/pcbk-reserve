@@ -45,10 +45,11 @@ def raw(url, method="POST", body=INIT, **headers):
 async def test_mcp_lists_tools(core_server):
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
         tools = {t.name: t for t in (await s.list_tools()).tools}
-    assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "save_agent",
-                          "my_agents", "report_event"}                                       # Д13: восемь
+    assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
+                          "calc_deviation", "save_agent", "my_agents", "report_event"}        # Д13: девять
     assert all(tools[name].annotations.readOnlyHint is True
-               for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "my_agents"))
+               for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
+                            "calc_deviation", "my_agents"))
     saver = tools["save_agent"]
     assert (saver.annotations.readOnlyHint, saver.annotations.destructiveHint, saver.annotations.idempotentHint,
             saver.annotations.openWorldHint) == (False, False, True, False)                  # Д7-R57
@@ -75,6 +76,7 @@ async def test_mcp_lists_tools(core_server):
     assert tools["tag_now"].description == TOOL_DESCRIPTIONS["tag_now"]
     assert tools["tag_series"].description == TOOL_DESCRIPTIONS["tag_series"]                    # Д9а, А2
     assert tools["calc_runtime"].description == TOOL_DESCRIPTIONS["calc_runtime"]
+    assert tools["calc_deviation"].description == TOOL_DESCRIPTIONS["calc_deviation"]             # Д13
     series = tools["tag_series"].inputSchema["properties"]
     assert (series["points"]["maximum"], series["tags"]["maxItems"]) == (96, 4)
 
@@ -384,3 +386,34 @@ async def test_mcp_calculators_answer_from_service(core_server):
         "Наработка по тегам состояний БДРВ (до 16 тегов, окно до 31 суток, бюджет 24 тего-суток): часы и доля "
         "периода в каждом состоянии и число переходов — по сырым данным историана. Смысл 1 зависит от окончания "
         "тега (_RUN 1 — работает, _CLS 1 — закрыт): в ответе есть подпись. Аналоговые теги не считаются.")
+
+
+# Д13: calc_deviation — контрольная точка считается службой, не агентом (144 точки «в уме» — 3–4 мин на шаг модели)
+
+
+@pytest.mark.anyio
+async def test_mcp_calc_deviation_answer_from_service(core_server):
+    args = {"measure_tag": "20FAKE_001_PV", "setpoint_tag": "20FAKE_004_PV", "threshold": 5, "period": "last_8h",
+            "points": 3}
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        tools = {t.name: t for t in (await s.list_tools()).tools}
+        r = (await s.call_tool("calc_deviation", args)).structuredContent
+        bad = (await s.call_tool("calc_deviation", {**args, "threshold": 0})).structuredContent
+    _, body = http_post(core_server.url + "/api/data/calc_deviation", args, TOKEN)
+    drop = lambda d: {k: v for k, v in d.items() if k != "cache"}
+    assert r["status"] == "ok" and drop(r) == drop(json.loads(body))                      # одна служба
+    assert (r["measure_tag"], r["setpoint_tag"], r["points"], r["over_count"]) == (
+        "20FAKE_001_PV", "20FAKE_004_PV", 2, 2)                                   # 04:00 — у задания нет значения
+    assert r["max_abs_dev"] == pytest.approx(11.8) and r["mean_abs_dev"] == pytest.approx(10.45)
+    assert len(r["intervals"]) == 1
+    iv = r["intervals"][0]
+    assert (iv["start"], iv["end"], iv["points"]) == ("2026-10-01T08:00:00+05:00", "2026-10-01T12:00:00+05:00", 2)
+    assert (iv["at"], iv["value"], iv["setpoint"]) == ("2026-10-01T08:00:00+05:00", 15.0, 3.2)
+    assert iv["max_abs_dev"] == pytest.approx(11.8)
+    assert bad["message"] == "неверные аргументы: threshold: число больше 0"              # как у службы
+    props = tools["calc_deviation"].inputSchema["properties"]
+    assert (props["points"]["type"], props["points"]["minimum"], props["points"]["maximum"],
+            props["points"]["default"]) == ("integer", 2, 96, 72)
+    assert set(props) == {"measure_tag", "setpoint_tag", "threshold", "period", "start", "end", "points"}
+    assert tools["calc_deviation"].annotations.openWorldHint is False
+    assert TOOL_DESCRIPTIONS["calc_deviation"].startswith("Отклонение измерения от задания регулятора БДРВ")

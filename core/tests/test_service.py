@@ -1007,3 +1007,107 @@ async def test_tag_series_first_of_equal_extremes(svc):                         
     p = (await s.tag_series("student-01", "http", ["20FAKE_001_PV"], period="last_8h", points=4))["items"][0]["profile"]
     assert (p["min_time"], p["max_time"]) == ("2026-10-01T04:00:00+05:00", "2026-10-01T06:00:00+05:00")
     assert (p["min"], p["max"], p["change"]) == (10.0, 15.0, 5.0)
+
+
+# Д13: calc_deviation — контрольная точка считается службой (не агентом «в уме»); чтение — тем же путём, что
+# tag_series (ворота, белый список, бюджет, точки, кэш); двойник историана отдаёт fake.series как есть, вне
+# зависимости от period/points — время точек в тестах подбирается напрямую
+
+
+async def test_calc_deviation_one_interval(svc):
+    s, fake = svc
+    times = [datetime(2026, 10, 1, h) for h in (4, 6, 8, 10)]
+    fake.series["20FAKE_001_PV"] = [(t, v, 0) for t, v in zip(times, [10.0, 20.0, 21.0, 11.0])]
+    fake.series["20FAKE_002_SP"] = [(t, v, 0) for t, v in zip(times, [10.0, 10.0, 10.0, 10.5])]
+    r = await s.calc_deviation("student-01", "http", "20FAKE_001_PV", "20FAKE_002_SP", 2.0, period="last_8h",
+                               points=10)
+    assert (r["tool"], r["status"], r["measure_tag"], r["setpoint_tag"], r["threshold"]) == (
+        "calc_deviation", "ok", "20FAKE_001_PV", "20FAKE_002_SP", 2.0)
+    assert (r["points"], r["over_count"]) == (4, 2)
+    assert r["max_abs_dev"] == pytest.approx(11.0) and r["mean_abs_dev"] == pytest.approx(5.375)
+    assert len(r["intervals"]) == 1
+    iv = r["intervals"][0]
+    assert (iv["start"], iv["end"], iv["points"]) == ("2026-10-01T06:00:00+05:00", "2026-10-01T08:00:00+05:00", 2)
+    assert (iv["at"], iv["value"], iv["setpoint"], iv["max_abs_dev"]) == (
+        "2026-10-01T08:00:00+05:00", 21.0, 10.0, pytest.approx(11.0))
+    assert GRID_NOTE in r["notes"]
+
+
+async def test_calc_deviation_several_intervals(svc):
+    s, fake = svc
+    times = [datetime(2026, 10, 1, h) for h in (4, 6, 8, 10, 12)]
+    fake.series["20FAKE_001_PV"] = [(t, v, 0) for t, v in zip(times, [20.0, 10.0, 20.0, 10.0, 20.0])]
+    fake.series["20FAKE_002_SP"] = [(t, 10.0, 0) for t in times]
+    r = await s.calc_deviation("student-01", "http", "20FAKE_001_PV", "20FAKE_002_SP", 5.0, period="last_8h",
+                               points=10)
+    assert (r["points"], r["over_count"], len(r["intervals"])) == (5, 3, 3)
+    assert [(iv["start"], iv["end"], iv["points"]) for iv in r["intervals"]] == [
+        ("2026-10-01T04:00:00+05:00", "2026-10-01T04:00:00+05:00", 1),
+        ("2026-10-01T08:00:00+05:00", "2026-10-01T08:00:00+05:00", 1),
+        ("2026-10-01T12:00:00+05:00", "2026-10-01T12:00:00+05:00", 1)]
+
+
+async def test_calc_deviation_no_intervals(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = [(datetime(2026, 10, 1, 4), 10.0, 0), (datetime(2026, 10, 1, 8), 11.0, 0)]
+    fake.series["20FAKE_002_SP"] = [(datetime(2026, 10, 1, 4), 10.0, 0), (datetime(2026, 10, 1, 8), 10.5, 0)]
+    r = await s.calc_deviation("student-01", "http", "20FAKE_001_PV", "20FAKE_002_SP", 5.0, period="last_8h",
+                               points=10)
+    assert (r["status"], r["points"], r["over_count"], r["intervals"]) == ("ok", 2, 0, [])
+    assert r["max_abs_dev"] == pytest.approx(0.5)
+
+
+async def test_calc_deviation_missing_values_are_skipped(svc):                   # пропуски значений — не пара
+    s, fake = svc
+    times = [datetime(2026, 10, 1, h) for h in (4, 8, 12)]
+    fake.series["20FAKE_001_PV"] = [(times[0], 10.0, 0), (times[1], None, 0), (times[2], 12.0, 0)]
+    fake.series["20FAKE_002_SP"] = [(times[0], None, 0), (times[1], 9.0, 0), (times[2], 10.0, 0)]
+    r = await s.calc_deviation("student-01", "http", "20FAKE_001_PV", "20FAKE_002_SP", 1.0, period="last_8h",
+                               points=10)
+    assert (r["points"], r["over_count"]) == (1, 1)                              # только 12:00 — пара с обоими
+    assert r["intervals"][0]["at"] == "2026-10-01T12:00:00+05:00"
+
+
+@pytest.mark.parametrize("bad", [0, -1, "5", True, False, float("nan"), float("inf"), None, [5]])
+async def test_calc_deviation_bad_threshold_is_args_refusal(svc, bad):
+    s, _ = svc
+    r = await s.calc_deviation("student-01", "http", "20FAKE_001_PV", "20FAKE_002_SP", bad, period="last_8h")
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["args"] + "threshold: число больше 0")
+
+
+@pytest.mark.parametrize("kwargs,reason", [
+    ({"measure_tag": 5, "setpoint_tag": "20FAKE_002_SP", "threshold": 1.0}, "measure_tag: нужен тег строкой"),
+    ({"measure_tag": "20FAKE_001_PV", "setpoint_tag": "x" * 129, "threshold": 1.0},
+     "setpoint_tag: строка тега длиннее 128 знаков"),
+    ({"measure_tag": "20FAKE_001_PV", "setpoint_tag": "20FAKE_002_SP", "threshold": 1.0, "points": 97},
+     "points: от 2 до 96"),
+])
+async def test_calc_deviation_argument_errors(svc, kwargs, reason):
+    s, _ = svc
+    r = await s.calc_deviation("student-01", "http", period="last_8h", **kwargs)
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["args"] + reason)
+
+
+@pytest.mark.parametrize("measure,setpoint", [
+    ("16FAKE_009_PV", "20FAKE_002_SP"),           # measure вне белого списка (тег есть, но не в нём)
+    ("20FAKE_001_PV", "16FAKE_009_PV"),           # setpoint вне белого списка
+    ("20FAKE_404_PV", "20FAKE_002_SP"),           # measure неизвестен историану
+    ("25FAKE_007_CLS", "20FAKE_002_SP"),          # measure — тег состояния, не аналоговый
+])
+async def test_calc_deviation_whitelist_violation_is_refused_like_series(svc, measure, setpoint):
+    s, fake = svc
+    r = await s.calc_deviation("student-01", "http", measure, setpoint, 1.0, period="last_8h")
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["none"])
+    assert fake.calls == []                                   # до ворот SQL не шлёт — как «none» у tag_series
+
+
+async def test_calc_deviation_event_has_both_tags(svc):
+    s, fake = svc
+    times = [datetime(2026, 10, 1, h) for h in (4, 8, 12)]
+    fake.series["20FAKE_002_SP"] = [(t, 10.0, 0) for t in times]
+    r = await s.calc_deviation("ops", "mcp", "20FAKE_001_PV", "20FAKE_002_SP", 1.0, period="last_8h", points=3)
+    assert r["status"] == "ok"
+    e = s.role.events.recent()[0]
+    assert (e.tool, e.caller, e.channel, e.outcome) == ("calc_deviation", "ops", "mcp", "ok")
+    assert tuple(e.tags) == ("20FAKE_001_PV", "20FAKE_002_SP")
+    assert set(e.sent) == {"20FAKE_001_PV", "20FAKE_002_SP"}

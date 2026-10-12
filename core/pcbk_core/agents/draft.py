@@ -26,9 +26,10 @@ if TYPE_CHECKING:
 
 TEMPLATE_VERSION = 2
 # инструменты агента студента; save_agent у агента студента — никогда (Global Constraints Д7). Ряд и наработка Д9а
-# (Д9-R89) и report_event Д13 — в конце: строки allow и дайджест черновика идут в порядке AGENT_TOOLS, файлы и
-# дайджесты агентов Д7/Д9 прежние
-AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "report_event")
+# (Д9-R89), калькулятор отклонения и report_event Д13 — в конце: строки allow и дайджест черновика идут в порядке
+# AGENT_TOOLS, файлы и дайджесты агентов Д7/Д9 прежние
+AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "calc_deviation",
+              "report_event")
 _NUMBER_TOOLS = frozenset({"tag_now", "tag_period", "tag_series", "calc_runtime"})
 _TOOL_PREFIX = "pcbk_"
 

@@ -1,5 +1,5 @@
 """HTTP-оболочка службы данных: POST /api/data/catalog_search, /api/data/tag_now, /api/data/tag_period и
-калькуляторы /api/data/tag_series, /api/data/calc_runtime (Д9-R85).
+калькуляторы /api/data/tag_series, /api/data/calc_runtime (Д9-R85), /api/data/calc_deviation (Д13).
 
 Порядок обработчика: токен → ошибка настройки → инструмент.
 - Нет или неверный Bearer — 401 {"detail": "нужен токен"} и строка журнала без токена, без события.
@@ -27,7 +27,7 @@ from .. import zones
 from ..hooks import DEFAULT_BODY_LIMIT, BodyLimit, safe_path, size_text  # noqa: F401 — реэкспорт Д3б
 from ..secrets import TokenTable
 from .periods import PRESETS
-from .service import QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
+from .service import DEVIATION_DEFAULT_POINTS, QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
 from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ REASON_ERRORS = 3                       # ошибок разбора в тек�
 # путь → инструмент
 DATA_TOOLS = {"/api/data/catalog_search": "catalog_search", "/api/data/tag_now": "tag_now",
               "/api/data/tag_period": "tag_period", "/api/data/tag_series": "tag_series",
-              "/api/data/calc_runtime": "calc_runtime"}
+              "/api/data/calc_runtime": "calc_runtime", "/api/data/calc_deviation": "calc_deviation"}
 
 log = logging.getLogger("pcbk_core.data.http")
 
@@ -79,6 +79,19 @@ class CalcRuntimeArgs(BaseModel):
     period: Literal[PRESETS] | None = None
     start: str | None = None
     end: str | None = None
+
+
+class CalcDeviationArgs(BaseModel):
+    """Отклонение измерения от задания регулятора (Д13): контрольная точка «измерение против задания»; порог —
+    только аргумент вызова, число больше 0 (не норматив ПЦБК). Чтение — пределы ряда (как у tag_series)."""
+
+    measure_tag: Tag
+    setpoint_tag: Tag
+    threshold: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    period: Literal[PRESETS] | None = None
+    start: str | None = None
+    end: str | None = None
+    points: Annotated[int, Field(ge=SERIES_MIN_POINTS, le=SERIES_MAX_POINTS)] = DEVIATION_DEFAULT_POINTS
 
 
 def bearer_caller(authorization: str | None, tokens: TokenTable, *, scope: Scope) -> str | None:
@@ -167,6 +180,19 @@ def data_router(role: "DataRole") -> APIRouter:
         return JSONResponse(await role.service.calc_runtime(caller, "http", args.tags, args.period, args.start,
                                                             args.end))
 
+    @router.post("/api/data/calc_deviation")
+    async def calc_deviation(args: CalcDeviationArgs, request: Request) -> JSONResponse:
+        caller, refusal = authorize(request)
+        if refusal is not None:
+            return refusal
+        if role.config_error:
+            return JSONResponse(await role.service.config_unavailable(caller, "http", "calc_deviation",
+                                                                       [args.measure_tag, args.setpoint_tag]),
+                                status_code=503)
+        return JSONResponse(await role.service.calc_deviation(caller, "http", args.measure_tag, args.setpoint_tag,
+                                                              args.threshold, args.period, args.start, args.end,
+                                                              args.points))
+
     return router
 
 
@@ -210,8 +236,9 @@ def _error_field(err: dict[str, Any]) -> str:
 
 
 def _reason(err: dict[str, Any]) -> str:
-    """«поле: текст»; пределы тегов и точек — словами службы (_tags_problem, _points_problem): у HTTP, MCP и вкладки
-    отказ тот же, что у прямого вызова службы (итоговая доводка Д9а, сомнение 2 исполнителя А2)."""
+    """«поле: текст»; пределы тегов и точек — словами службы (_tags_problem, _points_problem, _threshold_problem,
+    _deviation_tag_problem): у HTTP, MCP и вкладки отказ тот же, что у прямого вызова службы (итоговая доводка Д9а,
+    сомнение 2 исполнителя А2; Д13 — threshold, measure_tag, setpoint_tag той же службы)."""
     field, kind = _error_field(err), err.get("type", "")
     if field == "points" and kind in ("less_than_equal", "greater_than_equal"):
         return f"points: от {SERIES_MIN_POINTS} до {SERIES_MAX_POINTS}"
@@ -219,6 +246,12 @@ def _reason(err: dict[str, Any]) -> str:
         return f"tags: не больше {(err.get('ctx') or {}).get('max_length', MAX_NAMES)} тегов за вызов"
     if field == "tags" and kind == "too_short":
         return "tags: нужен хотя бы один тег"
+    if field == "threshold":                     # _threshold_problem: одно замечание на любой сбой поля
+        return "threshold: число больше 0"
+    if field in ("measure_tag", "setpoint_tag"):  # _deviation_tag_problem
+        if kind == "string_too_long":
+            return f"{field}: строка тега длиннее {TAG_CHARS} знаков"
+        return f"{field}: нужен тег строкой"
     return f"{field}: {_error_text(err)}"
 
 

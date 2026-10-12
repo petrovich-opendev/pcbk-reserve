@@ -38,12 +38,12 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import zones
-from .http_api import (UNAUTHORIZED, CalcRuntimeArgs, CatalogSearchArgs, TagNowArgs, TagPeriodArgs, TagSeriesArgs,
-                       bearer_caller, unauthorized, validation_reason)
+from .http_api import (UNAUTHORIZED, CalcDeviationArgs, CalcRuntimeArgs, CatalogSearchArgs, TagNowArgs,
+                       TagPeriodArgs, TagSeriesArgs, bearer_caller, unauthorized, validation_reason)
 from .periods import PRESETS
 from .report_event import REPORT_DESCRIPTION, REPORT_PROPERTIES, REPORT_REQUIRED
 from .save_agent import SAVE_DESCRIPTION, SAVE_PROPERTIES, SAVE_REQUIRED
-from .service import QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
+from .service import DEVIATION_DEFAULT_POINTS, QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
 from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
 if TYPE_CHECKING:
@@ -71,6 +71,14 @@ TOOL_DESCRIPTIONS = {
                     "доля периода в каждом состоянии и число переходов — по сырым данным историана. Смысл 1 зависит "
                     "от окончания тега (_RUN 1 — работает, _CLS 1 — закрыт): в ответе есть подпись. Аналоговые теги "
                     "не считаются.",
+    "calc_deviation": "Отклонение измерения от задания регулятора БДРВ за период — контрольная точка (один запрос, "
+                      "пределы как у tag_series: на тег до 96 точек, окно до 31 суток, бюджет 24 тего-суток): для "
+                      "тега измерения (_PV/_MV) и задания (_SP) того же контура считает |измерение − задание| по "
+                      "совпадающим меткам ряда и сравнивает с threshold — порогом технолога (число больше 0, не "
+                      "норматив ПЦБК), который вы передаёте аргументом. В ответе — наибольшее и среднее отклонение, "
+                      "число точек сверх порога и интервалы подряд идущих точек сверх порога (начало, конец, число "
+                      "точек, наибольшее отклонение с его измерением и заданием). Период — готовый (period) или "
+                      "начало и конец (start, end, ISO 8601).",
     "save_agent": SAVE_DESCRIPTION,         # одно место правды — save_agent.py (research/09 §4.1, дословно)
     "my_agents": "Ваши сохранённые агенты этого места (без архивных и отправленных на карантин), с их инструкцией "
                 "— чтобы найти агента и предложить студенту правку. Без аргументов.",
@@ -94,6 +102,8 @@ Preset = Annotated[Any, Field(json_schema_extra={"type": "string", "enum": list(
 IsoTime = Annotated[Any, Field(json_schema_extra={"type": "string"})]
 Query = Annotated[Any, Field(json_schema_extra={"type": "string", "minLength": 1, "maxLength": QUERY_CHARS})]
 Limit = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 1, "maximum": SEARCH_LIMIT})]
+DeviationTag = Annotated[Any, Field(json_schema_extra={"type": "string", "maxLength": TAG_CHARS})]
+Threshold = Annotated[Any, Field(json_schema_extra={"type": "number", "exclusiveMinimum": 0})]
 AgentName = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["name"])]
 AgentTitle = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["title"])]
 AgentNode = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["node"])]
@@ -199,6 +209,17 @@ def build_mcp(role: "DataRole") -> FastMCP:
                           {"tags": tags, "period": period, "start": start, "end": end},
                           lambda caller, a: role.service.calc_runtime(caller, "mcp", a.tags, a.period, a.start,
                                                                       a.end))
+
+    @mcp.tool(name="calc_deviation", description=TOOL_DESCRIPTIONS["calc_deviation"], annotations=READ_ONLY)
+    async def calc_deviation(ctx: Context, measure_tag: DeviationTag = None, setpoint_tag: DeviationTag = None,
+                             threshold: Threshold = None, period: Preset = None, start: IsoTime = None,
+                             end: IsoTime = None, points: Points = DEVIATION_DEFAULT_POINTS) -> dict[str, Any]:
+        return await call(ctx, "calc_deviation", [measure_tag, setpoint_tag], CalcDeviationArgs,
+                          {"measure_tag": measure_tag, "setpoint_tag": setpoint_tag, "threshold": threshold,
+                           "period": period, "start": start, "end": end, "points": points},
+                          lambda caller, a: role.service.calc_deviation(caller, "mcp", a.measure_tag,
+                                                                        a.setpoint_tag, a.threshold, a.period,
+                                                                        a.start, a.end, a.points))
 
     @mcp.tool(name="save_agent", description=TOOL_DESCRIPTIONS["save_agent"], annotations=SAVE_ANNOTATIONS)
     async def save_agent(ctx: Context, name: AgentName = None, title: AgentTitle = None, node: AgentNode = None,
