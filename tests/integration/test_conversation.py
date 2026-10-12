@@ -14,7 +14,7 @@ Q = "что сейчас по тегу 20FAKE_001_PV?"
 MCP_WORD = re.compile(r"\bmcp=([a-z_]+)")
 PCBK3 = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_tag_period"}       # агент по умолчанию Д6–Д8 (Д6-R45)
 PCBK5 = PCBK3 | {"pcbk_tag_series", "pcbk_calc_runtime"}                 # с Д9а — ряд и наработка (Д9-R89)
-KONSTRUKTOR = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_save_agent"}  # инструменты Конструктора (Д7-R63)
+KONSTRUKTOR = {"pcbk_catalog_search", "pcbk_tag_now", "pcbk_save_agent", "pcbk_my_agents"}  # инструменты Конструктора (Д7-R63; Д13 — правка)
 
 
 @pytest.fixture(scope="module")
