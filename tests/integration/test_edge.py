@@ -22,7 +22,8 @@ DECLARED_ENV = {                   # наши переменные сверх п
                       "VMSTAT_PATH", "PRESSURE_PATH", "SWAP_GROW_WARN_MIB", "PSI_FULL_MAX"},
     "pcbk-core": {"CORE_PORT", "FRESH_POLL_S", "CATALOG_DEADLINE_S", "DRILL_FRESHNESS",
                   "DRILL_DATA",                                    # учения службы данных (Д9а, Д9-R83)
-                  "LLM_MODELS", "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
+                  "LLM_MODELS", "LLM_FALLBACK",                 # запасная модель при отказе основной (Д14)
+                  "LLM_STATE", "DRILL_LLM", "LLM_OPS_SHARE_USD", "LLM_KEY_DEDICATED",
                   # шлюз (Д5а): сети мест для сверки токенов и адресов мест, origin входа, простой, такт, учения
                   "STU_NET", "GW_ORIGIN", "GW_IDLE_STOP_S", "GW_REAPER_TICK_S", "DRILL_GATEWAY",
                   "DRILL_AGENTS",                                  # учения агентов студентов (Д7а, П10)
