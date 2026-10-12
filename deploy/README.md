@@ -1626,6 +1626,65 @@ pause`, `DRILL_FRESHNESS`, `DRILL_FREEZE_LOOP`, `LLM_RUN_SILENT_S`, правка
 значений — той же командой. Свидетель, который спал, после проверки снова остановлен (`docker stop`). Ни учёток, ни
 томов, ни `DRILL_*` модуль не трогает.
 
+## Сеть ПЦБК подменяет TLS исходящих соединений (с окна 1, 12.10)
+
+Межсетевой экран ПЦБК (PT NGFW) перешифровывает исходящий HTTPS сервера своим корнем (`CN=PTNGFW`). Хост ему
+доверяет (`/usr/local/share/ca-certificates/pt-ngfw.crt`), контейнер `core` — нет: без этого строка «LLM-прокси и
+бюджет» — «OpenRouter недоступен» (в `core`: `CERTIFICATE_VERIFY_FAILED … self-signed certificate in certificate chain`).
+`core` ходит в OpenRouter через httpx с `trust_env=False` и файлом certifi образа — поэтому поверх этого файла
+кладётся связка «certifi образа + корень PT NGFW» (только сервер ПЦБК, файлом `compose.override.yaml`, который
+`docker compose` подхватывает сам рядом с `compose.yaml`):
+```bash
+cd /opt/pcbk-reserve && install -d -m 0755 ca
+docker run --rm --network none --entrypoint cat pcbk-reserve/core:<день> /usr/local/lib/python3.12/site-packages/certifi/cacert.pem > ca/ca-bundle.pem.new
+awk '/BEGIN CERT/{n++} n==2{print} /END CERT/&&n==2{exit}' /usr/local/share/ca-certificates/pt-ngfw.crt > ca/pt-ngfw-root.pem
+openssl x509 -in ca/pt-ngfw-root.pem -noout -subject -fingerprint -sha256     # CN = PTNGFW, отпечаток — в журнал окна
+cat ca/pt-ngfw-root.pem >> ca/ca-bundle.pem.new && chmod 0644 ca/* && mv ca/ca-bundle.pem.new ca/ca-bundle.pem
+```
+`compose.override.yaml`:
+```yaml
+services:
+  core:
+    volumes:
+      - {type: bind, source: ./ca/ca-bundle.pem, target: /usr/local/lib/python3.12/site-packages/certifi/cacert.pem, read_only: true, bind: {create_host_path: false}}
+```
+Корень берётся из цепочки, которую экран показывает (`openssl s_client -connect openrouter.ai:443 -showcerts`), и
+сверяется с файлом хоста по отпечатку: в `pt-ngfw.crt` хоста первым лежит не корень, а листовой сертификат. **Новый
+образ `core`** — сверить файл certifi нового образа с прежним (`sha256sum`); другой — пересобрать связку командами
+выше. Проверка — `/health/llm` → `upstream.state: ok`.
+
+## Вход через nginx Dify по своему имени (с окна 1, 12.10)
+
+Снаружи у сервера опубликован только 443, его держит nginx Dify; порт `edge` 8443 снаружи закрыт. Решение владельца
+(12.10): резерв остаётся на своём 8443, а nginx Dify отдаёт его по отдельному имени `<имя резерва>` (поддомен под
+тот же сертификат `*.<домен>`; запись DNS заводит ИТ ПЦБК). Отдельным файлом
+`/opt/dify/docker/nginx/conf.d/<имя резерва>.conf` — `default.conf` Dify пересоздаёт из шаблона при старте, этот файл
+не трогает; nginx Dify включает все `conf.d/*.conf`:
+```nginx
+server { listen 80; server_name <имя резерва>; return 301 https://<имя резерва>$request_uri; }
+server {
+    listen 443 ssl; server_name <имя резерва>;
+    ssl_certificate /etc/ssl/<файл сертификата Dify>; ssl_certificate_key /etc/ssl/<файл ключа Dify>;
+    ssl_protocols TLSv1.2 TLSv1.3; client_max_body_size 8m;
+    location / {
+        proxy_pass https://<шлюз сети docker_default Dify>:8443;      # опубликованный порт edge
+        proxy_ssl_server_name on; proxy_ssl_name <имя резерва>;
+        proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_http_version 1.1; proxy_set_header Connection ""; proxy_buffering off;   # поток событий чата
+        proxy_read_timeout 3600s; proxy_send_timeout 3600s;
+    }
+}
+```
+Затем `docker exec docker-nginx-1 nginx -t` и только при успехе `docker exec docker-nginx-1 nginx -s reload` — Dify
+не перезапускается. `.env` резерва: `GW_ORIGIN=https://<имя резерва>`, `core` пересоздать. Проверка до DNS — на
+сервере: `curl -sk --resolve <имя резерва>:443:127.0.0.1 https://<имя резерва>/login` → `200`. Снять — удалить файл
+и тот же `reload`.
+
+Принятые ограничения: (1) этот вход живёт в nginx Dify — при выключенном Dify целиком (вместе с nginx) резерв
+снаружи недоступен; при сбое прочих контейнеров Dify вход работает; (2) `edge` видит всех клиентов с одного адреса
+прокси — предел входа (5 в секунду, запас 20) общий на всех, для класса его хватает.
+
 ## Что открывается наружу
 
 - Порт **8443** контейнера `edge` — Docker публикует его **в обход ufw**.
