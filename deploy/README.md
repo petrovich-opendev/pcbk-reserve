@@ -1685,6 +1685,491 @@ server {
 снаружи недоступен; при сбое прочих контейнеров Dify вход работает; (2) `edge` видит всех клиентов с одного адреса
 прокси — предел входа (5 в секунду, запас 20) общий на всех, для класса его хватает.
 
+## Резервная копия и восстановление (с Д12)
+
+Копия — на том же сервере, только для своих же аварий (том удалён, файл испорчен, диск не трогая); от потери самого
+сервера или диска она не защищает (раздел «Без резервирования» ниже). Когда — перед каждым обновлением (раздел
+«Выкладка и обновление», п. 1 ниже) и перед каждым окном владельца.
+
+### Размер раньше копии (I-10)
+
+Копия не начинается, если на разделе `/opt` не хватит места: сначала посчитать, сколько займёт копия, и свериться со
+свободным местом. Тома **спящих** мест меряет тот же одноразовый контейнер, что потом их копирует (ниже), только с
+`du` вместо `tar`; работающее место в счёт не входит — у него копии не будет вовсе (строка «работает — в размер не
+входит»).
+
+```bash
+cd /opt/pcbk-reserve
+SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && DD=$(grep '^DATA_DIR=' .env | cut -d= -f2) &&
+need=$(
+  docker exec pcbk-core du -sk /var/lib/pcbk-core /srv/agents
+  du -sk "$SD" "$DD" .env compose.yaml edge
+  for n in $(seq -w 1 10); do
+    docker ps --filter "name=pcbk-student-$n" --format '{{.Names}}' | grep -q . && { echo "0 место-$n-работает"; continue; }
+    docker run --rm --network none --user 10001:10001 \
+      -v "pcbk-student-$n-state:/s:ro" -v "pcbk-student-$n-work:/w:ro" \
+      --entrypoint du pcbk-reserve/student:d9a -sk /s /w
+  done
+) && printf '%s\n' "$need" &&
+total=$(awk '{s+=$1} END{print s+0}' <<<"$need") &&
+read -r avail size < <(df --output=avail,size /opt | tail -n 1) &&
+limit=$((size / 10)); [ "$limit" -lt 5242880 ] && limit=5242880
+if [ $((avail - total)) -ge "$limit" ]; then
+  echo "места достаточно: свободно $avail КиБ, нужно $total КиБ, порог $limit КиБ — копия начинается"
+else
+  echo "МЕСТА НЕ ХВАТАЕТ: свободно $avail КиБ, нужно $total КиБ, порог $limit КиБ — копия НЕ делается; строка владельцу (полный диск — отказ и у баз Dify)"
+fi
+```
+
+Дальше — только если строка «копия начинается».
+
+### Что, куда, как
+
+```bash
+cd /opt/pcbk-reserve && B=/opt/pcbk-reserve/backup/$(date +%Y%m%d-%H%M) && install -d -m 0700 "$B"
+```
+
+| Что | Как | В копии |
+|---|---|---|
+| `core.db` | `sqlite3.backup()` из `file:…/core.db?mode=ro` в `/var/lib/pcbk-core/backup.db`, `docker cp`, удаление временного файла | согласованная копия даже при WAL |
+| агенты, архив, карантин | `tar` каталога `/srv` внутри `core` | от владельца 10003 |
+| секреты | `tar` каталога `SECRETS_DIR` снаружи | ключи, пароли, `bdrv.env` |
+| `.env`, `compose.yaml*`, `edge/`, `DATA_DIR` | `tar` от пользователя выкладки | белый список — производственные данные |
+| разговоры **спящих** мест | одноразовый контейнер образа места, том только на чтение | OpenCode пишет SQLite — читается только у спящего |
+| не входит | `key.pem` (root, берётся заново у Dify), журнал сторожа | |
+
+```bash
+# core.db — согласованная копия даже при WAL
+docker exec pcbk-core python -c '
+import sqlite3
+src = sqlite3.connect("file:/var/lib/pcbk-core/core.db?mode=ro", uri=True)
+dst = sqlite3.connect("/var/lib/pcbk-core/backup.db")
+with dst:
+    src.backup(dst)
+dst.close(); src.close()'
+docker cp pcbk-core:/var/lib/pcbk-core/backup.db "$B/core.db"
+docker exec pcbk-core rm /var/lib/pcbk-core/backup.db
+
+# агенты, архив, карантин — от владельца 10003
+docker exec pcbk-core tar -C /srv -cf - agents > "$B/agents.tar"
+
+# секреты
+SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) &&
+tar -C "$(dirname "$SD")" -cf "$B/secrets.tar" "$(basename "$SD")"
+
+# .env, compose.yaml и его прежние копии отката, edge/, DATA_DIR
+DD=$(grep '^DATA_DIR=' .env | cut -d= -f2) &&
+files=(.env compose.yaml edge "$DD") &&
+for f in compose.yaml.*; do [ -e "$f" ] && files+=("$f"); done &&
+tar -cf "$B/config.tar" "${files[@]}"
+
+# разговоры спящих мест; работающее — пропуск со строкой в manifest.txt
+for n in $(seq -w 1 10); do
+  if docker ps --filter "name=pcbk-student-$n" --format '{{.Names}}' | grep -q .; then
+    echo "место $n работает — копии нет" >> "$B/manifest.txt"; continue
+  fi
+  docker run --rm --network none --user 10001:10001 \
+    -v "pcbk-student-$n-state:/s:ro" -v "pcbk-student-$n-work:/w:ro" \
+    --entrypoint tar pcbk-reserve/student:d9a -cf - /s /w > "$B/student-$n.tar"
+done
+```
+
+**Проверка** — обязательна перед тем, как копию можно считать годной:
+
+```bash
+# PRAGMA integrity_check — читает уже снятую копию, без сети и без доступа к текущим данным тома;
+# от пользователя выкладки (каталог копии — 0700) и с immutable=1: на томе только для чтения SQLite иначе
+# не открывает файл («unable to open database file», окно 1, 12.10)
+docker run --rm --network none --user "$(id -u):$(id -g)" -v "$B:/b:ro" --entrypoint python pcbk-reserve/core:<день> -c '
+import sqlite3
+c = sqlite3.connect("file:/b/core.db?mode=ro&immutable=1", uri=True)
+print(c.execute("PRAGMA integrity_check").fetchone()[0])'
+```
+Ожидается `ok`.
+
+```bash
+for f in "$B"/*.tar; do tar -tf "$f" > /dev/null && echo "$f ok" || echo "$f ПОВРЕЖДЁН — копию повторить"; done
+```
+
+```bash
+cd "$B" &&
+for f in *; do [ "$f" = manifest.txt ] && continue
+  printf '%s %s %s\n' "$(stat -c %s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
+done >> manifest.txt &&
+chmod 0600 "$B"/* && chmod 0700 "$B"
+```
+
+**Хранятся две последние копии.** После того как новая проверена, старые свои каталоги `backup/<ГГГГММДД-ЧЧММ>`,
+кроме двух последних, удаляются:
+```bash
+ls -1d /opt/pcbk-reserve/backup/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]/ | head -n -2 | while read -r old; do
+  echo "удаляю старую копию: $old"; rm -rf "$old"
+done
+```
+Копия не покидает сервер (перенос вовне — решение владельца, вопрос 8).
+
+### Восстановление — ничего не удаляется, текущее уходит в сторону
+
+`B` — каталог нужной копии (`/opt/pcbk-reserve/backup/<ГГГГММДД-ЧЧММ>`), `T` — одна метка времени на весь заход.
+
+**`core.db`:**
+```bash
+cd /opt/pcbk-reserve && B=<каталог копии> && docker compose stop core && T=$(date -u +%Y%m%dT%H%M%SZ)
+docker run --rm --network none --user 0 \
+  -v pcbk-reserve_pcbk-core-data:/d \
+  -v "$B/core.db:/src/core.db:ro" \
+  --entrypoint sh pcbk-reserve/core:d11a -c \
+  "mkdir -p /d/before-restore-$T && for f in core.db core.db-wal core.db-shm; do [ -e /d/\$f ] && mv /d/\$f /d/before-restore-$T/; done; chown -R 10003:10003 /d/before-restore-$T; cp /src/core.db /d/core.db && chown 10003:10003 /d/core.db && chmod 0600 /d/core.db"
+docker compose up -d --no-build core
+curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["stale"])'
+docker exec pcbk-core python -m pcbk_core.gateway.accounts list
+```
+Ожидается: `stale` → `False`; `accounts list` — прежние учётки и закрепления мест. Том не создавался отдельно: если
+он был удалён целиком, `docker run -v` заводит его пустым сам, и команда выше заполняет его той же копией.
+`before-restore-$T/` на томе — данные, не удалять без решения владельца.
+
+**Агенты — из той же копии, обменом каталогов** (корень `/srv/agents` у `core` — только для чтения, пишется лишь
+сама привязка; распаковка — рядом, не на место):
+```bash
+RT=restore-$T && BR=before-restore-$T &&
+docker exec -i pcbk-core sh -c "mkdir /srv/agents/.$RT && tar -C /srv/agents/.$RT -xf -" < "$B/agents.tar"
+for n in $(seq -w 1 10); do
+  docker exec pcbk-core sh -c "[ -e /srv/agents/.$RT/agents/student-$n ]" || continue
+  docker exec -u 10003 pcbk-core sh -c "
+    mkdir -p /srv/agents/.$BR &&
+    { [ ! -e /srv/agents/student-$n ] || mv /srv/agents/student-$n /srv/agents/.$BR/student-$n; } &&
+    mv /srv/agents/.$RT/agents/student-$n /srv/agents/student-$n"
+  docker exec pcbk-core python -m pcbk_core.agents.admin reload --place "${n#0}"
+  docker exec pcbk-core python -m pcbk_core.agents.admin list --place "${n#0}"
+done
+```
+Ожидается у каждого восстановленного места — последняя строка `list` «расхождений нет» (не сразу: перезагрузка идёт,
+когда на месте стихнет ход — раздел «Файл агента вручную»). `.restore-*` и `.before-restore-*` — данные студентов,
+удаляются только решением владельца.
+
+**Секреты** — распаковать рядом, сравнить, заменить только недостающее:
+```bash
+cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && RS="${SD}.restore-$T" &&
+mkdir -m 0700 "$RS" && tar -C "$RS" -xf "$B/secrets.tar" &&
+diff -rq "$SD" "$RS/$(basename "$SD")"
+```
+Для каждого файла из вывода `diff` вида «Only in `$RS/<имя SD>`: …» (в `$SD` его не хватает) — вернуть сам файл:
+```bash
+cp -p "$RS/$(basename "$SD")/<имя файла>" "$SD/" && docker compose up -d --no-build --force-recreate core
+```
+Новый файл токена (не просто восстановленный прежний) — пересоздание `core`, а если менялся токен места — и самого
+места («Пересоздание мест с сохранением томов»). Каталог `$RS` — данные, удаляется только решением владельца.
+
+**Том места** — восстанавливается только у спящего (у работающего места копии не было вовсе — см. manifest.txt
+копии); потерянный том — завести как в «Рабочие места», п. 1, затем распаковать:
+```bash
+n=<NN, номер места> &&
+docker volume create --label pcbk.role=student "pcbk-student-$n-state" &&
+docker volume create --label pcbk.role=student "pcbk-student-$n-work" &&
+docker run --rm --network none --user 0 \
+  -v "pcbk-student-$n-state:/s" -v "pcbk-student-$n-work:/w" \
+  -v "<каталог копии>/student-$n.tar:/src.tar:ro" \
+  --entrypoint sh pcbk-reserve/student:d9a -c "tar -C / -xf /src.tar && chown -R 10001:10001 /s /w"
+```
+
+### Без резервирования (принятый риск постановки)
+
+Копия лежит на том же сервере, что данные: от потери самого сервера или его диска она не спасает. Это принятый
+риск постановки, не дефект процедуры.
+
+## Прогон без Dify (с Д12)
+
+Критерий успеха 3 постановки: **«Dify выключен целиком — контур работает»**. Резерв (этот стенд) ничем не
+держится за Dify — ни сетью, ни томом, ни привязкой файлов, ни сертификатом, ни секретом (Д12-R137; тест
+компоновки `tests/integration/test_edge.py::test_production_config_independent_of_dify`, зелёный с положительным
+контролем — он портит компоновку чужой сетью `dify` и привязкой `/opt/dify` и проверяет, что тест это находит).
+Единственное общее с Dify у резерва — **копии** файлов (сертификат, учётка историана): они снимаются один раз,
+Dify после остановки их не касается.
+
+### Кто держит откат
+
+По умолчанию — **«А со страховкой Б»** (Д12-R139):
+
+- **А (основной).** Владелец у терминала всё время, пока Dify выключен (пробный цикл, интервал прогона,
+  возврат). `stop` нажимает только он. На просьбу сессии «включить» — реакция ≤ 2 мин.
+- **Б (страховка).** До первой остановки владелец сам ставит на сервере **профиль разрешений окна** (готовит
+  контроллер, `$JOB/pcbk-d12/live/permissions-window.md`): сессии разрешена ровно одна команда к Dify — дословная
+  строка `start` (ниже), запрещены все глаголы Dify (`down`, `rm`, `up`, `restart`, `pull`, `exec`, `kill`,
+  `stop` компоновки Dify и `docker stop` без явного `pcbk-student-NN`, любая запись в `/opt/dify`). Сессия жмёт
+  `start` сама — если повод тревоги (ниже) наступил, а владелец не ответил за 2 мин, если он отошёл дольше чем на
+  2 мин, или если наступил срок окна.
+- **Последняя линия** при полной потере связи с владельцем — **администратор сервера ПЦБК**: единственное
+  разрешённое ему действие — та же строка `start`, не позже срока окна.
+
+Таймеры срока — два фоновых отсчёта от начала остановки: «осталось 5 мин» (сигнал начинать возврат) и «срок»
+(возврат обязателен при любом состоянии прогона).
+
+### Помощники наблюдения
+
+Три читающих процесса и одна проверка — bash, `curl`, `python3` хоста, без новых зависимостей. Тексты (дословно;
+источник — `$JOB/pcbk-d12/helpers/`, `chmod 0700`):
+
+```bash
+#!/bin/bash
+# pulse HOST PORT OUT [TICK] — раз в TICK с (15) через edge: свежесть и строки страницы сторожа (не ok — «строка:состояние»),
+# страница чата, шлюз без входа (401 от core, не 502/503 от edge). Только чтение, учёток нет. HOST — имя сертификата edge.
+tick=${4:-15}
+while :; do
+  t=$(date +%s); r="--resolve $1:$2:127.0.0.1"; u="https://$1:$2"
+  st=$(curl -sk -m 5 $r "$u/status.json" | python3 -c 'import json, sys
+d = json.load(sys.stdin); bad = [c["component"] + ":" + c["state"] for c in d["checks"] if c["state"] != "ok"]
+print("stale" if d["stale"] else "fresh", ",".join(bad) or "-", sep="\t")' 2>/dev/null || printf 'нет\t-')
+  chat=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' $r "$u/chat/")
+  me=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' $r "$u/pcbk/api/auth/me")
+  printf '%s\t%s\t%s\t%s\n' "$t" "$st" "$chat" "$me" >> "$3"
+  sleep "$tick"
+done
+```
+
+```bash
+#!/bin/bash
+# difywatch IDS URL OUT — раз в 10 с: running/всего и healthy/с проверкой по Id из S0, код веба Dify, step /console/api/setup.
+# Только docker inspect -f по Id и GET к 127.0.0.1. URL — схема и порт веба Dify из разведки.
+n=$(wc -l < "$1")
+while :; do
+  t=$(date +%s)
+  s=$(docker inspect -f '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' $(cat "$1") 2>/dev/null)
+  if [ -z "$s" ]; then run=0; hc=0; hl=0
+  else run=$(grep -c '^running|' <<<"$s"); hc=$(grep -vc '|-$' <<<"$s"); hl=$(grep -c '|healthy$' <<<"$s"); fi
+  web=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' "$2/")
+  step=$(curl -sk -m 5 "$2/console/api/setup" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("step", "-"))' 2>/dev/null || echo -)
+  printf '%s\t%s/%s\t%s/%s\t%s\t%s\n' "$t" "$run" "$n" "$hl" "$hc" "$web" "$step" >> "$3"
+  sleep 10
+done
+```
+
+```bash
+#!/bin/bash
+# snap IDS OUT — снимок R144: Id|Name|Image|State|Health|RestartCount|StartedAt; сверка — поля 1–6
+docker inspect -f '{{.ID}}|{{.Name}}|{{.Config.Image}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}|{{.RestartCount}}|{{.State.StartedAt}}' $(cat "$1") > "$2"
+```
+
+> `snap` использует `.ID` (прописная буква), а не `.Id`: на Docker 29.5.2 (проверено на двойнике, см.
+> `docs/checks/D12a.md`) `.Id` в одном шаблоне с `{{if .State.Health}}` переключает `docker inspect` на общий
+> разбор по карте, где отсутствующий у контейнера без проверки здоровья `State.Health` ломает даже `if`/`with` —
+> `.ID` возвращает то же значение типобезопасным путём, без этой ошибки. Вывод (поля и их смысл) не меняется.
+
+```bash
+#!/bin/bash
+# watchcond — одна проверка условий R143 по файлам в ~/pcbk-d12: «ok» и код 0 или «ТРЕВОГА: …» и код 1.
+# Флаги: dify-off — Dify выключен (ждём 0 работающих); pause — плановое пересоздание (≤ 180 с);
+# allowed — пары «строка:состояние», допустимые вне ok (edge:fail при истёкшем сертификате, edge:warn).
+# строка вне ok и вне allowed два такта подряд, хотя бы раз fail/unknown (по имени строки: fail↔warn — тоже) — ТРЕВОГА (код 1); warn вне allowed дольше 300 с — ВНИМАНИЕ
+# (код 2, один раз на непрерывный warn: отметка warn-noted) — запись и разбор, не откат (I-4 р2).
+d=${PCBK_D12:-$HOME/pcbk-d12}; now=$(date +%s)
+alarm() { echo "ТРЕВОГА: $*"; exit 1; }
+p=$(tail -n 2 "$d/pulse.tsv" 2>/dev/null); w=$(tail -n 1 "$d/difywatch.tsv" 2>/dev/null)
+pt=$(tail -n 1 <<<"$p" | cut -f1); wt=$(cut -f1 <<<"$w")
+[ -n "$pt" ] && [ $((now - pt)) -le 45 ] || alarm "pulse молчит"
+[ -n "$wt" ] && [ $((now - wt)) -le 30 ] || alarm "difywatch молчит"
+if [ -f "$d/dify-off" ]; then [ "$(cut -f2 <<<"$w" | cut -d/ -f1)" = 0 ] || alarm "Dify поднялся сам: $(cut -f2 <<<"$w")"; fi
+if [ -f "$d/pause" ]; then
+  [ $((now - $(stat -c %Y "$d/pause"))) -le 180 ] || alarm "плановая пауза дольше 3 мин"
+  echo ok; exit 0
+fi
+[ "$(grep -c . <<<"$p")" -ge 2 ] || { echo ok; exit 0; }
+[ "$(awk -F'\t' '$2 != "fresh" || $4 != "200" || $5 != "401"' <<<"$p" | wc -l)" -lt 2 ] || alarm "pulse — два отказа подряд"
+last=$(tail -n 1 <<<"$p" | cut -f3 | tr ',' '\n'); prev=$(head -n 1 <<<"$p" | cut -f3 | tr ',' '\n')
+mkdir -p "$d/warn-since"; notice=
+bad() { [ -n "$1" ] && [ "$1" != "-" ] && ! grep -qx "$1" "$d/allowed" 2>/dev/null; }   # строка вне ok и вне allowed
+for r in $last; do
+  bad "$r" || continue
+  c=${r%%:*}; s=${r##*:}
+  pr=$(awk -F: -v c="$c" '$1 == c' <<<"$prev")     # тот же компонент такт назад — по имени, не по точной строке
+  if bad "$pr" && { [ "$s" != warn ] || [ "${pr##*:}" != warn ]; }; then
+    alarm "строка $c не ok два такта подряд: $pr → $r"   # fail/unknown хотя бы в одном из двух (и чередование fail↔warn)
+  fi
+  if [ "$s" = warn ]; then
+    [ -f "$d/warn-since/$c" ] || echo "$now" > "$d/warn-since/$c"
+    if [ $((now - $(cat "$d/warn-since/$c"))) -gt 300 ] && [ ! -f "$d/warn-since/$c.noted" ]; then
+      touch "$d/warn-since/$c.noted"; notice="ВНИМАНИЕ: строка $c — warn дольше 5 мин"
+    fi
+  fi
+done
+for f in "$d"/warn-since/*; do                      # строка вернулась в ok (или в allowed) — отметки снять
+  [ -e "$f" ] || continue; c=$(basename "${f%.noted}")
+  for r in $last; do bad "$r" && [ "${r%%:*}" = "$c" ] && continue 2; done
+  rm -f "$f"
+done
+[ -z "$notice" ] || { echo "$notice"; exit 2; }      # ТРЕВОГИ (выше) проверены раньше ВНИМАНИЯ
+echo ok
+```
+
+Самопроверка `watchcond` на подставных файлах (15 случаев, в том числе чередование `fail`↔`warn` одной строки — тревога: строки сравниваются по имени, а не по точному «строка:состояние») и проверка на двойнике Dify — пройдены, журнал в
+`docs/checks/D12a.md`.
+
+**Запуск на сервере** (В1, помощники уже скопированы в `~/pcbk-d12/`, `chmod 0700`):
+
+```bash
+setsid nohup ~/pcbk-d12/pulse <имя сертификата edge, из разведки А1> 8443 ~/pcbk-d12/pulse.tsv >/dev/null 2>&1 &
+echo $! > ~/pcbk-d12/pulse.pid
+setsid nohup ~/pcbk-d12/difywatch ~/pcbk-d12/dify.ids <схема и порт веба Dify, из разведки А1> ~/pcbk-d12/difywatch.tsv >/dev/null 2>&1 &
+echo $! > ~/pcbk-d12/difywatch.pid
+```
+
+**Тихий фоновый наблюдатель** (сессия, Bash в фоне, R140 — не инструмент Monitor: каждая строка — уведомление,
+окно короче 30 мин):
+
+```bash
+until ! ssh -o BatchMode=yes -o ConnectTimeout=10 <сервер, из разведки А1> ~/pcbk-d12/watchcond >/dev/null; do sleep 15; done;
+ssh -o BatchMode=yes -o ConnectTimeout=10 <сервер, из разведки А1> ~/pcbk-d12/watchcond
+```
+
+Молчание (`ok` в `/dev/null`) — нормально. Срабатывание печатает причину и завершает цикл — разбор, затем
+наблюдатель запускается заново. Локально (двойник, стенд «чистых рук») — то же самое без `ssh`, с
+`PCBK_D12=<каталог>` перед `watchcond`; двойник Dify (Д12а, этот день) и стенд рук (Д12б) проверяют этот же
+наблюдатель тем же способом до окна на сервере — на двойнике положительный контроль дал ровно одно уведомление
+«Dify поднялся сам», как и ожидалось (числа — в `docs/checks/D12a.md`).
+
+### Порядок окна (В-часть, Д12в)
+
+0. **Ворота: наблюдение раньше остановки.** Первый `stop` не нажимается, пока не выполнено всё: `pulse` и
+   `difywatch` пишут строки **≥ 5 мин** без пропусков (`tail -n 25 ~/pcbk-d12/pulse.tsv`, `tail -n 35
+   ~/pcbk-d12/difywatch.tsv` — первые столбцы идут через 15 и 10 с, последняя строка не старше 45 и 30 с);
+   `~/pcbk-d12/allowed` на месте (строки ниже, «Таблица ожидаемых строк»); `~/pcbk-d12/watchcond` печатает `ok`;
+   тихий фоновый наблюдатель запущен и молчит; положительные контроли помощников пройдены до окна (двойник Dify —
+   Д12а, `pulse` при остановленном `edge` — стенд «чистых рук», Д12б; числа — `docs/checks/D12a.md`, `D12b.md`).
+   Не выполнено — `stop` не нажимается, разбор.
+1. **R141 — пробный цикл.** `stop -t 120` → коды выхода (не `137` у базы, Redis, хранилища векторов) →
+   `difywatch` `0/N` → ждать ≥ 2 мин → `start` → сверка R144 за ≤ 10 мин. Ворота: прошёл — есть основной прогон;
+   не прошёл — Dify к владельцу (аварийный путь ниже), резерв не трогаем. Худший случай недоступности в пробном
+   цикле — до 20 мин (это число — в «да» окна).
+2. **R142 — сторож на время окна не шумит про отбор модели.** До остановки Dify сторож пересоздаётся с
+   `LLM_RUN_SILENT_S=3600` (вместе с прочими `LLM_RUN_*`, если они стоят) — иначе прогон отбора модели даёт ложную
+   строку, пока Dify выключен без всякой связи с ним. После окна (В5) — `LLM_RUN_*` снова пустые, сторож
+   пересоздаётся под флагом `pause`.
+3. **Прогон без Dify** — только путь студента (вход, Конструктор заводит агента, автотест «агент =
+   калькулятор», вкладка «Калькуляторы», преподаватель читает разговор); ни одного учения, ни одного
+   пересоздания `core`, кроме планового снятия прогона в конце под флагом `pause` (≤ 3 мин).
+4. **R144 — «Dify вернулся целиком».** После `start` — тот же набор Id, что в `S0` (снимок `snap` сразу после
+   шага В1.5, не из разведки — счётчики перезапуска за прошедшие дни не наши), поля `Id|Name|Image|State|
+   RestartCount` равны, `Health` не хуже, чем в `S0`, время старта новое, новых контейнеров в проекте Dify нет,
+   веб и `step` — как в `S0`. Ждать совпадения до 10 мин.
+
+### Таблица ожидаемых строк (R143)
+
+Пока весь стенд выложен (Д3б…Д11) и Dify выключен, строки страницы сторожа должны остаться **`ok`** — тест
+компоновки и независимость кода это гарантируют. Единственное заранее известное отклонение — не из-за Dify:
+
+| Строка (`id` / заголовок) | Ожидается без Dify | Почему |
+|---|---|---|
+| `edge` — «Входной прокси» | **`fail` — допустимо (`allowed`)**, пока сертификат не заменён (истёк 21.09) | TLS-проверка сторожа, не зависит от Dify (раздел «Замена сертификата») |
+| `sp-ro`, `sp-ctl` — прокси сокета | `ok` | свой docker.sock, Dify не использует |
+| `memory` — «Память сервера» | `ok` (вероятно свободнее — без контейнеров Dify) | хост общий, замер свой |
+| `core` / `core-container` — «Служба данных» | `ok` | историан отдельная СУБД, не Dify |
+| `historian` — «Историан БДРВ» | `ok` | учётка — только копия файла Dify, сам БДРВ Dify не использует |
+| `llm` — «LLM-прокси и бюджет» | `ok` | OpenRouter, не Dify |
+| `gateway` — «Шлюз и вход» | `ok` | свой nginx + `core` |
+| `web` — «Веб-чат» | `ok` | статика на `edge`, Dify её не отдаёт |
+| `agents` — «Агенты студентов» | `ok` | своя служба данных |
+| `teacher` — «Кабинет преподавателя и доли» | `ok` | своя служба данных |
+| `student-01`…`10` — рабочие места | `ok` (спящие — `sleeping_ok`) | gVisor-контейнеры, Dify не трогают |
+
+Строка `edge:fail` (или `edge:warn` в последние 14 дней перед истечением) должна лежать в файле `~/pcbk-d12/allowed`
+на сервере **до** старта `watchcond` — иначе она даст ложную тревогу, не связанную с Dify (I-4 р2: откат — только
+по доказанной зависимости от Dify, неясное — «не засчитано, разбор»).
+
+### Сроки
+
+- пробный цикл — ≤ 20 мин (худший случай: остановка по уровням `depends_on` ≈ 6 мин + 2 мин ожидания + возврат до
+  10 мин);
+- прогон без Dify — ≤ 75 мин от `stop` до начала возврата (срок «да» окна), твёрдый: по истечении — `start`
+  при любом состоянии прогона (R143 п. 3);
+- таймеры «осталось 5 мин» и «срок» — фоновые, по одному уведомлению каждый.
+
+### Чего не делать
+
+Запрещены, пока открыт профиль разрешений окна (кроме дословной строки `start`): `docker compose … down`,
+`down -v`, `up` (кроме крайней меры ниже, только словом владельца), `restart`, `pull`, `exec`, `run`, `kill`,
+`stop` компоновки Dify и `docker stop` без явного `pcbk-student-NN`, любая запись в `/opt/dify` (`sed -i`, `tee`,
+`>`, `rm`, `mv`, `cp` туда). Перезапуск демона Docker (`systemctl restart docker`) не делается никогда — гасит
+все контейнеры, включая Dify (см. «Один раз»). Не читать `.env` Dify целиком и не выводить `Cmd`/`Env`/`Args`/`Config` контейнеров Dify целиком — там его
+секреты; только узкие поля через `docker inspect -f` (как в `snap` и `difywatch`). `docker pause`, блокировка сети к Dify и «выключить только nginx
+Dify» — не считаются «Dify выключен целиком» (R136, отклонено).
+
+### Команда остановки/включения (R139)
+
+Окончательная строка — дословно по разведке А1 (проект, каталог, файлы компоновки Dify); здесь — форма с
+подстановками:
+
+```bash
+env -u COMPOSE_FILE -u COMPOSE_PROFILES docker compose -p <проект Dify, из разведки А1> \
+  --project-directory <каталог Dify, из разведки А1> -f <файл1, из разведки А1> [-f <файл2, из разведки А1>] stop -t 120
+env -u COMPOSE_FILE -u COMPOSE_PROFILES docker compose -p <проект Dify, из разведки А1> \
+  --project-directory <каталог Dify, из разведки А1> -f <файл1, из разведки А1> [-f <файл2, из разведки А1>] start
+```
+
+По памяти ожидается `-p docker --project-directory /opt/dify/docker -f /opt/dify/docker/docker-compose.yaml -f
+/opt/dify/docker/docker-compose.override.yaml` — подтверждается и вписывается дословно разведкой А1, до окна.
+`-t 120` — дать базе, Redis и хранилищу векторов Dify сохраниться. Владелец выполняет через `sudo`:
+`sudo env -u COMPOSE_FILE -u COMPOSE_PROFILES docker compose …` (`env -u` перед `sudo` не действует). Перед
+`stop` — `… ps -a --format '{{.Name}} {{.State}}'` в журнал как `S0`-состояния (одноразовые службы Dify —
+`exited`, это ожидаемо); сразу после `stop` — `docker inspect -f '{{.Name}}|{{.State.ExitCode}}|{{.State.OOMKilled}}'
+$(cat dify.ids)` в журнал; код `137` у базы, Redis или хранилища векторов — стоп, не продолжать пробный цикл.
+
+### Аварийный путь
+
+Контейнер Dify не стартует после `start`: только чтение (`ps -a`, `docker logs --tail 50 <имя>` — читает
+владелец, сессия логов Dify не выводит), решение — владельца. Крайняя мера — `… up -d --no-recreate --pull never
+--no-build` (создаёт только отсутствующие контейнеры, без выхода в интернет) — только словом владельца.
+
+## После перезагрузки сервера (с Д12)
+
+[Д] — живой перезагрузкой хоста не проверено; ниже — ожидание по политике `restart: unless-stopped`, которая стоит
+у всех служб `compose.yaml` (`docker compose config` — читать, не поднимать).
+
+**Что поднимается само** — при условии, что демон Docker сам встаёт при загрузке хоста (это проверяется один раз,
+раздел «Один раз», и дальше не трогается): `edge`, `watchdog`, `sp-ro`, `sp-ctl`, `core` — они были в состоянии
+«работает» перед выключением, и Engine возвращает такие контейнеры при своём старте; `unless-stopped` не поднимает
+только то, что было явно остановлено (`docker stop`) до выключения. Рабочие места, которые спали до перезагрузки,
+спящими и останутся — это ожидаемо: разбудит их следующий вход студента или преподавателя. Место, которое было
+разбужено в момент перезагрузки, вернётся запущенным — с тем же логином, но без разговора в памяти процесса
+OpenCode (сам разговор и агенты на томах не теряются).
+
+**Проверка:**
+```bash
+curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["stale"], [c["component"]+":"+c["state"] for c in d["checks"] if c["state"] != "ok"])'
+docker compose ps
+```
+Ожидается: `False []` (ничего не красное, кроме допустимых строк — раздел «Перед занятием»); у нужных служб в
+`docker compose ps` — `State` `running`.
+
+**Не поднялось** — то же первое действие, что у любой красной строки контейнера (раздел «Перед занятием»): для
+каждой отсутствующей службы — `docker compose up -d --no-build <имя службы>`, по имени, никогда без имён (без имён
+служб команда создаёт ещё и профиль `students`, которого в обычной выкладке нет в этой команде). Рабочие места эта
+команда не поднимает — профиль `students` только создаёт их, не запускает (раздел «Рабочие места»); спящее место
+будит вход, место, работавшее до перезагрузки, — только `docker start pcbk-student-NN`, если само не поднялось.
+
+## Порт 3389 (с Д12)
+
+**Решается в окне В4 плана Д12в — на момент этой правки ещё не проведено.** Ниже — форма по решению Д12-R145: что
+окно сделает и как вернуть; факты о текущем сервере (слушает ли сейчас 3389, включён ли `xrdp`, точный текст
+правила `ufw`) появляются только после разведки А1 и самого окна — здесь заранее не предполагаются.
+
+Выбирает заказчик (через владельца) один из трёх вариантов; исходный текст снимаемого правила — дословно из
+`sudo ufw show added`, записывается в окне, до снятия.
+
+- **Вариант А — выключить `xrdp`** (рекомендация, если подключений за 30 дней не было): `sudo systemctl disable
+  --now xrdp xrdp-sesman`; правило, если было, — `sudo ufw delete <исходный текст из "ufw show added">` (снимает
+  сразу v4 и v6). Проверка: `ss -ltnH '( sport = :3389 )'` — пусто; `systemctl is-enabled xrdp xrdp-sesman` —
+  `disabled`; **новое** SSH-соединение входит, текущее не закрывается. Возврат: `sudo systemctl enable --now xrdp
+  xrdp-sesman`; `sudo ufw <исходный текст правила>`.
+- **Вариант Б — только `127.0.0.1`** (если RDP всё же нужен): копия `xrdp.ini` в `xrdp.ini.pre-d12`, в рабочей —
+  `port=tcp://127.0.0.1:3389`, `sudo systemctl restart xrdp`; правило `ufw` снимается тем же `delete <исходный
+  текст>`. Доступ к RDP — туннелем: `ssh -L 13389:127.0.0.1:3389 <сервер>`. Возврат: вернуть `xrdp.ini.pre-d12`,
+  `sudo systemctl restart xrdp`, `sudo ufw <исходный текст правила>`.
+- **Вариант В — не закрывать.** Ничего не меняется на сервере; этот раздел тогда и остаётся отметкой «не закрыто
+  по решению заказчика», без команд выше.
+
+Во всех вариантах: правило **22** не трогается, пакет `xrdp` не удаляется, текущая SSH-сессия не закрывается, пока
+новая не подтверждена. После окна здесь появляется: дата, какой вариант выбран, дословное согласие заказчика (роль,
+без имени), результат проверки — со ссылкой на `docs/checks/D12c.md`.
+
 ## Что открывается наружу
 
 - Порт **8443** контейнера `edge` — Docker публикует его **в обход ufw**.
@@ -1724,6 +2209,17 @@ server {
   которого байт приходит чаще раза в 10 с, срок между чтениями не обрывает:
   такое соединение держит слот сколько угодно. Окончательно — предел по адресу
   клиента после замера `$remote_addr` на сервере (Б7).
+- **Экран сети выхода `pcbk-egress` — предложение (с Д12), по умолчанию не применяется.** Сеть `pcbk-egress`
+  сейчас открывает с `core` любой адрес (строка «Сеть выхода», раздел «Служба данных»): направления держит только
+  охрана выхода в процессе (Д3б), не сетевой экран — остаточный риск Д3а. Готовое решение (не применено, решает
+  заказчик отдельным «да», окно В4, вопрос 9) — блок `*filter … COMMIT` в `/etc/ufw/after.rules` по образцу
+  ufw-docker, только на интерфейсе `pcbk-egress`: пропускает уже установленные соединения, DNS и историан по их
+  адресам, HTTPS (443) кроме частных сетей (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) — и запрещает
+  остальное; плюс `sudo ufw insert 1 deny in on pcbk-egress`. Откат — снять блок, `sudo ufw reload`, `sudo ufw
+  delete deny in on pcbk-egress`. Проверка после применения — строки «Служба данных» и «LLM-прокси и бюджет» в
+  норме, и одноразовым контейнером образа `core` в сети `pcbk-egress`: адрес OpenRouter резолвится и открыт на 443,
+  историан открыт на своём порту, посторонние адреса и DNS вне списка — закрыты. Применено или нет — здесь
+  появится после окна В4 (тот же `docs/checks/D12c.md`).
 
 ## Замена сертификата
 
