@@ -364,6 +364,34 @@ def test_build_roles_llm_run_typo_is_config_error(tmp_path):                    
     role = build_llm_role(settings, {**LLM_ENV, "LLM_RUN_ID": "d8", "LLM_RUN_USD": "10",
                                      "LLM_RUN_CALLERS": "student-07,student-7"})
     assert role.config_error.startswith("настройки: LLM_RUN_CALLERS") and role.run is None
+
+
+# Д14: запасная модель — разбор LLM_FALLBACK (settings.py), имена — кандидаты models.py (их тестирует test_llm_fallback.py)
+@pytest.mark.parametrize("env", [
+    {"LLM_FALLBACK": "zq-raw/model=z-ai/glm-5.3-flash"},                  # основная неизвестна
+    {"LLM_FALLBACK": "z-ai/glm-5.3=zq-raw/model"},                        # запасная неизвестна
+    {"LLM_FALLBACK": "z-ai/glm-5.3=z-ai/glm-5.3"},                        # совпадают
+    {"LLM_FALLBACK": "z-ai/glm-5.3=z-ai/glm-5.3-flash,z-ai/glm-5.3=openai/gpt-6-sol"},   # основная повторена
+    {"LLM_FALLBACK": "z-ai/glm-5.3"},                                     # без «=»
+    {"LLM_MODELS": "z-ai/glm-5.3,z-ai/glm-5.3-flash", "LLM_FALLBACK": "z-ai/glm-5.3=openai/gpt-6-luna"},
+])
+def test_llm_fallback_settings_refused(env):
+    with pytest.raises(ValueError, match=r"^LLM_FALLBACK:") as e:
+        LlmSettings.from_env(env)
+    assert "zq-raw" not in str(e.value)
+
+
+def test_llm_fallback_settings_ok():
+    assert LlmSettings.from_env({}).LLM_FALLBACK == ""
+    s = LlmSettings.from_env({"LLM_FALLBACK": "z-ai/glm-5.3=z-ai/glm-5.3-flash"})
+    assert s.LLM_FALLBACK == "z-ai/glm-5.3=z-ai/glm-5.3-flash"
+
+
+def test_build_roles_llm_fallback_typo_is_config_error(tmp_path):                 # опечатка — 403 всем, как LLM_RUN_*
+    from pcbk_core.main import build_llm_role
+    settings = replace(SETTINGS, DB_PATH=str(tmp_path / "core.db"))
+    role = build_llm_role(settings, {**LLM_ENV, "LLM_FALLBACK": "z-ai/glm-5.3=z-ai/glm-5.3"})
+    assert role.config_error.startswith("настройки: LLM_FALLBACK") and role.fallback == {}
     assert "student-7" not in role.config_error
 
 

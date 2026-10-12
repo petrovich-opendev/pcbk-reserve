@@ -652,11 +652,12 @@ def test_deadline_in_open_chat_after_send_is_unknown_and_keeps_step(tmp_path, fa
 async def test_cancel_in_open_chat_after_send_is_unknown(tmp_path, fake_or):     # ревью A, I1: снят обработчик
     role = make_llm_role(tmp_path, fake_or)
     policy = role.models["z-ai/glm-5.3"]
-    body = rebuild_body(chat_body(text="q FAKESLOWSTART"), policy, caller="student-01", session=SES)
+    raw = chat_body(text="q FAKESLOWSTART")
+    body = rebuild_body(raw, policy, caller="student-01", session=SES)
     assert role.turns.step("student-01", SES, turn_mark(body)) == 1
     call = role.begin_call(caller="student-01", session=SES, parent=None, model=policy.model, step=1,
                            estimate=policy.estimate_usd(body_bytes(body), body["max_tokens"]))
-    task = asyncio.create_task(forward(role, call, body))
+    task = asyncio.create_task(forward(role, call, body, raw))
     await wait_until_async(lambda: call.sent_upstream)
     await anyio.sleep(0.3)                                                       # запрос у двойника, заголовков нет
     task.cancel()
