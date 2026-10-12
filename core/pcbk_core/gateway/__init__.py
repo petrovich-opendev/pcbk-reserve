@@ -71,6 +71,7 @@ from fastapi import APIRouter, Depends, FastAPI
 from fastapi.responses import JSONResponse
 
 from .. import zones
+from ..agents.findings import AgentFindings
 from ..agents.stats import AgentStats
 from ..agents.store import AgentStore
 from ..app import RoleBase
@@ -284,6 +285,8 @@ class GatewayRole(RoleBase):
         self._shares_seen: tuple[bool, int] = (True, 0)   # (ok, drift) прошлой сверки: строка журнала — на смену
         # учёт агентов шлюза (Д7-R53: свой AgentStore на тот же core.db) и воркер перезагрузки (Д7-R58)
         self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
+        # находки агентов (Д13: свой AgentFindings на тот же core.db, читает GET /pcbk/api/events)
+        self.findings = AgentFindings(settings.DB_PATH)
         self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
                                     wallclock=wallclock, drill=gw.DRILL_AGENTS)
         workplaces.on_ready = self.reloads.place_ready
@@ -545,6 +548,7 @@ class GatewayRole(RoleBase):
                 self._add_config_error(f"учётные записи не открываются: {self.store.last_error or 'сбой'}")
             await self._open_teacher_log()          # не бросает: сбой — store_ok ложь, не config_error (R100)
             await self._open_agents()               # не бросает: сбой — флаг воркера, не config_error (П13)
+            await self._open_findings()             # не бросает: сбой — строка журнала (Д13, П13)
             await self.workplaces.spctl.open()
             await self.workplaces.open()
             if self.config_error:
@@ -586,6 +590,17 @@ class GatewayRole(RoleBase):
         if not opened:
             self.agent_stats.worker_store_failed(self.agents.last_error or "Error")
             log.error("шлюз: учёт агентов не открыт (%s)", self.agents.last_error)
+
+    async def _open_findings(self) -> None:
+        """Таблица находок агентов (CREATE IF NOT EXISTS, Д13) в потоке. Неудача — строка журнала; GET
+        /pcbk/api/events ответит 503, пока таблица не появится (её создаёт и роль «данные»); не config_error —
+        вход студентов от находок не зависит."""
+        try:
+            opened = await asyncio.to_thread(self.findings.open)
+        except Exception as exc:
+            self.findings.last_error, opened = type(exc).__name__, False
+        if not opened:
+            log.error("шлюз: находки агентов не открыты (%s)", self.findings.last_error)
 
     async def _shutdown(self) -> None:
         for name in ("_reaper", "_reload_task", "_halt_task"):

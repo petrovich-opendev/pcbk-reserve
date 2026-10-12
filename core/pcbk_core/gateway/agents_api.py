@@ -22,6 +22,12 @@ GET /pcbk/api/agents — панель «Агенты» чата (Д7-R64, R65): 
   save, и отказ too_many_agents приходит раньше own == limit (предпроверка Д7б, m12; docs/checks/D7b.md). Веб own и
   limit проверяет, но не показывает (R65).
 
+GET /pcbk/api/events (Д13) — вкладка «События»: {"events": [...], "limit": EVENTS_LIMIT}, новые первыми, не больше
+EVENTS_LIMIT. Проверки те же, что у GET /pcbk/api/agents (зона → настройка → сессия, преподаватель — 403 тем же
+текстом TEACHER_TEXT); только место учётки сессии. Источник строк — AgentFindings.recent (role.findings, agent_findings
+в core.db, пишет report_event службы данных). agent_title — AgentStore.title_of места (role.agents): архивный агент —
+прежнее название, имени не нашли вовсе — имя агента как есть.
+
 Модуль импортируется лениво, как api, proxy и web (команда администратора accounts).
 """
 from __future__ import annotations
@@ -32,6 +38,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
+from ..agents.findings import Finding, FindingsError
 from ..agents.store import MAX_AGENTS, AgentRow, StoreError
 from .accounts import Account
 from .api import ERROR_NAMES, GW_MESSAGES, PREFIX, configured, current_account, front_only, gw_error
@@ -41,6 +48,8 @@ if TYPE_CHECKING:
 
 HEALTH_AGENTS_PATH = "/health/agents"
 AGENTS_PATH = PREFIX + "/agents"
+EVENTS_PATH = PREFIX + "/events"               # GET /pcbk/api/events (Д13): события агентов места студента
+EVENTS_LIMIT = 100
 
 # встроенные агенты образа места (Д7-R64): (имя файла без .md, название, назначение) — в порядке панели
 IMAGE_AGENTS: tuple[tuple[str, str, str], ...] = (
@@ -59,6 +68,17 @@ def agents_json(rows: list[AgentRow]) -> dict:
     agents += [{"name": row.name, "title": row.title, "purpose": row.purpose, "kind": "own",
                 "state": OWN_STATES.get(row.state, "broken")} for row in rows]
     return {"agents": agents, "own": len(rows), "limit": MAX_AGENTS}
+
+
+def events_json(findings: list[Finding], titles: dict[str, str | None]) -> dict:
+    """Ответ GET /pcbk/api/events (Д13): новые первыми (findings уже отданы recent() так), не больше EVENTS_LIMIT.
+    agent_title — из учёта (titles[agent]); агента не нашли вовсе — имя агента (titles не держит такого ключа или
+    он None)."""
+    events = [{"id": f.id, "ts": f.ts, "agent": f.agent, "agent_title": titles.get(f.agent) or f.agent,
+              "kind": f.kind, "title": f.title, "tags": list(f.tags), "period_start": f.period_start,
+              "period_end": f.period_end, "value": f.value, "setpoint": f.setpoint, "text": f.text}
+             for f in findings]
+    return {"events": events, "limit": EVENTS_LIMIT}
 
 
 def agents_router(role: "GatewayRole") -> APIRouter:
@@ -82,5 +102,24 @@ def agents_router(role: "GatewayRole") -> APIRouter:
         except StoreError:
             return gw_error(503, ERROR_NAMES[503], GW_MESSAGES["store"])
         return JSONResponse(agents_json(rows))
+
+    # Д13: та же зона, настройка и сессия, что у /pcbk/api/agents (m24); преподаватель — тот же текст 403
+    @router.get(EVENTS_PATH, dependencies=[Depends(front_only), Depends(configured(role))])
+    async def my_events(account: Account = Depends(account_of)) -> JSONResponse:
+        if account.place is None:
+            return gw_error(403, ERROR_NAMES[403], TEACHER_TEXT)
+        try:
+            findings = await asyncio.to_thread(role.findings.recent, account.place, EVENTS_LIMIT)
+        except FindingsError:
+            return gw_error(503, ERROR_NAMES[503], GW_MESSAGES["store"])
+        names = sorted({f.agent for f in findings})
+
+        def titles_of() -> dict[str, str | None]:
+            return {name: role.agents.title_of(account.place, name) for name in names}
+        try:
+            titles = await asyncio.to_thread(titles_of)
+        except StoreError:
+            return gw_error(503, ERROR_NAMES[503], GW_MESSAGES["store"])
+        return JSONResponse(events_json(findings, titles))
 
     return router

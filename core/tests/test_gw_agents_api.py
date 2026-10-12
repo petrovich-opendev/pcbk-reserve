@@ -4,14 +4,16 @@ own и limit. Место — только из учётки сессии; зон
 нужен); воркер перезагрузки припаркован — его проход менял бы состояния строк посреди теста."""
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from helpers import BASE, FRONT, PLACE_NET, Gw, fail_connect, make_gateway, park_reload_worker   # Gw — общий с Д9а
+from pcbk_core.agents.findings import FindingsError
 from pcbk_core.agents.store import MAX_AGENTS
-from pcbk_core.gateway.agents_api import AGENTS_PATH, IMAGE_AGENTS
+from pcbk_core.gateway.agents_api import AGENTS_PATH, EVENTS_LIMIT, EVENTS_PATH, IMAGE_AGENTS
 from pcbk_core.gateway.api import GW_MESSAGES
 
 REPO = Path(__file__).resolve().parents[2]      # m11: в helpers его нет; чистая копия — с student (и web)
@@ -175,6 +177,89 @@ def test_agents_api_other_methods_404_without_allow(gw):                        
 
 def test_agents_path():
     assert AGENTS_PATH == "/pcbk/api/agents"
+
+
+# --- Д13: GET /pcbk/api/events — события агентов места (agent_findings) ---
+
+EVENT_AT = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
+
+
+def add_finding(gw: Gw, place: int, agent: str = "sushka-bdm2", *, kind: str = "deviation", title: str = "Заголовок",
+                tags=("20FAKE_001_PV",), text: str = "Текст находки.", value=85.0, setpoint=90.0,
+                period_start=None, period_end=None, at: datetime = EVENT_AT) -> int:
+    assert gw.role.findings.open(), gw.role.findings.last_error
+    return gw.role.findings.add(place, agent, kind, title, list(tags), period_start, period_end, value, setpoint,
+                                text, at)
+
+
+def test_events_api_shape_and_own_place_only(gw):
+    gw.store_save(3, "sushka-bdm2", state="visible", title="Сушка БДМ-2")
+    fid = add_finding(gw, 3, period_start="2026-10-07T06:00:00+00:00", period_end="2026-10-07T06:30:00+00:00")
+    add_finding(gw, 5, agent="someone")                                      # другое место — не видно
+    body = gw.as_("stu-03").get(EVENTS_PATH).json()
+    assert body == {"events": [{
+        "id": fid, "ts": "2026-10-07T09:00:00+00:00", "agent": "sushka-bdm2", "agent_title": "Сушка БДМ-2",
+        "kind": "deviation", "title": "Заголовок", "tags": ["20FAKE_001_PV"],
+        "period_start": "2026-10-07T06:00:00+00:00", "period_end": "2026-10-07T06:30:00+00:00", "value": 85.0,
+        "setpoint": 90.0, "text": "Текст находки."}], "limit": EVENTS_LIMIT}
+    events5 = gw.as_("stu-05").get(EVENTS_PATH).json()["events"]               # своё место видно, место 3 — нет
+    assert [e["agent"] for e in events5] == ["someone"]
+
+
+def test_events_api_agent_title_from_store(gw):
+    gw.store_save(3, "sushka-bdm2", state="visible", title="Сушка БДМ-2")
+    add_finding(gw, 3, agent="sushka-bdm2")
+    gw.role.agents.archive(3, "sushka-bdm2", EVENT_AT)                       # архивный — прежнее название
+    add_finding(gw, 3, agent="bez-uchota")                                   # имени вовсе нет в учёте
+    events = gw.as_("stu-03").get(EVENTS_PATH).json()["events"]
+    assert {(e["agent"], e["agent_title"]) for e in events} == {("sushka-bdm2", "Сушка БДМ-2"),
+                                                                ("bez-uchota", "bez-uchota")}
+
+
+def test_events_api_new_first_and_limit(gw):
+    for i in range(EVENTS_LIMIT + 5):
+        add_finding(gw, 3, title=f"Находка {i:03d}", at=EVENT_AT + timedelta(seconds=i))
+    events = gw.as_("stu-03").get(EVENTS_PATH).json()["events"]
+    assert len(events) == EVENTS_LIMIT
+    assert [e["title"] for e in events[:3]] == ["Находка 104", "Находка 103", "Находка 102"]   # новые первыми
+
+
+def test_events_api_refusals(gw):
+    r = gw.anon().get(EVENTS_PATH)
+    assert (r.status_code, r.json()) == (401, {"name": "Unauthorized", "data": {"message": GW_MESSAGES["need_login"]}})
+    r = gw.as_("teach").get(EVENTS_PATH)
+    assert (r.status_code, r.json()["data"]["message"]) == (403, TEACHER_TEXT)                 # тем же текстом
+    assert gw.as_("stu-03", client=PLACE_NET).get(EVENTS_PATH).status_code == 404
+
+
+def test_events_api_zone_before_session(gw):
+    for client in (PLACE_NET, EGRESS):
+        for c in (gw.anon(client), gw.as_("stu-03", client=client)):
+            r = c.get(EVENTS_PATH)
+            assert (r.status_code, r.json()) == (404, {"name": "NotFound", "data": {"message": "Не найдено"}}), client
+
+
+def test_events_api_store_failure_503(gw, monkeypatch):
+    add_finding(gw, 3)
+    s3 = gw.as_("stu-03")
+    assert s3.get(EVENTS_PATH).status_code == 200
+
+    def broken(place, limit):
+        raise FindingsError("находки агентов: OperationalError")
+
+    monkeypatch.setattr(gw.role.findings, "recent", broken)
+    r = s3.get(EVENTS_PATH)
+    assert (r.status_code, r.json()) == (503, {"name": "Unavailable", "data": {"message": GW_MESSAGES["store"]}})
+    r = gw.as_("teach").get(EVENTS_PATH)                                       # преподавателю — всё равно 403
+    assert (r.status_code, r.json()["data"]["message"]) == (403, TEACHER_TEXT)
+
+
+def test_events_api_empty_place(gw):
+    assert gw.as_("stu-03").get(EVENTS_PATH).json() == {"events": [], "limit": EVENTS_LIMIT}
+
+
+def test_events_path():
+    assert EVENTS_PATH == "/pcbk/api/events"
 
 
 def image_description(name: str) -> str:
