@@ -134,7 +134,6 @@ NAME_LINE = "Твоё имя в системе: `{name}` (его передав�
 _RULES_MARKER = "\n\n" + _RULES[0]
 # начало раздела тегов без даты (она в render_agent_file динамическая): extract_prompt ищет, что из двух разделов
 # идёт первым после инструкции — раздел тегов (если он есть) или сразу правила стенда
-_TAGS_MARKER = "\n\n## Теги узла"
 
 
 @dataclass(frozen=True)
@@ -223,6 +222,9 @@ def one_line_problem(text: str, low: int, high: int) -> bool:
     return not low <= len(text) <= high or bool(_ONE_LINE_BAD.search(text))
 
 
+_TAGS_HEADER = re.compile(r"\n\n## Теги узла \(каталог историана; проверено службой \d{4}-\d{2}-\d{2}\)\n", re.ASCII)
+
+
 def extract_prompt(text: str, name: str) -> str:
     """Инструкция агента из текста файла (my_agents, Д13): между строкой имени (NAME_LINE) и разделом «## Правила
     стенда» — ровно то, что сохранил студент в prompt, без строк шаблона. Файл не того вида (ручная правка,
@@ -236,9 +238,10 @@ def extract_prompt(text: str, name: str) -> str:
     rules_at = rest.rfind(_RULES_MARKER)
     if rules_at == -1:
         return ""
-    tags_at = rest.find(_TAGS_MARKER)
-    # раздел тегов (если есть) идёт раньше правил — границу инструкции задаёт первый из двух разделов
-    idx = tags_at if 0 <= tags_at < rules_at else rules_at
+    # раздел тегов (если есть) идёт раньше правил; как и правила — последнее совпадение настоящего заголовка службы
+    # (с датой проверки) до правил: такой же текст внутри инструкции студента не обрезает её (ревью Д13, I-1)
+    tags = [m.start() for m in _TAGS_HEADER.finditer(rest, 0, rules_at)]
+    idx = tags[-1] if tags else rules_at
     if idx < 2:
         return ""
     return rest[2:idx]
