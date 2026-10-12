@@ -186,6 +186,16 @@ svg.profile circle { fill: var(--accent); }
 .calc-about dd { margin: 0; overflow-wrap: anywhere; }
 .calc-notes { margin: .3rem 0 0; padding-left: 1.2rem; font-size: .9em; color: var(--warn); }
 
+/* вкладка «События» (Д13): таблица событий агентов, кнопка «Обновить»; всё только текстом */
+.events { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: .75rem; padding: 1rem; }
+.events-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-shrink: 0; }
+.events-head h2 { margin: 0; font-size: 1.2rem; }
+.events-msg { margin: 0; color: var(--fail); font-weight: 600; flex-shrink: 0; }
+.events-note { margin: 0; color: var(--muted); flex-shrink: 0; }
+.events-table { border-collapse: collapse; margin: 0; flex-shrink: 0; }
+.events-table th, .events-table td { padding: .3rem .7rem; border: 1px solid var(--border); text-align: left;
+  vertical-align: top; overflow-wrap: anywhere; }
+
 /* кабинет преподавателя (Д10-R106): таблица мест слева, открытое место справа; ниже — доли и журнал. Колонка
    прокручивается сама, как вкладка калькуляторов; поля долей — классы .calc-row и .calc-field */
 .teacher { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: .9rem; padding: 1rem; }

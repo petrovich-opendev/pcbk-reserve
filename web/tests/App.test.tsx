@@ -8,7 +8,8 @@ import { App } from "../src/App";
 import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import type { startStatusPolling } from "../src/status";
-import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_NOTICE_UNKNOWN, T_TCH_UNKNOWN, T_UNKNOWN } from "../src/texts";
+import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_EVENTS_CRASH, T_EVENTS_EMPTY, T_EVENTS_RESTART,
+         T_NOTICE_UNKNOWN, T_TCH_UNKNOWN, T_UNKNOWN } from "../src/texts";
 import { OVERVIEW_READY_03, teacherApi } from "./teacherFixtures";
 
 type Answer = [number, unknown];
@@ -16,7 +17,7 @@ type Answers = Answer | Answer[];
 
 // Ответы по ручкам: один ответ — на каждый вызов, список — по очереди (последний повторяется).
 function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: Answers; ackNotice?: Answers; agents?: Answers;
-                   calc?: Answers }) {
+                   events?: Answers; calc?: Answers }) {
   const queue = (a: Answers | undefined): (() => Promise<Reply>) => {
     const list: Answer[] = a === undefined ? [[500, null]] : typeof a[0] === "number" ? [a as Answer] : a as Answer[];
     let i = 0;
@@ -33,6 +34,7 @@ function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: An
     logout: vi.fn(queue(o.logout ?? [200, { ok: true }])),
     ackNotice: vi.fn(queue(o.ackNotice)),
     agents: vi.fn(queue(o.agents)),
+    events: vi.fn(queue(o.events)),
     calc: vi.fn(queue(o.calc)),
     report: vi.fn(async (_kind: string) => {}),
   } satisfies Api;
@@ -400,6 +402,62 @@ test("tabs_on_workplace_and_asleep_screens", async () => {                      
   expect(await screen.findByText("Рабочее место спит")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
   expect(screen.getByRole("heading", { name: "Калькуляторы БДРВ — те же расчёты, что у агентов" })).toBeTruthy();
+});
+
+// --- Д13: вкладка «События» — только у студента, рядом с «Чат» и «Калькуляторы» ---
+
+test("events_tab_present_for_student_not_teacher", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }] });
+  const first = render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  for (const name of ["Чат", "Калькуляторы", "События"]) expect(screen.getByRole("button", { name })).toBeTruthy();
+  first.unmount();
+
+  const t = api({ me: [200, { login: "t", role: "teacher", place: null }] });
+  render(<App api={t} teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })} navigate={vi.fn()}
+              ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText("Кабинет преподавателя");
+  expect(screen.queryByRole("button", { name: "События" })).toBeNull();           // DESIGN п.7: только у студента
+});
+
+test("events_tab_switch_keeps_chat_mounted_and_loads_once", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }], events: [200, { events: [], limit: 100 }] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  const chat = await screen.findByTestId("fake-chat");
+  expect(a.events).not.toHaveBeenCalled();                                        // вкладка сама ничего не спрашивает
+  fireEvent.click(screen.getByRole("button", { name: "События" }));
+  expect(await screen.findByText(T_EVENTS_EMPTY)).toBeTruthy();
+  expect(chat.closest("[hidden]")).not.toBeNull();                                // чат не снят — поток жив
+  expect(a.events).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "Чат" }));
+  expect(screen.getByTestId("fake-chat")).toBe(chat);
+  expect(chat.closest("[hidden]")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "События" }));
+  expect(a.events).toHaveBeenCalledTimes(1);                                      // не перемонтирована — не перезапросила
+});
+
+test("events_tab_crash_reports_and_keeps_chat", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }] });
+  const Boom = (): never => { throw new Error("сбой вкладки"); };
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} EventsImpl={Boom} startPolling={okPolling} />);
+  const chat = await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "События" }));
+  await waitFor(() => expect(a.report).toHaveBeenCalledWith("ui_crash"));
+  expect(screen.getByText(T_EVENTS_CRASH)).toBeTruthy();
+  expect(screen.getByRole("button", { name: T_EVENTS_RESTART })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Чат" }));
+  expect(screen.getByTestId("fake-chat")).toBe(chat);                             // чат не перемонтирован
+});
+
+test("events_tab_signed_out_goes_to_login", async () => {
+  const navigate = vi.fn();
+  const a = api({ me: student, workplace: [200, { state: "ready" }], events: [401, { name: "Unauthorized" }] });
+  render(<App api={a} navigate={navigate} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "События" }));
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
+  expect(screen.queryByRole("button", { name: "События" })).toBeNull();           // ушли на вход — вкладок нет
 });
 
 // --- Д10б: вкладки «Кабинет» и «Калькуляторы» у преподавателя (Д10-R110, Д10-R109) ---

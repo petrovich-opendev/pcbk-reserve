@@ -45,6 +45,7 @@ export interface Api {
   workplace(): Promise<Reply>;
   ackNotice(notice: string): Promise<Reply>;          // тело ровно {"notice": N}; ответ — 204 (R49)
   agents(): Promise<Reply>;                           // агенты места учётки (Д7-R64); старый core — 404 (R65)
+  events(): Promise<Reply>;                           // события агентов места — вкладка «События» (Д13, DESIGN п.5)
   report(kind: ReportKind): Promise<void>;            // тело ровно {"kind": K}; ответ не читается, ошибки глушатся (R51)
   // ответ службы как есть: 200 при любом статусе инструмента, отказы шлюза — {"name", "data": {"message"}} (Д9-R87)
   calc(tool: CalcTool, args: Record<string, unknown>): Promise<Reply>;
@@ -58,6 +59,7 @@ export function createApi(fetchImpl: JsonFetch = defaultFetch): Api {
     workplace: () => callJson("GET", "/pcbk/api/workplace", undefined, fetchImpl),
     ackNotice: (notice) => callJson("POST", "/pcbk/api/auth/notice", { notice }, fetchImpl),
     agents: () => callJson("GET", "/pcbk/api/agents", undefined, fetchImpl),
+    events: () => callJson("GET", "/pcbk/api/events", undefined, fetchImpl),
     calc: (tool, args) => callJson("POST", `/pcbk/api/calc/${tool}`, args, fetchImpl),
     // отчёт не повторяется (в том числе 404 старого core и 503 WorkplaceBusy предела edge — 509 → busy.json): потерянный
     // отчёт дешевле шторма

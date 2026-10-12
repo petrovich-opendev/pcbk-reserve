@@ -6,10 +6,11 @@ import { expect, test } from "vitest";
 import { CALC_QUERY_CHARS, CALC_SEARCH_LIMIT, CALC_TAG_CHARS, DEFAULT_FORM, MODE_CHOICES, PERIOD_CHOICES, POINT_CHOICES,
          SIMILAR_NOTE_CORE } from "../src/calc";
 import * as texts from "../src/texts";
-import { CALC_LABELS, MAX_TEXT, MAX_TITLE, NOTICES, STAND_WARNING, T_BUSY, T_CALC_BAD_RANGE, T_CALC_BUSY,
-         T_CALC_CRASH, T_CALC_FIND, T_CALC_NO_TAG, T_CALC_PERIOD_LINE, T_CALC_RESTART, T_CALC_RUN, T_CALC_SIMILAR,
-         T_CALC_TITLE, T_DOWN, T_TAB_CALC, T_TAB_CHAT, T_TCH_CRASH, T_TCH_READ_ONLY, T_TCH_RESTART, T_TCH_SHARES_DONE,
-         T_TCH_TITLE, T_TCH_WAKE, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
+import { CALC_LABELS, EVENT_KIND_LABELS, EVENTS_COLUMNS, MAX_TEXT, MAX_TITLE, NOTICES, STAND_WARNING, T_BUSY,
+         T_CALC_BAD_RANGE, T_CALC_BUSY, T_CALC_CRASH, T_CALC_FIND, T_CALC_NO_TAG, T_CALC_PERIOD_LINE, T_CALC_RESTART,
+         T_CALC_RUN, T_CALC_SIMILAR, T_CALC_TITLE, T_DOWN, T_EVENTS_CRASH, T_EVENTS_EMPTY, T_EVENTS_RESTART,
+         T_EVENTS_TITLE, T_TAB_CALC, T_TAB_CHAT, T_TAB_EVENTS, T_TCH_CRASH, T_TCH_READ_ONLY, T_TCH_RESTART,
+         T_TCH_SHARES_DONE, T_TCH_TITLE, T_TCH_WAKE, T_TOO_MANY_TABS, TOOL_LABELS } from "../src/texts";
 
 test("stand_warning_same_as_login_page", () => {
   const html = readFileSync("../edge/static/login.html", "utf8");
@@ -32,7 +33,21 @@ test("fallback_texts_same_as_gateway", () => {
 test("tool_labels", () => {
   expect(TOOL_LABELS).toEqual({ pcbk_tag_now: "текущее значение", pcbk_tag_period: "сводка за период", pcbk_catalog_search: "поиск тегов",
                                pcbk_save_agent: "сохранение агента",
-                               pcbk_tag_series: "ряд и профиль", pcbk_calc_runtime: "наработка" });   // Д9-R88
+                               pcbk_tag_series: "ряд и профиль", pcbk_calc_runtime: "наработка",
+                               pcbk_my_agents: "мои агенты", pcbk_report_event: "запись события" });   // Д9-R88, Д13
+});
+
+// --- Д13: вкладка «События» — тексты дословно ---
+
+test("events_texts", () => {
+  expect([T_TAB_CHAT, T_TAB_CALC, T_TAB_EVENTS, T_EVENTS_TITLE, T_EVENTS_CRASH, T_EVENTS_RESTART])
+    .toEqual(["Чат", "Калькуляторы", "События", "События агентов",
+              "Вкладка событий столкнулась с ошибкой. Сбой отмечен для администратора.", "Перезапустить события"]);
+  expect(T_EVENTS_EMPTY).toBe(
+    "Событий пока нет. Их записывают агенты контроля, например при проверке контрольной точки за смену.");
+  expect(EVENT_KIND_LABELS).toEqual({ deviation: "Отклонение от задания", note: "Заметка" });
+  expect(Object.values(EVENTS_COLUMNS)).toEqual(
+    ["Время", "Агент", "Вид", "Заголовок", "Теги", "Период", "Значение и задание", "Текст"]);
 });
 
 test("calc_texts", () => {                                                        // Д9-R88: тексты вкладки дословно

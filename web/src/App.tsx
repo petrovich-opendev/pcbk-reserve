@@ -18,6 +18,9 @@
 // монтируется при первом открытии и остаётся (форма и итог переживают переход в чат), снимается только с уходом из фаз
 // вкладок; у неё своя ErrorBoundary (m5) со своими текстами: сбой — отчёт ui_crash, «Перезапустить калькуляторы»
 // перемонтирует только её, чат не трогается.
+// Вкладка «События» (Д13, DESIGN п.7): только у студента (showEvents = tabs && !teacher), рядом с «Чат» и
+// «Калькуляторы». Устроена так же, как «Калькуляторы»: монтируется при первом открытии, остаётся смонтированной,
+// своя ErrorBoundary. Основная область (чат/кабинет) прячется, пока открыта любая вкладка кроме «main».
 // Преподаватель (Д10-R106): фаза teacher рисует кабинет (TeacherPage) в своей ErrorBoundary с текстами кабинета; ни места
 // студента, ни чата, ни одного вызова /pcbk/api/oc; вызовы кабинета — teacherApi (по умолчанию createTeacherApi()).
 // Вкладки преподавателя (Д10-R110): в фазе teacher — «Кабинет» и «Калькуляторы». Кабинет, как чат студента, не снимается:
@@ -29,14 +32,15 @@ import { replyText, type Api, type ReportKind, type Reply } from "./api";
 import { CalcPage, type CalcPageProps } from "./components/CalcPage";
 import { Chat, type ChatProps } from "./components/Chat";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { EventsPage, type EventsPageProps } from "./components/EventsPage";
 import { Header, type View } from "./components/Header";
 import { NoticeScreen } from "./components/NoticeScreen";
 import { TeacherPage } from "./components/TeacherPage";
 import { WorkplaceScreen } from "./components/WorkplaceScreen";
 import { startStatusPolling } from "./status";
 import { createTeacherApi, type TeacherApi } from "./teacherApi";
-import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TCH_CRASH, T_TCH_RESTART,
-         T_TCH_UNKNOWN, T_UNKNOWN, T_WAKE } from "./texts";
+import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_EVENTS_CRASH, T_EVENTS_RESTART, T_LOADING,
+         T_NOTICE_UNKNOWN, T_RETRY, T_TCH_CRASH, T_TCH_RESTART, T_TCH_UNKNOWN, T_UNKNOWN, T_WAKE } from "./texts";
 import { placeView, type Timers } from "./workplace";
 
 export interface AppProps {
@@ -45,6 +49,7 @@ export interface AppProps {
   navigate(url: string): void;
   ChatImpl?: ComponentType<ChatProps>;
   CalcImpl?: ComponentType<CalcPageProps>;                // подмена вкладки «Калькуляторы» в тестах, как ChatImpl
+  EventsImpl?: ComponentType<EventsPageProps>;            // подмена вкладки «События» в тестах, как CalcImpl (Д13)
   startPolling?: typeof startStatusPolling;
   pollMs?: number;              // опрос места — для тестов (preflight M11)
   timers?: Timers;
@@ -86,13 +91,15 @@ const noAnswer = (): Reply => ({ status: 0, body: null });
 export function App(p: AppProps) {
   const ChatImpl = p.ChatImpl ?? Chat;
   const CalcImpl = p.CalcImpl ?? CalcPage;
+  const EventsImpl = p.EventsImpl ?? EventsPage;
   const startPolling = p.startPolling ?? startStatusPolling;
   const teacherApi = useMemo(() => p.teacherApi ?? createTeacherApi(), [p.teacherApi]);
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [who, setWho] = useState<Who | null>(null);
   const [attempt, setAttempt] = useState(0);            // «Повторить» после сбоя /me
-  const [view, setView] = useState<View>("main");        // открытая вкладка (Д9-R88, Д10-R110)
+  const [view, setView] = useState<View>("main");        // открытая вкладка (Д9-R88, Д10-R110, Д13)
   const [calcOpened, setCalcOpened] = useState(false);   // вкладку калькуляторов уже открывали — она смонтирована
+  const [eventsOpened, setEventsOpened] = useState(false);   // вкладку «События» уже открывали (Д13)
   const props = useRef(p);
   props.current = p;
   const lastSession = useRef<string | undefined>(undefined);
@@ -260,24 +267,33 @@ export function App(p: AppProps) {
   const teacher = who?.role === "teacher";
   const tabs = (who?.role === "student" && (phase.kind === "workplace" || phase.kind === "asleep" || phase.kind === "chat"))
     || (teacher && phase.kind === "teacher");
+  const showEvents = tabs && !teacher;                   // «События» — только у студента (Д13)
   const showView = (v: View): void => {
     setView(v);
     if (v === "calc") setCalcOpened(true);
+    if (v === "events") setEventsOpened(true);
   };
   return (
     <div className="app">
       {header && (
         <Header login={who?.login ?? null} ownPlace={who?.place ?? null} startPolling={startPolling}
                 onLogout={() => void logout()} leaving={phase.kind === "leaving"} view={tabs ? view : null}
-                teacher={teacher} onView={showView} />
+                teacher={teacher} showEvents={showEvents} onView={showView} />
       )}
       <main className="main">
-        {/* обёртка — во всех фазах: смена фазы не перемонтирует чат, вкладка калькуляторов его только прячет */}
-        <div className="view" hidden={tabs && view === "calc"}>{body}</div>
+        {/* обёртка — во всех фазах: смена фазы не перемонтирует чат, прочие вкладки его только прячут */}
+        <div className="view" hidden={tabs && view !== "main"}>{body}</div>
         {tabs && calcOpened && (
           <div className="view" hidden={view !== "calc"}>
             <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_CALC_CRASH} restartText={T_CALC_RESTART}>
               <CalcImpl api={p.api} onSignedOut={goLogin} unknownText={teacher ? T_TCH_UNKNOWN : undefined} />
+            </ErrorBoundary>
+          </div>
+        )}
+        {showEvents && eventsOpened && (
+          <div className="view" hidden={view !== "events"}>
+            <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_EVENTS_CRASH} restartText={T_EVENTS_RESTART}>
+              <EventsImpl api={p.api} onSignedOut={goLogin} />
             </ErrorBoundary>
           </div>
         )}

@@ -153,6 +153,7 @@ function fakeApi(o: { me?: Answer; workplace?: Answer }) {
   return {
     me: vi.fn(reply(o.me)), workplace: vi.fn(reply(o.workplace)), wake: vi.fn(reply(undefined)),
     logout: vi.fn(reply([200, { ok: true }])), ackNotice: vi.fn(reply([204, null])), agents: vi.fn(reply(undefined)),
+    events: vi.fn(reply(undefined)),
     calc: vi.fn(),
     report: vi.fn(async (_kind: string) => {}),
   } satisfies Api;
