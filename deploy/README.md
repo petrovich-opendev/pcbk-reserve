@@ -1846,14 +1846,16 @@ docker run --rm --network none --user 0 \
   -v pcbk-reserve_pcbk-core-data:/d \
   -v "$B/core.db:/src/core.db:ro" \
   --entrypoint sh pcbk-reserve/core:d11a -c \
-  "mkdir -p /d/before-restore-$T && for f in core.db core.db-wal core.db-shm; do [ -e /d/\$f ] && mv /d/\$f /d/before-restore-$T/; done; chown -R 10003:10003 /d/before-restore-$T; cp /src/core.db /d/core.db && chown 10003:10003 /d/core.db && chmod 0600 /d/core.db"
+  "mkdir -p /d/before-restore-$T && for f in core.db core.db-wal core.db-shm; do [ -e /d/\$f ] && mv /d/\$f /d/before-restore-$T/; done; chown -R 10003:10003 /d/before-restore-$T; cp /src/core.db /d/core.db && chown 10003:10003 /d /d/core.db && chmod 0750 /d && chmod 0600 /d/core.db"
 docker compose up -d --no-build core
 curl -sk https://127.0.0.1:8443/status.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["stale"])'
 docker exec pcbk-core python -m pcbk_core.gateway.accounts list
 ```
 Ожидается: `stale` → `False`; `accounts list` — прежние учётки и закрепления мест. Том не создавался отдельно: если
 он был удалён целиком, `docker run -v` заводит его пустым сам, и команда выше заполняет его той же копией.
-`before-restore-$T/` на томе — данные, не удалять без решения владельца.
+`before-restore-$T/` на томе — данные, не удалять без решения владельца. Корень тома — тоже `10003`, `0750`: том,
+потерянный целиком и созданный заново этой командой, иначе остаётся за root, и `core` не пишет в базу («attempt to
+write a readonly database», «чистые руки», заход 2, 12.10).
 
 **Агенты — из той же копии, обменом каталогов** (корень `/srv/agents` у `core` — только для чтения, пишется лишь
 сама привязка; распаковка — рядом, не на место):
