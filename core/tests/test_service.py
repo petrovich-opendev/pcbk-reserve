@@ -877,7 +877,29 @@ def _duplicate_state(statements):
 
 
 def _text_state(statements):
-    return GateResult(rows=[[("25FAKE_007_CLS", "1", 3_600_000, 50.0, 1)]], sent=GATE_SENT)
+    return GateResult(rows=[[("25FAKE_007_CLS", "on", 3_600_000, 50.0, 1)]], sent=GATE_SENT)    # текст не из цифр
+
+
+def _digit_text_state(statements):
+    """Живой историан ПЦБК (окно 1, 12.10): vValue — sql_variant, состояние приходит строкой '0'/'1'."""
+    return GateResult(rows=[[("25FAKE_007_CLS", "1", 3_600_000, 50.0, 1), ("25FAKE_007_CLS", "0", 0, 0.0, 0)]],
+                      sent=GATE_SENT)
+
+
+async def test_calc_runtime_accepts_state_value_as_digit_text(svc):
+    s, _ = svc
+    stub_gate(s, _digit_text_state)
+    r = await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="last_8h")
+    assert r["status"] in ("ok", "partial") and s.role.events.recent()[0].outcome != "error", r
+    assert "row_shape" not in s.role.events.recent()[0].summary
+
+
+@pytest.mark.parametrize("text", ["١", "1e3", "1 ", "0x1", ""])
+async def test_calc_runtime_state_text_not_ascii_digits_is_row_shape(svc, text):
+    s, _ = svc
+    stub_gate(s, lambda st: GateResult(rows=[[("25FAKE_007_CLS", text, 3_600_000, 50.0, 1)]], sent=GATE_SENT))
+    r = await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="last_8h")
+    assert r["status"] == "error" and "row_shape" in s.role.events.recent()[0].summary
 
 
 @pytest.mark.parametrize("tool, answer, code", [("tag_series", _text_time, "row_shape"),

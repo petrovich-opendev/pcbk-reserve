@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -373,6 +374,19 @@ def _rows_grouped(rows: object, width: int, row_ok: Callable[[Row], bool]) -> di
 def _series_row_ok(row: Row) -> bool:
     """Строка ряда: метка — дата и время (по ней служба упорядочивает точки), значение — число или NULL."""
     return isinstance(row[1], datetime) and (row[2] is None or _is_number(row[2]))
+
+
+# vValue StateSummaryHistory — sql_variant: живой историан ПЦБК отдаёт значение состояния строкой ('0', '1'), двойник —
+# числом [П окна 1, 12.10]. Строка только из ASCII-цифр (знак, дробная часть) — число; прочий текст остаётся текстом и
+# даёт row_shape, как раньше. re.ASCII: без него \d пропустил бы не-ASCII цифры.
+_STATE_TEXT = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?", re.ASCII)
+
+
+def _state_value(row: Row) -> Row:
+    """Строка наработки с vValue-текстом из цифр — с числом вместо текста; прочие строки — как есть."""
+    if len(row) > 1 and isinstance(row[1], str) and _STATE_TEXT.fullmatch(row[1]):
+        return (row[0], float(row[1]), *row[2:])
+    return row
 
 
 def _state_row_ok(row: Row) -> bool:
@@ -852,7 +866,9 @@ class DataService:
         result = await self.role.gate.run([state_sql(names, period.start, period.end)])
 
         def keep() -> Snapshot:
-            grouped = _rows_grouped(result.rows[0], 1 + len(STATE_COLUMNS), _state_row_ok)
+            rows0 = result.rows[0]
+            states = [_state_value(tuple(r)) for r in rows0] if isinstance(rows0, list) else rows0
+            grouped = _rows_grouped(states, 1 + len(STATE_COLUMNS), _state_row_ok)
             rows = {name: _state_rows(group) for name, group in grouped.items()}
             snap = Snapshot(rows=MappingProxyType(rows), sent=tuple(result.sent), count=len(result.rows[0]),
                             open=period.open)
