@@ -136,6 +136,9 @@ UPSTREAM_REFUSALS: dict[str, str] = {"money_out": "money_out", "key_limit": "key
                                      "in_flight": "wait", "rejected": "rejected", "server": "down",
                                      "unreachable": "down"}
 MONEY_KINDS = frozenset({"money_out", "key_limit"})     # статус вызова money, а не upstream_error
+# запасная модель (Д14): виды отказа «подождите/недоступен» до первого байта — ровно те, что UPSTREAM_REFUSALS
+# ведёт на wait/down; деньги, ключ, регион и rejected (включая переполнение) — не переключают
+RETRYABLE_KINDS = frozenset(kind for kind, key in UPSTREAM_REFUSALS.items() if key in ("wait", "down"))
 # 4xx OpenRouter, чей статус клиент получает как есть; прочие 4xx — 400 (текст всегда постоянный)
 PASS_THROUGH_4XX = frozenset({400, 404, 422})
 # переполнение контекста — образцы OpenCode 1.18.33 (packages/llm/src/provider-error.ts): на них и на 413
@@ -226,11 +229,17 @@ def _shown(text: str | None, limit: int) -> str:
 
 def log_call(*, caller: str, model: str, provider: str | None, step: int, status: str, code: str,
              cost: float | None, cost_source: str, usage: Usage | None, ms: int, estimate: float,
-             or_message: str | None = None) -> None:
-    """Строка журнала на вызов и отказ: числа, коды, имена — без текста, токенов и ключей (П12)."""
+             or_message: str | None = None, fallback_from: str | None = None,
+             fallback_reason: str | None = None) -> None:
+    """Строка журнала на вызов и отказ: числа, коды, имена — без текста, токенов и ключей (П12).
+
+    fallback_from/fallback_reason (Д14) — строка модели, которая ответила: основная, с которой был
+    повтор, и вид её отказа (UpstreamKind); без повтора — оба None, в строку не идут."""
     level = logging.WARNING if status in ("upstream_error", "money", "unknown") else logging.INFO
     tail = "" if or_message is None else " or_message=" + json.dumps(or_message[:OR_MESSAGE_CHARS],
                                                                      ensure_ascii=False)
+    if fallback_from is not None:
+        tail += f" fallback_from={_shown(fallback_from, MODEL_LABEL_CHARS)} fallback_reason={fallback_reason}"
     log.log(level, "llm caller=%s model=%s provider=%s step=%d status=%s%s cost=%s cost_source=%s cached=%d "
             "reasoning=%d ms=%d est=%.6g%s", caller, _shown(model, MODEL_LABEL_CHARS),
             _shown(provider, PROVIDER_LOG_CHARS), step, status, f" code={code}" if code else "",
@@ -243,10 +252,14 @@ class LlmCall:
 
     Флаги: opened — OpenRouter ответил 200; completed — ответ OpenRouter дочитан; upstream_broken — httpx
     бросил при чтении; deadline_hit — истёк общий срок вызова; sent_upstream — запрос отдан open_chat.
+
+    fallback_from/fallback_reason (Д14) — для повтора на запасной модели: имя основной, с которой был
+    повтор, и вид её отказа; у обычного вызова (и у основной попытки перед повтором) — оба None.
     """
 
     def __init__(self, role: "LlmRole", call_id: int, *, caller: str, session: str | None, parent: str | None,
-                 model: str, step: int, estimate: float):
+                 model: str, step: int, estimate: float, fallback_from: str | None = None,
+                 fallback_reason: str | None = None):
         self.role = role
         self.call_id = call_id
         self.caller = caller
@@ -255,6 +268,8 @@ class LlmCall:
         self.model = model
         self.step = step
         self.estimate = estimate
+        self.fallback_from = fallback_from
+        self.fallback_reason = fallback_reason
         self.started = role.monotonic()
         self.deadline = self.started + role.chat_deadline_s
         self.observer = SseObserver()
@@ -389,7 +404,8 @@ class LlmCall:
             role.note_upstream(record, now, source="chat")
         cost = usage.cost if source in ("stream", "body") else (0.0 if source == "none" else None)
         log_call(caller=self.caller, model=self.model, provider=provider, step=self.step, status=status, code=code,
-                 cost=cost, cost_source=source, usage=usage, ms=ms, estimate=self.estimate, or_message=or_message)
+                 cost=cost, cost_source=source, usage=usage, ms=ms, estimate=self.estimate, or_message=or_message,
+                 fallback_from=self.fallback_from, fallback_reason=self.fallback_reason)
         if source == "pending":
             role.spawn_resolve(self.call_id, gen)
 
@@ -515,12 +531,45 @@ async def chat(role: "LlmRole", request: Request) -> Response:
             return ask.refuse("turn_limit", text=LLM_MESSAGES["turn_limit"].format(limit=role.turns.limit))
     call = role.begin_call(caller=caller, session=ask.session, parent=ask.parent, model=policy.model, step=step,
                            estimate=estimate)
-    return await forward(role, call, body)
+    return await forward(role, call, body, raw)
 
 
-async def forward(role: "LlmRole", call: LlmCall, body: dict) -> Response:
+async def _attempt_fallback(role: "LlmRole", call: LlmCall, exc: UpstreamError, raw: dict) -> Response | None:
+    """Запасная модель (Д14, требования 2–3): None — отказа основной идти своим путём (call ничего не
+    трогал, его закроет forward()). Иначе — готовый ответ клиенту: либо результат повтора на запасной
+    (успех или её собственный отказ), либо тот же отказ exc, если резерв под запасную не прошёл
+    (доля/бюджет/прогон) — в обоих случаях call уже завершён, резерв основной снят.
+
+    Переключает только первая попытка (call.fallback_from is None — второго повтора нет) и только вид
+    «подождите/недоступен» до первого байта (RETRYABLE_KINDS); тело для повтора — rebuild_body той же
+    политикой, что и первое (провайдер, усилие, цены запасной), без ручной замены полей. Проверки
+    доли/бюджета/прогона — по текущему расходу вызывающего (Budget.refusal), после того как резерв
+    основной освобождён: висящей оценки основной не остаётся (ревью owner, Д14)."""
+    if call.fallback_from is not None or exc.kind not in RETRYABLE_KINDS:
+        return None
+    name = role.fallback.get(call.model)
+    policy = role.models.get(name) if name is not None else None
+    if policy is None:                      # нет пары, или LLM_MODELS сузили список после старта — отказ как сейчас
+        return None
+    try:
+        body = rebuild_body(raw, policy, caller=call.caller, session=call.session,
+                            max_tokens_cap=role.llm.LLM_MAX_TOKENS)
+    except BodyRefused:                      # тело не собрать и для запасной — отказ как сейчас
+        return None
+    estimate = policy.estimate_usd(body_bytes(body), body["max_tokens"])
+    await call.finish(error=exc)             # резерв основной снят; строка о её неудаче — как сейчас
+    if role.budget.refusal(call.caller) is not None:
+        return upstream_refusal(role, exc)   # доля/бюджет/прогон не пускают запасную — тот же отказ, без вызова
+    new_call = role.begin_call(caller=call.caller, session=call.session, parent=call.parent, model=policy.model,
+                               step=call.step, estimate=estimate)
+    new_call.fallback_from, new_call.fallback_reason = call.model, exc.kind
+    return await forward(role, new_call, body, raw)
+
+
+async def forward(role: "LlmRole", call: LlmCall, body: dict, raw: dict) -> Response:
     """От резерва до ответа: строка на диске, OpenRouter, поток или тело. finish() — на всём, что не отдано
-    потоком (LlmStream зовёт её сам)."""
+    потоком (LlmStream зовёт её сам). raw — исходное тело клиента (Д14): нужно для повтора на запасной,
+    его rebuild_body строит заново своей политикой."""
     handed = False
     try:
         try:
@@ -537,6 +586,9 @@ async def forward(role: "LlmRole", call: LlmCall, body: dict) -> Response:
             with anyio.move_on_after(call.remaining()) as scope:
                 response = await role.upstream.open_chat(body)
         except UpstreamError as exc:
+            retried = await _attempt_fallback(role, call, exc, raw)
+            if retried is not None:
+                return retried
             await call.finish(error=exc)
             return upstream_refusal(role, exc)
         if response is None:
@@ -548,11 +600,11 @@ async def forward(role: "LlmRole", call: LlmCall, body: dict) -> Response:
             handed = True
             return stream
         call.attach(response)
-        raw = await call.read_body()
+        payload = await call.read_body()
         await call.finish()
-        if raw is None:
+        if payload is None:
             return refusal_response(role, "down")
-        return Response(raw, media_type="application/json")
+        return Response(payload, media_type="application/json")
     finally:
         if not handed:
             await call.finish()                 # идемпотентна; ловит исключения и отмену обработчика

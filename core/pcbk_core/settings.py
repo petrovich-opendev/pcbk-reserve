@@ -134,6 +134,9 @@ class LlmSettings:
     # хеши токенов LLM: строки «<id> <sha256 hex>», отдельная таблица от core-tokens
     LLM_TOKENS_FILE: str = "/run/secrets/llm-tokens"
     LLM_MODELS: str = ""                    # пусто — все семь кандидатов (select_models)
+    # запасная модель при отказе основной «подождите/недоступен» (Д14): пусто — запасного пути нет, иначе
+    # пары <основная>=<запасная> через запятую, имена — точные имена CANDIDATES (parse_fallback)
+    LLM_FALLBACK: str = ""
     LLM_TOTAL_USD: float = 1000.0
     LLM_SHARE_USD: float = 100.0            # больше общего бюджета — можно: тогда держит общий
     LLM_OPS_SHARE_USD: float = 100.0
@@ -168,7 +171,7 @@ class LlmSettings:
         select_models импортируется здесь, а не в модуле: import pcbk_core.main в пробе здоровья не тянет
         pcbk_core.llm, fastapi и httpx (П8).
         """
-        from .llm.models import select_models
+        from .llm.models import parse_fallback, select_models
 
         env = os.environ if env is None else env
         values = {}
@@ -203,8 +206,12 @@ class LlmSettings:
                 raise ValueError(f"{name}: допустимо " + " или ".join(repr(v) for v in sorted(allowed)))
         _check_base_url(llm.OPENROUTER_BASE_URL)
         try:
-            select_models(llm.LLM_MODELS)
+            models = select_models(llm.LLM_MODELS)
         except ValueError as exc:           # «LLM_MODELS: неизвестная модель «имя»» — имя не повторяется
+            raise ValueError(re.sub(r"«[^»]*»", "«…»", str(exc))) from None
+        try:
+            parse_fallback(llm.LLM_FALLBACK, models)
+        except ValueError as exc:           # «LLM_FALLBACK: …«имя»…» — имя не повторяется
             raise ValueError(re.sub(r"«[^»]*»", "«…»", str(exc))) from None
         run_parts(llm)                      # LLM_RUN_*: все три или ни одного (Д8-R69)
         return llm

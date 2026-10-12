@@ -113,6 +113,38 @@ def select_models(names: str) -> dict[str, ModelPolicy]:
     return chosen
 
 
+def parse_fallback(raw: str, models: dict[str, ModelPolicy]) -> dict[str, str]:
+    """`LLM_FALLBACK` (Д14): пусто — запасного пути нет. Иначе пары `<основная>=<запасная>` через запятую
+    (пробелы вокруг имён и «=» срезаются): оба имени — точные имена CANDIDATES.
+
+    Ошибка — `ValueError("LLM_FALLBACK: …")`: неизвестное имя (основной или запасной), основная равна
+    запасной, основная названа дважды, запасная не входит в `models` (активные кандидаты, как у
+    `select_models`), если `models` — не все семь (LLM_MODELS их сузил).
+    """
+    if not raw.strip():
+        return {}
+    restricted = len(models) < len(_BY_NAME)
+    pairs: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if part.count("=") != 1:
+            raise ValueError(f"LLM_FALLBACK: пара не вида «основная=запасная»: «{part}»")
+        primary, _, fallback = part.partition("=")
+        primary, fallback = primary.strip(), fallback.strip()
+        if primary not in _BY_NAME:
+            raise ValueError(f"LLM_FALLBACK: неизвестное имя основной модели «{primary}»")
+        if fallback not in _BY_NAME:
+            raise ValueError(f"LLM_FALLBACK: неизвестное имя запасной модели «{fallback}»")
+        if primary == fallback:
+            raise ValueError(f"LLM_FALLBACK: основная модель совпадает с запасной: «{primary}»")
+        if primary in pairs:
+            raise ValueError(f"LLM_FALLBACK: основная модель названа дважды: «{primary}»")
+        if restricted and fallback not in models:
+            raise ValueError(f"LLM_FALLBACK: запасная модель «{fallback}» не входит в LLM_MODELS")
+        pairs[primary] = fallback
+    return pairs
+
+
 def _squash(name: str) -> str:
     return "".join(ch for ch in name.lower() if ch.isalnum())
 

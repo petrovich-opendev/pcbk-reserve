@@ -41,7 +41,7 @@ from ..secrets import TokenTable
 from ..settings import LlmSettings, Settings
 from .api import CHAT_DEADLINE_S, LEDGER_DURABLE_S, LlmCall, llm_router, too_large_body
 from .ledger import LEDGER_CHECK_S, OPS, Budget, Ledger, LedgerWriteLost, RunSpec, run_spec
-from .models import select_models
+from .models import parse_fallback, select_models
 from .shares import PLACES, Shares
 from .state import FAIL_STATES, UpstreamState
 from .turns import TurnLimiter
@@ -90,7 +90,11 @@ class LlmRole(RoleBase):
     RUN_WINDOW_S, last_run_call_mono — последняя из них, started_mono — запуск роли (тишина без вызовов — от него).
     LLM_RUN_* с ошибкой (настройки без from_env) — config_error: закрыто при сомнении.
 
-    shares (Д10-R98) — доли мест или None (у всех мест одна LLM_SHARE_USD, как до Д10)."""
+    shares (Д10-R98) — доли мест или None (у всех мест одна LLM_SHARE_USD, как до Д10).
+
+    fallback (Д14) — запасная модель по основной (LLM_FALLBACK, parse_fallback): пусто — повтора нет.
+    Отказ основной «подождите/недоступен» до первого байта — один повтор тем же вызовом на запасной
+    (api.py, forward); второго повтора нет."""
 
     name = "llm"
 
@@ -113,6 +117,8 @@ class LlmRole(RoleBase):
         self.cost_retry_delays = tuple(cost_retry_delays)
         self.chat_deadline_s = chat_deadline_s
         self.models = select_models(llm.LLM_MODELS)
+        # запасная модель при отказе основной (Д14): основная → запасная; пусто — повтора нет
+        self.fallback = parse_fallback(llm.LLM_FALLBACK, self.models)
         run: RunSpec | None = None
         try:
             run = run_spec(llm)
