@@ -660,6 +660,7 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
 
   const proxied = ["/pcbk/api/auth/", "/pcbk/api/auth/me", "/pcbk/api/auth/notice", "/pcbk/api/workplace",
                    "/pcbk/api/workplace/wake", "/pcbk/api/agents",                      // «Мои агенты» (Д7б, Д7-R64)
+                   "/pcbk/api/events",                                                  // события агентов (Д13)
                    "/pcbk/api/calc/",                                                   // калькуляторы (Д9а, Д9-R87)
                    "/pcbk/api/teacher/"];                                               // кабинет (Д10-R105)
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
@@ -729,6 +730,11 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.equal(locs.filter((l) => l.port === 8443 && l.path === "/pcbk/api/agents").length, 1);
     assert.ok(flat("/pcbk/api/workplace").includes("limit_req zone=pcbk_place_rate burst=20 nodelay;"));   // контроль
     assert.equal(flat("/pcbk/api/agents"), flat("/pcbk/api/workplace"));
+    // события агентов (Д13, DESIGN п.6): копия location = /pcbk/api/agents — та же зона, предел, таймаут
+    const events = "/pcbk/api/events";
+    assert.equal(loc(events).exact, true);
+    assert.equal(locs.filter((l) => l.port === 8443 && l.path === events).length, 1);
+    assert.equal(flat(events), flat("/pcbk/api/agents"));
     // Д9-R87: калькуляторы — префикс (имя инструмента сверяет core), копия пределов ручек места
     const calc = "/pcbk/api/calc/";
     assert.equal(loc(calc).exact, false);

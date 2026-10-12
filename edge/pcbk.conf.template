@@ -336,6 +336,19 @@ server {
         proxy_pass http://$pcbk_core;
     }
 
+    # события агентов вкладки «События» (Д13, DESIGN п.6): копия location = /pcbk/api/agents — та же зона, предел,
+    # таймаут
+    location = /pcbk/api/events {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
     # калькуляторы вкладки чата (Д9а, Д9-R87): POST /pcbk/api/calc/<tool> — префикс, имя инструмента сверяет core;
     # копия location = /pcbk/api/workplace — зона ручек места, 509 → busy.json, тело 64k, срок 30 с, сверка сырого пути
     location /pcbk/api/calc/ {
