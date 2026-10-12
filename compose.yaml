@@ -251,6 +251,9 @@ services:
       # «кончились деньги» (402) без OpenRouter, доля администратора, $; ключ только у резервного
       # контура (on — сверка расхода с /key; off — ключ общий, сверки нет)
       LLM_MODELS: ${LLM_MODELS:-}
+      # запасная модель при отказе основной «подождите/недоступен» до первого байта (Д14): пусто — повтора нет,
+      # иначе пары <основная>=<запасная> через запятую, имена — точные имена CANDIDATES (llm/models.py)
+      LLM_FALLBACK: ${LLM_FALLBACK:-}
       LLM_STATE: ${LLM_STATE:-on}
       DRILL_LLM: ${DRILL_LLM:-}
       LLM_OPS_SHARE_USD: ${LLM_OPS_SHARE_USD:-100}
