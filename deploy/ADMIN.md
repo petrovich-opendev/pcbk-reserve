@@ -158,7 +158,11 @@ curl -sk --resolve "$C:8443:127.0.0.1" -b "$T/cookie.txt" "https://$C:8443/pcbk/
 curl -sk --resolve "$C:8443:127.0.0.1" -b "$T/cookie.txt" -H 'Sec-Fetch-Site: same-origin' \
   -X POST "https://$C:8443/pcbk/api/workplace/wake"
 ```
-Что увидите: у студента — `202` и `{"state":"starting",…}`, повторный `GET` того же пути до `"state":"ready"`; у
-преподавателя места нет — `403 no_place`, это ожидаемо.
+Что увидите: у студента — `202` и `{"state":"starting",…}`; у преподавателя места нет — `403 no_place`, это ожидаемо.
+Готовность места — повторять, пока не будет `"state":"ready"` (обычно 5–10 с; у `/wake` запроса `GET` нет — 404):
+
+```bash
+curl -sk --resolve "$C:8443:127.0.0.1" -b "$T/cookie.txt" "https://$C:8443/pcbk/api/workplace"
+```
 
 Убрать за собой: `rm -rf "$T"` (пароль и cookie лежали только в личном временном каталоге `0700`).

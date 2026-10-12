@@ -1739,7 +1739,7 @@ need=$(
   done
 ) && printf '%s\n' "$need" &&
 total=$(awk '{s+=$1} END{print s+0}' <<<"$need") &&
-read -r avail size < <(df --output=avail,size /opt | tail -n 1) &&
+read -r avail size < <(df --output=avail,size /opt/pcbk-reserve | tail -n 1) &&
 limit=$((size / 10)); [ "$limit" -lt 5242880 ] && limit=5242880
 if [ $((avail - total)) -ge "$limit" ]; then
   echo "места достаточно: свободно $avail КиБ, нужно $total КиБ, порог $limit КиБ — копия начинается"
