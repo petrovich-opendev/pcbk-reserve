@@ -2,7 +2,7 @@
 // callJson — тот же вид запроса, что у Api чата (cookie сессии, Accept JSON, тело — JSON), и тот же Reply. Отдельный
 // интерфейс: в Api его нет, и заглушки Api прежних тестов не меняются. Роль решает сервер: кабинет только просит.
 // Части пути — номер места, id разговора, имя агента, логин учётки — уходят только проверенными по шаблонам шлюза (NN —
-// 01…10, ses_ и 26 знаков, имя агента — NAME_RE черновика, логин — LOGIN_RE учёток): иначе вызов не уходит, ответ — 400
+// 01…11, ses_ и 26 знаков, имя агента — NAME_RE черновика, логин — LOGIN_RE учёток): иначе вызов не уходит, ответ — 400
 // без запроса. Сервер проверяет сам (R100, шаг 6), это второй рубеж: ввод в путь как есть не идёт и отсюда.
 // Учётки (R108): все POST; ответ с паролем (201 заведения, 200 нового пароля) только возвращается вызвавшему — модуль его
 // не хранит и не пишет в журнал браузера.
@@ -32,7 +32,9 @@ export interface TeacherApi {
 }
 
 const PREFIX = "/pcbk/api/teacher";
-const PLACE_RE = /^(0[1-9]|10)$/;
+// Д15б: единственный источник числа мест в кабинете — отсюда PLACES и isPlace берут teacher.ts (разбор обзора,
+// фильтр detail перевода доли) и эта форма (проверка пути до запроса); 12 — первый недопустимый номер.
+export const PLACES: readonly string[] = Array.from({ length: 11 }, (_, i) => String(i + 1).padStart(2, "0"));
 const SES_RE = /^ses_[0-9A-Za-z]{26}$/;                // ID_RE["ses"] правил шлюза
 const AGENT_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;    // NAME_RE черновика агента (agents/draft.py)
 const AGENT_MIN = 3;
@@ -40,7 +42,7 @@ const AGENT_MAX = 40;
 const LOGIN_RE = /^[a-z][a-z0-9._-]{2,31}$/;           // LOGIN_RE учёток шлюза (gateway/accounts.py)
 const PROBE_RE = /^d[0-9]+[a-z]?-probe-[a-z0-9-]+$/;   // PROBE_LOGIN учёток шлюза: пробные учётки проверок
 
-export const isPlace = (nn: string): boolean => PLACE_RE.test(nn);
+export const isPlace = (nn: string): boolean => PLACES.includes(nn);
 export const isSessionId = (id: string): boolean => SES_RE.test(id);
 export const isAgentName = (name: string): boolean =>
   name.length >= AGENT_MIN && name.length <= AGENT_MAX && AGENT_RE.test(name);

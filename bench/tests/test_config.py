@@ -25,7 +25,7 @@ def test_model_refs_only_enabled_bench_providers():
     assert model_refs(oc) == {"pcbk/a/b"}
 
 
-@pytest.mark.parametrize("patch", [{"places": {"11": "pcbk/z-ai/glm-5.3"}}, {"places": {"7": "pcbk/z-ai/glm-5"}},
+@pytest.mark.parametrize("patch", [{"places": {"12": "pcbk/z-ai/glm-5.3"}}, {"places": {"7": "pcbk/z-ai/glm-5"}},
                                    {"places": {"7": "pcbk/z-ai/glm-5.3", "8": "pcbk/z-ai/glm-5.3"}},
                                    {"reps": {"create": 0, "number": 3, "trap": 3}}, {"cap_usd": 0}])
 def test_config_refused(tmp_path, patch):

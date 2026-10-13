@@ -15,7 +15,7 @@ def test_override_render_only_model():                                          
            {"model": "pcbk-or/google/gemini-3.8-flash"}
 
 
-@pytest.mark.parametrize("places", [{}, {0: "pcbk/z-ai/glm-5.3"}, {11: "pcbk/z-ai/glm-5.3"}, {7: "glm"}, {7: ""}])
+@pytest.mark.parametrize("places", [{}, {0: "pcbk/z-ai/glm-5.3"}, {12: "pcbk/z-ai/glm-5.3"}, {7: "glm"}, {7: ""}])
 def test_override_refuses_bad_places(places):
     with pytest.raises(ValueError):
         render_override(places)

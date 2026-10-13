@@ -188,8 +188,8 @@ TEACHER_KEYS = frozenset({"checked_at", "shares_loaded", "shares_ok", "shares_dr
                           "store_ok", "reads_1h", "read_failed_1h", "changes_1h", "change_failed_1h", "role_refused_1h",
                           "drill"})
 TEACHER_DRILL_MODES = frozenset({"shares_stale", "journal_down"})
-# мест в стенде: shares_drift — число мест с расхождением, больше — не по договору (длина note ограничена)
-TEACHER_PLACES = 10
+# мест в стенде: shares_drift — число мест с расхождением, больше — не по договору (длина note ограничена; Д15б — 11)
+TEACHER_PLACES = 11
 TEACHER_DOWN_DETAIL = "кабинет преподавателя не отвечает"
 TEACHER_NOT_DEPLOYED_DETAIL = "кабинет преподавателя ещё не выложен"   # 404: core старше сторожа (выкладка)
 TEACHER_OFF_CONTRACT_DETAIL = "кабинет преподавателя ответил не по договору"

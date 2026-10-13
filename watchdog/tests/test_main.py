@@ -90,7 +90,7 @@ def test_run_checks_all_kinds(fake_proxy, tls_server, fake_core):
 
 def test_tick_bounded_when_proxy_hangs(silent_proxy_url):   # принимает соединение и молчит
     comps = [{"id": f"s{n}", "title": "x", "kind": "container", "container": f"pcbk-student-{n:02d}",
-              "sleeping_ok": True} for n in range(1, 11)]
+              "sleeping_ok": True} for n in range(1, 12)]
     started = time.monotonic()
     run_checks(comps, DockerReader(silent_proxy_url, timeout=0.5), SETTINGS, T0)
     assert time.monotonic() - started < 1.5
@@ -258,7 +258,8 @@ def test_components_file_d4a():                    # было test_components_fi
     students = [c for i, c in comps.items() if i.startswith("student-")]
     assert [(c["id"], c["title"], c["kind"], c["container"], c["sleeping_ok"]) for c in students] == \
            [(f"student-{n:02d}", f"Рабочее место {n:02d}", "container", f"pcbk-student-{n:02d}", True)
-            for n in range(1, 11)]
+            for n in range(1, 12)]
+    assert len(comps) == 23                                                     # Д15б: 11 мест, не 10
 
 
 def test_components_file_d4b():

@@ -38,7 +38,7 @@ from typing import Any
 from .scenarios import BY_ID, RUN_TIMEOUT_S, SCENARIO_IDS
 
 RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")          # RUN_ID_RE LlmSettings (Д8-R69) — значением
-PLACES = range(1, 11)
+PLACES = range(1, 12)                                # Д15б: мест 11, не 10
 PROVIDERS = ("pcbk", "pcbk-or")
 GROUPS = ("create", "number", "trap")
 MAX_REPS = 10
@@ -132,7 +132,7 @@ def _places(raw: object, refs: frozenset[str], load: bool = False) -> dict[int, 
     out: dict[int, str] = {}
     for key, ref in raw.items():
         if not isinstance(key, str) or not key.isdecimal() or int(key) not in PLACES:
-            raise ValueError("конфиг: places — номера мест от 1 до 10")
+            raise ValueError("конфиг: places — номера мест от 1 до 11")
         n = int(key)
         if n in out:
             raise ValueError("конфиг: places — место названо дважды")

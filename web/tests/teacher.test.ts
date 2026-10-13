@@ -5,14 +5,14 @@ import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { ACTION_LABELS, fmtCents, parseAgents, parseJournal, parseMoney, parseOverview, parseSessions, parseTranscript,
          transferChanges } from "../src/teacher";
-import { createTeacherApi } from "../src/teacherApi";
+import { createTeacherApi, isPlace, PLACES } from "../src/teacherApi";
 import { AGENTS_03, JOURNAL_ROWS, OVERVIEW_READY_03, SESSION, SESSION_ARCHIVED, TRANSCRIPT_WITH_HTML } from "./teacherFixtures";
 
 const row = (place: string, share: number, floor = 0, spent = 0) =>
   ({ place, login: `stu-${place}`, free: false, disabled: false, noticed: true, locked: false, state: "sleeping",
      share_cents: share, floor_cents: floor, spent_usd: spent, agents: 0 });
 const overview = {
-  places: ["01","02","03","04","05","06","07","08","09","10"].map((p) =>
+  places: ["01","02","03","04","05","06","07","08","09","10","11"].map((p) =>   // Д15б: 11 мест
     p === "03" ? row(p, 10000, 1234, 12.349) : row(p, 10000)),
   budget: { total_cents: 100000, allocated_cents: 100000, free_cents: 0, spent_usd: 12.349, ops_usd: 0 },
   shares_ok: true,
@@ -133,6 +133,18 @@ test("teacher_api_paths_and_bodies", async () => {
     expect(r.status).toBe(400);
   }
   expect(calls.length).toBe(before);
+});
+
+test("places_run_01_to_11_then_12_is_refused_on_client", async () => {   // Д15б: 11 мест, 12 — первый недопустимый
+  expect(PLACES).toEqual(["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11"]);
+  expect(PLACES.map(isPlace)).toEqual(PLACES.map(() => true));
+  expect([isPlace("00"), isPlace("12"), isPlace("1"), isPlace("011")]).toEqual([false, false, false, false]);
+  const calls: string[] = [];
+  const api = createTeacherApi(async (path) => { calls.push(path); return new Response("{}", { status: 200 }); });
+  await api.place("11");
+  expect(calls).toEqual(["/pcbk/api/teacher/places/11"]);
+  expect((await api.place("12")).status).toBe(400);                        // отказ до запроса, без похода на сервер
+  expect(calls).toEqual(["/pcbk/api/teacher/places/11"]);                   // второй вызов не ушёл
 });
 
 test("action_labels_are_exactly_core_actions", () => {                // ревью Б1+Б2, M-3: договорный словарь журнала

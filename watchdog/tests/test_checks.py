@@ -1781,7 +1781,7 @@ def test_teacher_off_contract_reply_has_own_text(json_site):                   #
                 *({**T_BASE, k: v} for k in counts for v in (-1, True, 1.5, "1", None)),
                 *({**T_BASE, k: v} for k in ("shares_sum_usd", "total_usd") for v in ("1000", None, True, [], 10 ** 400)),
                 {**T_BASE, "shares_sum_usd": -0.01}, {**T_BASE, "total_usd": 0}, {**T_BASE, "total_usd": -5},
-                {**T_BASE, "shares_drift": 11}, {**T_BASE, "shares_drift": 10 ** 4000},   # мест больше десяти (р1, m-1)
+                {**T_BASE, "shares_drift": 12}, {**T_BASE, "shares_drift": 10 ** 4000},   # мест больше одиннадцати (Д15б)
                 {**T_BASE, "drill": None}, {**T_BASE, "drill": "SHARES_STALE"}, {**T_BASE, "drill": "freeze_reload"},
                 {**T_BASE, "drill": "journal_down "}, {**T_BASE, "drill": " "}):
         assert teacher_row(json_site, obj) == TEACHER_OFF, obj
@@ -1836,9 +1836,9 @@ def test_teacher_huge_money_is_off_contract_not_check_error(json_site):         
 
 
 def test_teacher_drift_bounded_by_places(json_site):                             # доводка р1, m-1: note не растёт
-    assert teacher_row(json_site, {**T_BASE, "shares_drift": 10}) == \
-           ("fail", "LLM-прокси считает доли не так, как сохранено", "мест: 10")       # все десять мест — по договору
-    for drift in (11, 10 ** 4000):
+    assert teacher_row(json_site, {**T_BASE, "shares_drift": 11}) == \
+           ("fail", "LLM-прокси считает доли не так, как сохранено", "мест: 11")    # все одиннадцать мест — по договору (Д15б)
+    for drift in (12, 10 ** 4000):
         assert teacher_row(json_site, {**T_BASE, "shares_drift": drift}) == TEACHER_OFF, drift
 
 

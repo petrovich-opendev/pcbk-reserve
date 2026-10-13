@@ -100,14 +100,14 @@ test("overview_table_marks_budget_and_refresh", async () => {
   const table = await screen.findByRole("table");
   expect(table.classList.contains("places")).toBe(true);
   expect([...table.querySelectorAll("tbody tr")].map((r) => r.getAttribute("data-place")))
-    .toEqual(["01", "02", "03", "04", "05", "06", "07", "08", "09", "10"]);
+    .toEqual(["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11"]);   // Д15б: 11 мест
   const cells = (nn: string) => [...container.querySelectorAll(`tr[data-place="${nn}"] td`)].map((c) => c.textContent!.replace(/\s/g, " "));
   expect(cells("03").slice(0, 6)).toEqual(["03", "stu-03", "работает", "100,00 $", "12,35 $", "2"]);
   expect(cells("06")[1]).toBe("stu-06 не подтвердил предупреждение");
   expect(cells("07")[1]).toBe("stu-07 отключена");
   expect(cells("08")[1]).toBe("stu-08 замок");
   expect(cells("10").slice(1, 3)).toEqual(["свободно", "спит"]);
-  expect(container.querySelectorAll("button.open-place")).toHaveLength(9);    // у свободного места открывать нечего
+  expect(container.querySelectorAll("button.open-place")).toHaveLength(10);   // у свободного места открывать нечего (Д15б: 11 мест)
   expect(container.querySelector('tr[data-place="10"] button.open-place')).toBeNull();
   expect(screen.getByRole("button", { name: "Открыть место 03" }).textContent).toBe("Открыть");
   expect(screen.getByText(/^Общий бюджет:/).textContent!.replace(/\s/g, " ")).toBe(
@@ -274,7 +274,7 @@ test("failed_overview_after_change_keeps_page", async () => {          // m-1: �
   transfer();
   expect(await screen.findByText("Обзор не обновился: Серверный слой не отвечает")).toBeTruthy();
   expect(screen.getByText("Доли обновлены")).toBeTruthy();                       // удачный перевод не стёрт
-  expect(container.querySelectorAll("table.places tbody tr")).toHaveLength(10);
+  expect(container.querySelectorAll("table.places tbody tr")).toHaveLength(11);  // Д15б: 11 мест
   expect(container.querySelector("section.transcript")).not.toBeNull();          // и открытый разговор
   fireEvent.click(screen.getByRole("button", { name: "Обновить" }));
   await waitFor(() => expect(screen.queryByText(/^Обзор не обновился/)).toBeNull());   // новый обзор — строки нет

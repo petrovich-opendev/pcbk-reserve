@@ -3,14 +3,14 @@
 // половину. Деньги — целые центы, как у сервера (Д10-R97); доллары расхода — числом как пришли. Правила перевода здесь —
 // только подсказка до запроса: проверяет сервер, его отказ показывается дословно.
 import { replyText, type Reply } from "./api";
-import { isAgentName, isSessionId, type ShareChange } from "./teacherApi";
+import { isAgentName, isPlace, isSessionId, PLACES, type ShareChange } from "./teacherApi";
 import { T_PLACE_GAVE_UP, T_PLACE_ODD, T_TCH_NO_SHARES, T_TCH_PLACE_GAVE_UP, T_TCH_PLACE_ODD, T_TCH_SAME_PLACE,
          T_TCH_TAKE_MAX, T_TCH_UNKNOWN, T_TCH_ZERO, T_UNKNOWN } from "./texts";
 
 export { ACTION_LABELS } from "./texts";
 
 export interface PlaceRow {
-  place: string;                       // «01»…«10»
+  place: string;                       // «01»…«11» (Д15б)
   login: string | null;                // учётка студента места; null — учётки нет
   free: boolean;                       // закрепления нет — место свободно (m-11)
   disabled: boolean | null;            // пометки учётки; null — учётки нет
@@ -68,8 +68,6 @@ const isUsd = (v: unknown): v is number => typeof v === "number" && Number.isFin
 const isTime = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 const orNull = <T>(v: unknown, ok: (x: unknown) => x is T): v is T | null => v === null || ok(v);
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every(isStr);
-const PLACES = Array.from({ length: 10 }, (_, i) => String(i + 1).padStart(2, "0"));
-const PLACE_KEY = /^(0[1-9]|10)$/;
 
 // массив из разборщика элемента; один плохой элемент — весь ответ не по договору
 function all<T>(v: unknown, one: (x: unknown) => T | null): T[] | null {
@@ -101,7 +99,8 @@ function budgetOf(v: unknown): Budget | null {
   return { total_cents, allocated_cents, free_cents, spent_usd, ops_usd };
 }
 
-// R101: ровно десять мест, 01…10 по порядку; budget — объект или null (без LLM-прокси или долей)
+// R101: ровно столько мест, сколько в PLACES (Д15б — 01…11), по порядку; budget — объект или null (без LLM-прокси
+// или долей)
 export function parseOverview(body: unknown): Overview | null {
   if (!isObj(body) || !Array.isArray(body.places) || body.places.length !== PLACES.length || !isBool(body.shares_ok)) {
     return null;
@@ -184,7 +183,7 @@ function shareDetail(v: unknown): [string, number, number][] | null {
   if (!isObj(v)) return null;
   const out: [string, number, number][] = [];
   for (const [key, pair] of Object.entries(v)) {
-    if (PLACE_KEY.test(key) && Array.isArray(pair) && pair.length === 2 && isCents(pair[0]) && isCents(pair[1])) {
+    if (isPlace(key) && Array.isArray(pair) && pair.length === 2 && isCents(pair[0]) && isCents(pair[1])) {
       out.push([key, pair[0], pair[1]]);
     }
   }

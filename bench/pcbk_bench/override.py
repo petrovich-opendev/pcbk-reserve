@@ -17,7 +17,7 @@ def render_override(places: Mapping[int, str]) -> str:
     services: dict[str, dict] = {}
     for n, ref in sorted(places.items()):
         if isinstance(n, bool) or not isinstance(n, int) or n not in PLACES:
-            raise ValueError("переопределение: места от 1 до 10")
+            raise ValueError("переопределение: места от 1 до 11")
         if not isinstance(ref, str) or "/" not in ref:
             raise ValueError("переопределение: модель — «провайдер/модель»")
         content = json.dumps({"model": ref}, ensure_ascii=False, separators=(",", ":"))

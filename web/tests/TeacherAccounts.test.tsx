@@ -179,7 +179,7 @@ test("password_window_survives_failed_overview_reload", async () => {
   expect(await screen.findByText("Обзор не обновился: Учётные записи недоступны — повторите позже")).toBeTruthy();
   expect(screen.getByText("Keep-Me-0042").closest(".password-once")).toBeTruthy();
   expect(a.overview).toHaveBeenCalledTimes(2);
-  expect(container.querySelectorAll("table.places tbody tr")).toHaveLength(10);   // прежняя таблица и окно
+  expect(container.querySelectorAll("table.places tbody tr")).toHaveLength(11);   // прежняя таблица и окно (Д15б: 11 мест)
   const buttons = [...container.querySelectorAll<HTMLButtonElement>("table.places button[class^='acc-']")];
   expect(buttons.length).toBeGreaterThan(0);
   expect(buttons.every((b) => b.disabled)).toBe(true);

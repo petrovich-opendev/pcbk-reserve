@@ -429,7 +429,7 @@ def _load_check(config: Path) -> int:
 
 def _load_gate(out: Path, next_k: int, warn_mib: int) -> int:
     """load-gate OUT --next K: одна строка чисел; код 0 — «можно», 1 — «нельзя»."""
-    if not 1 <= next_k <= 10:
+    if not 1 <= next_k <= 11:                       # Д15б: мест 11, не 10
         raise _UsageError("--next")
     line, code = gate_from_out(out, next_k, warn_mib)
     print(line)

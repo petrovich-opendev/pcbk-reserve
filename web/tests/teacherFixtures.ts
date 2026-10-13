@@ -9,7 +9,7 @@ import type { ShareChange, TeacherApi } from "../src/teacherApi";
 export type Answer = [number, unknown];
 export type Answers = Answer | Answer[];
 
-const PLACES = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10"];
+const PLACES = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11"];   // Д15б: 11 мест
 
 // строка обзора (R101): у места со студентом — его логин и пометки; доля $100, пол и расход — ноль
 const row = (place: string, patch: Record<string, unknown> = {}) => ({
