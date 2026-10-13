@@ -139,7 +139,7 @@ async def test_stop_failure_counted(tmp_path):
 
 def test_place_name_checked():
     with pytest.raises(ValueError):
-        SpCtl("http://pcbk-sp-ctl:2375").path(11, "start")    # имя вне диапазона — не в путь
+        SpCtl("http://pcbk-sp-ctl:2375").path(12, "start")    # имя вне диапазона — не в путь
 
 
 # --- сверх брифа: договоры, которые тесты выше не задевают ---
@@ -395,7 +395,7 @@ async def test_wake_on_fresh_ready_does_no_work(tmp_path, caplog):              
 
 class RefusingInspect(FakeDocker):
     """sp-ctl отвечает на ping, а inspect мест из refuse — 403 (правило прокси сломано или сменилось)."""
-    refuse = frozenset(range(1, 11))
+    refuse = frozenset(places.PLACES)
 
     async def __call__(self, request):
         m = re.search(r"pcbk-student-([0-9]{2})/json$", request.url.path)
@@ -414,7 +414,7 @@ async def test_inspect_refused_while_ping_alive_is_down(tmp_path, caplog):      
     assert role.health() == (False, "нет связи с прокси сокета — места не будятся")
     assert role.health_json(role.wallclock())["sp_ctl"] == "down"
     assert "gw sp-ctl down step=inspect" in caplog.text
-    docker.refuse = frozenset(range(2, 11))                                            # место 01 видно
+    docker.refuse = frozenset(range(2, max(places.PLACES) + 1))                        # место 01 видно
     await w.tick()
     assert w.sp_ctl == "ok" and role.health() == (True, "принимает вход")
     await w.aclose(); await w.spctl.aclose()

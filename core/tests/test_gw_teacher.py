@@ -14,6 +14,7 @@ from pcbk_core.gateway.api import GW_MESSAGES
 from pcbk_core.gateway.places import PlaceAnswer
 from pcbk_core.gateway.teacher_api import JOURNAL_ROWS, TEACHER_PREFIX as P, TEACHER_TEXTS
 from pcbk_core.gateway.teacher_api import TEACHER_PLACE_PATHS, TeacherGate, changes_of, floor_body_of, teacher_path
+from pcbk_core.places import PLACES
 
 READS = ("overview", "journal", "places/03", "places/03/sessions", f"places/03/sessions/{TEACHER_SES}",
          "places/03/agents", f"places/03/agents/{AGENT_DRAFT.name}")
@@ -100,11 +101,11 @@ def test_teacher_wake_is_student_wake(tmp_path, monkeypatch):            # I-2, 
 def test_no_student_place_and_bad_paths(tg):
     t = tg.as_("teach")
     before = len(tg.role.fake_places.requests)
-    for path in ("places/07/sessions", "places/07/agents", "places/07"):
+    for path in ("places/07/sessions", "places/07/agents", "places/07", "places/11/sessions"):
         r = t.get(P + path)
         assert (r.status_code, r.json()["data"]["message"]) == (404, TEACHER_TEXTS["no_student"]), path
     journal = len(tg.role.teacher_log.recent(100))
-    for path in ("places/11/sessions", "places/3/sessions", "places/03/sessions/ses_short",
+    for path in ("places/12/sessions", "places/3/sessions", "places/03/sessions/ses_short",
                  f"places/03/sessions/{TEACHER_SES}x", "places/03/agents/..%2Fx", "places/03/agents/Bad_Name"):
         r = t.get(P + path)
         assert (r.status_code, r.json()["data"]["message"]) == (404, GW_MESSAGES["not_found"]), path
@@ -243,7 +244,7 @@ def test_overview_shape(tg):                                             # Д10-
     tg.role.store.disable("gone")
     tg.role.store.remove("gone")
     body = tg.as_("teach").get(P + "overview").json()
-    assert [p["place"] for p in body["places"]] == [f"{n:02d}" for n in range(1, 11)]
+    assert [p["place"] for p in body["places"]] == [f"{n:02d}" for n in PLACES]
     p3, p7, p8 = body["places"][2], body["places"][6], body["places"][7]
     assert (p3["login"], p3["free"], p3["state"], p3["share_cents"], p3["floor_cents"], p3["agents"]) == \
            ("stu-03", False, "ready", 10000, 0, 1)
@@ -328,10 +329,14 @@ def test_place_paths_are_three_gets():                                   # Revie
 def test_body_forms():
     ok = json.dumps(MOVE).encode()
     assert changes_of(ok) == [(3, 10000, 9000), (5, 10000, 11000)]
+    # Д15б, p11-critic §1: лимит длины списка — len(PLACES) = 11, не жёсткая «10»
+    eleven = json.dumps({"changes": [{"place": f"{n:02d}", "from_cents": 10000, "to_cents": 9000}
+                                     for n in PLACES]}).encode()
+    assert changes_of(eleven) == [(n, 10000, 9000) for n in PLACES]
     for bad in (b"{", b"[]", b'{"changes": [{"place": "03", "from_cents": 1, "to_cents": 2, "x": 1}]}',
                 b'{"changes": [{"place": 3, "from_cents": 1, "to_cents": 2}]}',
                 b'{"changes": [{"place": "03", "from_cents": 1.0, "to_cents": 2}]}',
-                json.dumps({"changes": [MOVE["changes"][0]] * 11}).encode()):
+                json.dumps({"changes": [MOVE["changes"][0]] * 12}).encode()):
         assert changes_of(bad) is None, bad
     assert floor_body_of(b'{"place": "03", "to": "10"}') == (3, 10)
     for bad in (b'{"place": "03", "to": "05", "to": "06"}', b'{"place": "00", "to": "05"}', b'{"place": "03"}',
@@ -506,11 +511,11 @@ def test_bad_path_parts_get_service_log_line(tg, caplog):                 # m-4:
     caplog.set_level(logging.INFO, logger="pcbk_core")
     t = tg.as_("teach")
     journal = len(tg.role.teacher_log.recent(100))
-    gets = ("places/11", "places/11/sessions", "places/03/sessions/ses_short", "places/3/agents",
+    gets = ("places/12", "places/12/sessions", "places/03/sessions/ses_short", "places/3/agents",
             "places/03/agents/Bad_Name")
     for path in gets:
         assert t.get(P + path).status_code == 404, path
-    assert post(t, "places/11/wake", {}).status_code == 404
+    assert post(t, "places/12/wake", {}).status_code == 404
     lines = [x.getMessage() for x in caplog.records if " outcome=not_found " in x.getMessage()]
     assert [line.split(" ms=")[0] for line in lines] == [
         "gw teacher login=teach action=place place=- outcome=not_found status=404",

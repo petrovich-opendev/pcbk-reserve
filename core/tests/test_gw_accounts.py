@@ -60,7 +60,7 @@ def test_add_rules(tmp_path):
     s = store(tmp_path)
     s.add("ivanov", "student", 3, PW)
     for args in (("ivanov", "student", 4, PW), ("petrov", "student", 3, PW), ("petrov", "student", None, PW),
-                 ("teach", "teacher", 5, PW), ("Petrov", "student", 4, PW), ("petrov", "student", 11, PW),
+                 ("teach", "teacher", 5, PW), ("Petrov", "student", 4, PW), ("petrov", "student", 12, PW),
                  ("petrov", "student", 4, "1234567")):
         with pytest.raises(ValueError) as e:
             s.add(*args)
@@ -690,7 +690,7 @@ def test_journal_command_prints_codes_only(tmp_path, monkeypatch, capsys):
     assert accounts_main(["journal", "--last", "0"]) == 1                     # число строк — от 1
 
 
-def test_journal_command_reads_only_and_limits(tmp_path, monkeypatch, capsys):   # сверх брифа: mode=ro, 1…1000, 50
+def test_journal_command_reads_only_and_limits(tmp_path, monkeypatch, capsys):   # сверх брифа: mode=ro, до 1000, 50
     db = tmp_path / "core.db"
     monkeypatch.setenv("DB_PATH", str(db))
     assert accounts_main(["journal"]) == 1                                    # базы нет — не заводит пустую

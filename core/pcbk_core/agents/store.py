@@ -43,10 +43,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, get_args
 
+from ..places import CALLER_RE, PLACES, place_text
 from .draft import MAX_FILE_BYTES, NAME_MAX, NAME_MIN, NAME_RE, RESERVED_NAMES, RESERVED_PREFIX, Draft, draft_digest
 
-PLACE_RE = re.compile(r"student-(0[1-9]|10)")
-PLACES = range(1, 11)
+PLACE_RE = CALLER_RE
 MAX_AGENTS = 20
 QUARANTINE_DIR = "quarantine"
 ARCHIVE_DIR = "archive"
@@ -181,7 +181,7 @@ class _Scan:
 
 
 def place_of_caller(caller: object) -> int | None:
-    """Номер места по id вызывающего (student-01…student-10), иначе None."""
+    """Номер места по id вызывающего (student-01…student-11), иначе None."""
     if not isinstance(caller, str):
         return None
     m = PLACE_RE.fullmatch(caller)
@@ -194,7 +194,7 @@ def _valid_name(name: object) -> bool:
 
 def _check_place(place: object) -> int:
     if type(place) is not int or place not in PLACES:
-        raise ValueError("место: 1…10")
+        raise ValueError(f"место: {place_text()}")
     return place
 
 
@@ -340,7 +340,7 @@ class AgentStore:
         return True
 
     def probe_write(self) -> None:
-        """Проба записи учёта: BEGIN IMMEDIATE, вставка в agent_reloads (место 0 — вне 1…10) и ROLLBACK. Одного open()
+        """Проба записи учёта: BEGIN IMMEDIATE, вставка в agent_reloads (место 0 — вне PLACES) и ROLLBACK. Одного open()
         мало: на файле только для чтения BEGIN IMMEDIATE и CREATE … IF NOT EXISTS проходят (итоговая доводка Д7а,
         I-1). Сбой — StoreError без пути и значений."""
         with self._op() as db:

@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..places import PLACE_MAX, place_text
+
 FINDINGS_KEEP = 1000             # строк на место; старые удаляются при записи (Д13)
 RECENT_MAX = 100                  # GET /pcbk/api/events: не больше стольких за раз (Д13)
 SQLITE_TIMEOUT_S = 5.0
@@ -130,8 +132,8 @@ class AgentFindings:
             period_end: str | None, value: float | None, setpoint: float | None, text: str, now: datetime) -> int:
         """Строка находки места; строки этого места сверх FINDINGS_KEEP (старые) удаляются той же транзакцией.
         id новой строки. Сбой SQLite — FindingsError, ничего не меняется (BEGIN IMMEDIATE одной транзакцией)."""
-        if type(place) is not int or not 1 <= place <= 10:
-            raise ValueError("место: 1…10")
+        if type(place) is not int or not 1 <= place <= PLACE_MAX:
+            raise ValueError(f"место: {place_text()}")
         ts = _iso(now)
         tags_json = json.dumps(list(tags), ensure_ascii=False)
         with self._op() as db:
@@ -145,8 +147,8 @@ class AgentFindings:
 
     def recent(self, place: int, limit: int = RECENT_MAX) -> list[Finding]:
         """Последние находки места, новые первыми (по id); limit — 1…RECENT_MAX."""
-        if type(place) is not int or not 1 <= place <= 10:
-            raise ValueError("место: 1…10")
+        if type(place) is not int or not 1 <= place <= PLACE_MAX:
+            raise ValueError(f"место: {place_text()}")
         if type(limit) is not int or not 1 <= limit <= RECENT_MAX:
             raise ValueError(f"limit: от 1 до {RECENT_MAX}")
         with self._op() as db:

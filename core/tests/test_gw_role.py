@@ -175,8 +175,8 @@ def test_health_does_no_io(tmp_path, monkeypatch):                              
 
 def test_egress_targets_cover_gateway():                                               # Review Focus 5
     t = egress_targets(LLM_SETTINGS, GatewaySettings.from_env({"STU_NET": "172.31"}), BDRV_CFG)
-    assert ("pcbk-sp-ctl", 2375) in t and all((f"172.31.{n}.3", 4096) in t for n in range(1, 11))
-    assert len(t) == 13
+    assert ("pcbk-sp-ctl", 2375) in t and all((f"172.31.{n}.3", 4096) in t for n in PLACES)
+    assert len(t) == 14
 
 
 def test_health_json_only_numbers(tmp_path):
@@ -291,7 +291,7 @@ def test_egress_places_follow_workplaces():
     assert (list(PLACES), PLACE_PORT) == (list(places.PLACES), places.PLACE_PORT)
     gw = GatewaySettings.from_env({"STU_NET": "10.50", "SP_CTL_URL": "http://127.0.0.1:2376"})
     t = egress_targets(LLM_SETTINGS, gw, None)
-    assert t[1:] == [("127.0.0.1", 2376)] + [(f"10.50.{n}.3", 4096) for n in range(1, 11)] and len(t) == 12
+    assert t[1:] == [("127.0.0.1", 2376)] + [(f"10.50.{n}.3", 4096) for n in PLACES] and len(t) == 13
 
 
 def test_install_only_through_registry(tmp_path):

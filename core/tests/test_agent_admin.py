@@ -56,7 +56,7 @@ def test_archive_and_reload(env_store, capsys):
 
 def test_errors_are_one_line_code_1(env_store, capsys):
     env_store.save(3, AGENT_DRAFT, agent_text(), AGENT_NOW)
-    for argv in (["archive", "--place", "3", "--name", "nety", "--yes"], ["archive", "--place", "11", "--yes"],
+    for argv in (["archive", "--place", "3", "--name", "nety", "--yes"], ["archive", "--place", "12", "--yes"],
                  ["reload"], ["list", "--place", "x"], ["archive", "--place", "3", "--name", "../x", "--yes"], []):
         assert admin.main(argv) == 1, argv
         err = capsys.readouterr()

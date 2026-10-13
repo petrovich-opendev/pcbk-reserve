@@ -228,7 +228,7 @@ def test_run_base_includes_final_estimates(tmp_path, fake_or):                  
 
 
 def test_run_settings_error_closes_proxy(tmp_path, fake_or):                     # настройки мимо from_env
-    for n, bad in enumerate(({"LLM_RUN_ID": "d8"}, {**RUN, "LLM_RUN_CALLERS": "student-01,student-11"},
+    for n, bad in enumerate(({"LLM_RUN_ID": "d8"}, {**RUN, "LLM_RUN_CALLERS": "student-01,student-12"},
                              {**RUN, "LLM_RUN_USD": 2000.0})):
         app, role = make_llm_app(tmp_path / f"case-{n}", fake_or, **bad)
         with TestClient(app) as c:

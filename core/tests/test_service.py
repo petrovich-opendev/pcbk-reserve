@@ -21,6 +21,7 @@ from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, DRILL_SUMMARY, ERROR_M
                                     SOURCE_LIVE, SOURCE_SERIES, SOURCE_STATE, SOURCE_SUMMARY, STD_KIND, TOOL_WINDOW)
 from pcbk_core.data.sql import HAS_LAST, SUMMARY_COLUMNS, clock_sql, live_sql
 from pcbk_core.logs import setup_logging
+from pcbk_core.places import PLACES
 
 pytestmark = pytest.mark.anyio
 
@@ -138,9 +139,9 @@ async def test_rate_and_single_flight(svc):
     s, fake = svc
     fake.delay_s = 0.1
     rs = await asyncio.gather(*(s.tag_period(f"student-{n:02d}", "http", ["20FAKE_001_PV"], period="prev_shift")
-                                for n in range(1, 11)))
+                                for n in PLACES))
     assert sum("AnalogSummaryHistory" in q for c in fake.calls for q in c) == 1
-    assert sorted(r["cache"] for r in rs) == ["miss"] + ["shared"] * 9
+    assert sorted(r["cache"] for r in rs) == ["miss"] + ["shared"] * (len(PLACES) - 1)
     for _ in range(59):
         await s.tag_now("student-01", "http", ["20FAKE_001_PV"])
     assert (await s.tag_now("student-01", "http", ["20FAKE_001_PV"]))["status"] == "rate"

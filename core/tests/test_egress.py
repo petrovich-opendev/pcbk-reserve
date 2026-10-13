@@ -215,9 +215,9 @@ CRASH = re.compile(r"EgressDenied|PermissionError|Traceback| \| [A-Z]\w*(?:Error
 
 
 @pytest.mark.parametrize("bdrv_text, code, line", [
-    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 13 направлений"),
-    (None, 503, "разрешено 12 направлений"),             # нет bdrv.env → config_error, процесс жив (I2); OpenRouter,
-])                                                       # sp-ctl и десять мест (Д5) — всегда
+    ("BDRV_HOST=127.0.0.1\nBDRV_PORT={closed}\nBDRV_USER=u\nBDRV_PW=<p>\n", 200, "разрешено 14 направлений"),
+    (None, 503, "разрешено 13 направлений"),             # нет bdrv.env → config_error, процесс жив (I2); OpenRouter,
+])                                                       # sp-ctl и одиннадцать мест (Д5, Д15б) — всегда
 def test_serve_installs_guard_and_stays_up(tmp_path, bdrv_text, code, line):
     port, closed = free_port(), free_port()             # на closed никто не слушает
     env = {**os.environ, "CORE_PORT": str(port), "FRESH_POLL_S": "3600",

@@ -1,7 +1,7 @@
 """Места шлюза (Д5-R27, Д5-R28): прокси сокета sp-ctl, замок места, пробуждение, готовность, уборщик простоя.
 
 Будит и усыпляет места только шлюз — через sp-ctl (правила Д2: ping, inspect, start и stop контейнеров
-pcbk-student-01…10, списка контейнеров нет). Имя контейнера сверяется с PLACE_NAME до подстановки в путь.
+pcbk-student-01…11, списка контейнеров нет). Имя контейнера сверяется с PLACE_NAME до подстановки в путь.
 
 Пробуждение и остановка уборщиком одного места идут под одним asyncio.Lock места. Пробуждение — одно на
 место (single-flight): touch до ожидания замка, задача в фоне, wake() отвечает сразу. «Упало при старте» —
@@ -86,11 +86,12 @@ from typing import Any, Literal
 import httpx
 
 from pcbk_core.gateway.stats import MAX_STREAMS_PER_LOGIN, GatewayStats
+from pcbk_core.places import PLACE_NN, PLACES, place_text
 from pcbk_core.settings import GatewaySettings
 
 log = logging.getLogger("pcbk_core.gateway.places")
 
-PLACE_NAME = re.compile(r"pcbk-student-(0[1-9]|10)")
+PLACE_NAME = re.compile(rf"pcbk-student-({PLACE_NN})")
 DOCKER_API = "/v1.44"
 PING_TIMEOUT_S = 3.0          # ping и inspect
 ACTION_TIMEOUT_S = 20.0       # start и stop (stop ждёт до 10 с остановки контейнера)
@@ -110,7 +111,6 @@ TEACHER_PARALLEL = 1
 # студента
 PLACE_CONNECTIONS = MAX_STREAMS_PER_LOGIN + PROXY_PARALLEL + 2 + TEACHER_PARALLEL
 SP_CTL_DOWN_TICK_S = 5.0      # такт, пока sp-ctl не отвечает (Ш10)
-PLACES = range(1, 11)
 # занятая сессия OpenCode: busy — ход идёт, retry — ход ждёт повтора запроса к модели
 BUSY_TYPES = frozenset({"busy", "retry"})
 
@@ -146,9 +146,9 @@ RepairResult = Literal["quarantined", "image", "capped", "not_config"]
 
 
 def _place(n: object) -> int:
-    """Номер места — целое 1…10, иначе ValueError (значение в текст не идёт)."""
+    """Номер места — целое 1…PLACE_MAX, иначе ValueError (значение в текст не идёт)."""
     if type(n) is not int or n not in PLACES:
-        raise ValueError("номер места — целое от 1 до 10")
+        raise ValueError(f"номер места — целое {place_text()}")
     return n
 
 
@@ -217,7 +217,7 @@ class SpCtl:
         """Путь Docker API действия inspect, start или stop над местом n; имя — по PLACE_NAME (research/04 §1)."""
         name = f"pcbk-student-{n:02d}" if type(n) is int else ""
         if not PLACE_NAME.fullmatch(name) or action not in _ACTIONS:
-            raise ValueError("место вне pcbk-student-01…10 или неизвестное действие")
+            raise ValueError(f"место вне pcbk-student-{place_text()} или неизвестное действие")
         return f"{DOCKER_API}/containers/{name}/{_ACTIONS[action]}"
 
     async def _send(self, method: str, path: str, limit: float) -> httpx.Response:

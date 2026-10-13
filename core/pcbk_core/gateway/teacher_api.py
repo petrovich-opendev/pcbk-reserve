@@ -20,7 +20,7 @@ pcbk-front. Отказы (зона, неизвестный метод) — об�
 Порядок проверок каждой ручки (R100) — строго: зона (front_only, 404) → настройка (configured, 503) → сессия
 (current_account, 401) → роль: не преподаватель — 403 teacher_only, событие role_refused и строка «gw teacher refused
 login=… reason=role» (одна на логин за ORIGIN_LOG_S), ни места, ни учёта, ни журнала → у POST — источник
-(origin_checked, 403) → части пути по шаблонам (NN — 01…10, SES — ID_RE["ses"], имя агента — NAME_RE черновика; не
+(origin_checked, 403) → части пути по шаблонам (NN — 01…11, SES — ID_RE["ses"], имя агента — NAME_RE черновика; не
 совпало — 404 not_found, без запроса к месту) → у ручек места — no_student (404: на месте нет учётки студента,
 действующей или отключённой) → строка журнала действий requested (до доступа; не записана — 503 journal без доступа и без проверки
 готовности, I-6) → у чтения разговоров — готовность (503 WorkplaceNotReady asleep, место не будится) → доступ.
@@ -87,6 +87,7 @@ from ..agents.store import AgentMissing, DirUnavailable
 from ..agents.store import StoreError as AgentsStoreError
 from ..llm.ledger import OPS
 from ..llm.shares import ShareRefused, SharesStoreError
+from ..places import PLACE_NN
 from ..teacher_log import TeacherLogError
 from .accounts import GENERATED_PW_BYTES, LOGIN_RE, NOTICE, _LOGIN_RULE, Account, StoreError, login_key
 from .api import (ERROR_NAMES, GW_MESSAGES, PREFIX, GatewayRefusal, _RolledLines, _unique_keys, configured,
@@ -155,7 +156,7 @@ TEACHER_PLACE_PATHS: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {
 # предел ответа места: список разговоров и сам разговор — как списки сверки прокси, сообщения — как ответ вызова
 _PLACE_LIMITS = {"sessions": "list", "session": "list", "messages": "upstream"}
 
-_NN = re.compile(r"0[1-9]|10")
+_NN = re.compile(PLACE_NN)
 _SES = ID_RE["ses"]
 _NO_ANSWER = (httpx.HTTPError, OSError)         # TimeoutError срока — подкласс OSError; PlaceAnswerEncoded — тоже
 
@@ -253,7 +254,7 @@ def _not_found(call: _Call) -> JSONResponse:
 
 
 def place_of(nn: str) -> int | None:
-    """Номер места из части пути: только «01»…«10»."""
+    """Номер места из части пути: только «01»…«11»."""
     return int(nn) if _NN.fullmatch(nn) else None
 
 
@@ -342,14 +343,14 @@ def _json_body(raw: bytes) -> object:
 
 
 def changes_of(raw: bytes) -> list[tuple[int, int, int]] | None:
-    """Тело ровно {"changes": [{"place": "NN", "from_cents": int, "to_cents": int}, …]} (1–10 элементов, без повтора и
-    лишних ключей, целые — не bool) → [(место, было, станет)]; иначе None. Прочие правила (диапазон, повтор места) —
-    Shares.apply."""
+    """Тело ровно {"changes": [{"place": "NN", "from_cents": int, "to_cents": int}, …]} (1–len(PLACES) элементов, без
+    повтора и лишних ключей, целые — не bool) → [(место, было, станет)]; иначе None. Прочие правила (диапазон, повтор
+    места) — Shares.apply."""
     body = _json_body(raw)
     if not isinstance(body, dict) or set(body) != {"changes"}:
         return None
     items = body["changes"]
-    if not isinstance(items, list) or not 1 <= len(items) <= 10:
+    if not isinstance(items, list) or not 1 <= len(items) <= len(PLACES):
         return None
     plan = []
     for item in items:

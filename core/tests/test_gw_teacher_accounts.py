@@ -176,7 +176,7 @@ def test_account_bodies_and_paths(tg):                                    # те
     t = tg.as_("teach")
     before = len(tg.role.teacher_log.recent(100))
     bad_add = ({"login": "x-new"}, {"place": "04"}, {"login": "x-new", "place": 4}, {"login": "x-new", "place": "4"},
-               {"login": "x-new", "place": "11"}, {"login": 7, "place": "04"}, [], "x", None,
+               {"login": "x-new", "place": "12"}, {"login": 7, "place": "04"}, [], "x", None,
                {"login": "x-new", "place": "04", "same_person": True})
     for body in bad_add:
         r = post(t, "accounts", body)

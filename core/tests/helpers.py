@@ -52,6 +52,7 @@ from pcbk_core.llm import LlmRole
 from pcbk_core.llm.ledger import Ledger
 from pcbk_core.llm.shares import Shares
 from pcbk_core.llm.upstream import Upstream
+from pcbk_core.places import PLACES
 from pcbk_core.secrets import BdrvConfig, TokenTable, key_fingerprint
 from pcbk_core.settings import GatewaySettings, LlmSettings, Settings
 
@@ -500,7 +501,7 @@ GW_SETTINGS = GatewaySettings()
 
 
 def pw_dir(tmp_path) -> Path:
-    """Каталог паролей мест student-01…10.pw (пароли — PLACE_PW, без перевода строки, как на сервере)."""
+    """Каталог паролей мест student-01…11.pw (пароли — PLACE_PW, без перевода строки, как на сервере)."""
     d = Path(tmp_path) / "place-secrets"
     d.mkdir(parents=True, exist_ok=True)
     for n, pw in PLACE_PW.items():
@@ -752,12 +753,12 @@ def agent_text(draft: Draft = AGENT_DRAFT, caller: str = "student-03") -> str:
 
 
 def make_agents_root(path) -> Path:
-    """Корень агентов, как на сервере после смены владельца (Д7-R55): student-01…10 — 0755, quarantine и
+    """Корень агентов, как на сервере после смены владельца (Д7-R55): student-01…11 — 0755, quarantine и
     archive — 0700. Сам корень — 0700 (у владельца тестов)."""
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
-    for n in range(1, 11):
+    for n in PLACES:
         (root / f"student-{n:02d}").mkdir(exist_ok=True)
         (root / f"student-{n:02d}").chmod(0o755)
     for side in ("quarantine", "archive"):

@@ -23,7 +23,7 @@ TEXT = agent_text()
 
 @pytest.fixture
 def store(tmp_path):
-    """AgentStore на tmp_path/core.db; корень tmp_path/agents — student-01…10 (0755), quarantine и archive (0700)."""
+    """AgentStore на tmp_path/core.db; корень tmp_path/agents — student-01…11 (0755), quarantine и archive (0700)."""
     s = AgentStore(str(tmp_path / "core.db"), str(make_agents_root(tmp_path / "agents")))
     assert s.open(), s.last_error
     yield s
@@ -169,7 +169,8 @@ def test_unreadable_subdir_is_refusal(store):                              # m-�
         store.place_has_agents(3)
 
 def test_place_of_caller():
-    assert [place_of_caller(c) for c in ("student-01", "student-10", "student-11", "ops", "student-1")] == [1, 10, None, None, None]
+    assert [place_of_caller(c) for c in ("student-01", "student-10", "student-11", "student-12", "ops",
+                                         "student-1")] == [1, 10, 11, None, None, None]
 
 
 # --- сверх брифа: имя перед путём (заметка А2), договор Role, ссылки в пути, сверка, каталоги ---
@@ -255,7 +256,7 @@ def test_dir_problem_texts(store, tmp_path):
         AgentStore(str(tmp_path / "core.db"), str(tmp_path / "нет")).place_has_agents(3)
 
 def test_place_numbers_checked(store, draft):
-    for place in (0, 11, "3", True):
+    for place in (0, 12, "3", True):
         with pytest.raises(ValueError):
             store.save(place, draft, TEXT, NOW)
     assert MAX_AGENTS == 20

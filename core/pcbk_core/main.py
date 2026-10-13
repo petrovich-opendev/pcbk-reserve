@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from .places import PLACES
 from .settings import Settings
 
 if TYPE_CHECKING:
@@ -26,8 +27,8 @@ if TYPE_CHECKING:
     from .settings import GatewaySettings, LlmSettings
 
 USAGE = "использование: python -m pcbk_core.main [--healthcheck]"
-# места Д2: {STU_NET}.N.3, сервер OpenCode на 4096 (как gateway.places — без его импорта: он тянет httpx)
-PLACES = range(1, 11)
+# места Д2: {STU_NET}.N.3, сервер OpenCode на 4096. Число мест — из .places (только stdlib, безопасно для импорта
+# здесь); gateway.places сюда всё равно не ведём — он тянет httpx
 PLACE_PORT = 4096
 # мягкая остановка uvicorn: столько ждать соединений, потом снять их задачи и пройти lifespan ролей (журнал вызовов
 # LLM, R19; замок входа). Без срока открытый поток /event (Д5б) держит остановку до SIGKILL stop_grace_period 10 с
@@ -57,7 +58,7 @@ def read_bdrv(settings: Settings) -> tuple[BdrvConfig | None, OSError | ValueErr
 def egress_targets(llm: LlmSettings, gw: GatewaySettings, cfg: BdrvConfig | None) -> list[tuple[str, int | None]]:
     """Направления охраны выхода: историан (BDRV_HOST без экземпляра, BDRV_PORT; None — любой порт), хост
     OPENROUTER_BASE_URL (порт из адреса, иначе 443/80), прокси сокета SP_CTL_URL (по имени — через кэш адресов
-    Д4а-R18) и места {STU_NET}.N.3:4096 литералами (Д5-R31): 13 направлений, без историана — 12. cfg None
+    Д4а-R18) и места {STU_NET}.N.3:4096 литералами (Д5-R31): 14 направлений, без историана — 13. cfg None
     (bdrv.env не читается) — без историана (П3)."""
     targets: list[tuple[str, int | None]] = [] if cfg is None else [(cfg.host.split("\\")[0], cfg.port)]
     url = urlsplit(llm.OPENROUTER_BASE_URL)

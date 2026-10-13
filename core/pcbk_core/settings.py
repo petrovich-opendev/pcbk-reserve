@@ -6,6 +6,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from urllib.parse import urlsplit
 
+from .places import PLACE_MAX, PLACE_NN
+
 # режимы учений свежести: "" — учений нет
 DRILL_MODES = frozenset({"", "freeze_stamps", "freeze_poll"})
 # учения службы данных (Д9-R83): tool_error — все инструменты чтения отвечают ошибкой без SQL; "" — учений нет
@@ -94,7 +96,7 @@ _LLM_CHOICES = (("LLM_KEY_DEDICATED", LLM_KEY_MODES), ("LLM_STATE", LLM_STATES),
 _LLM_FILE_FIELDS = ("OPENROUTER_KEY_FILE", "OPENROUTER_MGMT_KEY_FILE", "LLM_TOKENS_FILE")
 # прогон отбора модели (Д8-R69): id прогона и вызывающие под его потолком; ops — для ботов Д11
 RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")
-RUN_CALLER_RE = re.compile(r"student-(0[1-9]|10)|ops")
+RUN_CALLER_RE = re.compile(rf"student-({PLACE_NN})|ops")
 
 
 def parse_run_callers(raw: str) -> frozenset[str]:
@@ -102,7 +104,7 @@ def parse_run_callers(raw: str) -> frozenset[str]:
     пустых. Ошибка — ValueError с именем переменной, без значения (текст идёт в config_error и на страницу)."""
     items = [item.strip() for item in raw.split(",")]
     if not all(RUN_CALLER_RE.fullmatch(item) for item in items):
-        raise ValueError("LLM_RUN_CALLERS: только student-01…student-10 и ops")
+        raise ValueError(f"LLM_RUN_CALLERS: только student-01…student-{PLACE_MAX:02d} и ops")
     if len(set(items)) != len(items):
         raise ValueError("LLM_RUN_CALLERS: вызывающий повторяется")
     return frozenset(items)

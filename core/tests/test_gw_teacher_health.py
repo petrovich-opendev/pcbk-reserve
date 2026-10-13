@@ -167,7 +167,7 @@ def test_teacher_tick_verifies_shares_and_pings_journal(tmp_path):
         role.teacher_tick()
         body = c.get("/health/teacher").json()
     assert (body["shares_loaded"], body["shares_ok"], body["shares_drift"], body["store_ok"],
-            body["shares_sum_usd"]) == (True, True, 2, True, 1000.0)
+            body["shares_sum_usd"]) == (True, True, 2, True, 1100.0)       # Д15б: 11 × $100 умолчания
     assert body["checked_at"] is not None
 
 
@@ -208,7 +208,7 @@ def test_reaper_runs_teacher_tick(tmp_path):                              # та
         wait_until(lambda: c.get("/health/teacher").json()["checked_at"] is not None)
         body = c.get("/health/teacher").json()
     assert (body["shares_loaded"], body["shares_ok"], body["shares_drift"], body["store_ok"], body["shares_sum_usd"],
-            body["total_usd"], body["drill"]) == (True, True, 0, True, 1000.0, 1000.0, "")
+            body["total_usd"], body["drill"]) == (True, True, 0, True, 1100.0, 1000.0, "")   # Д15б: 11 × $100
     assert set(body) == KEYS
 
 
@@ -263,7 +263,7 @@ def test_shares_sum_is_memory_and_total_from_llm(tmp_path):              # су�
     app, role = make_gateway(tmp_path, llm=llm)
     with TestClient(app, client=FRONT) as c:
         body = c.get("/health/teacher").json()
-    assert (body["shares_sum_usd"], body["total_usd"]) == (400.0, 500.0)
+    assert (body["shares_sum_usd"], body["total_usd"]) == (440.0, 500.0)  # Д15б: 11 × $40 умолчания
 
 
 # --- итоговая доводка Д10а: ревью А2, m-1 и m-6 ---

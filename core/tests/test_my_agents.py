@@ -1,5 +1,5 @@
 """my_agents службы данных (Д13): живые агенты места вызывающего с инструкцией — для Конструктора («правка
-агента»). Вызывающий — только student-01…10; без quarantined и archived; событие без текста инструкций."""
+агента»). Вызывающий — только student-01…11; без quarantined и archived; событие без текста инструкций."""
 import json
 import sqlite3
 from contextlib import closing

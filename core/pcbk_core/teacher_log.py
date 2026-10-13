@@ -31,11 +31,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .places import PLACE_MAX, place_text
+
 log = logging.getLogger("pcbk_core.teacher_log")
 
 JOURNAL_DRILL = "journal_down"
 SQLITE_TIMEOUT_S = 2.0
-RECENT_MAX = 1000                      # строк за одно чтение (команда journal --last — 1…1000)
+RECENT_MAX = 1000                      # строк за одно чтение (команда journal --last — от 1 до 1000)
 
 # действия кабинета: Д10а — чтения, пробуждение, доли; Д10б (R108) — учётки студентов. Словарь — договор с вебом
 # (ACTION_LABELS кабинета — ровно эти ключи); при записи он не проверяется (ревью Б1+Б2, M-3)
@@ -90,7 +92,7 @@ def _drill_error() -> TeacherLogError:
 
 @dataclass(frozen=True)
 class ActionRow:
-    """Строка teacher_actions: at — ISO с поясом UTC, place — 1…10 или None, detail — разобранный JSON или None."""
+    """Строка teacher_actions: at — ISO с поясом UTC, place — 1…11 или None, detail — разобранный JSON или None."""
 
     id: int
     at: str
@@ -152,8 +154,8 @@ def _values(*, at: datetime, login: object, action: object, place: object, targe
         raise ValueError("login: не логин")
     if not isinstance(action, str) or ACTION_RE.fullmatch(action) is None:
         raise ValueError("action: не код действия")
-    if place is not None and (type(place) is not int or not 1 <= place <= 10):
-        raise ValueError("place: 1…10 или None")
+    if place is not None and (type(place) is not int or not 1 <= place <= PLACE_MAX):
+        raise ValueError(f"place: {place_text()} или None")
     if target is not None and (not isinstance(target, str) or TARGET_RE.fullmatch(target) is None):
         raise ValueError("target: id разговора, имя агента или логин")
     if outcome not in OUTCOMES:

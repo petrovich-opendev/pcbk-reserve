@@ -13,6 +13,18 @@ from pcbk_core.teacher_log import (ACTIONS, JOURNAL_DRILL, OUTCOMES, TEACHER_SCH
 AT = datetime(2026, 10, 11, 9, tzinfo=timezone.utc)
 
 
+def test_teacher_log_place_11(tmp_path):                                  # Д15б: 11-е место пишется в журнал
+    log = TeacherLog(str(tmp_path / "core.db"), clock=lambda: 1_760_000_000.0)
+    assert log.open()
+    log.requested("teach", "sessions", 11, None)
+    rid = log.started("teach", "wake", 11, None)
+    log.finish(rid, "ok")
+    assert [(r.action, r.place, r.outcome) for r in log.recent(10)] == [("wake", 11, "ok"), ("sessions", 11,
+                                                                                            "requested")]
+    with pytest.raises(ValueError):
+        log.requested("teach", "read", 12, None)                          # 12 — первое недопустимое место
+
+
 def test_teacher_log_rows_and_ping(tmp_path):                             # Review Focus 4
     log = TeacherLog(str(tmp_path / "core.db"), clock=lambda: 1_760_000_000.0)
     assert log.open() and log.store_ok
@@ -68,7 +80,7 @@ def test_texts_and_bad_values_never_reach_the_table(tmp_path):           # в ж
     assert log.open()
     for bad in (dict(login="Teach", action="read", place=3, target=None),          # логин не того вида
                 dict(login="teach", action="прочитал", place=3, target=None),      # действие — код
-                dict(login="teach", action="read", place=11, target=None),
+                dict(login="teach", action="read", place=12, target=None),
                 dict(login="teach", action="read", place=True, target=None),
                 dict(login="teach", action="read", place=3, target="текст разговора"),
                 dict(login="teach", action="read", place=3, target="a\tb"),

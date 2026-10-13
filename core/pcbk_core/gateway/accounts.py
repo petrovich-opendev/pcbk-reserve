@@ -63,6 +63,7 @@ from typing import Literal
 
 from pcbk_core.agents.store import AgentStore, DirUnavailable
 from pcbk_core.agents.store import StoreError as AgentStoreError
+from pcbk_core.places import PLACES, place_text
 from pcbk_core.settings import Settings
 from pcbk_core.teacher_log import RECENT_MAX, TeacherLog, TeacherLogError
 
@@ -72,7 +73,6 @@ LOGIN_RE = re.compile(r"[a-z][a-z0-9._-]{2,31}")
 PROBE_LOGIN = re.compile(r"d[0-9]+[a-z]?-probe-[a-z0-9-]+")
 PASSWORD_MIN = 8
 PASSWORD_MAX = 128
-PLACES = range(1, 11)
 LOCK_FAILURES = 5
 LOCK_WINDOW_S = 900.0
 UNKNOWN_KEYS = 10000
@@ -399,7 +399,7 @@ class AccountStore:
             raise ValueError("роль: student или teacher")
         if role == "student":
             if type(place) is not int or place not in PLACES:
-                raise ValueError("у студента должно быть место 1…10")
+                raise ValueError(f"у студента должно быть место {place_text()}")
         elif place is not None:
             raise ValueError("у преподавателя места нет")
         _check_password(password)
@@ -517,7 +517,7 @@ class AccountStore:
     def _check_release(db: sqlite3.Connection, place: object) -> None:
         """Правило release_place: место закреплено за пробной учёткой (PROBE_LOGIN), действующей учётки на нём нет."""
         if type(place) is not int or place not in PLACES:
-            raise ValueError("место: 1…10")
+            raise ValueError(f"место: {place_text()}")
         bound = db.execute("SELECT login FROM gw_places WHERE place = ?", (place,)).fetchone()
         active = db.execute("SELECT 1 FROM gw_accounts WHERE place = ? AND disabled = 0", (place,)).fetchone()
         if bound is None or PROBE_LOGIN.fullmatch(bound[0]) is None or active is not None:
@@ -776,7 +776,7 @@ def _parser() -> argparse.ArgumentParser:
     add = sub.add_parser("add", help="завести учётку")
     add.add_argument("--login", required=True)
     add.add_argument("--role", required=True, choices=ROLES)
-    add.add_argument("--place", type=int, help="место студента, 1…10")
+    add.add_argument("--place", type=int, help=f"место студента, {place_text()}")
     add.add_argument("--generate", action="store_true", help="породить пароль и напечатать его один раз")
     add.add_argument("--same-person", action="store_true",
                      help="логин удалённой учётки вернулся к тому же человеку")

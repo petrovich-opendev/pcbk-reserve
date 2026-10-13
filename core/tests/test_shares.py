@@ -12,6 +12,7 @@ import pytest
 
 from pcbk_core.llm.shares import (PLACE_CALLER, STALE_DRILL, ShareRefused, Shares, SharesStoreError, floor_cents,
                                   money_text)
+from pcbk_core.places import PLACES
 from pcbk_core.teacher_log import JOURNAL_DRILL, TeacherLog
 
 NOW = datetime(2026, 10, 11, 9, tzinfo=timezone.utc)
@@ -27,20 +28,22 @@ def make(path, settled=None, *, total=1000.0, default=100.0, drill=""):
 
 
 def memory(s):                                                             # центы, по которым отказал бы прокси
-    return {n: s.cents(n) for n in range(1, 11)}
+    return {n: s.cents(n) for n in PLACES}
 
 
 def test_defaults(tmp_path):
     s = make(tmp_path)
-    assert [s.cents(n) for n in range(1, 11)] == [10000] * 10 and s.sum_cents() == s.total_cents == 100000
-    assert (s.usd("student-03"), s.usd("ops"), s.usd("student-11"), s.usd("bench")) == (100.0, None, None, None)
+    assert [s.cents(n) for n in PLACES] == [10000] * 11 and s.sum_cents() == 110000 and s.total_cents == 100000
+    # Д15б: 11 × $100 по умолчанию ($1100) больше умолчания кода total_usd=$1000 — на сервере LLM_TOTAL_USD=1100
+    assert (s.usd("student-03"), s.usd("student-11"), s.usd("student-12"), s.usd("ops"), s.usd("bench")) == \
+           (100.0, 100.0, None, None, None)
     assert (money_text(123456), money_text(5)) == ("1234,56 $", "0,05 $")
 
 
 def test_transfer_and_reload(tmp_path):
     s = make(tmp_path)
     s.apply([(3, 10000, 4000), (5, 10000, 16000)], by="teach", now=NOW)
-    assert (s.cents(3), s.cents(5), s.usd("student-05"), s.sum_cents()) == (4000, 16000, 160.0, 100000)
+    assert (s.cents(3), s.cents(5), s.usd("student-05"), s.sum_cents()) == (4000, 16000, 160.0, 110000)
     again = make(tmp_path)                                                 # новый процесс — память по диску
     assert (again.cents(3), again.cents(5)) == (4000, 16000)
 
@@ -86,11 +89,11 @@ def test_floor_cents_survives_float_noise():                             # B-1 �
 def test_apply_floor_is_one_operation(tmp_path):                         # I-1 р2: пол берёт сервер под замком
     s = make(tmp_path, {"student-03": 12.349})
     s.apply_floor(3, 5, by="teach", now=NOW)
-    assert (s.cents(3), s.cents(5), s.sum_cents()) == (1234, 18766, 100000)
+    assert (s.cents(3), s.cents(5), s.sum_cents()) == (1234, 18766, 110000)
     with pytest.raises(ShareRefused) as e:
         s.apply_floor(3, 5, by="teach", now=NOW)                             # уже на полу
     assert e.value.kind == "at_floor"
-    for bad in ((3, 3), (0, 5), (3, 11), (True, 5)):
+    for bad in ((3, 3), (0, 5), (3, 12), (True, 5)):
         with pytest.raises(ShareRefused) as e:
             s.apply_floor(*bad, by="teach", now=NOW)
         assert e.value.kind == "bad", bad
@@ -124,25 +127,25 @@ def test_conflict_and_bad_input(tmp_path):                               # Revie
     with pytest.raises(ShareRefused) as e:
         s.apply([(3, 9999, 9000), (5, 10000, 11000)], by="teach", now=NOW)   # вторая вкладка видела другое
     assert e.value.kind == "conflict"
-    for bad in ([], [(3, 10000, -1)], [(3, 10000, True)], [(3, 10000, 10.5)], [(0, 10000, 1)], [(11, 10000, 1)],
+    for bad in ([], [(3, 10000, -1)], [(3, 10000, True)], [(3, 10000, 10.5)], [(0, 10000, 1)], [(12, 10000, 1)],
                 [(True, 10000, 1)], [(3, 10000, 9000), (3, 9000, 8000)],
-                [(n, 10000, 10000) for n in range(1, 11)] + [(1, 10000, 1)], [(3, 10000, 100001)]):
+                [(n, 10000, 10000) for n in PLACES] + [(1, 10000, 1)], [(3, 10000, 100001)]):
         with pytest.raises(ShareRefused) as e:
             s.apply(bad, by="teach", now=NOW)
         assert e.value.kind == "bad", bad
-    assert s.sum_cents() == 100000
+    assert s.sum_cents() == 110000
 
 
 def test_sum_not_over_total_unless_not_worse(tmp_path):                  # сверка с кодом, п. 16
-    s = make(tmp_path)
+    s = make(tmp_path, total=1100.0)                                       # Д15б: 11 × $100 — ровно бюджет
     with pytest.raises(ShareRefused) as e:
         s.apply([(3, 10000, 10001)], by="teach", now=NOW)
-    assert e.value.kind == "over_total" and "1000,01 $ из 1000,00 $" in e.value.text
+    assert e.value.kind == "over_total" and "1100,01 $ из 1100,00 $" in e.value.text
     s.apply([(3, 10000, 9000)], by="teach", now=NOW)                       # в свободный остаток
     s.apply([(3, 9000, 10000)], by="teach", now=NOW)                       # и обратно — ровно бюджет
-    # I-5: бюджет $500 меньше суммы по умолчанию ($1000), каждая доля ($100) — меньше бюджета
+    # I-5: бюджет $500 меньше суммы по умолчанию ($1100), каждая доля ($100) — меньше бюджета
     low = make(tmp_path / "low", total=500.0)
-    assert (low.sum_cents(), low.total_cents) == (100000, 50000)
+    assert (low.sum_cents(), low.total_cents) == (110000, 50000)
     low.apply([(3, 10000, 9000), (5, 10000, 11000)], by="teach", now=NOW)  # перевод — сумма та же, не хуже
     with pytest.raises(ShareRefused) as e:
         low.apply([(3, 9000, 9001)], by="teach", now=NOW)                  # хуже прежнего
@@ -193,7 +196,7 @@ def test_verify_compares_disk_with_effective_shares(tmp_path, monkeypatch):  # I
     honest.apply([(3, 10000, 4000), (5, 10000, 16000)], by="teach", now=NOW)
     honest.verify(NOW, memory(honest))
     assert honest.drift == 0
-    honest.verify(NOW, {n: 10000 for n in range(1, 11)})                    # Budget собран без долей: $100 у всех
+    honest.verify(NOW, {n: 10000 for n in PLACES})                          # Budget собран без долей: $100 у всех
     assert honest.drift == 2
     with closing(sqlite3.connect(tmp_path / "h" / "core.db")) as db, db:
         db.execute("UPDATE llm_shares SET cents = 3999 WHERE place = 3")   # правка мимо кабинета
@@ -210,19 +213,55 @@ def test_open_failure_is_reported(tmp_path):
     assert s.open() is False and s.loaded is False and s.last_error
 
 
+def test_shares_migrates_old_check(tmp_path):                            # Д15б: перенос схемы — старый CHECK → новый
+    db_path = tmp_path / "core.db"
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("""CREATE TABLE llm_shares (
+            place INTEGER PRIMARY KEY CHECK (place BETWEEN 1 AND 10),
+            cents INTEGER NOT NULL CHECK (cents >= 0),
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL
+        )""")
+        db.execute("INSERT INTO llm_shares (place, cents, updated_at, updated_by) VALUES (3, 4000, 'x', 'teach')")
+        db.execute("INSERT INTO llm_shares (place, cents, updated_at, updated_by) VALUES (7, 15000, 'y', 'teach')")
+    s = Shares(str(db_path), total_usd=1100.0, default_usd=100.0)
+    assert s.open(), s.last_error
+    assert (s.cents(3), s.cents(7)) == (4000, 15000)                       # строки 03 и 07 целы
+    s.apply([(11, 10000, 5000)], by="teach", now=NOW)                      # место 11 теперь пишется
+    assert s.cents(11) == 5000
+    with closing(sqlite3.connect(db_path)) as db:
+        schema_once = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'llm_shares'").fetchone()[0]
+    assert "BETWEEN 1 AND 10" not in schema_once
+    again = Shares(str(db_path), total_usd=1100.0, default_usd=100.0)
+    assert again.open(), again.last_error                                  # второй open() — идемпотентно
+    assert (again.cents(3), again.cents(7), again.cents(11)) == (4000, 15000, 5000)
+    with closing(sqlite3.connect(db_path)) as db:
+        schema_twice = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'llm_shares'").fetchone()[0]
+    assert schema_twice == schema_once                                    # схема не меняется второй раз
+
+
+def test_eleven_defaults_fit_total_1100(tmp_path):                       # Review Focus 5: 11 × $100 = $1100
+    s = make(tmp_path, total=1100.0)
+    assert s.sum_cents() == s.total_cents == 110000 and len(PLACES) == 11
+    s.apply([(3, 10000, 20000), (5, 10000, 0)], by="teach", now=NOW)      # перевод доли — не отказывает «больше общего»
+    assert s.sum_cents() == 110000
+
+
 # --- сверх брифа ---
 
 def test_constructor_does_no_io_and_keeps_defaults(tmp_path):            # договор Role; m-5 р3
     s = Shares(str(tmp_path / "нет" / "core.db"), total_usd=250.0, default_usd=30.0, drill=STALE_DRILL)
     assert not (tmp_path / "нет").exists()
     assert (s.loaded, s.ok, s.drift, s.checked_at, s.last_error) == (False, False, 0, None, None)
-    assert [s.cents(n) for n in range(1, 11)] == [3000] * 10 and (s.total_cents, s.default_cents) == (25000, 3000)
+    assert [s.cents(n) for n in PLACES] == [3000] * 11 and (s.total_cents, s.default_cents) == (25000, 3000)
     assert s.drill == STALE_DRILL and s.settled_of("student-01") == 0.0
 
 
 def test_place_caller_is_exact():
-    assert all(PLACE_CALLER.fullmatch(f"student-{n:02d}") for n in range(1, 11))
-    for other in ("student-00", "student-11", "student-1", "student-010", "ops", "teacher", "student-01 ", "bench-x"):
+    assert all(PLACE_CALLER.fullmatch(f"student-{n:02d}") for n in PLACES)
+    for other in ("student-00", "student-12", "student-1", "student-010", "ops", "teacher", "student-01 ", "bench-x"):
         assert PLACE_CALLER.fullmatch(other) is None, other
     s = Shares(":memory:", total_usd=1000.0, default_usd=100.0)
     assert [s.usd(c) for c in ("student-1", "student-010", "Student-01", None, 3)] == [None] * 5
@@ -257,7 +296,7 @@ def test_shares_stale_logs_warning_and_keeps_memory(tmp_path, caplog):
         s.apply([(3, 10000, 4000), (5, 10000, 16000)], by="teach", now=NOW)
         s.apply_floor(5, 3, by="teach", now=NOW)                           # и «Остановить место» — диск, не память
     assert caplog.text.count("УЧЕНИЯ: shares_stale — доли записаны, память прокси не обновлена") == 2
-    assert memory(s) == {n: 10000 for n in range(1, 11)}
+    assert memory(s) == {n: 10000 for n in PLACES}
     with closing(sqlite3.connect(tmp_path / "core.db")) as db:
         assert dict(db.execute("SELECT place, cents FROM llm_shares")) == {3: 20000, 5: 0}   # пол места 05 — ноль
 
@@ -306,9 +345,9 @@ def test_concurrent_transfers_do_not_lose_a_cent(tmp_path):              # CAS �
     second.start()
     first.join(10)
     second.join(10)
-    assert results == {"first": "ok", "second": "conflict"} and s.sum_cents() == 100000
+    assert results == {"first": "ok", "second": "conflict"} and s.sum_cents() == 110000
     again = make(tmp_path)
-    assert (again.cents(3), again.cents(5), again.cents(6), again.sum_cents()) == (9000, 11000, 10000, 100000)
+    assert (again.cents(3), again.cents(5), again.cents(6), again.sum_cents()) == (9000, 11000, 10000, 110000)
 
 
 def test_cas_compares_with_disk_not_memory(tmp_path):                    # ревью А2, m-3: «было» — по диску (R97, п. 3)

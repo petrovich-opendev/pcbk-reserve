@@ -849,8 +849,8 @@ async def test_place_clients_share_tls_context(tmp_path, monkeypatch):          
     monkeypatch.setattr(ssl, "create_default_context", lambda *a, **k: made.append(1) or real(*a, **k))
     w = make_places(tmp_path)
     w._transport = None                                                                  # настоящие транспорты httpx
-    clients = [w._http(n) for n in range(1, 11)]
-    assert len(made) == 1 and len({id(c) for c in clients}) == 10
+    clients = [w._http(n) for n in places.PLACES]
+    assert len(made) == 1 and len({id(c) for c in clients}) == len(places.PLACES)
     await w.aclose()
 
 

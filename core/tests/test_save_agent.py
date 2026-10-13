@@ -2,7 +2,7 @@
 счётчики. Отказ — обычный результат, не isError; место — только из токена.
 
 Фикстура served — роль с каталогом agent_catalog() под serve_role (каталог закреплён: загрузка двойника историана его
-не заменит), корень агентов tmp_path/agents со student-01…10; served_no_catalog — то же, но каталог не грузится.
+не заменит), корень агентов tmp_path/agents со student-01…11; served_no_catalog — то же, но каталог не грузится.
 """
 import asyncio
 import json
@@ -30,13 +30,14 @@ from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.save_agent import SAVE_LIMIT, SAVE_MESSAGES, SAVE_PROPERTIES, SaveAgent, refused_message
 from pcbk_core.data.service import MESSAGES
+from pcbk_core.places import PLACES
 from pcbk_core.secrets import TokenTable
 
 # тестовые токены — не 48 шестнадцатеричных знаков (шаблон проверки на секреты)
 TOKEN3 = "test-token-student-03"
-TOKEN11 = "test-token-student-11"
+TOKEN12 = "test-token-student-12"                                        # Д15б: токен есть, места нет (12 — вне PLACES)
 OPS = "test-token-ops"
-TOKENS = TokenTable({"student-01": sha(TOKEN), "student-03": sha(TOKEN3), "student-11": sha(TOKEN11),
+TOKENS = TokenTable({"student-01": sha(TOKEN), "student-03": sha(TOKEN3), "student-12": sha(TOKEN12),
                      "ops": sha(OPS)})
 
 ARGS = {"name": "proverka", "title": "Проверка Д7", "node": "Тестовый узел", "purpose": "Проверка записи агента службой",
@@ -262,13 +263,13 @@ async def test_missing_fields_are_all_wrong_type(tmp_path):
 # --- сверх брифа: охранные ветки Д7-R57 ---
 
 @pytest.mark.anyio
-async def test_place_outside_1_10_cannot_save(served):                       # student-11: токен есть, места нет
-    _, out = await save(served.url, TOKEN11)
+async def test_place_outside_1_11_cannot_save(served):                       # student-12: токен есть, места нет
+    _, out = await save(served.url, TOKEN12)
     assert (out["status"], out["message"], out["problems"]) == ("refused", SAVE_MESSAGES["not_student"], [])
     ev = served.events(tool="save_agent")[-1]
-    assert (ev["caller"], ev["outcome"], ev["summary"]) == ("student-11", "refused", "refused: not_student")
+    assert (ev["caller"], ev["outcome"], ev["summary"]) == ("student-12", "refused", "refused: not_student")
     assert served.role.agent_stats.count_1h("refused") == 1
-    assert all(not any((served.root / f"student-{n:02d}").iterdir()) for n in range(1, 11))
+    assert all(not any((served.root / f"student-{n:02d}").iterdir()) for n in PLACES)
 
 
 @pytest.mark.anyio

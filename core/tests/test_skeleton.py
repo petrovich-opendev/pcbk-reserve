@@ -306,7 +306,7 @@ def test_llm_settings_error_names_variable_without_value(name, raw):            
     {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "2000", "LLM_RUN_CALLERS": "student-07"},
     {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-7"},
     {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-07,student-07"},
-    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-11"},
+    {"LLM_RUN_ID": "d8", "LLM_RUN_USD": "10", "LLM_RUN_CALLERS": "student-12"},
 ])
 def test_llm_run_settings_refused(env):                                           # Review Focus 1
     with pytest.raises(ValueError, match=r"^LLM_RUN_") as e:

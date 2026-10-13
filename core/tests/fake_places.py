@@ -1,7 +1,7 @@
 """Двойники мест для шлюза (Д5а, задача А3): обработчики httpx.MockTransport, без Docker и сборок (Ш2).
 
 FakeDocker — Docker API за прокси сокета sp-ctl (правила Д2: ping, inspect, start и stop только
-pcbk-student-01…10; путь вне правил — 403, метод без правил — 405). FakePlaces — серверы OpenCode мест по
+pcbk-student-01…11; путь вне правил — 403, метод без правил — 405). FakePlaces — серверы OpenCode мест по
 адресу {STU_NET}.N.3:4096 с Basic «opencode:<пароль места>».
 
 Пароли мест тестов — PLACE_PW; их пишет helpers.pw_dir. Ожидаемый Authorization двойник считает сам, а не
@@ -41,14 +41,16 @@ from dataclasses import dataclass
 
 import httpx
 
-PLACES = range(1, 11)
+from pcbk_core.places import PLACE_MAX, PLACE_NN, PLACES
+
 # тестовые пароли мест — не секреты: не 48 шестнадцатеричных знаков
 PLACE_PW = {n: f"test-place-pw-{n:02d}" for n in PLACES}
 NEVER_STARTED = "0001-01-01T00:00:00Z"          # StartedAt контейнера, который ни разу не запускали
 
-_DOCKER_GET = re.compile(r"/v1\.44/(_ping|containers/pcbk-student-(0[1-9]|10)/json)")
-_DOCKER_POST = re.compile(r"/v1\.44/containers/pcbk-student-(0[1-9]|10)/(start|stop)")
-_PLACE_TAIL = re.compile(r"([1-9]|10)\.3")         # после префикса STU_NET: N.3, номер без нуля впереди
+_DOCKER_GET = re.compile(rf"/v1\.44/(_ping|containers/pcbk-student-({PLACE_NN})/json)")
+_DOCKER_POST = re.compile(rf"/v1\.44/containers/pcbk-student-({PLACE_NN})/(start|stop)")
+# после префикса STU_NET: N.3, номер без нуля впереди (PLACE_NN — с нулём, здесь строится отдельно из PLACE_MAX)
+_PLACE_TAIL = re.compile(rf"([1-9]|1[0-{PLACE_MAX - 10}])\.3")
 _PROMPT_ASYNC = re.compile(r"/session/[^/]+/prompt_async")
 _SESSION = re.compile(r"/session/(ses_[^/]+)(/message)?")      # разговор и его сообщения (Д10а, кабинет)
 BIG_CHUNK = 1024                                   # кусок большого тела big: предел читается с точностью до КиБ

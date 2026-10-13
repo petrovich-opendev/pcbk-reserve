@@ -3,7 +3,7 @@
 Строка есть только у изменённых мест; прочие — по умолчанию default_cents = round(LLM_SHARE_USD × 100). Удалений строк
 нет. Доля ops («отбор и проверки») — вне таблицы и суммы (решает Budget).
 
-Память _cents — центы десяти мест, по которым отказывает LLM-прокси (Budget.share_of → usd). Она заменяется целиком
+Память _cents — центы мест, по которым отказывает LLM-прокси (Budget.share_of → usd). Она заменяется целиком
 новым словарём (атомарная замена ссылки): usd(), cents(), sum_cents() и floor_of() зовутся из цикла событий без замка и
 без SQLite. Конструктор сразу ставит умолчания (m-5 р3): при loaded == False такт шлюза считает доли без KeyError, а
 денег эти умолчания не открывают — роль llm при незагруженных долях закрыта (config_error, R98).
@@ -35,13 +35,13 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..places import CALLER_RE, PLACE_MAX, PLACES
 from ..teacher_log import LOGIN_RE, TEACHER_SCHEMA, TeacherLogError, insert_action
 
 log = logging.getLogger("pcbk_core.llm.shares")
 
 STALE_DRILL = "shares_stale"
-PLACE_CALLER = re.compile(r"student-(0[1-9]|10)")
-PLACES = range(1, 11)
+PLACE_CALLER = CALLER_RE
 SQLITE_TIMEOUT_S = 2.0                  # запись ждёт блокировку недолго, как AccountStore (Г14)
 FLOOR_SLACK_USD = 1e-9                  # запас пола против шума float (B-1 р2)
 _SQLITE_CODE = re.compile(r"SQLITE_[A-Z_]{1,40}")
@@ -49,12 +49,14 @@ _SQLITE_CODE = re.compile(r"SQLITE_[A-Z_]{1,40}")
 BAD_TEXT = "Неверный запрос"
 CONFLICT_TEXT = "Доли изменились, пока страница была открыта, — обновите её"
 
-SHARES_SCHEMA = """CREATE TABLE IF NOT EXISTS llm_shares (
-    place INTEGER PRIMARY KEY CHECK (place BETWEEN 1 AND 10),
+SHARES_SCHEMA = f"""CREATE TABLE IF NOT EXISTS llm_shares (
+    place INTEGER PRIMARY KEY CHECK (place BETWEEN 1 AND {PLACE_MAX}),
     cents INTEGER NOT NULL CHECK (cents >= 0),
     updated_at TEXT NOT NULL,
     updated_by TEXT NOT NULL
 )"""
+# Д15б: старая проверка (мест было 10) — перенос схемы в open() копией строк, без ALTER TABLE (SQLite его не умеет)
+_OLD_CHECK = "CHECK (place BETWEEN 1 AND 10)"
 _UPSERT = ("INSERT INTO llm_shares (place, cents, updated_at, updated_by) VALUES (?, ?, ?, ?)"
            " ON CONFLICT (place) DO UPDATE SET cents = excluded.cents, updated_at = excluded.updated_at,"
            " updated_by = excluded.updated_by")
@@ -124,8 +126,24 @@ def _nn(place: int) -> str:
     return f"{place:02d}"
 
 
+def _needs_migration(db: sqlite3.Connection) -> bool:
+    """llm_shares уже на диске со старой проверкой (Д15б: мест было 10) — перенести схему."""
+    row = db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'llm_shares'").fetchone()
+    return row is not None and row[0] is not None and _OLD_CHECK in row[0]
+
+
+def _migrate_schema(db: sqlite3.Connection) -> None:
+    """Новая таблица (SHARES_SCHEMA с текущим PLACE_MAX) под именем на обмен, копия строк старой, удаление старой,
+    переименование — одной транзакцией с остальным открытием (ALTER TABLE CHECK не меняет, п. 3.3 Review Focus)."""
+    db.execute(SHARES_SCHEMA.replace("llm_shares", "llm_shares_new", 1))
+    db.execute("INSERT INTO llm_shares_new (place, cents, updated_at, updated_by)"
+              " SELECT place, cents, updated_at, updated_by FROM llm_shares")
+    db.execute("DROP TABLE llm_shares")
+    db.execute("ALTER TABLE llm_shares_new RENAME TO llm_shares")
+
+
 class Shares:
-    """Доли десяти мест: память — для прокси, SQLite — под _apply_lock. Конструктор только запоминает.
+    """Доли мест (PLACE_MAX): память — для прокси, SQLite — под _apply_lock. Конструктор только запоминает.
 
     settled_of — оплаченное вызывающим, $ (ставит LlmRole: ledger.settled, B-1; без роли — ноль). Поля для здоровья —
     из памяти: loaded (open() удался), ok (последняя сверка прочла таблицу), drift (мест с расхождением), checked_at
@@ -172,7 +190,7 @@ class Shares:
         return sqlite3.connect(uri, uri=True, timeout=SQLITE_TIMEOUT_S, isolation_level=None)
 
     def _read(self, db: sqlite3.Connection) -> dict[int, int]:
-        """Центы десяти мест по диску: строка или умолчание. Строка не по правилам — _BadRow."""
+        """Центы мест по диску: строка или умолчание. Строка не по правилам — _BadRow."""
         cents = {n: self.default_cents for n in PLACES}
         for place, value in db.execute("SELECT place, cents FROM llm_shares").fetchall():
             if not _int(place) or place not in PLACES or not _int(value) or value < 0:
@@ -181,16 +199,20 @@ class Shares:
         return cents
 
     def open(self) -> bool:
-        """Файл (mode=rwc), WAL, таблицы llm_shares и журнала действий (TEACHER_SCHEMA), память по диску. Сбой не
-        бросает: last_error, loaded = False, False. Ввод-вывод — не в цикле событий (роль зовёт через
-        asyncio.to_thread)."""
+        """Файл (mode=rwc), WAL, таблицы llm_shares и журнала действий (TEACHER_SCHEMA), память по диску. Старая
+        проверка llm_shares (мест было 10, Д15б) — перенос схемы под тем же BEGIN IMMEDIATE: новая таблица, копия
+        строк, удаление старой, переименование; идемпотентно (второй open() схему не трогает). Сбой не бросает:
+        last_error, loaded = False, False. Ввод-вывод — не в цикле событий (роль зовёт через asyncio.to_thread)."""
         with self._apply_lock:
             try:
                 db = self._connect(create=True)
                 try:
                     db.execute("PRAGMA journal_mode=WAL")
                     db.execute("BEGIN IMMEDIATE")
-                    db.execute(SHARES_SCHEMA)
+                    if _needs_migration(db):
+                        _migrate_schema(db)
+                    else:
+                        db.execute(SHARES_SCHEMA)
                     for statement in TEACHER_SCHEMA:
                         db.execute(statement)
                     cents = self._read(db)
@@ -206,9 +228,10 @@ class Shares:
             return True
 
     def _form(self, changes: object) -> list[tuple[int, int, int]]:
-        """Форма изменения (R97, п. 1): 1…10 изменений, места различны, int 1…10 (не bool); «было» и «станет» — int (не
-        bool) от 0 до total_cents. Иначе ShareRefused bad."""
-        if isinstance(changes, (str, bytes)) or not isinstance(changes, Sequence) or not 1 <= len(changes) <= 10:
+        """Форма изменения (R97, п. 1): 1…len(PLACES) изменений, места различны, int 1…PLACE_MAX (не bool); «было» и
+        «станет» — int (не bool) от 0 до total_cents. Иначе ShareRefused bad."""
+        if (isinstance(changes, (str, bytes)) or not isinstance(changes, Sequence)
+                or not 1 <= len(changes) <= len(PLACES)):
             raise ShareRefused("bad", BAD_TEXT)
         plan: list[tuple[int, int, int]] = []
         for item in changes:
@@ -228,7 +251,7 @@ class Shares:
                      decide: Callable[[dict[int, int]], tuple[dict[int, int], dict]]) -> dict[int, int]:
         """Под _apply_lock: BEGIN IMMEDIATE, доли с диска, decide(диск) → (новые центы изменённых мест, detail строки
         журнала) или ShareRefused; запись строк, строка журнала shares в той же транзакции, COMMIT; память — новым
-        словарём (под shares_stale — нет). Возврат — центы десяти мест по диску после изменения."""
+        словарём (под shares_stale — нет). Возврат — центы мест по диску после изменения."""
         if not isinstance(by, str) or LOGIN_RE.fullmatch(by) is None:
             raise ValueError("by: логин преподавателя")
         if not isinstance(now, datetime):

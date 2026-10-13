@@ -21,6 +21,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
+from pcbk_core.places import place_text
 from pcbk_core.settings import Settings
 
 from .store import PLACES, AgentStore, DirUnavailable, StoreError
@@ -45,7 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True, metavar="команда")
     show = sub.add_parser("list", help="агенты (место, имя, название, состояние, создан, признаки) и расхождения"
                                        " файлов с учётом")
-    show.add_argument("--place", type=int, help="место 1…10; без него — все места")
+    show.add_argument("--place", type=int, help=f"место {place_text()}; без него — все места")
     archive = sub.add_parser("archive", help="агентов места — в архив, место — в очередь перезагрузки")
     archive.add_argument("--place", required=True, type=int)
     archive.add_argument("--name", help="имя агента (как в list); без него — все агенты и файлы места")
@@ -62,7 +63,7 @@ def _show(text: str) -> str:
 
 def _place(place: int) -> int:
     if place not in PLACES:
-        raise ValueError("место: 1…10")
+        raise ValueError(f"место: {place_text()}")
     return place
 
 

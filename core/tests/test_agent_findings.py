@@ -66,7 +66,7 @@ def test_place_bounds(store):
     with pytest.raises(ValueError):
         store.add(0, "a", "note", "t", [], None, None, None, None, "текст текст текст", NOW)
     with pytest.raises(ValueError):
-        store.recent(11)
+        store.recent(12)                                                  # Д15б: 12 — первое недопустимое место
 
 
 def test_open_failure_without_io(tmp_path):
