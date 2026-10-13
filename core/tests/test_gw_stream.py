@@ -91,6 +91,23 @@ def test_stream_logs_dropped_types(tmp_path, gwlog):                            
     assert "gw event place=03 dropped=3 types=session.diff:2,todo.updated:1" in text     # итог при закрытии, по алфавиту
 
 
+def test_stream_caps_dropped_type_keys(tmp_path, gwlog):                                # Правка раунд 1: критик 13.10
+    app, role = make_gateway(tmp_path, ready=(3,))
+    kinds = [f"noise.{i:02d}" for i in range(20)]                                       # 20 разных неразрешённых типов
+    role.fake_places.events[3] = [EV(k) for k in kinds] + [EV("server.connected")]
+    with TestClient(app, base_url=BASE) as c:
+        login(c, "stu-03")
+        with c.stream("GET", "/pcbk/api/oc/event") as r:
+            body = b"".join(r.iter_bytes())
+    assert body.count(b"data: ") == 1                                                   # браузеру — только разрешённое
+    text = gwlog.text
+    assert text.count("dropped_type=") == 8                                             # предел — не больше STREAM_DROP_TYPES_MAX
+    assert [f"dropped_type=noise.{i:02d}" in text for i in range(8)] == [True] * 8       # первые 8 — со своим ключом
+    assert all(f"dropped_type=noise.{i:02d}" not in text for i in range(8, 20))          # сверх предела — без ключа и строки
+    types = "noise.00:1,noise.01:1,noise.02:1,noise.03:1,noise.04:1,noise.05:1,noise.06:1,noise.07:1,…"
+    assert f"gw event place=03 dropped=20 types={types}" in text                        # «прочие» (12) — в total, без ключа
+
+
 def test_stream_ends_with_place_and_is_not_activity(tmp_path):                          # Review Focus 4
     app, role = make_gateway(tmp_path, ready=(3,))
     role.fake_places.events[3] = [EV("server.connected"), EV("session.status"), EV("server.instance.disposed")]

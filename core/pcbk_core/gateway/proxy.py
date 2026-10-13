@@ -76,10 +76,11 @@ timeout, oversize, store и у обрыва места с классом иск�
 зовётся, Д5-R35).
 
 Отбросы по типу (Task 1b, Д15а, случай 13.10): filter_sse зовёт on_drop типом события, не из ALLOWED_EVENTS или
-неразборчивым — первый раз за тип в потоке — строка «gw event place=NN dropped_type=kind», дальше тип только
-считается; при закрытии, если отбросы были, — одна строка «gw event place=NN dropped=всего types=k1:n1,k2:n2,…»
-(типы по алфавиту, не больше STREAM_DROP_TYPES_MAX, дальше «,…»). В журнал — только тип и числа, содержимое
-события никуда не идёт.
+неразборчивым — первый раз за тип в потоке (не больше STREAM_DROP_TYPES_MAX разных типов — ключ и строка; сверх
+предела место не растит словарь и не флудит журнал, отброс уходит в общий счётчик «прочие», правка раунд 1) —
+строка «gw event place=NN dropped_type=kind», дальше тип только считается; при закрытии, если отбросы были, —
+одна строка «gw event place=NN dropped=всего types=k1:n1,k2:n2,…» (типы по алфавиту, «,…» — если были «прочие»).
+В журнал — только тип и числа, содержимое события никуда не идёт.
 """
 from __future__ import annotations
 
@@ -154,7 +155,10 @@ _WARN_ENDS = (*_BROKEN, "store")            # концы потока со ст�
 # (например session.diff) — filter_sse зовёт on_drop(kind) типом, не содержимым; kind — сам тип по этому шаблону,
 # иначе "unreadable" (не JSON, не строка, пустой и т.п.)
 _DROP_KIND = re.compile(r"[a-z][a-z0-9._-]{0,63}")
-STREAM_DROP_TYPES_MAX = 8                   # итоговая строка при закрытии: не больше стольких типов, дальше ",…"
+# не больше стольких разных типов отброса — свой ключ и строка dropped_type= за поток (правка раунд 1, критик
+# 13.10): без предела место, слающее много разных type, растило бы словарь без конца и флудило бы журнал строкой
+# на каждый новый тип; сверх предела — счётчик "прочие" без ключа, итоговая строка — с ",…"
+STREAM_DROP_TYPES_MAX = 8
 
 PROXY_MESSAGES = {
     "not_whitelisted": RULE_MESSAGES["not_whitelisted"],        # тот же объект, что у правил Б2
@@ -572,14 +576,22 @@ class _EventStream:
         self._store_failures = 0
         self._started = time.monotonic()
         self._ends_at = self._started + STREAM_MAX_S    # предел жизни потока (L2)
-        self._dropped: dict[str, int] = {}          # Task 1b: тип отброса → счёт за весь поток, по первому — строка
+        self._dropped: dict[str, int] = {}          # Task 1b: тип отброса → счёт, не больше STREAM_DROP_TYPES_MAX ключей
+        self._dropped_other = 0                     # правка раунд 1: отбросы сверх предела — без своего ключа и строки
 
     def _on_drop(self, kind: str) -> None:
-        """on_drop для filter_sse (Task 1b, Д15а, случай 13.10): первый раз за тип в этом потоке — строка журнала,
-        дальше тип только считается; итог — одной строкой в release()."""
-        if kind not in self._dropped:
+        """on_drop для filter_sse (Task 1b, Д15а, случай 13.10): первый раз за тип в этом потоке — строка журнала и
+        свой ключ, но не больше STREAM_DROP_TYPES_MAX разных ключей (правка раунд 1, критик 13.10): без предела
+        сломанное или умышленно шумящее место за STREAM_MAX_S слало бы сколько угодно разных type — словарь рос бы
+        без конца, и каждый новый тип — отдельная строка в журнал (флуд). Сверх предела — только общий счётчик
+        «прочие», ни своего ключа, ни строки; итог, включая «прочие», — одной строкой в release()."""
+        if kind in self._dropped:
+            self._dropped[kind] += 1
+        elif len(self._dropped) < STREAM_DROP_TYPES_MAX:
+            self._dropped[kind] = 1
             log.info("gw event place=%02d dropped_type=%s", self.n, kind)
-        self._dropped[kind] = self._dropped.get(kind, 0) + 1
+        else:
+            self._dropped_other += 1
 
     async def _read(self) -> None:
         """Читатель: события filter_sse — в очередь, в конце — метка _End. Исключения места — только классом (Ш11)."""
@@ -675,12 +687,12 @@ class _EventStream:
             if reader is not None:
                 with anyio.move_on_after(STREAM_CLOSE_S, shield=True):
                     await asyncio.gather(reader, return_exceptions=True)
-            if self._dropped:                       # Task 1b: отбросы были — одна итоговая строка, типы по алфавиту
-                kinds = sorted(self._dropped)
-                types = ",".join(f"{k}:{self._dropped[k]}" for k in kinds[:STREAM_DROP_TYPES_MAX])
-                if len(kinds) > STREAM_DROP_TYPES_MAX:
+            if self._dropped or self._dropped_other:    # Task 1b: отбросы были — одна итоговая строка, типы по алфавиту
+                types = ",".join(f"{k}:{self._dropped[k]}" for k in sorted(self._dropped))
+                if self._dropped_other:                 # правка раунд 1: «прочие» сверх предела — в total, без ключа
                     types += ",…"
-                log.info("gw event place=%02d dropped=%d types=%s", self.n, sum(self._dropped.values()), types)
+                log.info("gw event place=%02d dropped=%d types=%s", self.n,
+                         sum(self._dropped.values()) + self._dropped_other, types)
             with anyio.move_on_after(STREAM_CLOSE_S, shield=True):     # своим сроком: читатель закрытие не съест
                 try:
                     await self._opened.__aexit__(None, None, None)
