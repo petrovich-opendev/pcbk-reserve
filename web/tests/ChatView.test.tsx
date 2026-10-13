@@ -480,6 +480,61 @@ test("chat_refreshes_once_when_turn_goes_quiet", async () => {
   expect(reloads()).toBe(before + 1);                                        // без нового прироста — больше ни одного
 });
 
+// ответ ассистента завершён (finish: "stop" — как в случае 13.10, место закончило ход), а поток всё ещё шлёт
+// session.status busy (та самая гонка, которую чинит задача) — и его «мигающий» вариант: та же часть с ответом
+// плюс лишняя пустая структурная часть (step-finish без текста) — отпечаток (id|len|mark) расходится, хотя ответ
+// студенту тот же самый. Ruling 13, раунд 1 критиков: именно так перечитывание может «соврать» про прирост
+const SILENT_USER = { info: { id: "msg_u1", sessionID: SES, role: "user", time: { created: 1 } },
+  parts: [{ id: "prt_u1", sessionID: SES, messageID: "msg_u1", type: "text", text: "вопрос" }] };
+const silentAssistant = (flicker: boolean) => ({
+  info: { id: "msg_a1", sessionID: SES, role: "assistant", time: { created: 2, completed: 3 }, parentID: "msg_u1", modelID: "m",
+          providerID: "openrouter", mode: "pomoshnik", agent: "pomoshnik", path: { cwd: "/work", root: "/work" },
+          cost: 0, tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, finish: "stop" },
+  parts: flicker
+    ? [{ id: "prt_a1", sessionID: SES, messageID: "msg_a1", type: "text", text: "Да, вот ответ" },
+       { id: "prt_a2", sessionID: SES, messageID: "msg_a1", type: "step-finish", reason: "stop" }]
+    : [{ id: "prt_a1", sessionID: SES, messageID: "msg_a1", type: "text", text: "Да, вот ответ" }],
+});
+
+test("chat_turn_silent_survives_quiet_refresh_fingerprint_flicker", async () => {
+  // Ruling 13: ответ был настоящий, модель замолчала насовсем, а единственное перечитывание (QUIET_REFRESH_S)
+  // «мигнуло» отпечатком (лишняя пустая часть в том же ответе) — сторож без предела принял бы это за прирост и
+  // откладывал turn_silent циклом. С пределом «не больше раза за ход» второго перечитывания не будет, и отчёт
+  // придёт не позже TURN_SILENT_S + QUIET_REFRESH_S после настоящего прироста (разовая задержка от одного мигания)
+  const c = chatClock();
+  let loads = 0;
+  const calls = stubOpenSession((_method, path) => {
+    if (path === "/pcbk/api/oc/event") return eventStream([
+      { type: "server.connected", properties: {} },
+      { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } },
+    ]);
+    if (path === `/pcbk/api/oc/session/${SES}/message`) {
+      loads += 1;
+      return ocJson(200, [SILENT_USER, silentAssistant(loads > 1)]);   // первая загрузка — без миганья, дальше — с ним
+    }
+    return undefined;
+  });
+  const onReport = vi.fn();
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} onReport={onReport} />);
+  await screen.findByText("Да, вот ответ");                                  // настоящий прирост получен
+  const reloads = () => calls.filter((call) => call.path === `/pcbk/api/oc/session/${SES}/message`).length;
+  const before = reloads();
+  c.pass(QUIET_REFRESH_S * 1000 - 1_000);
+  expect(reloads()).toBe(before);
+  c.pass(1_000);                                                             // 30 с тишины — onQuiet, перечитывание
+  await waitFor(() => expect(reloads()).toBe(before + 1));
+  c.pass(TURN_SILENT_S * 1000 - 1_000);
+  await sleep(50);
+  expect(onReport).not.toHaveBeenCalled();                                   // ещё не 180 с от мигнувшего перечитывания
+  c.pass(1_000);
+  await sleep(50);
+  expect(onReport.mock.calls).toEqual([["turn_silent"]]);                    // ровно один, в пределах 180 + 30 с
+  c.pass(QUIET_REFRESH_S * 1000 * 3);                                        // и дальше — не больше раза за ход
+  await sleep(50);
+  expect(reloads()).toBe(before + 1);
+  expect(onReport).toHaveBeenCalledTimes(1);
+}, 15_000);
+
 test.each([
   ["", false],
   ["_interval_ticks", true],

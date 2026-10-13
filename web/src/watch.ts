@@ -5,8 +5,12 @@
 //   Отчёт — один на ход.
 // - Тихое перечитывание (onQuiet, случай 13.10 — место закончило ход, поток был жив, а страница не заметила конец
 //   ответа и отчиталась только через 3 минуты): на том же since, что у отсчёта хода, после QUIET_REFRESH_S без
-//   прироста Chat тихо зовёт refresh() адаптера — один раз на отрезок тишины. Прирост, начало нового хода и конец
-//   хода разрешают следующий onQuiet; пауза (поток не "ok") и конец хода — как у turn_silent — onQuiet не зовут.
+//   прироста Chat тихо зовёт refresh() адаптера. Не больше одного раза за ход (Ruling 13, раунд 1 критиков):
+//   refresh() пересобирает историю из снимка места, и расхождение отпечатка после перечитывания (например, лишняя
+//   пустая часть) сторож, как и любой прирост, не отличает от настоящего ответа — без предела перечитывания шли бы
+//   циклом и откладывали turn_silent без предела. Поэтому прирост (настоящий или мнимый от самого refresh) и разрыв
+//   тиков onQuiet больше не разрешают — только новый ход (started); так самообман от refresh сдвигает turn_silent
+//   не больше чем на один QUIET_REFRESH_S. Пауза (поток не "ok") и конец хода — как у turn_silent — onQuiet не зовут.
 // - Сон машины (preflight Н15; итоговая доводка Д6б, m4 и поправка контролёра): между тиками больше TICK_GAP_S —
 //   ноутбук спал или браузер троттлил фоновую вкладку (до раза в минуту); отличить одно от другого по таймерам нельзя.
 //   Пока машина спала, поток стоял: ход мог кончиться, а ответ — прийти. Поэтому при любой видимости вкладки отсчёт
@@ -52,7 +56,7 @@ export function createTurnWatch(o: {
   now(): number;
   onSilent(): void;
   silentS?: number;
-  onQuiet?(): void;                       // тишина QUIET_REFRESH_S — тихо перечитать разговор (Task 2c)
+  onQuiet?(): void;                       // тишина QUIET_REFRESH_S — тихо перечитать разговор, не больше раза за ход (Ruling 13)
   quietS?: number;
 }): TurnWatch {
   const silentMs = (o.silentS ?? TURN_SILENT_S) * 1000;
@@ -62,7 +66,7 @@ export function createTurnWatch(o: {
   let since = 0;                          // начало хода, последний прирост ответа или пробуждение после разрыва тиков
   let fingerprint: string | null = null;
   let reported = false;
-  let quieted = false;                    // onQuiet уже дан за этот отрезок тишины (сбрасывается прогрессом/разрывом)
+  let quieted = false;                    // onQuiet уже дан в этом ходе (Ruling 13) — сбрасывает только started()
   let lastTick = 0;
   let pausedAt: number | null = null;     // начало паузы (поток не "ok")
 
@@ -78,8 +82,7 @@ export function createTurnWatch(o: {
     progress(next) {
       if (!running || next === fingerprint) return;          // тот же отпечаток — не прогресс
       fingerprint = next;
-      since = o.now();
-      quieted = false;                                        // новый отрезок тишины — onQuiet снова можно
+      since = o.now();                                        // quieted не трогаем (Ruling 13): прирост onQuiet не разрешает
     },
     pause() {
       pausedAt ??= o.now();
@@ -98,7 +101,7 @@ export function createTurnWatch(o: {
     tick() {
       if (!running) return;
       const t = o.now();
-      if (t - lastTick > gapMs) { since = t; quieted = false; }   // разрыв: сон или троттлинг — отсчёт заново
+      if (t - lastTick > gapMs) since = t;                      // разрыв: сон или троттлинг — отсчёт заново (quieted — нет)
       lastTick = t;
       if (pausedAt === null && !quieted && t - since >= quietMs) {
         quieted = true;
@@ -186,7 +189,7 @@ export function turnFingerprint(messages: readonly ThreadMessage[]): string {
 // хода).
 export function useTurnWatch(runtime: AssistantRuntime, o: {
   onSilent(): void;
-  onQuiet?(): void;                       // тишина QUIET_REFRESH_S — тихо перечитать разговор (Task 2c)
+  onQuiet?(): void;                       // тишина QUIET_REFRESH_S — тихо перечитать разговор, не больше раза за ход (Ruling 13)
   now?(): number;
   tickMs?: number;
   streamOk?: boolean;                     // поток "ok" (по умолчанию да); нет — отсчёт на паузе (m4)

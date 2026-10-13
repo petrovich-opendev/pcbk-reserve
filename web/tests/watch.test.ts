@@ -90,24 +90,19 @@ test("turn_watch_restarts_per_turn", () => {
   w.progress("a1|1|text:5"); c.ticksTo(w, 1_999_000); expect(onSilent).toHaveBeenCalledTimes(2);   // прирост вне хода — не начало
 });
 
-// --- тихое перечитывание (onQuiet, Task 2c, случай 13.10): тот же since, что у отчёта, свой флаг на отрезок тишины ---
+// --- тихое перечитывание (onQuiet, Task 2c, случай 13.10): не больше раза за ход (Ruling 13, раунд 1 критиков) ---
 
 test("quiet_fires_once_after_30s", () => {
+  // «один раз за ход», не «на отрезок тишины»: прирост (настоящий или мнимый от самого refresh) второго вызова
+  // не разрешает — иначе мигающий отпечаток после перечитывания гонял бы refresh по кругу без предела
   expect(QUIET_REFRESH_S).toBe(30);
   const c = clock(); const onSilent = vi.fn(); const onQuiet = vi.fn();
   const w = createTurnWatch({ now: c.now, onSilent, onQuiet });
   w.started(); c.ticksTo(w, 29_000); expect(onQuiet).not.toHaveBeenCalled();
   c.ticksTo(w, 30_000); expect(onQuiet).toHaveBeenCalledTimes(1);
-  c.ticksTo(w, 90_000); expect(onQuiet).toHaveBeenCalledTimes(1);           // ещё 60 с — больше ни одного
-});
-
-test("quiet_rearmed_by_progress", () => {
-  const c = clock(); const onSilent = vi.fn(); const onQuiet = vi.fn();
-  const w = createTurnWatch({ now: c.now, onSilent, onQuiet });
-  w.started(); c.ticksTo(w, 30_000); expect(onQuiet).toHaveBeenCalledTimes(1);
   w.progress("tool:pcbk_tag_now:running");
-  c.ticksTo(w, 59_000); expect(onQuiet).toHaveBeenCalledTimes(1);
-  c.ticksTo(w, 60_000); expect(onQuiet).toHaveBeenCalledTimes(2);           // прирост — новый отрезок тишины
+  c.ticksTo(w, 60_000); expect(onQuiet).toHaveBeenCalledTimes(1);          // прирост — второго вызова всё равно нет
+  w.ended(); w.started(); c.ticksTo(w, 90_000); expect(onQuiet).toHaveBeenCalledTimes(2);   // новый ход — снова один
 });
 
 test("quiet_not_on_pause", () => {
