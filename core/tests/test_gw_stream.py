@@ -61,6 +61,36 @@ async def test_filter_sse_crlf_and_oversize():
         await collect([b"data: " + b"x" * (SSE_MAX_EVENT_BYTES + 1)])
 
 
+async def test_filter_sse_on_drop_kinds():                                              # Task 1b: Д15а, случай 13.10
+    stream = EV("session.diff", patch="x") + EV("todo.updated", done=1) + b"data: {not json}\n\n" + \
+             EV("server.connected")
+    drops = []
+    out = [e async for e in filter_sse(aiter_of([stream]), drops.append)]
+    assert [json.loads(e[6:])["type"] for e in out] == ["server.connected"]              # разрешённое дошло
+    assert drops == ["session.diff", "todo.updated", "unreadable"]                       # тип, тип, неразборчивое
+    assert "x" not in "".join(drops)                                                     # содержимого в аргументах нет
+
+
+async def test_filter_sse_without_on_drop_unchanged():                                  # Task 1b: прежнее поведение
+    stream = EV("session.diff") + EV("server.connected")
+    out = await collect([stream])                                                       # collect() не зовёт on_drop
+    assert [json.loads(e[6:])["type"] for e in out] == ["server.connected"]
+
+
+def test_stream_logs_dropped_types(tmp_path, gwlog):                                    # Task 1b: Д15а, случай 13.10
+    app, role = make_gateway(tmp_path, ready=(3,))
+    role.fake_places.events[3] = [EV("session.diff"), EV("todo.updated"), EV("session.diff"), EV("server.connected")]
+    with TestClient(app, base_url=BASE) as c:
+        login(c, "stu-03")
+        with c.stream("GET", "/pcbk/api/oc/event") as r:
+            body = b"".join(r.iter_bytes())
+    assert body.count(b"data: ") == 1                                                   # браузеру — только разрешённое
+    text = gwlog.text
+    assert text.count("dropped_type=session.diff") == 1                                 # повтор типа — не вторая строка
+    assert text.count("dropped_type=todo.updated") == 1
+    assert "gw event place=03 dropped=3 types=session.diff:2,todo.updated:1" in text     # итог при закрытии, по алфавиту
+
+
 def test_stream_ends_with_place_and_is_not_activity(tmp_path):                          # Review Focus 4
     app, role = make_gateway(tmp_path, ready=(3,))
     role.fake_places.events[3] = [EV("server.connected"), EV("session.status"), EV("server.instance.disposed")]

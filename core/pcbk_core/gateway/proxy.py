@@ -74,12 +74,19 @@ timeout, oversize, store и у обрыва места с классом иск�
 потоки и дожидается закрытия (_EventStream.shutdown) — всех вместе не дольше STREAM_SHUTDOWN_S (Б4-m2). В реестр
 потоков роли ответ попадает, только когда принял владение (Б4-m3). Поток место не будит и простой не продлевает (touch не
 зовётся, Д5-R35).
+
+Отбросы по типу (Task 1b, Д15а, случай 13.10): filter_sse зовёт on_drop типом события, не из ALLOWED_EVENTS или
+неразборчивым — первый раз за тип в потоке — строка «gw event place=NN dropped_type=kind», дальше тип только
+считается; при закрытии, если отбросы были, — одна строка «gw event place=NN dropped=всего types=k1:n1,k2:n2,…»
+(типы по алфавиту, не больше STREAM_DROP_TYPES_MAX, дальше «,…»). В журнал — только тип и числа, содержимое
+события никуда не идёт.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 import time
 import weakref
 from collections import deque
@@ -143,6 +150,11 @@ STREAM_STORE_FAILURES = 3                   # сбоев базы подряд �
 STREAM_MAX_S = 1800.0                       # предел жизни потока (closed_by=lifetime); читается при открытии потока
 _BROKEN = ("timeout", "oversize")           # концы потока, которые считаются stream_broken
 _WARN_ENDS = (*_BROKEN, "store")            # концы потока со строкой WARNING
+# журнал отброшенных типов события места (Task 1b, Д15а, случай 13.10): OpenCode шлёт и типы вне ALLOWED_EVENTS
+# (например session.diff) — filter_sse зовёт on_drop(kind) типом, не содержимым; kind — сам тип по этому шаблону,
+# иначе "unreadable" (не JSON, не строка, пустой и т.п.)
+_DROP_KIND = re.compile(r"[a-z][a-z0-9._-]{0,63}")
+STREAM_DROP_TYPES_MAX = 8                   # итоговая строка при закрытии: не больше стольких типов, дальше ",…"
 
 PROXY_MESSAGES = {
     "not_whitelisted": RULE_MESSAGES["not_whitelisted"],        # тот же объект, что у правил Б2
@@ -467,8 +479,13 @@ def _event_type(lines: list[bytes]) -> str | None:
     return kind if isinstance(kind, str) else None
 
 
-async def filter_sse(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+async def filter_sse(chunks: AsyncIterator[bytes], on_drop: Callable[[str], None] | None = None) -> AsyncIterator[bytes]:
     """События потока места, чей type — из ALLOWED_EVENTS (Д5-R35), кадром из одних строк data: и пустой строки \\n\\n.
+
+    on_drop (Task 1b, Д15а, случай 13.10): для каждого события, отброшенного по типу (не из ALLOWED_EVENTS или
+    неразборчивого — не JSON, не объект, type не строка), один вызов on_drop(kind): kind — сам тип, если он по
+    _DROP_KIND, иначе "unreadable"; содержимое события в вызов не идёт. Слишком большое и неоконченное к концу
+    потока событие — не отброс по типу, on_drop не зовётся.
 
     Концы строк — как у SDK OpenCode (serverSentEvents.gen.ts v2, :155, доводка Б4 K2): \\r\\n и одиночный \\r
     приводятся к \\n до поиска конца события — \\r в конце куска ждёт следующего (половина \\r\\n не считается
@@ -506,8 +523,11 @@ async def filter_sse(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
                 break
             event = bytes(buf[start:end + 2])
             start = end + 2
-            if _event_type(event.split(b"\n")[:-2]) in ALLOWED_EVENTS:
+            kind = _event_type(event.split(b"\n")[:-2])
+            if kind in ALLOWED_EVENTS:
                 ready.append(event)
+            elif on_drop is not None:                # Task 1b: тип не из списка или неразборчив — в журнал по типу
+                on_drop(kind if kind is not None and _DROP_KIND.fullmatch(kind) else "unreadable")
             event = b""                             # отброшенное событие не держится до yield
         if too_large or start == len(buf):
             buf = bytearray()                       # буфер разобран (или брошен): копившееся место не держится
@@ -552,13 +572,21 @@ class _EventStream:
         self._store_failures = 0
         self._started = time.monotonic()
         self._ends_at = self._started + STREAM_MAX_S    # предел жизни потока (L2)
+        self._dropped: dict[str, int] = {}          # Task 1b: тип отброса → счёт за весь поток, по первому — строка
+
+    def _on_drop(self, kind: str) -> None:
+        """on_drop для filter_sse (Task 1b, Д15а, случай 13.10): первый раз за тип в этом потоке — строка журнала,
+        дальше тип только считается; итог — одной строкой в release()."""
+        if kind not in self._dropped:
+            log.info("gw event place=%02d dropped_type=%s", self.n, kind)
+        self._dropped[kind] = self._dropped.get(kind, 0) + 1
 
     async def _read(self) -> None:
         """Читатель: события filter_sse — в очередь, в конце — метка _End. Исключения места — только классом (Ш11)."""
         end = _End("place")
         raw = self._response.aiter_raw()
         timed = _timed(raw)
-        events = filter_sse(timed)
+        events = filter_sse(timed, self._on_drop)
         try:
             async for event in events:
                 await self._queue.put(event)
@@ -647,6 +675,12 @@ class _EventStream:
             if reader is not None:
                 with anyio.move_on_after(STREAM_CLOSE_S, shield=True):
                     await asyncio.gather(reader, return_exceptions=True)
+            if self._dropped:                       # Task 1b: отбросы были — одна итоговая строка, типы по алфавиту
+                kinds = sorted(self._dropped)
+                types = ",".join(f"{k}:{self._dropped[k]}" for k in kinds[:STREAM_DROP_TYPES_MAX])
+                if len(kinds) > STREAM_DROP_TYPES_MAX:
+                    types += ",…"
+                log.info("gw event place=%02d dropped=%d types=%s", self.n, sum(self._dropped.values()), types)
             with anyio.move_on_after(STREAM_CLOSE_S, shield=True):     # своим сроком: читатель закрытие не съест
                 try:
                     await self._opened.__aexit__(None, None, None)
