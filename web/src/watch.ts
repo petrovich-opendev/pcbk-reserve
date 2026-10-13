@@ -3,6 +3,10 @@
 //   вкладка троттлит таймеры, и тики лишь проверяют часы (раз в секунду и на visibilitychange). Любой прирост
 //   последнего ответа ассистента (текст, рассуждение, вызов инструмента) отсчёт сбрасывает, конец хода снимает.
 //   Отчёт — один на ход.
+// - Тихое перечитывание (onQuiet, случай 13.10 — место закончило ход, поток был жив, а страница не заметила конец
+//   ответа и отчиталась только через 3 минуты): на том же since, что у отсчёта хода, после QUIET_REFRESH_S без
+//   прироста Chat тихо зовёт refresh() адаптера — один раз на отрезок тишины. Прирост, начало нового хода и конец
+//   хода разрешают следующий onQuiet; пауза (поток не "ok") и конец хода — как у turn_silent — onQuiet не зовут.
 // - Сон машины (preflight Н15; итоговая доводка Д6б, m4 и поправка контролёра): между тиками больше TICK_GAP_S —
 //   ноутбук спал или браузер троттлил фоновую вкладку (до раза в минуту); отличить одно от другого по таймерам нельзя.
 //   Пока машина спала, поток стоял: ход мог кончиться, а ответ — прийти. Поэтому при любой видимости вкладки отсчёт
@@ -30,6 +34,7 @@ import { useEffect, useRef, useState } from "react";
 import type { StreamState } from "./gateway";
 
 export const TURN_SILENT_S = 180;         // «Ответа нет уже 3 минуты»
+export const QUIET_REFRESH_S = 30;        // тишина хода короче отчёта — тихо перечитать разговор (случай 13.10)
 export const STREAM_DOWN_S = 120;
 export const TICK_GAP_S = 30;             // разрыв тиков длиннее — машина могла спать (Н15) или вкладку троттлили
 export const TICK_MS = 1000;
@@ -47,13 +52,17 @@ export function createTurnWatch(o: {
   now(): number;
   onSilent(): void;
   silentS?: number;
+  onQuiet?(): void;                       // тишина QUIET_REFRESH_S — тихо перечитать разговор (Task 2c)
+  quietS?: number;
 }): TurnWatch {
   const silentMs = (o.silentS ?? TURN_SILENT_S) * 1000;
+  const quietMs = (o.quietS ?? QUIET_REFRESH_S) * 1000;
   const gapMs = TICK_GAP_S * 1000;
   let running = false;
   let since = 0;                          // начало хода, последний прирост ответа или пробуждение после разрыва тиков
   let fingerprint: string | null = null;
   let reported = false;
+  let quieted = false;                    // onQuiet уже дан за этот отрезок тишины (сбрасывается прогрессом/разрывом)
   let lastTick = 0;
   let pausedAt: number | null = null;     // начало паузы (поток не "ok")
 
@@ -61,6 +70,7 @@ export function createTurnWatch(o: {
     started() {
       running = true;
       reported = false;
+      quieted = false;
       fingerprint = null;
       since = o.now();
       lastTick = since;
@@ -69,6 +79,7 @@ export function createTurnWatch(o: {
       if (!running || next === fingerprint) return;          // тот же отпечаток — не прогресс
       fingerprint = next;
       since = o.now();
+      quieted = false;                                        // новый отрезок тишины — onQuiet снова можно
     },
     pause() {
       pausedAt ??= o.now();
@@ -82,12 +93,17 @@ export function createTurnWatch(o: {
     ended() {
       running = false;
       fingerprint = null;
+      quieted = false;
     },
     tick() {
       if (!running) return;
       const t = o.now();
-      if (t - lastTick > gapMs) since = t;                    // разрыв: сон или троттлинг — отсчёт заново
+      if (t - lastTick > gapMs) { since = t; quieted = false; }   // разрыв: сон или троттлинг — отсчёт заново
       lastTick = t;
+      if (pausedAt === null && !quieted && t - since >= quietMs) {
+        quieted = true;
+        o.onQuiet?.();
+      }
       if (pausedAt !== null || reported || t - since < silentMs) return;
       reported = true;
       o.onSilent();
@@ -170,6 +186,7 @@ export function turnFingerprint(messages: readonly ThreadMessage[]): string {
 // хода).
 export function useTurnWatch(runtime: AssistantRuntime, o: {
   onSilent(): void;
+  onQuiet?(): void;                       // тишина QUIET_REFRESH_S — тихо перечитать разговор (Task 2c)
   now?(): number;
   tickMs?: number;
   streamOk?: boolean;                     // поток "ok" (по умолчанию да); нет — отсчёт на паузе (m4)
@@ -187,6 +204,7 @@ export function useTurnWatch(runtime: AssistantRuntime, o: {
         setSilent(true);
         opts.current.onSilent();
       },
+      onQuiet: () => opts.current.onQuiet?.(),
     });
     if (opts.current.streamOk === false) watch.pause();
     current.current = watch;

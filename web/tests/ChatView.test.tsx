@@ -8,7 +8,7 @@ import { Chat } from "../src/components/Chat";
 import { ChatView } from "../src/components/ChatView";
 import { PendingInteractions } from "../src/components/PendingInteractions";
 import { MAX_TEXT, T_TOO_MANY_TABS, T_TURN_SILENT } from "../src/texts";
-import { STREAM_DOWN_S, TURN_SILENT_S } from "../src/watch";
+import { QUIET_REFRESH_S, STREAM_DOWN_S, TURN_SILENT_S } from "../src/watch";
 
 // адаптер OpenCode — настоящий; useOpenCodeRuntime лишь отдаёт тесту рантайм чата (итоговая доводка Д6б, Б3-m1)
 const seen = vi.hoisted(() => ({ runtime: null as unknown }));
@@ -457,6 +457,27 @@ test("chat_reports_turn_silent_once", async () => {
   c.pass(400_000);
   await sleep(1_200);                                                         // и настоящий тик
   expect(onReport).toHaveBeenCalledTimes(1);                                  // один на ход
+});
+
+test("chat_refreshes_once_when_turn_goes_quiet", async () => {
+  // Task 2c, случай 13.10: ход молчит QUIET_REFRESH_S (короче отчёта) — страница тихо перечитывает разговор
+  // (refresh адаптера = GET session + GET message), не дожидаясь turn_silent
+  const c = chatClock();
+  const calls = stubOpenSession((_method, path) => path === "/pcbk/api/oc/event" ? eventStream([
+    { type: "server.connected", properties: {} },
+    { type: "session.status", properties: { sessionID: SES, status: { type: "busy" } } },
+  ]) : undefined);
+  render(<Chat onHalt={vi.fn()} initialSessionId={SES} />);
+  await screen.findByRole("button", { name: "Стоп" });                        // ход идёт
+  const reloads = () => calls.filter((call) => call.path === `/pcbk/api/oc/session/${SES}/message`).length;
+  const before = reloads();
+  c.pass(QUIET_REFRESH_S * 1000 - 1_000);
+  expect(reloads()).toBe(before);
+  c.pass(1_000);                                                              // полный срок тишины
+  await waitFor(() => expect(reloads()).toBe(before + 1));
+  c.pass(QUIET_REFRESH_S * 1000);
+  await sleep(100);
+  expect(reloads()).toBe(before + 1);                                        // без нового прироста — больше ни одного
 });
 
 test.each([

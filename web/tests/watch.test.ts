@@ -7,7 +7,8 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { StreamState } from "../src/gateway";
 import { T_TURN_SILENT } from "../src/texts";
 import {
-  STREAM_DOWN_S, TICK_GAP_S, TURN_SILENT_S, createStreamWatch, createTurnWatch, turnFingerprint, useTurnWatch,
+  QUIET_REFRESH_S, STREAM_DOWN_S, TICK_GAP_S, TURN_SILENT_S, createStreamWatch, createTurnWatch, turnFingerprint,
+  useTurnWatch,
 } from "../src/watch";
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -87,6 +88,47 @@ test("turn_watch_restarts_per_turn", () => {
   w.ended(); w.started(); c.ticksTo(w, 500_000); w.ended(); c.ticksTo(w, 999_000);
   expect(onSilent).toHaveBeenCalledTimes(2);                                             // ход кончился до срока — отчёта нет
   w.progress("a1|1|text:5"); c.ticksTo(w, 1_999_000); expect(onSilent).toHaveBeenCalledTimes(2);   // прирост вне хода — не начало
+});
+
+// --- тихое перечитывание (onQuiet, Task 2c, случай 13.10): тот же since, что у отчёта, свой флаг на отрезок тишины ---
+
+test("quiet_fires_once_after_30s", () => {
+  expect(QUIET_REFRESH_S).toBe(30);
+  const c = clock(); const onSilent = vi.fn(); const onQuiet = vi.fn();
+  const w = createTurnWatch({ now: c.now, onSilent, onQuiet });
+  w.started(); c.ticksTo(w, 29_000); expect(onQuiet).not.toHaveBeenCalled();
+  c.ticksTo(w, 30_000); expect(onQuiet).toHaveBeenCalledTimes(1);
+  c.ticksTo(w, 90_000); expect(onQuiet).toHaveBeenCalledTimes(1);           // ещё 60 с — больше ни одного
+});
+
+test("quiet_rearmed_by_progress", () => {
+  const c = clock(); const onSilent = vi.fn(); const onQuiet = vi.fn();
+  const w = createTurnWatch({ now: c.now, onSilent, onQuiet });
+  w.started(); c.ticksTo(w, 30_000); expect(onQuiet).toHaveBeenCalledTimes(1);
+  w.progress("tool:pcbk_tag_now:running");
+  c.ticksTo(w, 59_000); expect(onQuiet).toHaveBeenCalledTimes(1);
+  c.ticksTo(w, 60_000); expect(onQuiet).toHaveBeenCalledTimes(2);           // прирост — новый отрезок тишины
+});
+
+test("quiet_not_on_pause", () => {
+  const c = clock(); const onSilent = vi.fn(); const onQuiet = vi.fn();
+  const w = createTurnWatch({ now: c.now, onSilent, onQuiet });
+  w.started(); w.pause(); c.ticksTo(w, 40_000); expect(onQuiet).not.toHaveBeenCalled();   // лежит связь — не модель молчит
+});
+
+test("quiet_not_after_end", () => {
+  const c = clock(); const onSilent = vi.fn(); const onQuiet = vi.fn();
+  const w = createTurnWatch({ now: c.now, onSilent, onQuiet });
+  w.started(); w.ended(); c.ticksTo(w, 40_000); expect(onQuiet).not.toHaveBeenCalled();   // хода нет — нечего сторожить
+});
+
+test("silent_unchanged", () => {
+  // onQuiet сработал по пути (QUIET_REFRESH_S короче TURN_SILENT_S) — срок и число отчётов onSilent это не меняет
+  const c = clock(); const onSilent = vi.fn(); const onQuiet = vi.fn();
+  const w = createTurnWatch({ now: c.now, onSilent, onQuiet });
+  w.started(); c.ticksTo(w, 179_000); expect(onSilent).not.toHaveBeenCalled();
+  c.ticksTo(w, 181_000); w.tick(); expect(onSilent).toHaveBeenCalledTimes(1);
+  expect(onQuiet.mock.calls.length).toBeGreaterThan(0);
 });
 
 test("stream_watch_reports_on_recovery_only", () => {

@@ -86,6 +86,15 @@ function RuntimePending(p: { onError(error: unknown): void }) {
   return <PendingWithReject permissions={pending} questions={questions} reply={reply} onError={p.onError} />;
 }
 
+// refresh() адаптера наружу — сторож тишины (onQuiet, watch.ts) зовёт его из useTurnWatch, вне провайдера рантайма
+// (Task 2c, случай 13.10): кладём в ref на каждую перерисовку, как Chat кладёт props.current, — тишина перечитывает
+// то, что видно в этот момент. Внутри провайдера, ничего не рисует (как ThreadAgentWatch)
+function RuntimeRefresh(p: { refreshRef: { current(): Promise<void> } }) {
+  const { refresh } = useOpenCodeRuntimeExtras();
+  p.refreshRef.current = refresh;
+  return null;
+}
+
 function PendingWithReject(p: {
   permissions: OpenCodePermissionRequest[];
   questions: OpenCodeQuestionRequest[];
@@ -115,6 +124,7 @@ export function Chat(p: ChatProps) {
   const [agents, setAgents] = useState<AgentsView>({ items: undefined, known: [] });
   const [newAgent, setNewAgent] = useState(DEFAULT_AGENT);            // агент нового разговора — выбор в панели
   const [seen, setSeen] = useState<ThreadAgentSeen>({ state: "none" });   // агент открытого разговора
+  const [running, setRunning] = useState(false);   // ход открытого разговора идёт (эффект ниже синхронизирует сразу)
   const picked = useRef(false);            // студент выбрал агента — прежний разговор поверх выбора не открывается (m15)
   const [awaitingOpen, setAwaitingOpen] =   // решение по прежнему разговору ещё не принято (m1 доводки р1)
     useState(() => p.loadAgents !== undefined && p.initialSessionId !== undefined);
@@ -254,14 +264,17 @@ export function Chat(p: ChatProps) {
     };
   }, [runtime, onError]);
 
-  // новый ход пошёл — ошибка прошлого действия больше не нужна; ход кончился — список агентов через 1 с (R65)
+  // новый ход пошёл — ошибка прошлого действия больше не нужна; ход кончился — список агентов через 1 с (R65); running —
+  // и для RuntimeRefresh (extras адаптера есть, только когда ход реально идёт, Task 2c)
   useEffect(() => {
-    let running = runtime.thread.getState().isRunning;
+    let was = runtime.thread.getState().isRunning;
+    setRunning(was);
     return runtime.thread.subscribe(() => {
       const now = runtime.thread.getState().isRunning;
-      if (now && !running) setError("");
-      if (!now && running && !halted.current) poll.current?.turnEnded();
-      running = now;
+      if (now && !was) setError("");
+      if (!now && was && !halted.current) poll.current?.turnEnded();
+      was = now;
+      setRunning(now);
     });
   }, [runtime]);
 
@@ -294,8 +307,19 @@ export function Chat(p: ChatProps) {
     runtime.threads.switchToNewThread().catch(onError);
   };
 
-  // ход без прироста ответа: строка над полем ввода и отчёт (Ф11 — начало хода по isRunning, не по onNew)
-  const silent = useTurnWatch(runtime, { onSilent: () => report("turn_silent"), streamOk });
+  // refresh адаптера для сторожа тишины: сам хук useOpenCodeRuntimeExtras — только внутри провайдера рантайма (как
+  // rejectQuestion у PendingWithReject); стабильная обёртка зовёт то, что в ref кладёт RuntimeRefresh (Task 2c)
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
+  const refresh = useRef((): Promise<void> => refreshRef.current()).current;
+
+  // ход без прироста ответа: строка над полем ввода и отчёт (Ф11 — начало хода по isRunning, не по onNew); тишина
+  // короче (QUIET_REFRESH_S) — тихо перечитать разговор с места, не дожидаясь отчёта (случай 13.10). После остановки
+  // (halted) место уже не ответит — перечитывать нет смысла, как и слать отчёт (report выше — та же проверка)
+  const silent = useTurnWatch(runtime, {
+    onSilent: () => report("turn_silent"),
+    onQuiet: () => { if (!halted.current) refresh().catch(onError); },
+    streamOk,
+  });
 
   // строка «Агент: …» и подсветка в панели — агент, которому уйдёт ход; пока он неизвестен — ни строки, ни подсветки
   const shown = locked ? undefined : agent;
@@ -304,6 +328,9 @@ export function Chat(p: ChatProps) {
     : agents.known.find((a) => a.name === shown)?.title ?? BUILTIN_AGENT_TITLES.get(shown) ?? shown;
   const threads = <ThreadSidebar runtime={runtime} onError={onError} />;
   const watch = <ThreadAgentWatch onAgent={onAgent} onError={onError} />;   // внутри провайдера, ничего не рисует
+  // extras адаптера (useOpenCodeRuntimeExtras без запасного значения) есть только при реальном ходе (Task 2c): вне
+  // хода компонент не монтируем — иначе бросит, пока у разговора ещё нет привязанного контроллера
+  const refreshBridge = running ? <RuntimeRefresh refreshRef={refreshRef} /> : null;
   return (
     <ChatView
       runtime={runtime}
@@ -316,8 +343,9 @@ export function Chat(p: ChatProps) {
           <AgentPanel items={agents.items} current={shown ?? ""} onPick={pick} />
           {threads}
           {watch}
+          {refreshBridge}
         </div>
-      ) : <>{threads}{watch}</>}
+      ) : <>{threads}{watch}{refreshBridge}</>}
       agentLine={withAgents && agents.items !== undefined && title !== undefined ? T_AGENT_LINE(title) : undefined}
     />
   );
