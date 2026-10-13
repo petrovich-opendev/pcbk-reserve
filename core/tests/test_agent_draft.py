@@ -191,7 +191,7 @@ def test_front_matter_rejects_foreign_line():                          # отр�
 def test_file_bytes_and_line_ends():
     text = render_agent_file(check_draft(OK, CAT.lookup)[0], {"20FAKE_001_PV": CAT.lookup("20FAKE_001_PV").info},
                              caller="student-03", created_at=AT)
-    assert text.endswith("ПЦБК». Отказ службы или «нет данных» — сообщай как есть, число не подставляй.\n")
+    assert text.endswith("короткий ответ из одной-двух фраз — обычным текстом.\n")
     assert "\r" not in text and not text.startswith("\ufeff") and not text.endswith("\n\n")
 
 
@@ -407,7 +407,7 @@ def test_render_includes_name_line_right_after_title():
     title_i = next(i for i, l in enumerate(lines) if l.startswith("Ты — агент «"))
     assert lines[title_i + 1] == NAME_LINE.format(name="sushka-bdm2") == (
         "Твоё имя в системе: `sushka-bdm2` (его передавай в pcbk_report_event как agent).")
-    assert f"шаблон {TEMPLATE_VERSION}" in lines[1] and TEMPLATE_VERSION == 2
+    assert f"шаблон {TEMPLATE_VERSION}" in lines[1] and TEMPLATE_VERSION == 3
 
 
 @pytest.mark.parametrize("tags", [[], ["20FAKE_001_PV"], ["20FAKE_001_PV", "20FAKE_003_PV"]])
@@ -451,3 +451,26 @@ def test_one_line_problem_matches_text_field():
     assert one_line_problem("a", 2, 10) is True                            # короче low
     assert one_line_problem("a" * 11, 1, 10) is True                       # длиннее high
     assert one_line_problem("a\nb", 1, 10) is True                         # перевод строки — отказ
+
+
+# --- Д15б (случай 13.10): Помощник перечислил насосы строками без маркеров — в чате вышла сплошная строка;
+# правило оформления — шаблон 3. Прежние файлы (шаблон 2) не переписываются ---
+
+# Правило дословно (брифу задачи): перечень — списком, сравнение — таблицей, короткий ответ — текстом
+FORMATTING_RULE = ("Оформление ответа: перечень из трёх и больше пунктов — маркированным списком "
+                   "(каждый пункт с новой строки, начиная с «- »); сравнение нескольких тегов или значений "
+                   "по одним и тем же свойствам (тег, описание, значение, единица) — таблицей markdown; "
+                   "короткий ответ из одной-двух фраз — обычным текстом.")
+
+
+def test_render_includes_formatting_rule():
+    text = render_agent_file(check_draft(OK, CAT.lookup)[0], {"20FAKE_001_PV": CAT.lookup("20FAKE_001_PV").info},
+                             caller="student-03", created_at=AT)
+    assert FORMATTING_RULE in " ".join(text.split())
+
+
+def test_extract_prompt_reads_old_template_2_file():                      # агенты на местах уже записаны шаблоном 2
+    old_text = (DATA / "agent-template2.md").read_text("utf-8")           # образец — заморожен, до правила оформления
+    assert "шаблон 2" in old_text and "Оформление ответа" not in old_text
+    d, _ = check_draft(OK, CAT.lookup)
+    assert extract_prompt(old_text, d.name) == d.prompt

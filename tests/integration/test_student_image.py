@@ -29,8 +29,9 @@ PERMISSION = {"*": "deny", "external_directory": "deny", "task": "deny", "webfet
 MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True, "oauth": False,
                 "headers": {"Authorization": "Bearer {file:/run/secrets/data-token}"}}}
 # агент по умолчанию (Д6-R45): фронтматтер файла — побайтно; ни name, ни model, ни question. Редакция 2 (Д9а, Д9-R89):
-# ряд и наработка — двумя строками allow в конце
-FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 2 (Д9а); меняется только пересборкой образа\n'
+# ряд и наработка — двумя строками allow в конце. Редакция 3 (Д15б, случай 13.10): правило оформления — в тело, не
+# во фронтматтер — FRONT не меняется
+FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 3 (Д15б); меняется только пересборкой образа\n'
          'description: "Помощник по данным: текущие значения и сводки тегов БДРВ"\nmode: primary\nsteps: 8\n'
          'permission:\n  "*": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n  pcbk_tag_period: allow\n'
          '  pcbk_tag_series: allow\n  pcbk_calc_runtime: allow\n')
@@ -184,6 +185,12 @@ def test_default_agent_file():                                                  
     for rule in ("только из ответов этих инструментов", "Не составляй имя тега сам", "не называй их",
                  "Смысл _MV у регуляторов не", "общие знания, не норматив ПЦБК"):        # пометка — как в AGENTS.md
         assert rule in body, rule
+    # Д15б (случай 13.10): Помощник перечислил насосы строками без маркеров — в чате вышла сплошная строка;
+    # правило оформления — дословно, строки сверяются без переносов (бриф задачи)
+    assert ("Оформление ответа: перечень из трёх и больше пунктов — маркированным списком (каждый пункт с новой "
+            "строки, начиная с «- »); сравнение нескольких тегов или значений по одним и тем же свойствам (тег, "
+            "описание, значение, единица) — таблицей markdown; короткий ответ из одной-двух фраз — обычным "
+            "текстом.") in " ".join(body.split())
     assert "не из данных стенда" not in body
     assert "пять вещей" in body and "три вещи" not in body                       # Д9а (m9): ряд и наработка
     for tool in ("pcbk_tag_series", "pcbk_calc_runtime"):
