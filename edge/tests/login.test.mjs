@@ -662,7 +662,8 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
                    "/pcbk/api/workplace/wake", "/pcbk/api/agents",                      // «Мои агенты» (Д7б, Д7-R64)
                    "/pcbk/api/events",                                                  // события агентов (Д13)
                    "/pcbk/api/calc/",                                                   // калькуляторы (Д9а, Д9-R87)
-                   "/pcbk/api/teacher/"];                                               // кабинет (Д10-R105)
+                   "/pcbk/api/teacher/",                                                // кабинет (Д10-R105)
+                   "/pcbk/api/lessons", "/pcbk/api/lessons/"];                          // пакет уроков (Д15а)
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
   const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
@@ -745,6 +746,16 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
     assert.equal(loc(teacher).exact, false);
     assert.equal(locs.filter((l) => l.port === 8443 && l.path === teacher).length, 1);
     assert.equal(flat(teacher), flat("/pcbk/api/workplace"));
+    // Д15а: пакет уроков вкладки «Уроки» — список (точный путь) и урок/картинка (префикс), оба — копии
+    // location = /pcbk/api/events: та же зона, предел, таймаут; ровно по одному на 8443
+    const lessons = "/pcbk/api/lessons";
+    assert.equal(loc(lessons).exact, true);
+    assert.equal(locs.filter((l) => l.port === 8443 && l.path === lessons).length, 1);
+    assert.equal(flat(lessons), flat(events));
+    const lessonsSub = "/pcbk/api/lessons/";
+    assert.equal(loc(lessonsSub).exact, false);
+    assert.equal(locs.filter((l) => l.port === 8443 && l.path === lessonsSub).length, 1);
+    assert.equal(flat(lessonsSub), flat(events));
   }
   assert.ok(loc("/pcbk/api/").body.includes("if ($pcbk_bad_api_uri) { return 400"));
   assert.match(loc("/pcbk/api/").body, /return 404 '\{"name":"NotFound"/);

@@ -41,7 +41,7 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d11a", "pcbk-core": "pcbk-reserve/core:d14a",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d11a", "pcbk-core": "pcbk-reserve/core:d15a",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d13b"}
@@ -312,7 +312,8 @@ def dify_ties(cfg: dict, roots: list[str]) -> list[str]:
 def test_production_config_independent_of_dify(stack, tmp_path):
     """Сети, тома, привязки, секреты compose.yaml — только свои; env_file и configs нет; слова dify нет вне комментариев."""
     env = stack.test_env()
-    roots = [env[k] for k in ("TLS_DIR", "DATA_DIR", "AGENTS_DIR", "SECRETS_DIR")] + [str(REPO / "edge")]
+    # LESSONS_DIR (Д15а) — образец пакета в git репозитория, а не временный каталог теста: своя строка roots
+    roots = [env[k] for k in ("TLS_DIR", "DATA_DIR", "AGENTS_DIR", "SECRETS_DIR", "LESSONS_DIR")] + [str(REPO / "edge")]
     assert dify_ties(stack.prod_config(), roots) == []
     text = "\n".join(line.split("#", 1)[0] for line in (REPO / "compose.yaml").read_text(encoding="utf-8").splitlines())
     assert "dify" not in text.lower()

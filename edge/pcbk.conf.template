@@ -349,6 +349,32 @@ server {
         proxy_pass http://$pcbk_core;
     }
 
+    # пакет уроков вкладки «Уроки» (Д15а, DESIGN): список — копия location = /pcbk/api/events — та же зона,
+    # предел, таймаут; ручки core — только GET, прочих методов для этого пути не бывает
+    location = /pcbk/api/lessons {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
+    # урок по id и картинка img/<имя> (Д15а) — префикс, та же копия пределов; сегменты пути (id, имя картинки)
+    # сверяет core (LESSON_ID_RE, IMAGE_NAME_RE lessons.py), edge — только сырой путь (map выше)
+    location /pcbk/api/lessons/ {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
     # калькуляторы вкладки чата (Д9а, Д9-R87): POST /pcbk/api/calc/<tool> — префикс, имя инструмента сверяет core;
     # копия location = /pcbk/api/workplace — зона ручек места, 509 → busy.json, тело 64k, срок 30 с, сверка сырого пути
     location /pcbk/api/calc/ {

@@ -57,6 +57,8 @@ PLACES = range(1, 11)
 TEST_VOLUME_LABEL = "pcbk-test.volume"
 # переменные компоновки: берутся только из test.env, не из окружения оболочки
 STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRETS_DIR", "AGENTS_DIR",
+                        # пакет уроков вкладки «Уроки» (Д15а): обязателен, как AGENTS_DIR — только на чтение у core
+                        "LESSONS_DIR",
                         "MEM_WARN_MIB", "MEM_FAIL_MIB", "TICK_S", "STALE_AFTER_S", "DOCKER_TIMEOUT_S",
                         "DRILL_FREEZE_LOOP", "DATA_DIR", "FRESH_POLL_S", "CATALOG_DEADLINE_S",
                         "DRILL_FRESHNESS", "HIST_WARN_S", "HIST_FAIL_S", "HIST_STALE_S",
@@ -1368,6 +1370,9 @@ def stack(tmp_path_factory, student_image):
         "DISPLAY_TZ=Europe/Moscow",
         f"SECRETS_DIR={work / 'secrets'}",
         f"AGENTS_DIR={work / 'agents'}",
+        # пакет уроков (Д15а): образец в git этой же копии репозитория — абсолютный путь, без своего временного
+        # каталога (core монтирует его только на чтение, писать тесту в него не нужно)
+        f"LESSONS_DIR={REPO / 'deploy' / 'lessons-sample'}",
         f"DATA_DIR={work / 'data'}",
         "MEM_WARN_MIB=64",
         "MEM_FAIL_MIB=32",

@@ -220,7 +220,7 @@ services:
   core:
     build: ./core
     # откатный образ — `core:d10b` (Д11а, А0; deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d14a
+    image: pcbk-reserve/core:d15a
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -296,6 +296,10 @@ services:
       # монтирует только свой student-NN и только на чтение. Владелец — 10003, корень 0700, каталоги мест 0755
       - {type: bind, source: "${AGENTS_DIR:?AGENTS_DIR не задан}", target: /srv/agents,
          bind: {create_host_path: false}}
+      # пакет уроков вкладки «Уроки» (Д15а): только на чтение, как сам каталог у LESSONS_ROOT core (lessons.py)
+      # не пишет; обязателен, как AGENTS_DIR — каталога нет, а не пустой урок (Ruling 3)
+      - {type: bind, source: "${LESSONS_DIR:?LESSONS_DIR не задан}", target: /srv/lessons,
+         read_only: true, bind: {create_host_path: false}}
       # журнал событий core.db; каталог образа принадлежит 10003 — том наследует владельца
       - {type: volume, source: pcbk-core-data, target: /var/lib/pcbk-core}
     secrets:
