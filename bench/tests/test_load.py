@@ -470,6 +470,17 @@ def test_load_gate_says_no_with_max(tmp_path, capsys):
     assert "прогноз на 10 мест: 3000 МиБ — нельзя, наибольшее 8" in out
 
 
+def test_load_gate_next_boundary_11_ok_12_refused(tmp_path, capsys):      # Д15б: капа --next — PLACE_MAX (11), не 10
+    pts = [{"t": 0, "free_mib": 8000}, {"t": 60, "free_mib": 8000}]        # без убыли — «можно» при любом next_k
+    (tmp_path / "memory.jsonl").write_text("".join(json.dumps(p) + "\n" for p in pts), encoding="utf-8")
+    (tmp_path / "load.json").write_text(json.dumps({"places": [1, 2]}), encoding="utf-8")
+    assert main(["load-gate", str(tmp_path), "--next", "11"]) == 0
+    assert "прогноз на 11 мест" in capsys.readouterr().out
+    assert main(["load-gate", str(tmp_path), "--next", "12"]) == 1          # отказ разбора, а не вердикт по данным
+    out, err = capsys.readouterr()
+    assert out == "" and "usage" in err.lower()
+
+
 def test_halted_turn_is_hard_memory(tmp_path):                             # pcbk_run_halted в ходе — жёстко memory
     stand = FakeStand(health=health_brake())
     r = runner(out=tmp_path, places={1: M1, 2: M1}, stand=stand, chat=FakeChat.honest(error="pcbk_run_halted"), **TWIN)
@@ -630,6 +641,18 @@ def test_server_stand_load_methods(tmp_path):
     assert got["price"]["calls"] == 3 and json.loads((out / "price.json").read_text())["replies"] == 2
     with pytest.raises(StandError):
         stand.load_check(["teacher; rm"], "a", "b")
+
+
+def test_server_stand_place_boundary_11_ok_12_refused(tmp_path):     # Д15б: _place — PLACE_MAX (11), не магическое 10
+    from pcbk_bench.stand import ServerStand, StandError
+    ssh = _Ssh()
+    stand = ServerStand(["ssh", "dev@host"], "http://127.0.0.1:18000", "https://127.0.0.1:28443", "stand:28443",
+                        tmp_path, run=ssh)
+    stand.sleep_places([11])
+    assert ssh.calls[-1][0][2] == "docker stop -t 10 pcbk-student-11"
+    with pytest.raises(StandError, match="1…11"):
+        stand.sleep_places([12])
+    assert ssh.calls[-1][0][2] == "docker stop -t 10 pcbk-student-11"           # 12 не ушло в команду вовсе
 
 
 def test_gateway_sessions_path():

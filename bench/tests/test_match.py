@@ -728,3 +728,10 @@ def test_jsonl_lines_carry_run_label(tmp_path):                                 
 def test_node_tags_take_backquoted_name_without_digits():                         # m-7 ревью Б1
     text = _agent_text(["20FAKE_201_PV", "FAKE_SPEED_PV", "20FAKE_210_RUN"])
     assert node_tags(text) == ["20FAKE_201_PV", "FAKE_SPEED_PV", "20FAKE_210_RUN"]
+
+
+def test_place_of_boundary_11_ok_12_refused():             # Д15б: _place_of — PLACE_MAX (11), не магическое 10
+    from pcbk_bench.match import _place_of
+    assert _place_of(11, "place") == 11
+    with pytest.raises(ValueError, match="от 1 до 11"):
+        _place_of(12, "place")

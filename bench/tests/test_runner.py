@@ -1034,7 +1034,7 @@ def test_server_stand_commands(tmp_path):
     with pytest.raises(StandError):
         stand.archive_agent(7, "../etc")
     with pytest.raises(StandError):
-        stand.agent_rows(11)
+        stand.agent_rows(12)                                                    # Д15б: 12 — вне диапазона, не 11
     ssh.out = "[]"
     assert stand.agent_rows(7) == []
     ssh.out = '{"model": "pcbk/z-ai/glm-5.3"}'

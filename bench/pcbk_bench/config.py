@@ -38,7 +38,8 @@ from typing import Any
 from .scenarios import BY_ID, RUN_TIMEOUT_S, SCENARIO_IDS
 
 RUN_ID_RE = re.compile(r"[a-z0-9-]{1,32}")          # RUN_ID_RE LlmSettings (Д8-R69) — значением
-PLACES = range(1, 12)                                # Д15б: мест 11, не 10
+PLACE_MAX = 11                                       # Д15б: мест 11, не 10 — единственный источник границы
+PLACES = range(1, PLACE_MAX + 1)
 PROVIDERS = ("pcbk", "pcbk-or")
 GROUPS = ("create", "number", "trap")
 MAX_REPS = 10
@@ -263,5 +264,5 @@ def load_config(path: Path, opencode_json: Path) -> BenchConfig:
         stand=_path(base, raw, "stand", required=False), scenarios=scenarios, **load)
 
 
-__all__ = ["BenchConfig", "GROUPS", "LOAD_DATA_MODES", "MAX_REPS", "PLACES", "PROVIDERS", "RUN_ID_RE",
+__all__ = ["BenchConfig", "GROUPS", "LOAD_DATA_MODES", "MAX_REPS", "PLACE_MAX", "PLACES", "PROVIDERS", "RUN_ID_RE",
            "WINDOW_BASE_KEYS", "load_config", "model_refs", "parse_window_start"]

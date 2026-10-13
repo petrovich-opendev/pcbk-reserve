@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from .config import PLACE_MAX
 from .load import LOAD_CHECK_PY, write_price
 from .secret import Secret
 
@@ -172,8 +173,8 @@ class Stand(Protocol):
 
 
 def _place(place: int) -> int:
-    if isinstance(place, bool) or not isinstance(place, int) or not 1 <= place <= 10:
-        raise StandError("место: 1…10")
+    if isinstance(place, bool) or not isinstance(place, int) or not 1 <= place <= PLACE_MAX:
+        raise StandError(f"место: 1…{PLACE_MAX}")             # Д15б: граница — из единственной константы
     return place
 
 

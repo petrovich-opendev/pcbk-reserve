@@ -68,6 +68,7 @@ from typing import Any
 
 from .cards import ALLOWED_TOOLS
 from .checks import TAG_IN_LINE_RE, TAGS_LINE_RE, output_of
+from .config import PLACE_MAX
 from .gateway import GatewayChat, GatewayError, WorkplaceNotReady
 from .numbers import Shown, close, non_measure_kind, parse_numbers, segment_of, value_label
 from .record import ToolCall, Turn, parse_turn
@@ -942,8 +943,8 @@ _M_OPTIONAL = frozenset({"turn_timeout_s", "source"})
 
 
 def _place_of(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 10:
-        raise ValueError(f"конфиг: {name} — номер места от 1 до 10")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= PLACE_MAX:
+        raise ValueError(f"конфиг: {name} — номер места от 1 до {PLACE_MAX}")   # Д15б: граница — из одной константы
     return value
 
 

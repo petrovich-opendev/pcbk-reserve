@@ -89,7 +89,7 @@ from .match import (BASIC_KINDS, MatchConfig, MatchRunner, build_cases, case_cou
                     load_case_tags, load_match_config, match_failures, probe_calc, render_match, write_case_tags,
                     write_private)
 from .override import render_override
-from .config import WINDOW_BASE_KEYS
+from .config import PLACE_MAX, WINDOW_BASE_KEYS
 from .load import MEM_WARN_MIB, check_lines, check_verdict, gate_from_out, overrun_usd, run_rows, runs_json
 from .runner import FUTURE_WINDOW_S, Runner, RunRefused, load_records, status_main
 from .secret import Secret
@@ -429,7 +429,7 @@ def _load_check(config: Path) -> int:
 
 def _load_gate(out: Path, next_k: int, warn_mib: int) -> int:
     """load-gate OUT --next K: одна строка чисел; код 0 — «можно», 1 — «нельзя»."""
-    if not 1 <= next_k <= 11:                       # Д15б: мест 11, не 10
+    if not 1 <= next_k <= PLACE_MAX:                # Д15б: граница — из единственной константы, не руками
         raise _UsageError("--next")
     line, code = gate_from_out(out, next_k, warn_mib)
     print(line)
