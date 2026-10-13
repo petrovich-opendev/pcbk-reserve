@@ -47,7 +47,9 @@ services:
       FRESH_POLL_S: "5"
       OPENROUTER_BASE_URL: http://fake-openrouter:8080/api/v1
       LLM_POLL_S: "5"
-      LLM_TOTAL_USD: ${LLM_TOTAL_USD:-1000}
+      # Д15б: 11 мест по умолчанию $100 — общий бюджет стенда поднят до 1100 (как на сервере), иначе
+      # «Кабинет преподавателя и доли» на свежем стенде видит «распределено больше общего» (warn)
+      LLM_TOTAL_USD: ${LLM_TOTAL_USD:-1100}
       PYTHONPATH: /twin
       PCBK_TWIN_HISTORIAN: ${PCBK_TWIN_HISTORIAN:-}
       LLM_RUN_MEMINFO: /run/pcbk-test-mem/meminfo-core

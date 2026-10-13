@@ -36,8 +36,8 @@ def test_llm_call_counted_on_status_page(stack):                                
         assert code == 200 and text.rstrip().endswith("data: [DONE]")
     added = calls * FAKE_CALL_USD
     wait_for(lambda: stack.llm_health()["spent_usd"] == pytest.approx(before + added), timeout=15)
-    want = f"расход {usd(before + added)} из $1000"
-    assert want != f"расход {usd(before)} из $1000"                                 # иначе сверка пустая
+    want = f"расход {usd(before + added)} из $1100"          # общий бюджет стенда (Д15б: 11 мест по $100)
+    assert want != f"расход {usd(before)} из $1100"                                 # иначе сверка пустая
     stack.wait_status(lambda d: row(d, "llm")[:2] == ("ok", "OpenRouter отвечает")
                       and row(d, "llm")[2].split(" · ")[0] == want, timeout=40)
     sent = stack.fake_requests()[-1]["body"]

@@ -1,6 +1,6 @@
 """Константы рабочего места для тестов: образ, окружение, точки монтирования, метки."""
 
-IMAGE = "pcbk-reserve/student:d13b"
+IMAGE = "pcbk-reserve/student:d15b"
 # модели места — ровно список прокси по порядку select_models("") (core/pcbk_core/llm/models.py)
 MODELS = ["z-ai/glm-5.3", "deepseek/deepseek-v4.1-flash", "google/gemini-3.8-flash", "openai/gpt-6-sol",
           "z-ai/glm-5.3-flash", "openai/gpt-6-luna", "anthropic/claude-sonnet-5.5"]
