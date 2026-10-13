@@ -1,12 +1,31 @@
 // Плагин remark: одиночные переносы строк в markdown (13.10 Д15а) — показываются переносом, а не пробелом.
 // Используется в MarkdownTextPrimitive как для чата (MessageParts.tsx), так и для уроков (LessonMarkdown.tsx).
 import { render } from "@testing-library/react";
+import { useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
 import { expect, test } from "vitest";
+import { ChatView } from "../src/components/ChatView";
 import { LessonMarkdown } from "../src/components/LessonMarkdown";
+
+type Status = NonNullable<ThreadMessageLike["status"]>;
+const DONE: Status = { type: "complete", reason: "stop" };
+let seq = 0;
+const id = (): string => `m${++seq}`;
+
+const assistant = (text: string): ThreadMessageLike =>
+  ({ id: id(), role: "assistant", content: [{ type: "text", text }], status: DONE });
+
+function Harness(p: { messages: ThreadMessageLike[] }) {
+  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
+    messages: p.messages, isRunning: false, onNew: async () => {}, convertMessage: (m) => m,
+  });
+  return <ChatView runtime={runtime} />;
+}
+
+// --- Тесты через чат (MessageParts): исходный случай владельца (ответ агента) ---
 
 test("soft_break_renders_br", () => {
   const markdown = "**А** — 20FAKE_001\n**Б** — 20FAKE_002";
-  const { container } = render(<LessonMarkdown markdown={markdown} />);
+  const { container } = render(<Harness messages={[assistant(markdown)]} />);
 
   const p = container.querySelector("p");
   expect(p).toBeTruthy();
@@ -22,7 +41,7 @@ test("soft_break_renders_br", () => {
 
 test("code_block_keeps_newlines_without_br", () => {
   const markdown = "```\nline1\nline2\nline3\n```";
-  const { container } = render(<LessonMarkdown markdown={markdown} />);
+  const { container } = render(<Harness messages={[assistant(markdown)]} />);
 
   const pre = container.querySelector("pre");
   expect(pre).toBeTruthy();
@@ -36,6 +55,8 @@ test("code_block_keeps_newlines_without_br", () => {
   const breaks = container.querySelectorAll("br");
   expect(breaks).toHaveLength(0);
 });
+
+// --- Остальные тесты через уроки (LessonMarkdown) ---
 
 test("inline_code_untouched", () => {
   const markdown = "`code with newlines`";
