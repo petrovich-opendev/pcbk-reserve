@@ -194,7 +194,7 @@ def test_reload_without_browser(stack, users):                         # пут�
 def test_refusal_writes_nothing(stack, users):
     out = stack.converse(10, "FAKESAVEBAD agent=plohoy", agent="probe-save")
     assert "tool_not_allowed" in tool_output_of(stack, 10, out["session"], "pcbk_save_agent")
-    assert "шаблон 2" in stack.agent_file(10, "proverka-quiet")         # положительный контроль: файл службы читается
+    assert "шаблон 3" in stack.agent_file(10, "proverka-quiet")         # положительный контроль: файл службы читается
     with pytest.raises(subprocess.CalledProcessError) as e:
         stack.agent_file(10, "plohoy")
     assert "FileNotFoundError" in e.value.stderr                          # файла нет, а не иной сбой команды

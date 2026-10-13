@@ -52,7 +52,7 @@ COMPOSE_FILES = ("compose.yaml", "compose.test.yaml")
 # профиль мест: без него compose не видит student-NN
 PROFILE = "students"
 STUDENT_PREFIX = "pcbk-student-"
-PLACES = range(1, 11)
+PLACES = range(1, 12)   # места 01…11 (Д2; место 11 — Д15б)
 # метка томов мест, созданных тестом: уборка удаляет только их
 TEST_VOLUME_LABEL = "pcbk-test.volume"
 # переменные компоновки: берутся только из test.env, не из окружения оболочки

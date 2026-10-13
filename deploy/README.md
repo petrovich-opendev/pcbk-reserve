@@ -110,7 +110,7 @@ mv -T chat chat.bad-<день> && mv -T chat.<прошлый день> chat
    ```bash
    cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) &&
    [ -n "$SD" ] && umask 077 && install -d -m 0700 "$SD" &&
-   for n in $(seq -w 1 10); do
+   for n in $(seq -w 1 11); do
      for s in pw llm-token; do f=$SD/student-$n.$s
        [ -e "$f" ] || { openssl rand -hex 24 | tr -d '\n' > "$f"; chmod 0444 "$f"; }   # не перезаписывать
      done
@@ -119,7 +119,7 @@ mv -T chat chat.bad-<день> && mv -T chat.<прошлый день> chat
    done
    docker exec pcbk-core sh -c 'stat -c "%u %a %n" /srv/agents /srv/agents/student-*'   # шаблон раскрывает core
    ```
-   Ожидается: `10003 700 /srv/agents` и `10003 755` у `student-01…10`.
+   Ожидается: `10003 700 /srv/agents` и `10003 755` у `student-01…11`.
 
    **Первая выкладка на чистый сервер** (каталога агентов и `core` ещё нет) — прежние строки: в цикле выше
    `install -d -m 0700 "$SD" "$AD"` (с `AD=$(grep '^AGENTS_DIR=' .env | cut -d= -f2)` и `[ -n "$AD" ]`) и
@@ -134,9 +134,9 @@ mv -T chat chat.bad-<день> && mv -T chat.<прошлый день> chat
    Ожидается: `10003 10003` у корня, `student-01…10`, `quarantine` и `archive`. Дальше каталог с хоста не
    читается: `stat`, `find` и `ls` — через `docker exec pcbk-core`.
 2. Места создаются, но не стартуют:
-   `docker compose --profile students create --no-build $(printf 'student-%02d ' $(seq 1 10))`,
+   `docker compose --profile students create --no-build $(printf 'student-%02d ' $(seq 1 11))`,
    затем `docker compose up -d --no-build watchdog` — в этом порядке, иначе
-   на странице будут десять «нет контейнера».
+   на странице будут одиннадцать «нет контейнера».
 3. Вручную: `docker start pcbk-student-NN` / `docker stop pcbk-student-NN`
    (с Д5 это делает шлюз при входе и после 30 минут простоя).
 4. Образ места собирается из чистого дерева (`git archive`): `COPY config/`
@@ -155,41 +155,41 @@ LLM-прокси `student-NN.llm-token` и токен службы данных
 ни в чат, ни в git, ни в вывод команд не идут.
 
 Каталог секретов — всегда `SECRETS_DIR` из `.env` выкладки. Таблица хешей
-собирается, только если каждый из одиннадцати файлов токенов есть и не пуст:
+собирается, только если каждый из двенадцати файлов токенов есть и не пуст:
 
 ```bash
 cd /opt/pcbk-reserve && SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && [ -n "$SD" ] && cd "$SD" && umask 077 &&
-for n in $(seq -w 1 10); do f=student-$n.data-token
+for n in $(seq -w 1 11); do f=student-$n.data-token
   [ -e "$f" ] || { openssl rand -hex 24 | tr -d '\n' > "$f"; chmod 0444 "$f"; }   # не перезаписывать
 done
-ok=1; for f in ops.data-token $(printf 'student-%02d.data-token ' $(seq 1 10)); do [ -s "$f" ] || { echo "нет или пуст: $f"; ok=0; }; done
+ok=1; for f in ops.data-token $(printf 'student-%02d.data-token ' $(seq 1 11)); do [ -s "$f" ] || { echo "нет или пуст: $f"; ok=0; }; done
 [ "$ok" = 1 ] && for f in ops.data-token student-*.data-token; do printf '%s %s\n' "${f%.data-token}" "$(sha256sum < "$f" | cut -c1-64)"; done > core-tokens.new &&
   chmod 0444 core-tokens.new && mv core-tokens.new core-tokens
 wc -l < core-tokens; awk 'NF!=2||length($2)!=64' core-tokens | wc -l; stat -c '%a %s' student-*.data-token | sort -u
 cat student-*.data-token student-*.llm-token student-*.pw ops.*-token | fold -w48 | sort -u | wc -l
 ```
 
-Ожидается: ни одной строки «нет или пуст», затем `11`; `0` — все строки вида
-«`<id> <sha256>`»; `444 48`; `32` различных значения (три разных секрета у
+Ожидается: ни одной строки «нет или пуст», затем `12`; `0` — все строки вида
+«`<id> <sha256>`»; `444 48`; `35` различных значения (три разных секрета у
 каждого места и два токена `ops`).
 
-Таблица хешей токенов LLM `llm-tokens` (Д4а: `ops.llm-token` и десять
+Таблица хешей токенов LLM `llm-tokens` (Д4а: `ops.llm-token` и одиннадцать
 `student-NN.llm-token`, тот же формат) собирается так же — в том же каталоге:
 
 ```bash
-ok=1; for f in ops.llm-token $(printf 'student-%02d.llm-token ' $(seq 1 10)); do [ -s "$f" ] || { echo "нет или пуст: $f"; ok=0; }; done
+ok=1; for f in ops.llm-token $(printf 'student-%02d.llm-token ' $(seq 1 11)); do [ -s "$f" ] || { echo "нет или пуст: $f"; ok=0; }; done
 [ "$ok" = 1 ] && for f in ops.llm-token student-*.llm-token; do printf '%s %s\n' "${f%.llm-token}" "$(sha256sum < "$f" | cut -c1-64)"; done > llm-tokens.new &&
   chmod 0444 llm-tokens.new && mv llm-tokens.new llm-tokens
 wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
 ```
 
-Ожидается `11` и `0`. `core` читает `core-tokens` и `llm-tokens` только при
+Ожидается `12` и `0`. `core` читает `core-tokens` и `llm-tokens` только при
 старте (привязанный файл — прежний inode): после нового файла —
 `docker compose up -d --no-build --force-recreate core`.
 
 `core` стоит в каждой сети места на `.2` (у мест — `core` в `extra_hosts`) с
-`net.ipv4.ip_forward=0`. Проверка: `docker inspect -f '{{len .NetworkSettings.Networks}}' pcbk-core` → `13`
-(с Д5а — ещё `pcbk-ctl`: `core` — клиент `sp-ctl`).
+`net.ipv4.ip_forward=0`. Проверка: `docker inspect -f '{{len .NetworkSettings.Networks}}' pcbk-core` → `14`
+(с Д5а — ещё `pcbk-ctl`: `core` — клиент `sp-ctl`; место 11 — Д15б).
 
 ### Пересоздание мест с сохранением томов
 
@@ -198,7 +198,7 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
 1. `docker ps -a --filter label=pcbk.role=student --format '{{.Names}} {{.State}}'` —
    пересоздание работающего места рвёт разговор студента: сначала выяснить,
    кто его поднял, и дождаться конца.
-2. `docker compose --profile students create --force-recreate --no-build $(printf 'student-%02d ' $(seq 1 10))`
+2. `docker compose --profile students create --force-recreate --no-build $(printf 'student-%02d ' $(seq 1 11))`
    (или имена нужных мест). Тома мест внешние — `create --force-recreate` их
    не трогает: разговоры и работы студентов остаются. Места после этого спят.
 3. **Не** `docker compose down`, **не** `up` без имён служб, **не** удаление
@@ -215,7 +215,7 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
   же `add` без `--generate` с паролем одной строкой stdin из файла (`docker exec -i … < <файл>`). Файлы
   `student-NN.pw`, `student-NN.llm-token` и `student-NN.data-token` (с Д5а; токен данных — с Д4б) при первой выдаче
   места не меняются — они заведены при выкладке (раздел «Токены данных мест и `core-tokens` (с Д4б)»).
-- **Смена студента в занятом месте (слот 01–10) — сейчас не поддерживается, до отдельной задачи.** Место закреплено
+- **Смена студента в занятом месте (слот 01–11) — сейчас не поддерживается, до отдельной задачи.** Место закреплено
   за логином прежнего студента (таблица `gw_places` в `core.db`), и закрепление не снимают ни `disable`, ни `remove`.
   Новый логин на такое место `accounts add` и кабинет отвергают: «место NN закреплено за учёткой L — смена студента в
   месте только по процедуре владельца» (`core/pcbk_core/gateway/accounts.py`, `add`) — такой процедуры в коде пока
@@ -243,18 +243,20 @@ wc -l < llm-tokens; awk 'NF!=2||length($2)!=64' llm-tokens | wc -l
     а каталог, созданный с хоста, `core` не запишет. До выкладки Д7а и после отката к Д6б (раздел «Откат») —
     по-старому: прежний каталог агентов места переименовать и сохранить, создать пустой; старые тома места —
     только по решению владельца; `docker compose --profile students create --force-recreate --no-build student-NN`.
-- **Место 11 и дальше:** правка регулярок `sp-ro`/`sp-ctl`, подсеть N, блок
+- **Место 12 и дальше:** правка регулярок `sp-ro`/`sp-ctl`, подсеть N, блок
   в `compose.yaml`, строка в `watchdog/components.json`, тесты границ
-  диапазона, пересборка сторожа; с Д5а — и правка `core`: `PLACES` в
-  `core/pcbk_core/` — `gateway/accounts.py`, `gateway/places.py`,
-  `agents/store.py` и `main.py` (там же направления к местам — `egress_targets`).
+  диапазона, пересборка сторожа; с Д15б — правка одной константы
+  `core/pcbk_core/places.py` (`PLACE_MAX`, `PLACE_NN`): от неё берут
+  `gateway/accounts.py`, `gateway/places.py`, `agents/store.py`,
+  `llm/shares.py`, `main.py` (там же направления к местам — `egress_targets`)
+  и прочие потребители без своего отдельного диапазона.
 
 ### Освобождение места пробной учётки
 
-Места 09 и 10 до пилота берут пробные учётки живых проверок (`dN-probe-*`);
-после каждой проверки место освобождается — пилот получает все 10 мест.
-`NN` — номер места, `L` — логин пробы; команды `accounts` и `agents.admin` —
-через `docker exec pcbk-core python -m …`.
+С 13.10 места 01–10 — у студентов целиком: пробные учётки живых проверок (`dN-probe-*`) мест больше не получают,
+живые проверки идут под учёткой-образцом `student_test` (место 11, Д15б). Процедура ниже остаётся в коде и в
+README на случай, если пробная учётка всё же временно займёт место (окно отбора модели и т. п.) — `NN` — номер
+места, `L` — логин пробы; команды `accounts` и `agents.admin` — через `docker exec pcbk-core python -m …`.
 
 0. Место к этому часу обычно спит: `docker start pcbk-student-NN`, затем
    помощник `probe NN` Д2 → `200`.
@@ -412,10 +414,10 @@ OpenRouter есть только у `core`. Строка страницы — «
   местом, и другому человеку команда место не выдаёт: иначе новый студент увидел бы разговоры и агентов
   прежнего. Логин прежнего студента новому человеку не выдаётся; `--same-person` — только тому же человеку.
   Смена студента в месте — процедура владельца (раздел «Новый студент»).
-- **Пробные учётки.** До начала пилота места 09 и 10 берут пробные учётки живых проверок (`dN-probe-*`) и
-  после каждой проверки освобождают — «Освобождение места пробной учётки»; пилот получает все 10 мест.
-  `release-place` освобождает только место пробной учётки после `disable` (с Д7а — и после `archive` агентов
-  места).
+- **Пробные учётки.** С 13.10 места 01–10 — у студентов целиком; пробные учётки живых проверок (`dN-probe-*`)
+  мест больше не получают — живые проверки идут под учёткой-образцом `student_test` (место 11, Д15б).
+  `release-place` (раздел «Освобождение места пробной учётки») остаётся в коде: освобождает место пробной учётки
+  после `disable` (с Д7а — и после `archive` агентов места), на случай временного исключения.
 - **Замок входа:** пять неверных паролей за 15 минут закрывают учётке вход, пока старейшая из пяти попыток не
   выйдет из 15-минутного окна; снять раньше — `unlock --login L`. В `edge` — не больше 5 запросов входа в
   секунду с адреса.
@@ -637,7 +639,7 @@ pcbk_bench …`. Ниже — коротко `python -m pcbk_bench …`.
      значение, а не строка: `grep -E '^(LLM_RUN_ID|LLM_RUN_USD|LLM_RUN_CALLERS|GW_IDLE_STOP_S|DRILL_LLM)=.' .env` —
      ни одной строки;
    - у мест нет `OPENCODE_CONFIG_CONTENT`:
-     `for n in $(seq -w 1 10); do docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' pcbk-student-$n | grep -q '^OPENCODE_CONFIG_CONTENT=' && echo "место $n"; done`
+     `for n in $(seq -w 1 11); do docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' pcbk-student-$n | grep -q '^OPENCODE_CONFIG_CONTENT=' && echo "место $n"; done`
      — пусто;
    - в `accounts list` нет `d8-probe-*` — ни строк учёток, ни строк `место NN`:
      `docker exec pcbk-core python -m pcbk_core.gateway.accounts list | grep -c 'd8-probe-'` → `0`;
@@ -985,7 +987,7 @@ docker logs --since <начало окна> pcbk-core 2>&1 | grep -E 'tool=(cata
 ниже — через `docker exec pcbk-core python -m …`. На сервере кабинет появляется окном Б4 (ниже).
 
 - **Что видит и может преподаватель:**
-  - обзор десяти мест: логин студента («свободно» — закрепления нет, «без учётки» — место закреплено за удалённым
+  - обзор одиннадцати мест: логин студента («свободно» — закрепления нет, «без учётки» — место закреплено за удалённым
     логином), пометки учётки («отключена», «замок», «не подтвердил предупреждение»), состояние места, доля,
     потрачено, число агентов; общий бюджет и расход `ops`;
   - разговоры и агенты студента — только на чтение. Разговор читается через само место тремя GET, агенты — из учёта
@@ -1009,7 +1011,7 @@ docker logs --since <начало окна> pcbk-core 2>&1 | grep -E 'tool=(cata
     изменились, пока страница была открыта, — обновите её»;
   - доля не ниже пола — оплаченного местом, округлённого вниз до цента с запасом против шума (на ровной сумме — на
     цент ниже: $0,30 → 29 центов);
-  - сумма долей десяти мест после изменения — не больше общего бюджета (`LLM_TOTAL_USD`), а если уже была больше —
+  - сумма долей одиннадцати мест после изменения — не больше общего бюджета (`LLM_TOTAL_USD`), а если уже была больше —
     не растёт. Свободный остаток — бюджет минус сумма долей;
   - «Остановить место» — серверная операция: доля места сводится к полу, разница уходит другому месту, пол берёт
     сервер под тем же замком, что перевод. Следующий же вызов модели этого места — отказ «доля израсходована».
@@ -1061,7 +1063,7 @@ ssh <сервер> docker exec pcbk-core python -m pcbk_core.gateway.accounts ad
 
 - **«Завести студента»** — логин (3…32 знака из a-z, 0-9, «.», «_», «-», первый — буква a-z) и свободное место.
   Пароль (12 знаков) показан один раз — преподаватель записывает его и передаёт студенту; «Я записал пароль» стирает
-  его со страницы. **Логин закрепляется за местом навсегда**: опечатка в логине занимает одно из десяти мест, а снять
+  его со страницы. **Логин закрепляется за местом навсегда**: опечатка в логине занимает одно из одиннадцати мест, а снять
   закрепление можно только у пробных логинов («Новый студент»).
 - **Логины вида `dN-probe-…` — только для проверок.** Место пробного логина администратор освобождает `release-place`
   («Освобождение места пробной учётки»): если такой логин выдан живому студенту, уборка пробных мест может отдать его
@@ -1806,7 +1808,7 @@ SD=$(grep '^SECRETS_DIR=' .env | cut -d= -f2) && DD=$(grep '^DATA_DIR=' .env | c
 need=$(
   docker exec pcbk-core du -sk /var/lib/pcbk-core /srv/agents
   du -sk "$SD" "$DD" .env compose.yaml edge
-  for n in $(seq -w 1 10); do
+  for n in $(seq -w 1 11); do
     docker ps --filter "name=pcbk-student-$n" --format '{{.Names}}' | grep -q . && { echo "0 место-$n-работает"; continue; }
     docker run --rm --network none --user 10001:10001 \
       -v "pcbk-student-$n-state:/s:ro" -v "pcbk-student-$n-work:/w:ro" \
@@ -1866,7 +1868,7 @@ for f in compose.yaml.*; do [ -e "$f" ] && files+=("$f"); done &&
 tar -cf "$B/config.tar" "${files[@]}"
 
 # разговоры спящих мест; работающее — пропуск со строкой в manifest.txt
-for n in $(seq -w 1 10); do
+for n in $(seq -w 1 11); do
   if docker ps --filter "name=pcbk-student-$n" --format '{{.Names}}' | grep -q .; then
     echo "место $n работает — копии нет" >> "$B/manifest.txt"; continue
   fi
@@ -1937,7 +1939,7 @@ write a readonly database», «чистые руки», заход 2, 12.10).
 ```bash
 RT=restore-$T && BR=before-restore-$T &&
 docker exec -i pcbk-core sh -c "mkdir /srv/agents/.$RT && tar -C /srv/agents/.$RT -xf -" < "$B/agents.tar"
-for n in $(seq -w 1 10); do
+for n in $(seq -w 1 11); do
   docker exec pcbk-core sh -c "[ -e /srv/agents/.$RT/agents/student-$n ]" || continue
   docker exec -u 10003 pcbk-core sh -c "
     mkdir -p /srv/agents/.$BR &&
@@ -2334,15 +2336,16 @@ docker compose ps
 
 ## Откат
 
-- **`docker compose down` на сервере не выполнять** — он снимает все десять
+- **`docker compose down` на сервере не выполнять** — он снимает все одиннадцать
   мест и их сети. **`down -v` запрещён** — он удаляет том журнала сторожа;
   журнал удаляется только явно: `docker volume rm pcbk-reserve_pcbk-watchdog-journal`.
 - Службы снимаются только по именам: `docker compose rm -sf <службы>`;
   Д1 — `docker compose stop edge watchdog sp-ro sp-ctl` /
   `docker compose rm -sf edge watchdog sp-ro sp-ctl`.
-- Места Д2 (только до первого входа студента):
-  `docker compose rm -sf $(printf 'student-%02d ' $(seq 1 10))`;
-  `docker network rm $(printf 'pcbk-stu-%02d ' $(seq 1 10))`; тома — только
+- Места Д2 (только до первого входа студента; команды ниже — пока `compose.yaml` ещё не откатан, снимают все
+  места, включая 11-е с Д15б):
+  `docker compose rm -sf $(printf 'student-%02d ' $(seq 1 11))`;
+  `docker network rm $(printf 'pcbk-stu-%02d ' $(seq 1 11))`; тома — только
   по именам `pcbk-student-NN-*`; вернуть `compose.yaml.d1` и
   `docker compose up -d --no-build watchdog` (образ `:d1`).
 - Д3а — раздел «Служба данных (с Д3а)», пункт «Откат Д3а».
@@ -2364,8 +2367,9 @@ docker compose ps
      `docker ps -a --filter label=pcbk.role=student --format '{{.Names}} {{.State}}'` —
      пересоздание работающего места рвёт разговор: выяснить, кто его поднял,
      и дождаться конца;
-  4. `docker compose --profile students create --force-recreate --no-build $(printf 'student-%02d ' $(seq 1 10))`
-     — места на `:d2`, тома сохраняются, места спят;
+  4. `docker compose --profile students create --force-recreate --no-build student-{01..10}`
+     — места на `:d2`, тома сохраняются, места спят (компоновка `compose.yaml.d4a`, уже возвращённая шагом 1, —
+     мест десять, 11-е этот снимок не знает: Д15б моложе Д4б);
   5. токены данных `student-NN.data-token` и `core-tokens` не удаляются.
 - Д5а — назад к Д4б (места не трогаются: образ места тот же, `student:d4`):
   1. вернуть `compose.yaml.d4b`, `edge/pcbk.conf.template.d4b` и `edge/static/index.html.d4b` — копии перед

@@ -31,9 +31,11 @@ DECLARED_ENV = {                   # наши переменные сверх п
                   "LLM_RUN_ID", "LLM_RUN_USD", "LLM_RUN_CALLERS",  # прогон отбора модели (Д8-R69)
                   # тормоз прогона (Д11-R117): пороги — вложенным умолчанием compose.yaml
                   "LLM_RUN_MEM_FAIL_MIB", "LLM_RUN_SWAP_GROW_MIB", "LLM_RUN_SWAP_BASE_MIB", "LLM_RUN_PSI_FULL_MAX",
-                  # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос и общий
-                  # бюджет (учение «бюджет стенда израсходован», Д4б); обёртка запуска и двойник историана (Д8-R75)
-                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "LLM_TOTAL_USD", "PYTHONPATH", "PCBK_TWIN_HISTORIAN",
+                  # общий бюджет LLM-прокси, $ (Д15б): теперь в compose.yaml — не только тестовый стенд
+                  "LLM_TOTAL_USD",
+                  # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос;
+                  # обёртка запуска и двойник историана (Д8-R75)
+                  "OPENROUTER_BASE_URL", "LLM_POLL_S", "PYTHONPATH", "PCBK_TWIN_HISTORIAN",
                   # двойники /proc тормоза прогона (Д11-R123а) — только тестовый стенд
                   "LLM_RUN_MEMINFO", "LLM_RUN_VMSTAT", "LLM_RUN_PRESSURE"},
     "pcbk-edge": set(),
@@ -41,10 +43,10 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d11a", "pcbk-core": "pcbk-reserve/core:d15a",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d15b", "pcbk-core": "pcbk-reserve/core:d15b",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
-          "pcbk-student-01": "pcbk-reserve/student:d13b"}
+          "pcbk-student-01": "pcbk-reserve/student:d15b"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 # CSP страницы чата — строка Global Constraints Д6 (Д6-R41)
 CHAT_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "
@@ -303,7 +305,7 @@ def dify_ties(cfg: dict, roots: list[str]) -> list[str]:
     out += [f"сеть {n}" for n, net in cfg["networks"].items()
             if net.get("external") or not (net.get("name") or n).startswith("pcbk-")]
     out += [f"том {n}" for n, v in cfg["volumes"].items()
-            if v.get("external") and not re.fullmatch(r"pcbk-student-(0[1-9]|10)-(state|work)", v.get("name") or n)]
+            if v.get("external") and not re.fullmatch(r"pcbk-student-(0[1-9]|1[01])-(state|work)", v.get("name") or n)]
     out += [f"секрет {n}" for n, sec in (cfg.get("secrets") or {}).items() if not inside(sec.get("file", ""))]
     out += [f"configs {n}" for n in (cfg.get("configs") or {})]
     return out

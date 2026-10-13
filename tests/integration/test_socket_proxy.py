@@ -28,7 +28,7 @@ def test_sp_ro_refuses_other_clients(stack):
     assert stack.http_as("pcbk-core", "pcbk-ro", "GET", RO + "/containers/pcbk-sp-ctl/json") == 403
 
 
-@pytest.mark.parametrize("name", ["pcbk-student-00", "pcbk-student-11", "pcbk-student-1"])
+@pytest.mark.parametrize("name", ["pcbk-student-00", "pcbk-student-12", "pcbk-student-1"])
 def test_student_range_boundaries(stack, name):
     assert stack.http_from_core("POST", CTL + f"/containers/{name}/start") == 403
     assert stack.http_from_core("GET", CTL + f"/containers/{name}/json") == 403
@@ -36,13 +36,13 @@ def test_student_range_boundaries(stack, name):
 
 
 def test_student_range_upper_bound_passes(stack):
-    # положительный контроль границы: 10 — последнее место, прокси пропускает
+    # положительный контроль границы: 11 — последнее место (Д15б), прокси пропускает
     try:
-        assert stack.http_from_core("POST", CTL + "/containers/pcbk-student-10/start") in PASSED
-        assert stack.http_from_core("GET", CTL + "/containers/pcbk-student-10/json") in PASSED
-        assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-student-10/json") in PASSED
+        assert stack.http_from_core("POST", CTL + "/containers/pcbk-student-11/start") in PASSED
+        assert stack.http_from_core("GET", CTL + "/containers/pcbk-student-11/json") in PASSED
+        assert stack.http_from_watchdog("GET", RO + "/containers/pcbk-student-11/json") in PASSED
     finally:
-        stack.stop("pcbk-student-10")      # место есть — Docker его запускает, тест возвращает в сон
+        stack.stop("pcbk-student-11")      # место есть — Docker его запускает, тест возвращает в сон
 
 
 def test_socket_only_in_hardened_proxies(stack):

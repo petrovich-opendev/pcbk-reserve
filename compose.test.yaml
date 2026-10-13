@@ -108,3 +108,4 @@ services:
   student-08: *runc
   student-09: *runc
   student-10: *runc
+  student-11: *runc

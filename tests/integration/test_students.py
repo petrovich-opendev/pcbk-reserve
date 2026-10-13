@@ -1,4 +1,5 @@
-"""Десять рабочих мест в компоновке: свои объекты, наблюдение сторожа, жёсткость, сеть, пароль, заглушки."""
+"""Одиннадцать рабочих мест в компоновке (место 11 — Д15б): свои объекты, наблюдение сторожа, жёсткость, сеть,
+пароль, заглушки."""
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from workplace import IMAGE, MOUNTS, STUB_PREFIX, WORKPLACE_ENV
 ROOT = Path(__file__).resolve().parents[2]
 RO = "http://pcbk-sp-ro:2375/v1.44"
 CTL = "http://pcbk-sp-ctl:2375/v1.44"
-WORKPLACES = {f"pcbk-student-{n:02d}" for n in range(1, 11)}
+WORKPLACES = {f"pcbk-student-{n:02d}" for n in range(1, 12)}
 HISTORIAN_ADDR = os.environ.get("HISTORIAN_ADDR", "192.0.2.10")   # адрес заказчика — только из окружения
 RUNTIME_ENV = {"HOSTNAME", "PWD", "SHLVL", "_", "OLDPWD"}         # добавляют Docker и bash при exec
 PROBE_AGENT = "---\ndescription: Проба видимости агента\nmode: primary\n---\nТы — проба.\n"
@@ -62,13 +63,13 @@ def test_every_workplace_is_watched(stack, asleep):                # Review Focu
     watched = {c["container"] for c in comps if c["kind"] == "container" and c["sleeping_ok"]}
     assert in_compose == watched == WORKPLACES
     # ждём целевое состояние, а не любое ok: старый снимок с «работает» не проходит
-    stack.wait_status(lambda d: len(student_rows(d)) == 10 and
+    stack.wait_status(lambda d: len(student_rows(d)) == 11 and
                       set(student_rows(d).values()) == {("ok", "спит")}, timeout=30)
 
 
 def test_each_workplace_uses_own_objects(stack):                   # Review Focus 2
     cfg, stu = stack.prod_config(), stack.stu_net
-    for n in range(1, 11):
+    for n in range(1, 12):
         nn = f"{n:02d}"
         s = cfg["services"][f"student-{nn}"]
         assert s["container_name"] == f"pcbk-student-{nn}"
@@ -145,7 +146,7 @@ def test_student_hardening(stack, running):                        # Review Focu
            (1024 ** 3, 1024 ** 3, 512, 1.0)
     agents = next(v for v in s["volumes"] if v["target"] == "/etc/pcbk-opencode/opencode/agents")
     assert agents["read_only"] is True and not agents.get("bind", {}).get("create_host_path")
-    for n in range(2, 11):                                         # блоки 02–10 — копия 01 с точностью до номера
+    for n in range(2, 12):                                         # блоки 02–11 — копия 01 с точностью до номера
         assert norm(services[f"student-{n:02d}"], n) == norm(s, 1), n
 
 
@@ -223,7 +224,7 @@ def routes(table: str) -> list[tuple[str, str]]:
 
 def test_no_route_anywhere(stack, running):
     stu = stack.stu_net
-    nets = [f"pcbk-stu-{n:02d}" for n in range(1, 11)]
+    nets = [f"pcbk-stu-{n:02d}" for n in range(1, 12)]
     assert stack.host_bridge_addresses(*nets) == []                # главное: у мостов нет адреса хоста
     for n, net in enumerate(nets, 1):
         info = stack.network(net)
@@ -274,7 +275,7 @@ def test_env_holds_only_own_secret(stack, running):
     values = {v for _, v in pairs}
     own = stack.password(1) in values
     # чужие пароли и токены данных, свои токены LLM и данных — только файлами, не в окружении
-    foreign = bool(values & ({stack.password(n) for n in range(2, 11)} | {stack.data_token(n) for n in range(1, 11)}
+    foreign = bool(values & ({stack.password(n) for n in range(2, 12)} | {stack.data_token(n) for n in range(1, 12)}
                              | {stack.llm_token(1)}))
     assert (own, foreign) == (True, False)
 

@@ -41,7 +41,7 @@ def test_edge_does_not_expose_core(stack):
         assert stack.https(path)[0] == 404
 
 
-STU_NETS = [f"pcbk-stu-{n:02d}" for n in range(1, 11)]
+STU_NETS = [f"pcbk-stu-{n:02d}" for n in range(1, 12)]
 
 
 def test_egress_network_only_core(stack):
@@ -51,7 +51,7 @@ def test_egress_network_only_core(stack):
     assert n["Options"].get("com.docker.network.bridge.enable_ip_masquerade", "true") == "true"
     # двойник OpenRouter — только в тестовом стенде (compose.test.yaml)
     assert sorted(c["Name"] for c in n["Containers"].values()) == ["pcbk-core", "pcbk-test-openrouter"]
-    # тринадцать сетей: pcbk-front, pcbk-egress, pcbk-ctl (клиент sp-ctl, Д5-R31) и десять сетей мест на .2
+    # четырнадцать сетей: pcbk-front, pcbk-egress, pcbk-ctl (клиент sp-ctl, Д5-R31) и одиннадцать сетей мест на .2
     nets = stack.inspect("pcbk-core")["NetworkSettings"]["Networks"]
     assert set(nets) == {"pcbk-front", "pcbk-egress", "pcbk-ctl", *STU_NETS} and \
         nets["pcbk-egress"]["IPAddress"] == "172.31.250.82"
@@ -67,7 +67,7 @@ def test_core_in_workplace_networks_on_dot2(stack):                         # Д
     # тот же адрес, что у места в extra_hosts: место зовёт core по имени (под gVisor DNS нет)
     places = stack.prod_config()["services"]
     assert [[tuple(re.split(r"[:=]", h, maxsplit=1)) for h in places[f"student-{n:02d}"]["extra_hosts"]]
-            for n in range(1, 11)] == [[("core", f"{stack.stu_net}.{n}.2")] for n in range(1, 11)]
+            for n in range(1, 12)] == [[("core", f"{stack.stu_net}.{n}.2")] for n in range(1, 12)]
 
 
 def test_only_core_declares_egress(stack):
@@ -101,13 +101,13 @@ def test_core_secret_and_list_are_readonly_files(stack):
     assert prod["pull_policy"] == "never"
     # двойник OpenRouter и частый опрос — только в compose.test.yaml; на сервере — настоящий OpenRouter
     assert not {"OPENROUTER_BASE_URL", "LLM_POLL_S"} & set(prod["environment"])
-    # секреты core — ровно эти пятнадцать файлов: ключи OpenRouter — среди них, а не в окружении; пароли мест
-    # (Д5а) знает только шлюз — секретами Compose student-NN-pw
+    # секреты core — ровно эти шестнадцать файлов (место 11 — Д15б): ключи OpenRouter — среди них, а не в
+    # окружении; пароли мест (Д5а) знает только шлюз — секретами Compose student-NN-pw
     assert sorted(x["target"] for x in prod["secrets"]) == \
         ["bdrv.env", "core-tokens", "llm-tokens", "openrouter-mgmt.key", "openrouter.key",
-         *(f"student-{n:02d}.pw" for n in range(1, 11))]
+         *(f"student-{n:02d}.pw" for n in range(1, 12))]
     assert {x["target"]: x["source"] for x in prod["secrets"] if x["target"].startswith("student-")} == \
-        {f"student-{n:02d}.pw": f"student-{n:02d}-pw" for n in range(1, 11)}
+        {f"student-{n:02d}.pw": f"student-{n:02d}-pw" for n in range(1, 12)}
 
 
 def test_prod_compose_has_no_memory_twins(stack):                             # Д11-R123а
@@ -137,9 +137,9 @@ def test_tool_over_egress_answers_and_journals(stack):
 
 
 def test_core_state_volume_writable(stack):                                     # Review Focus 4
-    # в тестовом стенде bdrv.env целый — 13 направлений: историан, OpenRouter (Д4а), pcbk-sp-ctl и десять мест
-    # на STU.N.3:4096 (Д5а); bdrv.env не читается — было бы 12, без историана (П3, Ш3)
-    assert "охрана выхода: разрешено 13 направлений" in stack.logs("pcbk-core")
+    # в тестовом стенде bdrv.env целый — 14 направлений: историан, OpenRouter (Д4а), pcbk-sp-ctl и одиннадцать
+    # мест на STU.N.3:4096 (Д5а, место 11 — Д15б); bdrv.env не читается — было бы 13, без историана (П3, Ш3)
+    assert "охрана выхода: разрешено 14 направлений" in stack.logs("pcbk-core")
     # core.db создаётся в начале lifespan роли (F23) — файл есть до первого вызова инструмента
     mounts = {m["Destination"]: m for m in stack.inspect("pcbk-core")["Mounts"]}
     assert mounts["/var/lib/pcbk-core"]["Type"] == "volume"
