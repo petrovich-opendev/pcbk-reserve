@@ -55,7 +55,7 @@ test("overview_without_llm_and_places_order", () => {
   expect(o.budget).toBeNull();
   expect(o.places[2]!.share_cents).toBeNull();
   expect(transferChanges(o, "03", "05", 100)).toBe("Доли бюджета недоступны — перевод закрыт");
-  // места — ровно 01…10 по порядку; доля — целые центы не меньше нуля
+  // места — ровно 01…11 по порядку; доля — целые центы не меньше нуля
   const swapped = [...overview.places];
   [swapped[0], swapped[1]] = [swapped[1]!, swapped[0]!];
   expect(parseOverview({ ...overview, places: swapped })).toBeNull();
