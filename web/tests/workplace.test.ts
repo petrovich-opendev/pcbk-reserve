@@ -35,7 +35,8 @@ function fakeApi(q: { wake?: Reply[]; workplace?: Reply[] }): Api & { calls: str
     calls.push(name); return list.length > 1 ? list.shift()! : list[0] ?? { status: 0, body: null };
   };
   return { calls, me: take("me"), logout: take("logout"), wake: take("wake", q.wake), workplace: take("workplace", q.workplace),
-           ackNotice: take("ackNotice"), agents: take("agents"), events: take("events"), calc: take("calc"),
+           ackNotice: take("ackNotice"), agents: take("agents"), events: take("events"),
+           lessons: take("lessons"), lesson: take("lesson"), calc: take("calc"),
            report: async () => { calls.push("report"); } };
 }
 const R = (status: number, body: unknown): Reply => ({ status, body });
@@ -120,7 +121,8 @@ test("abort_during_request_ignores_late_reply", async () => {
   let answer!: (r: Reply) => void;
   const calls: string[] = [];
   const api: Api = {
-    me: vi.fn(), logout: vi.fn(), ackNotice: vi.fn(), agents: vi.fn(), events: vi.fn(), calc: vi.fn(), report: vi.fn(),
+    me: vi.fn(), logout: vi.fn(), ackNotice: vi.fn(), agents: vi.fn(), events: vi.fn(),
+    lessons: vi.fn(), lesson: vi.fn(), calc: vi.fn(), report: vi.fn(),
     wake: async () => { calls.push("wake"); return R(202, { state: "starting" }); },
     workplace: () => { calls.push("workplace"); return new Promise<Reply>((r) => { answer = r; }); },
   };
@@ -136,7 +138,7 @@ test("abort_during_request_ignores_late_reply", async () => {
 
   let woke!: (r: Reply) => void;                                                  // то же для ответа wake
   const api2: Api = { me: vi.fn(), logout: vi.fn(), workplace: vi.fn(), ackNotice: vi.fn(), agents: vi.fn(), events: vi.fn(),
-    calc: vi.fn(), report: vi.fn(),
+    lessons: vi.fn(), lesson: vi.fn(), calc: vi.fn(), report: vi.fn(),
     wake: () => new Promise<Reply>((r) => { woke = r; }) };
   const ctl2 = new AbortController(); const onView2 = vi.fn();
   const done2 = wakeAndWait({ api: api2, onView: onView2, signal: ctl2.signal });

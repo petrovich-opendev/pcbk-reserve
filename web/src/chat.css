@@ -198,6 +198,21 @@ svg.profile circle { fill: var(--accent); }
 /* заголовки, время и «значение / задание» — без переноса по буквам (живой показ 12.10: «Врем я») */
 .events-table th, .events-table td:first-child, .events-table td:nth-child(7) { white-space: nowrap; }
 
+/* вкладка «Уроки» (Д15а): список слева, текст урока справа; список переносится сверху при узком экране */
+.lessons { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: .75rem; padding: 1rem; }
+.lessons-head h2 { margin: 0; font-size: 1.2rem; }
+.lessons-msg { margin: 0; color: var(--fail); font-weight: 600; }
+.lessons-note { margin: 0; color: var(--muted); }
+.lessons-body { display: grid; grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr); gap: 1rem; align-items: start; }
+.lessons-list { display: flex; flex-direction: column; gap: .4rem; }
+.lessons-list button { display: flex; flex-direction: column; align-items: flex-start; gap: .1rem; padding: .5rem .7rem;
+  text-align: left; }
+.lessons-list button[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.lessons-item-title { font-weight: 600; }
+.lessons-item-summary { font-size: .85em; color: var(--muted); }
+.lessons-content { min-width: 0; }
+@media (max-width: 899px) { .lessons-body { grid-template-columns: minmax(0, 1fr); } }
+
 /* кабинет преподавателя (Д10-R106): таблица мест слева, открытое место справа; ниже — доли и журнал. Колонка
    прокручивается сама, как вкладка калькуляторов; поля долей — классы .calc-row и .calc-field */
 .teacher { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: .9rem; padding: 1rem; }

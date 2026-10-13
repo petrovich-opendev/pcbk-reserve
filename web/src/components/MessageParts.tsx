@@ -24,7 +24,8 @@ type MdProps<T extends "a" | "img"> = ComponentPropsWithoutRef<T> & { node?: unk
 // ссылка: href — только безопасный (react-markdown уже вырезал javascript: и прочие схемы, это второй
 // рубеж и отказ от mailto:, data:, file: и хоста без схемы); без Referer. Якорь (сноски GFM) — на этой же
 // странице: новая вкладка открыла бы вторую копию чата и тратила бы пределы шлюза на cookie
-function Link({ href, title, children }: MdProps<"a">) {
+// Экспортирован (Д15а, Ruling 2): та же ссылка — в markdown вкладки «Уроки» (LessonMarkdown), без копии логики.
+export function Link({ href, title, children }: MdProps<"a">) {
   const safe = typeof href === "string" && SAFE_HREF.test(href) ? href : undefined;
   const target = safe === undefined || safe.startsWith("#") ? undefined : "_blank";
   return <a href={safe} title={title} rel="noopener noreferrer" target={target}>{children}</a>;

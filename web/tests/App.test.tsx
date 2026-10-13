@@ -17,7 +17,7 @@ type Answers = Answer | Answer[];
 
 // Ответы по ручкам: один ответ — на каждый вызов, список — по очереди (последний повторяется).
 function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: Answers; ackNotice?: Answers; agents?: Answers;
-                   events?: Answers; calc?: Answers }) {
+                   events?: Answers; lessons?: Answers; lesson?: Answers; calc?: Answers }) {
   const queue = (a: Answers | undefined): (() => Promise<Reply>) => {
     const list: Answer[] = a === undefined ? [[500, null]] : typeof a[0] === "number" ? [a as Answer] : a as Answer[];
     let i = 0;
@@ -35,6 +35,8 @@ function api(o: { me?: Answers; workplace?: Answers; wake?: Answers; logout?: An
     ackNotice: vi.fn(queue(o.ackNotice)),
     agents: vi.fn(queue(o.agents)),
     events: vi.fn(queue(o.events)),
+    lessons: vi.fn(queue(o.lessons)),
+    lesson: vi.fn(queue(o.lesson)),
     calc: vi.fn(queue(o.calc)),
     report: vi.fn(async (_kind: string) => {}),
   } satisfies Api;
@@ -458,6 +460,24 @@ test("events_tab_signed_out_goes_to_login", async () => {
   fireEvent.click(screen.getByRole("button", { name: "События" }));
   await waitFor(() => expect(navigate).toHaveBeenCalledWith("/login"));
   expect(screen.queryByRole("button", { name: "События" })).toBeNull();           // ушли на вход — вкладок нет
+});
+
+// --- Д15а: вкладка «Уроки» — только у студента, рядом с «События»; по умолчанию не выбрана (видна «Чат») ---
+
+test("lessons_tab_present_for_student_not_teacher", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }] });
+  const first = render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  const lessonsTab = screen.getByRole("button", { name: "Уроки" });
+  expect(lessonsTab.getAttribute("aria-pressed")).toBe("false");                  // чат открыт по умолчанию, не «Уроки»
+  expect(screen.getByRole("button", { name: "Чат" }).getAttribute("aria-pressed")).toBe("true");
+  first.unmount();
+
+  const t = api({ me: [200, { login: "t", role: "teacher", place: null }] });
+  render(<App api={t} teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })} navigate={vi.fn()}
+              ChatImpl={FakeChat} startPolling={okPolling} />);
+  await screen.findByText("Кабинет преподавателя");
+  expect(screen.queryByRole("button", { name: "Уроки" })).toBeNull();             // только у студента
 });
 
 // --- Д10б: вкладки «Кабинет» и «Калькуляторы» у преподавателя (Д10-R110, Д10-R109) ---
