@@ -11,6 +11,7 @@ import type {
 import { MarkdownTextPrimitive, type MarkdownTextPrimitiveProps } from "@assistant-ui/react-markdown";
 import type { ComponentPropsWithoutRef } from "react";
 import remarkGfm from "remark-gfm";
+import { remarkSoftBreaks } from "../remarkSoftBreaks";
 import {
   T_IMAGE, T_TOOL_DONE, T_TOOL_ERROR, T_TOOL_LINE, T_TOOL_RUNNING, TOOL_LABELS,
 } from "../texts";
@@ -38,7 +39,7 @@ function ImageText({ alt }: MdProps<"img">) {
 
 // постоянные объекты: MarkdownTextPrimitive и MessagePrimitive.Parts сравнивают их по ссылке (memo)
 const MARKDOWN_COMPONENTS: MarkdownTextPrimitiveProps["components"] = { a: Link, img: ImageText };
-const REMARK_PLUGINS: MarkdownTextPrimitiveProps["remarkPlugins"] = [remarkGfm];
+export const REMARK_PLUGINS: MarkdownTextPrimitiveProps["remarkPlugins"] = [remarkGfm, remarkSoftBreaks];
 
 export const MarkdownText: TextMessagePartComponent = () => (
   <MarkdownTextPrimitive className="md" remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS} />

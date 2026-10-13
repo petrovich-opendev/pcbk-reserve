@@ -9,9 +9,8 @@
 import { TextMessagePartProvider } from "@assistant-ui/react";
 import { MarkdownTextPrimitive, type MarkdownTextPrimitiveProps } from "@assistant-ui/react-markdown";
 import type { ComponentPropsWithoutRef } from "react";
-import remarkGfm from "remark-gfm";
 import { T_IMAGE } from "../texts";
-import { Link } from "./MessageParts";
+import { Link, REMARK_PLUGINS } from "./MessageParts";
 
 export interface LessonMarkdownProps {
   markdown: string;
@@ -31,7 +30,6 @@ function LessonImage({ src, alt }: ImgProps) {
 
 // постоянные объекты: MarkdownTextPrimitive сравнивает их по ссылке (memo), как в MessageParts.tsx
 const MARKDOWN_COMPONENTS: MarkdownTextPrimitiveProps["components"] = { a: Link, img: LessonImage };
-const REMARK_PLUGINS: MarkdownTextPrimitiveProps["remarkPlugins"] = [remarkGfm];
 
 export function LessonMarkdown(p: LessonMarkdownProps) {
   return (
