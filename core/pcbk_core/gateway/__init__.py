@@ -50,9 +50,14 @@ HALT_WATCH_S смотрит флаг защёлки (llm.brake.event — threadi
 304 — удача, не глядя на running (до первого такта уборщика он пуст). Дальше каждый такт уборщика гасит любое место
 прогона, которое inspect видит работающим (Workplaces._pass).
 
-Модули accounts, agents_api, api, calc_api, proxy, teacher_api и web (а через них — accounts) здесь импортируются только
-внутри методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет, импортирующий её модуль при
-загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
+Пакет уроков (Д15а) — lessons_router: GET /pcbk/api/lessons*, вкладка «Уроки» студента; зона и настройка — у маршрута,
+сессия — любая вошедшая учётка (и студент, и преподаватель, в отличие от /pcbk/api/agents и /pcbk/api/events — место
+ручкам не нужно). self.lessons_root — только путь (settings.LESSONS_ROOT); lessons.py читает каталог с диска на
+каждый запрос, без своего хранилища и без кеша — правка файла на сервере видна без перезапуска.
+
+Модули accounts, agents_api, api, calc_api, lessons_api, proxy, teacher_api и web (а через них — accounts) здесь
+импортируются только внутри методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет,
+импортирующий её модуль при загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
 """
 from __future__ import annotations
 
@@ -287,6 +292,8 @@ class GatewayRole(RoleBase):
         self.agents = AgentStore(settings.DB_PATH, settings.AGENTS_ROOT)
         # находки агентов (Д13: свой AgentFindings на тот же core.db, читает GET /pcbk/api/events)
         self.findings = AgentFindings(settings.DB_PATH)
+        # пакет уроков (Д15а): только путь — lessons.py читает с диска на каждый запрос, без своего хранилища
+        self.lessons_root = settings.LESSONS_ROOT
         self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
                                     wallclock=wallclock, drill=gw.DRILL_AGENTS)
         workplaces.on_ready = self.reloads.place_ready
@@ -302,6 +309,7 @@ class GatewayRole(RoleBase):
         from .agents_api import agents_router
         from .api import auth_router, catch_all_router, configured, front_only, workplace_router
         from .calc_api import calc_router
+        from .lessons_api import lessons_router
         from .proxy import proxy_router
         from .teacher_api import teacher_router
         from .web import web_router
@@ -314,6 +322,8 @@ class GatewayRole(RoleBase):
         router.include_router(web_router(self))         # зона и настройка — у маршрутов отчётов; до ловящего
         router.include_router(agents_router(self))      # /health/agents (Д7а) и /pcbk/api/agents (Д7б): зона и
                                                         # настройка — у маршрутов (m24); до ловящего
+        router.include_router(lessons_router(self))     # /pcbk/api/lessons* (Д15а): зона и настройка — у маршрута;
+                                                        # сессия — любая учётка (студент и преподаватель)
         router.include_router(calc_router(self))        # калькуляторы страницы (Д9а): зона и настройка — у маршрута
         router.include_router(teacher_router(self))     # /health/teacher (Д10а): зона — у маршрута; до ловящего
 

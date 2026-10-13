@@ -33,6 +33,8 @@ class Settings:
     # агенты студентов (Д7-R53): ${AGENTS_DIR} хоста на запись; student-NN — каталоги мест (их точки монтирования),
     # quarantine и archive — в корне, вне каталогов мест
     AGENTS_ROOT: str = "/srv/agents"
+    # пакет уроков (Д15а): ${LESSONS_DIR} хоста на чтение (core только читает); lessons.json, <id>.md, img/<имя>
+    LESSONS_ROOT: str = "/srv/lessons"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
