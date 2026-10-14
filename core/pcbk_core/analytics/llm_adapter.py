@@ -69,7 +69,8 @@ False`); до этого модуля с политикой `none` в обычн
 по-прежнему отказывает ей явно (и любому неизвестному значению) — защита на случай ручной сборки
 `Preanalysis` в тестах/будущем коде, не промолчать телом без ограничения.
 
-Строгий формат ответа — `response_format` с `json_schema` по `contracts/llm-selection.schema.json`,
+Строгий формат ответа — `response_format` с `json_schema` (обёртка `name`/`strict`/`schema`, без ключей, которых нет
+в грамматике поставщика, — `_response_format`) по `contracts/llm-selection.schema.json`,
 дополнительно суженной для этого запроса: `enum` у `reference_claim_ids`/`mechanism_ids` — ровно разрешённый
 пакет (или `maxItems: 0`, если он пуст), `calculation_ids.maxItems = 0` вне `intent == "calculation"`
 (докстринг самой схемы: «сервер дополнительно сужает enum под конкретный пакет»).
@@ -177,6 +178,32 @@ def _narrow_schema(schema: dict, *, claim_ids: "Sequence[str]", mechanism_ids: "
     return narrowed
 
 
+# ключи схемы, которые грамматика строгого вывода поставщика не реализует (DeepInfra, Д17: «Grammar error:
+# Unimplemented keys: ["uniqueItems"]») — уникальность и пределы всё равно перепроверяет сервер (LlmSelection,
+# validator.validate_selection; мастер-промпт §8: «при неподдержанном строгом формате поставщика можно принимать
+# JSON-объект с той же последующей строгой валидацией»)
+_PROVIDER_UNSUPPORTED_KEYS = frozenset({"uniqueItems"})
+_SCHEMA_META_KEYS = ("$schema", "$id", "description")
+
+
+def _without_keys(node: object, keys: frozenset[str]) -> object:
+    if isinstance(node, dict):
+        return {k: _without_keys(v, keys) for k, v in node.items() if k not in keys}
+    if isinstance(node, list):
+        return [_without_keys(v, keys) for v in node]
+    return node
+
+
+def _response_format(narrowed: dict) -> dict:
+    """`response_format` в формате OpenAI/OpenRouter: `json_schema` — обёртка `name`/`strict`/`schema`, не сама
+    схема (Д17, живая проверка: без обёртки DeepInfra отвечает 422 «Input should be 'text'», а Fireworks молча
+    игнорирует схему и возвращает произвольный JSON — строгий разбор ответа модели не проходил). Служебные ключи
+    схемы (`$schema`, `$id`, `description`) и ключи, которых нет в грамматике поставщика, — снимаются."""
+    schema = {k: v for k, v in narrowed.items() if k not in _SCHEMA_META_KEYS}
+    return {"type": "json_schema", "json_schema": {
+        "name": "llm_selection", "strict": True, "schema": _without_keys(schema, _PROVIDER_UNSUPPORTED_KEYS)}}
+
+
 def _resolved_term_ids(preanalysis: "Preanalysis") -> list[str]:
     """Только id терминов (не исходное слово вопроса `ResolvedTerm.original`): выбранный, если преданализ его
     определил, иначе все кандидаты — без повторов, по возрастанию (детерминированное тело)."""
@@ -237,7 +264,8 @@ def build_raw_body(preanalysis: "Preanalysis", pack: tuple["EvidenceCard", ...],
     числиться разрешённым преданализом, и реально присутствовать в пакете этого запроса, не текстом фрагментов
     целиком) и одно пользовательское — абстрактное намерение (`preanalysis.intent`, id разрешённых терминов/
     узлов/расхождений); `stream: False` (аналитика не стримит ответ клиенту); `response_format` —
-    `{"type": "json_schema", "json_schema": {...}}` по `contracts/llm-selection.schema.json`, суженной
+    `{"type": "json_schema", "json_schema": {"name", "strict", "schema"}}` (`_response_format`) по
+    `contracts/llm-selection.schema.json`, суженной
     `_narrow_schema` под этот пакет.
 
     Политика передачи (докстринг модуля, решение владельца F6 14.10.2026) — `public_only` (умолчание): как
@@ -285,7 +313,7 @@ def build_raw_body(preanalysis: "Preanalysis", pack: tuple["EvidenceCard", ...],
             {"role": "user", "content": json.dumps(user, ensure_ascii=False, sort_keys=True)},
         ],
         "stream": False,
-        "response_format": {"type": "json_schema", "json_schema": narrowed_schema},
+        "response_format": _response_format(narrowed_schema),
     }
 
 

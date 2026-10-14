@@ -112,16 +112,31 @@ def test_build_raw_body_drops_allowed_id_missing_from_pack():
 def test_build_raw_body_narrows_schema_enum_and_zeroes_empty_or_unused():
     pre = _preanalysis(intent="definition", allowed_claim_ids=("CLAIM-FAKE-001",))
     raw = llm_adapter.build_raw_body(pre, (_card("CLAIM-FAKE-001"),), schema=SCHEMA)
-    props = raw["response_format"]["json_schema"]["properties"]
+    props = raw["response_format"]["json_schema"]["schema"]["properties"]
     assert props["reference_claim_ids"]["items"]["enum"] == ["CLAIM-FAKE-001"]
     assert props["mechanism_ids"].get("maxItems") == 0          # пусто — maxItems 0, не enum: []
     assert props["calculation_ids"].get("maxItems") == 0        # intent != calculation
 
 
+def test_build_raw_body_response_format_is_wrapped_and_provider_safe():
+    """Д17, живая проверка: `json_schema` — обёртка name/strict/schema (без неё DeepInfra — 422, Fireworks молча
+    игнорирует схему); служебных ключей схемы и `uniqueItems` (грамматика DeepInfra его не реализует) в теле
+    нет — уникальность перепроверяет сервер."""
+    raw = llm_adapter.build_raw_body(_preanalysis(allowed_claim_ids=("CLAIM-FAKE-001",)),
+                                     (_card("CLAIM-FAKE-001"),), schema=SCHEMA)
+    fmt = raw["response_format"]["json_schema"]
+    assert set(fmt) == {"name", "strict", "schema"} and fmt["name"] == "llm_selection" and fmt["strict"] is True
+    dumped = json.dumps(fmt["schema"])
+    assert '"uniqueItems"' not in dumped and '"$schema"' not in dumped and '"$id"' not in dumped
+    assert '"uniqueItems"' in json.dumps(SCHEMA)          # исходная схема контракта не тронута
+    assert fmt["schema"]["required"] == SCHEMA["required"]
+    assert fmt["schema"]["additionalProperties"] is False
+
+
 def test_build_raw_body_allows_calculation_ids_when_intent_is_calculation():
     raw = llm_adapter.build_raw_body(_preanalysis(intent="calculation"), (), schema=SCHEMA)
     not_calc = SCHEMA["properties"]["calculation_ids"]["maxItems"]               # исходный предел схемы (4)
-    assert raw["response_format"]["json_schema"]["properties"]["calculation_ids"]["maxItems"] == not_calc
+    assert raw["response_format"]["json_schema"]["schema"]["properties"]["calculation_ids"]["maxItems"] == not_calc
 
 
 def test_build_raw_body_rejects_unsupported_export_policy():
@@ -142,7 +157,7 @@ def test_build_raw_body_approved_subset_includes_question_and_card_text():
     assert user["cards"] == [{"id": "CLAIM-FAKE-001",
                               "text": f"Выдуманная карточка CLAIM-FAKE-001: {FAKE_TAG}.", "fragments": []}]
     # ответ модели по-прежнему ограничен той же схемой — только id, не текст (narrow по тем же claim_ids)
-    assert raw["response_format"]["json_schema"]["properties"]["reference_claim_ids"]["items"]["enum"] == \
+    assert raw["response_format"]["json_schema"]["schema"]["properties"]["reference_claim_ids"]["items"]["enum"] == \
         ["CLAIM-FAKE-001"]
 
 
