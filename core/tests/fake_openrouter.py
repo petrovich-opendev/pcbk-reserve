@@ -71,7 +71,8 @@ WORDS = ("FAKE402", "FAKE402INFLIGHT", "FAKE403KEY", "FAKE403REGION", "FAKE401",
          "FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD", "FAKEDEAR")
 _WORD = re.compile(r"\bFAKE[A-Z0-9]+\b")
 # закреплённая точка запроса (provider.only прокси) → имя провайдера в ответе, как его пишет OpenRouter
-PROVIDER_NAMES = {"fireworks": "Fireworks", "google-vertex/global": "Google Vertex", "azure": "Azure"}
+PROVIDER_NAMES = {"fireworks": "Fireworks", "google-vertex/global": "Google Vertex", "azure": "Azure",
+                  "deepinfra/fp8": "DeepInfra"}
 DEFAULT_PROVIDER = "Fireworks"
 SAVE_WORDS = ("FAKESAVE", "FAKESAVESLOW", "FAKESAVEBAD")
 SAVE_NAME = "proverka-d7a"              # имя агента, если в вопросе нет «agent=<имя>»

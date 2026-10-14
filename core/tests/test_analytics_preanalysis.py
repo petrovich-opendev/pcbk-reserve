@@ -758,13 +758,14 @@ def test_clarification_candidates_caps_at_six(handle):
 
 def test_clarification_candidates_only_first_ambiguous_term_used(handle):
     """Несколько спорных терминов одновременно — подписи только ПЕРВОГО (докстринг функции): объединённый
-    список кандидатов двух разных слов в одной секции было бы невозможно понять."""
-    first = ResolvedTerm(original="альфа", candidate_ids=["TERM-FAKE-001"], selected_id=None,
+    список кандидатов двух разных слов в одной секции было бы невозможно понять. ДВА кандидата у каждого
+    термина (не один, правка Task 5, п.5: одного кандидата здесь недостаточно, см. тесты ниже)."""
+    first = ResolvedTerm(original="альфа", candidate_ids=["TERM-FAKE-001", "TERM-FAKE-002"], selected_id=None,
                          requires_confirmation=True)
-    second = ResolvedTerm(original="бета", candidate_ids=["TERM-FAKE-002"], selected_id=None,
+    second = ResolvedTerm(original="бета", candidate_ids=["TERM-FAKE-003", "TERM-FAKE-004"], selected_id=None,
                           requires_confirmation=True)
     labels = clarification_candidates(handle, _nq("альфа бета"), (first, second))
-    assert labels == ("выдуманный термин 1",)
+    assert labels == ("выдуманный термин 1", "выдуманный термин 2")
 
 
 def test_clarification_candidates_end_to_end_via_render_clarification_section(handle):
@@ -1000,11 +1001,40 @@ def test_term_phrase_single_word_still_ambiguous(handle):
     assert pack == ()
 
 
-def test_term_phrase_ambiguous_term_still_clarifies(handle):
-    """Термин, точно совпавший ФРАЗОЙ, но помеченный `ambiguous` в корпусе, — уточнение сохраняется (равенство
-    множества основ не отменяет флаг корпуса, план §Task 3, раунд 1)."""
+def test_term_phrase_single_non_basis_sensitive_candidate_still_asks_quantity(handle):
+    """Правка Task 5, п.5, ИСПРАВЛЕНО ревью дельты (Critical-1): термин, точно совпавший ФРАЗОЙ, с РОВНО
+    ОДНИМ кандидатом, но НЕ являющийся базочувствительной величиной («Теневая зона» — не влажность/вакуум/
+    давление/..., по образцу «Верх»/«Низ»/«ПЦ» из находки ревью), ВСЁ РАВНО просит `"quantity"` — его
+    неоднозначность не покрывается никаким другим полем. Контраст — тест ниже про фразу, совпавшую с ДВУМЯ
+    терминами (тоже спорна), и тест про базочувствительный одиночный кандидат (НЕ спорен)."""
     path = Path(handle.path)
     _insert_term_row(path, "TERM-TEST-AMBIG-PHRASE", "Теневая зона", ambiguous=True)
+
+    pre, pack = analyze(STUDENT, _request("Что такое теневая зона?"), handle, handle.version)
+    assert "quantity" in pre.missing_fields
+    assert pre.decision == "needs_clarification"
+    assert pack == ()
+
+
+def test_term_phrase_single_basis_sensitive_candidate_no_quantity_but_basis(handle):
+    """Контраст: термин с РОВНО одним кандидатом, совпавший ФРАЗОЙ, но являющийся базочувствительной
+    величиной (основа «вакуумн» совпадает с «вакуум» из `_BASIS_SENSITIVE_STEMS`) — `"quantity"` не
+    запрашивается (выбирать не из чего, контекст покрывает `"basis"`), `"basis"` остаётся (слово «вакуумная»
+    и в тексте вопроса)."""
+    path = Path(handle.path)
+    _insert_term_row(path, "TERM-TEST-VAC-PHRASE", "Вакуумная зона", ambiguous=True)
+
+    pre, pack = analyze(STUDENT, _request("Что такое вакуумная зона?"), handle, handle.version)
+    assert "quantity" not in pre.missing_fields
+    assert "basis" in pre.missing_fields
+
+
+def test_term_phrase_two_candidates_same_name_still_clarifies(handle):
+    """Контраст к тесту выше: ДВА термина с одинаковым (по основам) названием, совпавшим фразой, — `quantity`
+    всё ещё запрашивается (два и более кандидата — план §Task 3, раунд 1/Task 5, п.5)."""
+    path = Path(handle.path)
+    _insert_term_row(path, "TERM-TEST-DUP-PHRASE-A", "Теневая зона", ambiguous=False)
+    _insert_term_row(path, "TERM-TEST-DUP-PHRASE-B", "Теневая зона", ambiguous=False)
 
     pre, pack = analyze(STUDENT, _request("Что такое теневая зона?"), handle, handle.version)
     assert pre.decision == "needs_clarification"
@@ -1857,5 +1887,409 @@ def test_real_corpus_equipment_label_question_no_quantity_basis_clarification():
         assert "basis" not in pre.missing_fields
         pre2, _pack2 = analyze(STUDENT, _request(f"Что сейчас на {label}?"), h, h.version)
         assert pre2.decision in ("ready", "limited_answer")
+    finally:
+        _close(h)
+
+
+# === Task 5 (Д17), п.1: цифра кода машины («КДМ-1»/«БДМ-2»/«КДМ1») — не номер узла/бассейна ===
+
+def test_digit_node_process_ids_ignores_digit_inside_machine_code(handle):
+    """Без исключения «КДМ-1» (цифра «1» — часть кода, не номер узла) находила узел №1 (и 10/11/12 по
+    префиксу FTS5) и ложно требовала уточнить участок. Код ЛЮБОЙ машины (в т.ч. самой КДМ-1) — цифра всё
+    равно часть кода, `_mentions_other_machine` при этом не меняется (чужая машина определяется отдельно)."""
+    from pcbk_core.analytics.preanalysis import _digit_node_process_ids
+
+    assert _digit_node_process_ids(handle, "Расскажи про КДМ-1") == []
+    assert _digit_node_process_ids(handle, "Расскажи про КДМ1") == []
+    assert _digit_node_process_ids(handle, "Расскажи про БДМ-2") == []
+    assert _digit_node_process_ids(handle, "узел 1") != []        # контроль: обычная цифра всё ещё находится
+
+
+def test_analyze_kdm1_machine_code_digit_does_not_force_process_clarification(handle):
+    """End-to-end: вопрос с «КДМ-1», но без иного основания для `"process"`, — участок не запрашивается
+    (цифра кода машины больше не создаёт ложных кандидатов узла)."""
+    pre, _pack = analyze(STUDENT, _request("Какая влажность на КДМ-1 сейчас?"), handle, handle.version)
+    assert "process" not in pre.missing_fields
+
+
+# === Task 5, п.2: число-значение с единицей/«%»/«куб…», десятичное число — не номер узла/бассейна ===
+
+def test_digit_node_process_ids_ignores_number_with_known_unit_or_decimal(handle):
+    from pcbk_core.analytics.preanalysis import _digit_node_process_ids
+
+    assert _digit_node_process_ids(handle, "расход 200 м3/ч") == []
+    assert _digit_node_process_ids(handle, "расход 200 кубов в час") == []
+    assert _digit_node_process_ids(handle, "расход 7 куб/ч") == []
+    assert _digit_node_process_ids(handle, "давление 4%") == []
+    assert _digit_node_process_ids(handle, "плотность 1,5 т/м3") == []
+    assert _digit_node_process_ids(handle, "масса 115.9 г/м2") == []
+    # контроль: номер узла/бассейна БЕЗ единицы рядом — не затронут (единица ищется сразу после числа)
+    assert _digit_node_process_ids(handle, "узел 7") != []
+    assert _digit_node_process_ids(handle, "бассейн 8") != []
+
+
+def test_analyze_number_with_unit_does_not_force_process_clarification(handle):
+    """End-to-end (буквальный сценарий задания): «Расход 200 кубов в час, концентрация 4 — …» раньше просила
+    лишнее уточнение участка из-за «200»/«4» — только `basis`/`unit`-подобные ключи остаются, не `process`."""
+    pre, _pack = analyze(
+        STUDENT, _request("Расход 200 кубов в час, концентрация 4 — сколько сухого вещества?"), handle,
+        handle.version)
+    assert "process" not in pre.missing_fields
+
+
+# === Task 5, п.3: фраза узла + номер — пересечение, а не объединение, если оба дали кандидатов ===
+
+def test_process_phrase_and_digit_intersection_narrows_candidates(handle):
+    """«…в учебном бассейне верхней сетки №8?» — фраза узла даёт ровно верхний бассейн (I1), цифра «8» сама
+    по себе находит ещё и посторонний узел с тем же номером («Выдуманная сортировка №8») — без пересечения
+    посторонний узел добавлялся бы лишним кандидатом участка."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+    _insert_process_row(path, "PROC-TEST-DISTRACTOR-8", "Выдуманная сортировка №8", "demo-sort-8")
+
+    pre, _pack = analyze(
+        STUDENT, _request("Где уровнемер в учебном бассейне верхней сетки №8?"), handle, handle.version)
+    assert pre.process_ids == [proc8]
+    assert "process" not in pre.missing_fields
+    assert proc4 not in pre.process_ids
+
+
+# === Task 5, п.4 (БАГ): явный period_given снимает и ОБЩУЮ (не только deviation_review) проверку периода ===
+
+def test_requires_clarification_deviation_period_given_suppresses_generic_period_check():
+    """`intent == "deviation"` без литерального периода в тексте, но с `period_given=True` (период из
+    `context.period`, не из текста) — `"period"` не запрашивается; `"grade"` — без изменений (как было)."""
+    needs, missing = requires_clarification(_nq("Масса выросла, что делать?"), (), (), period_given=True)
+    assert "period" not in missing
+    assert "grade" in missing
+
+
+def test_analyze_deviation_period_given_from_context_suppresses_period(handle):
+    """End-to-end: `request.context.period` задан клиентом структурно — `"period"` не запрашивается даже
+    без относительного слова в тексте («вчера»/«смена»/…)."""
+    from datetime import datetime, timezone
+
+    from pcbk_core.analytics.models import PeriodWindow
+
+    period = PeriodWindow(start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+                          end=datetime(2026, 10, 2, tzinfo=timezone.utc))
+    req = AnalysisRequest(client_request_id="req-1", question="Масса выросла, что делать?", mode="reference",
+                          context=RequestContext(period=period))
+    pre, _pack = analyze(STUDENT, req, handle, handle.version)
+    assert "period" not in pre.missing_fields
+    assert "grade" in pre.missing_fields
+
+
+# === Task 5, п.5, ИСПРАВЛЕНО ревью дельты (Critical-1): "quantity" у одиночного кандидата зависит от того, ===
+# === является ли он базочувствительной величиной — не снимается для ЛЮБОГО одиночного кандидата ===
+
+def test_requires_clarification_single_candidate_default_still_asks_quantity():
+    """Без явного множества `basis_sensitive_single_candidate_term_ids` (старый вызов, обратная
+    совместимость) — термин с РОВНО одним кандидатом ВСЁ РАВНО спорен (поведение Д16 до Task 5): по
+    умолчанию сервер не знает, что этот термин — безопасная величина с контекстом в `basis`. Это и был
+    Critical-1 ревью дельты: первая версия п.5 снимала `quantity` для ЛЮБОГО одиночного кандидата, в т.ч.
+    для терминов вида «Верх»/«Низ»/«ПЦ»/«ЦВВ»/«Глинозем», которые сами требуют подтверждения и ничем другим
+    не покрываются."""
+    single = ResolvedTerm(original="верх", candidate_ids=["upper-only"], selected_id=None,
+                          requires_confirmation=True)
+    needs, missing = requires_clarification(_nq("верх"), (single,), ())
+    assert "quantity" in missing
+
+
+def test_requires_clarification_single_candidate_basis_sensitive_exemption_no_quantity():
+    """С явным множеством (как передаёт `analyze()`) — термин с РОВНО одним кандидатом, ПОМЕЧЕННЫЙ как
+    базочувствительная величина («Влажность»/«Вакуум» настоящего корпуса — там это значит «нужен контекст:
+    база/место», не «несколько величин на выбор»), не считается спорным для `"quantity"`."""
+    single = ResolvedTerm(original="вакуум", candidate_ids=["vac-only"], selected_id=None,
+                          requires_confirmation=True)
+    needs, missing = requires_clarification(
+        _nq("вакуум"), (single,), (), basis_sensitive_single_candidate_term_ids=frozenset({"vac-only"}))
+    assert "quantity" not in missing
+
+
+def test_requires_clarification_two_candidates_still_asks_quantity():
+    """Контраст: ДВА и более кандидата («масса» — несколько РАЗНЫХ величин корпуса) — уточнение как раньше."""
+    two = ResolvedTerm(original="масса", candidate_ids=["stock", "rolled-mass"], selected_id=None,
+                       requires_confirmation=True)
+    needs, missing = requires_clarification(_nq("масса"), (two,), ())
+    assert "quantity" in missing
+
+
+def test_clarification_candidates_single_non_basis_sensitive_candidate_returns_label(handle):
+    """ИСПРАВЛЕНО ревью дельты (Critical-1): термин с одним кандидатом, который НЕ базочувствительная
+    величина (как «выдуманный термин 1» фикстуры — не влажность/вакуум/...), всё равно даёт подпись-вариант
+    (сам этот кандидат и есть вариант уточнения — Д16 до Task 5): раньше `clarification_candidates`
+    молчаливо прятала его для ЛЮБОГО одиночного кандидата, что соответствовало снятому `"quantity"` и было
+    частью Critical-1."""
+    single = ResolvedTerm(original="термин", candidate_ids=["TERM-FAKE-001"], selected_id=None,
+                          requires_confirmation=True)
+    assert clarification_candidates(handle, _nq("термин"), (single,)) == ("выдуманный термин 1",)
+
+
+def test_clarification_candidates_single_basis_sensitive_candidate_returns_no_labels(handle):
+    """Контраст: термин с одним кандидатом, который ДЕЙСТВИТЕЛЬНО базочувствительная величина (основа
+    «вакуумн» совпадает с «вакуум»), — не предлагает «вариант» (его неоднозначность покрывает `"basis"`, не
+    выбор термина)."""
+    path = Path(handle.path)
+    _insert_term_row(path, "TERM-TEST-VAC-LABEL", "Вакуумная зона", ambiguous=True)
+    single = ResolvedTerm(original="вакуумная", candidate_ids=["TERM-TEST-VAC-LABEL"], selected_id=None,
+                          requires_confirmation=True)
+    assert clarification_candidates(handle, _nq("вакуумная"), (single,)) == ()
+
+
+# === Task 5, п.6 (T-01): вопрос-перечисление с фразой узла, совпавшей с несколькими узлами — не неоднозначность ===
+
+def test_enumeration_question_with_multiple_process_matches_no_clarification(handle):
+    """«Какие учебные бассейны есть в модели?» — множественное число «какие», фраза узла совпала с двумя
+    узлами: это список, не выбор одного — `"process"` не запрашивается, оба узла в `process_ids`."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+
+    pre, _pack = analyze(STUDENT, _request("Какие учебные бассейны есть в модели?"), handle, handle.version)
+    assert "process" not in pre.missing_fields
+    assert set(pre.process_ids) == {proc8, proc4}
+
+
+def test_singular_question_with_multiple_process_matches_still_clarifies(handle):
+    """Контраст: единственное число («какой…») — не перечисление, неоднозначность между двумя узлами
+    сохраняется (как и до этой правки)."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+
+    pre, _pack = analyze(
+        STUDENT, _request("Какой учебный бассейн показывает аварию?"), handle, handle.version)
+    assert "process" in pre.missing_fields
+    assert set(pre.process_ids) == {proc8, proc4}
+
+
+def test_enumeration_perechisli_vse_spisok_forms_also_suppress_process(handle):
+    """Другие слова-перечисления («перечисли»/«все»/«список») — тот же эффект, что «какие»."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+
+    for question in (
+        "Перечисли учебные бассейны в модели",
+        "Покажи все учебные бассейны в модели",
+        "Нужен список: учебные бассейны в модели",
+    ):
+        pre, _pack = analyze(STUDENT, _request(question), handle, handle.version)
+        assert "process" not in pre.missing_fields, question
+        assert set(pre.process_ids) == {proc8, proc4}, question
+
+
+# === правка контроллера, раунд 1 (Task 5, п.1 — сужение п.6): номер без фразы не «перечисление» ===
+
+def test_process_ambiguity_is_phrase_only_true_for_pure_phrase(handle):
+    from pcbk_core.analytics.preanalysis import _process_ambiguity_is_phrase_only
+
+    path = Path(handle.path)
+    _insert_process_phrase_fixture(path)
+    assert _process_ambiguity_is_phrase_only(handle, _nq("учебном бассейне")) is True
+
+
+def test_process_ambiguity_is_phrase_only_false_when_digit_also_matches(handle):
+    """Фраза дала кандидатов, но в тексте ЕСТЬ и номер, который сам по себе тоже что-то находит, —
+    множественность не считается «чисто фразовой» (п.1)."""
+    from pcbk_core.analytics.preanalysis import _process_ambiguity_is_phrase_only
+
+    path = Path(handle.path)
+    _insert_process_phrase_fixture(path)
+    assert _process_ambiguity_is_phrase_only(handle, _nq("учебном бассейне №8")) is False
+
+
+def test_enumeration_word_with_pure_digit_ambiguity_still_clarifies(handle):
+    """«Какие параметры у узла 1?» — неоднозначность чисто от цифры (узлы 1/10/11/12 по префиксу FTS5), не
+    от фразы узла — слово «какие» НЕ снимает уточнение участка (номер сам по себе не предлагает список)."""
+    pre, _pack = analyze(STUDENT, _request("Какие параметры у узла 1?"), handle, handle.version)
+    assert "process" in pre.missing_fields
+    assert len(pre.process_ids) > 1
+
+
+def test_enumeration_word_with_phrase_plus_unrelated_digit_still_clarifies(handle):
+    """«Какие учебные бассейны и узел 1?» — фраза даёт оба бассейна, но номер «1» САМ ПО СЕБЕ (по префиксу
+    FTS5 среди фикстуры) находит ДРУГИЕ, посторонние узлы — пересечение пусто (правка п.3), список кандидатов
+    остаётся объединением (не только фразой), и `_process_ambiguity_is_phrase_only` видит непустой `digit_ids`
+    — множественность не признаётся чисто фразовой, уточнение участка остаётся."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+
+    pre, _pack = analyze(
+        STUDENT, _request("Какие учебные бассейны и узел 1?"), handle, handle.version)
+    assert "process" in pre.missing_fields
+    assert {proc8, proc4} <= set(pre.process_ids)
+    assert len(pre.process_ids) > 2
+
+
+@real_corpus
+def test_real_corpus_enumeration_narrowed_number_without_phrase_still_clarifies():
+    """Буквальные отрицательные примеры задания (раунд 1, п.1) на настоящем корпусе — номер без участка
+    остаётся неоднозначностью, даже в форме вопроса-перечисления; T-01 (чисто фразовая множественность) —
+    без изменений."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        for question in (
+            "Какие показатели у бассейна №8?",
+            "Какие насосы на №8?",
+            "Какие потоки у №7 и №9?",
+        ):
+            pre, _pack = analyze(STUDENT, _request(question), h, h.version)
+            assert "process" in pre.missing_fields, question
+
+        pre_t01, _pack2 = analyze(
+            STUDENT, _request("Какие машинные бассейны показаны в модели КДМ-1?"), h, h.version)
+        assert "process" not in pre_t01.missing_fields
+        assert len(pre_t01.process_ids) == 2
+    finally:
+        _close(h)
+
+
+# === правка контроллера, раунд 1 (Task 5, п.7): вопрос ТОЛЬКО о подписи оборудования ===
+
+def test_equipment_label_only_question_skips_evidence_pack_and_is_limited_answer(handle):
+    """Четыре формы вопроса, содержащие (после выброса служебных слов и слов-заполнителей) только точную
+    подпись оборудования, — пакет доказательств не собирается (пуст), `decision == "limited_answer"`,
+    `missing_fields` пуст (не нужна ни одна форма уточнения)."""
+    for question in (
+        "Что сейчас на 20FAKE_001_PV?",
+        "20FAKE_001_PV",
+        "Покажи 20FAKE_001_PV?",
+        "Какое значение 20FAKE_001_PV?",
+    ):
+        pre, pack = analyze(STUDENT, _request(question), handle, handle.version)
+        assert pack == (), question
+        assert pre.decision == "limited_answer", question
+        assert pre.missing_fields == [], question
+
+
+def test_equipment_label_only_question_helper_direct(handle):
+    from pcbk_core.analytics.preanalysis import _is_equipment_label_only_question
+
+    assert _is_equipment_label_only_question(handle, "Что сейчас на 20FAKE_001_PV?") is True
+    assert _is_equipment_label_only_question(handle, "20FAKE_001_PV") is True
+    assert _is_equipment_label_only_question(handle, "Покажи 20FAKE_001_PV?") is True
+    assert _is_equipment_label_only_question(handle, "Какое значение 20FAKE_001_PV?") is True
+    # контраст: содержательное слово сверх подписи — больше не «только подпись»
+    assert _is_equipment_label_only_question(handle, "Какой вакуум на 20FAKE_001_PV сейчас?") is False
+    assert _is_equipment_label_only_question(handle, "Почему растёт 20FAKE_001_PV?") is False
+    # без подписи вовсе — не «только подпись» (нет самой подписи, которую можно было бы исключить)
+    assert _is_equipment_label_only_question(handle, "Что сейчас происходит?") is False
+
+
+def test_equipment_label_with_content_word_keeps_normal_pack_search(handle):
+    """Контраст: вопрос с содержательным словом сверх подписи («Какой вакуум на {подпись} сейчас?») —
+    label-only правило не срабатывает, обычный путь поиска пакета не меняется."""
+    path = Path(handle.path)
+    _insert_claim(path, "CLAIM-TESTONLY-VAC-LABEL",
+                  "Контрольная проверочная карточка вакуум зеброфон квакозябр для поиска без цифр.")
+
+    pre, pack = analyze(
+        STUDENT, _request("Какой вакуум зеброфон квакозябр на 20FAKE_001_PV сейчас?"), handle, handle.version)
+    assert "CLAIM-TESTONLY-VAC-LABEL" in pre.allowed_claim_ids
+    assert len(pack) >= 1
+
+
+def test_equipment_label_only_question_command_stays_control(handle):
+    """Команда с подписью («Открой {подпись}») — по-прежнему `control` (проверка команд раньше правила
+    label-only в `analyze()`)."""
+    pre, _pack = analyze(STUDENT, _request("Открой 20FAKE_001_PV"), handle, handle.version)
+    assert pre.intent == "control"
+
+
+@real_corpus
+def test_real_corpus_equipment_label_only_question_empty_pack():
+    """Буквальный сценарий задания (раунд 1, п.7) на живом корпусе: «Что сейчас на {подпись}?» — пустой
+    пакет."""
+    from pcbk_core.analytics.knowledge import all_ids as _all_ids
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import get_rows as _get_rows
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        rows = _get_rows(h, "equipment_links", _all_ids(h, "equipment_links"))
+        label = next(r["display_label"] for r in rows.values() if r.get("display_label"))
+        pre, pack = analyze(STUDENT, _request(f"Что сейчас на {label}?"), h, h.version)
+        assert pack == ()
+        assert pre.decision == "limited_answer"
+    finally:
+        _close(h)
+
+
+# === Task 5: регрессии — №7/№9/№8 без участка, «масса», команда с кодом машины, «БДМ-2» ===
+
+def test_regression_bassein_8_without_participant_still_clarifies(handle):
+    """«Бассейн №8 без участка» (образец задания) — по-прежнему спрашивает участок там, где он реально
+    неоднозначен (контроль: фикс пп.1–2 не трогает обычные номера узлов без единицы/кода машины рядом)."""
+    pre, _pack = analyze(STUDENT, _request("Расскажи про узел 1"), handle, handle.version)
+    assert "process" in pre.missing_fields
+    assert len(pre.process_ids) > 1
+
+
+def test_regression_command_with_machine_code_still_control():
+    """Команда с кодом машины («КДМ-1») — по-прежнему `control` (не затронуто цифровым исключением п.1)."""
+    assert classify_intent(_nq("Открой задвижку на КДМ-1")) == "control"
+
+
+def test_regression_other_machine_still_out_of_scope():
+    """«БДМ-2» — по-прежнему чужая машина (не затронуто цифровым исключением п.1)."""
+    assert classify_intent(_nq("Загрузи БДМ-2 из той же книги")) == "out_of_scope"
+
+
+@real_corpus
+def test_real_corpus_node_7_and_9_still_not_confused_after_task5():
+    """Контроль на настоящем корпусе: №7/№9 по-прежнему разные узлы после всех правок Task 5 (Особый фокус
+    проверки плана)."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+    from pcbk_core.analytics.preanalysis import _candidate_process_ids
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        nq7 = _nq("Сортировка номер 7")
+        ids7 = _candidate_process_ids(h, nq7)
+        assert "screen-lower" in ids7
+        assert "screen-upper" not in ids7
+    finally:
+        _close(h)
+
+
+@real_corpus
+def test_real_corpus_task5_literal_scenarios_from_controller():
+    """Буквальные сценарии задания Task 5 на живом корпусе (теги предприятия в текст теста не попадают —
+    только синтетический вопрос, никаких подписей оборудования)."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        pre1, _pack1 = analyze(
+            STUDENT, _request("Какая норма влажности после сушки на КДМ-1?"), h, h.version)
+        assert "process" not in pre1.missing_fields
+
+        pre2, _pack2 = analyze(
+            STUDENT, _request("Какие машинные бассейны показаны в модели КДМ-1?"), h, h.version)
+        assert pre2.decision != "needs_clarification"
+        assert len(pre2.process_ids) == 2
+
+        pre3, _pack3 = analyze(
+            STUDENT, _request("Какой уровнемер в машинном бассейне верхней сетки №8?"), h, h.version)
+        assert pre3.decision != "needs_clarification"
+        assert len(pre3.process_ids) == 1
+
+        pre4, _pack4 = analyze(
+            STUDENT, _request("Расход 200 кубов в час, концентрация 4 — сколько сухого вещества?"), h,
+            h.version)
+        assert "process" not in pre4.missing_fields
+
+        pre5, _pack5 = analyze(STUDENT, _request("Какой уровнемер в машинном бассейне?"), h, h.version)
+        assert "process" in pre5.missing_fields
+        assert len(pre5.process_ids) == 2
+
+        pre6, _pack6 = analyze(STUDENT, _request("Что такое масса?"), h, h.version)
+        assert pre6.decision == "needs_clarification"
+        assert "quantity" in pre6.missing_fields
     finally:
         _close(h)

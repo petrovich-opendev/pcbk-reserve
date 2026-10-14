@@ -988,13 +988,19 @@ class AnalyticsService:
             return outcome, sections, state, stage
 
         sections = [*telemetry_sections, *pack_sections]
-        if sections:
-            # ответ, где есть хотя бы одна telemetry_observation (даже без карточек пакета), — completed при
-            # decision=="ready", тем же правилом, что ответ с карточками (план Д17, Task 1)
+        if any(s.kind == "telemetry_observation" for s in sections):
+            # план Д17, Task 1, раунд правки 3 (стык с Task 5): вопрос только о подписи оборудования без
+            # содержательных слов — пакет пуст, преданализ отдаёт limited_answer (модель не вызывается, Task 5),
+            # но значение историана — полноценный ответ на такой вопрос. Поэтому completed независимо от
+            # decision ("ready"/"limited_answer"), как только есть хотя бы одна telemetry_observation —
+            # сильнее общего правила ниже (не только при decision=="ready").
+            state = "completed"
+        elif sections:
+            # ответ с карточками пакета (без телеметрии) — completed при decision=="ready", как раньше
             state = "limited_answer" if analysis.decision == "limited_answer" else "completed"
         else:
-            # ничего не прошло повторную проверку в момент выдачи (или пакет и так был пуст) — безопасный
-            # ограниченный ответ, не пустой "completed" (Правка, раунд 1, Critical)
+            # ничего не прошло повторную проверку в момент выдачи (или пакет и так был пуст, и телеметрии нет)
+            # — безопасный ограниченный ответ, не пустой "completed" (Правка, раунд 1, Critical)
             state = "limited_answer"
         stage = "ограниченный ответ" if state == "limited_answer" else "проверка пройдена"
         return outcome, sections, state, stage

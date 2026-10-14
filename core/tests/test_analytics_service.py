@@ -2080,3 +2080,50 @@ async def test_telemetry_at_most_three_labels(tmp_path, monkeypatch):
     truncated = [s for s in response.sections if s.kind == "limitation" and "Показаны первые" in s.text]
     assert len(truncated) == 1 and "4" in truncated[0].text
     await svc.aclose()
+
+
+async def test_telemetry_only_answer_with_empty_pack_and_limited_answer_decision_is_completed(tmp_path, monkeypatch):
+    """Раунд правки 3 (стык с Task 5): вопрос только о подписи оборудования без содержательных слов — пакет
+    пуст, преданализ отдаёт `decision="limited_answer"` (Task 5: модель не вызывается), но значение историана
+    — полноценный ответ на такой вопрос. Хотя бы одна `telemetry_observation` → `completed`, независимо от
+    `ready`/`limited_answer`."""
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("limited_answer", corpus_version=corpus_version), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path, reviewers="all_students")
+    svc.calc = _FakeCalc(now_reply=_now_reply())
+    _approve_equipment_link(svc, link_id="EQ-FAKE-001", tag="20FAKE_001_PV")
+
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что сейчас на 20FAKE_001_PV?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.state == "completed"
+    assert any(s.kind == "telemetry_observation" for s in response.sections)
+    assert svc.llm is None                           # LLM не подключён вовсе — путь без модели не затронут
+    await svc.aclose()
+
+
+async def test_telemetry_absent_with_empty_pack_and_limited_answer_decision_stays_limited(tmp_path, monkeypatch):
+    """То же, но подпись без связи — пустой пакет + ограничение (не `telemetry_observation`) — состояние
+    остаётся `limited_answer`, как раньше (правило раунда 3 не применяется без хотя бы одной секции
+    телеметрии)."""
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("limited_answer", corpus_version=corpus_version), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    svc.calc = _FakeCalc(now_reply=_now_reply())          # служба подключена — связи всё равно нет
+
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что сейчас на 20FAKE_001_PV?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.state == "limited_answer"
+    assert not any(s.kind == "telemetry_observation" for s in response.sections)
+    limitation = [s for s in response.sections if s.kind == "limitation"]
+    assert len(limitation) == 1 and "не согласована" in limitation[0].text
+    await svc.aclose()

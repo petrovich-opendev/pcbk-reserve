@@ -49,7 +49,17 @@ Task 4: преданализ отдаёт факты и риск, не марш�
 resolve_term_exact_phrase`) — РАВЕНСТВО множества основ с одной из форм термина, не подмножество: отличает
 термин, чьё название фраза называет целиком, от более длинного термина, который содержит ту же пару слов как
 часть своего названия. Её слова тоже не идут в пословный разбор отдельно (см. `_resolve_question_terms`).
-"""
+
+Правка Task 5 (Д17, живой корпус, живая проверка под student_test) — шесть точечных находок: (1) цифра кода
+машины («КДМ-1»/«БДМ-2»/«КДМ1») — не номер узла (`_machine_code_number_spans`); (2) число с единицей рядом
+(«200 м3/ч», «4%», «куб/кубов/кубометров», десятичное «1,5») — измеренное значение, не номер узла
+(`_measured_value_digit_spans`), включая цифру, спрятанную в самой единице («м3/ч»); (3) фраза узла + номер
+вместе — пересечение, а не объединение кандидатов, если оба дали результат (`_candidate_process_ids`);
+(4) `period_given` снимает и общую (не только `deviation_review`) проверку периода у `intent == "deviation"`
+(был баг — игнорировался); (5) термин с РОВНО одним кандидатом (хоть и `ambiguous=True` в корпусе) не считается
+спорным для `"quantity"` — выбирать не из чего, контекст покрывают `basis`/`process`/`period`; (6) вопрос-
+перечисление («какие…», «перечисли…», «все…», «список…») с фразой узла, совпавшей с несколькими узлами, — не
+неоднозначность, все узлы идут в `process_ids` без запроса `"process"` (T-01)."""
 from __future__ import annotations
 
 import re
@@ -657,6 +667,23 @@ _BASIS_SENSITIVE_STEMS: tuple[str, ...] = (
 # «избыточное» намеренно НЕ сюда — вопрос «это абсолютное давление?» (T-06) называет оба варианта, СПРАШИВАЯ,
 # какой из них, а не сообщая базу, и сам по себе не должен гасить уточнение
 _BASIS_GIVEN_STEMS: tuple[str, ...] = ("по масс", "по сух", "по влажн", "wet basis", "dry basis")
+
+
+# Правка контроллера, раунд 2 (Task 5, Critical ревью дельты): различает ДВА вида `ambiguous=True` термина
+# корпуса с ровно одним кандидатом (см. докстринг `requires_clarification`, п.5) — «величина ясна, нужен
+# контекст измерения» (его неоднозначность реально покрывает `_BASIS_SENSITIVE_STEMS`/`"basis"`, например
+# «Влажность»/«Вакуум») от «сам термин не разрешён без подтверждения» («Верх»/«Низ»/«ПЦ»/«ЦВВ»/«Глинозем»/
+# COV/ГРВ/РПО — определения «не выбирается без контекста»/«не объединять автоматически»), у которого никакого
+# резервного поля НЕТ. Критерий — основы (`terms.normalize_ru`) `preferred_ru`/`aliases` ТЕРМИНА (не текста
+# вопроса) пересекаются со стеблями `_BASIS_SENSITIVE_STEMS`.
+def _term_is_basis_sensitive_quantity(handle: "CorpusHandle", term_id: str) -> bool:
+    row = knowledge.get_row(handle, "terms", term_id)
+    if row is None:
+        return False
+    words = [str(row.get("preferred_ru") or "")]
+    words.extend(str(alias) for alias in (row.get("aliases") or ()))
+    combined = terms.normalize_ru(" ".join(words))
+    return _stem_matches(combined, _BASIS_SENSITIVE_STEMS)
 _GRADE_STEMS: tuple[str, ...] = ("сорт", "реж", "марк")
 # Правка, раунд 1 (минорный пункт 3 координатора): «снимок»/«снимк» убраны — снимок сам по себе не сообщает,
 # КОГДА он сделан, и не должен гасить требование уточнить период (снимок — источник наблюдения, не дата).
@@ -773,10 +800,92 @@ def _mentions_equipment_link_label(handle: "CorpusHandle", original: str) -> boo
     return any(label in equipment_labels for label in labels)
 
 
+# Правка контроллера, раунд 1 (Task 5, п.7 задания): вопрос ТОЛЬКО о подписи оборудования («Что сейчас на
+# {подпись}?», «{подпись}», «Покажи {подпись}?», «Какое значение {подпись}?») — после выброса служебных слов
+# (`_STOPWORDS`) и небольшого набора слов-заполнителей вопроса о значении (ниже) в тексте не остаётся
+# содержательных слов, кроме самой точной подписи. Полнотекстовый поиск пакета доказательств по такому
+# вопросу даёт только шум (случайные совпадения по общим словам процесса — «проклейка», «осветление» и
+# подобное, не относящиеся к самому прибору) — пакет не собирается вовсе, технолог получает значение
+# историана через отдельный механизм (`_mentions_equipment_link_label`/service.py, Task 1), не через карточки.
+_VALUE_QUESTION_FILLER_WORDS: frozenset[str] = frozenset({
+    "значение", "значения", "показание", "показания", "покажи", "покажите",
+    "текущее", "текущий", "текущая", "сейчас", "сколько",
+    "какое", "какой", "какая", "на", "по", "что",
+})
+
+
+def _equipment_link_label_spans(handle: "CorpusHandle", original: str) -> list[tuple[int, int]]:
+    """Диапазоны ТОЧНЫХ подписей `equipment_links.display_label` в тексте — как `_mentions_equipment_link_
+    label`, только с положением (нужно `_is_equipment_label_only_question`)."""
+    equipment_labels = {
+        row.get("display_label")
+        for row in knowledge.get_rows(handle, "equipment_links", knowledge.all_ids(handle, "equipment_links")).values()
+        if row.get("display_label")
+    }
+    if not equipment_labels:
+        return []
+    spans: list[tuple[int, int]] = []
+    for label in equipment_labels:
+        pattern = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё_])" + re.escape(label) + r"(?![0-9A-Za-zА-Яа-яЁё_])")
+        spans.extend(m.span() for m in pattern.finditer(original))
+    return spans
+
+
+def _is_equipment_label_only_question(handle: "CorpusHandle", original: str) -> bool:
+    """`True` — вопрос не содержит ничего содержательного сверх точной подписи оборудования (см. комментарий
+    выше). Вопрос с хотя бы одним содержательным словом сверх подписи («Какой вакуум на {подпись} сейчас?»,
+    «Почему растёт {подпись}?») этим не считается — обычный путь (поиск пакета/уточнение) не меняется.
+    Команда с подписью («Открой {подпись}») сюда не попадает вовсе: `classify_intent` отбирает `control`
+    раньше, чем `analyze()` доходит до этой проверки."""
+    label_spans = _equipment_link_label_spans(handle, original)
+    if not label_spans:
+        return False
+    for match in _TOKEN_RE.finditer(original):
+        word = match.group(0)
+        if len(word) < 2:
+            continue
+        start, end = match.span()
+        if _span_within(start, end, label_spans):
+            continue
+        if word.lower() in _STOPWORDS or word.lower() in _VALUE_QUESTION_FILLER_WORDS:
+            continue
+        return False
+    return True
+
+
+# Правка Task 5, п.6 задания (T-01, живой корпус): вопрос-ПЕРЕЧИСЛЕНИЕ («какие…», «перечисли…», «все…»,
+# «список…») — множественное число, явная просьба о списке. Литералы множественного числа («какие»/«каких»/
+# «какими»), не корень «как» (не ловит единственное число «какой»/«какая»/«какое» — «Какой уровнемер в
+# машинном бассейне?» остаётся вопросом про ОДИН узел, неоднозначность между двумя сохраняется).
+_ENUMERATION_RE = re.compile(
+    r"\bкакие\b|\bкаких\b|\bкакими\b|\bперечисли\w*|\bвсе\b|\bвсех\b|\bвсеми\b|\bсписок\w*|\bсписк\w*",
+    re.IGNORECASE)
+
+
+def _is_enumeration_question(original: str) -> bool:
+    return bool(_ENUMERATION_RE.search(original))
+
+
+# Правка контроллера, раунд 1 (Task 5, п.1 — сужение п.6): перечисление снимает `"process"` ТОЛЬКО когда
+# множественность пришла ИЗ ФРАЗЫ узла (с головой названия, `_process_phrase_matches`) И номер (`_digit_node_
+# process_ids`) не дал НИ ОДНОГО кандидата. Номер узла без участка («Какие показатели у бассейна №8?»,
+# «Какие насосы на №8?», «Какие потоки у №7 и №9?») остаётся неоднозначностью участка даже в вопросе-
+# перечислении: сама цифра ничего не «перечисляет» — она указывает на конкретный (хоть и не единственный по
+# номеру) узел, а не предлагает список однородных узлов, как фраза узла (T-01: «какие машинные бассейны»).
+def _process_ambiguity_is_phrase_only(handle: "CorpusHandle", parsed: NormalizedQuestion) -> bool:
+    _, phrase_ids = _process_phrase_matches(handle, parsed.original)
+    if len(set(phrase_ids)) <= 1:
+        return False
+    digit_ids = _digit_node_process_ids(handle, parsed.original)
+    return not digit_ids
+
+
 def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["ResolvedTerm", ...],
                            process_ids: tuple[str, ...], *, mode: "AnalysisMode | None" = None,
-                           period_given: bool = False,
-                           has_equipment_label: bool = False) -> tuple[bool, tuple[str, ...]]:
+                           period_given: bool = False, has_equipment_label: bool = False,
+                           is_enumeration: bool = False,
+                           basis_sensitive_single_candidate_term_ids: frozenset[str] = frozenset()
+                           ) -> tuple[bool, tuple[str, ...]]:
     """Пункты 4–5 мастер-промпта §7: единицы, база процентов/влажности/давления, период/пояс, сорт/режим,
     качество/свежесть, конфликты и применимость. Возвращает (нужно ли уточнение, `missing_fields` —
     `models.Preanalysis.missing_fields`, значения — строго из `models.ClarificationKey`). Существенная
@@ -839,16 +948,62 @@ def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["Re
     расчёт по формуле этого модуля («сколько сухого вещества») по-прежнему нуждается в явных единицах/базе
     независимо от подписи прибора, которая про формулу расчёта ничего не говорит. `"process"`/`"period"`/
     `"timezone"` и прочие ключи — без изменений (подпись оборудования не снимает неоднозначность участка/
-    периода)."""
+    периода).
+
+    Правка Task 5, п.5 задания, ИСПРАВЛЕНО ревью дельты (Critical-1): термин с РОВНО одним кандидатом не
+    считается спорным для `"quantity"` НЕ всегда — только когда этот термин сам является величиной, чья
+    неоднозначность есть БАЗА/контекст измерения («Влажность»/«Вакуум» — корпус отмечает «нужен контекст:
+    база/место», и этот контекст действительно покрывает независимая проверка `_BASIS_SENSITIVE_STEMS`,
+    отсюда `"basis"` в missing_fields вместо `"quantity"`). Термины вроде «Верх»/«Низ»/«ПЦ»/«ЦВВ»/«Глинозем»/
+    COV/ГРВ/РПО тоже помечены `ambiguous=True` с одним кандидатом, но их определения прямо пишут «не
+    выбирается без контекста»/«не объединять автоматически»/«не приравнивать автоматически» — у ЭТОЙ
+    категории неоднозначность НЕ сводится к базе измерения и не покрывается НИ ОДНИМ другим полем
+    (`process_ids` пуст, `_BASIS_SENSITIVE_STEMS` не совпадает) — сняв `"quantity"` для них, первая правка
+    п.5 убирала единственный сигнал неоднозначности целиком (T-12 «Верх стал влажнее», T-07 «ПЦ и ЦВВ
+    одинаковые, объедини их», T-24 «глинозем — это точно Al₂O₃?» уходили в `ready`/`limited_answer` и
+    настоящий платный вызов без единого уточнения — нарушение мастер-промпта §7 п.4).
+
+    Различие — через `basis_sensitive_single_candidate_term_ids` (готовое множество id терминов, вычисленное
+    вызывающим, `analyze()`, который имеет `handle` для поиска строки термина и сравнения её `preferred_ru`/
+    `aliases`, через `terms.normalize_ru`, со стеблями `_BASIS_SENSITIVE_STEMS` — см. `_term_is_basis_
+    sensitive_quantity`). Значение по умолчанию — пустое множество: СТАРЫЙ вызов (без этого параметра, как у
+    всех тестов раунда 0/1 на термины ДО этого исправления, например «масса» с двумя кандидатами) получает
+    поведение Д16 в точности для одиночных кандидатов — `candidate_ids` непустой уже считается спорным
+    (обратная совместимость сигнатуры). Термин с ДВУМЯ и более кандидатами («масса») — уточнение как раньше,
+    независимо от этого множества (проверка размера `>= 2` ниже вообще не смотрит на него).
+
+    Правка Task 5, п.6 задания (T-01): вопрос-ПЕРЕЧИСЛЕНИЕ («какие…», «перечисли…», «все…», «список…») с
+    несколькими кандидатами узла — не неоднозначность (техпроцесс сам предлагает список подходящих узлов, не
+    просит выбрать один): `"process"` не запрашивается, все совпавшие узлы остаются в `process_ids`
+    (`_candidate_process_ids` их туда уже кладёт — здесь только снимается уточнение). Вопрос в ЕДИНСТВЕННОМ
+    числе («какой…») этим не считается перечислением и неоднозначность сохраняет («Какой уровнемер в
+    машинном бассейне?» — по-прежнему требует выбрать один из двух).
+
+    Правка контроллера, раунд 1 (Task 5, п.1 — сужение п.6, задание сочло исходное опасение верным): флаг
+    `is_enumeration` теперь передаётся ГОТОВЫМ (эта функция не знает про `handle`, не может сама отличить
+    фразу узла от цифрового номера) — вызывающий (`analyze`) вычисляет его через `_is_enumeration_question`
+    (слово-перечисление в тексте) И `_process_ambiguity_is_phrase_only` (множественность кандидатов пришла
+    ИЗ ФРАЗЫ узла, номер не дал ни одного кандидата). Номер узла без участка («Какие показатели у бассейна
+    №8?», «Какие насосы на №8?», «Какие потоки у №7 и №9?») остаётся неоднозначностью, даже если в тексте
+    есть слово «какие» — цифра сама по себе не предлагает список, в отличие от фразы узла (T-01)."""
     intent = classify_intent(parsed)
     missing: list[str] = []
     known_calc_refusal = calculations.known_refusal_reason(parsed.original) is not None
     self_sufficient = known_calc_refusal or _has_complete_calculation_plan(parsed.original)
     equipment_label_suppresses = has_equipment_label and intent != "calculation"
-    ambiguous_terms = [t for t in resolved_terms if t.requires_confirmation and t.candidate_ids]
+    # п.5 (исправлено, ревью дельты, Critical-1): термин с ОДНИМ кандидатом НЕ считается спорным для
+    # "quantity" только если этот кандидат — базочувствительная величина (готовое множество от вызывающего,
+    # basis_sensitive_single_candidate_term_ids); для всех остальных одиночных кандидатов, как и для двух и
+    # более, — спорен (поведение Д16 до Task 5).
+    ambiguous_terms = [
+        t for t in resolved_terms
+        if t.requires_confirmation and t.candidate_ids
+        and not (len(t.candidate_ids) == 1
+                and t.candidate_ids[0] in basis_sensitive_single_candidate_term_ids)
+    ]
     if ambiguous_terms and not self_sufficient and not equipment_label_suppresses:
         missing.append("quantity")
-    if len(process_ids) > 1 and not self_sufficient:
+    if len(process_ids) > 1 and not self_sufficient and not is_enumeration:
         missing.append("process")
     # буквальный интервал ЧЧ:ММ–ЧЧ:ММ в тексте — самодостаточный сигнал (время самоописывающийся формат, не
     # нуждается в каноническом токене единицы); без literal-интервала — T-32-стиль («Сложить времена...» без
@@ -863,7 +1018,11 @@ def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["Re
     if intent == "calculation" and parsed.unit_hint is None and not known_calc_refusal and not time_union_question:
         missing.append("unit")
     if intent == "deviation":
-        if not _stem_matches(parsed.normalized, _PERIOD_STEMS):
+        # Правка Task 5, п.4 задания (БАГ): явный `period_given` (период из `context.period`, не из текста)
+        # снимает и эту, более мягкую, текстовую проверку периода — раньше снимал только более строгую
+        # `deviation_review` ниже, и разбор отклонения с периодом из формы всё равно просил "period" повторно.
+        # `"grade"` этой правкой не затронут (задание: «grade — как было»).
+        if not period_given and not _stem_matches(parsed.normalized, _PERIOD_STEMS):
             missing.append("period")
         if not _stem_matches(parsed.normalized, _GRADE_STEMS):
             missing.append("grade")
@@ -901,12 +1060,70 @@ def _label_process_ids(handle: "CorpusHandle", original: str) -> list[str]:
     return [row["id"] for row in rows.values() if row.get("source_label") in labels]
 
 
+# Правка Task 5 (Д17, п.1 задания, живой корпус): цифра КОДА МАШИНЫ («КДМ-1», «БДМ-2», «КДМ1») — часть кода,
+# не номер узла/бассейна (тот же принцип, что уже есть у «масса 1 м²» выше). Без исключения «Какая норма
+# влажности после сушки на КДМ-1?»/«Какие машинные бассейны показаны в модели КДМ-1?» давали лишнее
+# уточнение «участок» (в вариантах — даже посторонний «сборник №19», найденный по префиксу FTS5 от цифры «1»
+# из «КДМ-1»). Используется `_MACHINE_CODE_RE` целиком (ЛЮБОЙ код — не только чужая машина, `_mentions_other_
+# machine` не меняется): цифра «1» из самой КДМ-1 — такая же часть кода, как цифра «2» из БДМ-2.
+def _machine_code_number_spans(original: str) -> list[tuple[int, int]]:
+    return [match.span(2) for match in _MACHINE_CODE_RE.finditer(original)]
+
+
+# Правка Task 5 (п.2 задания): число, за которым (через пробел или слитно) идёт известная единица
+# (`_UNIT_TOKENS`, включая «%») или «куб/кубов/кубометров» (даже без «в час»), — измеренное значение, не
+# номер узла/бассейна (тот же принцип). «Расход 200 кубов в час, концентрация 4 — …» раньше просило лишнее
+# уточнение участка из-за «200»/«4»; десятичное число («1,5»/«115.9») — тоже значение, не номер узла. Число
+# БЕЗ единицы рядом (например, «концентрация 4» без «%») этим правилом не исключается — на усмотрение
+# исполнителя (задание), но №7/№9/№8/«бассейн 8» (без единицы рядом) этим не затрагиваются никогда: единица
+# ищется СРАЗУ после числа, не где-то в вопросе.
+_UNIT_SUFFIX_ALTERNATION = "|".join(
+    sorted((re.escape(tok.strip()) for tok in _UNIT_TOKENS), key=len, reverse=True))
+_NUMBER_UNIT_SUFFIX_RE = re.compile(rf"(\d+)\s?(?:{_UNIT_SUFFIX_ALTERNATION}|куб\w*)", re.IGNORECASE)
+_DECIMAL_NUMBER_RE = re.compile(r"\d+[.,]\d+")
+# сама единица иногда пишется ASCII-цифрой вместо надстрочной («м3/ч»/«т/м3»/«г/м2» — цифра 3/2 — часть
+# ОБОЗНАЧЕНИЯ единицы, не измеренное число и не номер узла/бассейна рядом; без этого исключения «расход 200
+# м3/ч» находило узел по самой цифре «3» из «м3» (отдельно от «200», которую уже исключает `_NUMBER_UNIT_
+# SUFFIX_RE` выше) — найдено проверкой на настоящем корпусе.
+_UNIT_TOKEN_ONLY_RE = re.compile(rf"{_UNIT_SUFFIX_ALTERNATION}", re.IGNORECASE)
+
+
+def _measured_value_digit_spans(original: str) -> list[tuple[int, int]]:
+    spans = [m.span(1) for m in _NUMBER_UNIT_SUFFIX_RE.finditer(original)]
+    spans.extend(m.span() for m in _DECIMAL_NUMBER_RE.finditer(original))
+    spans.extend(m.span() for m in _UNIT_TOKEN_ONLY_RE.finditer(original))
+    return spans
+
+
+# Правка контроллера, раунд 1 (Task 5, п.7, попутно найденное при проверке label-only вопроса): цифра ВНУТРИ
+# точной подписи тега/узла (`terms.exact_tag_candidates` — `equipment_links.display_label` ИЛИ `processes.
+# source_label`) — часть самой подписи, не отдельный номер узла (тот же принцип, что у кода машины/единицы
+# измерения выше). Без этого исключения цифры внутри подписи оборудования («…001…» из подписи вида
+# «20FAKE_001_PV») давали ложных кандидатов узла по префиксу FTS5 — вопрос «только о подписи» (п.7) получал
+# фантомную неоднозначность участка вместо пустого пакета.
+def _exact_label_digit_spans(handle: "CorpusHandle", original: str) -> list[tuple[int, int]]:
+    labels = terms.exact_tag_candidates(handle, original)
+    if not labels:
+        return []
+    spans: list[tuple[int, int]] = []
+    for label in labels:
+        pattern = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё_])" + re.escape(label) + r"(?![0-9A-Za-zА-Яа-яЁё_])")
+        spans.extend(m.span() for m in pattern.finditer(original))
+    return spans
+
+
 def _digit_node_process_ids(handle: "CorpusHandle", original: str) -> list[str]:
     """Правка контроллера, раунд 2, п.2 (попутно найденное продолжение): цифра из «масса 1 м²»/«масса м2» —
     часть единицы площади (1 квадратный метр), не номер узла/бассейна — без исключения «Что такое масса
     1 м²?» находило узел №1 (и 10/11/12 по префиксу FTS5) и ложно требовало уточнить участок (`"process"`),
-    хотя вопрос про определение однозначного термина вообще не касается никакого конкретного узла."""
-    excluded_spans = _basis_weight_phrase_spans(original)
+    хотя вопрос про определение однозначного термина вообще не касается никакого конкретного узла.
+
+    Правка Task 5 (п.1–2 задания): то же исключение теперь и для цифры кода машины (`_machine_code_number_
+    spans`) и для числа-значения с единицей/десятичного числа (`_measured_value_digit_spans`, см. комментарии
+    у них). Правка раунда 1 (п.7): и для цифры внутри точной подписи тега/узла (`_exact_label_digit_spans`) —
+    четыре независимых источника исключённых диапазонов, объединённых в один список."""
+    excluded_spans = (_basis_weight_phrase_spans(original) + _machine_code_number_spans(original)
+                      + _measured_value_digit_spans(original) + _exact_label_digit_spans(handle, original))
     ids: list[str] = []
     for match in _DIGIT_TOKEN_RE.finditer(original):
         if _span_within(match.start(), match.end(), excluded_spans):
@@ -1121,14 +1338,28 @@ def _candidate_process_ids(handle: "CorpusHandle", parsed: NormalizedQuestion) -
     комментарий выше), иначе цифровой номер узла/бассейна (№7/№8/№9/№22 — Особый фокус проверки плана) через
     полнотекстовый поиск по виду `processe`. Несколько разных id из этого — неоднозначность участка
     (`requires_clarification` добавляет `"process"`), не выбор одного произвольно (мастер-промпт §9 пакета:
-    «не переставлять №7/№9 автоматически», «№8 без участка — разные узлы»)."""
+    «не переставлять №7/№9 автоматически», «№8 без участка — разные узлы»).
+
+    Правка Task 5, п.3 задания: ФРАЗА узла + НОМЕР вместе — если оба источника дали кандидатов и их
+    пересечение непусто, остаются только узлы из пересечения (номер уточняет, какой из узлов фразы имелся в
+    виду, а не добавляет посторонний узел с тем же номером — «…в машинном бассейне верхней сетки №8?» без
+    этого правила добавляла «Сортировка 2-й ступени №8» лишним кандидатом участка). Пустое пересечение (или
+    один из источников пуст) — поведение не меняется, оба набора объединяются, как раньше. Подпись тега
+    (`label_ids`) в это сужение не входит — точное совпадение подписи всегда сильнее эвристики фразы/номера."""
     explicit = _explicit_process_id(handle, parsed.process_hint)
     if explicit:
         return explicit
-    ids = _label_process_ids(handle, parsed.original)
+    label_ids = _label_process_ids(handle, parsed.original)
     _, phrase_ids = _process_phrase_matches(handle, parsed.original)
-    ids.extend(phrase_ids)
-    ids.extend(_digit_node_process_ids(handle, parsed.original))
+    digit_ids = _digit_node_process_ids(handle, parsed.original)
+    if phrase_ids and digit_ids:
+        intersection = [pid for pid in phrase_ids if pid in digit_ids]
+        if intersection:
+            ids = list(label_ids) + intersection
+        else:
+            ids = list(label_ids) + list(phrase_ids) + digit_ids
+    else:
+        ids = list(label_ids) + list(phrase_ids) + digit_ids
     return tuple(dict.fromkeys(ids))
 
 
@@ -1198,9 +1429,19 @@ def clarification_candidates(handle: "CorpusHandle", parsed: NormalizedQuestion,
     `requires_clarification`) — подписи вариантов становятся `title` этих узлов («Машинный бассейн нижней сетки
     №4» и «...верхней сетки №8», не «какая величина»). Сигнатура функции не меняется (вызывается из
     `service.py`, который правит Task 1) — данные для узлов добираются здесь же, заново через `parsed`, тем же
-    путём, что и у `analyze()`."""
+    путём, что и у `analyze()`.
+
+    Правка Task 5, п.5 задания, ИСПРАВЛЕНО ревью дельты (Critical-1): термин с ОДНИМ кандидатом здесь не
+    считается спорным (нет вариантов для подписи) ТОЛЬКО если этот кандидат — базочувствительная величина
+    (`_term_is_basis_sensitive_quantity`, та же проверка, что в `requires_clarification` для `"quantity"`,
+    только здесь `handle` уже есть в сигнатуре — отдельного множества-параметра не нужно). Термин с одним
+    кандидатом, который сам требует подтверждения («Верх»/«Низ»/«ПЦ»/«ЦВВ»/«Глинозем»/COV/ГРВ/РПО), ВСЁ ЖЕ
+    спорен — его единственный кандидат и есть вариант подписи (ровно как у Д16 до Task 5)."""
     for term in resolved_terms:
         if not (term.requires_confirmation and term.candidate_ids):
+            continue
+        if (len(term.candidate_ids) == 1
+                and _term_is_basis_sensitive_quantity(handle, term.candidate_ids[0])):
             continue
         rows = knowledge.get_rows(handle, "terms", term.candidate_ids)
         labels = [str(rows[cid].get("preferred_ru") or cid) for cid in term.candidate_ids if cid in rows]
@@ -1454,9 +1695,23 @@ def analyze(identity: "RequestIdentity", request: "AnalysisRequest", handle: "Co
     # база ниже), не по `search_parsed` без кода чужой машины — та же причина, по которой requires_clarification
     # уже вызывается с исходным `parsed`, см. комментарий выше.
     has_equipment_label = _mentions_equipment_link_label(handle, parsed.original)
+    # Правка контроллера, раунд 1 (Task 5, п.1 — сужение п.6): перечисление снимает "process" только когда
+    # множественность пришла ИЗ ФРАЗЫ узла и номер не дал ни одного кандидата — `search_parsed`, та же
+    # область поиска, что у `_candidate_process_ids`/`resolved_terms` выше.
+    is_enumeration = (_is_enumeration_question(parsed.original)
+                      and _process_ambiguity_is_phrase_only(handle, search_parsed))
+    # Правка контроллера, раунд 2 (Task 5, Critical ревью дельты): множество id терминов с ровно одним
+    # кандидатом, которые действительно являются базочувствительной величиной (см. докстринг `requires_
+    # clarification`, п.5) — вычисляется здесь (только у `analyze()` есть `handle`) и передаётся готовым.
+    basis_sensitive_single_candidate_term_ids = frozenset(
+        t.candidate_ids[0] for t in resolved_terms
+        if t.requires_confirmation and len(t.candidate_ids) == 1
+        and _term_is_basis_sensitive_quantity(handle, t.candidate_ids[0])
+    )
     needs_clarification, missing_fields = requires_clarification(
         parsed, resolved_terms, process_ids, mode=request.mode, period_given=period_given,
-        has_equipment_label=has_equipment_label)
+        has_equipment_label=has_equipment_label, is_enumeration=is_enumeration,
+        basis_sensitive_single_candidate_term_ids=basis_sensitive_single_candidate_term_ids)
 
     if needs_clarification:
         preanalysis = Preanalysis(
@@ -1468,7 +1723,15 @@ def analyze(identity: "RequestIdentity", request: "AnalysisRequest", handle: "Co
         )
         return preanalysis, ()
 
-    pack = build_evidence_pack(handle, process_ids, search_parsed)
+    # Правка контроллера, раунд 1 (Task 5, п.7): вопрос ТОЛЬКО о подписи оборудования — полнотекстовый поиск
+    # пакета доказательств не вызывается вовсе (даёт только шум), пакет остаётся пустым; `decision` ниже
+    # сама становится `limited_answer` (пакет пуст), значение историана технолог получит отдельным
+    # механизмом (Task 1), не через карточки. По исходному `parsed` (как `has_equipment_label` выше) — не по
+    # `search_parsed` без кода чужой машины, подписи оборудования машинными кодами не являются.
+    if _is_equipment_label_only_question(handle, parsed.original):
+        pack: tuple[EvidenceCard, ...] = ()
+    else:
+        pack = build_evidence_pack(handle, process_ids, search_parsed)
     allowed_claim_ids = tuple(card.id for card in pack if card.kind == "claim")
     allowed_mechanism_ids = tuple(card.id for card in pack if card.kind == "mechanism")
     risk = "local_claim" if any(card.critical_local_fact for card in pack) else _risk_for(intent)

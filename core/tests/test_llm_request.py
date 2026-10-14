@@ -85,8 +85,8 @@ def test_model_list_exact():                                                    
     assert list(allowed) == ["z-ai/glm-5.3", "deepseek/deepseek-v4.1-flash", "google/gemini-3.8-flash",
                              "openai/gpt-6-sol", "z-ai/glm-5.3-flash", "openai/gpt-6-luna",
                              "anthropic/claude-sonnet-5.5"]
-    assert [p.provider_only for p in allowed.values()] == ["fireworks", "fireworks", "google-vertex/global", "azure",
-                                                         "fireworks", "azure", "google-vertex/global"]
+    assert [p.provider_only for p in allowed.values()] == ["fireworks", "deepinfra/fp8", "google-vertex/global",
+                                                         "azure", "fireworks", "azure", "google-vertex/global"]
     assert [p.effort for p in allowed.values()] == ["high", "high", "medium", "medium", "low", "medium", "low"]
     assert list(select_models("z-ai/glm-5.3")) == ["z-ai/glm-5.3"]
     for bad in ("z-ai/glm-5.3:nitro", "~z-ai/glm-latest", "openrouter/auto", "z-ai/glm-5.3,z-ai/glm-5.3"):
@@ -97,6 +97,7 @@ def test_model_list_exact():                                                    
 def test_provider_matches_and_session_of():
     assert provider_matches("fireworks", "Fireworks") and provider_matches("google-vertex/global", "Google Vertex")
     assert provider_matches("azure", "Azure") and not provider_matches("fireworks", "Together")
+    assert provider_matches("deepinfra/fp8", "DeepInfra")        # Д17 Task 6: suffix точки, точка deepinfra/fp8
     assert (session_of(SES), session_of("ses_1"), session_of(None)) == (SES, None, None)
 
 
@@ -115,7 +116,7 @@ def test_estimate_uses_max_variant_undiscounted_and_tier():                     
     m = select_models("")
     ds, gem, luna, sol = (m["deepseek/deepseek-v4.1-flash"], m["google/gemini-3.8-flash"],
                           m["openai/gpt-6-luna"], m["openai/gpt-6-sol"])
-    assert ds.estimate_usd(3000, 100) == pytest.approx(3000 * 0.45e-6 + 100 * 1.80e-6)    # fireworks/us, не 0.22/0.66
+    assert ds.estimate_usd(3000, 100) == pytest.approx(3000 * 0.20e-6 + 100 * 0.60e-6)    # deepinfra/fp8, без скидки 0,3
     assert gem.estimate_usd(3000, 100) == pytest.approx(3000 * 1.50e-6 + 100 * 7.50e-6)   # без скидки 0,5
     below, at = 271_999, 272_000                                        # граница длинного входа; байт — токен (раунд 2)
     assert luna.estimate_usd(below, 16000) == pytest.approx(271_999 * 0.1375e-6 + 16000 * 0.55e-6)
@@ -123,12 +124,12 @@ def test_estimate_uses_max_variant_undiscounted_and_tier():                     
     assert sol.estimate_usd(1_048_576, 16000) == pytest.approx(1_048_576 * 5.50e-6 + 16000 * 16.50e-6)   # ≈ $6,03
     # доводка ревью I2, M3: max_price — по той же ступени, что оценка; плата за запрос — 0
     assert [p.max_price(271_999) for p in (ds, gem, luna, sol, m["z-ai/glm-5.3-flash"])] == [
-        {"prompt": 0.45, "completion": 1.80, "request": 0}, {"prompt": 1.50, "completion": 7.50, "request": 0},
+        {"prompt": 0.20, "completion": 0.60, "request": 0}, {"prompt": 1.50, "completion": 7.50, "request": 0},
         {"prompt": 0.11, "completion": 0.55, "request": 0}, {"prompt": 2.20, "completion": 11.00, "request": 0},
         {"prompt": 0.225, "completion": 0.75, "request": 0}]
     assert [p.max_price(272_000) for p in (luna, sol, ds)] == [
         {"prompt": 0.22, "completion": 0.825, "request": 0}, {"prompt": 4.40, "completion": 16.50, "request": 0},
-        {"prompt": 0.45, "completion": 1.80, "request": 0}]
+        {"prompt": 0.20, "completion": 0.60, "request": 0}]
     b = rebuild_body({**OC_BODY, "model": luna.model}, luna, caller="ops", session=None)
     assert b["provider"]["max_price"] == {"prompt": 0.11, "completion": 0.55, "request": 0}   # короткое тело — базовая
 
@@ -166,7 +167,7 @@ def test_table_is_seven_upper_prices():
             p.tier_out_usd_m, p.tier_write_usd_m) for p in CANDIDATES]
     assert got == [
         ("z-ai/glm-5.3", 1.40, 4.40, 0, False, None, 0.0, 0.0, 0.0),
-        ("deepseek/deepseek-v4.1-flash", 0.45, 1.80, 0.45, False, None, 0.0, 0.0, 0.0),
+        ("deepseek/deepseek-v4.1-flash", 0.20, 0.60, 0.20, False, None, 0.0, 0.0, 0.0),
         ("google/gemini-3.8-flash", 1.50, 7.50, 0, False, None, 0.0, 0.0, 0.0),
         ("openai/gpt-6-sol", 2.20, 11.00, 2.75, False, 272_000, 4.40, 16.50, 5.50),
         ("z-ai/glm-5.3-flash", 0.225, 0.75, 0, False, None, 0.0, 0.0, 0.0),

@@ -1699,6 +1699,26 @@ fallback_from=<основная> fallback_reason=<rate|in_flight|server|unreacha
 `LLM_FALLBACK=z-ai/glm-5.3=z-ai/glm-5.3-flash,z-ai/glm-5.3-flash=z-ai/glm-5.3` — 13.10 Fireworks дважды отвечал 429
 уже на `flash` (Помощник без ответа); повтор — один на вызов, цикла нет (`docs/checks/D15a.md`).
 
+**Основная модель — DeepSeek на deepinfra/fp8 (14.10, Д17 Task 6)**: решение владельца 14.10 — основная модель
+стенда `deepseek/deepseek-v4.1-flash`, закреплённая точка сменена с `fireworks` на `deepinfra/fp8`. Причина смены
+точки — выше (12.10): на `fireworks` DeepSeek в проверке получал сплошные 429; `deepinfra/fp8` варианта региона не
+имеет (`provider.only` без расхождения, как раньше у `fireworks`/`fireworks/us`), 100 % аптайм за сутки проверки и
+входит в список ZDR (`GET /api/v1/endpoints/zdr`, факты сняты 14.10 ~20:27 UTC). Цены — без скидки 0,3 точки
+(листинг 0.14 / 0.42 за 1 млн токенов ÷ 0,7): вход $0,20, выход $0,60, запись кэша — своей цены у точки нет, взята
+как вход, $0,20 за 1 млн (таблица `core/pcbk_core/llm/models.py`). Запасная модель — `z-ai/glm-5.3` через
+`LLM_FALLBACK` (тот же механизм Д14 выше: один повтор за вызов на отказ «подождите/недоступен», без цикла).
+
+`.env` сервера:
+```
+LLM_MODELS=deepseek/deepseek-v4.1-flash,z-ai/glm-5.3,z-ai/glm-5.3-flash
+LLM_FALLBACK=deepseek/deepseek-v4.1-flash=z-ai/glm-5.3,z-ai/glm-5.3=z-ai/glm-5.3-flash,z-ai/glm-5.3-flash=z-ai/glm-5.3
+ANALYTICS_LLM_MODELS=deepseek/deepseek-v4.1-flash
+```
+и место конфига (`compose.override.yaml`, рядом с ролями выше): `OPENCODE_CONFIG_CONTENT={"model":
+"pcbk/deepseek/deepseek-v4.1-flash"}`. Три строки проверены кодом проекта без ошибки (`select_models`,
+`parse_fallback`, `LlmSettings.from_env`, `AnalyticsSettings.from_env`) — граф `LLM_FALLBACK` разбирается, цикла
+(в смысле ошибки разбора) нет.
+
 **Нагрузка 12.10** (10 студентов одновременно через веб: вход, Помощник, Конструктор, калькулятор): сервер — с запасом
 (свободно не меньше 7026 МиБ из 11 610, swap +1 МиБ, давление памяти ≤ 1,83 %); узкое место — частота у провайдера
 модели: 43 из 109 вызовов получили 429 и прошли повтором прокси (ответ Помощника — медиана 32 с, Конструктор — до 80 с).

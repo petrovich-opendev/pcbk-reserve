@@ -72,8 +72,10 @@ class ModelPolicy:
 CANDIDATES: tuple[ModelPolicy, ...] = (
     # точка, вариантов нет
     ModelPolicy("z-ai/glm-5.3", "fireworks", "high", 1.40, 4.40, 0.0),
-    # максимум — fireworks/us (точка fireworks: 0.22 / 0.66)
-    ModelPolicy("deepseek/deepseek-v4.1-flash", "fireworks", "high", 0.45, 1.80, 0.45),
+    # deepinfra/fp8 (решение владельца 14.10, причина смены точки — deploy/README.md «Модели по ролям»),
+    # вариантов точки нет; без скидки 0,3 (листинг 0.14 / 0.42 ÷ 0.7); своей цены записи нет — как вход;
+    # ZDR — в списке /endpoints/zdr
+    ModelPolicy("deepseek/deepseek-v4.1-flash", "deepinfra/fp8", "high", 0.20, 0.60, 0.20),
     # без скидки 0,5: 0.75 / 3.75 × 2
     ModelPolicy("google/gemini-3.8-flash", "google-vertex/global", "medium", 1.50, 7.50, 0.0),
     # максимум — azure/us, azure/eu (+10 %); длинный вход 4.00 / 15.00 / 5.00 + те же 10 %
@@ -152,7 +154,8 @@ def _squash(name: str) -> str:
 def provider_matches(pinned: str, reported: str) -> bool:
     """Точка из ответа (`provider`) — закреплённая: без регистра и знаков одна строка — начало другой.
 
-    `google-vertex/global` ~ `Google Vertex`, `fireworks` ~ `Fireworks`. Пустое после чистки имя не
+    `google-vertex/global` ~ `Google Vertex`, `fireworks` ~ `Fireworks`, `deepinfra/fp8` ~ `DeepInfra`
+    (тот же приём слэша — суффикс точки не входит в имя провайдера ответа). Пустое после чистки имя не
     совпадает ни с чем: пустая строка — начало любой.
     """
     if not isinstance(pinned, str) or not isinstance(reported, str):

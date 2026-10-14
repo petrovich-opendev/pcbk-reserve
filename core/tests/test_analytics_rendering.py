@@ -379,13 +379,17 @@ def _now_reply(**over) -> dict:
 
 
 def test_render_telemetry_section_includes_label_tag_approval_value_unit_time_quality():
+    """`reply["tz"]` ("Europe/Moscow" — метка каталога, не связанная со смещением `item["time"]`) не попадает в
+    текст вовсе (раунд правки 2) — показывается смещение, разобранное из самой строки времени значения
+    (здесь — «+00:00» ISO-строки `_now_reply`, отсюда «UTC+00:00», а не «Europe/Moscow»)."""
     section = render_telemetry_section("20FAKE_001_PV", _link(), _now_reply())
     assert section.kind == "telemetry_observation"
     assert section.evidence_refs == [] and section.claim_id is None and section.rendered_by == "server"
     text = section.text
-    for piece in ("20FAKE_001_PV", "tech1", "15.01.2026", "12,5", "л/час", "время историана", "Europe/Moscow",
-                 "good", "не норматив и не уставка"):
+    for piece in ("20FAKE_001_PV", "tech1", "15.01.2026", "12,5", "л/час", "14.10.2026 08:00:00", "UTC+00:00",
+                 "время историана", "good", "не норматив и не уставка"):
         assert piece in text, piece
+    assert "Europe/Moscow" not in text
 
 
 def test_render_telemetry_section_discrete_tag_uses_state_label_not_value_unit():
@@ -414,7 +418,57 @@ def test_render_telemetry_section_item_status_not_ok_uses_item_text():
     assert "нет значения" in section.text
 
 
+# --- план Д17, Task 1, раунд правки 2 (живая проверка на сервере): оформление числа/единицы/времени ---
+
+def test_render_telemetry_section_live_bug_rounds_number_marks_missing_unit_shows_own_timezone():
+    """Воспроизводит буквально то, что вышло на сервере: сырое значение историана
+    `-75.99102783203125`, `unit=None`, время `+05:00` (не UTC и не `reply["tz"]`, который в этом тесте вообще
+    не задан) — раньше в текст уходило полное значение без единицы, без форматирования времени."""
+    reply = _now_reply(item={"tag": "20FAKE_001_PV", "status": "ok", "description": "датчик",
+                             "unit": None, "kind": "analog", "value": -75.99102783203125,
+                             "time": "2026-10-15T00:54:42+05:00", "age_s": 5, "quality": "хорошее",
+                             "item_notes": []})
+    del reply["tz"]
+    link = _link(approved_by="student_test", approved_at=datetime(2026, 10, 14))
+    section = render_telemetry_section("20FAKE_001_PV", link, reply)
+    text = section.text
+    assert "-75,991" in text
+    assert "75,99102783203125" not in text and "75.99102783203125" not in text
+    assert "(единица в историане не задана)" in text
+    assert "15.10.2026 00:54:42 (UTC+05:00, время историана)" in text
+    assert "хорошее" in text
+
+
+def test_render_telemetry_section_integer_value_has_no_decimal_separator():
+    reply = _now_reply(item={"tag": "20FAKE_001_PV", "status": "ok", "description": "расход", "unit": "л/час",
+                             "kind": "analog", "value": 8.0, "time": "2026-10-14T08:00:00+00:00", "age_s": 5,
+                             "quality": "good", "item_notes": []})
+    section = render_telemetry_section("20FAKE_001_PV", _link(), reply)
+    assert "8 л/час" in section.text
+    assert "8,0" not in section.text and "8.0" not in section.text
+
+
+def test_render_telemetry_section_rounds_to_three_decimals_strips_trailing_zeros():
+    reply = _now_reply(item={"tag": "20FAKE_001_PV", "status": "ok", "description": "расход", "unit": "л/час",
+                             "kind": "analog", "value": 12.50001, "time": "2026-10-14T08:00:00+00:00",
+                             "age_s": 5, "quality": "good", "item_notes": []})
+    section = render_telemetry_section("20FAKE_001_PV", _link(), reply)
+    assert "12,5" in section.text
+    assert "12,50001" not in section.text and "12,500" not in section.text
+
+
+def test_render_telemetry_section_unparseable_time_shown_as_is_not_crash():
+    reply = _now_reply(item={"tag": "20FAKE_001_PV", "status": "ok", "description": "расход", "unit": "л/час",
+                             "kind": "analog", "value": 1.0, "time": "не-время-вовсе", "age_s": 5,
+                             "quality": "good", "item_notes": []})
+    section = render_telemetry_section("20FAKE_001_PV", _link(), reply)   # не бросает
+    assert "не-время-вовсе" in section.text
+    assert "время историана" in section.text
+
+
 def test_render_telemetry_period_section_includes_period_avg_min_max_good():
+    """`period["tz"]` ("Europe/Moscow") не попадает в текст — границы разобраны из своих ISO-строк (раунд
+    правки 2), отсюда «UTC+00:00» на каждой, не метка каталога."""
     reply = {"tool": "tag_period", "status": "ok", "notes": [], "cache": "none",
             "period": {"start": "2026-10-14T00:00:00+00:00", "end": "2026-10-14T08:00:00+00:00",
                       "tz": "Europe/Moscow", "preset": "prev_shift", "shift_grid_assumed": False,
@@ -425,8 +479,25 @@ def test_render_telemetry_period_section_includes_period_avg_min_max_good():
                       "avg": 12.4, "min": 10.1, "max": 15.0, "range": 4.9, "std": 0.3, "percent_good": 99.5}]}
     section = render_telemetry_period_section("20FAKE_001_PV", _link(), reply)
     assert section.kind == "telemetry_observation"
-    for piece in ("12,4", "10,1", "15", "99,5", "л/час", "prev_shift"):
+    for piece in ("12,4", "10,1", "15", "99,5", "л/час", "prev_shift", "14.10.2026 00:00:00", "14.10.2026 08:00:00",
+                 "UTC+00:00"):
         assert piece in section.text, piece
+    assert "Europe/Moscow" not in section.text
+
+
+def test_render_telemetry_period_section_live_bug_rounds_number_marks_missing_unit_shows_own_timezone():
+    reply = {"tool": "tag_period", "status": "ok", "notes": [], "cache": "none",
+            "period": {"start": "2026-10-14T00:00:00+05:00", "end": "2026-10-15T00:54:42+05:00",
+                      "preset": None, "shift_grid_assumed": False, "clamped": False, "open": False},
+            "items": [{"tag": "20FAKE_001_PV", "status": "ok", "description": "датчик", "unit": None,
+                      "avg": -75.99102783203125, "min": -80.1234, "max": -70.0, "range": 10.1234,
+                      "std": 1.2, "percent_good": 99.0}]}
+    section = render_telemetry_period_section("20FAKE_001_PV", _link(), reply)
+    text = section.text
+    assert "-75,991" in text and "75,99102783203125" not in text
+    assert "-80,123" in text and "-70" in text and "-70,0" not in text
+    assert "(единица в историане не задана)" in text
+    assert "14.10.2026 00:00:00 (UTC+05:00)" in text and "15.10.2026 00:54:42 (UTC+05:00)" in text
 
 
 def test_render_telemetry_period_section_appends_reply_notes():

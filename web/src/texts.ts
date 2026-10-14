@@ -302,6 +302,12 @@ export const AN_ERROR_LABELS: Readonly<Record<string, string>> = {
 // --- основания (AnalyticsSources.tsx) ---
 export const T_AN_SOURCES = "Основания";
 export const T_AN_NO_SOURCES = "Без оснований — общая справка";
+// раунд правки 2 (живая проверка на сервере): секция telemetry_observation не имеет evidence_refs по контракту
+// (источник значения — служба данных, не корпус документов, Д17 Task 1/DRIFT.md), но «Без оснований — общая
+// справка» для неё неверно — у значения ЕСТЬ источник, просто не из документов. AnalyticsPage.tsx показывает
+// эту строку вместо AnalyticsSources специально для telemetry_observation (остальные виды секций — без правки)
+export const T_AN_TELEMETRY_SOURCE =
+  "Источник: служба данных историана — тот же канал, что у калькуляторов, не документы КДМ-1";
 export const T_AN_LIMITATION = "Ограничение";
 export const T_AN_CORPUS_VERSION = (v: string): string => `Версия корпуса: ${v}`;
 // название/тип/дата источника при раскрытии (правка итогового ревью, п.1 F2-brief; мастер-промпт §6: «название,

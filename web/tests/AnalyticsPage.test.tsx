@@ -10,8 +10,8 @@ import { AnalyticsPage } from "../src/components/AnalyticsPage";
 import type { VisibilityDoc } from "../src/status";
 import {
   T_AN_CANCEL, T_AN_CLARIFY_TITLE, T_AN_LINKS, T_AN_LINKS_EMPTY, T_AN_LINKS_NO_BRIDGE, T_AN_NO_CONVERSATIONS,
-  T_AN_ORIGINAL_QUESTION, T_AN_REVIEWS, T_AN_SEND, T_AN_SEND_TO_REVIEW, T_AN_SEND_TO_REVIEW_DONE,
-  T_AN_SEND_TO_REVIEW_RATIONALE, T_AN_SHOW_FRAGMENT, T_AN_UNAVAILABLE, T_DOWN,
+  T_AN_NO_SOURCES, T_AN_ORIGINAL_QUESTION, T_AN_REVIEWS, T_AN_SEND, T_AN_SEND_TO_REVIEW, T_AN_SEND_TO_REVIEW_DONE,
+  T_AN_SEND_TO_REVIEW_RATIONALE, T_AN_SHOW_FRAGMENT, T_AN_TELEMETRY_SOURCE, T_AN_UNAVAILABLE, T_DOWN,
 } from "../src/texts";
 
 // doc управляемый из теста (приём status.test.ts у startStatusPolling): hidden — геттер, listener захватываем
@@ -363,6 +363,33 @@ test("analytics_page_shows_telemetry_observation_section_label", async () => {
 
   expect(await screen.findByText("Данные историана")).toBeTruthy();
   expect(screen.getByText(/время историана/)).toBeTruthy();
+  // раунд правки 2 (живая проверка на сервере): у telemetry_observation evidence_refs всегда пуст по контракту,
+  // но у значения есть источник (служба данных) — «Без оснований — общая справка» здесь неверно
+  expect(screen.queryByText(T_AN_NO_SOURCES)).toBeNull();
+  expect(screen.getByText(T_AN_TELEMETRY_SOURCE)).toBeTruthy();
+});
+
+test("analytics_page_non_telemetry_section_without_evidence_keeps_no_sources_text", async () => {
+  const api = fakeApi({
+    createConversation: () => Promise.resolve(reply(201, { id: "c1" })),
+    conversation: () => Promise.resolve(reply(200, {
+      conversation: { id: "c1", mode: "reference", created_at: "2026-10-14T08:00:00+00:00",
+                     last_activity_at: "2026-10-14T08:00:00+00:00", corpus_version: "20FAKE-v1" },
+      requests: [],
+    })),
+    ask: () => Promise.resolve(reply(202, { request_id: "r1" })),
+    request: () => Promise.resolve(reply(200, jobBody({
+      sections: [section({ kind: "public_definition", text: "БДРВ — база данных реального времени." })],
+    }))),
+  });
+  render(<AnalyticsPage api={api} onSignedOut={vi.fn()} pollMs={10} />);
+  fireEvent.click(await screen.findByRole("button", { name: /Новый диалог: Справка по документам/ }));
+  fireEvent.change(screen.getByLabelText(/Ваш вопрос технологу/), { target: { value: "Что такое БДРВ?" } });
+  fireEvent.click(screen.getByRole("button", { name: T_AN_SEND }));
+
+  // остальные виды секций без оснований — прежний текст, правка раунда 2 их не касается
+  expect(await screen.findByText(T_AN_NO_SOURCES)).toBeTruthy();
+  expect(screen.queryByText(T_AN_TELEMETRY_SOURCE)).toBeNull();
 });
 
 // --- Правка, раунд 1, п.1: пауза опроса при скрытой вкладке (НЕ отмена задания, НЕ сброс pollToken) ---

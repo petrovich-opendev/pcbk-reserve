@@ -68,9 +68,25 @@ section` ниже, а не этими двумя функциями.
 telemetry_refusal_section` (служба данных подключена, но отказала — текст отказа передаётся как есть, мастер-
 промпт: «отказ `DataService` показывается как есть, не прячется и не переформулируется в «ошибку»»), `render_
 telemetry_truncated_section` (подписей в вопросе больше, чем сервер читает за один ответ).
+
+Правка плана Д17, Task 1, раунд правки 2 (живая проверка на сервере, 14.10.2026) — три уточнения оформления
+телеметрии (значения не менялись, только показ):
+
+1. Число — `_fmt_measured`: не больше трёх знаков после запятой, без хвостовых нулей, запятая не точка; это
+   округление ПОКАЗА, не пересчёт (сырое значение историана, например `-75.99102783203125`, без округления
+   уходило в текст целиком). Целое/дискретное (`state_label`) — как есть, эта функция их не трогает.
+2. Единица `None`/пустая строка (у реального тега в историане бывает не задана) — place-holder `_UNIT_NOT_SET`
+   («единица в историане не задана») вместо того, чтобы молча пропасть из текста (было: значение без единицы
+   встык со временем, неотличимо от опечатки).
+3. Время — `_telemetry_time_text`/`_telemetry_bound_text`: строка `time`/`start`/`end` ответа `DataService`
+   (ISO со своим смещением) разбирается и показывается В ЕЁ ЖЕ поясе («ДД.ММ.ГГГГ ЧЧ:ММ:СС (UTC±ЧЧ:ММ)»), не
+   переводится в другой — отдельное поле `tz` ответа (`reply["tz"]`/`period["tz"]`, текстовая метка пояса
+   каталога) для этого больше не читается, чтобы не показывать смещение одного пояса рядом с меткой другого.
+   Строка не разбирается (нет значения, не ISO, нет смещения) — показывается как есть, без форматирования.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from .models import JobResponse, Section
@@ -233,6 +249,66 @@ def render_response(request_id: str, conversation_id: str, state: str, corpus_ve
 TELEMETRY_LINKS_SECTION_NAME = "Связи с историаном"  # заголовок раздела вкладки — тот же текст, что в подсказке
 
 
+_UNIT_NOT_SET = "(единица в историане не задана)"  # план Д17, Task 1, раунд правки 2 — unit=None/"" у тега
+
+
+def _fmt_measured(value: float) -> str:
+    """Округление ПОКАЗА сырого измеренного значения историана (не `_fmt` — та хранит полную точность для
+    расчётов, план Д17, Task 1, раунд правки 2): не больше трёх знаков после запятой, без хвостовых нулей,
+    запятая не точка; целое — без разделителя вовсе (как `_fmt`). Это только отображение, значение из ответа
+    `DataService` не пересчитывается и никуда дальше в этом виде не передаётся."""
+    rounded = round(float(value), 3)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.3f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def _unit_text(unit: str | None) -> str:
+    """Единица для текста секции — `_UNIT_NOT_SET`, если у тега в историане она не задана (`unit=None`/пустая
+    строка), не молчаливое исчезновение единицы из текста (план Д17, Task 1, раунд правки 2)."""
+    text = str(unit or "").strip()
+    return text if text else _UNIT_NOT_SET
+
+
+def _utc_offset_text(offset: timedelta) -> str:
+    total_minutes = round(offset.total_seconds() / 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def _parse_iso_datetime(time_iso) -> "datetime | None":
+    """`time_iso` → `datetime` СО СМЕЩЕНИЕМ (`utcoffset()` не `None`) или `None`, если строка не ISO, пустая
+    или наивная (без смещения — показывать как «её же пояс» тогда нечего, план Д17, Task 1, раунд правки 2)."""
+    if not isinstance(time_iso, str) or not time_iso:
+        return None
+    try:
+        parsed = datetime.fromisoformat(time_iso)
+    except ValueError:
+        return None
+    return parsed if parsed.utcoffset() is not None else None
+
+
+def _telemetry_time_text(time_iso) -> str:
+    """«ДД.ММ.ГГГГ ЧЧ:ММ:СС (UTC±ЧЧ:ММ, время историана)» — из строки `time` ответа `DataService` (ISO со
+    своим смещением), в ЕЁ ЖЕ поясе, без перевода в другой (план Д17, Task 1, раунд правки 2: `reply["tz"]`,
+    отдельная текстовая метка пояса каталога, здесь больше не используется — смещение берётся из самой строки
+    времени значения, не рискует разойтись с ней). Строка не разобралась — показывается как есть."""
+    parsed = _parse_iso_datetime(time_iso)
+    if parsed is None:
+        return f"{time_iso} — время историана"
+    return f"{parsed:%d.%m.%Y %H:%M:%S} ({_utc_offset_text(parsed.utcoffset())}, время историана)"
+
+
+def _telemetry_bound_text(time_iso) -> str:
+    """Граница периода тем же приёмом, что `_telemetry_time_text`, без повторяющейся на каждой границе подписи
+    «время историана» (она не о конкретном значении, а об окне целиком — секция и так про историан)."""
+    parsed = _parse_iso_datetime(time_iso)
+    if parsed is None:
+        return str(time_iso)
+    return f"{parsed:%d.%m.%Y %H:%M:%S} ({_utc_offset_text(parsed.utcoffset())})"
+
+
 def _telemetry_header(label: str, tag: str, link: "ResolvedLink") -> str:
     """Общий префикс обеих секций значения: подпись из вопроса, тег и кто/когда согласовал связь — из
     `ResolvedLink` (мастер-промпт §7, этап 7: связь оборудования согласуется отдельно, подпись её не
@@ -243,29 +319,31 @@ def _telemetry_header(label: str, tag: str, link: "ResolvedLink") -> str:
 
 def _telemetry_value_text(item: dict) -> str:
     """Значение элемента ответа `DataService` для текста секции: дискретный тег — `state_label` вместо
-    значения/единицы (план, Task 1: «дискретный тег — state_label вместо значения/единицы»)."""
+    значения/единицы (план, Task 1: «дискретный тег — state_label вместо значения/единицы»); аналоговое
+    значение — округление показа (`_fmt_measured`) и честная единица (`_unit_text`, план Д17, Task 1, раунд
+    правки 2)."""
     if "state_label" in item:
         return str(item["state_label"])
-    unit = str(item.get("unit") or "").strip()
-    return f"{_fmt(item['value'])} {unit}".strip()
+    return f"{_fmt_measured(item['value'])} {_unit_text(item.get('unit'))}"
 
 
 def render_telemetry_section(label: str, link: "ResolvedLink", reply: dict) -> "Section":
     """Секция `telemetry_observation` — значение «сейчас» согласованного тега (`data_bridge.tag_now`). `reply`
     — ответ `DataService`, в котором уже есть хотя бы один элемент `items` (вызывающий, `service.py`, отличает
     полный отказ службы без `items` раньше и строит для него `render_telemetry_refusal_section`, не эту
-    функцию). Текст — только из полей ответа, без пересчёта; время — буквально `item["time"]`/`reply["tz"]`, с
-    явной подписью «время историана» (мастер-промпт §8). `item["status"] != "ok"` (например, тег без недавнего
-    значения) — в текст идёт его `item["text"]`, не придуманное число."""
+    функцию). Текст — только из полей ответа, без пересчёта значения; время — `item["time"]`, разобранное в
+    ЕЁ ЖЕ поясе (`_telemetry_time_text`, план Д17, Task 1, раунд правки 2), с явной подписью «время историана»
+    (мастер-промпт §8). `item["status"] != "ok"` (например, тег без недавнего значения) — в текст идёт его
+    `item["text"]`, не придуманное число."""
     item = reply["items"][0]
     tag = item.get("tag") or link.historian_tag
     header = _telemetry_header(label, tag, link)
     if item.get("status") != "ok":
         text = f"{header}: {item.get('text', '')}"
     else:
-        text = (f"{header}: {_telemetry_value_text(item)} на {item.get('time')} — время историана "
-               f"({reply.get('tz')}); качество: {item.get('quality')}. Это измеренное значение на момент "
-               "ответа, не норматив и не уставка.")
+        text = (f"{header}: {_telemetry_value_text(item)} на {_telemetry_time_text(item.get('time'))}; "
+               f"качество: {item.get('quality')}. Это измеренное значение на момент ответа, не норматив и не "
+               "уставка.")
         notes = item.get("item_notes") or []
         if notes:
             text += " " + "; ".join(notes) + "."
@@ -274,15 +352,18 @@ def render_telemetry_section(label: str, link: "ResolvedLink", reply: dict) -> "
 
 
 def _telemetry_period_text(period: dict) -> str:
-    """Период текстом — буквально из `reply["period"]` (`preset`/`start`/`end`/`tz`), без пересчёта границ."""
-    preset, start, end, tz = period.get("preset"), period.get("start"), period.get("end"), period.get("tz")
-    span = f"{start} — {end}"
-    return f"{preset} ({span}, {tz})" if preset else f"{span} ({tz})"
+    """Период текстом — границы (`start`/`end`) разобраны в ИХ ЖЕ поясе (`_telemetry_bound_text`, план Д17,
+    Task 1, раунд правки 2), `preset` ответа — как есть; `period["tz"]` (отдельная метка пояса каталога) здесь
+    больше не читается, по той же причине, что в `_telemetry_time_text`."""
+    preset, start, end = period.get("preset"), period.get("start"), period.get("end")
+    span = f"{_telemetry_bound_text(start)} — {_telemetry_bound_text(end)}"
+    return f"{preset} ({span})" if preset else span
 
 
 def render_telemetry_period_section(label: str, link: "ResolvedLink", reply: dict) -> "Section":
     """Секция `telemetry_observation` за период (`data_bridge.tag_period`) — среднее/минимум/максимум/доля
-    хороших точек буквально из ответа `DataService`, тем же приёмом, что `render_telemetry_section`."""
+    хороших точек буквально из ответа `DataService` (округление показа — `_fmt_measured`, честная единица —
+    `_unit_text`, план Д17, Task 1, раунд правки 2), тем же приёмом, что `render_telemetry_section`."""
     item = reply["items"][0]
     tag = item.get("tag") or link.historian_tag
     header = _telemetry_header(label, tag, link)
@@ -290,9 +371,10 @@ def render_telemetry_period_section(label: str, link: "ResolvedLink", reply: dic
     if item.get("status") != "ok":
         text = f"{header} за {period_text}: {item.get('text', '')}"
     else:
-        unit = str(item.get("unit") or "").strip()
-        text = (f"{header} за {period_text}: среднее {_fmt(item['avg'])}, минимум {_fmt(item['min'])}, "
-               f"максимум {_fmt(item['max'])} {unit}; доля хороших точек {_fmt(item['percent_good'])} %.")
+        unit = _unit_text(item.get("unit"))
+        text = (f"{header} за {period_text}: среднее {_fmt_measured(item['avg'])}, минимум "
+               f"{_fmt_measured(item['min'])}, максимум {_fmt_measured(item['max'])} {unit}; доля хороших "
+               f"точек {_fmt_measured(item['percent_good'])} %.")
         notes = reply.get("notes") or []
         if notes:
             text += " " + "; ".join(notes) + "."

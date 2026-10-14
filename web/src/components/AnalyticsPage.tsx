@@ -40,7 +40,7 @@ import {
   T_AN_NEW_CONVERSATION, T_AN_NO_CONVERSATIONS, T_AN_NO_QUESTION, T_AN_ORIGINAL_QUESTION, T_AN_PERIOD,
   T_AN_PERIOD_FROM, T_AN_PERIOD_TO, T_AN_PERIOD_TZ, T_AN_PROCESS, T_AN_QUESTION, T_AN_RETRY, T_AN_REVIEWS,
   T_AN_SCOPE, T_AN_SEND, T_AN_SEND_TO_REVIEW, T_AN_SEND_TO_REVIEW_DONE, T_AN_SEND_TO_REVIEW_RATIONALE,
-  T_AN_SENDING, T_AN_START_HINT, T_AN_TITLE, T_AN_UNAVAILABLE, T_AN_UNIT, T_UNKNOWN,
+  T_AN_SENDING, T_AN_START_HINT, T_AN_TELEMETRY_SOURCE, T_AN_TITLE, T_AN_UNAVAILABLE, T_AN_UNIT, T_UNKNOWN,
 } from "../texts";
 
 export interface AnalyticsPageProps {
@@ -97,7 +97,15 @@ function SectionCard({ s, api }: { s: JobResponse["sections"][number]; api: Anal
     <div className="an-section" data-kind={s.kind}>
       <h5 className="an-section-kind">{AN_SECTION_LABELS[s.kind] ?? s.kind}</h5>
       <div className="an-section-text"><LessonMarkdown markdown={s.text} /></div>
-      <AnalyticsSources evidenceRefs={s.evidenceRefs} api={api} />
+      {/* раунд правки 2 (живая проверка на сервере): telemetry_observation не имеет evidence_refs по контракту
+          (источник — служба данных, не корпус документов) — «Без оснований» (AnalyticsSources при пустом
+          evidenceRefs) тут неверно, у значения источник есть, просто не из документов; остальные виды секций
+          не меняются */}
+      {s.kind === "telemetry_observation" ? (
+        <p className="an-note">{T_AN_TELEMETRY_SOURCE}</p>
+      ) : (
+        <AnalyticsSources evidenceRefs={s.evidenceRefs} api={api} />
+      )}
     </div>
   );
 }
