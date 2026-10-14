@@ -182,7 +182,9 @@ def render_calculation_section(result: "CalculationResult") -> "Section":
         return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server",
                        claim_id=None)
     inputs_text = "; ".join(f"{name}={_fmt(value)} {unit}".strip() for name, value, unit in result.inputs)
-    assumptions_text = "; ".join(result.assumptions) if result.assumptions else "без дополнительных допущений"
+    # допущения — готовые предложения расчётного модуля, с точкой на конце: своя точка шаблона ниже не удваивается
+    assumptions_text = ("; ".join(a.rstrip(".") for a in result.assumptions) if result.assumptions
+                        else "без дополнительных допущений")
     text = (f"Расчёт «{result.calculation_id}»: входы — {inputs_text}. "
             f"Результат — {_fmt(result.value)} {result.unit}. Допущения: {assumptions_text}.")
     return Section(kind="calculation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)
