@@ -111,7 +111,7 @@ async def _service_no_processes(tmp_path, *, build: "callable | None" = None) ->
 
 def _preanalysis(decision: str, *, allowed_claim_ids=(), allowed_mechanism_ids=(), missing_fields=(),
                  corpus_version: str = "v1", resolved_terms=(), intent: str = "definition",
-                 llm_export_policy: str = "public_only") -> Preanalysis:
+                 llm_export_policy: str = "public_only", conflict_ids=()) -> Preanalysis:
     """`corpus_version` (правка F4a) — умолчание `"v1"` остаётся для тестов с пустым пакетом (отсутствие
     карточек само по себе ничего не сверяет с версией); тесты, где пакет непустой и карточки несут настоящие
     `evidence_refs` (после `_refresh_pack` — см. `_service`), передают сюда РЕАЛЬНУЮ версию хендла, иначе
@@ -119,9 +119,11 @@ def _preanalysis(decision: str, *, allowed_claim_ids=(), allowed_mechanism_ids=(
     что тест на самом деле проверяет. `resolved_terms` (дополнение контроллера к правке F4a, H-26) — для тестов
     подписи кандидатов неоднозначного термина (`preanalysis.clarification_candidates`, см. `_build_outcome`).
     `intent`/`llm_export_policy` (итоговая правка F6) — умолчания прежние (`"definition"`/`"public_only"`),
-    тесты control-ветки (F6, п.2 брифа) и подстановки политики экспорта (F6, п.1) передают их явно."""
+    тесты control-ветки (F6, п.2 брифа) и подстановки политики экспорта (F6, п.1) передают их явно.
+    `conflict_ids` (раунд правки 4, план Д17, Task 1) — умолчание `()` не меняет прежние тесты; тесты открытых
+    расхождений (`test_conflict_*`) передают id строк `conflicts` синтетического корпуса."""
     return Preanalysis(scope="KDM1_PCBK", intent=intent, decision=decision,
-                       resolved_terms=list(resolved_terms), process_ids=[], conflict_ids=[],
+                       resolved_terms=list(resolved_terms), process_ids=[], conflict_ids=list(conflict_ids),
                        missing_fields=list(missing_fields), risk="reference", corpus_version=corpus_version,
                        evidence_pack_id=None, allowed_claim_ids=list(allowed_claim_ids),
                        allowed_mechanism_ids=list(allowed_mechanism_ids), data_access_ready=False,
@@ -2126,4 +2128,127 @@ async def test_telemetry_absent_with_empty_pack_and_limited_answer_decision_stay
     assert not any(s.kind == "telemetry_observation" for s in response.sections)
     limitation = [s for s in response.sections if s.kind == "limitation"]
     assert len(limitation) == 1 and "не согласована" in limitation[0].text
+    await svc.aclose()
+
+
+# --- план Д17, Task 1, раунд правки 4: открытые расхождения корпуса в ответе (мастер-промпт §6) ---
+
+async def test_conflict_open_adds_limitation_section_and_source_conflict_error_code(tmp_path, monkeypatch):
+    """Пробел Д16: `error_code="source_conflict"` был объявлен в контракте, но никогда не выставлялся —
+    открытое расхождение корпуса, на которое преданализ сослался (`analysis.conflict_ids`), теперь даёт
+    секцию `limitation` с id/описанием и этот код (мастер-промпт §6: «конфликт виден и может быть отправлен
+    на согласование»). `CONF-FAKE-001` синтетического корпуса уже в статусе `"open"` — фикстуру не трогал."""
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version, conflict_ids=("CONF-FAKE-001",)), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что с узлом №8?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.error_code == "source_conflict"
+    conflict = [s for s in response.sections if "CONF-FAKE-001" in s.text]
+    assert len(conflict) == 1 and conflict[0].kind == "limitation"
+    assert "Выдуманное открытое расхождение 1." in conflict[0].text
+    assert "согласование" in conflict[0].text
+    await svc.aclose()
+
+
+async def test_conflict_closed_or_missing_is_skipped_silently(tmp_path, monkeypatch):
+    """Расхождение не в статусе `"open"` (вставлено в файл корпуса, не в общую фикстуру) или вовсе не
+    найденное в таблице `conflicts` — пропускается молча: ни секции, ни `error_code`."""
+    def build(corpus_path: Path) -> None:
+        _insert_row(corpus_path, "conflicts", {
+            "id": "CONF-FAKE-900", "description": "Закрытое расхождение.", "state": "closed",
+            "resolution": "решено", "reviewer_login": "tech1", "resolved_at": "2026-01-01T00:00:00+00:00",
+            "blocking_scope": "related_local_claims_only"})
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version,
+                            conflict_ids=("CONF-FAKE-900", "CONF-FAKE-NO-SUCH-ID")), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path, build=build)
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Вопрос")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.error_code is None
+    assert response.sections == []
+    await svc.aclose()
+
+
+async def test_conflict_does_not_overwrite_busy_error_code(tmp_path, monkeypatch):
+    """`error_code="busy"` (платный вызов диалога уже занят, правка F4a) не перетирается
+    `"source_conflict"` — другой код уже выставлен (план, раунд правки 4: «busy/policy_refused и т.п. не
+    перетирать»). Занятость форсируется напрямую (`_llm_inflight_conversations`), без настоящей
+    конкурентности."""
+    class FakeLlm:
+        config_error = None
+        stopped = False
+        upstream = object()
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version, conflict_ids=("CONF-FAKE-001",)), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    svc.llm = FakeLlm()
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    svc._llm_inflight_conversations.add(conv)
+    request_id = await _ask(svc, STUDENT_A, conv, question="Вопрос")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.error_code == "busy"
+    assert any("CONF-FAKE-001" in s.text for s in response.sections)      # секция расхождения всё равно есть
+    await svc.aclose()
+
+
+async def test_conflict_section_not_added_on_clarification(tmp_path, monkeypatch):
+    """Уточняющий вопрос — секция расхождения не строится вовсе (ветка `needs_clarification` возвращает ответ
+    раньше, чем доходит до `_conflict_sections`), даже если `analysis.conflict_ids` непуст."""
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("needs_clarification", corpus_version=corpus_version, missing_fields=("unit",),
+                            conflict_ids=("CONF-FAKE-001",)), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Вопрос")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.state == "needs_clarification"
+    assert response.error_code is None
+    assert not any("CONF-FAKE-001" in s.text for s in response.sections)
+    await svc.aclose()
+
+
+async def test_conflict_sections_capped_at_two_with_truncated_note(tmp_path, monkeypatch):
+    """Три открытых расхождения в `analysis.conflict_ids` — показаны первые два (`service.
+    MAX_CONFLICT_SECTIONS`), третье — только в сводной строке «ещё N»."""
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version,
+                            conflict_ids=("CONF-FAKE-001", "CONF-FAKE-002", "CONF-FAKE-003")), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Вопрос")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    shown = [s for s in response.sections if "В источниках КДМ-1 есть открытое расхождение" in s.text]
+    texts = [s.text for s in shown]
+    assert len(shown) == 2
+    assert any("CONF-FAKE-001" in t for t in texts)
+    assert any("CONF-FAKE-002" in t for t in texts)
+    assert not any("CONF-FAKE-003" in t for t in texts)
+    truncated = [s for s in response.sections if "Ещё" in s.text and "расхожден" in s.text]
+    assert len(truncated) == 1 and "1" in truncated[0].text
+    assert response.error_code == "source_conflict"
     await svc.aclose()

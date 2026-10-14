@@ -149,6 +149,9 @@ MAX_CONCURRENT_JOBS = 4
 # телеметрия БДРВ в ответе (план Д17, Task 1): не больше этого числа подписей-с-согласованной-связью читается
 # за один ответ — остальные отмечает render_telemetry_truncated_section, не падение и не тихое молчание
 MAX_TELEMETRY_LABELS = 3
+# открытые расхождения корпуса в ответе (план Д17, Task 1, раунд правки 4): не больше этого числа секций
+# `render_conflict_section` на ответ — остальные считает render_conflict_truncated_section
+MAX_CONFLICT_SECTIONS = 2
 # составной evidence_id GET .../evidence/{id} — см. докстринг модуля
 EVIDENCE_SEP = ":"
 _CONTRACTS_DIR = Path(__file__).resolve().parent / "contracts"
@@ -972,12 +975,21 @@ class AnalyticsService:
         # (после расчётной, если она есть, см. ниже)
         telemetry_sections = await self._telemetry_sections(identity, request, handle)
 
+        # открытые расхождения корпуса (план Д17, Task 1, раунд правки 4 — пробел Д16, мастер-промпт §6:
+        # «конфликт виден и может быть отправлен на согласование»); тем же приёмом, что телеметрия — только на
+        # путях с ответом, после needs_clarification/refused/control
+        conflict_sections = await self._conflict_sections(handle, tuple(analysis.conflict_ids))
+        if conflict_sections and outcome.error_code is None:
+            # error_code="source_conflict" не перетирает уже выставленный код (busy/policy_refused и т.п.) —
+            # только если по этому заданию он ещё не задан
+            outcome = dataclasses.replace(outcome, error_code="source_conflict")
+
         if analysis.intent == "calculation":
             # правка F1, п.1: число считает только сервер (calculations.py) — LLM здесь не участвует вовсе
             # (ни в выборе формулы, ни в самом числе); секция расчёта/ограничения — ПЕРВАЯ в ответе, телеметрия
-            # и справочные карточки пакета — следом, как обычно
+            # и расхождения — следом, справочные карточки пакета — последними
             calc_section = self._calculation_section(request.question, analysis)
-            sections = [calc_section, *telemetry_sections, *pack_sections]
+            sections = [calc_section, *telemetry_sections, *conflict_sections, *pack_sections]
             if calc_section.kind == "calculation":
                 state = "completed" if analysis.decision == "ready" else "limited_answer"
             else:
@@ -987,7 +999,7 @@ class AnalyticsService:
             stage = "проверка пройдена" if state == "completed" else "ограниченный ответ"
             return outcome, sections, state, stage
 
-        sections = [*telemetry_sections, *pack_sections]
+        sections = [*telemetry_sections, *conflict_sections, *pack_sections]
         if any(s.kind == "telemetry_observation" for s in sections):
             # план Д17, Task 1, раунд правки 3 (стык с Task 5): вопрос только о подписи оборудования без
             # содержательных слов — пакет пуст, преданализ отдаёт limited_answer (модель не вызывается, Task 5),
@@ -1050,6 +1062,30 @@ class AnalyticsService:
         if conflict is not None:
             result = dataclasses.replace(result, value=None, missing_basis=(conflict,))
         return rendering.render_calculation_section(result)
+
+    async def _conflict_sections(self, handle: "CorpusHandle", conflict_ids: tuple[str, ...]) -> list["Section"]:
+        """Открытые расхождения корпуса, на которые преданализ сослался (`analysis.conflict_ids`) — план Д17,
+        Task 1, раунд правки 4 (пробел Д16, мастер-промпт §6: «конфликт виден и может быть отправлен на
+        согласование»; `error_code="source_conflict"` был объявлен в контракте, но никогда не выставлялся).
+        Расхождение не найдено в таблице `conflicts` или не в статусе `"open"` (решено/отклонено) — пропускается
+        МОЛЧА, ответ его уже не касается. До `MAX_CONFLICT_SECTIONS` штук, в порядке `conflict_ids`; остальные —
+        отдельной строкой («ещё N…»), не показываются целиком. Сбой чтения корпуса — пустой список, не падение
+        задания (тот же приём, что у телеметрии)."""
+        if not conflict_ids:
+            return []
+        try:
+            rows = await asyncio.to_thread(knowledge.get_rows, handle, "conflicts", conflict_ids)
+        except knowledge.CorpusError:
+            return []
+        open_conflicts = [(cid, rows[cid]) for cid in conflict_ids
+                          if rows.get(cid) is not None and rows[cid].get("state") == "open"]
+        shown = open_conflicts[:MAX_CONFLICT_SECTIONS]
+        sections = [rendering.render_conflict_section(cid, row.get("description") or "")
+                   for cid, row in shown]
+        remaining = len(open_conflicts) - len(shown)
+        if remaining > 0:
+            sections.append(rendering.render_conflict_truncated_section(remaining))
+        return sections
 
     async def _telemetry_sections(self, identity: "RequestIdentity", request: "AnalysisRequest",
                                   handle: "CorpusHandle") -> list["Section"]:

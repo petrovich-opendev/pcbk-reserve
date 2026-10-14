@@ -146,6 +146,32 @@ def _basis_weight_phrase_spans(text: str) -> list[tuple[int, int]]:
     return [m.span() for m in _BASIS_WEIGHT_PHRASE_RE.finditer(text)]
 
 
+# Правка контроллера, раунд 3 (Task 5, живая проверка, петля уточнений — то же, что Minor-3 ревью дельты):
+# слово НАЗВАНИЯ БАЗЫ измерения («по массе», «массовая доля», «по объёму», «по сухому», «по влажному», «wet/
+# dry basis» — то же множество форм, что уже снимает `"basis"` через `_BASIS_GIVEN_STEMS` ниже по файлу) само
+# резолвилось как спорный термин корпуса («массе» → «масса», несколько кандидатов словаря), давая лишнее
+# `"quantity"` ПОВЕРХ ответа технолога, который базу УЖЕ назвал текстом: «…влажность полотна после сушки по
+# массе…» получало уточнение «какая величина» вместо прямого ответа — технолог, ответивший на уточнение базы,
+# получал ВТОРОЕ, бессмысленное уточнение. Тот же принцип, что у `_BASIS_WEIGHT_PHRASE_RE` выше (квалификатор
+# снимает неоднозначность текстом, повторно слово не резолвится) — здесь шире, на всё множество форм базы, не
+# только «масса 1 м²». Слово «масса» ВНЕ такой фразы («Что такое масса?», «масса рулона») не исключается —
+# там оно и есть спорное слово вопроса.
+_BASIS_EXPRESSION_PHRASE_RE = re.compile(
+    r"по\s+масс\w*\b|массов\w*\s+дол\w*\b|"
+    r"по\s+объ[ёе]м\w*\b|объ[ёе]мн\w*\s+дол\w*\b|"
+    r"по\s+сух\w*\b|на\s+сух\w*\b|абсолютно\s+сух\w*\b|"
+    r"по\s+влажн\w*\b|влажн\w*\s+баз\w*\b|на\s+влажн\w*\b|"
+    r"wet\s+basis\b|dry\s+basis\b",
+    re.IGNORECASE)
+
+
+def _basis_expression_phrase_spans(text: str) -> list[tuple[int, int]]:
+    """Диапазоны `_BASIS_EXPRESSION_PHRASE_RE` — только для `_content_tokens` (слово выражения базы не
+    резолвится по отдельности как спорный термин); не используется в `_digit_node_process_ids`/`_ordered_
+    content_words` — у этих форм нет ни цифр, ни фразы узла/термина, которую имело бы смысл трогать."""
+    return [m.span() for m in _BASIS_EXPRESSION_PHRASE_RE.finditer(text)]
+
+
 def _span_within(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     return any(span_start <= start and end <= span_end for span_start, span_end in spans)
 
@@ -157,7 +183,8 @@ def _content_tokens_with_positions(text: str, *, extra_excluded_spans: tuple[tup
     исходного текста вопроса, а не в порядке, в котором их нашли разные механизмы."""
     seen: set[str] = set()
     result: list[tuple[str, int, int]] = []
-    excluded_spans = _basis_weight_phrase_spans(text) + list(extra_excluded_spans)
+    excluded_spans = (_basis_weight_phrase_spans(text) + _basis_expression_phrase_spans(text)
+                      + list(extra_excluded_spans))
     for match in _TOKEN_RE.finditer(text):
         word = match.group(0)
         if len(word) < 2:
@@ -665,8 +692,20 @@ _BASIS_SENSITIVE_STEMS: tuple[str, ...] = (
 )
 # только КОНКРЕТНО названная база ("по массе"/"по сухому"/"по влажной") снимает уточнение; слова «абсолютное»/
 # «избыточное» намеренно НЕ сюда — вопрос «это абсолютное давление?» (T-06) называет оба варианта, СПРАШИВАЯ,
-# какой из них, а не сообщая базу, и сам по себе не должен гасить уточнение
-_BASIS_GIVEN_STEMS: tuple[str, ...] = ("по масс", "по сух", "по влажн", "wet basis", "dry basis")
+# какой из них, а не сообщая базу, и сам по себе не должен гасить уточнение. Правка контроллера, раунд 3
+# (Task 5, живая проверка, то же — Minor-3 ревью дельты): «объемн дол»/«массов дол» добавлены — «Влажность по
+# объёму» раньше всё равно просила "basis", хотя база (объёмная доля) уже названа текстом. «По объём»/«по
+# объем» НЕ добавлены сюда отдельной записью, хотя об этом просил координатор буквально: наивный стеммер
+# (`_SUFFIXES`) усекает И «объём», И «объем», И «объёму»/«объему» до «объ» (суффикс «ем»/«му» снимается, 5-2=3
+# и 6-3=3 — ровно `_MIN_STEM`) — запись длиной 3 буквы в стебле-ФРАЗЕ (`_stem_matches` ищет такие подстрокой по
+# ВСЕМУ нормализованному тексту, без границ слова, см. docstring функции) ложно сработала бы на «по объект…»
+# (документы пакета употребляют слово «объект» — RISK, не подтверждённый в ACCEPTANCE_CASES, но реальный).
+# Вместо этого «по объёму»/«по объему»/«объёмная доля»/«объемная доля» снимает "basis" через отдельную
+# проверку `_BASIS_EXPRESSION_PHRASE_RE.search(parsed.original)` ниже (точные границы слова `\b`, без риска
+# со «объект») — тот же регэксп, что уже исключает эти слова из разрешения терминов (см. `_basis_expression_
+# phrase_spans` выше), поэтому форма не продублирована, а правильно переиспользована под вторую задачу.
+_BASIS_GIVEN_STEMS: tuple[str, ...] = ("по масс", "по сух", "по влажн", "объемн дол", "массов дол",
+                                       "wet basis", "dry basis")
 
 
 # Правка контроллера, раунд 2 (Task 5, Critical ревью дельты): различает ДВА вида `ambiguous=True` термина
@@ -1011,8 +1050,9 @@ def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["Re
     # совпадёт с «сложилась»/«сложилось», см. комментарий у `_CALCULATION_STEMS`) + стеблем временной области
     time_union_question = calculations.mentions_time_range(parsed.original) or (
         _mentions_sum_imperative(parsed.original) and _stem_matches(parsed.normalized, _PERIOD_STEMS))
-    if (_stem_matches(parsed.normalized, _BASIS_SENSITIVE_STEMS) and not _stem_matches(
-            parsed.normalized, _BASIS_GIVEN_STEMS) and not known_calc_refusal
+    basis_given = (_stem_matches(parsed.normalized, _BASIS_GIVEN_STEMS)
+                  or bool(_BASIS_EXPRESSION_PHRASE_RE.search(parsed.original)))
+    if (_stem_matches(parsed.normalized, _BASIS_SENSITIVE_STEMS) and not basis_given and not known_calc_refusal
             and not equipment_label_suppresses):
         missing.append("basis")
     if intent == "calculation" and parsed.unit_hint is None and not known_calc_refusal and not time_union_question:

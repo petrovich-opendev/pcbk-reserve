@@ -26,6 +26,8 @@ from pcbk_core.analytics.rendering import (
     render_calculation_section,
     render_claim_section,
     render_clarification_section,
+    render_conflict_section,
+    render_conflict_truncated_section,
     render_mechanism_section,
     render_response,
     render_telemetry_period_section,
@@ -546,6 +548,23 @@ def test_render_telemetry_truncated_section_mentions_shown_and_total():
     assert "3" in section.text and "5" in section.text
 
 
+# --- план Д17, Task 1, раунд правки 4: открытые расхождения корпуса в ответе (мастер-промпт §6) ---
+
+def test_render_conflict_section_mentions_id_and_description_and_invites_review():
+    section = render_conflict_section("CONF-FAKE-001", "Выдуманное открытое расхождение 1.")
+    assert section.kind == "limitation"
+    assert section.evidence_refs == [] and section.claim_id is None and section.rendered_by == "server"
+    assert "CONF-FAKE-001" in section.text
+    assert "Выдуманное открытое расхождение 1." in section.text
+    assert "не разрешает" in section.text and "согласование" in section.text
+
+
+def test_render_conflict_truncated_section_mentions_remaining_count():
+    section = render_conflict_truncated_section(3)
+    assert section.kind == "limitation"
+    assert "3" in section.text
+
+
 def test_telemetry_section_functions_only_take_typed_arguments_not_free_model_text():
     """Как и прочие `render_*_section` — ни одна функция телеметрии не принимает свободный текст модели."""
     assert list(inspect.signature(render_telemetry_section).parameters) == ["label", "link", "reply"]
@@ -554,6 +573,8 @@ def test_telemetry_section_functions_only_take_typed_arguments_not_free_model_te
     assert list(inspect.signature(render_telemetry_unavailable_section).parameters) == ["label"]
     assert list(inspect.signature(render_telemetry_refusal_section).parameters) == ["label", "message"]
     assert list(inspect.signature(render_telemetry_truncated_section).parameters) == ["shown", "total"]
+    assert list(inspect.signature(render_conflict_section).parameters) == ["conflict_id", "description"]
+    assert list(inspect.signature(render_conflict_truncated_section).parameters) == ["remaining"]
 
 
 def test_rendered_text_never_equals_a_free_form_string_not_derived_from_the_card():

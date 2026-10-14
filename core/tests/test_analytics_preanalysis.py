@@ -2293,3 +2293,155 @@ def test_real_corpus_task5_literal_scenarios_from_controller():
         assert "quantity" in pre6.missing_fields
     finally:
         _close(h)
+
+
+# === Task 5, раунд правки 3 (живая проверка, петля уточнений — то же, что Minor-3 ревью дельты): слово ===
+# === выражения БАЗЫ измерения («по массе», «по объёму», «объёмная доля»…) не должно резолвиться отдельным ===
+# === спорным термином корпуса и давать лишний "quantity" ПОВЕРХ ответа технолога на уже заданный "basis" ===
+
+@pytest.mark.parametrize("text,excluded", [
+    ("влажность по массе на линии", ("массе",)),
+    ("массовая доля сухого вещества", ("массовая",)),
+    ("массовой доли воды в целлюлозе", ("массовой",)),
+    ("влажность по объёму на линии", ("объёму",)),
+    ("влажность по объему на линии", ("объему",)),
+    ("объёмная доля воздуха в потоке", ("объёмная",)),
+    ("объемная доля воздуха в потоке", ("объемная",)),
+    ("показатель по сухому веществу", ("сухому",)),
+    ("на сухое вещество пересчитано", ("сухое",)),
+    ("абсолютно сухое вещество", ("сухое",)),
+    ("влажность по влажному веществу", ("влажному",)),
+    ("влажная база расчёта", ("влажная",)),
+    ("пересчёт на влажную массу", ("влажную",)),
+    ("wet basis указан явно", ("wet", "basis")),
+    ("dry basis указан явно", ("dry", "basis")),
+])
+def test_content_tokens_excludes_basis_expression_words(text, excluded):
+    """Слова выражения базы измерения не идут в пословное разрешение терминов — по образцу `_BASIS_WEIGHT_
+    PHRASE_RE`/исключения чисел-значений и цифр кода машины (докстринг `_basis_expression_phrase_spans`)."""
+    from pcbk_core.analytics.preanalysis import _content_tokens
+
+    tokens = {t.lower() for t in _content_tokens(text)}
+    for word in excluded:
+        assert word not in tokens, (text, tokens)
+
+
+def test_content_tokens_keeps_mass_word_outside_basis_expression():
+    """Слово «масса» ВНЕ выражения базы («масса рулона», без «по массе»/«массовая доля») — как раньше: обычное
+    содержательное слово, резолвится отдельно."""
+    from pcbk_core.analytics.preanalysis import _content_tokens
+
+    tokens = {t.lower() for t in _content_tokens("масса рулона на складе")}
+    assert "масса" in tokens
+
+
+def test_content_tokens_keeps_object_word_near_po_unaffected():
+    """Контроль отсутствия коллизии «по объ…»: слово «объект» (не форма «объём»/«объему») после предлога «по»
+    НЕ попадает ни в один из новых регэксп-вариантов `_BASIS_EXPRESSION_PHRASE_RE` (только `объём`/`объем` с
+    суффиксами через `\\w*`, а не произвольное «объ…») — исключение не ловит «объект» по ошибке."""
+    from pcbk_core.analytics.preanalysis import _content_tokens
+
+    tokens = {t.lower() for t in _content_tokens("вопрос по объекту КДМ-1")}
+    assert "объекту" in tokens
+
+
+def _insert_ambiguous_mass_term(path: Path) -> tuple[str, str]:
+    """Два термина корпуса с одинаковой (по основам) формой «масса» — воспроизведение настоящего дефекта:
+    словарь знает несколько величин с этим словом («Масса квадратного метра», «Концентрация массы», «Масса»,
+    …), слово само по себе спорно. См. `_insert_term_row` выше (своя вставка, не трогает `kdm1_corpus.py`)."""
+    id_a, id_b = "TERM-TEST-MASS-A", "TERM-TEST-MASS-B"
+    _insert_term_row(path, id_a, "Масса", ambiguous=True)
+    _insert_term_row(path, id_b, "Масса рулона", ambiguous=True)
+    return id_a, id_b
+
+
+def test_analyze_basis_expression_phrase_suppresses_quantity_and_basis(handle):
+    """Буквальный сценарий раунда 3 (координатор): технолог отвечает на вопрос о базе измерения фразой «по
+    массе» — слово «массе» не резолвится как спорный термин «масса» (никакого лишнего `quantity`), а база уже
+    названа текстом (никакого `basis`, несмотря на «влажности» — `_BASIS_SENSITIVE_STEMS`)."""
+    _insert_ambiguous_mass_term(Path(handle.path))
+    pre, _pack = analyze(STUDENT, _request("Какая норма влажности по массе на линии?"), handle, handle.version)
+    assert "quantity" not in pre.missing_fields
+    assert "basis" not in pre.missing_fields
+
+
+def test_analyze_bare_mass_word_still_clarifies_quantity(handle):
+    """Контраст к тесту выше: БЕЗ фразы-базы («масса» сама по себе, без «по массе»/«массовая доля») слово
+    по-прежнему спорное — `quantity` запрашивается, как и до раунда 3 (фикс не маскирует обычную
+    неоднозначность, только ту, что сама фраза уже сняла текстом)."""
+    _insert_ambiguous_mass_term(Path(handle.path))
+    pre, _pack = analyze(STUDENT, _request("Масса сейчас какая на линии?"), handle, handle.version)
+    assert "quantity" in pre.missing_fields
+
+
+def test_analyze_basis_expression_volume_variant_suppresses_basis(handle):
+    """«…по объёму…» — тот же эффект на `basis`, что и «по массе» (раунд 3, явный пункт координатора:
+    `_BASIS_GIVEN_STEMS` раньше не знал «объём»/«объем»)."""
+    pre, _pack = analyze(STUDENT, _request("Какая норма влажности по объёму на линии?"), handle, handle.version)
+    assert "basis" not in pre.missing_fields
+
+    pre2, _pack2 = analyze(STUDENT, _request("Какая норма влажности по объему на линии?"), handle, handle.version)
+    assert "basis" not in pre2.missing_fields
+
+
+def test_analyze_basis_expression_deviation_with_period_given_no_clarifications(handle):
+    """Буквальный сценарий координатора: режим разбора отклонения, `period_given` из структурного контекста,
+    сорт назван текстом, база названа фразой «по массе» — без единого уточнения."""
+    from datetime import datetime, timezone
+
+    from pcbk_core.analytics.models import PeriodWindow
+
+    _insert_ambiguous_mass_term(Path(handle.path))
+    period = PeriodWindow(start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+                          end=datetime(2026, 10, 2, tzinfo=timezone.utc))
+    question = "Почему могла вырасти влажность полотна после сушки по массе на сорте тестлайнер?"
+    req = AnalysisRequest(client_request_id="req-1", question=question, mode="deviation_review",
+                          context=RequestContext(period=period))
+    pre, _pack = analyze(STUDENT, req, handle, handle.version)
+    assert pre.missing_fields == []
+
+
+def test_requires_clarification_basis_given_stems_cover_massov_and_obemn_dol():
+    """`_BASIS_GIVEN_STEMS` после раунда 3 содержит «объемн дол»/«массов дол» буквально (безопасные стебли —
+    без риска ложного совпадения, в отличие от трёхбуквенного «объ», см. комментарий у самой константы)."""
+    from pcbk_core.analytics.preanalysis import _BASIS_GIVEN_STEMS
+
+    assert "объемн дол" in _BASIS_GIVEN_STEMS
+    assert "массов дол" in _BASIS_GIVEN_STEMS
+    assert "по объем" not in _BASIS_GIVEN_STEMS      # сняли бы «по объект…» ложно, см. комментарий
+
+
+@real_corpus
+def test_real_corpus_task5_round3_literal_scenarios_from_controller():
+    """Буквальные сценарии раунда 3 (координатор) на настоящем корпусе (теги предприятия в текст теста не
+    попадают — только общий текст вопроса)."""
+    from datetime import datetime, timezone
+
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+    from pcbk_core.analytics.models import PeriodWindow
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        pre1, _pack1 = analyze(
+            STUDENT, _request("Какая норма влажности полотна после сушки по массе на КДМ-1?"), h, h.version)
+        assert "quantity" not in pre1.missing_fields
+        assert "basis" not in pre1.missing_fields
+
+        pre2, _pack2 = analyze(
+            STUDENT, _request("Какая норма влажности полотна после сушки по объёму на КДМ-1?"), h, h.version)
+        assert "basis" not in pre2.missing_fields
+
+        pre3, _pack3 = analyze(STUDENT, _request("Что такое масса?"), h, h.version)
+        assert pre3.decision == "needs_clarification"
+        assert "quantity" in pre3.missing_fields
+
+        period = PeriodWindow(start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+                              end=datetime(2026, 10, 13, tzinfo=timezone.utc))
+        question4 = "Почему могла вырасти влажность полотна после сушки по массе на сорте тестлайнер?"
+        req4 = AnalysisRequest(client_request_id="req-1", question=question4, mode="deviation_review",
+                               context=RequestContext(period=period))
+        pre4, _pack4 = analyze(STUDENT, req4, h, h.version)
+        assert pre4.missing_fields == []
+    finally:
+        _close(h)

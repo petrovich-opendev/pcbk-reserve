@@ -83,6 +83,13 @@ telemetry_truncated_section` (подписей в вопросе больше, �
    переводится в другой — отдельное поле `tz` ответа (`reply["tz"]`/`period["tz"]`, текстовая метка пояса
    каталога) для этого больше не читается, чтобы не показывать смещение одного пояса рядом с меткой другого.
    Строка не разбирается (нет значения, не ISO, нет смещения) — показывается как есть, без форматирования.
+
+Открытые расхождения корпуса (план Д17, Task 1, раунд правки 4 — пробел Д16, мастер-промпт §6: «конфликт виден
+и может быть отправлен на согласование»): `render_conflict_section`/`render_conflict_truncated_section` — тот
+же приём, что у ограничений телеметрии (фиксированный шаблон, `evidence_refs=[]`, `claim_id=None`). Какое
+расхождение показывать и какой `error_code` ставить — решает `service._conflict_sections`/`_build_outcome`
+(только статус `"open"`, не перетирая уже выставленный код `busy`/`policy_refused`), этот модуль только строит
+секцию из уже выбранного `conflict_id`/`description`.
 """
 from __future__ import annotations
 
@@ -410,4 +417,24 @@ def render_telemetry_truncated_section(shown: int, total: int) -> "Section":
     """Подписей со связью в вопросе больше, чем сервер читает за один ответ (`service.MAX_TELEMETRY_LABELS`) —
     `shown` — сколько реально прочитано, `total` — сколько подписей со связью нашёл сервер всего."""
     text = f"Показаны первые {shown} подписи из {total}."
+    return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)
+
+
+# --- открытые расхождения корпуса в ответе (план Д17, Task 1, раунд правки 4; мастер-промпт §6) ---
+
+def render_conflict_section(conflict_id: str, description: str) -> "Section":
+    """Открытое расхождение корпуса (`conflicts`), на которое преданализ сослался (`analysis.conflict_ids`) —
+    мастер-промпт §6: «конфликт виден и может быть отправлен на согласование» (пробел Д16: `error_code=
+    "source_conflict"` был объявлен в контракте, но никогда не выставлялся). Текст — фиксированный шаблон с
+    `description` как есть, не вольный пересказ; вызывающий (`service._conflict_sections`) передаёт сюда
+    только расхождение в статусе `"open"` — решённые/отклонённые сюда не доходят вовсе."""
+    text = (f"В источниках КДМ-1 есть открытое расхождение {conflict_id}: {description} Ответ ниже его не "
+           "разрешает — расхождение можно отправить на согласование.")
+    return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)
+
+
+def render_conflict_truncated_section(remaining: int) -> "Section":
+    """Открытых расхождений, на которые преданализ сослался, больше, чем секций на ответ (`service.
+    MAX_CONFLICT_SECTIONS`) — `remaining` — сколько ещё не показано этим ответом."""
+    text = f"Ещё {remaining} открытых расхождений корпуса не показаны."
     return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)
