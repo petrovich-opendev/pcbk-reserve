@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:pcbk:kdm1:analytics:job-response",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "conversation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "preanalysis",
+        "retrieving",
+        "generating",
+        "validating",
+        "completed",
+        "needs_clarification",
+        "limited_answer",
+        "cancelled",
+        "failed"
+      ]
+    },
+    "corpus_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "stage_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "document_observation",
+              "public_definition",
+              "calculation",
+              "qualified_hypothesis",
+              "limitation",
+              "clarification"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "fragment_id": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 250
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "locator": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "pdf_page"
+                        },
+                        "page": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 10000
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "page"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "xlsx_cell"
+                        },
+                        "sheet": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 100
+                        },
+                        "cell": {
+                          "type": "string",
+                          "pattern": "^[A-Z]{1,3}[1-9][0-9]{0,6}$"
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "sheet",
+                        "cell"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "image_label"
+                        },
+                        "file": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 120
+                        },
+                        "label": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 120
+                        },
+                        "region_pixels": {
+                          "anyOf": [
+                            {
+                              "type": "array",
+                              "items": {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "file",
+                        "label",
+                        "region_pixels"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "public_section"
+                        },
+                        "url": {
+                          "type": "string",
+                          "format": "uri",
+                          "pattern": "^https://"
+                        },
+                        "section": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 250
+                        }
+                      },
+                      "required": [
+                        "type",
+                        "url",
+                        "section"
+                      ]
+                    }
+                  ]
+                },
+                "corpus_version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "limitation": {
+                  "type": "string",
+                  "minLength": 0,
+                  "maxLength": 500
+                }
+              },
+              "required": [
+                "source_id",
+                "fragment_id",
+                "locator",
+                "corpus_version",
+                "limitation"
+              ]
+            },
+            "maxItems": 12,
+            "uniqueItems": true
+          },
+          "rendered_by": {
+            "const": "server"
+          },
+          "claim_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 250
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "text",
+          "evidence_refs",
+          "rendered_by",
+          "claim_id"
+        ]
+      },
+      "maxItems": 24,
+      "uniqueItems": true
+    },
+    "clarification_keys": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      },
+      "maxItems": 12,
+      "uniqueItems": true
+    },
+    "error_code": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "unavailable",
+            "invalid_input",
+            "policy_refused",
+            "source_conflict",
+            "validation_failed",
+            "interrupted",
+            "busy"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "request_id",
+    "conversation_id",
+    "state",
+    "corpus_version",
+    "stage_label",
+    "sections",
+    "clarification_keys",
+    "error_code"
+  ],
+  "description": "Публичный результат: нет сырых ответов, секретов, внутреннего промпта, плательщика или рассуждений модели. До проверки sections пуст. Доступность источника/владельца проверяется сервером."
+}

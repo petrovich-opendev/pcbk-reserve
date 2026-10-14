@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:pcbk:kdm1:analytics:llm-selection",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "reference_claim_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 250
+      },
+      "maxItems": 20,
+      "uniqueItems": true
+    },
+    "mechanism_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      },
+      "maxItems": 6,
+      "uniqueItems": true
+    },
+    "clarification_keys": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "quantity",
+          "process",
+          "unit",
+          "basis",
+          "period",
+          "timezone",
+          "grade",
+          "measurement_quality",
+          "source_applicability"
+        ]
+      },
+      "maxItems": 9,
+      "uniqueItems": true
+    },
+    "calculation_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "dry_solid_flow",
+          "geometric_output",
+          "dry_grammage",
+          "interval_union"
+        ]
+      },
+      "maxItems": 4,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "reference_claim_ids",
+    "mechanism_ids",
+    "clarification_keys",
+    "calculation_ids"
+  ],
+  "description": "Только предложение выбора. Все ID должны входить в разрешенный пакет; сервер дополнительно сужает enum под конкретный пакет. Свободного технологического текста, нормы, владельца и ссылки модель не передает."
+}

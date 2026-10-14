@@ -1,0 +1,104 @@
+{
+  "description": "Текущие sha256 19 защищённых файлов (PROTECTED_DATA_BASELINE.json пакета заказчика) — пересчёт от рабочего дерева pcbk-reserve-kdm1 (план КДМ1, Task 0, Global Constraints). Эти файлы не менялись задачей 0 и не должны меняться последующими задачами плана без отдельного решения владельца.",
+  "reason": "Прямое указание пользователя: не менять общий разрешенный список тегов и его функции.",
+  "archive_sha256": "9b87f7273b6da95069835f7bd3485f28b7c3d3d1e36db0637c1162a802b11dba",
+  "computed_from_git_head": "bea62db",
+  "drift_from_archive_baseline": "docs/kdm1/DRIFT.md",
+  "files": [
+    {
+      "path": "core/pcbk_core/data/__init__.py",
+      "bytes": 28965,
+      "sha256": "007d089e83378413dd9c34c9e111ad71632b8cf3fee99de0406eccede212c7e7"
+    },
+    {
+      "path": "core/pcbk_core/data/budget.py",
+      "bytes": 3134,
+      "sha256": "7da04cdb830fc80dcf7fa06d4017f1e8c236bdea73f43e35c009d0f2e3b3aeb4"
+    },
+    {
+      "path": "core/pcbk_core/data/build_whitelist.py",
+      "bytes": 13826,
+      "sha256": "8694ebd1fe20503e9c94d25411cc5ec4c6e6c602b71ef1fb4bc1ee2432a3fe9c"
+    },
+    {
+      "path": "core/pcbk_core/data/cache.py",
+      "bytes": 6045,
+      "sha256": "6acb7016038b97704203770b0482fbb79c384d9d8630534b5d89db55671545fc"
+    },
+    {
+      "path": "core/pcbk_core/data/catalog.py",
+      "bytes": 9697,
+      "sha256": "9c689be14fb22c62cdcb7abd7a22e34364692414cbe176ca14239114b889bd20"
+    },
+    {
+      "path": "core/pcbk_core/data/events.py",
+      "bytes": 14288,
+      "sha256": "04335576b1ba05d4217d4cd40f00f2f34d39675d2eb03433f5d84cd7cd2b7e00"
+    },
+    {
+      "path": "core/pcbk_core/data/freshness.py",
+      "bytes": 5077,
+      "sha256": "1877e612dd199b8852d349b9de40ad0318d09ecafbcaea9c1e328bcae8b148b6"
+    },
+    {
+      "path": "core/pcbk_core/data/gate.py",
+      "bytes": 23896,
+      "sha256": "a6942b9d72c31a678fe908b73a0638d866679421b1c9498045cc22688e54df98"
+    },
+    {
+      "path": "core/pcbk_core/data/historian.py",
+      "bytes": 8810,
+      "sha256": "e336d2f21a5c0ec57b63d6745a57fcf66c88bbaee226f23841a2c5aea42d3af9"
+    },
+    {
+      "path": "core/pcbk_core/data/http_api.py",
+      "bytes": 15876,
+      "sha256": "27cec7ba9e639697bd648b6805c066c56309133c3f8750c4b8a9e37d2c9911a5"
+    },
+    {
+      "path": "core/pcbk_core/data/mcp_server.py",
+      "bytes": 25193,
+      "sha256": "681e940e0e55efda17700bc8ec7f206689c88e9bcc55c17d3cb49f2636ab8c9a"
+    },
+    {
+      "path": "core/pcbk_core/data/my_agents.py",
+      "bytes": 5712,
+      "sha256": "46fa3183d5e730eacb6713e1c6a5b3b13d19295fc67c6d61c0efc4babf998852"
+    },
+    {
+      "path": "core/pcbk_core/data/names.py",
+      "bytes": 1089,
+      "sha256": "759624189136589efe6a576042650300d3f1900e174209d77c5ee1fcf4e2c277"
+    },
+    {
+      "path": "core/pcbk_core/data/periods.py",
+      "bytes": 6350,
+      "sha256": "edb108fe9a7c510c87e51fdc304e6381c7d27bcaa4a37d950672f8a87630f5ca"
+    },
+    {
+      "path": "core/pcbk_core/data/report_event.py",
+      "bytes": 13495,
+      "sha256": "1837a7ebf43b955aacde84010e8d96df6b72387a6992530a6a7b2411e4b2f536"
+    },
+    {
+      "path": "core/pcbk_core/data/save_agent.py",
+      "bytes": 22096,
+      "sha256": "af3a6bb05a6eb6ac135220e87d7a34c7b0e59100c3d0e69d37e53857f4cf12dd"
+    },
+    {
+      "path": "core/pcbk_core/data/service.py",
+      "bytes": 77601,
+      "sha256": "9e865b27f544115ad8f05713a5e706fd26e424679f04cd344833de03e9f83050"
+    },
+    {
+      "path": "core/pcbk_core/data/sql.py",
+      "bytes": 16722,
+      "sha256": "ea5f1b02e46b319d19372effe38f2af356931e651382a0a66579f70518234611"
+    },
+    {
+      "path": "core/pcbk_core/gateway/calc_api.py",
+      "bytes": 8740,
+      "sha256": "f3a14a28c95ce2b4a6124f47b05be430d05a05a8ed7e92bcf7403302ec983fba"
+    }
+  ]
+}

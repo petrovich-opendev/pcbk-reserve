@@ -220,7 +220,7 @@ services:
   core:
     build: ./core
     # откатный образ — `core:d10b` (Д11а, А0; deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d15b
+    image: pcbk-reserve/core:d16
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
@@ -292,6 +292,22 @@ services:
       # LLM-прокси не обновляет; journal_down — журнал действий не пишется (кабинет закрыт); пусто — нет. Опечатка —
       # ошибка настройки шлюза и закрытый LLM-прокси, процесс жив
       DRILL_TEACHER: ${DRILL_TEACHER:-}
+      # аналитический чат технолога КДМ-1 (Task 9; мастер-промпт §4, §10): core получает только настройки из
+      # analytics/settings.py — выключатель по умолчанию пуст (аналитика выключена, старый .env без ANALYTICS_*
+      # поднимается как раньше). ANALYTICS_CORPUS_DIR/ANALYTICS_STATE_PATH здесь НЕ передаются: путь внутри
+      # контейнера фиксирован умолчанием settings.py (/srv/analytics — ровно том ниже; /var/lib/pcbk-core/
+      # analytics.db — уже существующий том core-data) — как LESSONS_ROOT/LESSONS_DIR: хост задаёт каталог
+      # хоста монтирования (ниже, volumes), контейнерный путь не параметр
+      ANALYTICS_ENABLED: ${ANALYTICS_ENABLED:-}
+      ANALYTICS_LLM_MODELS: ${ANALYTICS_LLM_MODELS:-}
+      ANALYTICS_LLM_EXPORT_POLICY: ${ANALYTICS_LLM_EXPORT_POLICY:-}
+      # кто решает заявки согласования reviews/* (F5, решение владельца 14.10.2026) — grants | all_students;
+      # пусто — умолчание кода grants (docs/kdm1/REVIEWS_OPERATIONS.md, раздел «Режим ANALYTICS_REVIEWERS»)
+      ANALYTICS_REVIEWERS: ${ANALYTICS_REVIEWERS:-}
+      ANALYTICS_TEACHER_PAYER: ${ANALYTICS_TEACHER_PAYER:-}
+      ANALYTICS_HISTORY_RETENTION_DAYS: ${ANALYTICS_HISTORY_RETENTION_DAYS:-}
+      ANALYTICS_EVIDENCE_RETENTION_DAYS: ${ANALYTICS_EVIDENCE_RETENTION_DAYS:-}
+      ANALYTICS_JOB_TIMEOUT_S: ${ANALYTICS_JOB_TIMEOUT_S:-}
     volumes:
       - {type: bind, source: "${DATA_DIR:?DATA_DIR не задан}/whitelist.txt", target: /app/data/whitelist.txt,
          read_only: true, bind: {create_host_path: false}}
@@ -303,6 +319,13 @@ services:
       # не пишет; обязателен, как AGENTS_DIR — каталога нет, а не пустой урок (Ruling 3)
       - {type: bind, source: "${LESSONS_DIR:?LESSONS_DIR не задан}", target: /srv/lessons,
          read_only: true, bind: {create_host_path: false}}
+      # корпус аналитики КДМ-1 (Task 9; мастер-промпт §4, §10): только на чтение, как LESSONS_DIR — но НЕ
+      # обязателен («:?»), в отличие от LESSONS_DIR/AGENTS_DIR/DATA_DIR: аналитика выключена по умолчанию
+      # (ANALYTICS_ENABLED пуст), и старый .env без ANALYTICS_CORPUS_DIR не должен падать на docker compose —
+      # умолчание — пустой именованный том pcbk-analytics-empty (короткая запись: путь — привязка каталога
+      # хоста, имя — том), а не каталог репозитория: на сервере есть только compose.yaml и edge/. На сервере
+      # ПЦБК ANALYTICS_CORPUS_DIR указывает на настоящий корпус (вне git, версии — docs/kdm1/CORPUS_OPERATIONS.md)
+      - "${ANALYTICS_CORPUS_DIR:-pcbk-analytics-empty}:/srv/analytics:ro"
       # журнал событий core.db; каталог образа принадлежит 10003 — том наследует владельца
       - {type: volume, source: pcbk-core-data, target: /var/lib/pcbk-core}
     secrets:
@@ -641,6 +664,9 @@ volumes:
   pcbk-core-data:
   # временные файлы edge (Д5б): только тела и ответы в пути, данных нет — с префиксом проекта, как журналы
   pcbk-edge-temp:
+  # пустой корпус аналитики КДМ-1 по умолчанию (Task 9): ANALYTICS_CORPUS_DIR не задан — аналитика выключена,
+  # core монтирует этот пустой том вместо каталога хоста
+  pcbk-analytics-empty:
   # данные студентов: внешние — Compose их не создаёт и не удаляет (down -v их не тронет)
   pcbk-student-01-state: {name: pcbk-student-01-state, external: true}
   pcbk-student-01-work: {name: pcbk-student-01-work, external: true}

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:pcbk:kdm1:analytics:analysis-request",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "client_request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 6000
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "reference",
+        "deviation_review"
+      ]
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "process_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "period": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "start": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "end": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "start",
+                "end"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unit_hint": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": []
+    }
+  },
+  "required": [
+    "client_request_id",
+    "question",
+    "mode"
+  ],
+  "description": "Идентичность, область КДМ-1, модель, пакет и полномочия задает сервер. Дата-время требует явного смещения; порядок/длительность проверяет сервер."
+}

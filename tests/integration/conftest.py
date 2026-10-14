@@ -76,6 +76,13 @@ STACK_VARS = frozenset({"DOCKER_GID", "STU_NET", "TLS_DIR", "DISPLAY_TZ", "SECRE
                         "DRILL_TEACHER", "TEACHER_STALE_S",
                         # двойник историана стенда отбора у core — только compose.test.yaml (Д8-R75)
                         "PCBK_TWIN_HISTORIAN",
+                        # аналитический чат технолога КДМ-1 (Task 9): по умолчанию test.env их не задаёт (как
+                        # старый .env — аналитика выключена); test_analytics.py включает их только на время
+                        # своего модуля через stack.recreate(), не через test.env
+                        "ANALYTICS_ENABLED", "ANALYTICS_CORPUS_DIR", "ANALYTICS_LLM_MODELS",
+                        "ANALYTICS_LLM_EXPORT_POLICY", "ANALYTICS_REVIEWERS", "ANALYTICS_TEACHER_PAYER",
+                        "ANALYTICS_HISTORY_RETENTION_DAYS", "ANALYTICS_EVIDENCE_RETENTION_DAYS",
+                        "ANALYTICS_JOB_TIMEOUT_S",
                         # статика edge тестового стенда со сборкой чата (Д6а): compose.test.yaml, «:?»
                         "PCBK_TEST_STATIC",
                         # память (Д11а, m-4 р2): пороги тормоза прогона у core и строки «Память сервера» у сторожа,

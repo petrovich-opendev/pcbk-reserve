@@ -19,6 +19,8 @@ from .settings import Settings
 
 if TYPE_CHECKING:
     from .agents.stats import AgentStats
+    from .analytics.service import AnalyticsService
+    from .analytics.settings import AnalyticsSettings
     from .app import Role
     from .data.service import DataService
     from .gateway import GatewayRole
@@ -134,7 +136,20 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
     shares_drill = str(gw_values.get("DRILL_TEACHER", GatewaySettings.DRILL_TEACHER))
     drill_error = any(error.startswith("DRILL_TEACHER:") for error in gw_errors)
     llm = build_llm_role(settings, env, shares_drill=shares_drill, drill_error=drill_error)
-    return [data, llm, build_gateway_role(settings, env, agent_stats=agent_stats, calc=data.service, llm=llm)]
+    analytics_settings, analytics_problem = analytics_settings_from_env(env)
+    if analytics_problem is not None:
+        log.error("аналитика КДМ-1: настройки: %s", analytics_problem)
+    analytics_role = None
+    if analytics_settings.ANALYTICS_ENABLED:
+        from .analytics.service import AnalyticsService
+        # llm=llm (Task 5, llm_adapter.py реализован): роль llm — та же, что у шлюза и калькуляторов страницы;
+        # сама по себе она не обещает оплачиваемый разбор — capabilities().llm_available у service.py остаётся
+        # false, пока эта роль не здорова (config_error/stopped/upstream) или identity — преподаватель без явно
+        # настроенного плательщика (мастер-промпт §6, см. llm_adapter.py и отчёт задачи 5)
+        analytics_role = AnalyticsService(analytics_settings, calc=data.service, llm=llm)
+    return [data, llm, build_gateway_role(settings, env, agent_stats=agent_stats, calc=data.service, llm=llm,
+                                          analytics=analytics_role,
+                                          analytics_enabled=analytics_settings.ANALYTICS_ENABLED)]
 
 
 def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None, *, shares_drill: str = "",
@@ -215,13 +230,16 @@ def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None, *, 
 
 def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None, *,
                        agent_stats: AgentStats | None = None, calc: DataService | None = None,
-                       llm: LlmRole | None = None) -> GatewayRole:
+                       llm: LlmRole | None = None, analytics: AnalyticsService | None = None,
+                       analytics_enabled: bool = False) -> GatewayRole:
     """Роль gateway по образцу build_llm_role (Ш9): GW_* с ошибкой — запасные настройки (gateway_settings) и
     config_error «настройки шлюза: …» (имя поля и правило, без значения); процесс жив. Ни один конструктор
     ничего не открывает: core.db — в lifespan роли, клиенты sp-ctl и мест — при первом запросе. agent_stats —
     общие с ролью «данные» счётчики агентов (build_roles); None — роль создаёт свои. calc — служба данных роли «данные»
     для калькуляторов страницы (Д9-R87); None — маршрут /pcbk/api/calc/ отвечает 503. llm — роль LLM-прокси с долями
-    мест (Д10-R98): их сверяет такт уборщика шлюза; None — шлюз без долей."""
+    мест (Д10-R98): их сверяет такт уборщика шлюза; None — шлюз без долей. analytics/analytics_enabled — аналитика
+    КДМ-1 (план КДМ1, Task 4): analytics_enabled по умолчанию False — старое поведение без аргументов не меняется
+    (build_roles передаёт оба явно из ANALYTICS_ENABLED)."""
     from .gateway import GatewayRole
     from .gateway.accounts import AccountStore
     from .gateway.places import SpCtl, Workplaces
@@ -234,7 +252,22 @@ def build_gateway_role(settings: Settings, env: Mapping[str, str] | None = None,
     return GatewayRole(settings, gw, store=AccountStore(settings.DB_PATH, ttl_s=gw.GW_SESSION_TTL_S),
                        workplaces=Workplaces(gw, SpCtl(gw.SP_CTL_URL), stats=stats), stats=stats,
                        config_error=None if problem is None else f"настройки шлюза: {problem}",
-                       agent_stats=agent_stats, calc=calc, llm=llm)
+                       agent_stats=agent_stats, calc=calc, llm=llm, analytics=analytics,
+                       analytics_enabled=analytics_enabled)
+
+
+def analytics_settings_from_env(env: Mapping[str, str] | None = None) -> tuple[AnalyticsSettings, str | None]:
+    """ANALYTICS_* для аналитики КДМ-1 (план КДМ1, Task 4) — по образцу `gateway_settings`: (настройки, None)
+    или (запасные `valid_from_env`, текст первой ошибки). Опечатка в одном поле (например,
+    ANALYTICS_LLM_EXPORT_POLICY) не сбрасывает ANALYTICS_ENABLED к умолчанию, если оно само читается верно
+    (`AnalyticsSettings.valid_from_env`) — аналитика не включается и не выключается молча опечаткой в другом
+    поле."""
+    from .analytics.settings import AnalyticsSettings
+
+    try:
+        return AnalyticsSettings.from_env(env), None
+    except ValueError as exc:
+        return AnalyticsSettings.valid_from_env(env), str(exc)
 
 
 def gateway_settings(env: Mapping[str, str] | None = None) -> tuple[GatewaySettings, str | None]:

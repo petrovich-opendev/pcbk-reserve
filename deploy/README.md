@@ -1734,6 +1734,58 @@ fallback_from=<основная> fallback_reason=<rate|in_flight|server|unreacha
 - **Откат Д15а** — `docs/checks/D15a.md`, раздел «Откат» (`compose.yaml.d14a`, `.env.pre-d15a`,
   `edge/pcbk.conf.template.d14a`, `edge/static/chat.d14`).
 
+## Аналитика КДМ-1 (с Task 9)
+
+Отдельная вкладка «Аналитический чат технолога» (план `PLAN-KDM1-analytics-2026-10-14`) — справка и предварительный
+разбор вопроса по корпусу КДМ-1 с опорой на проверенные источники. Подсистема целиком в этом же `core`/`edge`:
+новый префикс `/pcbk/api/analytics/` (девять путей — `docs/kdm1/INTERFACES.md`), своё состояние, свой корпус.
+
+- **Включение:** `ANALYTICS_ENABLED=on` в `.env` (пусто/`off` — выключена, умолчание; как старый `.env` без этой
+  переменной вовсе — вход, чат, калькуляторы и уроки не затрагивает). Применяется пересозданием `core`:
+  `docker compose up -d --no-build --force-recreate core`. Выключенная — `/pcbk/api/analytics/*` отвечает 404, как
+  путь, которого нет вовсе (роутер не подключён); включённая без готового корпуса/подсистемы — понятный 503.
+- **Корпус:** каталог `ANALYTICS_CORPUS_DIR` из `.env`, только на чтение (`core` монтирует в `/srv/analytics`, тот
+  же приём, что `LESSONS_DIR`/`/srv/lessons`), файл `*.seed.sqlite3` внутри (схема и поля —
+  `core/pcbk_core/analytics/knowledge.py`, `knowledge/README.md` пакета заказчика). В отличие от `LESSONS_DIR`
+  переменная **не обязательна**: без неё `docker compose` не падает — умолчание — пустой именованный том
+  `pcbk-analytics-empty` (аналитика и так выключена по умолчанию; каталога репозитория на сервере нет). На
+  сервере ПЦБК `ANALYTICS_CORPUS_DIR` — отдельный каталог вне git (`/opt/pcbk-reserve/analytics-corpus`);
+  `core` в контейнере — uid 10003, поэтому каталог и файлы корпуса должны читаться всеми (`chmod -R o+rX`, каталог
+  0755, файлы 0644) — иначе корпус не откроется и аналитика ответит 503. Публикация новых версий корпуса —
+  `docs/kdm1/CORPUS_OPERATIONS.md`.
+- **Состояние:** `/var/lib/pcbk-core/analytics.db` — отдельный файл в уже существующем томе `pcbk-core-data`
+  (новый том для аналитики не создавался); диалоги, задания, пакеты доказательств и журнал аналитики не смешаны с
+  `core.db` (история чата, журнал расходов LLM).
+- **Неисправный корпус** (нет каталога/файла, битый SQLite, манифест не JSON или область не КДМ-1) — аналитика
+  отвечает понятным отказом (`capabilities.reference_available = false`, создание диалога — 503 «Аналитика КДМ-1
+  недоступна»), вход, чат, уроки и калькуляторы продолжают работать (ошибка корпуса не бросается из общего
+  жизненного цикла шлюза).
+- **Откат подсистемы/корпуса** — только пересоздание `core` без удаления томов и истории: вернуть `ANALYTICS_ENABLED`
+  в пусто (выключить) или прежнее значение `ANALYTICS_CORPUS_DIR` (вернуть прежнюю версию корпуса), затем
+  `docker compose up -d --no-build --force-recreate core`. `core.db`, журнал расходов LLM и `analytics.db` этим не
+  трогаются — откат меняет только настройку и примонтированный каталог, не состояние.
+- **Резервная копия/восстановление `analytics.db`** — тот же приём, что у `core.db` (раздел «Резервная копия и
+  восстановление», «Что, куда, как» и «Восстановление»), только файл есть лишь после хотя бы одного включения
+  аналитики; нет файла — копии/восстановления для него в этом заходе не делаем, остальной заход не прерываем.
+- **Операторские команды** (офлайн, внутри контейнера `core`, сеть не используется) — без дублирования, только
+  ссылки: карантин входящих файлов и публикация/откат версий корпуса — `docs/kdm1/CORPUS_OPERATIONS.md`;
+  назначение и отзыв полномочия согласования (кто решает заявки `reviews/*`) — `docs/kdm1/REVIEWS_OPERATIONS.md`.
+- **Кто решает заявки согласования:** `ANALYTICS_REVIEWERS` в `.env` — `grants` (умолчание, право только по
+  назначению `bootstrap`/`grant` выше) или `all_students` (решение владельца 14.10.2026: любой `student` без
+  назначения решает любую заявку области в одно действие; `teacher` — исключение, как в `grants`). Применяется
+  пересозданием `core`, как `ANALYTICS_ENABLED`. **На сервере ПЦБК — `all_students`.** Подробности и эффект
+  переключения на уже принятые решения — `docs/kdm1/REVIEWS_OPERATIONS.md`, раздел «Режим ANALYTICS_REVIEWERS».
+- **Что уходит модели (политика передачи в LLM):** `ANALYTICS_LLM_EXPORT_POLICY` в `.env` — `public_only`
+  (умолчание: модель видит только id разрешённого пакета и абстрактное намерение, без текста карточек и без
+  вопроса), `approved_subset` (решение владельца, итоговая правка F6, 14.10.2026, дословно: «4. Разрешен
+  полный контент в тч внутренний и данные с БДРВ»; повторно, тем же днём: «Разрашею передачу полного контента
+  в модель!» — модели уходит исходный вопрос технолога и тексты карточек пакета, включая внутренние и данные
+  БДРВ, если они есть в пакете) или `none` (модель не вызывается вовсе, справочный путь без неё работает как
+  обычно). Ни при одном значении ответ модели не расширяется — он всё равно только выбор id по
+  `llm-selection.schema.json`, сырой текст модели клиенту не выводится никогда; учёт, бюджет и журнал
+  LLM-роли не меняются этой настройкой. Применяется пересозданием `core`, как `ANALYTICS_ENABLED`. **На
+  сервере ПЦБК — `approved_subset`** (решение владельца выше).
+
 ## Учётка-образец student_test (с Д15б)
 
 Место 11 — учётка `student_test` (студент, не для выдачи студентам): образец по урокам и учётка живых проверок
@@ -1859,6 +1911,7 @@ cd /opt/pcbk-reserve && B=/opt/pcbk-reserve/backup/$(date +%Y%m%d-%H%M) && insta
 | Что | Как | В копии |
 |---|---|---|
 | `core.db` | `sqlite3.backup()` из `file:…/core.db?mode=ro` в `/var/lib/pcbk-core/backup.db`, `docker cp`, удаление временного файла | согласованная копия даже при WAL |
+| `analytics.db` (Task 9, если есть) | тот же приём `sqlite3.backup()`, отдельный файл в том же томе — только если аналитика хоть раз включалась | диалоги/задания аналитики, отдельно от `core.db` |
 | агенты, архив, карантин | `tar` каталога `/srv` внутри `core` | от владельца 10003 |
 | секреты | `tar` каталога `SECRETS_DIR` снаружи | ключи, пароли, `bdrv.env` |
 | `.env`, `compose.yaml*`, `edge/`, `DATA_DIR` | `tar` от пользователя выкладки | белый список — производственные данные |
@@ -1876,6 +1929,22 @@ with dst:
 dst.close(); src.close()'
 docker cp pcbk-core:/var/lib/pcbk-core/backup.db "$B/core.db"
 docker exec pcbk-core rm /var/lib/pcbk-core/backup.db
+
+# analytics.db (Task 9) — тот же приём, только если файл есть (аналитика хоть раз включалась); нет файла —
+# аналитику не включали, копии для неё в этом заходе не делаем, остальной заход не прерываем
+if docker exec pcbk-core test -f /var/lib/pcbk-core/analytics.db; then
+  docker exec pcbk-core python -c '
+import sqlite3
+src = sqlite3.connect("file:/var/lib/pcbk-core/analytics.db?mode=ro", uri=True)
+dst = sqlite3.connect("/var/lib/pcbk-core/backup-analytics.db")
+with dst:
+    src.backup(dst)
+dst.close(); src.close()'
+  docker cp pcbk-core:/var/lib/pcbk-core/backup-analytics.db "$B/analytics.db"
+  docker exec pcbk-core rm /var/lib/pcbk-core/backup-analytics.db
+else
+  echo "analytics.db нет — аналитику не включали, копии для неё не будет" >> "$B/manifest.txt"
+fi
 
 # агенты, архив, карантин — от владельца 10003
 docker exec pcbk-core tar -C /srv -cf - agents > "$B/agents.tar"
@@ -1956,6 +2025,23 @@ docker exec pcbk-core python -m pcbk_core.gateway.accounts list
 `before-restore-$T/` на томе — данные, не удалять без решения владельца. Корень тома — тоже `10003`, `0750`: том,
 потерянный целиком и созданный заново этой командой, иначе остаётся за root, и `core` не пишет в базу («attempt to
 write a readonly database», «чистые руки», заход 2, 12.10).
+
+**`analytics.db` (Task 9)** — тот же приём, только если в копии есть файл (аналитику включали хотя бы раз); нет
+файла в `$B` — восстанавливать нечего, остальной заход (`core.db`, агенты, секреты) это не блокирует:
+```bash
+cd /opt/pcbk-reserve && B=<каталог копии> &&
+if [ -e "$B/analytics.db" ]; then
+  docker compose stop core && T=$(date -u +%Y%m%dT%H%M%SZ)
+  docker run --rm --network none --user 0 \
+    -v pcbk-reserve_pcbk-core-data:/d \
+    -v "$B/analytics.db:/src/analytics.db:ro" \
+    --entrypoint sh pcbk-reserve/core:d11a -c \
+    "mkdir -p /d/before-restore-$T && for f in analytics.db analytics.db-wal analytics.db-shm; do [ -e /d/\$f ] && mv /d/\$f /d/before-restore-$T/; done; chown -R 10003:10003 /d/before-restore-$T; cp /src/analytics.db /d/analytics.db && chown 10003:10003 /d /d/analytics.db && chmod 0750 /d && chmod 0600 /d/analytics.db"
+  docker compose up -d --no-build core
+else
+  echo "analytics.db нет в копии — аналитику не включали, восстанавливать нечего"
+fi
+```
 
 **Агенты — из той же копии, обменом каталогов** (корень `/srv/agents` у `core` — только для чтения, пишется лишь
 сама привязка; распаковка — рядом, не на место):

@@ -5,11 +5,12 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useEffect } from "react";
 import { expect, test, vi } from "vitest";
 import { App } from "../src/App";
+import type { AnalyticsApi } from "../src/analyticsApi";
 import type { Api, Reply } from "../src/api";
 import type { ChatProps } from "../src/components/Chat";
 import type { startStatusPolling } from "../src/status";
-import { STAND_WARNING, T_CALC_CRASH, T_CALC_RESTART, T_EVENTS_CRASH, T_EVENTS_EMPTY, T_EVENTS_RESTART,
-         T_NOTICE_UNKNOWN, T_TCH_UNKNOWN, T_UNKNOWN } from "../src/texts";
+import { STAND_WARNING, T_AN_CRASH, T_AN_RESTART, T_AN_UNAVAILABLE, T_CALC_CRASH, T_CALC_RESTART, T_EVENTS_CRASH,
+         T_EVENTS_EMPTY, T_EVENTS_RESTART, T_NOTICE_UNKNOWN, T_TCH_UNKNOWN, T_UNKNOWN } from "../src/texts";
 import { OVERVIEW_READY_03, teacherApi } from "./teacherFixtures";
 
 type Answer = [number, unknown];
@@ -478,6 +479,77 @@ test("lessons_tab_present_for_student_not_teacher", async () => {
               ChatImpl={FakeChat} startPolling={okPolling} />);
   await screen.findByText("Кабинет преподавателя");
   expect(screen.queryByRole("button", { name: "Уроки" })).toBeNull();             // только у студента
+});
+
+// --- план КДМ1, Task 6: вкладка «Аналитический чат технолога» — у студента И у преподавателя (мастер-промпт §6:
+// справка преподавателю без LLM), в отличие от «Событий»/«Уроков». Компонент — React.lazy (AnalyticsImpl не
+// задан в большинстве тестов ниже — проверяем настоящую ленивую загрузку хотя бы раз). ---
+
+const FakeAnalytics = () => <div data-testid="fake-analytics" />;
+
+function analyticsApiStub(over: Partial<AnalyticsApi> = {}): AnalyticsApi {
+  const notReady = () => Promise.resolve({ status: 404, body: { name: "NotFound" } });
+  return {
+    capabilities: vi.fn(notReady), conversations: vi.fn(() => Promise.resolve({ status: 200, body: { conversations: [] } })),
+    createConversation: vi.fn(notReady), conversation: vi.fn(notReady), ask: vi.fn(notReady), request: vi.fn(notReady),
+    cancel: vi.fn(notReady), evidence: vi.fn(notReady), reviewRequests: vi.fn(notReady), createReview: vi.fn(notReady),
+    decideReview: vi.fn(notReady), ...over,
+  } as unknown as AnalyticsApi;
+}
+
+test("analytics_tab_present_for_student_and_teacher", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }] });
+  const first = render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} AnalyticsImpl={FakeAnalytics} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  expect(screen.getByRole("button", { name: "Аналитический чат технолога" })).toBeTruthy();
+  first.unmount();
+
+  const t = api({ me: [200, { login: "t", role: "teacher", place: null }] });
+  render(<App api={t} teacherApi={teacherApi({ overview: [200, OVERVIEW_READY_03] })} navigate={vi.fn()}
+              ChatImpl={FakeChat} AnalyticsImpl={FakeAnalytics} startPolling={okPolling} />);
+  await screen.findByText("Кабинет преподавателя");
+  // в отличие от «Событий»/«Уроков» — видна и преподавателю (мастер-промпт §6)
+  expect(screen.getByRole("button", { name: "Аналитический чат технолога" })).toBeTruthy();
+});
+
+test("analytics_tab_switch_keeps_chat_mounted_and_opens_on_demand", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }] });
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} AnalyticsImpl={FakeAnalytics} startPolling={okPolling} />);
+  const chat = await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "Аналитический чат технолога" }));
+  expect(await screen.findByTestId("fake-analytics")).toBeTruthy();
+  expect(chat.closest("[hidden]")).not.toBeNull();                               // чат не снят — поток жив
+  fireEvent.click(screen.getByRole("button", { name: "Чат" }));
+  expect(screen.getByTestId("fake-chat")).toBe(chat);
+  expect(chat.closest("[hidden]")).toBeNull();
+});
+
+test("analytics_tab_crash_reports_and_keeps_chat", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }] });
+  const Boom = (): never => { throw new Error("сбой вкладки аналитики"); };
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} AnalyticsImpl={Boom} startPolling={okPolling} />);
+  const chat = await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "Аналитический чат технолога" }));
+  await waitFor(() => expect(a.report).toHaveBeenCalledWith("ui_crash"));
+  expect(screen.getByText(T_AN_CRASH)).toBeTruthy();
+  expect(screen.getByRole("button", { name: T_AN_RESTART })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Чат" }));
+  expect(screen.getByTestId("fake-chat")).toBe(chat);                            // чат не перемонтирован
+});
+
+test("analytics_tab_real_lazy_component_disabled_server_shows_text_other_tabs_still_work", async () => {
+  const a = api({ me: student, workplace: [200, { state: "ready" }], calc: [200, { status: "ok", matches: [] }] });
+  // AnalyticsImpl не задан — настоящая ленивая загрузка (React.lazy(() => import(...))), не заглушка теста
+  render(<App api={a} navigate={vi.fn()} ChatImpl={FakeChat} analyticsApi={analyticsApiStub()} startPolling={okPolling} />);
+  await screen.findByTestId("fake-chat");
+  fireEvent.click(screen.getByRole("button", { name: "Аналитический чат технолога" }));
+  expect(await screen.findByText(T_AN_UNAVAILABLE)).toBeTruthy();                // 404 — «выключена»/не готова
+  // остальные вкладки продолжают работать независимо от отказа аналитики
+  fireEvent.click(screen.getByRole("button", { name: "Калькуляторы" }));
+  expect(screen.getByRole("heading", { name: "Калькуляторы БДРВ — те же расчёты, что у агентов" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Чат" }));
+  expect(screen.getByTestId("fake-chat")).toBeTruthy();
 });
 
 // --- Д10б: вкладки «Кабинет» и «Калькуляторы» у преподавателя (Д10-R110, Д10-R109) ---

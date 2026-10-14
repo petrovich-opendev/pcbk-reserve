@@ -33,6 +33,11 @@ DECLARED_ENV = {                   # наши переменные сверх п
                   "LLM_RUN_MEM_FAIL_MIB", "LLM_RUN_SWAP_GROW_MIB", "LLM_RUN_SWAP_BASE_MIB", "LLM_RUN_PSI_FULL_MAX",
                   # общий бюджет LLM-прокси, $ (Д15б): теперь в compose.yaml — не только тестовый стенд
                   "LLM_TOTAL_USD",
+                  # аналитический чат технолога КДМ-1 (Task 9): ANALYTICS_CORPUS_DIR/ANALYTICS_STATE_PATH сюда
+                  # не передаются (путь внутри контейнера фиксирован умолчанием settings.py, как LESSONS_ROOT)
+                  "ANALYTICS_ENABLED", "ANALYTICS_LLM_MODELS", "ANALYTICS_LLM_EXPORT_POLICY",
+                  "ANALYTICS_REVIEWERS", "ANALYTICS_TEACHER_PAYER", "ANALYTICS_HISTORY_RETENTION_DAYS",
+                  "ANALYTICS_EVIDENCE_RETENTION_DAYS", "ANALYTICS_JOB_TIMEOUT_S",
                   # только тестовый стенд (compose.test.yaml): двойник OpenRouter, частый опрос;
                   # обёртка запуска и двойник историана (Д8-R75)
                   "OPENROUTER_BASE_URL", "LLM_POLL_S", "PYTHONPATH", "PCBK_TWIN_HISTORIAN",
@@ -43,7 +48,7 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d15b", "pcbk-core": "pcbk-reserve/core:d15b",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d15b", "pcbk-core": "pcbk-reserve/core:d16",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
           "pcbk-student-01": "pcbk-reserve/student:d15b"}
@@ -316,6 +321,8 @@ def test_production_config_independent_of_dify(stack, tmp_path):
     env = stack.test_env()
     # LESSONS_DIR (Д15а) — образец пакета в git репозитория, а не временный каталог теста: своя строка roots
     roots = [env[k] for k in ("TLS_DIR", "DATA_DIR", "AGENTS_DIR", "SECRETS_DIR", "LESSONS_DIR")] + [str(REPO / "edge")]
+    if env.get("ANALYTICS_CORPUS_DIR"):                   # корпус аналитики стенда (Task 9), если задан
+        roots.append(env["ANALYTICS_CORPUS_DIR"])
     assert dify_ties(stack.prod_config(), roots) == []
     text = "\n".join(line.split("#", 1)[0] for line in (REPO / "compose.yaml").read_text(encoding="utf-8").splitlines())
     assert "dify" not in text.lower()

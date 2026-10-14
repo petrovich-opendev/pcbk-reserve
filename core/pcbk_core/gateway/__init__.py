@@ -55,6 +55,18 @@ HALT_WATCH_S смотрит флаг защёлки (llm.brake.event — threadi
 ручкам не нужно). self.lessons_root — только путь (settings.LESSONS_ROOT); lessons.py читает каталог с диска на
 каждый запрос, без своего хранилища и без кеша — правка файла на сервере видна без перезапуска.
 
+Аналитический чат технолога КДМ-1 (план `docs/plans/PLAN-KDM1-analytics-2026-10-14.md`, Task 0 — каркас,
+Task 4 — настоящий координатор) — analytics_router: /pcbk/api/analytics/*, за выключателем
+self.analytics_enabled (по умолчанию False — старое поведение без аргумента не меняется); выключена — роутер не
+подключается вовсе, путь отвечает 404 через catch_all_router, не 503 (существование подсистемы не видно по коду
+ответа выключенным клиентам). self.analytics — необязательный `AnalyticsService` (main.py, Task 4): `None` —
+ручки включённого роутера отвечают прежней заглушкой Task 0 («аналитика ещё не готова»); подключён — lifespan
+открывает его корпус/состояние своим вызовом _open_analytics (ниже), рядом с _open_agents/_open_findings — сбой
+(битый корпус, недоступное состояние) не config_error шлюза (мастер-промпт §4: «ошибка корпуса или
+аналитическая база не ломают вход, чат, калькуляторы, уроки»), виден только маршрутам аналитики как 503
+(role.analytics.config_error/corpus_error, gateway/analytics_api.py). Остановка роли (_shutdown) закрывает его
+вместе с прочими клиентами.
+
 Модули accounts, agents_api, api, calc_api, lessons_api, proxy, teacher_api и web (а через них — accounts) здесь
 импортируются только внутри методов: команда администратора идёт как python -m pcbk_core.gateway.accounts, и пакет,
 импортирующий её модуль при загрузке, дал бы RuntimeWarning runpy в stderr каждой команды.
@@ -88,6 +100,7 @@ from .reload import AgentReloads
 from .stats import GatewayStats, TeacherStats
 
 if TYPE_CHECKING:
+    from ..analytics.service import AnalyticsService
     from ..data.service import DataService
     from ..llm import LlmRole
     from .accounts import AccountStore
@@ -253,7 +266,8 @@ class GatewayRole(RoleBase):
                  monotonic: Callable[[], float] = time.monotonic,
                  wallclock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  stream_recheck_s: float = 10.0, agent_stats: AgentStats | None = None,
-                 calc: DataService | None = None, llm: LlmRole | None = None):
+                 calc: DataService | None = None, llm: LlmRole | None = None, analytics_enabled: bool = False,
+                 analytics: AnalyticsService | None = None):
         from .accounts import LOCK_WINDOW_S
         from .api import LOGIN_BACKLOG, LOGIN_PARALLEL, LOGIN_QUEUE
         from .teacher_api import TeacherGate
@@ -294,6 +308,11 @@ class GatewayRole(RoleBase):
         self.findings = AgentFindings(settings.DB_PATH)
         # пакет уроков (Д15а): только путь — lessons.py читает с диска на каждый запрос, без своего хранилища
         self.lessons_root = settings.LESSONS_ROOT
+        # аналитика КДМ-1 (план КДМ1, Task 0): выключатель роутера; умолчание False — старое поведение без
+        # аргумента не меняется (старые тесты сборки не требуют новой зависимости, приём Этапа 4 плана)
+        self.analytics_enabled = analytics_enabled
+        # координатор аналитики (Task 4): None — ручки включённого роутера отвечают заглушкой Task 0, не падают
+        self.analytics: AnalyticsService | None = analytics
         self.reloads = AgentReloads(workplaces, self.agents, self.agent_stats, monotonic=monotonic,
                                     wallclock=wallclock, drill=gw.DRILL_AGENTS)
         workplaces.on_ready = self.reloads.place_ready
@@ -307,6 +326,7 @@ class GatewayRole(RoleBase):
 
     def router(self) -> APIRouter:
         from .agents_api import agents_router
+        from .analytics_api import analytics_router
         from .api import auth_router, catch_all_router, configured, front_only, workplace_router
         from .calc_api import calc_router
         from .lessons_api import lessons_router
@@ -326,6 +346,8 @@ class GatewayRole(RoleBase):
                                                         # сессия — любая учётка (студент и преподаватель)
         router.include_router(calc_router(self))        # калькуляторы страницы (Д9а): зона и настройка — у маршрута
         router.include_router(teacher_router(self))     # /health/teacher (Д10а): зона — у маршрута; до ловящего
+        if self.analytics_enabled:                      # план КДМ1, Task 0: выключена — роутера вовсе нет (404)
+            router.include_router(analytics_router(self))
 
         @router.get(HEALTH_PATH, dependencies=[Depends(front_only)])
         async def health_gateway() -> JSONResponse:
@@ -559,6 +581,7 @@ class GatewayRole(RoleBase):
             await self._open_teacher_log()          # не бросает: сбой — store_ok ложь, не config_error (R100)
             await self._open_agents()               # не бросает: сбой — флаг воркера, не config_error (П13)
             await self._open_findings()             # не бросает: сбой — строка журнала (Д13, П13)
+            await self._open_analytics()            # не бросает: сбой — role.analytics.config_error/corpus_error
             await self.workplaces.spctl.open()
             await self.workplaces.open()
             if self.config_error:
@@ -612,6 +635,19 @@ class GatewayRole(RoleBase):
         if not opened:
             log.error("шлюз: находки агентов не открыты (%s)", self.findings.last_error)
 
+    async def _open_analytics(self) -> None:
+        """Корпус и состояние аналитики КДМ-1 (план КДМ1, Task 4) — `self.analytics.open()` уже не бросает
+        (Договор модуля `analytics/service.py`: сбой — `config_error`/`corpus_error`, строка журнала), но обёртка
+        здесь — на случай непредвиденного исключения: сбой подсистемы аналитики не config_error шлюза (Global
+        Constraints: «неисправный корпус или аналитическая база не ломают вход, чат, калькуляторы, уроки»),
+        видно только маршрутам `/pcbk/api/analytics/*`."""
+        if self.analytics is None:
+            return
+        try:
+            await self.analytics.open()
+        except Exception as exc:
+            log.error("шлюз: аналитика КДМ-1 не открыта (%s)", type(exc).__name__)
+
     async def _shutdown(self) -> None:
         for name in ("_reaper", "_reload_task", "_halt_task"):
             task = getattr(self, name)
@@ -639,6 +675,11 @@ class GatewayRole(RoleBase):
                 await close()
             except Exception as exc:
                 log.warning("шлюз: клиент (%s) не закрыт (%s)", name, type(exc).__name__)
+        if self.analytics is not None:              # аналитика КДМ-1 (Task 4): фоновые задания и корпус/состояние
+            try:
+                await self.analytics.aclose()
+            except Exception as exc:
+                log.warning("шлюз: аналитика КДМ-1 не закрыта (%s)", type(exc).__name__)
 
     async def _reaper_loop(self) -> None:
         """Строка запуска, первый такт сразу, дальше — через workplaces.next_tick_s(); каждый такт — ещё проба

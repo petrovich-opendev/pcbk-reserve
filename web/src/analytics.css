@@ -1,0 +1,113 @@
+/* Вкладка «Аналитический чат технолога» (план КДМ1, Task 6): диалоги слева, разбор справа — список переносится
+   сверху при узком экране (приём .lessons-body chat.css). Переменные цвета — :root chat.css (загружен раньше,
+   main.tsx); своих цветов здесь нет. CSP style-src 'self' — ни url(), ни @import (как chat.css). */
+.an { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: .75rem; padding: 1rem; }
+.an-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .4rem .75rem; }
+.an-head h2 { margin: 0; font-size: 1.2rem; }
+.an-scope { font-size: .85em; font-weight: 600; color: var(--muted); }
+.an-note { margin: 0; color: var(--muted); }
+.an-msg { margin: 0; color: var(--fail); font-weight: 600; }
+
+/* переключатель «Диалог» / «Назначенное согласование» — только когда сервер отдал review_authority */
+.an-inner-nav { display: flex; gap: .35rem; }
+.an-inner-nav button[aria-pressed="true"] { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+
+.an-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
+  gap: 1rem; align-items: start; }
+@media (max-width: 899px) { .an-body { grid-template-columns: minmax(0, 1fr); } }
+
+/* список диалогов и кнопки «новый диалог» по режиму */
+.an-list { display: flex; flex-direction: column; gap: .6rem; min-height: 0; }
+.an-list-head h3 { margin: 0; font-size: 1.05rem; }
+.an-new-modes, .an-list-items { display: flex; flex-direction: column; gap: .3rem; }
+.an-list-items { max-height: 40vh; overflow-y: auto; }
+.an-new-modes button, .an-list-items button { display: flex; flex-direction: column; align-items: flex-start;
+  gap: .1rem; padding: .5rem .7rem; text-align: left; }
+.an-list-items button[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.an-list-item-title { font-weight: 600; }
+.an-list-item-mode { font-size: .85em; color: var(--muted); }
+
+/* разговор: история (an-thread), активный ответ и форма вопроса */
+.an-main { display: flex; flex-direction: column; gap: .75rem; min-width: 0; }
+.an-thread { display: flex; flex-direction: column; gap: .75rem; }
+.an-answer { display: flex; flex-direction: column; gap: .5rem; padding: .75rem 1rem; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--field); }
+.an-answer-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem; }
+.an-answer-state { font-weight: 600; }
+.an-answer[data-state="failed"] .an-answer-state { color: var(--fail); }
+.an-answer[data-state="cancelled"] .an-answer-state, .an-answer[data-state="limited_answer"] .an-answer-state { color: var(--warn); }
+.an-clarify { padding: .5rem .7rem; border-radius: 6px; color: var(--warn-fg); background: var(--warn-bg); }
+.an-clarify-title { margin: 0 0 .3rem; font-weight: 600; }
+.an-clarify ul { margin: .2rem 0; padding-left: 1.2rem; }
+.an-clarify .an-note { color: inherit; }
+
+/* отправка конфликта на согласование (мастер-промпт §6) — внутри an-answer, короткая форма пояснения */
+.an-conflict-flag { display: flex; flex-direction: column; gap: .4rem; align-items: flex-start; }
+.an-conflict-flag textarea { min-height: 3rem; }
+
+/* разделы ответа и их основания */
+.an-section { padding: .5rem 0 0; border-top: 1px solid var(--border); }
+.an-section:first-child { border-top: 0; padding-top: 0; }
+.an-section-kind { margin: 0 0 .3rem; font-size: .8em; font-weight: 600; letter-spacing: .03em; text-transform: uppercase;
+  color: var(--muted); }
+.an-sources { margin-top: .5rem; }
+.an-sources h4 { margin: 0 0 .3rem; font-size: .8em; font-weight: 600; letter-spacing: .03em; text-transform: uppercase;
+  color: var(--muted); }
+.an-source-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .4rem; }
+.an-source { display: flex; flex-direction: column; align-items: flex-start; gap: .2rem; padding: .4rem .6rem;
+  border: 1px solid var(--border); border-radius: 6px; font-size: .88em; }
+.an-source-locator { font-weight: 600; overflow-wrap: anywhere; }
+/* раскрытая карточка (правка итогового ревью, п.1 F2-brief): название вместо кода, код — мелко рядом */
+.an-source-title-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: .35rem; }
+.an-source-title { font-weight: 600; overflow-wrap: anywhere; }
+.an-source-code, .an-source-type, .an-source-date { color: var(--muted); font-size: .9em; }
+.an-source-limitation, .an-source-version { color: var(--muted); overflow-wrap: anywhere; }
+.an-source-toggle { padding: .15rem .5rem; font-size: .9em; }
+.an-source-fragment { margin: .2rem 0 0; padding: .5rem .7rem; width: 100%; white-space: pre-wrap; overflow-wrap: anywhere;
+  border-radius: 6px; background: var(--code-bg);
+  font: .9em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* форма вопроса: участок/единица, период/пояс, отправка/отмена/повтор */
+.an-compose { display: flex; flex-direction: column; gap: .6rem; padding: .75rem; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--field); }
+.an-field { display: flex; flex-direction: column; gap: .2rem; min-width: 0; font-size: .9em; color: var(--muted); }
+.an-field-wide { flex: 1 1 100%; }
+.an-field input, .an-field select, .an-field textarea { font: 1rem/1.4 inherit; color: var(--fg); background: var(--field);
+  border: 1px solid var(--border); border-radius: 6px; padding: .35rem .6rem; min-width: 0; }
+.an-field-wide textarea { min-height: 5rem; resize: vertical; }
+.an-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .6rem .75rem; }
+fieldset.an-row { margin: 0; padding: 0; border: 0; }
+fieldset.an-row legend { width: 100%; margin: 0 0 .3rem; padding: 0; font-size: .85em; color: var(--muted); }
+.an-mode-note { font-size: .9em; color: var(--muted); }
+
+/* назначенное согласование (AnalyticsReviews) */
+.an-reviews { display: flex; flex-direction: column; gap: .75rem; }
+.an-reviews-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.an-reviews-head h3 { margin: 0; font-size: 1.05rem; }
+.an-review-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .6rem; }
+.an-review { display: flex; flex-direction: column; gap: .4rem; padding: .6rem .8rem; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--field); }
+.an-review-head { display: flex; justify-content: space-between; gap: .5rem; font-weight: 600; }
+.an-review-status { font-weight: 400; color: var(--muted); }
+.an-review[data-status="accepted"] .an-review-status { color: var(--ok); }
+.an-review[data-status="rejected"] .an-review-status { color: var(--fail); }
+.an-review[data-status="info_requested"] .an-review-status { color: var(--warn); }
+.an-review-facts { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: .2rem .75rem; font-size: .9em; }
+.an-review-facts div { display: contents; }
+.an-review-facts dt { color: var(--muted); }
+.an-review-facts dd { margin: 0; overflow-wrap: anywhere; }
+.an-review-decide { display: flex; flex-direction: column; gap: .4rem; padding-top: .4rem; border-top: 1px solid var(--border); }
+.an-review-comment-field { display: flex; flex-direction: column; gap: .2rem; font-size: .85em; color: var(--muted); }
+.an-review-comment-field textarea { font: 1rem/1.4 inherit; color: var(--fg); background: var(--field);
+  border: 1px solid var(--border); border-radius: 6px; padding: .3rem .5rem; min-height: 3rem; }
+.an-review-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+
+/* название вкладки «Аналитика КДМ-1» в шапке (Header.tsx): полное на обычном экране, короткое «Аналитика» на
+   узком (мастер-промпт §6) — доступное имя кнопки остаётся полным всегда через aria-label, это только видимый
+   текст. Брейкпоинт — как у .chat/.threads chat.css (48rem). */
+.tab-full { display: inline; }
+.tab-short { display: none; }
+@media (max-width: 48rem) {
+  .tab-full { display: none; }
+  .tab-short { display: inline; }
+}

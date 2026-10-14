@@ -29,8 +29,17 @@
 // вкладка калькуляторов его только прячет (окно пароля учётки и открытое место живы). «Калькуляторы» — тот же CalcPage
 // Д9 через api.calc; вызывающего (teacher, канал web) шлюз определяет сам по роли сессии (Д10-R109). Запасной текст
 // вкладки у преподавателя — кабинетный T_TCH_UNKNOWN, не «…сообщите преподавателю» (итоговое ревью Д10б, m-4).
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+// Вкладка «Аналитический чат технолога» (план КДМ1, Task 6; мастер-промпт §6): у студента и преподавателя — рядом
+// с «Чат»/«Кабинет» (showAnalytics = tabs, без исключения преподавателя, в отличие от «Событий»/«Уроков»).
+// Своя АНАЛИТИКА API (analyticsApi, по умолчанию createAnalyticsApi()) не трогает общий api.ts/Api — отдельный
+// клиент, как teacherApi. Компонент — React.lazy (мастер-промпт §6: «используй ленивую загрузку»): код вкладки не
+// попадает в основной чанк, пока вкладку не откроют хотя бы раз (analyticsOpened — тот же приём «флаг первого
+// открытия», что у калькуляторов/событий/уроков, но здесь вдобавок и загрузка модуля отложена). Suspense — только
+// вокруг неё: остальные вкладки как были, синхронно.
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { createAnalyticsApi, type AnalyticsApi } from "./analyticsApi";
 import { replyText, type Api, type ReportKind, type Reply } from "./api";
+import type { AnalyticsPageProps } from "./components/AnalyticsPage";
 import { CalcPage, type CalcPageProps } from "./components/CalcPage";
 import { Chat, type ChatProps } from "./components/Chat";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -42,19 +51,24 @@ import { TeacherPage } from "./components/TeacherPage";
 import { WorkplaceScreen } from "./components/WorkplaceScreen";
 import { startStatusPolling } from "./status";
 import { createTeacherApi, type TeacherApi } from "./teacherApi";
-import { NOTICES, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_EVENTS_CRASH, T_EVENTS_RESTART, T_LESSONS_CRASH,
-         T_LESSONS_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TCH_CRASH, T_TCH_RESTART, T_TCH_UNKNOWN,
-         T_UNKNOWN, T_WAKE } from "./texts";
+import { NOTICES, T_AN_CRASH, T_AN_LOADING, T_AN_RESTART, T_ASLEEP, T_CALC_CRASH, T_CALC_RESTART, T_EVENTS_CRASH,
+         T_EVENTS_RESTART, T_LESSONS_CRASH, T_LESSONS_RESTART, T_LOADING, T_NOTICE_UNKNOWN, T_RETRY, T_TCH_CRASH,
+         T_TCH_RESTART, T_TCH_UNKNOWN, T_UNKNOWN, T_WAKE } from "./texts";
 import { placeView, type Timers } from "./workplace";
+
+const LazyAnalyticsPage = lazy(() => import("./components/AnalyticsPage"));
 
 export interface AppProps {
   api: Api;
   teacherApi?: TeacherApi;                                // кабинет преподавателя (Д10-R106); по умолчанию createTeacherApi()
+  analyticsApi?: AnalyticsApi;                             // «Аналитический чат технолога» (план КДМ1, Task 6);
+                                                            // по умолчанию createAnalyticsApi()
   navigate(url: string): void;
   ChatImpl?: ComponentType<ChatProps>;
   CalcImpl?: ComponentType<CalcPageProps>;                // подмена вкладки «Калькуляторы» в тестах, как ChatImpl
   EventsImpl?: ComponentType<EventsPageProps>;            // подмена вкладки «События» в тестах, как CalcImpl (Д13)
   LessonsImpl?: ComponentType<LessonsPageProps>;          // подмена вкладки «Уроки» в тестах, как EventsImpl (Д15а)
+  AnalyticsImpl?: ComponentType<AnalyticsPageProps>;      // подмена вкладки аналитики в тестах — минует lazy/Suspense
   startPolling?: typeof startStatusPolling;
   pollMs?: number;              // опрос места — для тестов (preflight M11)
   timers?: Timers;
@@ -98,8 +112,10 @@ export function App(p: AppProps) {
   const CalcImpl = p.CalcImpl ?? CalcPage;
   const EventsImpl = p.EventsImpl ?? EventsPage;
   const LessonsImpl = p.LessonsImpl ?? LessonsPage;
+  const AnalyticsImpl = p.AnalyticsImpl ?? LazyAnalyticsPage;
   const startPolling = p.startPolling ?? startStatusPolling;
   const teacherApi = useMemo(() => p.teacherApi ?? createTeacherApi(), [p.teacherApi]);
+  const analyticsApi = useMemo(() => p.analyticsApi ?? createAnalyticsApi(), [p.analyticsApi]);
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [who, setWho] = useState<Who | null>(null);
   const [attempt, setAttempt] = useState(0);            // «Повторить» после сбоя /me
@@ -107,6 +123,7 @@ export function App(p: AppProps) {
   const [calcOpened, setCalcOpened] = useState(false);   // вкладку калькуляторов уже открывали — она смонтирована
   const [eventsOpened, setEventsOpened] = useState(false);   // вкладку «События» уже открывали (Д13)
   const [lessonsOpened, setLessonsOpened] = useState(false);  // вкладку «Уроки» уже открывали (Д15а)
+  const [analyticsOpened, setAnalyticsOpened] = useState(false);  // вкладку аналитики уже открывали (план КДМ1, Task 6)
   const props = useRef(p);
   props.current = p;
   const lastSession = useRef<string | undefined>(undefined);
@@ -274,6 +291,7 @@ export function App(p: AppProps) {
   const teacher = who?.role === "teacher";
   const tabs = (who?.role === "student" && (phase.kind === "workplace" || phase.kind === "asleep" || phase.kind === "chat"))
     || (teacher && phase.kind === "teacher");
+  const showAnalytics = tabs;                            // «Аналитический чат технолога» — у студента и преподавателя
   const showEvents = tabs && !teacher;                   // «События» — только у студента (Д13)
   const showLessons = tabs && !teacher;                  // «Уроки» — только у студента (Д15а)
   const showView = (v: View): void => {
@@ -281,13 +299,15 @@ export function App(p: AppProps) {
     if (v === "calc") setCalcOpened(true);
     if (v === "events") setEventsOpened(true);
     if (v === "lessons") setLessonsOpened(true);
+    if (v === "analytics") setAnalyticsOpened(true);
   };
   return (
     <div className="app">
       {header && (
         <Header login={who?.login ?? null} ownPlace={who?.place ?? null} startPolling={startPolling}
                 onLogout={() => void logout()} leaving={phase.kind === "leaving"} view={tabs ? view : null}
-                teacher={teacher} showEvents={showEvents} showLessons={showLessons} onView={showView} />
+                teacher={teacher} showAnalytics={showAnalytics} showEvents={showEvents} showLessons={showLessons}
+                onView={showView} />
       )}
       <main className="main">
         {/* обёртка — во всех фазах: смена фазы не перемонтирует чат, прочие вкладки его только прячут */}
@@ -310,6 +330,15 @@ export function App(p: AppProps) {
           <div className="view" hidden={view !== "lessons"}>
             <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_LESSONS_CRASH} restartText={T_LESSONS_RESTART}>
               <LessonsImpl api={p.api} onSignedOut={goLogin} />
+            </ErrorBoundary>
+          </div>
+        )}
+        {showAnalytics && analyticsOpened && (
+          <div className="view" hidden={view !== "analytics"}>
+            <ErrorBoundary onCrash={() => report("ui_crash")} crashText={T_AN_CRASH} restartText={T_AN_RESTART}>
+              <Suspense fallback={<p className="phase">{T_AN_LOADING}</p>}>
+                <AnalyticsImpl api={analyticsApi} onSignedOut={goLogin} pollMs={p.pollMs} timers={p.timers} />
+              </Suspense>
             </ErrorBoundary>
           </div>
         )}

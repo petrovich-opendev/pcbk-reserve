@@ -401,6 +401,20 @@ server {
         proxy_pass http://$pcbk_core;
     }
 
+    # аналитический чат технолога КДМ-1 (Task 9, мастер-промпт §10): /pcbk/api/analytics/<девять путей> — копия
+    # location = /pcbk/api/teacher/ — та же зона ручек места, предел, тело 64k, срок 30 с, сверка сырого пути;
+    # выключатель и доступность решает core (ANALYTICS_ENABLED), edge открывает префикс всегда, как lessons/calc
+    location /pcbk/api/analytics/ {
+        default_type application/json;
+        if ($pcbk_bad_api_uri) { return 400 '{"name":"BadRequest","data":{"message":"неверный адрес"}}'; }
+        limit_req zone=pcbk_place_rate burst=20 nodelay;
+        limit_req_status 509;
+        limit_req_log_level warn;
+        client_max_body_size 64k;
+        proxy_read_timeout 30s;
+        proxy_pass http://$pcbk_core;
+    }
+
     # отчёты браузеров (Д6б, Д6-R50): тело ровно {"kind": …} — core сам режет до 256 Б, edge — до 1 КиБ (413 JSON);
     # предел частоты на cookie сессии — 509 → busy.json, как у прочих пределов Д5б (ответ отчёта веб не показывает)
     location = /pcbk/api/web/report {
@@ -468,6 +482,7 @@ server {
     location = /pcbk/api/oc   { default_type application/json; return 403 '{"name":"Forbidden","data":{"message":"Вызов не разрешён"}}'; }
     location = /pcbk/api/calc { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
     location = /pcbk/api/teacher { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
+    location = /pcbk/api/analytics { default_type application/json; return 404 '{"name":"NotFound","data":{"message":"не найдено"}}'; }
 
     # прочее под /pcbk/api/ — 404 JSON; сюда же попадает /pcbk/api/auth/%2e%2e/… после нормализации
     location /pcbk/api/ {

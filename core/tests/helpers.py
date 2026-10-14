@@ -555,7 +555,8 @@ ORIGIN_HEADERS = {"Origin": ORIGIN}
 def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | None = None, ready: Sequence[int] = (),
                  stream_recheck_s: float = 10.0, config_error: str | None = None, db_path: Path | None = None,
                  accounts: bool = True, agents_root: Path | None = None, lessons_root: Path | None = None,
-                 calc: DataService | None = None, llm: LlmRole | None = None, **gw_overrides) -> GatewayRole:
+                 calc: DataService | None = None, llm: LlmRole | None = None, analytics_enabled: bool = False,
+                 **gw_overrides) -> GatewayRole:
     """Роль gateway на двойниках задачи А3, FakeMono(1000.0), GW_ORIGIN = ORIGIN; gw_overrides — поля
     GatewaySettings (без проверок from_env), в том числе учения DRILL_GATEWAY, DRILL_AGENTS и DRILL_TEACHER (Д10а, m-6).
     stream_recheck_s — срок перепроверки сессии потоком /event (Д5б, Б4).
@@ -569,6 +570,8 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
     подготовки: каталога или lessons.json может не быть — read_index отдаёт [] (тесты пишут пакет сами).
     calc — служба данных калькуляторов страницы (Д9-R87, обычно make_service), None — маршрут отвечает 503.
     llm — роль LLM-прокси с долями мест (Д10а, задача А2: make_llm_role(…, shares=True)), None — шлюз без неё.
+    analytics_enabled — выключатель аналитики КДМ-1 (план КДМ1, Task 0); по умолчанию False — /pcbk/api/analytics/*
+    отвечает 404 (роутера нет), как до Task 0.
     Роли для тестов добавлены fake_docker, fake_places, mono.
     """
     tmp_path = Path(tmp_path)
@@ -595,7 +598,7 @@ def gateway_role(tmp_path, docker: FakeDocker | None = None, oc: FakePlaces | No
     role = GatewayRole(replace(SETTINGS, DB_PATH=str(db), AGENTS_ROOT=str(root), LESSONS_ROOT=str(lessons)), gw,
                        store=AccountStore(str(db), ttl_s=gw.GW_SESSION_TTL_S), workplaces=workplaces, stats=stats,
                        config_error=config_error, monotonic=mono, stream_recheck_s=stream_recheck_s, calc=calc,
-                       llm=llm)
+                       llm=llm, analytics_enabled=analytics_enabled)
     role.fake_docker, role.fake_places, role.mono = docker, oc, mono
     return role
 

@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:pcbk:kdm1:analytics:preanalysis",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "scope": {
+      "const": "KDM1_PCBK"
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "definition",
+        "lookup",
+        "calculation",
+        "deviation",
+        "control",
+        "out_of_scope"
+      ]
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "needs_clarification",
+        "limited_answer",
+        "refused"
+      ]
+    },
+    "resolved_terms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "original": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "candidate_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "maxItems": 10,
+            "uniqueItems": true
+          },
+          "selected_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requires_confirmation": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "original",
+          "candidate_ids",
+          "selected_id",
+          "requires_confirmation"
+        ]
+      },
+      "maxItems": 40,
+      "uniqueItems": true
+    },
+    "process_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      },
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "conflict_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      },
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "missing_fields": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      },
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "risk": {
+      "type": "string",
+      "enum": [
+        "reference",
+        "calculation",
+        "local_claim",
+        "control"
+      ]
+    },
+    "corpus_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "evidence_pack_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "allowed_claim_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 250
+      },
+      "maxItems": 48,
+      "uniqueItems": true
+    },
+    "allowed_mechanism_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      },
+      "maxItems": 12,
+      "uniqueItems": true
+    },
+    "data_access_ready": {
+      "type": "boolean"
+    },
+    "llm_export_policy": {
+      "type": "string",
+      "enum": [
+        "public_only",
+        "approved_subset",
+        "none"
+      ]
+    }
+  },
+  "required": [
+    "scope",
+    "intent",
+    "decision",
+    "resolved_terms",
+    "process_ids",
+    "conflict_ids",
+    "missing_fields",
+    "risk",
+    "corpus_version",
+    "evidence_pack_id",
+    "allowed_claim_ids",
+    "allowed_mechanism_ids",
+    "data_access_ready",
+    "llm_export_policy"
+  ],
+  "description": "Достоверный результат только серверного координатора. Схема не доказывает смысл, права, размерность или истинность: нужны отдельные проверки."
+}

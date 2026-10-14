@@ -206,6 +206,151 @@ export const CALC_LABELS = {
   avgKind: "Вид среднего",
 } as const;
 
+// --- вкладка «Аналитический чат технолога» (план КДМ1, Task 6; мастер-промпт §6): у студента и преподавателя
+// (справка преподавателю — без LLM), сразу после «Чат»/«Кабинет» и перед «Калькуляторы». Узкий экран — короткое
+// название вкладки, доступное имя (aria-label) — полное (мастер-промпт §6: «„Аналитика“ с полным доступным
+// названием»).
+export const T_TAB_ANALYTICS = "Аналитический чат технолога";
+export const T_TAB_ANALYTICS_SHORT = "Аналитика";
+export const T_AN_TITLE = "Аналитический чат технолога";
+export const T_AN_SCOPE = "Область: КДМ-1";
+export const T_AN_CRASH = "Вкладка аналитики столкнулась с ошибкой. Сбой отмечен для администратора.";
+export const T_AN_RESTART = "Перезапустить аналитику";
+export const T_AN_LOADING = "Открываю аналитику…";
+// отказ capabilities/conversations (404 — выключатель, 503 — не готова, сеть, чужая форма ответа): один общий
+// текст, причина студенту не важна (приём T_LESSONS_ERROR); 401 — onSignedOut отдельно
+export const T_AN_UNAVAILABLE = "Аналитика КДМ-1 сейчас не отвечает — попробуйте позже";
+export const T_AN_NAV = "Разделы аналитики";
+export const T_AN_NAV_CHAT = "Диалог";
+export const T_AN_START_HINT = "Выберите диалог слева или начните новый";
+
+// --- диалоги слева (история — мастер-промпт §6) ---
+export const T_AN_CONVERSATIONS = "Диалоги";
+export const T_AN_NEW_CONVERSATION = "Новый диалог";
+export const T_AN_NO_CONVERSATIONS = "Диалогов пока нет — задайте первый вопрос";
+export const T_AN_CONVERSATION_ITEM = (when: string): string => `Диалог от ${when}`;
+
+// --- режим (мастер-промпт §6: «Справка по документам / Разбор отклонения») ---
+export const T_AN_MODE = "Вид разбора";
+export const AN_MODE_LABELS: Readonly<Record<string, string>> = {
+  reference: "Справка по документам",
+  deviation_review: "Разбор отклонения",
+};
+
+// --- составление вопроса ---
+export const T_AN_QUESTION = "Ваш вопрос технологу КДМ-1";
+export const T_AN_PROCESS = "Участок (необязательно)";
+export const T_AN_PERIOD = "Период (необязательно)";
+export const T_AN_PERIOD_FROM = "С";
+export const T_AN_PERIOD_TO = "По";
+export const T_AN_PERIOD_TZ = "Часовой пояс периода";
+export const AN_TZ_CHOICES: ReadonlyArray<{ id: string; label: string; offset: string }> = [
+  { id: "utc", label: "UTC", offset: "Z" },
+  { id: "msk", label: "Москва (UTC+3)", offset: "+03:00" },
+];
+export const T_AN_UNIT = "Единица измерения (необязательно)";
+export const T_AN_SEND = "Спросить";
+export const T_AN_SENDING = "Отправляю…";
+export const T_AN_CANCEL = "Отмена";
+export const T_AN_RETRY = "Повторить";
+export const T_AN_NO_QUESTION = "Введите вопрос";
+export const T_AN_BAD_PERIOD = "Укажите обе границы периода, конец — не раньше начала";
+// подсказки участков КДМ-1 (мастер-промпт §5: обогащаемые процессы) — свободный ввод, не каталог ID
+export const AN_PROCESS_HINTS: readonly string[] = [
+  "Подготовка массы", "Сортирование", "Сгущение/водооборот", "Напорные ящики", "Формование", "Прессование",
+  "Сушка", "Пароконденсатная система", "Вентиляция", "Поверхностная проклейка", "Измерение качества",
+];
+
+// --- ход задания (JobState) ---
+export const AN_STATE_LABELS: Readonly<Record<string, string>> = {
+  queued: "в очереди", preanalysis: "предварительный анализ", retrieving: "поиск оснований",
+  generating: "формирование ответа", validating: "проверка ответа", completed: "готово",
+  needs_clarification: "нужно уточнение", limited_answer: "ограниченный ответ", cancelled: "отменено",
+  failed: "сбой",
+};
+
+// --- уточнения (ClarificationKey) ---
+export const AN_CLARIFICATION_LABELS: Readonly<Record<string, string>> = {
+  quantity: "количество или величина", process: "участок процесса КДМ-1", unit: "единица измерения",
+  basis: "база (например, по массе или по объёму)", period: "период", timezone: "часовой пояс",
+  grade: "сорт или режим", measurement_quality: "качество/достоверность измерения",
+  source_applicability: "применимость источника к КДМ-1",
+};
+export const T_AN_CLARIFY_TITLE = "Нужны уточнения, прежде чем продолжить:";
+export const T_AN_CLARIFY_HINT = "Уточните вопрос ниже и отправьте снова — прежний вопрос остался рядом для сверки";
+export const T_AN_CLARIFY_RESEND = "Уточнить и спросить снова";
+export const T_AN_ORIGINAL_QUESTION = "Исходный вопрос";
+
+// --- разделы ответа (SectionKind) и подписи карточек ---
+export const AN_SECTION_LABELS: Readonly<Record<string, string>> = {
+  document_observation: "Наблюдение по документу", public_definition: "Публичное определение",
+  calculation: "Расчёт", qualified_hypothesis: "Гипотеза с условиями проверки", limitation: "Ограничение",
+  clarification: "Уточнение",
+};
+
+// --- отказ задания (ErrorCode) ---
+export const AN_ERROR_LABELS: Readonly<Record<string, string>> = {
+  unavailable: "Аналитика КДМ-1 сейчас недоступна — попробуйте позже",
+  invalid_input: "Вопрос не принят — проверьте текст и попробуйте снова",
+  policy_refused: "Управляющее действие и вопросы вне области КДМ-1 не выполняются — ниже только допустимая справка",
+  source_conflict: "В основаниях найден конфликт — его можно отправить на согласование",
+  validation_failed: "Ответ не прошёл проверку — попробуйте переформулировать вопрос",
+  interrupted: "Разбор был прерван",
+  busy: "Слишком много одновременных запросов — повторите позже",
+};
+
+// --- основания (AnalyticsSources.tsx) ---
+export const T_AN_SOURCES = "Основания";
+export const T_AN_NO_SOURCES = "Без оснований — общая справка";
+export const T_AN_LIMITATION = "Ограничение";
+export const T_AN_CORPUS_VERSION = (v: string): string => `Версия корпуса: ${v}`;
+// название/тип/дата источника при раскрытии (правка итогового ревью, п.1 F2-brief; мастер-промпт §6: «название,
+// страница/ячейка/снимок, дата, тип, фрагмент и ограничения»): название заменяет код в заголовке, код — мелко
+// рядом (T_AN_SOURCE_CODE); нет записи источника — поля null, строка не показывается (см. AnalyticsSources.tsx)
+export const T_AN_SOURCE_CODE = (code: string): string => `код ${code}`;
+export const T_AN_SOURCE_CHECKED = (date: string): string => `проверено ${date}`;
+export const T_AN_SHOW_FRAGMENT = "Показать фрагмент источника";
+export const T_AN_HIDE_FRAGMENT = "Скрыть фрагмент источника";
+export const T_AN_FRAGMENT_ERROR = "Фрагмент источника сейчас не открывается";
+export const T_AN_LOC_PDF = (page: number): string => `страница ${page} (документ в предоставленной модели)`;
+export const T_AN_LOC_XLSX = (sheet: string, cell: string): string => `лист «${sheet}», ячейка ${cell}`;
+export const T_AN_LOC_IMAGE = (file: string, label: string): string => `снимок «${file}», метка «${label}»`;
+export const T_AN_LOC_PUBLIC = (section: string): string => `публичный источник, раздел «${section}»`;
+
+// --- отправка конфликта на согласование (мастер-промпт §6: «конфликт виден и может быть отправлен») ---
+export const T_AN_SEND_TO_REVIEW = "Отправить на согласование";
+export const T_AN_SEND_TO_REVIEW_DONE = "Заявка отправлена на согласование";
+export const T_AN_SEND_TO_REVIEW_RATIONALE = "Пояснение для проверяющего";
+
+// --- назначенное согласование (AnalyticsReviews.tsx) — видно только при праве, сообщённом сервером ---
+export const T_AN_REVIEWS = "Назначенное согласование";
+export const T_AN_REVIEWS_EMPTY = "Заявок на согласование нет";
+export const T_AN_REVIEWS_ERROR = "Заявки на согласование сейчас не открываются";
+export const T_AN_REVIEW_OLD = "Было";
+export const T_AN_REVIEW_NEW = "Предлагается";
+export const T_AN_REVIEW_SCOPE = "Область";
+export const T_AN_REVIEW_PERIOD = "Срок";
+export const T_AN_REVIEW_RATIONALE = "Основание";
+export const T_AN_REVIEW_COMMENT = "Комментарий";
+export const T_AN_REVIEW_ACCEPT = "Принять";
+export const T_AN_REVIEW_REJECT = "Отклонить";
+export const T_AN_REVIEW_INFO = "Запросить сведения";
+export const T_AN_REVIEW_REFRESH = "Обновить";
+// отказ решения заявки (правка итогового ревью, п.2 F2-brief): проверяющий раньше не видел отказ decide() вовсе —
+// теперь понятный текст (role="alert") на 403/404/409, прочее (503 и незнакомый код) — общий; 401 — выход, как
+// раньше (AnalyticsReviews.tsx)
+export const T_AN_REVIEW_DECIDE_CONFLICT = "Заявка уже решена другим проверяющим";       // 409
+export const T_AN_REVIEW_DECIDE_NOT_FOUND = "Заявка недоступна";                         // 404
+export const T_AN_REVIEW_DECIDE_FORBIDDEN = "Нет права решать эту заявку";               // 403
+export const T_AN_REVIEW_DECIDE_ERROR = "Решение не сохранилось — попробуйте ещё раз";   // прочее (503 и т.п.)
+export const AN_REVIEW_KIND_LABELS: Readonly<Record<string, string>> = {
+  local_claim: "местное утверждение", equipment_link: "связь с оборудованием", local_norm: "местный норматив",
+  conflict: "конфликт источников",
+};
+export const AN_REVIEW_STATUS_LABELS: Readonly<Record<string, string>> = {
+  pending: "на рассмотрении", accepted: "принято", rejected: "отклонено", info_requested: "запрошены сведения",
+};
+
 // --- отказы шлюза (таблица R43) ---
 export const T_SIGNED_OUT = "Сессия закончилась — войдите снова";
 // запасные тексты: в ответе шлюза или edge свой data.message, эти — когда его нет (равны текстам шлюза)
