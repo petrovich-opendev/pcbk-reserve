@@ -416,6 +416,36 @@ test("analytics_page_limitation_without_evidence_has_no_sources_line", async () 
   expect(screen.queryByText(T_AN_NO_SOURCES)).toBeNull();
 });
 
+test("analytics_page_local_web_section_is_internal_not_public", async () => {
+  // Д17: раздел веб-страницы у местного источника (LOCAL-…, база знаний Dify ПЦБК) — «внутренний источник», у PUB-… —
+  // по-прежнему «публичный источник»: тип локатора контракта один на оба случая
+  const loc = { type: "public_section", url: "https://example.invalid/kb", section: "Глоссарий → 20FAKE" };
+  const api = fakeApi({
+    createConversation: () => Promise.resolve(reply(201, { id: "c1" })),
+    conversation: () => Promise.resolve(reply(200, {
+      conversation: { id: "c1", mode: "reference", created_at: "2026-10-14T08:00:00+00:00",
+                     last_activity_at: "2026-10-14T08:00:00+00:00", corpus_version: "20FAKE-v1" },
+      requests: [],
+    })),
+    ask: () => Promise.resolve(reply(202, { request_id: "r1" })),
+    request: () => Promise.resolve(reply(200, jobBody({
+      sections: [section({
+        evidence_refs: [
+          { source_id: "LOCAL-FAKE-KB", fragment_id: null, corpus_version: "20FAKE-v1", limitation: "", locator: loc },
+          { source_id: "PUB-FAKE", fragment_id: null, corpus_version: "20FAKE-v1", limitation: "", locator: loc },
+        ],
+      })],
+    }))),
+  });
+  render(<AnalyticsPage api={api} onSignedOut={vi.fn()} pollMs={10} />);
+  fireEvent.click(await screen.findByRole("button", { name: /Новый диалог: Справка по документам/ }));
+  fireEvent.change(screen.getByLabelText(/Ваш вопрос технологу/), { target: { value: "Что такое 20FAKE?" } });
+  fireEvent.click(screen.getByRole("button", { name: T_AN_SEND }));
+
+  expect(await screen.findByText(/LOCAL-FAKE-KB — внутренний источник, раздел/)).toBeTruthy();
+  expect(screen.getByText(/PUB-FAKE — публичный источник, раздел/)).toBeTruthy();
+});
+
 // --- Правка, раунд 1, п.1: пауза опроса при скрытой вкладке (НЕ отмена задания, НЕ сброс pollToken) ---
 
 test("analytics_page_pauses_polling_when_hidden_and_resumes_on_visible", async () => {

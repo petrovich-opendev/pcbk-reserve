@@ -8,8 +8,8 @@ import type { EvidenceRef, Locator } from "../analytics";
 import { parseEvidenceItem } from "../analytics";
 import {
   T_AN_CORPUS_VERSION, T_AN_FRAGMENT_ERROR, T_AN_HIDE_FRAGMENT, T_AN_LIMITATION, T_AN_LOC_IMAGE, T_AN_LOC_PDF,
-  T_AN_LOC_PUBLIC, T_AN_LOC_XLSX, T_AN_NO_SOURCES, T_AN_SHOW_FRAGMENT, T_AN_SOURCE_CHECKED, T_AN_SOURCE_CODE,
-  T_AN_SOURCES,
+  T_AN_LOC_INTERNAL_SECTION, T_AN_LOC_PUBLIC, T_AN_LOC_XLSX, T_AN_NO_SOURCES, T_AN_SHOW_FRAGMENT, T_AN_SOURCE_CHECKED,
+  T_AN_SOURCE_CODE, T_AN_SOURCES,
 } from "../texts";
 
 export interface AnalyticsSourcesProps {
@@ -17,12 +17,15 @@ export interface AnalyticsSourcesProps {
   api: AnalyticsApi;
 }
 
-function locatorText(l: Locator): string {
+// раздел веб-страницы у местного источника (LOCAL-…, например база знаний Dify ПЦБК, Д17) — не «публичный»: тип
+// локатора контракта один на оба случая, различает их только код источника
+function locatorText(l: Locator, sourceId: string): string {
   switch (l.type) {
     case "pdf_page": return T_AN_LOC_PDF(l.page);
     case "xlsx_cell": return T_AN_LOC_XLSX(l.sheet, l.cell);
     case "image_label": return T_AN_LOC_IMAGE(l.file, l.label);
-    case "public_section": return T_AN_LOC_PUBLIC(l.section);
+    case "public_section":
+      return sourceId.startsWith("LOCAL-") ? T_AN_LOC_INTERNAL_SECTION(l.section) : T_AN_LOC_PUBLIC(l.section);
   }
 }
 
@@ -74,10 +77,12 @@ function SourceItem({ item: evidenceRef, api }: { item: EvidenceRef; api: Analyt
           </span>
           {fragment.type !== null && <span className="an-source-type">{fragment.type}</span>}
           {fragment.date !== null && <span className="an-source-date">{T_AN_SOURCE_CHECKED(fragment.date)}</span>}
-          <span className="an-source-locator">{locatorText(fragment.locator)}</span>
+          <span className="an-source-locator">{locatorText(fragment.locator, evidenceRef.sourceId)}</span>
         </>
       ) : (
-        <span className="an-source-locator">{evidenceRef.sourceId} — {locatorText(evidenceRef.locator)}</span>
+        <span className="an-source-locator">
+          {evidenceRef.sourceId} — {locatorText(evidenceRef.locator, evidenceRef.sourceId)}
+        </span>
       )}
       {evidenceRef.limitation !== "" && (
         <span className="an-source-limitation">{T_AN_LIMITATION}: {evidenceRef.limitation}</span>

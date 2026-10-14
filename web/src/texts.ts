@@ -322,6 +322,7 @@ export const T_AN_LOC_PDF = (page: number): string => `страница ${page} 
 export const T_AN_LOC_XLSX = (sheet: string, cell: string): string => `лист «${sheet}», ячейка ${cell}`;
 export const T_AN_LOC_IMAGE = (file: string, label: string): string => `снимок «${file}», метка «${label}»`;
 export const T_AN_LOC_PUBLIC = (section: string): string => `публичный источник, раздел «${section}»`;
+export const T_AN_LOC_INTERNAL_SECTION = (section: string): string => `внутренний источник, раздел «${section}»`;
 
 // --- отправка конфликта на согласование (мастер-промпт §6: «конфликт виден и может быть отправлен») ---
 export const T_AN_SEND_TO_REVIEW = "Отправить на согласование";
