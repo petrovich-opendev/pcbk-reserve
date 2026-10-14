@@ -1,10 +1,12 @@
 // Вкладка «Аналитический чат технолога» (план КДМ1, Task 6; мастер-промпт §6): диалоги, два режима («Справка
 // по документам» / «Разбор отклонения»), участок/период/единица — необязательные уточнения вопроса, отправка/
-// отмена/опрос хода задания, адресные уточнения, раскрытие оснований (AnalyticsSources) и — только при праве,
-// которое сообщил сервер (`capabilities.reviewAuthority`) — экран назначенного согласования (AnalyticsReviews).
-// Ответ рисуется только из серверных полей JobResponse: текст разделов — markdown тем же безопасным рендером,
-// что у уроков (LessonMarkdown), сырой ответ модели сюда не попадает ни при каком состоянии (сервер его и не
-// отдаёт — только rendered_by:"server").
+// отмена/опрос хода задания, адресные уточнения, раскрытие оснований (AnalyticsSources), раздел «Связи с
+// историаном» (AnalyticsLinks, план Д17 Task 2 — доступен любому вошедшему с доступом к вкладке) и — только
+// при праве, которое сообщил сервер (`capabilities.reviewAuthority`) — экран назначенного согласования
+// (AnalyticsReviews). Ответ рисуется только из серверных полей JobResponse, включая секцию телеметрии
+// `telemetry_observation` (Д17 Task 1 — «Данные историана», AN_SECTION_LABELS): текст разделов — markdown тем
+// же безопасным рендером, что у уроков (LessonMarkdown), сырой ответ модели сюда не попадает ни при каком
+// состоянии (сервер его и не отдаёт — только rendered_by:"server").
 //
 // Идентичность — только серверная сессия (как у calc/lessons): эта страница не посылает ни role, ни owner, ни
 // place. Повтор после сетевого сбоя посылки вопроса — тот же client_request_id (ОСОБЫЙ ФОКУС ПРОВЕРКИ №3 плана:
@@ -30,14 +32,15 @@ import type { Timers } from "../workplace";
 import { LessonMarkdown } from "./LessonMarkdown";
 import { AnalyticsSources } from "./AnalyticsSources";
 import { AnalyticsReviews } from "./AnalyticsReviews";
+import { AnalyticsLinks } from "./AnalyticsLinks";
 import {
   AN_CLARIFICATION_LABELS, AN_ERROR_LABELS, AN_MODE_LABELS, AN_PROCESS_HINTS, AN_SECTION_LABELS, AN_STATE_LABELS,
   AN_TZ_CHOICES, T_AN_BAD_PERIOD, T_AN_CANCEL, T_AN_CLARIFY_HINT, T_AN_CLARIFY_RESEND, T_AN_CLARIFY_TITLE,
-  T_AN_CONVERSATION_ITEM, T_AN_CONVERSATIONS, T_AN_LOADING, T_AN_MODE, T_AN_NAV, T_AN_NAV_CHAT, T_AN_NEW_CONVERSATION,
-  T_AN_NO_CONVERSATIONS, T_AN_NO_QUESTION, T_AN_ORIGINAL_QUESTION, T_AN_PERIOD, T_AN_PERIOD_FROM, T_AN_PERIOD_TO,
-  T_AN_PERIOD_TZ, T_AN_PROCESS, T_AN_QUESTION, T_AN_RETRY, T_AN_REVIEWS, T_AN_SCOPE, T_AN_SEND,
-  T_AN_SEND_TO_REVIEW, T_AN_SEND_TO_REVIEW_DONE, T_AN_SEND_TO_REVIEW_RATIONALE, T_AN_SENDING, T_AN_START_HINT,
-  T_AN_TITLE, T_AN_UNAVAILABLE, T_AN_UNIT, T_UNKNOWN,
+  T_AN_CONVERSATION_ITEM, T_AN_CONVERSATIONS, T_AN_LINKS, T_AN_LOADING, T_AN_MODE, T_AN_NAV, T_AN_NAV_CHAT,
+  T_AN_NEW_CONVERSATION, T_AN_NO_CONVERSATIONS, T_AN_NO_QUESTION, T_AN_ORIGINAL_QUESTION, T_AN_PERIOD,
+  T_AN_PERIOD_FROM, T_AN_PERIOD_TO, T_AN_PERIOD_TZ, T_AN_PROCESS, T_AN_QUESTION, T_AN_RETRY, T_AN_REVIEWS,
+  T_AN_SCOPE, T_AN_SEND, T_AN_SEND_TO_REVIEW, T_AN_SEND_TO_REVIEW_DONE, T_AN_SEND_TO_REVIEW_RATIONALE,
+  T_AN_SENDING, T_AN_START_HINT, T_AN_TITLE, T_AN_UNAVAILABLE, T_AN_UNIT, T_UNKNOWN,
 } from "../texts";
 
 export interface AnalyticsPageProps {
@@ -198,7 +201,7 @@ export function AnalyticsPage(p: AnalyticsPageProps) {
   const [composingMode, setComposingMode] = useState<AnalysisMode | null>(null);    // не null — форма нового диалога
   const [detail, setDetail] = useState<DetailState>({ kind: "none" });
   const [job, setJob] = useState<JobPhase>({ kind: "idle" });
-  const [innerView, setInnerView] = useState<"chat" | "reviews">("chat");
+  const [innerView, setInnerView] = useState<"chat" | "reviews" | "links">("chat");
   const [question, setQuestion] = useState("");
   const [form, setForm] = useState(emptyContext());
 
@@ -467,14 +470,20 @@ export function AnalyticsPage(p: AnalyticsPageProps) {
         <h2>{T_AN_TITLE}</h2>
         <span className="an-scope">{T_AN_SCOPE}</span>
       </div>
-      {caps.caps.reviewAuthority && (
-        <nav className="an-inner-nav" aria-label={T_AN_NAV}>
-          <button type="button" aria-pressed={innerView === "chat"} onClick={() => setInnerView("chat")}>{T_AN_NAV_CHAT}</button>
+      {/* «Диалог» и «Связи с историаном» — всем вошедшим с доступом к вкладке (предложить связь может любой,
+          план Д17 Task 2); «Назначенное согласование» — только при праве, которое сообщил сервер */}
+      <nav className="an-inner-nav" aria-label={T_AN_NAV}>
+        <button type="button" aria-pressed={innerView === "chat"} onClick={() => setInnerView("chat")}>{T_AN_NAV_CHAT}</button>
+        <button type="button" aria-pressed={innerView === "links"} onClick={() => setInnerView("links")}>{T_AN_LINKS}</button>
+        {caps.caps.reviewAuthority && (
           <button type="button" aria-pressed={innerView === "reviews"} onClick={() => setInnerView("reviews")}>{T_AN_REVIEWS}</button>
-        </nav>
-      )}
+        )}
+      </nav>
       {innerView === "reviews" && caps.caps.reviewAuthority ? (
         <AnalyticsReviews api={props.current.api} onSignedOut={props.current.onSignedOut} />
+      ) : innerView === "links" ? (
+        <AnalyticsLinks api={props.current.api} onSignedOut={props.current.onSignedOut}
+                         dataBridgeAvailable={caps.caps.dataBridgeAvailable} />
       ) : (
         <div className="an-body">
           <nav className="an-list" aria-label={T_AN_CONVERSATIONS}>

@@ -48,6 +48,67 @@ def handle(tmp_path):
     close(h)
 
 
+def _insert_process_row(path: Path, process_id: str, title: str, source_label: str) -> None:
+    """Узел корпуса для тестов приоритета фразы узла (Task 3, план §Task 3/Этап 3) — своя вставка, как
+    `_insert_claim` ниже: не трогает `fixtures/kdm1_corpus.py` (там точное число записей проверяют другие
+    тесты, например `test_analytics_knowledge.py` — добавление в фикстуру сломало бы их), запись живёт только
+    в `handle` конкретного теста."""
+    conn = sqlite3.connect(path)
+    try:
+        payload = {
+            "id": process_id, "title": title, "source_label": source_label,
+            "machine_scope": "KDM1_PCBK", "source_refs": ["SRC-FAKE-001"],
+            "knowledge_state": "document_label", "actual_name_requires_review": True,
+            "inferred_connectivity": None, "operating_limits": None, "conflict_ids": [],
+        }
+        conn.execute("INSERT INTO processes (id, payload) VALUES (?, ?)", (process_id, json.dumps(payload)))
+        conn.execute("INSERT INTO kb_search (kind, id, text) VALUES ('processe', ?, ?)", (process_id, title))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_term_row(path: Path, term_id: str, preferred_ru: str, *, aliases: list[str] | None = None,
+                     ambiguous: bool = False) -> None:
+    """Термин корпуса для тех же тестов — своя вставка, как `_insert_process_row` выше."""
+    conn = sqlite3.connect(path)
+    try:
+        definition = f"Определение «{preferred_ru}» — только для теста приоритета фразы узла."
+        payload = {
+            "id": term_id, "preferred_ru": preferred_ru, "aliases": list(aliases or ()),
+            "definition": definition, "source_refs": ["SRC-FAKE-001"], "ambiguous": ambiguous,
+            "machine_scope": "KDM1_PCBK_related", "knowledge_state": "editorial_definition_or_unresolved_candidate",
+            "local_operating_authority": False, "auto_merge_aliases": False,
+        }
+        conn.execute("INSERT INTO terms (id, payload) VALUES (?, ?)", (term_id, json.dumps(payload)))
+        conn.execute("INSERT INTO kb_search (kind, id, text) VALUES ('term', ?, ?)", (term_id, definition))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_process_phrase_fixture(path: Path) -> tuple[str, str, str]:
+    """Пара узлов с общей двусловной фразой + термин с тем же первым словом — воспроизведение на синтетике
+    корня дефекта Д16→Д17 (настоящий корпус: «Машинный бассейн нижней/верхней сетки» + термин «Машинное
+    направление», общая основа «машинн»). Возвращает (id узла №8, id узла №4, id термина)."""
+    proc8, proc4, term_id = "PROC-TEST-UCH-008", "PROC-TEST-UCH-004", "TERM-TEST-UCH-DIR"
+    _insert_process_row(path, proc8, "Учебный бассейн верхней сетки №8", "demo-uch-bowl-8")
+    _insert_process_row(path, proc4, "Учебный бассейн нижней сетки №4", "demo-uch-bowl-4")
+    _insert_term_row(path, term_id, "Учебное направление", aliases=["направление"])
+    return proc8, proc4, term_id
+
+
+def _insert_term_phrase_fixture(path: Path) -> tuple[str, str]:
+    """Короткий термин + более длинный, содержащий ТУ ЖЕ пару слов как часть названия — синтетика раунда 1
+    (Д17, план §Task 3), воспроизводящая на выдуманных именах пару настоящего корпуса «Машинное направление»
+    (`md`) / «Кратковременная изменчивость в машинном направлении» (`st-md`). Возвращает (id короткого, id
+    длинного)."""
+    short_id, long_id = "TERM-TEST-SHORT-PHRASE", "TERM-TEST-LONG-PHRASE"
+    _insert_term_row(path, short_id, "Опорная линия", aliases=[])
+    _insert_term_row(path, long_id, "Опорная линия базового контура выравнивания", aliases=[])
+    return short_id, long_id
+
+
 def _insert_claim(path: Path, claim_id: str, text: str, *, process_ids: list[str] | None = None,
                   critical_local_fact: bool = False) -> None:
     """Как `test_analytics_retrieval.py::_insert_claim` (Task 1) — своя копия, независимая от параллельных
@@ -679,9 +740,12 @@ def test_clarification_candidates_no_ambiguous_term_is_empty(handle):
     assert clarification_candidates(handle, _nq("термин"), ()) == ()
 
 
-def test_clarification_candidates_skips_term_without_candidates():
+def test_clarification_candidates_skips_term_without_candidates(handle):
+    """Правка Task 3 (Д17): `handle` теперь нужен не только спорному термину — без ambiguous-термина функция
+    проверяет и неоднозначность узла (`_candidate_process_ids`), поэтому `handle=None` больше не подходящий
+    аргумент (раньше его было достаточно — функция не трогала корпус, если ни один термин не подходил)."""
     not_found = ResolvedTerm(original="абырвалг", candidate_ids=[], selected_id=None, requires_confirmation=True)
-    assert clarification_candidates(None, _nq("абырвалг"), (not_found,)) == ()
+    assert clarification_candidates(handle, _nq("абырвалг"), (not_found,)) == ()
 
 
 def test_clarification_candidates_caps_at_six(handle):
@@ -716,6 +780,290 @@ def test_clarification_candidates_end_to_end_via_render_clarification_section(ha
     section = render_clarification_section(("quantity",), labels)
     assert "Возможные варианты" in section.text
     assert labels[0] in section.text
+
+
+# === правка Task 3 (Д17, план §Task 3/Этап 3): приоритет фразы узла над пословным совпадением термина ===
+
+def test_process_phrase_beats_partial_term_match(handle):
+    """Корень дефекта, найденный на настоящем корпусе (контроллер, 14.10): «уровнемер в машинном бассейне» на
+    пословном разборе находило термин «Машинное направление» только по общей основе «машинн» и давало
+    уточнение «какая величина», хотя в тексте явно названа фраза узла «машинном бассейне», которая совпадает
+    (подмножеством основ) с ДВУМЯ узлами корпуса — правильное уточнение «какой бассейн». Синтетика: два узла с
+    общей двусловной фразой («Учебный бассейн ...») + термин с тем же первым словом («Учебное направление»)."""
+    from pcbk_core.analytics.preanalysis import _resolve_question_terms
+
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+
+    pre, pack = analyze(STUDENT, _request("Где уровнемер в учебном бассейне?"), handle, handle.version)
+    assert pre.decision == "needs_clarification"
+    assert "process" in pre.missing_fields
+    assert "quantity" not in pre.missing_fields          # термин «Учебное направление» не должен всплыть
+    assert {proc8, proc4} <= set(pre.process_ids)
+    assert pack == ()
+
+    parsed = _nq("Где уровнемер в учебном бассейне?")
+    resolved = _resolve_question_terms(handle, parsed)
+    assert all(term.original.lower() != "учебном" for term in resolved)   # слово фразы не ушло в resolve_term
+
+    labels = clarification_candidates(handle, parsed, resolved)
+    assert set(labels) == {"Учебный бассейн верхней сетки №8", "Учебный бассейн нижней сетки №4"}
+
+
+def test_term_phrase_still_resolves(handle):
+    """«Что такое {термин из двух слов}» — определение без лишнего уточнения, даже когда в том же корпусе есть
+    узлы с похожим первым словом (Review Focus п.5: «"что такое машинное направление" — по-прежнему определение
+    без лишнего уточнения»)."""
+    path = Path(handle.path)
+    _insert_process_phrase_fixture(path)
+
+    pre, _pack = analyze(STUDENT, _request("Что такое учебное направление?"), handle, handle.version)
+    assert pre.intent == "definition"
+    assert pre.decision != "needs_clarification"
+
+
+def test_single_ambiguous_word_still_clarifies(handle):
+    """Контроль: одиночное спорное слово корпуса (вид «масса») по-прежнему даёт уточнение с вариантами —
+    приоритет фразы узла не гасит обычную пословную неоднозначность там, где фразы узла вообще нет в вопросе."""
+    from pcbk_core.analytics.preanalysis import _resolve_question_terms
+
+    pre, pack = analyze(STUDENT, _request("Что такое выдуманный?"), handle, handle.version)
+    assert pre.decision == "needs_clarification"
+    assert "quantity" in pre.missing_fields
+    assert pack == ()
+
+    parsed = _nq("Что такое выдуманный?")
+    resolved = _resolve_question_terms(handle, parsed)
+    labels = clarification_candidates(handle, parsed, resolved)
+    assert len(labels) >= 2
+
+
+# === правка ревью Task 3, раунд 3 (Critical C1): фраза узла/термина не пересекает границу предложения ===
+
+def _insert_generic_qualifier_distractor_node(path: Path) -> str:
+    """Третий узел с ТЕМ ЖЕ родовым уточнителем («нижней сетки»), но ДРУГОЙ головой названия — воспроизводит
+    находку ревью I1 (раунд 3) на синтетике: настоящий корпус содержит много разных узлов, чьё название
+    заканчивается на «нижней/верхней сетки» (`composition-lower`/`headbox-lower`/`screen-lower`/…) — без
+    требования головы подмножественное сравнение раздувало бы список кандидатов этим посторонним
+    оборудованием."""
+    node_id = "PROC-TEST-UCH-HEADBOX-009"
+    _insert_process_row(path, node_id, "Учебный напорный ящик нижней сетки №9", "demo-uch-headbox-9")
+    return node_id
+
+
+def test_process_phrase_does_not_merge_across_sentences(handle):
+    """Ревью, раунд 3, Critical C1 (воспроизведение на синтетике, своими словами): хвост первого предложения
+    («учебным бассейном», сам по себе неоднозначный между двумя узлами) и начало ВТОРОГО, грамматически не
+    связанного предложения («Нижней сетки…») раньше молча докомплектовывали фразу до ОДНОГО конкретного узла
+    — границу предложения поиск фразы не замечал. Теперь граница останавливает поиск: неоднозначность между
+    двумя бассейнами сохраняется (уточнение участка, не ложный единственный выбор). Та же фраза ЦЕЛИКОМ в
+    ОДНОМ предложении — узел находится однозначно (контроль: приоритет фразы продолжает работать там, где
+    ему и положено)."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+
+    pre_two_sentences, _pack = analyze(
+        STUDENT, _request("Что случилось с учебным бассейном? Нижней сетки показания подозрительные."),
+        handle, handle.version)
+    assert "process" in pre_two_sentences.missing_fields
+    assert set(pre_two_sentences.process_ids) == {proc8, proc4}
+
+    pre_one_sentence, _pack2 = analyze(
+        STUDENT, _request("Что случилось с учебным бассейном нижней сетки?"), handle, handle.version)
+    assert pre_one_sentence.process_ids == [proc4]
+    assert "process" not in pre_one_sentence.missing_fields
+
+
+@real_corpus
+def test_real_corpus_process_phrase_does_not_merge_across_sentences():
+    """Буквальные примеры ревью (раунд 3, C1) на настоящем корпусе: межпредложенческая склейка больше не
+    даёт ложный `ready`/единственный узел — уточнение участка с двумя бассейнами сохраняется."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        for question in (
+            "Какой уровень в бассейне машинном. Нижней сетки там номер.",
+            "Что с машинным бассейном? Нижней сетки датчик неисправен.",
+        ):
+            pre, _pack = analyze(STUDENT, _request(question), h, h.version)
+            assert pre.decision != "ready", question
+            assert len(pre.process_ids) != 1, question
+        pre_term, _pack = analyze(
+            STUDENT, _request("Что такое машинное. Направление задано в документации, покажи её."), h,
+            h.version)
+        assert pre_term.decision != "ready", "cross-sentence term phrase must not merge"
+        assert all(t.selected_id != "md" for t in pre_term.resolved_terms)
+    finally:
+        _close(h)
+
+
+# === правка ревью Task 3, раунд 3 (Important I1): фраза узла — только с головой названия узла ===
+
+def test_process_phrase_requires_head_bare_generic_qualifier_no_new_candidates(handle):
+    """Родовой уточнитель («нижней сетки») без головы названия узла больше не считается фразой узла ни для
+    одного узла — список кандидатов участка не раздувается посторонним оборудованием (I1)."""
+    path = Path(handle.path)
+    _insert_process_phrase_fixture(path)
+    _insert_generic_qualifier_distractor_node(path)
+
+    pre, _pack = analyze(STUDENT, _request("Что сейчас происходит на нижней сетке?"), handle, handle.version)
+    assert "process" not in pre.missing_fields
+    assert pre.process_ids == []
+
+
+def test_process_phrase_head_present_still_finds_both_siblings(handle):
+    """«…в учебном бассейне…» (голова «учебный бассейн» присутствует) — оба узла-бассейна остаются
+    кандидатами, посторонний узел с тем же родовым уточнителем («нижней сетки») НЕ добавляется (I1)."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+    distractor_id = _insert_generic_qualifier_distractor_node(path)
+
+    pre, _pack = analyze(STUDENT, _request("Где уровнемер в учебном бассейне?"), handle, handle.version)
+    assert set(pre.process_ids) == {proc8, proc4}
+    assert distractor_id not in pre.process_ids
+
+
+def test_process_phrase_head_plus_qualifier_picks_single_sibling(handle):
+    """«…в учебном бассейне нижней сетки…» (голова + уточнитель вместе) — выбирает ОДИН конкретный узел
+    (нижний), не оба и не постороннее оборудование с тем же уточнителем (I1)."""
+    path = Path(handle.path)
+    proc8, proc4, _term_id = _insert_process_phrase_fixture(path)
+    distractor_id = _insert_generic_qualifier_distractor_node(path)
+
+    pre, _pack = analyze(
+        STUDENT, _request("Где уровнемер в учебном бассейне нижней сетки?"), handle, handle.version)
+    assert pre.process_ids == [proc4]
+    assert proc8 not in pre.process_ids
+    assert distractor_id not in pre.process_ids
+
+
+@real_corpus
+def test_real_corpus_process_phrase_requires_head_i1():
+    """Буквальные примеры ревью (раунд 3, I1) на настоящем корпусе."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        pre_bare, _pack = analyze(
+            STUDENT, _request("Что сейчас происходит на нижней сетки?"), h, h.version)
+        assert "process" not in pre_bare.missing_fields
+
+        pre_head, _pack2 = analyze(STUDENT, _request("Какой уровнемер в машинном бассейне?"), h, h.version)
+        assert len(pre_head.process_ids) == 2
+
+        pre_full, _pack3 = analyze(
+            STUDENT, _request("Какой уровень в машинном бассейне нижней сетки?"), h, h.version)
+        assert len(pre_full.process_ids) == 1
+    finally:
+        _close(h)
+
+
+# === правка Task 3, раунд 1 (Д17, тот же класс дефекта — контроллер): приоритет фразы ТЕРМИНА ===
+# === («что такое машинное направление?» резолвило И короткий, И более длинный термин одновременно) ===
+
+def test_term_phrase_disambiguates_short_vs_long_term(handle):
+    """Корень дефекта раунда 1 на настоящем корпусе: пословный разбор резолвил ОДНОВРЕМЕННО короткий термин и
+    более длинный, содержащий ту же пару слов как часть названия — хотя технолог назвал короткий термин ТОЧНО.
+    Синтетика: «Опорная линия» (короткий) / «Опорная линия базового контура выравнивания» (длинный, та же
+    пара слов — образец md/st-md настоящего корпуса). «Что такое {короткий}» выбирает короткий без уточнения;
+    «что такое {длинный}» выбирает длинный без уточнения."""
+    path = Path(handle.path)
+    short_id, long_id = _insert_term_phrase_fixture(path)
+
+    pre_short, _pack = analyze(STUDENT, _request("Что такое опорная линия?"), handle, handle.version)
+    assert pre_short.intent == "definition"
+    assert pre_short.decision != "needs_clarification"
+    selected_short = [t.selected_id for t in pre_short.resolved_terms if t.selected_id is not None]
+    assert selected_short == [short_id]
+
+    pre_long, _pack = analyze(
+        STUDENT, _request("Что такое опорная линия базового контура выравнивания?"), handle, handle.version)
+    assert pre_long.intent == "definition"
+    assert pre_long.decision != "needs_clarification"
+    selected_long = [t.selected_id for t in pre_long.resolved_terms if t.selected_id is not None]
+    assert selected_long == [long_id]
+
+
+def test_term_phrase_single_word_still_ambiguous(handle):
+    """Одиночное первое слово фразы термина (без второго слова) — минимум два слова для фразы (план §Task 3,
+    раунд 1): без второго слова это обычное пословное слово, которое подстановочно совпадает И с коротким, И с
+    длинным термином — уточнение, как и до правки фразы термина."""
+    path = Path(handle.path)
+    _insert_term_phrase_fixture(path)
+
+    pre, pack = analyze(STUDENT, _request("Что такое опорная?"), handle, handle.version)
+    assert pre.decision == "needs_clarification"
+    assert "quantity" in pre.missing_fields
+    assert pack == ()
+
+
+def test_term_phrase_ambiguous_term_still_clarifies(handle):
+    """Термин, точно совпавший ФРАЗОЙ, но помеченный `ambiguous` в корпусе, — уточнение сохраняется (равенство
+    множества основ не отменяет флаг корпуса, план §Task 3, раунд 1)."""
+    path = Path(handle.path)
+    _insert_term_row(path, "TERM-TEST-AMBIG-PHRASE", "Теневая зона", ambiguous=True)
+
+    pre, pack = analyze(STUDENT, _request("Что такое теневая зона?"), handle, handle.version)
+    assert pre.decision == "needs_clarification"
+    assert "quantity" in pre.missing_fields
+    assert pack == ()
+
+
+@real_corpus
+def test_real_corpus_term_phrase_machine_direction_no_quantity_clarification():
+    """Буквальный сценарий раунда 1 (контроллер) на настоящем корпусе: «что такое машинное направление?» —
+    без уточнения `quantity`, выбран короткий термин `md`; «что такое кратковременная изменчивость в машинном
+    направлении?» — без уточнения, выбран длинный термин `st-md`; «что такое масса?» — уточнение как раньше
+    (обычная пословная неоднозначность без фразы термина не затронута)."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        pre_short, _pack = analyze(STUDENT, _request("Что такое машинное направление?"), h, h.version)
+        assert "quantity" not in pre_short.missing_fields
+        assert pre_short.decision != "needs_clarification"
+
+        pre_long, _pack = analyze(
+            STUDENT, _request("Что такое кратковременная изменчивость в машинном направлении?"), h, h.version)
+        assert "quantity" not in pre_long.missing_fields
+        assert pre_long.decision != "needs_clarification"
+
+        pre_mass, _pack = analyze(STUDENT, _request("Что такое масса?"), h, h.version)
+        assert pre_mass.decision == "needs_clarification"
+        assert "quantity" in pre_mass.missing_fields
+    finally:
+        _close(h)
+
+
+# --- «кубов в час»/«кубометров в час»/«куб/ч» — та же единица, что «м³/ч» (мелкие хвосты распознавания) ---
+
+@pytest.mark.parametrize("phrase", ["кубов в час", "кубометров в час", "куб/ч"])
+def test_cubic_meters_per_hour_words(phrase):
+    reference = _nq("Расход 200 м3/ч, концентрация 4% по массе — сколько сухого?")
+    candidate = _nq(f"Расход 200 {phrase}, концентрация 4% по массе — сколько сухого?")
+    assert candidate.unit_hint is not None
+    assert candidate.unit_hint == reference.unit_hint
+    needs, missing = requires_clarification(candidate, (), ())
+    assert "unit" not in missing
+
+
+# --- формы команды «заблокируй(те)»/«разблокируй» (мелкие хвосты распознавания, Task 3) ---
+
+@pytest.mark.parametrize("question", [
+    "Заблокируй выход из зоны сканирования лентой",
+    "Заблокируйте выход из зоны сканирования лентой",
+    "Разблокируй выход из зоны сканирования лентой",
+])
+def test_classify_intent_block_unblock_scanner_exit_is_control(question):
+    assert classify_intent(_nq(question)) == "control"
+
+
+def test_classify_intent_why_blocked_scanner_exit_is_not_control():
+    assert classify_intent(_nq("Почему заблокирован выход из зоны сканирования?")) != "control"
 
 
 # === правка контроллера, раунд 2, п.2: «масса 1 м²»/«масса квадратного метра»/«масса м2»/«граммаж» — ===
@@ -1195,9 +1543,11 @@ def test_real_corpus_full_control_table_never_ready():
 
 
 # Правка, раунд 5 (контроллер): свежий зонд повторной проверки раунда 4 (ограждение/концевик/фильтр — команды;
-# «вы …ете?», «можно я посмотрю», числительные «пяти/семи/три» — не команды). Одна команда зонда («Заблокируй
-# выход из зоны сканирования лентой») не ловится — известный остаток, справка без плашки, карточек-инструкций нет
+# «вы …ете?», «можно я посмотрю», числительные «пяти/семи/три» — не команды). Правка Task 3 (Д17): «Заблокируй
+# выход из зоны сканирования лентой» раньше не ловилась (известный остаток раунда 5) — форма «заблокируй(те)»
+# отсутствовала в `_IMPERATIVE_FORMS` (была только обратная «разблокируй(те)»); теперь добавлена и фраза ловится.
 CONTROL_PHRASES_R5: tuple[str, ...] = (
+    "Заблокируй выход из зоны сканирования лентой",
     "Подтяни фланец на трубопроводе подачи пара",
     "Почисти фильтр грубой очистки.",
     "Зашунтируй контакт концевика на дверце ограждения сканера",
@@ -1363,3 +1713,149 @@ def test_requires_clarification_still_asks_unit_for_ordinary_calculation_without
     parsed = _nq("Рассчитай производительность по ширине и скорости")
     needs, missing = requires_clarification(parsed, (), ())
     assert "unit" in missing
+
+
+# === правка контроллера, раунд 2 (Д17, план §Task 3, находка на живом корпусе): подпись ОБОРУДОВАНИЯ ===
+# === (equipment_links.display_label) подавляет quantity/basis — КРОМЕ intent == "calculation" ===
+
+def test_requires_clarification_equipment_label_suppresses_quantity_and_basis():
+    """«Какой вакуум на {подпись}?» — подпись прибора сама однозначно задаёт величину и единицу (их отдаёт
+    служба данных, Task 1/`data_bridge.py`), уточнение "quantity"/"basis" лишнее."""
+    from pcbk_core.analytics.models import ResolvedTerm
+
+    ambiguous = ResolvedTerm(original="вакуум", candidate_ids=["vac-a", "vac-b"], selected_id=None,
+                             requires_confirmation=True)
+    question = "Какой вакуум сейчас на подписи прибора?"
+    needs, missing = requires_clarification(_nq(question), (ambiguous,), (), has_equipment_label=True)
+    assert "quantity" not in missing
+    assert "basis" not in missing
+
+
+def test_requires_clarification_equipment_label_false_by_default_keeps_old_behavior():
+    """Старый вызов без `has_equipment_label` — поведение не меняется (обратная совместимость сигнатуры, та
+    же дисциплина, что у `mode`/`period_given`)."""
+    from pcbk_core.analytics.models import ResolvedTerm
+
+    ambiguous = ResolvedTerm(original="вакуум", candidate_ids=["vac-a", "vac-b"], selected_id=None,
+                             requires_confirmation=True)
+    question = "Какой вакуум сейчас на подписи прибора?"
+    needs, missing = requires_clarification(_nq(question), (ambiguous,), ())
+    assert "quantity" in missing
+    assert "basis" in missing
+
+
+def test_requires_clarification_equipment_label_does_not_suppress_for_calculation_intent():
+    """Расчётный вопрос — исключение из правила: подпись оборудования ничего не говорит о формуле/единицах
+    самого расчёта, "unit"/"basis" остаются."""
+    from pcbk_core.analytics.models import ResolvedTerm
+
+    ambiguous = ResolvedTerm(original="вакуум", candidate_ids=["vac-a", "vac-b"], selected_id=None,
+                             requires_confirmation=True)
+    question = "Переведи вакуум на подписи прибора в паскали"
+    parsed = _nq(question)
+    assert classify_intent(parsed) == "calculation"
+    needs, missing = requires_clarification(parsed, (ambiguous,), (), has_equipment_label=True)
+    assert "basis" in missing
+    assert "unit" in missing
+
+
+# --- end-to-end через analyze(): подпись оборудования фикстуры (20FAKE_*_PV) ---
+
+def _insert_ambiguous_vacuum_term_pair(path: Path) -> None:
+    """Два термина с общим alias «вакуум» — синтетическое ambiguous-слово корпуса (образец реального сценария
+    контроллера: слово корпуса, многозначное в словаре И одновременно базочувствительное — `_BASIS_SENSITIVE_
+    STEMS` содержит «вакуум» литералом)."""
+    _insert_term_row(path, "TERM-TEST-VAC-A", "Вакуум отсасывающего ящика", aliases=["вакуум"])
+    _insert_term_row(path, "TERM-TEST-VAC-B", "Вакуум формующего стола", aliases=["вакуум"])
+
+
+def test_analyze_equipment_label_suppresses_quantity_and_basis(handle):
+    """Буквальный сценарий раунда 2: «Какой вакуум на {подпись оборудования}?» — без подписи слово «вакуум»
+    и многозначно (словарь), и требует базу (`_BASIS_SENSITIVE_STEMS`); с точной подписью оборудования
+    (`20FAKE_001_PV`, готовая `EQ-FAKE-001.display_label` фикстуры) — ни quantity, ни basis не запрашиваются."""
+    path = Path(handle.path)
+    _insert_ambiguous_vacuum_term_pair(path)
+
+    pre, _pack = analyze(STUDENT, _request("Какой вакуум на 20FAKE_001_PV сейчас?"), handle, handle.version)
+    assert "quantity" not in pre.missing_fields
+    assert "basis" not in pre.missing_fields
+
+
+def test_analyze_equipment_label_regression_without_label_still_asks(handle):
+    """Тот же вопрос БЕЗ подписи — уточнение как раньше (контроль регрессии: правило не включается по
+    умолчанию, только по найденной точной подписи оборудования)."""
+    path = Path(handle.path)
+    _insert_ambiguous_vacuum_term_pair(path)
+
+    pre, _pack = analyze(STUDENT, _request("Какой вакуум сейчас?"), handle, handle.version)
+    assert pre.decision == "needs_clarification"
+    assert "quantity" in pre.missing_fields
+    assert "basis" in pre.missing_fields
+
+
+def test_analyze_process_label_does_not_suppress_quantity_and_basis(handle):
+    """Подпись УЗЛА (`processes.source_label`) правило НЕ включает (только `equipment_links.display_label`,
+    план §Task 3, раунд 2) — узел называет участок, не измеряемую величину/единицу."""
+    path = Path(handle.path)
+    _insert_ambiguous_vacuum_term_pair(path)
+    _insert_process_row(path, "PROC-TEST-VAC-NODE", "Узел с вакуумным насосом", "demo-vacuum-node")
+
+    pre, _pack = analyze(STUDENT, _request("Какой вакуум на demo-vacuum-node сейчас?"), handle, handle.version)
+    assert "quantity" in pre.missing_fields
+    assert "basis" in pre.missing_fields
+
+
+def test_analyze_equipment_label_calculation_intent_still_requires_unit_and_basis(handle):
+    """Расчётный вопрос с подписью оборудования, но без единиц/базы — "unit"/"basis" остаются (calculation —
+    прямое исключение из правила раунда 2)."""
+    pre, _pack = analyze(
+        STUDENT, _request("Переведи вакуум на 20FAKE_001_PV в паскали"), handle, handle.version)
+    assert pre.intent == "calculation"
+    assert "unit" in pre.missing_fields
+    assert "basis" in pre.missing_fields
+
+
+# --- _mentions_equipment_link_label напрямую: только equipment_links, не processes ---
+
+def test_mentions_equipment_link_label_true_for_equipment_tag(handle):
+    from pcbk_core.analytics.preanalysis import _mentions_equipment_link_label
+
+    assert _mentions_equipment_link_label(handle, "Какой вакуум на 20FAKE_001_PV сейчас?") is True
+
+
+def test_mentions_equipment_link_label_false_for_process_label(handle):
+    from pcbk_core.analytics.preanalysis import _mentions_equipment_link_label
+
+    path = Path(handle.path)
+    _insert_process_row(path, "PROC-TEST-VAC-NODE2", "Ещё один узел с насосом", "demo-vacuum-node-2")
+    assert _mentions_equipment_link_label(handle, "Какой вакуум на demo-vacuum-node-2 сейчас?") is False
+
+
+def test_mentions_equipment_link_label_false_without_any_label(handle):
+    from pcbk_core.analytics.preanalysis import _mentions_equipment_link_label
+
+    assert _mentions_equipment_link_label(handle, "Какой вакуум сейчас?") is False
+    assert _mentions_equipment_link_label(handle, "") is False
+
+
+@real_corpus
+def test_real_corpus_equipment_label_question_no_quantity_basis_clarification():
+    """Буквальный сценарий раунда 2 на живом корпусе: подпись оборудования из `equipment_links` в вопросе —
+    без уточнения quantity/basis (значение само пойдёт на чтение, Task 1); «Что сейчас на {подпись}?» —
+    по-прежнему `ready`, как и до правки."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import get_rows as _get_rows
+    from pcbk_core.analytics.knowledge import all_ids as _all_ids
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        rows = _get_rows(h, "equipment_links", _all_ids(h, "equipment_links"))
+        label = next(r["display_label"] for r in rows.values() if r.get("display_label"))
+        pre, _pack = analyze(STUDENT, _request(f"Какой вакуум на {label} сейчас?"), h, h.version)
+        assert "quantity" not in pre.missing_fields
+        assert "basis" not in pre.missing_fields
+        pre2, _pack2 = analyze(STUDENT, _request(f"Что сейчас на {label}?"), h, h.version)
+        assert pre2.decision in ("ready", "limited_answer")
+    finally:
+        _close(h)

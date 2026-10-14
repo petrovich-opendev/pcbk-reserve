@@ -4,9 +4,9 @@
 // (api.ts) аналитических методов нет — заглушки Api старых тестов (lessons/events/calc) не меняются ни на один
 // метод.
 //
-// Пути — ровно девять ручек `gateway/analytics_api.py` (docs/kdm1/INTERFACES.md, таблица «Task 0»); этот файл их
-// не меняет и не переименовывает. Идентичность (place/caller/login/owner/role) сервер берёт из сессии — здесь её
-// нет ни в одном теле запроса (мастер-промпт §6, §10).
+// Пути — ручки `gateway/analytics_api.py` (docs/kdm1/INTERFACES.md, таблица «Task 0»; links/links/{id}/candidates —
+// добавление Д17 Task 1, форма дословно оттуда); этот файл их не переименовывает. Идентичность (place/caller/
+// login/owner/role) сервер берёт из сессии — здесь её нет ни в одном теле запроса (мастер-промпт §6, §10).
 import { callJson, type JsonFetch, type Reply } from "./api";
 import { CLIENT_REQUEST_ID_MAX, type AnalysisMode, type ReviewDecisionKind, type ReviewKind } from "./analytics";
 
@@ -47,6 +47,8 @@ export interface AnalyticsApi {
   request(requestId: string): Promise<Reply>;
   cancel(requestId: string): Promise<Reply>;
   evidence(evidenceId: string): Promise<Reply>;
+  links(): Promise<Reply>;                                  // GET analytics/links (Д17 Task 2 — «Связи с историаном»)
+  linkCandidates(linkId: string): Promise<Reply>;            // GET analytics/links/{id}/candidates — подбор тега
   reviewRequests(): Promise<Reply>;
   createReview(input: CreateReviewInput): Promise<Reply>;
   decideReview(reviewId: string, decision: ReviewDecisionKind, comment: string): Promise<Reply>;
@@ -90,6 +92,8 @@ export function createAnalyticsApi(fetchImpl?: JsonFetch): AnalyticsApi {
     request: (requestId) => get(`/requests/${requestId}`),
     cancel: (requestId) => post(`/requests/${requestId}/cancel`),
     evidence: (evidenceId) => get(`/evidence/${evidenceId}`),
+    links: () => get("/links"),
+    linkCandidates: (linkId) => get(`/links/${linkId}/candidates`),
     reviewRequests: () => get("/reviews/requests"),
     createReview: (input) => post("/reviews/requests", {
       kind: input.kind, subject_id: input.subjectId, new_value: input.newValue, scope: input.scope,

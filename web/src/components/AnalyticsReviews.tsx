@@ -5,16 +5,22 @@
 // компонент этого не проверяет, решение — AnalyticsPage, как источник права; дублировать проверку здесь нечем:
 // без него ручки `reviews/*` и так ответят отказом). Роль `teacher` сама по себе не даёт этого права (мастер-
 // промпт §6) — здесь это тоже не предполагается, право только то, что отдал `capabilities`.
+//
+// Д17 Task 2: для заявок `equipment_link` вместо внутреннего id связи показывается подпись оборудования
+// (`display_label`) — список связей грузится здесь же, параллельно со списком заявок (equipmentLabel ниже);
+// предложить связь и подобрать тег — отдельный раздел «Связи с историаном» (AnalyticsLinks.tsx), решение по
+// заявке остаётся только здесь.
 import { useEffect, useRef, useState } from "react";
 import type { AnalyticsApi } from "../analyticsApi";
-import { parseReviewList, type ReviewDecisionKind, type ReviewRequestItem } from "../analytics";
+import { parseEquipmentLinkList, parseReviewList, type EquipmentLink, type ReviewDecisionKind,
+         type ReviewRequestItem } from "../analytics";
 import { replyText, type Reply } from "../api";
 import {
   AN_REVIEW_KIND_LABELS, AN_REVIEW_STATUS_LABELS, T_AN_REVIEW_ACCEPT, T_AN_REVIEW_COMMENT,
   T_AN_REVIEW_DECIDE_CONFLICT, T_AN_REVIEW_DECIDE_ERROR, T_AN_REVIEW_DECIDE_FORBIDDEN,
-  T_AN_REVIEW_DECIDE_NOT_FOUND, T_AN_REVIEW_INFO, T_AN_REVIEW_NEW, T_AN_REVIEW_OLD, T_AN_REVIEW_PERIOD,
-  T_AN_REVIEW_RATIONALE, T_AN_REVIEW_REFRESH, T_AN_REVIEW_REJECT, T_AN_REVIEW_SCOPE, T_AN_REVIEWS,
-  T_AN_REVIEWS_EMPTY, T_AN_REVIEWS_ERROR, T_UNKNOWN,
+  T_AN_REVIEW_DECIDE_NOT_FOUND, T_AN_REVIEW_EQUIPMENT, T_AN_REVIEW_INFO, T_AN_REVIEW_NEW, T_AN_REVIEW_OLD,
+  T_AN_REVIEW_PERIOD, T_AN_REVIEW_RATIONALE, T_AN_REVIEW_REFRESH, T_AN_REVIEW_REJECT, T_AN_REVIEW_SCOPE,
+  T_AN_REVIEWS, T_AN_REVIEWS_EMPTY, T_AN_REVIEWS_ERROR, T_UNKNOWN,
 } from "../texts";
 
 export interface AnalyticsReviewsProps {
@@ -38,8 +44,16 @@ function periodText(r: ReviewRequestItem): string | null {
   return `${r.periodStart ?? "…"} — ${r.periodEnd ?? "…"}`;
 }
 
-function ReviewRow({ r, onDecide, busy }: {
+// подпись оборудования вместо внутреннего id заявки equipment_link (план Д17, Task 2): ищем subject_id в уже
+// загруженном списке связей (load() ниже грузит его параллельно со списком заявок) — нет в списке (отказ
+// загрузки, устаревший кэш) — id как раньше, не отказ разбора всей строки
+function equipmentLabel(subjectId: string, links: readonly EquipmentLink[]): string {
+  return links.find((l) => l.id === subjectId)?.displayLabel ?? subjectId;
+}
+
+function ReviewRow({ r, links, onDecide, busy }: {
   r: ReviewRequestItem;
+  links: readonly EquipmentLink[];
   onDecide(id: string, decision: ReviewDecisionKind, comment: string): void;
   busy: boolean;
 }) {
@@ -53,6 +67,9 @@ function ReviewRow({ r, onDecide, busy }: {
         <span className="an-review-status">{AN_REVIEW_STATUS_LABELS[r.status] ?? r.status}</span>
       </div>
       <dl className="an-review-facts">
+        {r.kind === "equipment_link" && (
+          <div><dt>{T_AN_REVIEW_EQUIPMENT}</dt><dd>{equipmentLabel(r.subjectId, links)}</dd></div>
+        )}
         {r.oldValue !== null && (
           <div><dt>{T_AN_REVIEW_OLD}</dt><dd>{r.oldValue}</dd></div>
         )}
@@ -88,6 +105,9 @@ function ReviewRow({ r, onDecide, busy }: {
 export function AnalyticsReviews(p: AnalyticsReviewsProps) {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [busy, setBusy] = useState(false);
+  // список связей — только для подписи equipment_link (equipmentLabel выше); отказ его загрузки не должен
+  // прятать список заявок — он просто не обновляется, подпись остаётся резервным id (план Д17, Task 2)
+  const [links, setLinks] = useState<EquipmentLink[]>([]);
   // отказ последнего decide() — отдельно от state (правка итогового ревью, п.2 F2-brief): load() ниже
   // перезагружает список после отказа (другой проверяющий мог уже решить заявку), и это не должно стирать
   // текст, который проверяющий должен увидеть
@@ -103,8 +123,14 @@ export function AnalyticsReviews(p: AnalyticsReviewsProps) {
 
   const load = async (): Promise<void> => {
     setState({ kind: "loading" });
-    const r = await props.current.api.reviewRequests().catch(noAnswer);
+    const [r, linksR] = await Promise.all([
+      props.current.api.reviewRequests().catch(noAnswer), props.current.api.links().catch(noAnswer),
+    ]);
     if (!alive.current) return;
+    if (linksR.status === 200) {
+      const parsedLinks = parseEquipmentLinkList(linksR.body);
+      if (parsedLinks !== null) setLinks(parsedLinks);
+    }
     if (r.status === 401) { props.current.onSignedOut(); return; }
     if (r.status !== 200) { setState({ kind: "error", text: replyText(r) === T_UNKNOWN ? T_AN_REVIEWS_ERROR : replyText(r) }); return; }
     const items = parseReviewList(r.body);
@@ -142,7 +168,9 @@ export function AnalyticsReviews(p: AnalyticsReviewsProps) {
           <p className="an-note">{T_AN_REVIEWS_EMPTY}</p>
         ) : (
           <ul className="an-review-list">
-            {state.items.map((r) => <ReviewRow key={r.id} r={r} onDecide={(id, d, c) => void decide(id, d, c)} busy={busy} />)}
+            {state.items.map((r) => (
+              <ReviewRow key={r.id} r={r} links={links} onDecide={(id, d, c) => void decide(id, d, c)} busy={busy} />
+            ))}
           </ul>
         )
       )}

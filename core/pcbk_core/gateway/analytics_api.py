@@ -50,6 +50,7 @@ from ..analytics.store import ConversationMeta, StoreError, StoreUnavailable
 if TYPE_CHECKING:
     from . import GatewayRole
     from ..analytics.reviews import ReviewRequest
+    from ..analytics.service import EquipmentLinkInfo
 
 ANALYTICS_PREFIX = PREFIX + "/analytics"
 CAPABILITIES_PATH = ANALYTICS_PREFIX + "/capabilities"
@@ -63,6 +64,9 @@ EVIDENCE_PATH = ANALYTICS_PREFIX + "/evidence/{evidence_id}"
 REVIEW_REQUESTS_PATH = ANALYTICS_PREFIX + "/reviews/requests"
 REVIEW_REQUEST_PATH = REVIEW_REQUESTS_PATH + "/{review_id}"
 REVIEW_DECISION_PATH = REVIEW_REQUEST_PATH + "/decisions"
+# «Связи с историаном» (план Д17, Task 1): состояние строк equipment_links + справочный поиск кандидатов тега
+LINKS_PATH = ANALYTICS_PREFIX + "/links"
+LINK_CANDIDATES_PATH = LINKS_PATH + "/{link_id}/candidates"
 
 ANALYTICS_NOT_READY_TEXT = "Аналитика КДМ-1 ещё не готова"
 ANALYTICS_BROKEN_PREFIX = "Аналитика КДМ-1 недоступна: "
@@ -207,6 +211,15 @@ def _review_json(r: "ReviewRequest") -> dict:
 
 def _reviews_json(items: list["ReviewRequest"]) -> dict:
     return {"requests": [_review_json(r) for r in items]}
+
+
+# --- «Связи с историаном» (links/*, план Д17, Task 1): формы — зеркало web/src/analytics.ts, не контракт схемой ---
+
+def _link_json(info: "EquipmentLinkInfo") -> dict:
+    return {"id": info.id, "display_label": info.display_label, "document_context": info.document_context,
+           "state": info.state, "historian_tag": info.historian_tag, "approved_by": info.approved_by,
+           "approved_at": None if info.approved_at is None else info.approved_at.isoformat(),
+           "pending_request_id": info.pending_request_id}
 
 
 def analytics_router(role: "GatewayRole") -> APIRouter:
@@ -437,6 +450,17 @@ def analytics_router(role: "GatewayRole") -> APIRouter:
             payload = _CreateReview.model_validate(body)
         except ValidationError:
             return gw_error(400, ERROR_NAMES[400], GW_MESSAGES["bad_body"])
+        # план Д17, Task 1: kind="equipment_link" — subject_id обязан быть id строки equipment_links ТЕКУЩЕГО
+        # корпуса, new_value — именем тега по data.sql.SAFE_NAME (иначе заявка несла бы мусорный тег или
+        # ссылку на несуществующую строку — это проверяется здесь, раньше reviews.create_request, который сам
+        # ни корпус, ни SAFE_NAME не знает)
+        if payload.kind == "equipment_link":
+            try:
+                valid = await svc.validate_equipment_link(payload.subject_id, payload.new_value)
+            except AnalyticsUnavailable as exc:
+                return _unavailable(str(exc))
+            if not valid:
+                return gw_error(400, ERROR_NAMES[400], GW_MESSAGES["bad_body"])
         try:
             created = await svc.create_review_request(
                 identity, payload.kind, payload.subject_id, payload.new_value, payload.scope, payload.rationale,
@@ -478,5 +502,46 @@ def analytics_router(role: "GatewayRole") -> APIRouter:
         except ValueError as exc:           # через эту ручку decision уже проверен _DecideReview — остаётся
             return gw_error(409, ERROR_NAMES[409], str(exc))   # только «заявка уже решена», конфликт состояния
         return JSONResponse(_review_json(decided))
+
+    # «Связи с историаном» (links/*, план Д17, Task 1) — состояние строк equipment_links и справочный поиск
+    # кандидатов тега; обе ручки нужен и корпус (_reference_broken), и согласование (_reviews_broken, для
+    # resolved_link/list_requests).
+    @router.get(LINKS_PATH, dependencies=guarded)
+    async def list_links(account: Account = Depends(account_of)) -> JSONResponse:
+        svc = _svc()
+        if svc is None:
+            return _not_ready()
+        identity = _identity_of(account)
+        if identity is None:
+            return gw_error(403, ERROR_NAMES[403], ROLE_TEXT)
+        broken = _reference_broken(svc) or _reviews_broken(svc)
+        if broken is not None:
+            return broken
+        try:
+            links = await svc.list_equipment_links(identity)
+        except ReviewStoreUnavailable:        # сбой самого SQLite хранилища согласования — 503, не 500
+            return _store_unavailable()
+        except AnalyticsUnavailable as exc:
+            return _unavailable(str(exc))
+        return JSONResponse({"links": [_link_json(info) for info in links]})
+
+    @router.get(LINK_CANDIDATES_PATH, dependencies=guarded)
+    async def link_candidates(link_id: str, account: Account = Depends(account_of)) -> JSONResponse:
+        svc = _svc()
+        if svc is None:
+            return _not_ready()
+        identity = _identity_of(account)
+        if identity is None:
+            return gw_error(403, ERROR_NAMES[403], ROLE_TEXT)
+        broken = _reference_broken(svc)
+        if broken is not None:
+            return broken
+        try:
+            result = await svc.link_candidates(identity, link_id)
+        except AnalyticsUnavailable as exc:
+            return _unavailable(str(exc))
+        if result is None:
+            return gw_error(404, ERROR_NAMES[404], GW_MESSAGES["not_found"])
+        return JSONResponse(result)
 
     return router

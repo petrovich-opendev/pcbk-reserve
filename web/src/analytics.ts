@@ -18,12 +18,15 @@ const JOB_STATES: readonly JobState[] =
 export const JOB_TERMINAL_STATES: ReadonlySet<JobState> =
   new Set(["completed", "needs_clarification", "limited_answer", "cancelled", "failed"]);
 
+// telemetry_observation — Д17 (план PLAN-D17-telemetry-lessons-2026-10-14, Task 1 «Produces»): секция данных
+// историана по согласованной связи оборудования; как остальные серверные секции — evidence_refs=[], claim_id=
+// null, rendered_by="server" (источник значения — служба данных через data_bridge.py, не корпус)
 export type SectionKind =
   | "document_observation" | "public_definition" | "calculation" | "qualified_hypothesis" | "limitation"
-  | "clarification";
+  | "clarification" | "telemetry_observation";
 const SECTION_KINDS: readonly SectionKind[] =
   ["document_observation", "public_definition", "calculation", "qualified_hypothesis", "limitation",
-   "clarification"];
+   "clarification", "telemetry_observation"];
 
 export type ErrorCode =
   | "unavailable" | "invalid_input" | "policy_refused" | "source_conflict" | "validation_failed" | "interrupted"
@@ -427,4 +430,94 @@ export function parseReviewList(body: unknown): ReviewRequestItem[] | null {
 // ответ POST reviews/requests и POST reviews/requests/{id}/decisions — одна заявка целиком
 export function parseReviewRequestItemResponse(body: unknown): ReviewRequestItem | null {
   return parseReviewRequestItem(body);
+}
+
+// --- связи оборудования с историаном (план Д17, Task 2; мастер-промпт §8): подпись оборудования из документов
+// КДМ-1 ↔ тег историана. Связь предлагает любой вошедший (раздел «Связи с историаном», AnalyticsLinks.tsx),
+// согласует — тот, у кого право согласования, обычной заявкой kind="equipment_link" (выше). Имя тега для чтения
+// значения — только ResolvedLink.historian_tag принятой заявки; сама подпись чтение не включает (Task 1 плана,
+// «Produces»: GET analytics/links и GET analytics/links/{id}/candidates — форма оттуда дословно).
+
+export type LinkState = "unbound" | "pending" | "linked";
+const LINK_STATES: readonly LinkState[] = ["unbound", "pending", "linked"];
+
+export interface EquipmentLink {
+  id: string;
+  displayLabel: string;
+  documentContext: string;
+  state: LinkState;
+  historianTag: string | null;
+  approvedBy: string | null;
+  approvedAt: string | null;
+  pendingRequestId: string | null;
+}
+
+function parseEquipmentLink(v: unknown): EquipmentLink | null {
+  if (!isObject(v) || !hasExactKeys(v, ["id", "display_label", "document_context", "state", "historian_tag",
+                                        "approved_by", "approved_at", "pending_request_id"])) {
+    return null;
+  }
+  const { id, display_label: displayLabel, document_context: documentContext, state,
+         historian_tag: historianTag, approved_by: approvedBy, approved_at: approvedAt,
+         pending_request_id: pendingRequestId } = v;
+  if (!isText(id) || !isText(displayLabel) || typeof documentContext !== "string") return null;
+  if (typeof state !== "string" || !LINK_STATES.includes(state as LinkState)) return null;
+  if (!isNullableText(historianTag) || !isNullableText(approvedBy) || !isNullableText(approvedAt)
+      || !isNullableText(pendingRequestId)) {
+    return null;
+  }
+  return {
+    id, displayLabel, documentContext, state: state as LinkState, historianTag, approvedBy, approvedAt,
+    pendingRequestId,
+  };
+}
+
+// ответ GET analytics/links: {"links": [...]} — порядок как отдаёт сервер (по id корпуса); пустой список — не
+// отказ (приём parseConversationList)
+export function parseEquipmentLinkList(body: unknown): EquipmentLink[] | null {
+  if (!isObject(body) || !hasExactKeys(body, ["links"]) || !Array.isArray(body.links)) return null;
+  const items: EquipmentLink[] = [];
+  for (const raw of body.links) {
+    const item = parseEquipmentLink(raw);
+    if (item === null) return null;
+    items.push(item);
+  }
+  return items;
+}
+
+export interface LinkCandidate {
+  tag: string;
+  description: string;
+  unit: string | null;
+}
+
+function parseLinkCandidate(v: unknown): LinkCandidate | null {
+  if (!isObject(v) || !hasExactKeys(v, ["tag", "description", "unit"])) return null;
+  const { tag, description, unit } = v;
+  if (!isText(tag) || typeof description !== "string" || !isNullableText(unit)) return null;
+  return { tag, description, unit };
+}
+
+// ответ GET analytics/links/{id}/candidates: status/message — из ответа DataService как есть (message есть
+// только у отказа), candidates — один catalog_search по подписи (может быть пуст)
+export interface LinkCandidates {
+  status: string;
+  message: string | null;
+  candidates: LinkCandidate[];
+}
+
+export function parseLinkCandidates(body: unknown): LinkCandidates | null {
+  if (!isObject(body) || !hasExactKeys(body, ["status", "message", "candidates"])
+      || !Array.isArray(body.candidates)) {
+    return null;
+  }
+  const { status, message } = body;
+  if (!isText(status) || !isNullableText(message)) return null;
+  const candidates: LinkCandidate[] = [];
+  for (const raw of body.candidates) {
+    const c = parseLinkCandidate(raw);
+    if (c === null) return null;
+    candidates.push(c);
+  }
+  return { status, message, candidates };
 }

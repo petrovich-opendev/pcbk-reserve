@@ -168,6 +168,81 @@ async def _wait_terminal(svc: AnalyticsService, identity: RequestIdentity, reque
         await asyncio.sleep(0.01)
 
 
+# --- телеметрия БДРВ в ответе (план Д17, Task 1): двойник DataService свой (фиксирует вызовы, отдаёт заданные
+# ответы) — не настоящий DataService/FakeHistorian (helpers.make_service), которые проверяет отдельно
+# test_analytics_data_bridge.py; здесь проверяется только то, как service.py использует результат ---
+
+class _FakeCalcRole:
+    def __init__(self, config_error: str | None = None):
+        self.config_error = config_error
+
+
+class _FakeCalc:
+    """Двойник `DataService` для тестов телеметрии: фиксирует вызовы `self.calls`, отдаёт заранее заданные
+    ответы `tag_now`/`tag_period`/`catalog_search` (не считает ничего сам)."""
+
+    def __init__(self, *, now_reply: dict | None = None, period_reply: dict | None = None,
+                config_error: str | None = None):
+        self.role = _FakeCalcRole(config_error)
+        self.calls: list[tuple] = []
+        self._now_reply = now_reply
+        self._period_reply = period_reply
+
+    async def tag_now(self, caller, channel, tags):
+        self.calls.append(("tag_now", caller, channel, tuple(tags)))
+        return self._now_reply
+
+    async def tag_period(self, caller, channel, tags, period, start, end):
+        self.calls.append(("tag_period", caller, channel, tuple(tags), period, start, end))
+        return self._period_reply
+
+    async def catalog_search(self, caller, channel, query, limit=10):
+        self.calls.append(("catalog_search", caller, channel, query, limit))
+        return {"status": "ok", "matches": []}
+
+
+def _now_reply(*, value: float = 12.5, unit: str = "л/час", tag: str = "20FAKE_001_PV", status: str = "ok",
+              quality: str = "good", time_iso: str = "2026-10-14T08:00:00+00:00", tz: str = "Europe/Moscow",
+              item_notes: tuple = (), text: str = "нет значения", state_label: str | None = None) -> dict:
+    """Ответ `DataService.tag_now` ровно формы `core/pcbk_core/data/service.py::_tag_now`/`_now_item`."""
+    item: dict = {"tag": tag, "status": status, "description": "расход", "unit": unit, "kind": "analog",
+                 "value": value if status == "ok" else None, "time": time_iso, "age_s": 5,
+                 "quality": quality if status == "ok" else None, "item_notes": list(item_notes)}
+    if status != "ok":
+        item["text"] = text
+    if state_label is not None:
+        item["state_label"] = state_label
+    return {"tool": "tag_now", "status": "ok" if status == "ok" else "partial", "notes": [], "cache": "none",
+           "asof": time_iso, "tz": tz, "source": "live", "items": [item]}
+
+
+def _period_reply(*, avg: float = 12.4, low: float = 10.1, high: float = 15.0, percent_good: float = 99.5,
+                  unit: str = "л/час", tag: str = "20FAKE_001_PV", preset: str | None = "prev_shift",
+                  start: str = "2026-10-14T00:00:00+00:00", end: str = "2026-10-14T08:00:00+00:00",
+                  tz: str = "Europe/Moscow", notes: tuple = ()) -> dict:
+    """Ответ `DataService.tag_period` ровно формы `_tag_period`/`_period_item`."""
+    item = {"tag": tag, "status": "ok", "description": "расход", "unit": unit, "avg": avg, "min": low,
+           "max": high, "range": high - low, "std": 0.3, "percent_good": percent_good}
+    return {"tool": "tag_period", "status": "ok", "notes": list(notes), "cache": "none",
+           "period": {"start": start, "end": end, "tz": tz, "preset": preset, "shift_grid_assumed": False,
+                      "clamped": False, "open": False},
+           "source": "summary", "avg_kind": {"code": "time_weighted", "text": "по времени"},
+           "std_kind": {"code": "time_weighted", "text": "по времени"}, "cost_tag_days": 0.1, "items": [item]}
+
+
+def _approve_equipment_link(svc: AnalyticsService, *, link_id: str, tag: str, scope: str = "PROC-FAKE-001",
+                            author: RequestIdentity = STUDENT_A, decider: RequestIdentity | None = None,
+                            reviewers: str = "all_students"):
+    """Заявка `kind="equipment_link"` на `link_id` → сразу согласована: в режиме `all_students` любой студент
+    (по умолчанию `STUDENT_B`) решает без назначения полномочия; в `"grants"` вызывающий передаёт `decider` с
+    уже назначенным полномочием (`svc.reviews.bootstrap_authority`/`grant_authority` до вызова этой функции).
+    Простой синхронный помощник теста — те же методы `reviews.ReviewStore`, что использует `service.py`."""
+    pending = svc.reviews.create_request("equipment_link", link_id, tag, scope, "видел подпись на снимке",
+                                         created_by=author)
+    decider = decider or (STUDENT_B if author is not STUDENT_B else STUDENT_A)
+    return svc.reviews.decide(pending.id, "accepted", "", decided_by=decider, reviewers_mode=reviewers)
+
+
 # --- базовые open()/capabilities() ---
 
 async def test_open_opens_corpus_and_state(tmp_path):
@@ -1172,12 +1247,18 @@ async def test_calculation_external_benchmark_comparison_refused(tmp_path):
     await svc.aclose()
 
 
-# --- п.2: честные capabilities связи с данными — ВСЕГДА False (решение контроллера) ---
+# --- план Д17, Task 1: capabilities.data_bridge_available следует за calc, не ВСЕГДА False ---
 
-async def test_capabilities_data_bridge_always_false(tmp_path):
+async def test_capabilities_data_bridge_available_follows_calc(tmp_path):
+    """`data_bridge_available = self.calc is not None` И у его роли нет `config_error` (план Д17, Task 1) —
+    снимает прежнее решение контроллера Д16 «ВСЕГДА False» (тогда контракт ответа ещё не нёс
+    `telemetry_observation`)."""
     svc = await _service(tmp_path)
-    svc.calc = object()                                        # двойник DataService — не None
-    assert svc.capabilities(STUDENT_A).data_bridge_available is False
+    assert svc.capabilities(STUDENT_A).data_bridge_available is False     # calc не подключён вовсе
+    svc.calc = _FakeCalc()
+    assert svc.capabilities(STUDENT_A).data_bridge_available is True      # подключён, у роли нет config_error
+    svc.calc.role.config_error = "нет связи с историаном"
+    assert svc.capabilities(STUDENT_A).data_bridge_available is False     # подключён, но роль неисправна
     await svc.aclose()
 
 
@@ -1742,4 +1823,260 @@ async def test_control_intent_never_reaches_llm_regardless_of_export_policy(tmp_
     assert calls == []                                # модель не вызывалась вовсе
     assert response.state == "limited_answer"
     assert response.error_code == "policy_refused"
+    await svc.aclose()
+
+
+# --- план Д17, Task 1: телеметрия БДРВ в ответе (мастер-промпт §7 п.7, §8) ---
+
+async def test_telemetry_unresolved_label_reads_nothing_and_explains(tmp_path, monkeypatch):
+    """Review Focus №1: подпись без согласованной связи — ни одного вызова `tag_now`, ограничение с подписью и
+    словами «связь»/«не согласована»."""
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    svc.calc = _FakeCalc(now_reply=_now_reply())              # служба данных подключена — связи всё равно нет
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что покажет 20FAKE_001_PV в машинном зале?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert svc.calc.calls == []
+    limitation = [s for s in response.sections if s.kind == "limitation"]
+    assert len(limitation) == 1
+    assert "20FAKE_001_PV" in limitation[0].text
+    assert "связь" in limitation[0].text and "не согласована" in limitation[0].text
+    await svc.aclose()
+
+
+async def test_telemetry_resolved_label_shows_value_unit_time_quality(tmp_path, monkeypatch):
+    """Принятая студентом заявка `equipment_link` (режим `all_students`) → `tag_now` вызван ровно с
+    `[historian_tag]`, секция `telemetry_observation` содержит подпись, тег, значение, единицу и время из
+    ответа двойника, с подписью «время историана»; в запрос к двойнику LLM ни тег, ни значение не попадают
+    (телеметрия строится ПОСЛЕ выбора модели, вне пакета доказательств `llm_adapter.build_raw_body` видит)."""
+    card = _card("CLAIM-FAKE-001")
+    captured: list[dict] = []
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", allowed_claim_ids=(card.id,), corpus_version=corpus_version), (card,)
+
+    class FakeLlm:
+        config_error = None
+        stopped = False
+        upstream = object()
+
+    def fake_build_raw_body(analysis, pack, *, schema, question=""):
+        body = {"question": question, "cards": [c.id for c in pack]}
+        captured.append(body)
+        return body
+
+    async def fake_request_selection(role, identity, session, raw_body, *, analytics_models, teacher_payer=""):
+        return LlmSelection(reference_claim_ids=[card.id], mechanism_ids=[], clarification_keys=[],
+                           calculation_ids=[])
+
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.llm_adapter, "select_model", lambda role, models: object())
+    monkeypatch.setattr(service_mod.llm_adapter, "build_raw_body", fake_build_raw_body)
+    monkeypatch.setattr(service_mod.llm_adapter, "request_selection", fake_request_selection)
+    monkeypatch.setattr(service_mod.rendering, "render_claim_section", lambda c: _section(c.text, claim_id=c.id))
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    # связь ведёт на ДРУГОЙ тег, чем подпись в вопросе (как в жизни: display_label — подпись документа/PNG,
+    # historian_tag — отдельное решение согласования, мастер-промпт §7, этап 7) — иначе проверить «тег/значение
+    # не попали в LLM» нечем: подпись студент и так печатает в своём же вопросе, который видит модель
+    svc = await _service(tmp_path, reviewers="all_students")
+    svc.llm = FakeLlm()
+    svc.calc = _FakeCalc(now_reply=_now_reply(tag="20FAKE_777_HIST", value=12.5, unit="л/час"))
+    _approve_equipment_link(svc, link_id="EQ-FAKE-001", tag="20FAKE_777_HIST")
+
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что покажет 20FAKE_001_PV в машинном зале?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert svc.calc.calls == [("tag_now", "student-03", "web", ("20FAKE_777_HIST",))]
+    telemetry = [s for s in response.sections if s.kind == "telemetry_observation"]
+    assert len(telemetry) == 1
+    text = telemetry[0].text
+    assert "20FAKE_001_PV" in text and "20FAKE_777_HIST" in text
+    assert "12,5" in text and "л/час" in text and "время историана" in text
+    assert response.state == "completed"
+    assert captured and "20FAKE_777_HIST" not in str(captured[0]) and "12,5" not in str(captured[0])
+    await svc.aclose()
+
+
+async def test_telemetry_with_context_period_uses_tag_period(tmp_path, monkeypatch):
+    """`request.context.period` задан → `tag_period` с этими границами, в секции среднее/мин/макс и доля
+    хороших точек из ответа двойника, без пересчёта."""
+    from datetime import datetime, timezone
+
+    from pcbk_core.analytics.models import AnalysisRequest, PeriodWindow, RequestContext
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path, reviewers="all_students")
+    svc.calc = _FakeCalc(period_reply=_period_reply())
+    _approve_equipment_link(svc, link_id="EQ-FAKE-001", tag="20FAKE_001_PV")
+
+    period = PeriodWindow(start=datetime(2026, 10, 14, 0, 0, tzinfo=timezone.utc),
+                          end=datetime(2026, 10, 14, 8, 0, tzinfo=timezone.utc))
+    request = AnalysisRequest(client_request_id="cr-1", question="Какой средний расход по 20FAKE_001_PV?",
+                              mode="reference", context=RequestContext(period=period))
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await svc.submit_question(STUDENT_A, conv, request)
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert len(svc.calc.calls) == 1 and svc.calc.calls[0][0] == "tag_period"
+    assert svc.calc.calls[0][4:] == (None, period.start.isoformat(), period.end.isoformat())
+    telemetry = [s for s in response.sections if s.kind == "telemetry_observation"]
+    assert len(telemetry) == 1
+    text = telemetry[0].text
+    assert "12,4" in text and "10,1" in text and "15" in text and "99,5" in text
+    await svc.aclose()
+
+
+async def test_telemetry_mode_switch_to_grants_stops_reading(tmp_path, monkeypatch):
+    """Review Focus №2: та же заявка, затем `ANALYTICS_REVIEWERS=grants` → чтения нет, ограничение."""
+    from dataclasses import replace
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path, reviewers="all_students")
+    svc.calc = _FakeCalc(now_reply=_now_reply())
+    _approve_equipment_link(svc, link_id="EQ-FAKE-001", tag="20FAKE_001_PV")
+
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что показывает 20FAKE_001_PV?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+    assert any(s.kind == "telemetry_observation" for s in response.sections)
+    assert len(svc.calc.calls) == 1
+
+    svc.settings = replace(svc.settings, ANALYTICS_REVIEWERS="grants")
+    conv2 = await svc.create_conversation(STUDENT_A, "reference")
+    request_id2 = await _ask(svc, STUDENT_A, conv2, question="Что показывает 20FAKE_001_PV?",
+                             client_request_id="cr-2")
+    response2 = await _wait_terminal(svc, STUDENT_A, request_id2)
+    assert len(svc.calc.calls) == 1                           # второй вопрос не прочитал значение заново
+    limitation = [s for s in response2.sections if s.kind == "limitation"]
+    assert any("не согласована" in s.text for s in limitation)
+    await svc.aclose()
+
+
+async def test_telemetry_not_read_on_clarification_control_refused(tmp_path, monkeypatch):
+    """Review Focus №3 (мастер-промпт §7 п.4: «уточнение до оплачиваемого вызова и чтения данных») —
+    уточняющий вопрос, команда и отказ преданализа не читают телеметрию вовсе, даже когда в вопросе есть
+    подпись с согласованной связью."""
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+    svc = await _service(tmp_path, reviewers="all_students")
+    svc.calc = _FakeCalc(now_reply=_now_reply())
+    _approve_equipment_link(svc, link_id="EQ-FAKE-001", tag="20FAKE_001_PV")
+    question = "Что покажет 20FAKE_001_PV?"
+
+    scenarios = (
+        ("needs_clarification", "lookup", ("quantity",)),
+        ("limited_answer", "control", ()),
+        ("refused", "out_of_scope", ()),
+    )
+    for decision, intent, missing in scenarios:
+        def fake_analyze(identity, request, handle, corpus_version, decision=decision, intent=intent,
+                        missing=missing):
+            return (_preanalysis(decision, corpus_version=corpus_version, intent=intent, missing_fields=missing),
+                   ())
+        monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+        conv = await svc.create_conversation(STUDENT_A, "reference")
+        request_id = await _ask(svc, STUDENT_A, conv, question=question, client_request_id=f"cr-{decision}")
+        await _wait_terminal(svc, STUDENT_A, request_id)
+    assert svc.calc.calls == []
+    await svc.aclose()
+
+
+async def test_telemetry_refusal_text_passed_through(tmp_path, monkeypatch):
+    """Review Focus №4: `DataService` отказал — ограничение содержит текст отказа как есть, карточки справки
+    остаются."""
+    card = _card("CLAIM-FAKE-001")
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", allowed_claim_ids=(card.id,), corpus_version=corpus_version), (card,)
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_claim_section", lambda c: _section(c.text, claim_id=c.id))
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path, reviewers="all_students")
+    svc.calc = _FakeCalc(now_reply={"tool": "tag_now", "status": "refused",
+                                    "message": "ворота закрыты (учения)", "notes": [], "cache": "none"})
+    _approve_equipment_link(svc, link_id="EQ-FAKE-001", tag="20FAKE_001_PV")
+
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что показывает 20FAKE_001_PV?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    limitation = [s for s in response.sections if s.kind == "limitation" and "20FAKE_001_PV" in s.text]
+    assert len(limitation) == 1 and "ворота закрыты (учения)" in limitation[0].text
+    assert any(s.claim_id == card.id for s in response.sections)      # карточки справки остаются
+    await svc.aclose()
+
+
+async def test_telemetry_review_store_failure_gives_unavailable_limitation_not_crash(tmp_path, monkeypatch):
+    """Ревью, раунд 1, Important 2: `reviews.resolved_link` бросает `ReviewStoreError` (сбой самого хранилища
+    согласований, не правило) — задание завершается, не падает `failed`; по этой подписи — ограничение
+    «служба данных недоступна», двойник `DataService` не вызван вовсе (решение о чтении не принято — читать
+    нечего), карточки справки остаются."""
+    from pcbk_core.analytics.reviews import ReviewStoreError
+
+    card = _card("CLAIM-FAKE-001")
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", allowed_claim_ids=(card.id,), corpus_version=corpus_version), (card,)
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_claim_section", lambda c: _section(c.text, claim_id=c.id))
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    svc.calc = _FakeCalc(now_reply=_now_reply())
+
+    def boom(link_id, *, reviewers_mode="grants"):
+        raise ReviewStoreError("аналитика КДМ-1 (согласование): сбой хранилища (двойник)")
+    monkeypatch.setattr(svc.reviews, "resolved_link", boom)
+
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что показывает 20FAKE_001_PV?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.state != "failed"
+    assert svc.calc.calls == []                                      # решение о чтении не принято — не читал
+    limitation = [s for s in response.sections if s.kind == "limitation" and "20FAKE_001_PV" in s.text]
+    assert len(limitation) == 1 and "недоступна" in limitation[0].text
+    assert any(s.claim_id == card.id for s in response.sections)      # карточки справки остаются
+    await svc.aclose()
+
+
+async def test_telemetry_at_most_three_labels(tmp_path, monkeypatch):
+    """4 подписи со связями → 3 чтения + ограничение «показаны первые 3 … из 4»."""
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", corpus_version=corpus_version), ()
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path, reviewers="all_students")
+    svc.calc = _FakeCalc(now_reply=_now_reply())
+    tags = ["20FAKE_001_PV", "20FAKE_002_PV", "20FAKE_003_PV", "20FAKE_004_PV"]
+    for i, tag in enumerate(tags, start=1):
+        _approve_equipment_link(svc, link_id=f"EQ-FAKE-{i:03d}", tag=tag)
+
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    question = "Сравни показания " + ", ".join(tags)
+    request_id = await _ask(svc, STUDENT_A, conv, question=question)
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert len(svc.calc.calls) == 3
+    telemetry = [s for s in response.sections if s.kind == "telemetry_observation"]
+    assert len(telemetry) == 3
+    truncated = [s for s in response.sections if s.kind == "limitation" and "Показаны первые" in s.text]
+    assert len(truncated) == 1 and "4" in truncated[0].text
     await svc.aclose()

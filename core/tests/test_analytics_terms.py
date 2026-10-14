@@ -14,7 +14,8 @@ import pytest
 
 from fixtures.kdm1_corpus import build_corpus
 from pcbk_core.analytics.knowledge import close, open_corpus
-from pcbk_core.analytics.terms import exact_tag_candidates, known_ambiguous_words, normalize_ru, resolve_term
+from pcbk_core.analytics.terms import (exact_tag_candidates, known_ambiguous_words, normalize_ru, resolve_term,
+                                       resolve_term_exact_phrase)
 
 KDM1_PACKAGE_DIR = os.environ.get("KDM1_PACKAGE_DIR", "")
 real_corpus = pytest.mark.skipif(not KDM1_PACKAGE_DIR, reason="нужен KDM1_PACKAGE_DIR — пакет заказчика вне репозитория")
@@ -170,6 +171,115 @@ def test_resolve_term_cov_vs_statistical_cv_stay_distinct(tmp_path):
         shared = resolve_term(handle, "коэффициент")
         assert set(shared.candidate_ids) == {"COV-SCREEN", "CV-STAT"}
         assert shared.requires_confirmation is True
+    finally:
+        close(handle)
+
+
+# --- resolve_term_exact_phrase: фраза термина (Task 3, раунд 1, Д17) — тот же класс дефекта, что фраза узла,
+# но равенство множества основ, не подмножество (отличает термин от более длинного термина, содержащего ту же
+# пару слов как часть своего названия — на настоящем корпусе: «Машинное направление» / «Кратковременная
+# изменчивость в машинном направлении»; здесь — синтетические имена по тому же образцу) ---
+
+def test_resolve_term_exact_phrase_single_word_returns_none(handle):
+    """Меньше двух слов — не фраза; функция отдаёт `None`, слово разрешает обычный пословный `resolve_term`."""
+    assert resolve_term_exact_phrase(handle, ["термин"]) is None
+    assert resolve_term_exact_phrase(handle, []) is None
+
+
+def test_resolve_term_exact_phrase_no_match_returns_none(handle):
+    assert resolve_term_exact_phrase(handle, ["совершенно", "неизвестная", "фраза"]) is None
+
+
+def test_resolve_term_exact_phrase_short_vs_long_term_disambiguates(tmp_path):
+    """Синтетика по образцу md/st-md настоящего корпуса: короткий термин «Опорная линия» и более длинный
+    «Опорная линия базового контура выравнивания», содержащий ТУ ЖЕ пару слов как часть названия. Фраза,
+    РАВНАЯ короткому названию (в другом падеже — как «машинном бассейне» у фразы узла), выбирает ТОЛЬКО
+    короткий; фраза, равная полному длинному названию, выбирает ТОЛЬКО длинный — равенство множества основ, не
+    подмножество (которое совпало бы с обоими, воспроизводя дефект)."""
+    path = build_corpus(tmp_path / "fake.seed.sqlite3")
+    _insert_term(path, "SHORT", "Опорная линия", [], ambiguous=False)
+    _insert_term(path, "LONG", "Опорная линия базового контура выравнивания", [], ambiguous=False)
+    handle = open_corpus(str(path))
+    try:
+        short = resolve_term_exact_phrase(handle, ["опорную", "линию"])
+        assert short is not None
+        assert short.candidate_ids == ["SHORT"]
+        assert short.selected_id == "SHORT"
+        assert short.requires_confirmation is False
+
+        long_ = resolve_term_exact_phrase(handle, ["опорная", "линия", "базового", "контура", "выравнивания"])
+        assert long_ is not None
+        assert long_.candidate_ids == ["LONG"]
+        assert long_.selected_id == "LONG"
+        assert long_.requires_confirmation is False
+
+        # подмножество названия длинного термина (не целиком) — равенством не совпадает ни с одним
+        assert resolve_term_exact_phrase(handle, ["базового", "контура"]) is None
+    finally:
+        close(handle)
+
+
+def test_resolve_term_exact_phrase_ambiguous_term_still_requires_confirmation(tmp_path):
+    """Термин, точно совпавший ФРАЗОЙ, но помеченный `ambiguous` в корпусе, — уточнение сохраняется, как у
+    пословного `resolve_term` (равенство множества основ не отменяет флаг корпуса)."""
+    path = build_corpus(tmp_path / "fake.seed.sqlite3")
+    _insert_term(path, "AMBIG-PHRASE", "Теневая зона", [], ambiguous=True)
+    handle = open_corpus(str(path))
+    try:
+        result = resolve_term_exact_phrase(handle, ["теневую", "зону"])
+        assert result is not None
+        assert result.candidate_ids == ["AMBIG-PHRASE"]
+        assert result.selected_id is None
+        assert result.requires_confirmation is True
+    finally:
+        close(handle)
+
+
+def test_resolve_term_exact_phrase_two_terms_same_name_both_candidates(tmp_path):
+    """Два термина с одинаковым (по основам) названием — оба кандидата, уточнение, как и у `resolve_term`."""
+    path = build_corpus(tmp_path / "fake.seed.sqlite3")
+    _insert_term(path, "DUP-A", "Общая фраза варианта", [], ambiguous=False)
+    _insert_term(path, "DUP-B", "Общая фраза варианта", [], ambiguous=False)
+    handle = open_corpus(str(path))
+    try:
+        result = resolve_term_exact_phrase(handle, ["общая", "фраза", "варианта"])
+        assert result is not None
+        assert set(result.candidate_ids) == {"DUP-A", "DUP-B"}
+        assert result.selected_id is None
+        assert result.requires_confirmation is True
+    finally:
+        close(handle)
+
+
+def test_resolve_term_exact_phrase_matches_via_alias_too(tmp_path):
+    """Равенство проверяется по ЛЮБОЙ форме термина (`preferred_ru` ИЛИ alias), как у `_candidate_forms`."""
+    path = build_corpus(tmp_path / "fake.seed.sqlite3")
+    _insert_term(path, "ALIAS-PHRASE", "Основное название термина", ["короткий псевдоним фразы"],
+                ambiguous=False)
+    handle = open_corpus(str(path))
+    try:
+        result = resolve_term_exact_phrase(handle, ["короткий", "псевдоним", "фразы"])
+        assert result is not None
+        assert result.candidate_ids == ["ALIAS-PHRASE"]
+        assert result.selected_id == "ALIAS-PHRASE"
+    finally:
+        close(handle)
+
+
+@real_corpus
+def test_real_corpus_term_phrase_disambiguates_machine_direction():
+    """Буквальный пример корня дефекта раунда 1 на настоящем корпусе: «машинное направление» (`md`) и
+    «кратковременная изменчивость в машинном направлении» (`st-md`) — равенство выбирает каждый по своей
+    фразе."""
+    handle = open_corpus(str(Path(KDM1_PACKAGE_DIR) / "knowledge" / "kdm1.seed.sqlite3"))
+    try:
+        short = resolve_term_exact_phrase(handle, ["машинное", "направление"])
+        assert short is not None
+        assert short.selected_id == "md"
+        long_ = resolve_term_exact_phrase(
+            handle, ["кратковременная", "изменчивость", "в", "машинном", "направлении"])
+        assert long_ is not None
+        assert long_.selected_id == "st-md"
     finally:
         close(handle)
 

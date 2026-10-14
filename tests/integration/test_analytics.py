@@ -44,9 +44,12 @@ REQUEST_CANCEL_PATH = ANALYTICS_PATH + "/requests/{id}/cancel"
 EVIDENCE_PATH = ANALYTICS_PATH + "/evidence/{id}"
 REVIEW_REQUESTS_PATH = f"{ANALYTICS_PATH}/reviews/requests"
 REVIEW_DECISION_PATH = ANALYTICS_PATH + "/reviews/requests/{id}/decisions"
+LINKS_PATH = f"{ANALYTICS_PATH}/links"
+LINK_CANDIDATES_PATH = ANALYTICS_PATH + "/links/{id}/candidates"
 # девять путей зафиксированного набора (docs/kdm1/INTERFACES.md); .format(id=...) безвреден и у путей без {id}
 ALL_PATHS = (CAPABILITIES_PATH, CONVERSATIONS_PATH, CONVERSATION_PATH, QUESTIONS_PATH, REQUESTS_PATH,
-            REQUEST_CANCEL_PATH, EVIDENCE_PATH, REVIEW_REQUESTS_PATH, REVIEW_DECISION_PATH)
+            REQUEST_CANCEL_PATH, EVIDENCE_PATH, REVIEW_REQUESTS_PATH, REVIEW_DECISION_PATH, LINKS_PATH,
+            LINK_CANDIDATES_PATH)
 NOT_FOUND_CORE = {"name": "NotFound", "data": {"message": "Не найдено"}}       # catch_all_router core (заглавная)
 NOT_FOUND_EDGE = {"name": "NotFound", "data": {"message": "не найдено"}}      # точный JSON edge (строчная)
 
@@ -73,8 +76,9 @@ def test_core_binds_analytics_corpus_dir_read_only(stack, tmp_path):
 
 
 def test_analytics_disabled_by_default_404_and_old_routes_work(stack):
-    """I-06/I-08 («выключена»): test.env (как и старый .env) не задаёт ANALYTICS_* — все девять путей отвечают
-    404, будто пути вовсе нет (роутер не подключён core, не edge); вход и уроки продолжают работать."""
+    """I-06/I-08 («выключена»): test.env (как и старый .env) не задаёт ANALYTICS_* — все пути аналитики
+    (ALL_PATHS) отвечают 404, будто пути вовсе нет (роутер не подключён core, не edge); вход и уроки продолжают
+    работать."""
     gw = stack.gw_client()
     for path in ALL_PATHS:
         code, body, h = gw.call("GET", path.format(id="x1"))
@@ -198,6 +202,23 @@ def test_analytics_cross_user_conversation_hidden(analytics_enabled, analytics_u
     assert a.call("GET", CONVERSATION_PATH.format(id=conv_id))[0] == 200
 
 
+def test_analytics_links_through_edge(analytics_enabled, analytics_users):
+    """Д17: «Связи с историаном» через настоящий edge и сессию — список строк `equipment_links` синтетического
+    корпуса (без согласования все «unbound»), неизвестная связь — 404 на подбор тега, заявка на связь с чужим id
+    или с именем тега не по `SAFE_NAME` — 400 (до записи заявки)."""
+    a, _ = analytics_users
+    code, body, h = a.call("GET", LINKS_PATH)
+    assert code == 200 and h["content-type"] == "application/json"
+    assert body["links"] and {link["state"] for link in body["links"]} == {"unbound"}
+    assert all(link["id"].startswith("EQ-FAKE-") for link in body["links"])
+    assert a.call("GET", LINK_CANDIDATES_PATH.format(id="no-such-link"))[0] == 404
+    bad_subject = {"kind": "equipment_link", "subject_id": "no-such-link", "new_value": "20FAKE_001_PV",
+                   "scope": "КДМ-1", "rationale": "проверка"}
+    assert a.call("POST", REVIEW_REQUESTS_PATH, bad_subject)[0] == 400
+    bad_tag = dict(bad_subject, subject_id=body["links"][0]["id"], new_value="20FAKE_001_PV; DROP")
+    assert a.call("POST", REVIEW_REQUESTS_PATH, bad_tag)[0] == 400
+
+
 def test_analytics_broken_corpus_degrades_without_breaking_others_then_switch_off(
         analytics_enabled, analytics_users, tmp_path_factory):
     """I-08: каталог без `*.seed.sqlite3` — аналитика отвечает понятным отказом, вход/уроки живы. Последним шагом
@@ -218,3 +239,4 @@ def test_analytics_broken_corpus_degrades_without_breaking_others_then_switch_of
     stack.recreate("core", {})                         # выключатель: вернуть умолчание для прочих модулей
     off = a.call("GET", CAPABILITIES_PATH)
     assert off[0] == 404
+

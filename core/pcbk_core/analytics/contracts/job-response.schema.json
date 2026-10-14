@@ -53,7 +53,8 @@
               "calculation",
               "qualified_hypothesis",
               "limitation",
-              "clarification"
+              "clarification",
+              "telemetry_observation"
             ]
           },
           "text": {

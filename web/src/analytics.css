@@ -102,6 +102,23 @@ fieldset.an-row legend { width: 100%; margin: 0 0 .3rem; padding: 0; font-size: 
   border: 1px solid var(--border); border-radius: 6px; padding: .3rem .5rem; min-height: 3rem; }
 .an-review-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
 
+/* связи оборудования с историаном (AnalyticsLinks, план Д17 Task 2) — приём .an-reviews/.an-review выше */
+.an-links { display: flex; flex-direction: column; gap: .75rem; }
+.an-links-head { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.an-links-head h3 { margin: 0; font-size: 1.05rem; }
+.an-link-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .6rem; }
+.an-link { display: flex; flex-direction: column; gap: .4rem; padding: .6rem .8rem; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--field); }
+.an-link-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; font-weight: 600; }
+.an-link-state { font-weight: 400; color: var(--muted); }
+.an-link[data-state="linked"] .an-link-state { color: var(--ok); }
+.an-link[data-state="pending"] .an-link-state { color: var(--warn); }
+.an-link-context { margin: 0; font-size: .9em; color: var(--muted); }
+.an-link-picker { display: flex; flex-direction: column; gap: .5rem; padding-top: .4rem; border-top: 1px solid var(--border); }
+.an-link-candidates { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: .3rem; }
+.an-link-candidates legend { padding: 0; font-size: .85em; color: var(--muted); }
+.an-link-candidate { display: flex; align-items: baseline; gap: .4rem; font-size: .9em; }
+
 /* название вкладки «Аналитика КДМ-1» в шапке (Header.tsx): полное на обычном экране, короткое «Аналитика» на
    узком (мастер-промпт §6) — доступное имя кнопки остаётся полным всегда через aria-label, это только видимый
    текст. Брейкпоинт — как у .chat/.threads chat.css (48rem). */

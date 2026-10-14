@@ -126,10 +126,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import calculations, knowledge, llm_adapter, preanalysis, rendering, reviews, validator
+from . import calculations, data_bridge, knowledge, llm_adapter, preanalysis, rendering, reviews, terms, validator
 from .models import JOB_TERMINAL_STATES, CalculationResult, LlmSelection, Section, ValidationOutcome
 from .reviews import ReviewStore, ReviewStoreError
 from .store import AnalyticsStore
+from ..data.sql import SAFE_NAME
 
 if TYPE_CHECKING:
     from ..data.service import DataService
@@ -145,6 +146,9 @@ log = logging.getLogger("pcbk_core.analytics")
 # ограничение параллелизма заданий (план, Этап 4: «ограничение параллелизма»; масштаб 10 мест — запас в 4 разом
 # не даёт редкому наплыву вопросов упереться в сеть OpenRouter всеми сразу, прочие ждут в "queued")
 MAX_CONCURRENT_JOBS = 4
+# телеметрия БДРВ в ответе (план Д17, Task 1): не больше этого числа подписей-с-согласованной-связью читается
+# за один ответ — остальные отмечает render_telemetry_truncated_section, не падение и не тихое молчание
+MAX_TELEMETRY_LABELS = 3
 # составной evidence_id GET .../evidence/{id} — см. докстринг модуля
 EVIDENCE_SEP = ":"
 _CONTRACTS_DIR = Path(__file__).resolve().parent / "contracts"
@@ -221,7 +225,7 @@ class Capabilities:
 
     reference_available: bool          # справка без LLM (корпус/состояние открыты)
     llm_available: bool                # оплачиваемый разбор (role.llm не None, не stopped, есть плательщик)
-    data_bridge_available: bool        # ВСЕГДА False (решение контроллера, правка F1 п.2) — см. capabilities()
+    data_bridge_available: bool        # calc подключён и у его роли нет config_error (план Д17, Task 1) — см. capabilities()
     review_authority: bool             # у identity есть хоть одно действующее полномочие согласования
     corpus_version: str | None
 
@@ -291,6 +295,23 @@ class ConversationTurn:
 
     question: str
     response: "JobResponse"
+
+
+@dataclass(frozen=True)
+class EquipmentLinkInfo:
+    """Один элемент `GET .../analytics/links` (план Д17, Task 1) — состояние строки `equipment_links` текущего
+    корпуса по отношению к согласованной связи с историаном (`"unbound"`/`"pending"`/`"linked"`), не сама
+    запись корпуса (`historian_tag`/`process_id` корпуса остаются `null` — связь живёт в `reviews.py`, не
+    правит `kdm1.seed.sqlite3`, см. докстринг `reviews.ResolvedLink`)."""
+
+    id: str
+    display_label: str
+    document_context: str
+    state: str                            # "unbound" | "pending" | "linked"
+    historian_tag: str | None
+    approved_by: str | None
+    approved_at: datetime | None
+    pending_request_id: str | None
 
 
 class AnalyticsService:
@@ -475,13 +496,17 @@ class AnalyticsService:
                     review_authority = self.reviews.has_any_active_grant(identity.login)
                 except ReviewStoreError:
                     pass      # согласование деградировало между open() и этим вызовом — честные False, не падение
-        # data_bridge_available — решение контроллера (правка F1, п.2, 2026-10-14): вывод телеметрии
-        # (data_bridge.py) в ОТВЕТ аналитики — следующий этап после решения владельца по полномочиям и формату
-        # секции ответа (контракт `job-response.schema.json#SectionKind` сейчас не несёт вида секции для
-        # телеметрии вовсе). Поэтому ВСЕГДА False здесь, независимо от того, подключена ли `self.calc` и есть
-        # ли у `reviews.py` хоть одна согласованная связь оборудования (`has_any_resolved_link`) — честное
-        # "недоступно", а не обещание того, чего в контракте ответа ещё нет.
-        data_bridge_available = False
+        # data_bridge_available (план Д17, Task 1): телеметрия (data_bridge.py) теперь выводится в ОТВЕТ
+        # аналитики секцией telemetry_observation — контракт ответа её несёт, решение владельца по формату
+        # секции и по полномочиям (согласование связи — отдельное, Task 7) уже принято. Снимает решение
+        # контроллера правки F1, п.2 Д16 («ВСЕГДА False» — тогда контракт ответа ещё не нёс вид секции для
+        # телеметрии). Доступность зависит только от того, подключена ли служба данных и исправна ли её роль —
+        # НЕ от наличия хоть одной согласованной связи оборудования (`reviews.has_any_resolved_link` сюда не
+        # входит: конкретную подпись без связи справка покажет как ограничение, не как недоступность службы).
+        calc = self.calc
+        calc_role = getattr(calc, "role", None)
+        data_bridge_available = (calc is not None and calc_role is not None
+                                 and getattr(calc_role, "config_error", None) is None)
         return Capabilities(reference_available=reference_available, llm_available=llm_ok,
                             data_bridge_available=data_bridge_available, review_authority=review_authority,
                             corpus_version=None if self._handle is None else self._handle.version)
@@ -618,6 +643,94 @@ class AnalyticsService:
         `student` решает любую заявку без назначения, в одно действие; `teacher` остаётся исключением."""
         return await asyncio.to_thread(self.reviews.decide, review_id, decision, comment, decided_by=identity,
                                        reviewers_mode=self.settings.ANALYTICS_REVIEWERS)
+
+    # --- связи оборудования с историаном (план Д17, Task 1): раздел «Связи с историаном» вкладки ---
+
+    async def list_equipment_links(self, identity: "RequestIdentity") -> list["EquipmentLinkInfo"]:
+        """`GET .../analytics/links` — состояние каждой строки `equipment_links` текущего корпуса, в порядке
+        корпуса (по `id`). `linked` — есть `reviews.resolved_link`; `pending` — связи нет, но есть заявка
+        `kind="equipment_link"` этого `id` в статусе `pending`/`info_requested`, ВИДИМАЯ `identity` (та же
+        видимость, что `reviews.list_requests` даёт самому вызывающему — `reviews.py` не меняется этой задачей,
+        своего «публичного» листинга заявок мимо видимости у него нет); иначе `unbound`."""
+        handle = self._handle
+        if handle is None:
+            raise AnalyticsUnavailable(self.corpus_error or "аналитика не готова")
+
+        def _read() -> list[EquipmentLinkInfo]:
+            try:
+                ids = knowledge.all_ids(handle, "equipment_links")
+                rows = knowledge.get_rows(handle, "equipment_links", ids)
+            except knowledge.CorpusError as exc:
+                raise AnalyticsUnavailable(str(exc)) from exc
+            pending_by_subject: dict[str, str] = {}
+            for req in self.reviews.list_requests(identity, reviewers_mode=self.settings.ANALYTICS_REVIEWERS):
+                if (req.kind == "equipment_link" and req.status in ("pending", "info_requested")
+                        and req.subject_id not in pending_by_subject):
+                    pending_by_subject[req.subject_id] = req.id
+            result: list[EquipmentLinkInfo] = []
+            for id_ in ids:
+                row = rows.get(id_)
+                if row is None:
+                    continue
+                label, context = row.get("display_label") or "", row.get("document_context") or ""
+                link = self.reviews.resolved_link(id_, reviewers_mode=self.settings.ANALYTICS_REVIEWERS)
+                if link is not None:
+                    result.append(EquipmentLinkInfo(id=id_, display_label=label, document_context=context,
+                                                     state="linked", historian_tag=link.historian_tag,
+                                                     approved_by=link.approved_by, approved_at=link.approved_at,
+                                                     pending_request_id=None))
+                elif id_ in pending_by_subject:
+                    result.append(EquipmentLinkInfo(id=id_, display_label=label, document_context=context,
+                                                     state="pending", historian_tag=None, approved_by=None,
+                                                     approved_at=None, pending_request_id=pending_by_subject[id_]))
+                else:
+                    result.append(EquipmentLinkInfo(id=id_, display_label=label, document_context=context,
+                                                     state="unbound", historian_tag=None, approved_by=None,
+                                                     approved_at=None, pending_request_id=None))
+            return result
+        return await asyncio.to_thread(_read)
+
+    async def link_candidates(self, identity: "RequestIdentity", link_id: str) -> dict | None:
+        """`GET .../analytics/links/{id}/candidates` — один `data_bridge.catalog_search(display_label,
+        limit=10)` по подписи строки `equipment_links`: справочный поиск «что сейчас доступно», не
+        подтверждение связи (точное совпадение строки само по себе не включает чтение, мастер-промпт §7, этап
+        7). Неизвестный `link_id` — `None` (ручка отвечает 404). `self.calc is None` (служба данных не
+        подключена) — `AnalyticsUnavailable` (ручка отвечает тем же 503 `_unavailable`, что и прочие сбои
+        подсистемы)."""
+        handle = self._handle
+        if handle is None:
+            raise AnalyticsUnavailable(self.corpus_error or "аналитика не готова")
+        try:
+            row = await asyncio.to_thread(knowledge.get_row, handle, "equipment_links", link_id)
+        except knowledge.CorpusError as exc:
+            raise AnalyticsUnavailable(str(exc)) from exc
+        if row is None:
+            return None
+        if self.calc is None:
+            raise AnalyticsUnavailable("служба данных не подключена")
+        label = row.get("display_label") or ""
+        reply = await data_bridge.catalog_search(self.calc, identity, label, 10)
+        matches = reply.get("matches") or []
+        return {"status": reply.get("status"), "message": reply.get("message"),
+               "candidates": [{"tag": m.get("tag"), "description": m.get("description"), "unit": m.get("unit")}
+                              for m in matches]}
+
+    async def validate_equipment_link(self, subject_id: str, new_value: str) -> bool:
+        """`POST reviews/requests` с `kind="equipment_link"` (план Д17, Task 1): `subject_id` обязан быть `id`
+        строки `equipment_links` ТЕКУЩЕГО корпуса, `new_value` — именем тега по `data.sql.SAFE_NAME` — иначе
+        `False` (ручка отвечает 400): заявка на связь не должна нести ни мусорное имя тега, ни ссылку на
+        несуществующую строку корпуса. `AnalyticsUnavailable` — корпус не открыт (посчитать нечего, не тихий
+        `True`)."""
+        if SAFE_NAME.fullmatch(new_value) is None:
+            return False
+        handle = self._handle
+        if handle is None:
+            raise AnalyticsUnavailable(self.corpus_error or "аналитика не готова")
+        try:
+            row = await asyncio.to_thread(knowledge.get_row, handle, "equipment_links", subject_id)
+        except knowledge.CorpusError as exc:
+            raise AnalyticsUnavailable(str(exc)) from exc
+        return row is not None
 
     async def _approved_critical_card_ids(self, pack: tuple, scope: str) -> frozenset[str]:
         """Для каждой `critical_local_fact` карточки пакета — действующее согласование `reviews.
@@ -854,12 +967,17 @@ class AnalyticsService:
             # ставится раньше, если применима; сам error_code="busy" на outcome — структурный сигнал клиенту)
             pack_sections = [_limitation_section(_BUSY_LIMITATION_TEXT), *pack_sections]
 
+        # телеметрия БДРВ (план Д17, Task 1; мастер-промпт §7 п.7, §8): только здесь, после needs_clarification/
+        # refused/control (там чтения нет вовсе) и после выбора карточек — секции телеметрии идут ПЕРВЫМИ
+        # (после расчётной, если она есть, см. ниже)
+        telemetry_sections = await self._telemetry_sections(identity, request, handle)
+
         if analysis.intent == "calculation":
             # правка F1, п.1: число считает только сервер (calculations.py) — LLM здесь не участвует вовсе
-            # (ни в выборе формулы, ни в самом числе); секция расчёта/ограничения — ПЕРВАЯ в ответе, справочные
-            # карточки пакета — как обычно, следом
+            # (ни в выборе формулы, ни в самом числе); секция расчёта/ограничения — ПЕРВАЯ в ответе, телеметрия
+            # и справочные карточки пакета — следом, как обычно
             calc_section = self._calculation_section(request.question, analysis)
-            sections = [calc_section, *pack_sections]
+            sections = [calc_section, *telemetry_sections, *pack_sections]
             if calc_section.kind == "calculation":
                 state = "completed" if analysis.decision == "ready" else "limited_answer"
             else:
@@ -869,8 +987,10 @@ class AnalyticsService:
             stage = "проверка пройдена" if state == "completed" else "ограниченный ответ"
             return outcome, sections, state, stage
 
-        sections = pack_sections
+        sections = [*telemetry_sections, *pack_sections]
         if sections:
+            # ответ, где есть хотя бы одна telemetry_observation (даже без карточек пакета), — completed при
+            # decision=="ready", тем же правилом, что ответ с карточками (план Д17, Task 1)
             state = "limited_answer" if analysis.decision == "limited_answer" else "completed"
         else:
             # ничего не прошло повторную проверку в момент выдачи (или пакет и так был пуст) — безопасный
@@ -924,6 +1044,83 @@ class AnalyticsService:
         if conflict is not None:
             result = dataclasses.replace(result, value=None, missing_basis=(conflict,))
         return rendering.render_calculation_section(result)
+
+    async def _telemetry_sections(self, identity: "RequestIdentity", request: "AnalysisRequest",
+                                  handle: "CorpusHandle") -> list["Section"]:
+        """Телеметрия БДРВ в ответе (план Д17, Task 1; мастер-промпт §7 п.7, §8): подписи оборудования из
+        вопроса, у которых есть СОГЛАСОВАННАЯ связь (`reviews.resolved_link`), читаются через `data_bridge.py`
+        и идут первыми секциями ответа (после расчётной, если она есть) — единственный вызывающий,
+        `_build_outcome`, зовёт этот метод уже ПОСЛЕ ветвей `needs_clarification`/`refused`/`control` (там
+        чтения нет вовсе, план, Review Focus №1/№3) и после выбора карточек пакета.
+
+        Подпись без согласованной связи, неподключённая/неисправная служба данных, отказ `DataService` или сбой
+        самого хранилища согласований — секция `limitation` с объяснением для каждой такой подписи, не падение
+        задания (мастер-промпт §7, этап 7: «без них справка полностью работает»). До `MAX_TELEMETRY_LABELS`
+        подписей на ответ — остальные найденные только считаются, последней секцией идёт предупреждение,
+        сколько показано из скольки найдено (`rendering.render_telemetry_truncated_section`)."""
+        try:
+            labels = await asyncio.to_thread(terms.exact_tag_candidates, handle, request.question)
+        except knowledge.CorpusError:
+            return []
+        if not labels:
+            return []
+        try:
+            eq_ids = await asyncio.to_thread(knowledge.all_ids, handle, "equipment_links")
+            eq_rows = await asyncio.to_thread(knowledge.get_rows, handle, "equipment_links", eq_ids)
+        except knowledge.CorpusError:
+            return []
+        # оставить только подписи, которые есть в equipment_links (подпись узла из processes — не оборудование,
+        # план, Task 1: «оставь только те, что есть в equipment_links»); подпись → список id строк этой подписи
+        label_to_ids: dict[str, list[str]] = {}
+        for row_id, row in eq_rows.items():
+            label = row.get("display_label")
+            if label:
+                label_to_ids.setdefault(label, []).append(row_id)
+        matched = [label for label in labels if label in label_to_ids]
+        if not matched:
+            return []
+        shown_labels = matched[:MAX_TELEMETRY_LABELS]
+        period = request.context.period if request.context is not None else None
+        sections = [await self._telemetry_section_for_label(identity, label, label_to_ids[label], period)
+                   for label in shown_labels]
+        if len(matched) > MAX_TELEMETRY_LABELS:
+            sections.append(rendering.render_telemetry_truncated_section(len(shown_labels), len(matched)))
+        return sections
+
+    async def _telemetry_section_for_label(self, identity: "RequestIdentity", label: str, link_ids: list[str],
+                                            period) -> "Section":
+        """Одна подпись → одна секция: первая СОГЛАСОВАННАЯ связь среди строк `equipment_links` этой подписи
+        (`reviews.resolved_link`, перепроверяется «здесь и сейчас» с текущим `ANALYTICS_REVIEWERS` — Review
+        Focus №2: отзыв режима `all_students` сразу прекращает чтение по решениям студентов без назначения).
+        `period` — `request.context.period`, если задан (`AnalysisRequest.context.period`, `models.
+        PeriodWindow`) — тогда `data_bridge.tag_period`, иначе `data_bridge.tag_now`."""
+        try:
+            link = None
+            for link_id in link_ids:
+                candidate = await asyncio.to_thread(self.reviews.resolved_link, link_id,
+                                                    reviewers_mode=self.settings.ANALYTICS_REVIEWERS)
+                if candidate is not None:
+                    link = candidate
+                    break
+        except ReviewStoreError:
+            # сбой самого хранилища согласований — ограничение «служба недоступна», не падение задания (план,
+            # Task 1, раздел service._build_outcome)
+            return rendering.render_telemetry_unavailable_section(label)
+        if link is None:
+            return rendering.render_telemetry_unresolved_section(label)
+        if self.calc is None:
+            return rendering.render_telemetry_unavailable_section(label)
+        if period is not None:
+            reply = await data_bridge.tag_period(self.calc, identity, link, None, period.start.isoformat(),
+                                                 period.end.isoformat())
+        else:
+            reply = await data_bridge.tag_now(self.calc, identity, link)
+        if not reply.get("items"):
+            # полный отказ службы данных (ворота/бюджет/сбой настройки) — текст отказа как есть, не прячется
+            # (мастер-промпт: «отказ DataService показывается как есть»)
+            return rendering.render_telemetry_refusal_section(label, reply.get("message") or "")
+        render = rendering.render_telemetry_period_section if period is not None else rendering.render_telemetry_section
+        return render(label, link, reply)
 
     async def _select_with_llm(self, identity: "RequestIdentity", conversation_id: str, analysis, pack,
                                approved_card_ids: frozenset[str] = frozenset(), *, question: str = ""

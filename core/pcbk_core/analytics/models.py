@@ -43,7 +43,7 @@ CalculationId = Literal["dry_solid_flow", "geometric_output", "dry_grammage", "i
 JobState = Literal["queued", "preanalysis", "retrieving", "generating", "validating", "completed",
                    "needs_clarification", "limited_answer", "cancelled", "failed"]
 SectionKind = Literal["document_observation", "public_definition", "calculation", "qualified_hypothesis",
-                      "limitation", "clarification"]
+                      "limitation", "clarification", "telemetry_observation"]
 ErrorCode = Literal["unavailable", "invalid_input", "policy_refused", "source_conflict", "validation_failed",
                     "interrupted", "busy"]
 

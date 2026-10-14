@@ -285,7 +285,7 @@ export const T_AN_ORIGINAL_QUESTION = "Исходный вопрос";
 export const AN_SECTION_LABELS: Readonly<Record<string, string>> = {
   document_observation: "Наблюдение по документу", public_definition: "Публичное определение",
   calculation: "Расчёт", qualified_hypothesis: "Гипотеза с условиями проверки", limitation: "Ограничение",
-  clarification: "Уточнение",
+  clarification: "Уточнение", telemetry_observation: "Данные историана",
 };
 
 // --- отказ задания (ErrorCode) ---
@@ -350,6 +350,30 @@ export const AN_REVIEW_KIND_LABELS: Readonly<Record<string, string>> = {
 export const AN_REVIEW_STATUS_LABELS: Readonly<Record<string, string>> = {
   pending: "на рассмотрении", accepted: "принято", rejected: "отклонено", info_requested: "запрошены сведения",
 };
+// подпись связи с оборудованием в заявке equipment_link (AnalyticsReviews.tsx) — вместо внутреннего id, когда
+// подпись найдена в уже загруженном списке связей (план Д17, Task 2)
+export const T_AN_REVIEW_EQUIPMENT = "Оборудование";
+
+// --- раздел «Связи с историаном» (план Д17, Task 2; мастер-промпт §8): подпись оборудования из документов
+// КДМ-1 ↔ тег историана. Видно всем вошедшим с доступом к вкладке — предложить связь может любой, решает тот,
+// у кого право согласования (экран выше, AnalyticsReviews.tsx; AnalyticsLinks.tsx) ---
+export const T_AN_LINKS = "Связи с историаном";
+export const T_AN_LINKS_EMPTY = "Связей пока нет";
+export const T_AN_LINKS_ERROR = "Связи с историаном сейчас не открываются";
+// честная строка (мастер-промпт §8), когда служба данных не подключена — подбор тега не работает, сам список
+// связей и их состояния при этом показываются
+export const T_AN_LINKS_NO_BRIDGE = "Служба данных недоступна — подбор тега сейчас не работает";
+export const T_AN_LINK_UNBOUND = "не связана";
+export const T_AN_LINK_PENDING = "на согласовании";
+export const T_AN_LINK_LINKED = (tag: string, approvedBy: string, approvedAt: string): string =>
+  `связана: ${tag} (согласовал ${approvedBy}, ${approvedAt})`;
+export const T_AN_LINK_PICK = "Подобрать тег";
+export const T_AN_LINK_LOADING = "Ищу подходящие теги…";
+// пустой список кандидатов (дословно) — не отказ службы данных, а честное «такого тега в разрешённом списке нет»
+export const T_AN_LINK_NO_CANDIDATES = "В разрешённом списке нет тегов с этой подписью";
+export const T_AN_LINK_CANDIDATES_TITLE = "Подходящие теги";
+export const T_AN_LINK_CANDIDATE_LABEL = (tag: string, description: string, unit: string | null): string =>
+  unit !== null ? `${tag} — ${description}, ${unit}` : `${tag} — ${description}`;
 
 // --- отказы шлюза (таблица R43) ---
 export const T_SIGNED_OUT = "Сессия закончилась — войдите снова";

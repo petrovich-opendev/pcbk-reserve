@@ -28,6 +28,14 @@ source_refs, ambiguous, machine_scope, knowledge_state, local_operating_authorit
 — отсюда "COV на экранах Valmet IQ" (термин `cov`, корпус заказчика) и статистический коэффициент вариации
 (термин `coefficient-variation-statistical`) остаются разными кандидатами даже при частично похожем вопросе
 «коэффициент…» (который тогда отдаёт ОБА — не угадывает, какой из двух, а запрашивает уточнение).
+
+Правка Task 3, раунд 1 (Д17, план §Task 3): `resolve_term_exact_phrase` — та же сборка `ResolvedTerm`, но для
+ФРАЗЫ (два и более слова) вопроса, совпадающей с формой термина РАВЕНСТВОМ множества основ, не подмножеством —
+находит корень отдельного дефекта: пословный `resolve_term`, применённый к каждому слову фразы по отдельности
+(`preanalysis._resolve_question_terms`), резолвил термин И более длинный термин, который содержит ту же пару
+слов как часть своего названия («Машинное направление» ⊆ «Кратковременная изменчивость в машинном
+направлении» — подмножеством совпадает всегда, равенством — только у того, чьё название фраза называет
+целиком).
 """
 from __future__ import annotations
 
@@ -143,6 +151,52 @@ def resolve_term(handle: "CorpusHandle", original: str) -> "ResolvedTerm":
     selected_id = candidate_ids[0] if len(candidate_ids) == 1 and not ambiguous_hit else None
     return ResolvedTerm(
         original=original[:120] if len(original) > 120 else original,
+        candidate_ids=candidate_ids,
+        selected_id=selected_id,
+        requires_confirmation=selected_id is None,
+    )
+
+
+def resolve_term_exact_phrase(handle: "CorpusHandle", words: list[str]) -> "ResolvedTerm | None":
+    """Правка Task 3, раунд 1 (Д17, план §Task 3): фраза вопроса (`words` — минимум два слова, как они стоят в
+    тексте; с одним словом — `None`, одно слово разрешает обычный пословный `resolve_term`), чьи основы
+    (`_word_set` по фразе, слова которой объединены пробелом) В ТОЧНОСТИ совпадают с одной из форм
+    (`preferred_ru`/alias) термина корпуса — РАВЕНСТВОМ множеств, не подмножеством (как `_matches` у
+    `resolve_term`). Отличает термин от более длинного термина, который содержит ТУ ЖЕ пару слов как часть
+    своего более длинного названия (корень найденного дефекта: пословный разбор «Машинное направление»
+    резолвил и сам этот термин, и «Кратковременная изменчивость в машинном направлении» — у второго основы той
+    же пары слов «машинн»/«направлен» лишь часть его полного набора основ, подмножеством совпадает всегда, а
+    равенством — только у термина, чьё название фраза называет целиком).
+
+    Непустой результат строится теми же правилами выбора `selected_id`/`requires_confirmation`, что у
+    `resolve_term`: несколько терминов совпали ТОЧНО той же формой (бывает — одинаковое название у двух разных
+    терминов) или термин помечен `ambiguous` в корпусе — уточнение остаётся (`selected_id=None`); ровно один
+    термин и не `ambiguous` — выбран. `None` — фраза (как дана) не совпала ТОЧНО ни с одной формой ни одного
+    термина: вызывающий (`preanalysis._term_phrase_matches`) пробует более короткую фразу с той же стартовой
+    позиции или решает, что фразы термина здесь нет вовсе."""
+    if len(words) < 2:
+        return None
+    phrase = " ".join(words)
+    query_words = _word_set(phrase)
+    if not query_words:
+        return None
+    term_ids = knowledge.all_ids(handle, "terms")
+    rows = knowledge.get_rows(handle, "terms", term_ids)
+    candidate_ids: list[str] = []
+    ambiguous_hit = False
+    for term_id in term_ids:
+        row = rows.get(term_id)
+        if row is None or not any(query_words == form for form in _candidate_forms(row)):
+            continue
+        candidate_ids.append(term_id)
+        if row.get("ambiguous"):
+            ambiguous_hit = True
+    if not candidate_ids:
+        return None
+    candidate_ids = candidate_ids[:MAX_CANDIDATES]
+    selected_id = candidate_ids[0] if len(candidate_ids) == 1 and not ambiguous_hit else None
+    return ResolvedTerm(
+        original=phrase[:120] if len(phrase) > 120 else phrase,
         candidate_ids=candidate_ids,
         selected_id=selected_id,
         requires_confirmation=selected_id is None,

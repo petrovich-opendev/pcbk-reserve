@@ -286,6 +286,13 @@ def analyze(identity: RequestIdentity, request: AnalysisRequest, handle: CorpusH
   избыточное→абсолютное без базы, COV экрана Valmet, межзаводское/межотраслевое сравнение) — уточнение не
   изменило бы этот исход. Модуль получил новую зависимость `from . import calculations` (сигнатуры самого
   `preanalysis.py` не меняются, цикла импортов нет — `calculations.py` от `preanalysis.py` не зависит).
+- `requires_clarification` (правка контроллера, Task 3, раунд 2, Д17 — Minor M2 ревью: необязательный
+  ключевой параметр, пропущенный при первой правке): `has_equipment_label: bool = False` — точная подпись
+  ОБОРУДОВАНИЯ (`equipment_links.display_label`, не подпись узла `processes.source_label`) в тексте вопроса
+  (`preanalysis._mentions_equipment_link_label`). При `True` и `intent != "calculation"` не добавляются
+  `"quantity"`/`"basis"` — подпись прибора сама однозначно задаёт измеряемую величину и единицу (их отдаёт
+  служба данных, Task 1/`data_bridge.py`); для `intent == "calculation"` поведение не меняется. Старый вызов
+  без параметра работает как раньше (аддитивный kwarg со значением по умолчанию, сигнатура выше не нарушена).
 
 ## `analytics/calculations.py` — Task 3, дополнено правкой итогового ревью F1 (14.10)
 
@@ -616,13 +623,13 @@ class AnalyticsService:
   «LLM недоступен сейчас» — откат на карточки пакета преданализа без модели, не падение задания. Task 5,
   подключив `llm_adapter.py`, должен в `build_roles` заменить `llm=None` на `llm=llm` одной строкой — `service.py`
   и `gateway/analytics_api.py` менять не нужно.
-- **`data_bridge_available` — РЕШЕНО контроллером правкой F1, п.2 (14.10): ВСЕГДА `False`.** `data_bridge.py`
-  не подключён к выводу ответа — контракт ответа (`job-response.schema.json#SectionKind`) не несёт вида секции
-  для телеметрии, решение владельца по полномочиям и формату этой секции — следующий этап, не этот. Раньше
-  `capabilities()` считала `data_bridge_available = self.calc is not None and reviews.has_any_resolved_link()`
-  — эта строка снята: `self.calc`/`reviews.has_any_resolved_link()` сами не изменились (Task 7 их не трогает),
-  но `capabilities()` больше их не спрашивает для этого поля, чтобы не обещать клиенту вывод телеметрии, которого
-  в контракте ответа ещё нет.
+- **`data_bridge_available` — план Д17, Task 1 (14.10): СНИМАЕТ решение контроллера Д16, правка F1, п.2
+  («ВСЕГДА `False`»).** Контракт ответа (`job-response.schema.json#SectionKind`) теперь несёт
+  `telemetry_observation` — решение владельца по формату секции и по полномочиям согласования (Task 7) принято
+  раньше. `data_bridge_available = self.calc is not None and getattr(self.calc.role, "config_error", None) is
+  None` (защитно через `getattr`, не `AttributeError` на двойнике без `.role`) — НЕ зависит от того, есть ли
+  хоть одна согласованная связь оборудования: конкретную подпись без связи справка показывает отдельным
+  ограничением (`render_telemetry_unresolved_section`), не выключает доступность службы целиком.
 - **`review_authority`/`reviews/*` — подключены Task 7, шаг 2 (не меняет этот раздел Task 4 структурно).**
   `AnalyticsService.__init__` строит `self.reviews = ReviewStore(settings.ANALYTICS_STATE_PATH)` (тот же файл,
   что `store.py`, свои таблицы); `open()` открывает его НЕЗАВИСИМО от `self.store` (отдельный
@@ -843,6 +850,69 @@ ReviewStoreUnavailable`) — ОТДЕЛЬНЫЙ от `reviews_error` 503 (тот
 дальнейшие пути под `reviews/*` (например, `reviews/grants` для полномочий), но не переименовывать/убирать эти.
 Порядок проверок у всех: `front_only → configured(role) → current_account` (как `lessons_api`); у `POST` —
 дополнительно `origin_checked` после сессии (как `workplace_router`/`calc_router`).
+
+## Правка плана Д17, Task 1 (14.10.2026): телеметрия БДРВ в ответе
+
+Мастер-промпт §7 п.7/§8, §2 — вывод данных историана в ответ аналитики новой серверной секцией, плюс маршруты
+«Связи с историаном». Телеметрия НЕ передаётся в LLM ни в каком виде (секция строится после выбора модели,
+только сервером) — Global Constraints плана Д17.
+
+- `models.SectionKind` += `"telemetry_observation"` (и зеркало в `contracts/job-response.schema.json#kind`
+  enum). Секция: `evidence_refs=[]`, `claim_id=None`, `rendered_by="server"` — источник значения не корпус, а
+  служба данных (`docs/kdm1/DRIFT.md`, запись «Расширение контракта: `telemetry_observation`»).
+- `rendering.py` (новые функции, без изменения уже выданных сигнатур выше):
+  - `render_telemetry_section(label: str, link: ResolvedLink, reply: dict) -> Section` — значение «сейчас»
+    (`data_bridge.tag_now`), текст только из полей ответа `DataService`, без пересчёта; дискретный тег —
+    `state_label`; `item["status"] != "ok"` — его `text`.
+  - `render_telemetry_period_section(label: str, link: ResolvedLink, reply: dict) -> Section` — то же за
+    период (`data_bridge.tag_period`): среднее/минимум/максимум/доля хороших точек + `notes` ответа.
+  - `render_telemetry_unresolved_section(label) -> Section`, `render_telemetry_unavailable_section(label) ->
+    Section`, `render_telemetry_refusal_section(label, message) -> Section`,
+    `render_telemetry_truncated_section(shown, total) -> Section` — четыре фиксированных ограничения (связь не
+    согласована / служба не подключена / служба отказала — текст отказа как есть / показаны первые N из M).
+- `service.py`:
+  - `MAX_TELEMETRY_LABELS = 3` — модульная константа, не больше этого числа подписей на ответ.
+  - `AnalyticsService._telemetry_sections(identity, request, handle) -> list[Section]` — единственная точка
+    вызова: `_build_outcome` зовёт её ПОСЛЕ ветвей `needs_clarification`/`refused`/`control` (там чтения нет
+    вовсе) и ПОСЛЕ выбора карточек пакета (`_render_pack_sections`), раньше расчётной секции ничего не читает
+    (секции телеметрии идут ПЕРВЫМИ после расчётной, если она есть). Подписи вопроса —
+    `terms.exact_tag_candidates(handle, request.question)`, оставлены только те, что есть в
+    `equipment_links.display_label` (подписи `processes.source_label` отфильтрованы — это подпись узла, не
+    оборудования). Для каждой — `reviews.resolved_link(id, reviewers_mode=self.settings.ANALYTICS_REVIEWERS)`
+    (первая согласованная из строк этой подписи, перепроверяется «здесь и сейчас»); `request.context.period`
+    задан → `data_bridge.tag_period`, иначе `data_bridge.tag_now`. Ответ без решённого `_build_outcome` —
+    `completed` при `decision=="ready"`, если в `sections` есть хоть одна `telemetry_observation` (то же
+    правило, что у ответа с карточками).
+  - `AnalyticsService.list_equipment_links(identity) -> list[EquipmentLinkInfo]` — `GET .../analytics/links`
+    (см. ниже); `link_candidates(identity, link_id) -> dict | None` — `GET .../links/{id}/candidates`;
+    `validate_equipment_link(subject_id, new_value) -> bool` — проверка перед `POST reviews/requests` с
+    `kind="equipment_link"` (используется `gateway/analytics_api.py`, не вызывается из `reviews.py`).
+  - `capabilities().data_bridge_available` — см. раздел выше.
+- `gateway/analytics_api.py`: два новых маршрута (таблица ниже) и проверка `kind="equipment_link"` при
+  создании заявки (`subject_id` — id строки `equipment_links` текущего корпуса, иначе 400; `new_value` — имя
+  тега по `data.sql.SAFE_NAME`, иначе 400) — проверяется ДО `svc.create_review_request`, через новый
+  `svc.validate_equipment_link`.
+
+| Путь | Метод | Константа |
+|---|---|---|
+| `/pcbk/api/analytics/links` | GET | `LINKS_PATH` |
+| `/pcbk/api/analytics/links/{link_id}/candidates` | GET | `LINK_CANDIDATES_PATH` |
+
+`GET .../links` → `200 {"links": [{"id", "display_label", "document_context", "state": "unbound"|"pending"|
+"linked", "historian_tag", "approved_by", "approved_at", "pending_request_id"}, ...]}`, порядок — как в
+корпусе (по `id`). `linked` — есть `resolved_link`; `pending` — связи нет, но есть заявка `equipment_link`
+этого `id` в статусе `pending`/`info_requested`, ВИДИМАЯ вызывающему (та же видимость, что
+`reviews.list_requests` даёт самому вызывающему — `reviews.py` не меняется этой задачей, публичного листинга
+заявок мимо видимости у него нет: студент без полномочия и не автор заявки в режиме `grants` не увидит чужую
+заявку как `pending`, увидит `unbound` — известное ограничение, снимается `ANALYTICS_REVIEWERS=all_students`,
+где видимость — все заявки области); иначе `unbound`. Справка недоступна (нет корпуса/состояния) — 503, как у
+остальных маршрутов; сбой самого хранилища согласований (`reviews.ReviewStoreUnavailable`) — тот же 503, что у
+`reviews/*`.
+
+`GET .../links/{link_id}/candidates` → `200 {"status": str, "message": str | null, "candidates": [{"tag",
+"description", "unit"}, ...]}` — один `data_bridge.catalog_search(display_label, limit=10)`; `status`/
+`message` — из ответа `DataService` как есть (`message` есть только у отказа). Неизвестный `link_id` — 404.
+`DataService` не подключён (`self.calc is None`) — 503 тем же `_unavailable`, что и прочие сбои подсистемы.
 
 ## Тесты Task 0 и как их продолжать
 

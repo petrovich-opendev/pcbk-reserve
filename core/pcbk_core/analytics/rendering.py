@@ -49,6 +49,25 @@
   `ValidationError`.
 - `_fmt` — десятичная запятая, не точка (Правка, раунд 1, Important 5): мастер-промпт §8 и остальной интерфейс
   пишут числа как «18,716334 т/ч»/«0,04», не «18.716334»/«0.04».
+
+Телеметрия БДРВ в ответе (план Д17, Task 1; мастер-промпт §7 п.7, §8): `render_telemetry_section`/
+`render_telemetry_period_section` строят секцию `telemetry_observation` буквально из полей ответа `DataService`
+(значение/единица/время/качество или среднее/минимум/максимум/доля хороших точек) — без пересчёта, с явной
+подписью «время историана» (§8: «время — как отдаёт `DataService`, браузер не подмешивается»). `ResolvedLink`
+(кто и когда согласовал связь) печатается в тексте, а не в `evidence_refs` — источник значения телеметрии не
+корпус (у секции `evidence_refs=[]`, `claim_id=None`, как и у прочих серверных ограничений). Элемент ответа со
+`status != "ok"` (дискретный тег без недавнего значения, «нет данных» и т.п.) — в текст идёт его `text`, не
+придуманное число; дискретный тег при `status == "ok"` — `state_label` вместо значения/единицы. Вызывающий
+(`service.py`) передаёт сюда только ответ `DataService`, у которого уже есть хотя бы один элемент `items` —
+полный отказ службы без `items` (ворота/бюджет/сбой настройки) рендерится отдельно, `render_telemetry_refusal_
+section` ниже, а не этими двумя функциями.
+
+Четыре серверных ограничения телеметрии — тоже фиксированные шаблоны этого модуля, не текст вопроса/ответа
+модели: `render_telemetry_unresolved_section` (подпись есть в документах, но связь не согласована — читать
+нечего), `render_telemetry_unavailable_section` (служба данных не подключена к этому процессу), `render_
+telemetry_refusal_section` (служба данных подключена, но отказала — текст отказа передаётся как есть, мастер-
+промпт: «отказ `DataService` показывается как есть, не прячется и не переформулируется в «ошибку»»), `render_
+telemetry_truncated_section` (подписей в вопросе больше, чем сервер читает за один ответ).
 """
 from __future__ import annotations
 
@@ -59,6 +78,7 @@ from .validator import APPROVED_CRITICAL_FACT_STATES
 
 if TYPE_CHECKING:
     from .models import CalculationResult, EvidenceCard, ValidationOutcome
+    from .reviews import ResolvedLink
 
 # шаблоны секций (мастер-промпт §8) — ключ в journal/тестах, не выводится клиенту как есть
 DOCUMENT_OBSERVATION_PREFIXES = ("В предоставленной модели указано: ", "На снимке указано: ")
@@ -206,3 +226,106 @@ def render_response(request_id: str, conversation_id: str, state: str, corpus_ve
         stage_label=stage_label, sections=list(sections), clarification_keys=clarification_keys,
         error_code=outcome.error_code,
     )
+
+
+# --- телеметрия БДРВ в ответе (план Д17, Task 1; мастер-промпт §7 п.7, §8) ---
+
+TELEMETRY_LINKS_SECTION_NAME = "Связи с историаном"  # заголовок раздела вкладки — тот же текст, что в подсказке
+
+
+def _telemetry_header(label: str, tag: str, link: "ResolvedLink") -> str:
+    """Общий префикс обеих секций значения: подпись из вопроса, тег и кто/когда согласовал связь — из
+    `ResolvedLink` (мастер-промпт §7, этап 7: связь оборудования согласуется отдельно, подпись её не
+    устанавливает), не из текста вопроса."""
+    return (f"Данные историана по подписи {label} (тег {tag}; связь согласовал {link.approved_by}, "
+           f"{link.approved_at:%d.%m.%Y})")
+
+
+def _telemetry_value_text(item: dict) -> str:
+    """Значение элемента ответа `DataService` для текста секции: дискретный тег — `state_label` вместо
+    значения/единицы (план, Task 1: «дискретный тег — state_label вместо значения/единицы»)."""
+    if "state_label" in item:
+        return str(item["state_label"])
+    unit = str(item.get("unit") or "").strip()
+    return f"{_fmt(item['value'])} {unit}".strip()
+
+
+def render_telemetry_section(label: str, link: "ResolvedLink", reply: dict) -> "Section":
+    """Секция `telemetry_observation` — значение «сейчас» согласованного тега (`data_bridge.tag_now`). `reply`
+    — ответ `DataService`, в котором уже есть хотя бы один элемент `items` (вызывающий, `service.py`, отличает
+    полный отказ службы без `items` раньше и строит для него `render_telemetry_refusal_section`, не эту
+    функцию). Текст — только из полей ответа, без пересчёта; время — буквально `item["time"]`/`reply["tz"]`, с
+    явной подписью «время историана» (мастер-промпт §8). `item["status"] != "ok"` (например, тег без недавнего
+    значения) — в текст идёт его `item["text"]`, не придуманное число."""
+    item = reply["items"][0]
+    tag = item.get("tag") or link.historian_tag
+    header = _telemetry_header(label, tag, link)
+    if item.get("status") != "ok":
+        text = f"{header}: {item.get('text', '')}"
+    else:
+        text = (f"{header}: {_telemetry_value_text(item)} на {item.get('time')} — время историана "
+               f"({reply.get('tz')}); качество: {item.get('quality')}. Это измеренное значение на момент "
+               "ответа, не норматив и не уставка.")
+        notes = item.get("item_notes") or []
+        if notes:
+            text += " " + "; ".join(notes) + "."
+    return Section(kind="telemetry_observation", text=_truncate(text), evidence_refs=[], rendered_by="server",
+                   claim_id=None)
+
+
+def _telemetry_period_text(period: dict) -> str:
+    """Период текстом — буквально из `reply["period"]` (`preset`/`start`/`end`/`tz`), без пересчёта границ."""
+    preset, start, end, tz = period.get("preset"), period.get("start"), period.get("end"), period.get("tz")
+    span = f"{start} — {end}"
+    return f"{preset} ({span}, {tz})" if preset else f"{span} ({tz})"
+
+
+def render_telemetry_period_section(label: str, link: "ResolvedLink", reply: dict) -> "Section":
+    """Секция `telemetry_observation` за период (`data_bridge.tag_period`) — среднее/минимум/максимум/доля
+    хороших точек буквально из ответа `DataService`, тем же приёмом, что `render_telemetry_section`."""
+    item = reply["items"][0]
+    tag = item.get("tag") or link.historian_tag
+    header = _telemetry_header(label, tag, link)
+    period_text = _telemetry_period_text(reply.get("period") or {})
+    if item.get("status") != "ok":
+        text = f"{header} за {period_text}: {item.get('text', '')}"
+    else:
+        unit = str(item.get("unit") or "").strip()
+        text = (f"{header} за {period_text}: среднее {_fmt(item['avg'])}, минимум {_fmt(item['min'])}, "
+               f"максимум {_fmt(item['max'])} {unit}; доля хороших точек {_fmt(item['percent_good'])} %.")
+        notes = reply.get("notes") or []
+        if notes:
+            text += " " + "; ".join(notes) + "."
+    return Section(kind="telemetry_observation", text=_truncate(text), evidence_refs=[], rendered_by="server",
+                   claim_id=None)
+
+
+def render_telemetry_unresolved_section(label: str) -> "Section":
+    """Подпись найдена в документах КДМ-1, но связи с тегом историана нет — значение не читается вовсе (вызов
+    этой функции сам по себе доказывает, что `tag_now`/`tag_period` не вызывались: `service.py` строит её ДО
+    любого обращения к `data_bridge.py`)."""
+    text = (f"Подпись {label} есть в документах КДМ-1, но её связь с тегом историана не согласована — значение "
+           f"не показывается. Предложить связь можно в разделе «{TELEMETRY_LINKS_SECTION_NAME}» этой вкладки.")
+    return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)
+
+
+def render_telemetry_unavailable_section(label: str) -> "Section":
+    """Связь согласована, но служба данных (`DataService`) не подключена к этому процессу/сейчас неисправна —
+    честное ограничение, не падение ответа."""
+    text = f"Служба данных недоступна — значение по подписи {label} не показывается."
+    return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)
+
+
+def render_telemetry_refusal_section(label: str, message: str) -> "Section":
+    """Служба данных подключена, но отказала (тег вне разрешённого списка, частота, учения) — текст отказа
+    `DataService` передаётся как есть (мастер-промпт: «отказ показывается как есть, не прячется и не
+    переформулируется в «ошибку»»)."""
+    text = f"Служба данных отказала по подписи {label}: {message}"
+    return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)
+
+
+def render_telemetry_truncated_section(shown: int, total: int) -> "Section":
+    """Подписей со связью в вопросе больше, чем сервер читает за один ответ (`service.MAX_TELEMETRY_LABELS`) —
+    `shown` — сколько реально прочитано, `total` — сколько подписей со связью нашёл сервер всего."""
+    text = f"Показаны первые {shown} подписи из {total}."
+    return Section(kind="limitation", text=_truncate(text), evidence_refs=[], rendered_by="server", claim_id=None)

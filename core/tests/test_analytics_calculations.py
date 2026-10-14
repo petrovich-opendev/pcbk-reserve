@@ -231,6 +231,32 @@ def test_plan_from_question_dry_solid_flow_t04():
     assert result.missing_basis == ()
 
 
+@pytest.mark.parametrize("phrase", ["кубов в час", "кубометров в час", "куб/ч"])
+def test_plan_from_question_cubic_meters_per_hour_words_recognized(phrase):
+    """Правка Task 3 (Д17, план §Task 3/Этап 3, «мелкие хвосты распознавания»): словесные формы объёмного
+    расхода («кубов в час»/«кубометров в час»/«куб/ч») распознаются тем же `_FLOW_RE`, что «м³/ч» — та же
+    единица, тот же вход формулы."""
+    plan = plan_from_question(f"Расход 200 {phrase}, ρ=1 т/м³, 4% по массе. Сколько сухого вещества?")
+    assert plan is not None
+    assert plan.calculation_id == "dry_solid_flow"
+    assert plan.inputs.get("volumetric_flow_m3_h") == Decimal("200")
+    assert plan.units.get("volumetric_flow_m3_h") == "м3/ч"
+
+
+def test_plan_from_question_cubic_meters_per_hour_dry_solid_flow_example():
+    """Мастер-промпт §8/§11, словесная форма: «200 кубов в час, ρ=1 т/м³, 4 % по массе» → 8 т/ч сухого вещества
+    — та же формула и то же число, что у T-04 (литерал «м³/ч»), независимый Fraction-эталон."""
+    plan = plan_from_question("200 кубов в час, ρ=1 т/м³, 4 % по массе. Сколько сухого вещества?")
+    assert plan is not None
+    assert plan.calculation_id == "dry_solid_flow"
+    assert plan.refusal_reason is None
+    result = run_calculation(plan.calculation_id, plan.inputs, plan.units)
+    independent = Fraction(200) * Fraction(1) * Fraction(4, 100)
+    assert result.value == pytest.approx(float(independent))
+    assert result.value == pytest.approx(8.0)
+    assert result.missing_basis == ()
+
+
 def test_plan_from_question_t03_missing_density_no_silent_8():
     """T-03: «Расход 200, концентрация 4 — сколько сухого волокна?» — без единицы расхода и без базы процента
     (и без самого «%») план распознаёт формулу, но НЕ выдумывает входы: result.value остаётся None, не 8."""

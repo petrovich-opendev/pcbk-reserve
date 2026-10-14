@@ -9,9 +9,9 @@ import type { AnalyticsApi } from "../src/analyticsApi";
 import { AnalyticsPage } from "../src/components/AnalyticsPage";
 import type { VisibilityDoc } from "../src/status";
 import {
-  T_AN_CANCEL, T_AN_CLARIFY_TITLE, T_AN_NO_CONVERSATIONS, T_AN_ORIGINAL_QUESTION, T_AN_REVIEWS, T_AN_SEND,
-  T_AN_SEND_TO_REVIEW, T_AN_SEND_TO_REVIEW_DONE, T_AN_SEND_TO_REVIEW_RATIONALE, T_AN_SHOW_FRAGMENT,
-  T_AN_UNAVAILABLE, T_DOWN,
+  T_AN_CANCEL, T_AN_CLARIFY_TITLE, T_AN_LINKS, T_AN_LINKS_EMPTY, T_AN_LINKS_NO_BRIDGE, T_AN_NO_CONVERSATIONS,
+  T_AN_ORIGINAL_QUESTION, T_AN_REVIEWS, T_AN_SEND, T_AN_SEND_TO_REVIEW, T_AN_SEND_TO_REVIEW_DONE,
+  T_AN_SEND_TO_REVIEW_RATIONALE, T_AN_SHOW_FRAGMENT, T_AN_UNAVAILABLE, T_DOWN,
 } from "../src/texts";
 
 // doc управляемый из теста (приём status.test.ts у startStatusPolling): hidden — геттер, listener захватываем
@@ -48,6 +48,8 @@ function fakeApi(over: Partial<Record<keyof AnalyticsApi, (...a: never[]) => Pro
     request: vi.fn(over.request ?? unset),
     cancel: vi.fn(over.cancel ?? (() => Promise.resolve(reply(200, null)))),
     evidence: vi.fn(over.evidence ?? unset),
+    links: vi.fn(over.links ?? (() => Promise.resolve(reply(200, { links: [] })))),
+    linkCandidates: vi.fn(over.linkCandidates ?? unset),
     reviewRequests: vi.fn(over.reviewRequests ?? (() => Promise.resolve(reply(200, { requests: [] })))),
     createReview: vi.fn(over.createReview ?? unset),
     decideReview: vi.fn(over.decideReview ?? unset),
@@ -307,6 +309,60 @@ test("analytics_page_shows_reviewer_nav_only_with_review_authority", async () =>
   const reviewBtn = await screen.findByRole("button", { name: T_AN_REVIEWS });
   fireEvent.click(reviewBtn);
   expect(await screen.findByText("Заявок на согласование нет")).toBeTruthy();
+});
+
+// --- план Д17, Task 2: раздел «Связи с историаном» — доступен ВСЕМ вошедшим с доступом к вкладке (не только
+// с правом согласования, в отличие от «Назначенное согласование») ---
+
+test("analytics_page_links_nav_visible_without_review_authority_and_shows_links_section", async () => {
+  const api = fakeApi({
+    links: () => Promise.resolve(reply(200, { links: [{
+      id: "EQ-FAKE-001", display_label: "20FAKE_001_PV", document_context: "уровнемер в машинном бассейне №1",
+      state: "unbound", historian_tag: null, approved_by: null, approved_at: null, pending_request_id: null,
+    }] })),
+  });
+  render(<AnalyticsPage api={api} onSignedOut={vi.fn()} />);
+  expect(screen.queryByRole("button", { name: T_AN_REVIEWS })).toBeNull();   // CAPS_PLAIN: review_authority=false
+
+  fireEvent.click(await screen.findByRole("button", { name: T_AN_LINKS }));
+  expect(await screen.findByText("20FAKE_001_PV")).toBeTruthy();
+  // CAPS_PLAIN: data_bridge_available=false — честная строка, список при этом показан (строка выше)
+  expect(screen.getByText(T_AN_LINKS_NO_BRIDGE)).toBeTruthy();
+});
+
+test("analytics_page_links_section_empty_list", async () => {
+  render(<AnalyticsPage api={fakeApi()} onSignedOut={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: T_AN_LINKS }));
+  expect(await screen.findByText(T_AN_LINKS_EMPTY)).toBeTruthy();
+});
+
+// --- план Д17, Task 1 «Produces»: секция telemetry_observation рисуется как остальные, подпись карточки —
+// «Данные историана» (AN_SECTION_LABELS) ---
+
+test("analytics_page_shows_telemetry_observation_section_label", async () => {
+  const api = fakeApi({
+    createConversation: () => Promise.resolve(reply(201, { id: "c1" })),
+    conversation: () => Promise.resolve(reply(200, {
+      conversation: { id: "c1", mode: "reference", created_at: "2026-10-14T08:00:00+00:00",
+                     last_activity_at: "2026-10-14T08:00:00+00:00", corpus_version: "20FAKE-v1" },
+      requests: [],
+    })),
+    ask: () => Promise.resolve(reply(202, { request_id: "r1" })),
+    request: () => Promise.resolve(reply(200, jobBody({
+      sections: [section({
+        kind: "telemetry_observation",
+        text: "Данные историана по подписи «20FAKE_001_PV» (тег 20FAKE_001_PV; связь согласовал tech1, " +
+          "14.10.2026): 42 % на 2026-10-14T08:00:00+00:00 — время историана (Europe/Moscow); качество: хорошее.",
+      })],
+    }))),
+  });
+  render(<AnalyticsPage api={api} onSignedOut={vi.fn()} pollMs={10} />);
+  fireEvent.click(await screen.findByRole("button", { name: /Новый диалог: Справка по документам/ }));
+  fireEvent.change(screen.getByLabelText(/Ваш вопрос технологу/), { target: { value: "Какой уровень в баке 1?" } });
+  fireEvent.click(screen.getByRole("button", { name: T_AN_SEND }));
+
+  expect(await screen.findByText("Данные историана")).toBeTruthy();
+  expect(screen.getByText(/время историана/)).toBeTruthy();
 });
 
 // --- Правка, раунд 1, п.1: пауза опроса при скрытой вкладке (НЕ отмена задания, НЕ сброс pollToken) ---

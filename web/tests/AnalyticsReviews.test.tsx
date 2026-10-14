@@ -13,10 +13,11 @@ import {
 type R = { status: number; body: unknown };
 const reply = (status: number, body: unknown = null): R => ({ status, body });
 
-function fakeApi(over: Partial<Pick<AnalyticsApi, "reviewRequests" | "decideReview">> = {}): AnalyticsApi {
+function fakeApi(over: Partial<Pick<AnalyticsApi, "reviewRequests" | "decideReview" | "links">> = {}): AnalyticsApi {
   return {
     capabilities: vi.fn(), conversations: vi.fn(), createConversation: vi.fn(), conversation: vi.fn(),
-    ask: vi.fn(), request: vi.fn(), cancel: vi.fn(), evidence: vi.fn(), createReview: vi.fn(),
+    ask: vi.fn(), request: vi.fn(), cancel: vi.fn(), evidence: vi.fn(), createReview: vi.fn(), linkCandidates: vi.fn(),
+    links: vi.fn(over.links ?? (() => Promise.resolve(reply(200, { links: [] })))),
     reviewRequests: vi.fn(over.reviewRequests ?? (() => Promise.resolve(reply(200, { requests: [] })))),
     decideReview: vi.fn(over.decideReview ?? (() => Promise.resolve(reply(200, null)))),
   } as unknown as AnalyticsApi;
@@ -87,4 +88,42 @@ test("analytics_reviews_signed_out_on_401", async () => {
   const api = fakeApi({ reviewRequests: () => Promise.resolve(reply(401, { name: "Unauthorized" })) });
   render(<AnalyticsReviews api={api} onSignedOut={onSignedOut} />);
   await waitFor(() => expect(onSignedOut).toHaveBeenCalled());
+});
+
+// --- план Д17, Task 2: для equipment_link вместо внутреннего id связи (display-link-…/EQ-FAKE-…) видна подпись
+// оборудования (display_label) из уже загруженного списка связей; нет в списке — id как раньше ---
+
+const LINK = {
+  id: "20FAKE_07_PV", display_label: "Уровнемер бассейна формования", document_context: "",
+  state: "pending", historian_tag: null, approved_by: null, approved_at: null, pending_request_id: "rv1",
+};
+
+test("analytics_reviews_equipment_link_shows_display_label_from_loaded_links", async () => {
+  const api = fakeApi({
+    links: () => Promise.resolve(reply(200, { links: [LINK] })),
+    reviewRequests: () => Promise.resolve(reply(200, { requests: [PENDING] })),
+  });
+  render(<AnalyticsReviews api={api} onSignedOut={vi.fn()} />);
+  expect(await screen.findByText("Уровнемер бассейна формования")).toBeTruthy();
+  expect(screen.queryByText("20FAKE_07_PV")).toBeNull();      // id больше не виден студенту — вместо него подпись
+});
+
+test("analytics_reviews_equipment_link_falls_back_to_id_when_not_in_links_list", async () => {
+  const api = fakeApi({ reviewRequests: () => Promise.resolve(reply(200, { requests: [PENDING] })) });
+  render(<AnalyticsReviews api={api} onSignedOut={vi.fn()} />);
+  // links() по умолчанию отдаёт пустой список — подписи взять негде, id показан как раньше
+  expect(await screen.findByText("20FAKE_07_PV")).toBeTruthy();
+});
+
+test("analytics_reviews_non_equipment_link_kind_shows_no_equipment_row", async () => {
+  const conflictReq = {
+    id: "rv2", kind: "conflict", subject_id: "r1", old_value: null,
+    new_value: "Рассмотреть конфликт источников в ответе", scope: "КДМ-1", period_start: null, period_end: null,
+    rationale: "два противоречащих источника", status: "pending", created_by: "student-03",
+    created_at: "2026-10-14T08:00:00+00:00", decided_by: null, decided_at: null, comment: null,
+  };
+  const api = fakeApi({ reviewRequests: () => Promise.resolve(reply(200, { requests: [conflictReq] })) });
+  render(<AnalyticsReviews api={api} onSignedOut={vi.fn()} />);
+  await screen.findByText("Рассмотреть конфликт источников в ответе");
+  expect(screen.queryByText("r1")).toBeNull();     // не equipment_link — подпись «Оборудование» не показывается
 });

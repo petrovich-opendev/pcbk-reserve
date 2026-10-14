@@ -34,6 +34,21 @@ Task 4: преданализ отдаёт факты и риск, не марш�
 (`"quantity"`) запрашивается только если словарь нашёл кандидата(ов), но не смог выбрать одного
 (`requires_confirmation` и `candidate_ids` непусты одновременно) — иначе почти любой свободный текст на русском
 выглядел бы «неоднозначным» просто потому, что большинство слов вопроса не входят в словарь из 41 записи.
+
+Правка Task 3 (Д17, план §Task 3/Этап 3): пословный разбор выше сам по себе ловил и ложные совпадения — слово
+«машинном» из вопроса «уровнемер в машинном бассейне» само по себе (основа «машинн») подстановочно совпадало с
+термином «Машинное направление», хотя в тексте явно названа фраза узла «машинном бассейне», совпадающая с ДВУМЯ
+узлами корпуса («...бассейн нижней сетки №4»/«...верхней сетки №8» — правильное уточнение «какой бассейн»).
+Фраза узла теперь имеет приоритет: её слова (`_process_phrase_matches`) не идут в этот пословный разбор вовсе,
+см. `_resolve_question_terms`/`_candidate_process_ids` ниже.
+
+Правка Task 3, раунд 1 (Д17, тот же класс дефекта — контроллер): тот же пословный разбор ложно резолвил
+ОДНОВРЕМЕННО короткий и более длинный термин на один и тот же вопрос — «что такое машинное направление?»
+находило и «Машинное направление» (`md`), и «Кратковременная изменчивость в машинном направлении» (`st-md`),
+хотя технолог назвал короткий термин ТОЧНО. Фраза термина (`_term_phrase_matches`, `terms.
+resolve_term_exact_phrase`) — РАВЕНСТВО множества основ с одной из форм термина, не подмножество: отличает
+термин, чьё название фраза называет целиком, от более длинного термина, который содержит ту же пару слов как
+часть своего названия. Её слова тоже не идут в пословный разбор отдельно (см. `_resolve_question_terms`).
 """
 from __future__ import annotations
 
@@ -69,15 +84,20 @@ class NormalizedQuestion:
 
 _UNIT_TOKENS: tuple[str, ...] = (
     "%", "м³/ч", "м3/ч", "т/ч", "т/м³", "т/м3", "г/м²", "г/м2", "кн/м", "н/м", "кпа", "мбар", "бар",
-    "л/мин", "м/мин", "кг/ч", " мм",
+    "л/мин", "м/мин", "кг/ч", " мм", "куб/ч", "кубов в час", "кубометров в час",
 )
+# Правка Task 3 (Д17, план §Task 3/Этап 3): словесные формы объёмного расхода («кубов в час»/«кубометров в
+# час»/«куб/ч») — та же единица, что «м3/ч» (`calculations._FLOW_RE` признаёт их тем же физическим входом), не
+# три разных значения `unit_hint` — отсюда канонизация ниже вместо буквального `token.strip()` для этих форм.
+_VOLUME_FLOW_WORD_TOKENS: frozenset[str] = frozenset({"куб/ч", "кубов в час", "кубометров в час"})
+_VOLUME_FLOW_CANONICAL_UNIT = "м3/ч"
 
 
 def _find_unit_hint(text: str) -> str | None:
     lowered = text.lower()
     for token in _UNIT_TOKENS:
         if token in lowered:
-            return token.strip()
+            return _VOLUME_FLOW_CANONICAL_UNIT if token in _VOLUME_FLOW_WORD_TOKENS else token.strip()
     return None
 
 
@@ -120,10 +140,14 @@ def _span_within(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     return any(span_start <= start and end <= span_end for span_start, span_end in spans)
 
 
-def _content_tokens(text: str) -> list[str]:
+def _content_tokens_with_positions(text: str, *, extra_excluded_spans: tuple[tuple[int, int], ...] = ()
+                                   ) -> list[tuple[str, int, int]]:
+    """Как `_content_tokens` ниже, но с положением каждого слова в тексте — правка Task 3, раунд 1 (Д17):
+    `_resolve_question_terms` должен расставить пословные и фразовые (узел/термин) результаты в ПОРЯДКЕ
+    исходного текста вопроса, а не в порядке, в котором их нашли разные механизмы."""
     seen: set[str] = set()
-    result: list[str] = []
-    excluded_spans = _basis_weight_phrase_spans(text)
+    result: list[tuple[str, int, int]] = []
+    excluded_spans = _basis_weight_phrase_spans(text) + list(extra_excluded_spans)
     for match in _TOKEN_RE.finditer(text):
         word = match.group(0)
         if len(word) < 2:
@@ -135,8 +159,18 @@ def _content_tokens(text: str) -> list[str]:
         if key in _STOPWORDS or key in seen:
             continue
         seen.add(key)
-        result.append(word)
+        result.append((word, start, end))
     return result
+
+
+def _content_tokens(text: str, *, extra_excluded_spans: tuple[tuple[int, int], ...] = ()) -> list[str]:
+    """`extra_excluded_spans` — правка Task 3 (Д17, план §Task 3/Этап 3): дополнительные диапазоны вне
+    `_basis_weight_phrase_spans`, чьи слова не нужно резолвить по отдельности — на практике это слова фразы
+    узла/термина (`_process_phrase_matches`/`_term_phrase_matches`), вызывается только из `_resolve_question_
+    terms`; старые вызывающие (`_has_substantive_remainder_after_other_machine` и сам этот модуль без
+    аргумента) не передают его и получают прежнее поведение в точности."""
+    return [word for word, _start, _end in _content_tokens_with_positions(
+        text, extra_excluded_spans=extra_excluded_spans)]
 
 
 def original_and_normalized(request: "AnalysisRequest") -> NormalizedQuestion:
@@ -192,6 +226,10 @@ _IMPERATIVE_FORMS: tuple[str, ...] = (
     r"задай(?:те)?", r"подай(?:те)?",
     r"настро(?:й|йте)",
     r"разблокируй(?:те)?",
+    # Правка Task 3 (Д17, план §Task 3/Этап 3, «мелкие хвосты распознавания»): «заблокируй(те)» отсутствовала
+    # (была только обратная форма «разблокируй(те)») — известный остаток раунда 5 («Заблокируй выход из зоны
+    # сканирования лентой» не ловилась, см. `test_analytics_preanalysis.py`, комментарий у `CONTROL_PHRASES_R5`).
+    r"заблокируй(?:те)?",
     r"отвяжи(?:те)?",
     r"двигай(?:те)?",
     r"сдвинь(?:те)?",
@@ -220,6 +258,7 @@ _INFINITIVE_FORMS: tuple[str, ...] = (
     r"обойти",
     r"настроить",
     r"разблокировать",
+    r"заблокировать",
     r"отвязать",
     r"сдвинуть",
     r"снизить", r"повысить",
@@ -389,9 +428,21 @@ def _imperative_like(word: str) -> bool:
     return False
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"[^.!?;\n]+[.!?;]*")
+
+
 def _sentences(text: str) -> list[str]:
     """Предложения вместе с завершающим знаком — вопросительный знак нужен `_generic_control`."""
-    return [s for s in re.findall(r"[^.!?;\n]+[.!?;]*", text) if s.strip()]
+    return [s for s in _SENTENCE_SPLIT_RE.findall(text) if s.strip()]
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Диапазоны предложений в исходном тексте (та же разбивка, что `_sentences`, тем же регэкспом — только с
+    положением, не текстом) — правка ревью Task 3, раунд 3 (Critical C1): `_process_phrase_matches`/`_term_
+    phrase_matches` не должны склеивать слова двух разных предложений в одну фразу узла/термина, та же
+    дисциплина, что уже есть у `_generic_control` для команд (L438 — «рамка в соседнем предложении не
+    снимает»)."""
+    return [m.span() for m in _SENTENCE_SPLIT_RE.finditer(text) if m.group(0).strip()]
 
 
 def _generic_control(sentence: str) -> bool:
@@ -699,9 +750,33 @@ def _has_complete_calculation_plan(original: str) -> bool:
     return result.value is not None
 
 
+# Правка контроллера, раунд 2 (Д17, план §Task 3, находка на живом корпусе): точная подпись ОБОРУДОВАНИЯ
+# (`equipment_links.display_label`, короткая буквенно-цифровая подпись прибора вида корпуса заказчика, не
+# публикуется в git — см. `fixtures/kdm1_corpus.py`, `20FAKE_*`) в тексте вопроса сама однозначно задаёт
+# измеряемую величину и её единицу — их отдаёт служба данных (Task 1/`data_bridge.py`) по самой подписи, а не
+# по догадке координатора, поэтому «Какой вакуум на {подпись}?» не должен получать уточнение "quantity"/
+# "basis": без фикса ответ не доходит до чтения значения (Task 1 читает телеметрию только на `ready`/
+# `limited_answer`). Подпись УЗЛА (`processes.source_label`) этого правила не несёт — она называет участок, не
+# измеряемую величину (разные узлы с одной фразой — наоборот, неоднозначность, см. `_process_phrase_matches`).
+def _mentions_equipment_link_label(handle: "CorpusHandle", original: str) -> bool:
+    """`terms.exact_tag_candidates` ищет подписи и узлов, и оборудования сразу (общий докстринг модуля
+    `terms.py`) — здесь дополнительно проверяется пересечение найденных совпадений именно с `equipment_links.
+    display_label` (не с `processes.source_label`)."""
+    labels = terms.exact_tag_candidates(handle, original)
+    if not labels:
+        return False
+    equipment_labels = {
+        row.get("display_label")
+        for row in knowledge.get_rows(handle, "equipment_links", knowledge.all_ids(handle, "equipment_links")).values()
+        if row.get("display_label")
+    }
+    return any(label in equipment_labels for label in labels)
+
+
 def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["ResolvedTerm", ...],
                            process_ids: tuple[str, ...], *, mode: "AnalysisMode | None" = None,
-                           period_given: bool = False) -> tuple[bool, tuple[str, ...]]:
+                           period_given: bool = False,
+                           has_equipment_label: bool = False) -> tuple[bool, tuple[str, ...]]:
     """Пункты 4–5 мастер-промпта §7: единицы, база процентов/влажности/давления, период/пояс, сорт/режим,
     качество/свежесть, конфликты и применимость. Возвращает (нужно ли уточнение, `missing_fields` —
     `models.Preanalysis.missing_fields`, значения — строго из `models.ClarificationKey`). Существенная
@@ -752,13 +827,26 @@ def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["Re
     «Расход 200 м³/ч, ρ=1 т/м³, 0 % по массе — сколько сухого?» — слово «массе» многозначно в словаре
     корпуса, но все три входа формулы уже названы буквально, уточнение не изменило бы число 0 т/ч; «Сравни
     производительность КДМ-1 с … в Китае» — известный структурный отказ сравнения с внешними данными не
-    зависит от того, какой из нескольких терминов «производительность» имелся в виду)."""
+    зависит от того, какой из нескольких терминов «производительность» имелся в виду).
+
+    Правка контроллера, раунд 2 (Д17, план §Task 3, находка на живом корпусе): `has_equipment_label` — новый
+    необязательный ключевой параметр (та же дисциплина расширения сигнатуры, что у `mode`/`period_given` —
+    старый вызов без него работает как раньше). `True` — вопрос содержит точную подпись ОБОРУДОВАНИЯ
+    (`equipment_links.display_label`, не подпись узла `processes.source_label` — `_mentions_equipment_link_
+    label`, вызывающий решает, звать ли её, эта функция только применяет уже готовый флаг). Подпись прибора
+    сама однозначно задаёт измеряемую величину и её единицу (их отдаёт служба данных, Task 1/`data_bridge.py`,
+    по самой подписи) — поэтому `"quantity"`/`"basis"` не запрашиваются, КРОМЕ `intent == "calculation"`:
+    расчёт по формуле этого модуля («сколько сухого вещества») по-прежнему нуждается в явных единицах/базе
+    независимо от подписи прибора, которая про формулу расчёта ничего не говорит. `"process"`/`"period"`/
+    `"timezone"` и прочие ключи — без изменений (подпись оборудования не снимает неоднозначность участка/
+    периода)."""
     intent = classify_intent(parsed)
     missing: list[str] = []
     known_calc_refusal = calculations.known_refusal_reason(parsed.original) is not None
     self_sufficient = known_calc_refusal or _has_complete_calculation_plan(parsed.original)
+    equipment_label_suppresses = has_equipment_label and intent != "calculation"
     ambiguous_terms = [t for t in resolved_terms if t.requires_confirmation and t.candidate_ids]
-    if ambiguous_terms and not self_sufficient:
+    if ambiguous_terms and not self_sufficient and not equipment_label_suppresses:
         missing.append("quantity")
     if len(process_ids) > 1 and not self_sufficient:
         missing.append("process")
@@ -769,7 +857,8 @@ def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["Re
     time_union_question = calculations.mentions_time_range(parsed.original) or (
         _mentions_sum_imperative(parsed.original) and _stem_matches(parsed.normalized, _PERIOD_STEMS))
     if (_stem_matches(parsed.normalized, _BASIS_SENSITIVE_STEMS) and not _stem_matches(
-            parsed.normalized, _BASIS_GIVEN_STEMS) and not known_calc_refusal):
+            parsed.normalized, _BASIS_GIVEN_STEMS) and not known_calc_refusal
+            and not equipment_label_suppresses):
         missing.append("basis")
     if intent == "calculation" and parsed.unit_hint is None and not known_calc_refusal and not time_union_question:
         missing.append("unit")
@@ -827,27 +916,252 @@ def _digit_node_process_ids(handle: "CorpusHandle", original: str) -> list[str]:
     return ids
 
 
+# Правка Task 3 (Д17, план §Task 3/Этап 3): приоритет фразы узла над пословным разбором терминов — КОРЕНЬ
+# дефекта, найденного на настоящем корпусе («уровнемер в машинном бассейне»): `_resolve_question_terms` звала
+# `terms.resolve_term` на КАЖДОЕ содержательное слово вопроса отдельно, и слово «машинном» само по себе (основа
+# «машинн») подстановочно совпадало с термином «Машинное направление» (та же основа «машинн» у его
+# preferred_ru), хотя в тексте явно названа ДВУСЛОВНАЯ фраза узла «машинном бассейне», совпадающая (подмножеством
+# основ) с ДВУМЯ узлами корпуса («Машинный бассейн нижней сетки №4» и «...верхней сетки №8») — правильное
+# уточнение «какой бассейн», не «какая величина». Фраза узла — соседние (после `_STOPWORDS`) содержательные
+# слова вопроса, минимум два, чьи основы (`terms.normalize_ru`) ВМЕСТЕ входят (подмножеством, как `terms.
+# _matches`, но в одну сторону — фраза короче полного названия) в набор основ `title`/`source_label` какого-то
+# узла. Найденная фраза даёт два следствия: её слова исключаются из `_content_tokens`/`resolve_term` (не
+# становятся спорным термином по отдельности, см. `_resolve_question_terms`), а узлы, которые она называет, —
+# кандидаты участка (`_candidate_process_ids`, тот же путь и та же обработка неоднозначности, что у подписи
+# тега/цифрового номера).
+_MAX_PROCESS_PHRASE_WORDS = 6  # разумный предел длины фразы узла — названия узлов корпуса короче
+
+
+def _ordered_content_words(text: str) -> list[tuple[str, int, int]]:
+    """Содержательные слова вопроса с положением в тексте, БЕЗ дедупликации по значению (в отличие от
+    `_content_tokens`, которой дедуп нужен для уникальности `Preanalysis.resolved_terms`) — здесь важны порядок
+    и соседство слов для поиска фразы узла, `_process_phrase_matches`."""
+    excluded_spans = _basis_weight_phrase_spans(text)
+    result: list[tuple[str, int, int]] = []
+    for match in _TOKEN_RE.finditer(text):
+        word = match.group(0)
+        if len(word) < 2:
+            continue
+        start, end = match.span()
+        if _span_within(start, end, excluded_spans):
+            continue
+        if word.lower() in _STOPWORDS:
+            continue
+        result.append((word, start, end))
+    return result
+
+
+# Правка ревью Task 3, раунд 3 (Critical C1): `_ordered_content_words` сама по себе не знает о границах
+# предложения — без этой проверки жадный поиск фразы в `_process_phrase_matches`/`_term_phrase_matches`
+# склеивал слова РАЗНЫХ, грамматически не связанных предложений («…в машинном бассейне. Нижней сетки
+# интересует больше.» → слово «бассейне» из первого предложения и «Нижней»/«сетки» из второго молчаливо
+# складывались в фразу «бассейне нижней сетки», выбирающую ОДИН конкретный узел вместо уточнения «какой
+# бассейн» между двумя равноправными кандидатами). Та же дисциплина, что уже есть в этом модуле для команд —
+# `_generic_control` проверяется ПО ПРЕДЛОЖЕНИЮ (`_sentences`), рамка в соседнем предложении не снимает
+# признак; здесь аналогично — фраза узла/термина не может перескочить границу предложения.
+def _sentence_indices_for_words(words: list[tuple[str, int, int]], text: str) -> list[int]:
+    """Индекс предложения (`_sentence_spans`) для каждого слова `words`, в том же порядке (оба списка
+    упорядочены по позиции в тексте — один проход с продвигающимся указателем, без возврата назад)."""
+    spans = _sentence_spans(text)
+    indices: list[int] = []
+    pos = 0
+    for _word, start, _end in words:
+        while pos < len(spans) and spans[pos][1] <= start:
+            pos += 1
+        if pos < len(spans) and spans[pos][0] <= start < spans[pos][1]:
+            indices.append(pos)
+        else:
+            indices.append(-1)   # не должно случаться для валидного слова — защитное значение, не падение
+    return indices
+
+
+def _same_sentence_run_length(sentence_of: list[int], i: int) -> int:
+    """Сколько слов подряд от позиции `i` (включая его само) принадлежат ТОЙ ЖЕ границе предложения, что
+    слово `i` — верхний предел длины фразы, начинающейся в `i` (ревью, раунд 3, C1)."""
+    n = len(sentence_of)
+    j = i + 1
+    while j < n and sentence_of[j] == sentence_of[i]:
+        j += 1
+    return j - i
+
+
+# Правка ревью Task 3, раунд 3 (Important I1): подмножественное сравнение фразы узла само по себе слишком
+# широкое для родовых двусловных уточнителей вида «нижней сетки»/«верхней сетки» — они входят подмножеством
+# основ в названия МНОГИХ разных узлов корпуса (композиционный бассейн, напорный ящик, сортировка…), не только
+# в пару «машинный бассейн нижней/верхней сетки», ради которой задумывался приоритет фразы. Решение
+# контроллера: фраза узла засчитывается, только если её основы включают ВСЕ основы ГОЛОВЫ названия — первых
+# ДВУХ слов формы (`title`/`source_label`; «Машинный бассейн нижней сетки №4» → голова «машинный бассейн»;
+# название из одного слова — голова само это слово). Голый родовой уточнитель без головы (например, одна
+# «нижней сетки») больше не считается фразой узла ни для одного узла — вопрос идёт прежним (пословным) путём.
+def _phrase_head(text: str) -> frozenset[str]:
+    """Голова названия (первые два слова, или одно — если название из одного слова) — см. комментарий выше."""
+    words = terms.normalize_ru(text).split()
+    return frozenset(words[: min(2, len(words))])
+
+
+def _process_phrase_forms(row: dict) -> list[tuple[frozenset[str], frozenset[str]]]:
+    """Как `terms._candidate_forms`, но для строки `processes`: (основы формы, основы головы формы) для
+    `title` и, если есть, `source_label` — голова нужна правилу I1 (ревью, раунд 3)."""
+    forms: list[tuple[frozenset[str], frozenset[str]]] = []
+    title = str(row.get("title") or "")
+    title_stems = frozenset(terms.normalize_ru(title).split())
+    if title_stems:
+        forms.append((title_stems, _phrase_head(title)))
+    label = row.get("source_label")
+    if label:
+        label_stems = frozenset(terms.normalize_ru(str(label)).split())
+        if label_stems:
+            forms.append((label_stems, _phrase_head(str(label))))
+    return forms
+
+
+def _process_phrase_matches(handle: "CorpusHandle",
+                            original: str) -> tuple[list[tuple[int, int]], tuple[str, ...]]:
+    """Фразы узла в исходном тексте вопроса (см. комментарий выше) — диапазоны (для исключения слов фразы из
+    `terms.resolve_term`) и id узлов, которые эта фраза называет (для `_candidate_process_ids`). Проход слева
+    направо по содержательным словам (`_ordered_content_words`), НЕ пересекая границу предложения (`ревью,
+    раунд 3, C1 — _sentence_indices_for_words`/`_same_sentence_run_length`): на каждой стартовой позиции
+    пробуется самая длинная совпавшая фраза (от `_MAX_PROCESS_PHRASE_WORDS` слов вниз до двух, но не выходя за
+    предложение) — совпадение проверяется только у узла, чья ГОЛОВА названия (I1, ревью, раунд 3) целиком
+    входит во фразу, не у слова самого по себе (минимум два слова, «одно слово «бассейн» фразой не
+    считается»)."""
+    words = _ordered_content_words(original)
+    if len(words) < 2:
+        return [], ()
+    sentence_of = _sentence_indices_for_words(words, original)
+    rows = knowledge.get_rows(handle, "processes", knowledge.all_ids(handle, "processes"))
+    forms_by_process = [(row["id"], _process_phrase_forms(row)) for row in rows.values()]
+    spans: list[tuple[int, int]] = []
+    matched_ids: list[str] = []
+    i = 0
+    n = len(words)
+    while i < n - 1:
+        max_len = min(n - i, _MAX_PROCESS_PHRASE_WORDS, _same_sentence_run_length(sentence_of, i))
+        matched_at_i: list[str] = []
+        matched_len = 0
+        for length in range(max_len, 1, -1):
+            window = words[i:i + length]
+            phrase_stems = frozenset(terms.normalize_ru(" ".join(w[0] for w in window)).split())
+            if not phrase_stems:
+                continue
+            hits = [pid for pid, forms in forms_by_process
+                   if any(phrase_stems <= form and head <= phrase_stems for form, head in forms)]
+            if hits:
+                matched_at_i, matched_len = hits, length
+                break
+        if matched_len >= 2:
+            spans.append((words[i][1], words[i + matched_len - 1][2]))
+            matched_ids.extend(matched_at_i)
+            i += matched_len
+        else:
+            i += 1
+    return spans, tuple(dict.fromkeys(matched_ids))
+
+
+# Правка Task 3, раунд 1 (Д17, план §Task 3, тот же класс дефекта — контроллер): пословный разбор резолвил
+# ОДНОВРЕМЕННО термин «Машинное направление» (`md`) И термин «Кратковременная изменчивость в машинном
+# направлении» (`st-md`) на вопрос «Что такое машинное направление?» — пара слов «машинное»/«направление»
+# подстановочно (`terms._matches`, подмножеством в любую сторону) совпадает с ОБОИМИ, хотя технолог назвал
+# короткий термин ТОЧНО, без части названия длинного. Фраза термина — та же идея, что фраза узла выше, но с
+# равенством множества основ вместо подмножества (`terms.resolve_term_exact_phrase`): равенство выбирает
+# термин, чьё название фраза называет ЦЕЛИКОМ, а не любой термин, который фраза частично упоминает.
+_MAX_TERM_PHRASE_WORDS = 8  # запас на длинные названия терминов настоящего корпуса (4+ содержательных слова)
+
+
+def _term_phrase_matches(handle: "CorpusHandle", original: str) -> tuple[list[tuple[int, int]],
+                                                                          tuple["ResolvedTerm", ...]]:
+    """Фразы термина в исходном тексте вопроса (см. комментарий выше) — диапазоны (чтобы слова фразы не шли в
+    пословный `terms.resolve_term`, см. `_resolve_question_terms`) и уже готовые `ResolvedTerm` для них
+    (`terms.resolve_term_exact_phrase`). Тот же проход слева направо по содержательным словам, что у фразы
+    узла: на каждой стартовой позиции — самая длинная совпавшая фраза (от `_MAX_TERM_PHRASE_WORDS` слов вниз до
+    двух), НЕ пересекая границу предложения (ревью, раунд 3, C1 — та же проверка, что у фразы узла,
+    `_sentence_indices_for_words`/`_same_sentence_run_length`). Повтор той же фразы (по набору основ) дальше в
+    тексте — не дублирует `ResolvedTerm` (гарантирует `_check_unique` модели `Preanalysis`: два одинаковых
+    результата подряд были бы неотличимы), но её слова всё равно исключаются из пословного разбора при каждом
+    появлении."""
+    words = _ordered_content_words(original)
+    if len(words) < 2:
+        return [], ()
+    sentence_of = _sentence_indices_for_words(words, original)
+    spans: list[tuple[int, int]] = []
+    resolved: list["ResolvedTerm"] = []
+    seen_keys: set[frozenset[str]] = set()
+    i = 0
+    n = len(words)
+    while i < n - 1:
+        max_len = min(n - i, _MAX_TERM_PHRASE_WORDS, _same_sentence_run_length(sentence_of, i))
+        match: "ResolvedTerm | None" = None
+        matched_len = 0
+        matched_key: frozenset[str] | None = None
+        for length in range(max_len, 1, -1):
+            window = words[i:i + length]
+            window_words = [w[0] for w in window]
+            key = frozenset(terms.normalize_ru(" ".join(window_words)).split())
+            if not key:
+                continue
+            candidate = terms.resolve_term_exact_phrase(handle, window_words)
+            if candidate is not None:
+                match, matched_len, matched_key = candidate, length, key
+                break
+        if match is not None:
+            spans.append((words[i][1], words[i + matched_len - 1][2]))
+            if matched_key not in seen_keys:
+                seen_keys.add(matched_key)
+                resolved.append(match)
+            i += matched_len
+        else:
+            i += 1
+    return spans, tuple(resolved)
+
+
 def _candidate_process_ids(handle: "CorpusHandle", parsed: NormalizedQuestion) -> tuple[str, ...]:
     """Узлы/бассейны/процессы, которые вопрос, по-видимому, называет: явный `context.process_id` (доверяем,
     если такой id существует в корпусе — дальше не ищем), иначе точная подпись тега/узла
-    (`terms.exact_tag_candidates`), иначе цифровой номер узла/бассейна (№7/№8/№9/№22 — Особый фокус проверки
-    плана) через полнотекстовый поиск по виду `processe`. Несколько разных id из этого — неоднозначность участка
+    (`terms.exact_tag_candidates`), иначе фраза узла (`_process_phrase_matches` — правка Task 3, Д17, см.
+    комментарий выше), иначе цифровой номер узла/бассейна (№7/№8/№9/№22 — Особый фокус проверки плана) через
+    полнотекстовый поиск по виду `processe`. Несколько разных id из этого — неоднозначность участка
     (`requires_clarification` добавляет `"process"`), не выбор одного произвольно (мастер-промпт §9 пакета:
     «не переставлять №7/№9 автоматически», «№8 без участка — разные узлы»)."""
     explicit = _explicit_process_id(handle, parsed.process_hint)
     if explicit:
         return explicit
     ids = _label_process_ids(handle, parsed.original)
+    _, phrase_ids = _process_phrase_matches(handle, parsed.original)
+    ids.extend(phrase_ids)
     ids.extend(_digit_node_process_ids(handle, parsed.original))
     return tuple(dict.fromkeys(ids))
 
 
 def _resolve_question_terms(handle: "CorpusHandle", parsed: NormalizedQuestion) -> tuple["ResolvedTerm", ...]:
     """Термины вопроса (см. докстринг модуля): по одному вызову `terms.resolve_term` на отдельное содержательное
-    слово текста (без служебных слов русского языка), результаты — без повторов по `original` (гарантирует
-    `_check_unique` модели `Preanalysis`, т.к. каждый токен встречается в списке ровно раз по построению
-    `_content_tokens`)."""
-    return tuple(terms.resolve_term(handle, token) for token in _content_tokens(parsed.original))
+    слово текста (без служебных слов русского языка), плюс фразы термина/узла — результаты без повторов по
+    `original` (гарантирует `_check_unique` модели `Preanalysis`: каждое слово встречается в разборе ровно
+    один раз, каждая фраза — максимум один раз на свой набор основ, см. `_term_phrase_matches`), в ПОРЯДКЕ
+    исходного текста вопроса (важно для `clarification_candidates`: «порядок — порядок слов в вопросе»).
+
+    Правка Task 3 (Д17, план §Task 3/Этап 3): слова найденной фразы узла (`_process_phrase_matches`) в этот
+    пословный разбор не попадают — у фразы узла приоритет над пословным совпадением термина (см. комментарий
+    у `_candidate_process_ids`): без исключения слово «машинном» из фразы «машинном бассейне» резолвилось бы
+    само по себе и подстановочно совпадало с термином «Машинное направление» через общую основу «машинн».
+
+    Правка Task 3, раунд 1 (Д17, тот же класс дефекта — контроллер): фраза ТЕРМИНА (`_term_phrase_matches`,
+    равенство множества основ, не подмножество) — тоже приоритет над пословным разбором и тоже исключается из
+    него: без исключения слова «машинное»/«направление» резолвились бы по отдельности и подстановочно
+    совпадали бы ОДНОВРЕМЕННО с «Машинное направление» (`md`) и «Кратковременная изменчивость в машинном
+    направлении» (`st-md`) — вопрос про короткий термин получал бы лишнее уточнение «какая величина» вместо
+    прямого определения. Готовый `ResolvedTerm` для найденной фразы термина идёт в общий список НАПРЯМУЮ
+    (не второй вызов `terms.resolve_term` на неё — `terms.resolve_term_exact_phrase` уже построил результат по
+    тем же правилам)."""
+    phrase_spans, _ = _process_phrase_matches(handle, parsed.original)
+    term_phrase_spans, term_resolved = _term_phrase_matches(handle, parsed.original)
+    excluded = tuple(phrase_spans) + tuple(term_phrase_spans)
+    word_items = _content_tokens_with_positions(parsed.original, extra_excluded_spans=excluded)
+    entries: list[tuple[int, "ResolvedTerm"]] = [
+        (start, terms.resolve_term(handle, word)) for word, start, _end in word_items
+    ]
+    entries.extend(zip((start for start, _end in term_phrase_spans), term_resolved))
+    entries.sort(key=lambda item: item[0])
+    return tuple(resolved for _start, resolved in entries)
 
 
 # правка F4b, п.2 (H-26): секция уточнения «какая величина имеется в виду» без вариантов не даёт технологу
@@ -874,16 +1188,27 @@ def clarification_candidates(handle: "CorpusHandle", parsed: NormalizedQuestion,
     спорному термину отдельно и решать, как их показать — сигнатура этого не ограничивает.
 
     `handle`/`parsed` — контракт, предусмотренный брифом (симметрия с `build_evidence_pack`/`_resolve_question_
-    terms`); сам текст вопроса здесь не нужен — подписи строит только `candidate_ids`, уже разрешённые
-    `terms.resolve_term`, без нового обращения к корпусу текстом. Термин, пропавший из словаря между
+    terms`); для спорного термина сам текст вопроса не нужен — подписи строит только `candidate_ids`, уже
+    разрешённые `terms.resolve_term`, без нового обращения к корпусу текстом. Термин, пропавший из словаря между
     `resolve_term` и этим вызовом (`knowledge.get_rows` не вернула строку), — пропускается молча: сбор подписей
-    вспомогательный, не критичный путь (без них вызывающий просто покажет прежний текст без вариантов)."""
-    del parsed  # зарезервировано контрактом брифа — сами подписи строятся только по candidate_ids, не по тексту
+    вспомогательный, не критичный путь (без них вызывающий просто покажет прежний текст без вариантов).
+
+    Правка Task 3 (Д17, план §Task 3/Этап 3): если спорного термина нет, но неоднозначен сам УЗЕЛ (несколько
+    кандидатов `_candidate_process_ids`, та же проверка, что добавляет `"process"` в `missing_fields` у
+    `requires_clarification`) — подписи вариантов становятся `title` этих узлов («Машинный бассейн нижней сетки
+    №4» и «...верхней сетки №8», не «какая величина»). Сигнатура функции не меняется (вызывается из
+    `service.py`, который правит Task 1) — данные для узлов добираются здесь же, заново через `parsed`, тем же
+    путём, что и у `analyze()`."""
     for term in resolved_terms:
         if not (term.requires_confirmation and term.candidate_ids):
             continue
         rows = knowledge.get_rows(handle, "terms", term.candidate_ids)
         labels = [str(rows[cid].get("preferred_ru") or cid) for cid in term.candidate_ids if cid in rows]
+        return tuple(dict.fromkeys(labels))[:MAX_CLARIFICATION_CANDIDATES]
+    process_ids = _candidate_process_ids(handle, parsed)
+    if len(process_ids) > 1:
+        rows = knowledge.get_rows(handle, "processes", process_ids)
+        labels = [str(rows[pid].get("title") or pid) for pid in process_ids if pid in rows]
         return tuple(dict.fromkeys(labels))[:MAX_CLARIFICATION_CANDIDATES]
     return ()
 
@@ -1125,8 +1450,13 @@ def analyze(identity: "RequestIdentity", request: "AnalysisRequest", handle: "Co
     # Правка F4b, п.3 (H-29): `period_given` — явный `context.period` клиента (`PeriodWindow` с датами), не
     # угадывание из текста; `mode` — режим диалога самого запроса (`request.mode`), не намерение по тексту.
     period_given = request.context is not None and request.context.period is not None
+    # Правка контроллера, раунд 2 (Д17): подпись оборудования — по исходному `parsed` (как единицы/период/
+    # база ниже), не по `search_parsed` без кода чужой машины — та же причина, по которой requires_clarification
+    # уже вызывается с исходным `parsed`, см. комментарий выше.
+    has_equipment_label = _mentions_equipment_link_label(handle, parsed.original)
     needs_clarification, missing_fields = requires_clarification(
-        parsed, resolved_terms, process_ids, mode=request.mode, period_given=period_given)
+        parsed, resolved_terms, process_ids, mode=request.mode, period_given=period_given,
+        has_equipment_label=has_equipment_label)
 
     if needs_clarification:
         preanalysis = Preanalysis(

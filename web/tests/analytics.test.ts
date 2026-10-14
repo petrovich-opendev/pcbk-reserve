@@ -6,7 +6,8 @@
 import { expect, test } from "vitest";
 import {
   parseCapabilities, parseConversationDetail, parseConversationList, parseCreatedConversation,
-  parseEvidenceItem, parseJobResponse, parseQuestionAccepted, parseReviewList, type JobResponse,
+  parseEquipmentLinkList, parseEvidenceItem, parseJobResponse, parseLinkCandidates, parseQuestionAccepted,
+  parseReviewList, type JobResponse,
 } from "../src/analytics";
 
 const section = (over: Partial<Record<string, unknown>> = {}) => ({
@@ -227,6 +228,68 @@ test("parse_evidence_item_ok_and_rejections", () => {
     { ...ok, source_date: "x".repeat(41) },                // длиннее SOURCE_DATE_MAX
   ]) {
     expect(parseEvidenceItem(bad), JSON.stringify(bad)).toBeNull();
+  }
+});
+
+// --- Д17 Task 1 «Produces»: telemetry_observation — та же строгая проверка SECTION_KINDS, что у остальных ---
+
+test("parse_job_response_accepts_telemetry_observation_section_kind", () => {
+  const body = jobBody({
+    sections: [section({ kind: "telemetry_observation", text: "Данные историана по подписи «20FAKE_001_PV»…" })],
+  });
+  const parsed = parseJobResponse(body);
+  expect(parsed).not.toBeNull();
+  expect(parsed?.sections[0]?.kind).toBe("telemetry_observation");
+});
+
+// --- Д17 Task 2: связи оборудования с историаном (GET analytics/links и .../candidates, форма — Task 1
+// плана «Produces», дословно) ---
+
+const LINK = { id: "EQ-FAKE-001", display_label: "20FAKE_001_PV", document_context: "уровнемер в машинном бассейне №1",
+              state: "unbound", historian_tag: null, approved_by: null, approved_at: null, pending_request_id: null };
+
+test("parse_equipment_link_list_ok_empty_and_rejections", () => {
+  expect(parseEquipmentLinkList({ links: [] })).toEqual([]);
+  expect(parseEquipmentLinkList({ links: [LINK] })).toEqual([{
+    id: "EQ-FAKE-001", displayLabel: "20FAKE_001_PV", documentContext: "уровнемер в машинном бассейне №1",
+    state: "unbound", historianTag: null, approvedBy: null, approvedAt: null, pendingRequestId: null,
+  }]);
+  const linked = { ...LINK, state: "linked", historian_tag: "20FAKE_001_PV", approved_by: "tech1",
+                   approved_at: "2026-10-14T08:00:00+00:00" };
+  expect(parseEquipmentLinkList({ links: [linked] })).toEqual([{
+    id: "EQ-FAKE-001", displayLabel: "20FAKE_001_PV", documentContext: "уровнемер в машинном бассейне №1",
+    state: "linked", historianTag: "20FAKE_001_PV", approvedBy: "tech1", approvedAt: "2026-10-14T08:00:00+00:00",
+    pendingRequestId: null,
+  }]);
+  for (const bad of [
+    null, { links: "nope" }, { links: [LINK], extra: 1 }, { links: [{ ...LINK, state: "unknown_state" }] },
+    { links: [{ ...LINK, extra: 1 }] }, { links: [{ ...LINK, display_label: "" }] },
+    (() => { const b = { ...LINK } as Record<string, unknown>; delete b.pending_request_id; return b; })(),
+  ]) {
+    expect(parseEquipmentLinkList(bad), JSON.stringify(bad)).toBeNull();
+  }
+});
+
+test("parse_link_candidates_ok_empty_and_rejections", () => {
+  const ok = { status: "ok", message: null,
+              candidates: [{ tag: "20FAKE_001_PV", description: "Уровень в баке 1", unit: "%" }] };
+  expect(parseLinkCandidates(ok)).toEqual({
+    status: "ok", message: null, candidates: [{ tag: "20FAKE_001_PV", description: "Уровень в баке 1", unit: "%" }],
+  });
+  // кандидат без единицы (unit: null) — допустим (дискретный тег)
+  expect(parseLinkCandidates({ ...ok, candidates: [{ tag: "25FAKE_007_CLS", description: "Состояние насоса", unit: null }] }))
+    .toEqual({ status: "ok", message: null, candidates: [{ tag: "25FAKE_007_CLS", description: "Состояние насоса", unit: null }] });
+  expect(parseLinkCandidates({ status: "ok", message: null, candidates: [] }))
+    .toEqual({ status: "ok", message: null, candidates: [] });
+  const refused = { status: "refused", message: "Тег вне разрешённого списка", candidates: [] };
+  expect(parseLinkCandidates(refused)).toEqual({ status: "refused", message: "Тег вне разрешённого списка", candidates: [] });
+  for (const bad of [
+    null, { ...ok, extra: 1 }, { ...ok, status: "" }, { ...ok, message: 7 },
+    { ...ok, candidates: [{ tag: "T", description: "d", unit: "u", extra: 1 }] },
+    { ...ok, candidates: "nope" }, { ...ok, candidates: [{ tag: "", description: "d", unit: null }] },
+    (() => { const b = { ...ok } as Record<string, unknown>; delete b.message; return b; })(),
+  ]) {
+    expect(parseLinkCandidates(bad), JSON.stringify(bad)).toBeNull();
   }
 });
 

@@ -11,8 +11,9 @@ from pcbk_core.analytics import service as service_mod
 from pcbk_core.analytics.service import AnalyticsService
 from pcbk_core.analytics.settings import AnalyticsSettings
 from pcbk_core.gateway.analytics_api import (CAPABILITIES_PATH, CONVERSATION_PATH, CONVERSATIONS_PATH,
-                                             EVIDENCE_PATH, QUESTIONS_PATH, REQUEST_CANCEL_PATH, REQUESTS_PATH,
-                                             REVIEW_DECISION_PATH, REVIEW_REQUESTS_PATH)
+                                             EVIDENCE_PATH, LINK_CANDIDATES_PATH, LINKS_PATH, QUESTIONS_PATH,
+                                             REQUEST_CANCEL_PATH, REQUESTS_PATH, REVIEW_DECISION_PATH,
+                                             REVIEW_REQUESTS_PATH)
 from pcbk_core.gateway.api import COOKIE, GW_MESSAGES
 from pcbk_core.gateway.lessons_api import LESSONS_PATH
 
@@ -33,7 +34,8 @@ def gw_on(tmp_path):
 
 ALL_PATHS = (CAPABILITIES_PATH, CONVERSATIONS_PATH, REQUESTS_PATH.format(request_id="r1"),
             REQUEST_CANCEL_PATH.format(request_id="r1"), EVIDENCE_PATH.format(evidence_id="e1"),
-            REVIEW_REQUESTS_PATH, REVIEW_DECISION_PATH.format(review_id="rv1"))
+            REVIEW_REQUESTS_PATH, REVIEW_DECISION_PATH.format(review_id="rv1"), LINKS_PATH,
+            LINK_CANDIDATES_PATH.format(link_id="l1"))
 
 
 def test_analytics_disabled_is_404_and_old_routes_work(gw_off):
@@ -60,7 +62,7 @@ def test_analytics_enabled_stub_503_get(gw_on):
     s3 = gw_on.as_("stu-03")
     for path in (CAPABILITIES_PATH, CONVERSATIONS_PATH, CONVERSATION_PATH.format(conversation_id="c1"),
                 REQUESTS_PATH.format(request_id="r1"), EVIDENCE_PATH.format(evidence_id="e1"),
-                REVIEW_REQUESTS_PATH):
+                REVIEW_REQUESTS_PATH, LINKS_PATH, LINK_CANDIDATES_PATH.format(link_id="l1")):
         r = s3.get(path)
         assert (r.status_code, r.json()) == (503, NOT_READY), path
 
@@ -526,10 +528,10 @@ def test_real_decide_review_rejects_unknown_decision_value(gw_an):
 
 def test_real_capabilities_reflects_review_authority_and_data_bridge(gw_an):
     """review_authority: действующее полномочие ЭТОГО логина, в любой области (не чужое) — поведение не менялось.
-    data_bridge_available: решение контроллера (итоговая правка F1, п.2, 14.10) — ВСЕГДА False; вывод
-    телеметрии (`data_bridge.py`) в ответ ждёт решения владельца по полномочиям и формату секции ответа.
-    Согласованная связь оборудования и подключённый `DataService` больше НЕ включают это поле — тест явно
-    проверяет, что обе прежние предпосылки одновременно выполнены, а поле всё равно False."""
+    data_bridge_available (план Д17, Task 1 — снимает прежнее решение Д16 «ВСЕГДА False», контракт ответа
+    теперь несёт `telemetry_observation`): `self.calc is not None` И у его роли нет `config_error` — НЕ зависит
+    от того, есть ли хоть одна согласованная связь оборудования (конкретную подпись без связи справка покажет
+    отдельным ограничением, не как недоступность службы)."""
     from pcbk_core.analytics.models import RequestIdentity
     svc = gw_an.role.analytics
     s3 = gw_an.as_("stu-03")
@@ -548,11 +550,18 @@ def test_real_capabilities_reflects_review_authority_and_data_bridge(gw_an):
     req = svc.reviews.create_request("equipment_link", "EQ-FAKE-900", "20FAKE_001_PV", "KDM1_PCBK",
                                      "основание", created_by=stu_identity)
     svc.reviews.decide(req.id, "accepted", "", decided_by=teach_identity)
-    # согласованная связь оборудования теперь есть, но calc всё ещё не подключён — False по обеим причинам
+    # согласованная связь оборудования есть, но calc всё ещё не подключён — False (нет службы данных вовсе)
     assert s3.get(CAPABILITIES_PATH).json()["data_bridge_available"] is False
-    svc.calc = object()                                                          # двойник DataService — не None
-    # ОБЕ прежние предпосылки выполнены (calc подключён И согласованная связь есть) — поле всё равно False
-    assert s3.get(CAPABILITIES_PATH).json()["data_bridge_available"] is False
+
+    class _CalcRole:
+        config_error = None
+
+    class _Calc:
+        role = _CalcRole()
+    svc.calc = _Calc()                            # двойник DataService с role.config_error=None — подключён
+    assert s3.get(CAPABILITIES_PATH).json()["data_bridge_available"] is True
+    svc.calc.role.config_error = "сбой ворот историана"
+    assert s3.get(CAPABILITIES_PATH).json()["data_bridge_available"] is False    # calc подключён, но роль неисправна
 
 
 # --- F5 (итоговое ревью, 14.10.2026, решение владельца): ANALYTICS_REVIEWERS=all_students ---
@@ -628,3 +637,113 @@ def test_real_all_students_mode_student_decides_any_request_including_own_no_sec
     teach_decide = teach.post(REVIEW_DECISION_PATH.format(review_id=review_id3), headers={"Origin": BASE},
                               json={"decision": "accepted", "comment": ""})
     assert teach_decide.status_code == 404      # та же невидимость, что у постороннего — не 403
+
+
+# --- план Д17, Task 1: «Связи с историаном» (links/*) ---
+
+def test_links_list_states(gw_an):
+    """`unbound` (ничего не сделано), `pending` (заявка `equipment_link` видна создателю), `linked` (принятая
+    заявка) — порядок как в корпусе, по `id`."""
+    from pcbk_core.analytics.models import RequestIdentity
+    svc = gw_an.role.analytics
+    s3 = gw_an.as_("stu-03")
+
+    pending = s3.post(REVIEW_REQUESTS_PATH, headers={"Origin": BASE},
+                      json={"kind": "equipment_link", "subject_id": "EQ-FAKE-002", "new_value": "20FAKE_002_PV",
+                            "scope": "KDM1_PCBK", "rationale": "видел на снимке"})
+    assert pending.status_code == 201
+    pending_id = pending.json()["id"]
+
+    teach_identity = RequestIdentity(login="teach", role="teacher", place=None, caller="teacher")
+    svc.reviews.bootstrap_authority("teach", "KDM1_PCBK", ("equipment_link",), operator="operator")
+    created = svc.reviews.create_request("equipment_link", "EQ-FAKE-003", "20FAKE_003_PV", "KDM1_PCBK",
+                                         "видел на снимке", created_by=teach_identity)
+    svc.reviews.grant_authority("stu-05", "KDM1_PCBK", ("equipment_link",), granted_by=teach_identity)
+    stu5_identity = RequestIdentity(login="stu-05", role="student", place=5, caller="student-05")
+    svc.reviews.decide(created.id, "accepted", "", decided_by=stu5_identity)
+
+    r = s3.get(LINKS_PATH)
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"links"}
+    ids = [link["id"] for link in body["links"]]
+    assert ids == sorted(ids)                                        # порядок как в корпусе, по id
+    links = {link["id"]: link for link in body["links"]}
+    assert set(links) >= {"EQ-FAKE-001", "EQ-FAKE-002", "EQ-FAKE-003"}
+    for link in links.values():
+        assert set(link) == {"id", "display_label", "document_context", "state", "historian_tag",
+                             "approved_by", "approved_at", "pending_request_id"}
+
+    unbound = links["EQ-FAKE-001"]
+    assert unbound["display_label"] == "20FAKE_001_PV"
+    assert (unbound["state"], unbound["historian_tag"], unbound["pending_request_id"]) == ("unbound", None, None)
+
+    pend = links["EQ-FAKE-002"]
+    assert (pend["state"], pend["historian_tag"], pend["pending_request_id"]) == ("pending", None, pending_id)
+
+    linked = links["EQ-FAKE-003"]
+    assert (linked["state"], linked["historian_tag"], linked["approved_by"]) == ("linked", "20FAKE_003_PV",
+                                                                                  "stu-05")
+    assert linked["approved_at"]
+
+
+def test_link_candidates_proxy_catalog_search(gw_an):
+    """Один `data_bridge.catalog_search(display_label, limit=10)`; `status`/`message` — из ответа `DataService`
+    как есть; неизвестный `link_id` — 404; служба данных не подключена — 503."""
+    svc = gw_an.role.analytics
+    s3 = gw_an.as_("stu-03")
+
+    unknown = s3.get(LINK_CANDIDATES_PATH.format(link_id="EQ-FAKE-900"))
+    assert unknown.status_code == 404
+
+    no_calc = s3.get(LINK_CANDIDATES_PATH.format(link_id="EQ-FAKE-001"))
+    assert no_calc.status_code == 503
+
+    class _FakeCalc:
+        async def catalog_search(self, caller, channel, query, limit=10):
+            self.seen = (caller, channel, query, limit)
+            return {"status": "ok", "matches": [{"tag": "20FAKE_001_PV", "description": "расход",
+                                                 "unit": "л/час", "kind": "analog"}]}
+    svc.calc = _FakeCalc()
+    ok = s3.get(LINK_CANDIDATES_PATH.format(link_id="EQ-FAKE-001"))
+    assert ok.status_code == 200
+    body = ok.json()
+    assert set(body) == {"status", "message", "candidates"}
+    assert body == {"status": "ok", "message": None,
+                    "candidates": [{"tag": "20FAKE_001_PV", "description": "расход", "unit": "л/час"}]}
+    assert svc.calc.seen == ("student-03", "web", "20FAKE_001_PV", 10)
+
+    class _RefusingCalc:
+        async def catalog_search(self, caller, channel, query, limit=10):
+            return {"status": "refused", "message": "ворота закрыты", "matches": []}
+    svc.calc = _RefusingCalc()
+    refused = s3.get(LINK_CANDIDATES_PATH.format(link_id="EQ-FAKE-001"))
+    assert refused.status_code == 200
+    assert refused.json() == {"status": "refused", "message": "ворота закрыты", "candidates": []}
+
+
+def test_create_equipment_link_validates_subject_and_tag(gw_an):
+    """`kind="equipment_link"`: `subject_id` обязан быть `id` строки `equipment_links` текущего корпуса,
+    `new_value` — именем тега по `data.sql.SAFE_NAME` — иначе 400; прочие виды заявок эту проверку не проходят
+    (`subject_id` у них не обязан быть строкой `equipment_links`)."""
+    s3 = gw_an.as_("stu-03")
+    bad_tag = s3.post(REVIEW_REQUESTS_PATH, headers={"Origin": BASE},
+                      json={"kind": "equipment_link", "subject_id": "EQ-FAKE-001", "new_value": "не тег!",
+                            "scope": "KDM1_PCBK", "rationale": "основание"})
+    assert bad_tag.status_code == 400
+
+    bad_subject = s3.post(REVIEW_REQUESTS_PATH, headers={"Origin": BASE},
+                          json={"kind": "equipment_link", "subject_id": "EQ-FAKE-900",
+                                "new_value": "20FAKE_900_PV", "scope": "KDM1_PCBK", "rationale": "основание"})
+    assert bad_subject.status_code == 400
+
+    ok = s3.post(REVIEW_REQUESTS_PATH, headers={"Origin": BASE},
+                json={"kind": "equipment_link", "subject_id": "EQ-FAKE-001", "new_value": "20FAKE_001_PV",
+                      "scope": "KDM1_PCBK", "rationale": "основание"})
+    assert ok.status_code == 201
+    assert ok.json()["kind"] == "equipment_link"
+
+    other_kind = s3.post(REVIEW_REQUESTS_PATH, headers={"Origin": BASE},
+                         json={"kind": "conflict", "subject_id": "не тег и не equipment_links!",
+                               "new_value": "значение", "scope": "KDM1_PCBK", "rationale": "основание"})
+    assert other_kind.status_code == 201

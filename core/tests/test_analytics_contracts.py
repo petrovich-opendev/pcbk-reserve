@@ -153,3 +153,34 @@ def test_job_response_invalid_duplicate_clarification_keys():
     bad["clarification_keys"] = ["unit", "unit"]
     with pytest.raises(ValidationError):
         JobResponse.model_validate(bad)
+
+
+# --- план Д17, Task 1: telemetry_observation — SectionKind и enum схемы не расходятся ---
+
+def test_job_response_accepts_telemetry_observation_section_kind():
+    """`kind="telemetry_observation"` (план Д17, Task 1) принимается моделью и зеркалит `evidence_refs=[]`,
+    `claim_id=None`, `rendered_by="server"` — как у прочих серверных ограничений/наблюдений, не контракт
+    заказчика (мастер-промпт §7 п.7: источник телеметрии — служба данных, не корпус)."""
+    body = json.loads(json.dumps(JOB_RESPONSE_VALID))
+    body["sections"] = [{
+        "kind": "telemetry_observation",
+        "text": "Данные историана по подписи 20FAKE_001_PV (тег 20FAKE_001_PV; связь согласовал tech1, "
+               "01.01.2026): 12,5 л/час на 2026-10-14T08:00:00+00:00 — время историана (Europe/Moscow); "
+               "качество: good. Это измеренное значение на момент ответа, не норматив и не уставка.",
+        "evidence_refs": [], "rendered_by": "server", "claim_id": None,
+    }]
+    job = JobResponse.model_validate(body)
+    assert job.sections[0].kind == "telemetry_observation"
+
+
+def test_job_response_schema_enum_includes_telemetry_observation():
+    """Копия схемы (`contracts/job-response.schema.json`) и модель (`models.SectionKind`) несут один и тот же
+    набор значений — синхронность, а не только то, что модель принимает значение."""
+    schema = json.loads((CONTRACTS_DIR / CONTRACT_SCHEMAS[JobResponse]).read_text(encoding="utf-8"))
+    schema_kinds = set(schema["properties"]["sections"]["items"]["properties"]["kind"]["enum"])
+    from typing import get_args
+    from pcbk_core.analytics.models import SectionKind
+    assert schema_kinds == set(get_args(SectionKind)) == {
+        "document_observation", "public_definition", "calculation", "qualified_hypothesis", "limitation",
+        "clarification", "telemetry_observation",
+    }

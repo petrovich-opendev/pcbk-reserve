@@ -42,3 +42,34 @@ PLACE_MAX = 11`, «было 10»); три докстринга в `data/` упо
   `PROTECTED_DATA_BASELINE.current.json` (не с архивным `PROTECTED_DATA_BASELINE.json` пакета, который заведомо
   устарел на этот докстринг) — падает при изменении любого из 19 файлов относительно текущей базы, независимо
   от этого уже учтённого расхождения.
+
+## Расширение контракта: `telemetry_observation` (Task 1, план Д17-telemetry-lessons, 14.10.2026)
+
+Причина — мастер-промпт §7 п.7 («Отделение наблюдения документа, теории, телеметрии, расчёта и гипотезы») и §8
+(`data_bridge.py`/ряды): до Д17 секция ответа `analytics/contracts/job-response.schema.json#kind`
+(`models.SectionKind`) не несла вида секции для данных историана вовсе — Д16 сознательно держал
+`capabilities().data_bridge_available` ВСЕГДА `False` (правка F1, п.2 итогового ревью), пока владелец не
+принял формат секции и полномочия согласования связи оборудования (Task 7, уже реализовано). Д17 закрывает
+этот отложенный пункт: `kind` enum получил значение `"telemetry_observation"` — в обоих местах одновременно
+(`models.py` и копия схемы `contracts/job-response.schema.json`, `test_analytics_contracts.py` держит их
+синхронными).
+
+Что несёт секция: `text` — детерминированный серверный шаблон (`rendering.render_telemetry_section`/
+`render_telemetry_period_section`) буквально из полей ответа прежнего `DataService` (значение/единица/время/
+качество историана или среднее/минимум/максимум/доля хороших точек за период), без пересчёта;
+`evidence_refs=[]` ВСЕГДА — источник значения не корпус (не `fragments`/`claims`), а служба данных, у неё нет
+локатора вида `pdf_page`/`xlsx_cell`/`image_label`/`public_section`; `claim_id=None` — не карточка; `rendered_
+by="server"`, как у всех секций. Имя тега историана для чтения — только `ResolvedLink.historian_tag` принятой
+заявки `kind="equipment_link"` (`reviews.resolved_link`), не подпись вопроса/корпуса и не результат поиска по
+каталогу — сама секция это не проверяет повторно, проверка уже сделана до вызова `render_telemetry_*_section`
+(`service._telemetry_section_for_label`).
+
+Где проверяется: `core/tests/test_analytics_rendering.py` (сами функции рендеринга — значение/период/четыре
+ограничения, на синтетическом `ResolvedLink`/ответе-двойнике `DataService`, без корпуса и без реального
+историана), `core/tests/test_analytics_contracts.py` (`test_job_response_accepts_telemetry_observation_
+section_kind`/`test_job_response_schema_enum_includes_telemetry_observation` — модель и копия схемы не
+расходятся), `core/tests/test_analytics_service.py` (`test_telemetry_*` — координатор: подпись без связи,
+подпись со связью читает ровно один раз, период, отзыв `ANALYTICS_REVIEWERS`, непопадание в needs_clarification/
+control/refused, отказ `DataService` как есть, предел трёх подписей на ответ), `core/tests/test_gw_analytics_
+api.py` (`test_links_list_states`/`test_link_candidates_proxy_catalog_search`/`test_create_equipment_link_
+validates_subject_and_tag` — настоящий HTTP-путь маршрутов `links/*` и валидация заявки `equipment_link`).

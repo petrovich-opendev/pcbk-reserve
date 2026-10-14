@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+from datetime import datetime
 
 import pydantic
 import pytest
@@ -27,7 +28,14 @@ from pcbk_core.analytics.rendering import (
     render_clarification_section,
     render_mechanism_section,
     render_response,
+    render_telemetry_period_section,
+    render_telemetry_refusal_section,
+    render_telemetry_section,
+    render_telemetry_truncated_section,
+    render_telemetry_unavailable_section,
+    render_telemetry_unresolved_section,
 )
+from pcbk_core.analytics.reviews import ResolvedLink
 
 
 def _ref(**over) -> EvidenceRef:
@@ -349,6 +357,132 @@ def test_section_rendered_by_is_always_server_literal():
     значение (например, подменить источник текста на модель)."""
     with pytest.raises(pydantic.ValidationError):
         Section(kind="limitation", text="x", evidence_refs=[], rendered_by="model", claim_id=None)
+
+
+# --- план Д17, Task 1: телеметрия БДРВ в ответе (мастер-промпт §7 п.7, §8) ---
+
+def _link(**over) -> ResolvedLink:
+    base = dict(link_id="EQ-FAKE-001", process_id="PROC-FAKE-001", historian_tag="20FAKE_001_PV", unit=None,
+               approved_by="tech1", approved_at=datetime(2026, 1, 15), scope="PROC-FAKE-001")
+    base.update(over)
+    return ResolvedLink(**base)
+
+
+def _now_reply(**over) -> dict:
+    item = {"tag": "20FAKE_001_PV", "status": "ok", "description": "расход", "unit": "л/час", "kind": "analog",
+           "value": 12.5, "time": "2026-10-14T08:00:00+00:00", "age_s": 5, "quality": "good", "item_notes": []}
+    item.update(over.pop("item", {}))
+    reply = {"tool": "tag_now", "status": "ok", "notes": [], "cache": "none",
+            "asof": "2026-10-14T08:00:00+00:00", "tz": "Europe/Moscow", "source": "live", "items": [item]}
+    reply.update(over)
+    return reply
+
+
+def test_render_telemetry_section_includes_label_tag_approval_value_unit_time_quality():
+    section = render_telemetry_section("20FAKE_001_PV", _link(), _now_reply())
+    assert section.kind == "telemetry_observation"
+    assert section.evidence_refs == [] and section.claim_id is None and section.rendered_by == "server"
+    text = section.text
+    for piece in ("20FAKE_001_PV", "tech1", "15.01.2026", "12,5", "л/час", "время историана", "Europe/Moscow",
+                 "good", "не норматив и не уставка"):
+        assert piece in text, piece
+
+
+def test_render_telemetry_section_discrete_tag_uses_state_label_not_value_unit():
+    reply = _now_reply(item={"tag": "25FAKE_007_CLS", "status": "ok", "description": "состояние",
+                             "unit": None, "kind": "discrete", "value": 1.0,
+                             "time": "2026-10-14T08:00:00+00:00", "age_s": 5, "quality": "good",
+                             "item_notes": [], "state_label": "работа"})
+    section = render_telemetry_section("20FAKE_007_CLS", _link(historian_tag="25FAKE_007_CLS"), reply)
+    assert "работа" in section.text
+    assert "1,0" not in section.text and "1.0" not in section.text
+
+
+def test_render_telemetry_section_item_notes_appended():
+    reply = _now_reply()
+    reply["items"][0]["item_notes"] = ["значение не менялось 30 мин: это и ровный процесс"]
+    section = render_telemetry_section("20FAKE_001_PV", _link(), reply)
+    assert "значение не менялось 30 мин" in section.text
+
+
+def test_render_telemetry_section_item_status_not_ok_uses_item_text():
+    reply = _now_reply(item={"tag": "20FAKE_001_PV", "status": "no_value", "text": "нет значения",
+                             "unit": "л/час", "kind": "analog", "value": None, "time": None, "age_s": None,
+                             "quality": None, "item_notes": []})
+    section = render_telemetry_section("20FAKE_001_PV", _link(), reply)
+    assert section.kind == "telemetry_observation"
+    assert "нет значения" in section.text
+
+
+def test_render_telemetry_period_section_includes_period_avg_min_max_good():
+    reply = {"tool": "tag_period", "status": "ok", "notes": [], "cache": "none",
+            "period": {"start": "2026-10-14T00:00:00+00:00", "end": "2026-10-14T08:00:00+00:00",
+                      "tz": "Europe/Moscow", "preset": "prev_shift", "shift_grid_assumed": False,
+                      "clamped": False, "open": False},
+            "source": "summary", "avg_kind": {"code": "x", "text": "x"}, "std_kind": {"code": "x", "text": "x"},
+            "cost_tag_days": 0.1,
+            "items": [{"tag": "20FAKE_001_PV", "status": "ok", "description": "расход", "unit": "л/час",
+                      "avg": 12.4, "min": 10.1, "max": 15.0, "range": 4.9, "std": 0.3, "percent_good": 99.5}]}
+    section = render_telemetry_period_section("20FAKE_001_PV", _link(), reply)
+    assert section.kind == "telemetry_observation"
+    for piece in ("12,4", "10,1", "15", "99,5", "л/час", "prev_shift"):
+        assert piece in section.text, piece
+
+
+def test_render_telemetry_period_section_appends_reply_notes():
+    reply = {"tool": "tag_period", "status": "ok", "notes": ["окно ограничено текущим моментом"], "cache": "none",
+            "period": {"start": "a", "end": "b", "tz": "Europe/Moscow", "preset": None,
+                      "shift_grid_assumed": False, "clamped": False, "open": True},
+            "items": [{"tag": "20FAKE_001_PV", "status": "ok", "description": "расход", "unit": "л/час",
+                      "avg": 1.0, "min": 1.0, "max": 1.0, "range": 0.0, "std": 0.0, "percent_good": 100.0}]}
+    section = render_telemetry_period_section("20FAKE_001_PV", _link(), reply)
+    assert "окно ограничено текущим моментом" in section.text
+
+
+def test_render_telemetry_period_section_item_status_not_ok_uses_item_text():
+    reply = {"tool": "tag_period", "status": "no_data",
+            "period": {"start": "a", "end": "b", "tz": "Europe/Moscow", "preset": None,
+                      "shift_grid_assumed": False, "clamped": False, "open": False},
+            "items": [{"tag": "20FAKE_001_PV", "status": "no_data", "text": "нет данных"}]}
+    section = render_telemetry_period_section("20FAKE_001_PV", _link(), reply)
+    assert "нет данных" in section.text
+
+
+def test_render_telemetry_unresolved_section_mentions_label_and_link_hint():
+    section = render_telemetry_unresolved_section("20FAKE_001_PV")
+    assert section.kind == "limitation"
+    assert "20FAKE_001_PV" in section.text
+    assert "связь" in section.text and "не согласована" in section.text
+    assert "Связи с историаном" in section.text
+
+
+def test_render_telemetry_unavailable_section_mentions_label():
+    section = render_telemetry_unavailable_section("20FAKE_001_PV")
+    assert section.kind == "limitation"
+    assert "20FAKE_001_PV" in section.text and "недоступна" in section.text
+
+
+def test_render_telemetry_refusal_section_passes_message_through():
+    section = render_telemetry_refusal_section("20FAKE_001_PV", "ворота закрыты (учения)")
+    assert section.kind == "limitation"
+    assert "20FAKE_001_PV" in section.text
+    assert "ворота закрыты (учения)" in section.text
+
+
+def test_render_telemetry_truncated_section_mentions_shown_and_total():
+    section = render_telemetry_truncated_section(3, 5)
+    assert section.kind == "limitation"
+    assert "3" in section.text and "5" in section.text
+
+
+def test_telemetry_section_functions_only_take_typed_arguments_not_free_model_text():
+    """Как и прочие `render_*_section` — ни одна функция телеметрии не принимает свободный текст модели."""
+    assert list(inspect.signature(render_telemetry_section).parameters) == ["label", "link", "reply"]
+    assert list(inspect.signature(render_telemetry_period_section).parameters) == ["label", "link", "reply"]
+    assert list(inspect.signature(render_telemetry_unresolved_section).parameters) == ["label"]
+    assert list(inspect.signature(render_telemetry_unavailable_section).parameters) == ["label"]
+    assert list(inspect.signature(render_telemetry_refusal_section).parameters) == ["label", "message"]
+    assert list(inspect.signature(render_telemetry_truncated_section).parameters) == ["shown", "total"]
 
 
 def test_rendered_text_never_equals_a_free_form_string_not_derived_from_the_card():
