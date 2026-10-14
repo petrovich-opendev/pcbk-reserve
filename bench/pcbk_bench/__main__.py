@@ -37,8 +37,8 @@ match-cases MCONFIG | match MCONFIG [--only basic] | probe-calc MCONFIG | load-c
 - table CONFIG … — таблица и рекомендация (pcbk_bench.table.main, Б2), ленивым импортом.
 
 Карточки окна (Б3, Д8-R80, I-р4-6; m19 — только ServerStand, без клиентов шлюза и паролей учёток):
-- calc CONFIG TOOL ARGS — калькулятор (DATA_TOOLS: catalog_search, tag_now, tag_period, tag_series, calc_runtime)
-  токеном ops; ARGS — JSON одной строкой
+- calc CONFIG TOOL ARGS — калькулятор (DATA_TOOLS: catalog_search, tag_now, tag_period, tag_series, calc_runtime,
+  calc_deviation, report_event) токеном ops; ARGS — JSON одной строкой
   ('{"tags": ["…"]}'); в stdout — ответ службы как есть (JSON). Только для субагента карточек (bench/cards/WRITER.md):
   контроллер его не зовёт;
 - cards-check CONFIG — коды формы карточек конфига и статусы калькулятора (cards_check), по строке: годно — ровно

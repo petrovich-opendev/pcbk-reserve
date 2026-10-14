@@ -131,9 +131,9 @@ REFUSAL_TEXTS: dict[str, str] = {
     "forbidden": "В поле … недопустимый фрагмент «…»: инструкции обхода, SQL, адреса, пути и пароли на стенде "
                  "запрещены",
     "tools_empty": "Агенту нужен хотя бы один инструмент: catalog_search, tag_now, tag_period, tag_series, "
-                   "calc_runtime",
+                   "calc_runtime, calc_deviation, report_event",
     "tool_not_allowed": "Инструмента «…» на стенде нет. Можно: catalog_search, tag_now, tag_period, tag_series, "
-                        "calc_runtime.",
+                        "calc_runtime, calc_deviation, report_event.",
     "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series или calc_runtime), а без тегов — "
                      "ещё catalog_search",
     "tags_too_many": "Тегов не больше 16",
@@ -142,6 +142,8 @@ REFUSAL_TEXTS: dict[str, str] = {
     "catalog_not_loaded": "Каталог тегов ещё не загружен — повторите позже",
     "name_taken": "Агент с именем «…» уже есть — возьмите другое имя",
     "too_many_agents": "У этого рабочего места уже 20 агентов — новый не сохранить; обратитесь к преподавателю",
+    # replace: true, а живого агента с этим именем нет (Д13) — копия draft.PROBLEM_TEXTS["replace_missing"]
+    "replace_missing": "Агента с таким именем у вас нет — сохраните как нового",
 }
 # «да» владельца на настоящие данные в пакетах — дословно п. 5 «Что нужно от владельца» (план Д8)
 REAL_DATA_CONSENT = ("Да: пакеты судьи отбора Д8 с настоящими числами значений и описаниями тегов (имена тегов, узлов "

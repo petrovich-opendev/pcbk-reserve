@@ -435,7 +435,7 @@ class GatewayRole(RoleBase):
 
         Доли — Shares роли llm (задача А2): checked_at — конец последней сверки такта уборщика (null — сверки не было:
         строка «неизвестно»), shares_loaded — доли загружены при запуске прокси, shares_ok — последняя сверка прочла
-        таблицу, shares_drift — мест с расхождением (I-7), shares_sum_usd — сумма долей десяти мест в памяти. Без роли
+        таблицу, shares_drift — мест с расхождением (I-7), shares_sum_usd — сумма долей мест в памяти. Без роли
         llm или без её долей — сверки нет: null, ложь, 0. store_ok — журнал действий открыт, и его последние запись и
         пульс прошли. total_usd — LLM_TOTAL_USD роли llm, без неё — умолчание LlmSettings."""
         count = self.teacher_stats.count_1h

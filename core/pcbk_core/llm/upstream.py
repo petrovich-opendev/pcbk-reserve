@@ -27,7 +27,7 @@ CREDITS_RE = re.compile(r"insufficient credits", re.I)
 REGION_RE = re.compile(r"not available in your region", re.I)
 
 CHAT_TIMEOUT = httpx.Timeout(connect=10, read=120, write=30, pool=10)
-MAX_CONNECTIONS = 40            # 10 мест × 3 одновременных вызова, ops и опрос
+MAX_CONNECTIONS = 40            # 11 мест × 3 = 33, плюс ops и опрос
 POLL_TIMEOUT_S = 15.0           # срок одного запроса /key, /credits, /generation — целиком, не read=120 чата
 ERROR_BODY_BYTES = 64 * 1024    # тело ответа об ошибке и ответов опроса читается не дальше
 MESSAGE_CHARS = 300

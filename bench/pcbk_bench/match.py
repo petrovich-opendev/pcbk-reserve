@@ -489,7 +489,8 @@ def _calc_verdict(case: Case, out: dict, item: dict, keys: dict, calc: dict | No
 # --- агент проверки и таблица ---
 
 def calc_agent_args(cases: Iterable[Case]) -> dict:
-    """Аргументы save_agent агента проверки CALC_AGENT: пять инструментов чтения, теги случаев, инструкция без цифр."""
+    """Аргументы save_agent агента проверки CALC_AGENT: все инструменты ALLOWED_TOOLS, теги случаев, инструкция без
+    цифр."""
     return {"name": CALC_AGENT, "title": CALC_TITLE, "node": CALC_NODE, "purpose": CALC_PURPOSE,
             "tools": list(ALLOWED_TOOLS), "tags": list(dict.fromkeys(c.tag for c in cases)),
             "prompt": CALC_PROMPT.format(node=CALC_NODE), "student_reply": CONSENT}

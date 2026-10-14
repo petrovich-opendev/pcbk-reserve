@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import WINDOW_BASE_KEYS
+from .config import PLACE_MAX, WINDOW_BASE_KEYS
 
 log = logging.getLogger("pcbk_bench.load")
 
@@ -74,7 +74,6 @@ DIFY_SWAP_MAX_MIB = 256
 MEM_FAIL_MIB = 1024
 PSI_FULL_MAX = 10.0
 MEM_WARN_MIB = 2048
-MAX_PLACES = 10
 # ворота службы данных: core/pcbk_core/data/gate.py GLOBAL_LIMIT за RATE_WINDOW_S — значением, тест сверяет
 GATE_LIMIT_5M = 300
 GATE_WINDOW_S = 300.0
@@ -530,7 +529,7 @@ class GateVerdict:
 def gate_verdict(points: Sequence[MemPoint], places: int, next_k: int, warn_mib: int = MEM_WARN_MIB) -> GateVerdict:
     """Прогноз памяти на next_k мест по ступени: база — первая точка со свободной памятью, минимум — наименьшая, прирост
     на место — (база − минимум) / places; «можно» — прогноз не ниже warn_mib + GATE_MARGIN_MIB; max_k — наибольшее
-    число мест (до MAX_PLACES), для которого это так."""
+    число мест (до PLACE_MAX), для которого это так."""
     free = [p.free_mib for p in points if p.free_mib is not None]
     if not free:
         raise ValueError("load-gate: в memory.jsonl нет точек свободной памяти")
@@ -541,9 +540,9 @@ def gate_verdict(points: Sequence[MemPoint], places: int, next_k: int, warn_mib:
     limit = warn_mib + GATE_MARGIN_MIB
     projected = base - next_k * per
     if per <= 0:
-        max_k = MAX_PLACES if base >= limit else 0
+        max_k = PLACE_MAX if base >= limit else 0
     else:
-        max_k = max(0, min(MAX_PLACES, math.floor((base - limit) / per)))
+        max_k = max(0, min(PLACE_MAX, math.floor((base - limit) / per)))
     return GateVerdict(base=base, low=low, places=places, per_place=per, next_k=next_k, projected=projected,
                        limit=limit, ok=projected >= limit, max_k=max_k)
 
