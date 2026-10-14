@@ -392,6 +392,30 @@ test("analytics_page_non_telemetry_section_without_evidence_keeps_no_sources_tex
   expect(screen.queryByText(T_AN_TELEMETRY_SOURCE)).toBeNull();
 });
 
+test("analytics_page_limitation_without_evidence_has_no_sources_line", async () => {
+  // Д17, живая проверка: секция-ограничение сервера (расхождение корпуса, отказ от команды) — не утверждение,
+  // «Без оснований — общая справка» к ней не относится; у определения без оснований — прежний текст
+  const api = fakeApi({
+    createConversation: () => Promise.resolve(reply(201, { id: "c1" })),
+    conversation: () => Promise.resolve(reply(200, {
+      conversation: { id: "c1", mode: "reference", created_at: "2026-10-14T08:00:00+00:00",
+                     last_activity_at: "2026-10-14T08:00:00+00:00", corpus_version: "20FAKE-v1" },
+      requests: [],
+    })),
+    ask: () => Promise.resolve(reply(202, { request_id: "r1" })),
+    request: () => Promise.resolve(reply(200, jobBody({
+      sections: [section({ kind: "limitation", text: "В источниках КДМ-1 есть открытое расхождение CONF-FAKE-001." })],
+    }))),
+  });
+  render(<AnalyticsPage api={api} onSignedOut={vi.fn()} pollMs={10} />);
+  fireEvent.click(await screen.findByRole("button", { name: /Новый диалог: Справка по документам/ }));
+  fireEvent.change(screen.getByLabelText(/Ваш вопрос технологу/), { target: { value: "Что с узлом?" } });
+  fireEvent.click(screen.getByRole("button", { name: T_AN_SEND }));
+
+  expect(await screen.findByText(/открытое расхождение CONF-FAKE-001/)).toBeTruthy();
+  expect(screen.queryByText(T_AN_NO_SOURCES)).toBeNull();
+});
+
 // --- Правка, раунд 1, п.1: пауза опроса при скрытой вкладке (НЕ отмена задания, НЕ сброс pollToken) ---
 
 test("analytics_page_pauses_polling_when_hidden_and_resumes_on_visible", async () => {

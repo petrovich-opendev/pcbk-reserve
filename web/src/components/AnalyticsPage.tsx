@@ -92,6 +92,10 @@ function QuestionBubble({ text }: { text: string }) {
   return <div className="msg" data-role="user">{text}</div>;
 }
 
+// ограничение и уточнение без ссылок — служебная плашка сервера (отказ от команды, расхождение корпуса, предел,
+// уточнение), не утверждение: строка «Без оснований — общая справка» к ним не относится (Д17, живая проверка)
+const NO_SOURCES_LINE_KINDS: ReadonlySet<string> = new Set(["limitation", "clarification"]);
+
 function SectionCard({ s, api }: { s: JobResponse["sections"][number]; api: AnalyticsApi }) {
   return (
     <div className="an-section" data-kind={s.kind}>
@@ -103,7 +107,7 @@ function SectionCard({ s, api }: { s: JobResponse["sections"][number]; api: Anal
           не меняются */}
       {s.kind === "telemetry_observation" ? (
         <p className="an-note">{T_AN_TELEMETRY_SOURCE}</p>
-      ) : (
+      ) : NO_SOURCES_LINE_KINDS.has(s.kind) && s.evidenceRefs.length === 0 ? null : (
         <AnalyticsSources evidenceRefs={s.evidenceRefs} api={api} />
       )}
     </div>

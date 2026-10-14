@@ -2307,18 +2307,25 @@ def test_real_corpus_task5_literal_scenarios_from_controller():
     ("влажность по объему на линии", ("объему",)),
     ("объёмная доля воздуха в потоке", ("объёмная",)),
     ("объемная доля воздуха в потоке", ("объемная",)),
-    ("показатель по сухому веществу", ("сухому",)),
-    ("на сухое вещество пересчитано", ("сухое",)),
-    ("абсолютно сухое вещество", ("сухое",)),
+    ("влажность: показатель по сухому веществу", ("сухому",)),
+    ("концентрация пересчитана на сухое вещество", ("сухое",)),
+    ("концентрация, абсолютно сухое вещество", ("сухое",)),
     ("влажность по влажному веществу", ("влажному",)),
-    ("влажная база расчёта", ("влажная",)),
-    ("пересчёт на влажную массу", ("влажную",)),
-    ("wet basis указан явно", ("wet", "basis")),
-    ("dry basis указан явно", ("dry", "basis")),
+    ("концентрация: влажная база расчёта", ("влажная",)),
+    ("концентрация: пересчёт на влажную массу", ("влажную",)),
+    ("влажность: wet basis указан явно", ("wet", "basis")),
+    ("влажность: dry basis указан явно", ("dry", "basis")),
 ])
 def test_content_tokens_excludes_basis_expression_words(text, excluded):
     """Слова выражения базы измерения не идут в пословное разрешение терминов — по образцу `_BASIS_WEIGHT_
-    PHRASE_RE`/исключения чисел-значений и цифр кода машины (докстринг `_basis_expression_phrase_spans`)."""
+    PHRASE_RE`/исключения чисел-значений и цифр кода машины (докстринг `_basis_expression_phrase_spans`).
+    Правка раунда 4 (Critical ревью 78e01b8): исключение теперь действует ТОЛЬКО когда в том же предложении
+    есть базочувствительная величина (`_BASIS_SENSITIVE_STEMS`) или явный «%» — семь случаев ниже («по
+    сухому»/«на сухое»/«абсолютно сухое»/«влажная база»/«на влажную»/wet/dry basis) сами по себе не несут
+    такого слова, поэтому к ним добавлен спутник («влажность:»/«концентрация:», та же фраза-предложение — см.
+    `_sentence_spans`, двоеточие/запятая не разбивают предложение), иначе тест проверял бы уже не ту ветку
+    (без гейта раунда 4 они перестали бы исключаться — см. контрастные тесты раунда 4 ниже, где спутника
+    умышленно НЕТ)."""
     from pcbk_core.analytics.preanalysis import _content_tokens
 
     tokens = {t.lower() for t in _content_tokens(text)}
@@ -2443,5 +2450,94 @@ def test_real_corpus_task5_round3_literal_scenarios_from_controller():
                                context=RequestContext(period=period))
         pre4, _pack4 = analyze(STUDENT, req4, h, h.version)
         assert pre4.missing_fields == []
+    finally:
+        _close(h)
+
+
+# === Task 5, раунд правки 4 (Critical ревью 78e01b8): фраза выражения базы — тема вопроса, не ответ о базе, ===
+# === без базочувствительной величины/«%» рядом ("вопрос по массе", "подскажите по массе") ===
+
+def test_basis_expression_phrase_spans_empty_without_context_trigger():
+    """Прямая проверка гейта: без базочувствительной величины/«%» в предложении — спорная фраза НЕ считается
+    названной базой, диапазон пуст (слово идёт в разрешение терминов как обычно)."""
+    from pcbk_core.analytics.preanalysis import _basis_expression_phrase_spans
+
+    assert _basis_expression_phrase_spans("У меня вопрос по массе — что это за величина?") == []
+    assert _basis_expression_phrase_spans("Подскажите по массе") == []
+    assert _basis_expression_phrase_spans("по массе рулона") == []
+
+
+def test_basis_expression_phrase_spans_nonempty_with_context_trigger():
+    """Контраст: с базочувствительной величиной («влажность») или явным «%» в том же предложении — диапазон
+    непустой (фраза считается названной базой, как в раунде 3)."""
+    from pcbk_core.analytics.preanalysis import _basis_expression_phrase_spans
+
+    assert _basis_expression_phrase_spans("влажность полотна по массе") != []
+    assert _basis_expression_phrase_spans("концентрация 4 % по массе") != []
+
+
+def test_content_tokens_keeps_mass_word_in_topic_phrase_without_trigger(handle):
+    """Буквальный сценарий координатора (Critical ревью 78e01b8): «вопрос по массе»/«подскажите по массе» —
+    тема вопроса, не ответ о базе; слово «массе» остаётся спорным термином словаря (не исключается), что и
+    даёт `quantity` ниже в end-to-end тестах."""
+    from pcbk_core.analytics.preanalysis import _content_tokens
+
+    assert "массе" in {t.lower() for t in _content_tokens("У меня вопрос по массе — что это за величина?")}
+    assert "массе" in {t.lower() for t in _content_tokens("Подскажите по массе")}
+
+
+def test_analyze_basis_expression_topic_phrase_still_clarifies_quantity(handle):
+    """End-to-end на синтетическом корпусе: буквальные сценарии координатора — фраза «по массе» как ТЕМА
+    вопроса (без базочувствительной величины/«%» в предложении) не гасит спорный термин «масса» — `quantity`
+    запрашивается, как до раунда 3 (регрессия раунда 2 — фикс раунда 3 не должен был трогать эту ветку, но
+    ловил её ошибочно до раунда 4, см. Critical ревью 78e01b8)."""
+    _insert_ambiguous_mass_term(Path(handle.path))
+    for question in ("У меня вопрос по массе — что это за величина?", "Подскажите по массе",
+                     "по массе рулона — что за величина?"):
+        pre, _pack = analyze(STUDENT, _request(question), handle, handle.version)
+        assert "quantity" in pre.missing_fields, question
+
+
+def test_analyze_basis_expression_with_context_trigger_still_suppresses_quantity_and_basis(handle):
+    """Контраст: та же фраза «по массе», но с базочувствительной величиной («влажность») в том же
+    предложении — поведение раунда 3 сохранено (`quantity`/`basis` снимаются)."""
+    _insert_ambiguous_mass_term(Path(handle.path))
+    pre, _pack = analyze(STUDENT, _request("влажность полотна по массе"), handle, handle.version)
+    assert "quantity" not in pre.missing_fields
+    assert "basis" not in pre.missing_fields
+
+
+def test_analyze_basis_expression_explicit_percent_suppresses_basis(handle):
+    """Буквальный сценарий координатора: «концентрация 4 % по массе» → без `basis` (явный «%» в том же
+    предложении — альтернативный, не только стеблевой, триггер гейта)."""
+    pre, _pack = analyze(STUDENT, _request("концентрация 4 % по массе"), handle, handle.version)
+    assert "basis" not in pre.missing_fields
+
+
+@real_corpus
+def test_real_corpus_task5_round4_literal_scenarios_from_controller():
+    """Буквальные сценарии раунда 4 (координатор, Critical ревью 78e01b8) на настоящем корпусе."""
+    from pcbk_core.analytics.knowledge import close as _close
+    from pcbk_core.analytics.knowledge import open_corpus as _open
+
+    h = _open(KDM1_PACKAGE_DIR)
+    try:
+        for question in ("У меня вопрос по массе — что это за величина?", "Подскажите по массе"):
+            pre, _pack = analyze(STUDENT, _request(question), h, h.version)
+            assert pre.decision == "needs_clarification", question
+            assert "quantity" in pre.missing_fields, question
+
+        pre_wet, _pack_wet = analyze(STUDENT, _request("влажность полотна по массе"), h, h.version)
+        assert "quantity" not in pre_wet.missing_fields
+        assert "basis" not in pre_wet.missing_fields
+
+        pre_pct, _pack_pct = analyze(STUDENT, _request("концентрация 4 % по массе"), h, h.version)
+        assert "basis" not in pre_pct.missing_fields
+
+        # регрессии раунда 3 — зелёные после раунда 4
+        pre_r3, _pack_r3 = analyze(
+            STUDENT, _request("Какая норма влажности полотна после сушки по массе на КДМ-1?"), h, h.version)
+        assert "quantity" not in pre_r3.missing_fields
+        assert "basis" not in pre_r3.missing_fields
     finally:
         _close(h)

@@ -2133,11 +2133,16 @@ async def test_telemetry_absent_with_empty_pack_and_limited_answer_decision_stay
 
 # --- план Д17, Task 1, раунд правки 4: открытые расхождения корпуса в ответе (мастер-промпт §6) ---
 
-async def test_conflict_open_adds_limitation_section_and_source_conflict_error_code(tmp_path, monkeypatch):
+async def test_conflict_open_with_empty_pack_adds_limitation_section_and_source_conflict_but_stays_limited(
+        tmp_path, monkeypatch):
     """Пробел Д16: `error_code="source_conflict"` был объявлен в контракте, но никогда не выставлялся —
     открытое расхождение корпуса, на которое преданализ сослался (`analysis.conflict_ids`), теперь даёт
     секцию `limitation` с id/описанием и этот код (мастер-промпт §6: «конфликт виден и может быть отправлен
-    на согласование»). `CONF-FAKE-001` синтетического корпуса уже в статусе `"open"` — фикстуру не трогал."""
+    на согласование»). `CONF-FAKE-001` синтетического корпуса уже в статусе `"open"` — фикстуру не трогал.
+
+    Раунд правки 5 (ревью Important, 8afc0d3): пакет доказательств и телеметрия пусты — секция расхождения
+    сама по себе НЕ делает ответ `completed` (это служебное ограничение, не содержательный ответ на вопрос) —
+    `limited_answer`, `error_code="source_conflict"` при этом остаётся."""
     def fake_analyze(identity, request, handle, corpus_version):
         return _preanalysis("ready", corpus_version=corpus_version, conflict_ids=("CONF-FAKE-001",)), ()
     monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
@@ -2148,11 +2153,37 @@ async def test_conflict_open_adds_limitation_section_and_source_conflict_error_c
     request_id = await _ask(svc, STUDENT_A, conv, question="Что с узлом №8?")
     response = await _wait_terminal(svc, STUDENT_A, request_id)
 
+    assert response.state == "limited_answer"
     assert response.error_code == "source_conflict"
     conflict = [s for s in response.sections if "CONF-FAKE-001" in s.text]
     assert len(conflict) == 1 and conflict[0].kind == "limitation"
     assert "Выдуманное открытое расхождение 1." in conflict[0].text
     assert "согласование" in conflict[0].text
+    await svc.aclose()
+
+
+async def test_conflict_open_with_nonempty_pack_still_completed(tmp_path, monkeypatch):
+    """Раунд правки 5: пакет непустой (карточка прошла повторную проверку) + открытое расхождение —
+    `completed`, как раньше («как сейчас» — расхождение не меняет состояние, когда есть настоящее
+    содержание); `error_code="source_conflict"` всё равно выставляется."""
+    card = _card("CLAIM-FAKE-001")
+
+    def fake_analyze(identity, request, handle, corpus_version):
+        return _preanalysis("ready", allowed_claim_ids=(card.id,), corpus_version=corpus_version,
+                            conflict_ids=("CONF-FAKE-001",)), (card,)
+    monkeypatch.setattr(service_mod.preanalysis, "analyze", fake_analyze)
+    monkeypatch.setattr(service_mod.rendering, "render_claim_section", lambda c: _section(c.text, claim_id=c.id))
+    monkeypatch.setattr(service_mod.rendering, "render_response", _fake_render_response)
+
+    svc = await _service(tmp_path)
+    conv = await svc.create_conversation(STUDENT_A, "reference")
+    request_id = await _ask(svc, STUDENT_A, conv, question="Что с узлом №8?")
+    response = await _wait_terminal(svc, STUDENT_A, request_id)
+
+    assert response.state == "completed"
+    assert response.error_code == "source_conflict"
+    assert any(s.claim_id == card.id for s in response.sections)
+    assert any("CONF-FAKE-001" in s.text for s in response.sections)
     await svc.aclose()
 
 

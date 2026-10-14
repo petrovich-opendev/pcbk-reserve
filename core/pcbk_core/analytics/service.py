@@ -1007,12 +1007,19 @@ class AnalyticsService:
             # decision ("ready"/"limited_answer"), как только есть хотя бы одна telemetry_observation —
             # сильнее общего правила ниже (не только при decision=="ready").
             state = "completed"
-        elif sections:
-            # ответ с карточками пакета (без телеметрии) — completed при decision=="ready", как раньше
+        elif pack_sections:
+            # ответ с карточками пакета (без телеметрии) — completed при decision=="ready", как раньше.
+            # Раунд правки 5 (ревью Important, 8afc0d3): проверяем именно pack_sections, не весь sections —
+            # conflict_sections (служебное ограничение «расхождение можно отправить на согласование», не
+            # содержательный ответ на вопрос) сам по себе не делает ответ completed; без карточек/телеметрии
+            # пустой пакет + только расхождение — всё равно limited_answer (см. else ниже), error_code=
+            # "source_conflict" на outcome при этом остаётся.
             state = "limited_answer" if analysis.decision == "limited_answer" else "completed"
         else:
             # ничего не прошло повторную проверку в момент выдачи (или пакет и так был пуст, и телеметрии нет)
-            # — безопасный ограниченный ответ, не пустой "completed" (Правка, раунд 1, Critical)
+            # — безопасный ограниченный ответ, не пустой "completed" (Правка, раунд 1, Critical). Сюда попадает
+            # и случай «пакет пуст + есть только секция(и) открытого расхождения» (раунд правки 5) — sections
+            # при этом может быть непустым (conflict_sections), но ответ всё равно limited_answer.
             state = "limited_answer"
         stage = "ограниченный ответ" if state == "limited_answer" else "проверка пройдена"
         return outcome, sections, state, stage

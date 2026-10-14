@@ -163,13 +163,45 @@ _BASIS_EXPRESSION_PHRASE_RE = re.compile(
     r"по\s+влажн\w*\b|влажн\w*\s+баз\w*\b|на\s+влажн\w*\b|"
     r"wet\s+basis\b|dry\s+basis\b",
     re.IGNORECASE)
+# Правка контроллера, раунд 4 (Critical ревью 78e01b8): фраза выше срабатывает и на ОБОРОТ-ТЕМУ, не ответ о
+# базе — «У меня вопрос по массе — что это за величина?», «Подскажите по массе», «по массе рулона» на живом
+# корпусе глушили спорное слово «масса» (4 кандидата) и давали `ready` с пакетом из 20 нерелевантных карточек
+# вместо уточнения `quantity`. Решение контроллера: фраза считается НАЗВАННОЙ БАЗОЙ (снимает слово из
+# разрешения терминов и гасит `"basis"`) ТОЛЬКО если в ТОМ ЖЕ предложении (`_sentence_spans` — та же
+# дисциплина границы предложения, что у `_process_phrase_matches`/`_term_phrase_matches`, Task 3 раунд 3 C1)
+# есть базочувствительная величина (`_BASIS_SENSITIVE_STEMS` — влажность/концентрация/доля/сухость/вакуум/
+# давление) или явное число с «%» (`_EXPLICIT_PERCENT_RE`). Без такого спутника фраза — просто вопрос ПРО
+# величину («по массе» как тема вопроса), слово идёт в разрешение терминов как до раунда 3.
+_EXPLICIT_PERCENT_RE = re.compile(r"\d+(?:[.,]\d+)?\s*%")
+
+
+def _basis_expression_phrase_context_satisfied(sentence: str) -> bool:
+    """Гейт раунда 4 — см. комментарий выше у `_BASIS_EXPRESSION_PHRASE_RE`. `_BASIS_SENSITIVE_STEMS`/
+    `_stem_matches` определены ниже по файлу — имена модуля разрешаются в момент ВЫЗОВА, не определения,
+    обычный для этого модуля приём прямого (не обратного) порядка объявлений не нарушен."""
+    return (_stem_matches(terms.normalize_ru(sentence), _BASIS_SENSITIVE_STEMS)
+           or bool(_EXPLICIT_PERCENT_RE.search(sentence)))
 
 
 def _basis_expression_phrase_spans(text: str) -> list[tuple[int, int]]:
-    """Диапазоны `_BASIS_EXPRESSION_PHRASE_RE` — только для `_content_tokens` (слово выражения базы не
-    резолвится по отдельности как спорный термин); не используется в `_digit_node_process_ids`/`_ordered_
-    content_words` — у этих форм нет ни цифр, ни фразы узла/термина, которую имело бы смысл трогать."""
-    return [m.span() for m in _BASIS_EXPRESSION_PHRASE_RE.finditer(text)]
+    """Диапазоны `_BASIS_EXPRESSION_PHRASE_RE`, ОТФИЛЬТРОВАННЫЕ гейтом раунда 4 (контекст того же предложения,
+    см. комментарий у регэкспа) — только для `_content_tokens` (слово выражения базы не резолвится по
+    отдельности как спорный термин); не используется в `_digit_node_process_ids`/`_ordered_content_words` —
+    у этих форм нет ни цифр, ни фразы узла/термина, которую имело бы смысл трогать. Та же отфильтрованная
+    функция — единственный источник и для `"basis"` в `requires_clarification` (не дублируем гейт в двух
+    местах)."""
+    sentence_spans = _sentence_spans(text)
+    result: list[tuple[int, int]] = []
+    for match in _BASIS_EXPRESSION_PHRASE_RE.finditer(text):
+        start, end = match.span()
+        sentence = text
+        for s_start, s_end in sentence_spans:
+            if s_start <= start < s_end:
+                sentence = text[s_start:s_end]
+                break
+        if _basis_expression_phrase_context_satisfied(sentence):
+            result.append((start, end))
+    return result
 
 
 def _span_within(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
@@ -1050,8 +1082,10 @@ def requires_clarification(parsed: NormalizedQuestion, resolved_terms: tuple["Re
     # совпадёт с «сложилась»/«сложилось», см. комментарий у `_CALCULATION_STEMS`) + стеблем временной области
     time_union_question = calculations.mentions_time_range(parsed.original) or (
         _mentions_sum_imperative(parsed.original) and _stem_matches(parsed.normalized, _PERIOD_STEMS))
+    # `_basis_expression_phrase_spans` (не сырой `_BASIS_EXPRESSION_PHRASE_RE.search`, правка раунда 4) — тот
+    # же отфильтрованный по контексту предложения источник, что и у `_content_tokens`, без дублирования гейта.
     basis_given = (_stem_matches(parsed.normalized, _BASIS_GIVEN_STEMS)
-                  or bool(_BASIS_EXPRESSION_PHRASE_RE.search(parsed.original)))
+                  or bool(_basis_expression_phrase_spans(parsed.original)))
     if (_stem_matches(parsed.normalized, _BASIS_SENSITIVE_STEMS) and not basis_given and not known_calc_refusal
             and not equipment_label_suppresses):
         missing.append("basis")
