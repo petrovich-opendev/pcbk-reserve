@@ -52,7 +52,7 @@ test("panel_markup_contract", () => {
   expect(rows.map((b) => [b.dataset.agent, b.dataset.state])).toEqual([
     ["pomoshnik", "ready"], ["konstruktor", "ready"], ["moy-agent", "pending"], ["slomannyy", "broken"]]);
   expect([...section.querySelectorAll(".agent-title")].map((s) => s.textContent))
-    .toEqual(["Помощник по данным", "Конструктор агентов", "Мой агент", "Сломанный"]);
+    .toEqual(["Помощник технолога КДМ-1", "Конструктор агентов", "Мой агент", "Сломанный"]);
   expect([...section.querySelectorAll(".agent-purpose")].map((s) => s.textContent)).toEqual(ITEMS.map((a) => a.purpose));
   expect(rows.map((b) => b.getAttribute("aria-current"))).toEqual([null, "true", null, null]);   // подсвечен агент разговора
   expect(rows.map((b) => b.type)).toEqual(["button", "button", "button", "button"]);
@@ -120,7 +120,7 @@ test("send_agent_follows_thread", async () => {
   const gw = chatGateway({ hold: (sid, n) => sid === SES_K && n === 1 });
   const { container } = render(<Chat onHalt={vi.fn()} loadAgents={createApi().agents} />);
   await waitFor(() => expect(container.querySelector(`[data-session-id="${SES_K}"]`)).toBeTruthy());
-  expect(agentLine(container)).toBe("Агент: Помощник по данным");                 // новый разговор — помощник места
+  expect(agentLine(container)).toBe("Агент: Помощник технолога КДМ-1");                 // новый разговор — помощник места
 
   await pickAgent(/Конструктор агентов/);
   expect(agentLine(container)).toBe("Агент: Конструктор агентов");
@@ -132,7 +132,7 @@ test("send_agent_follows_thread", async () => {
   expect(again.body).toMatchObject({ agent: "konstruktor" });                    // «Новый разговор» сохраняет выбор
   expect(again.session).not.toBe(first.session);
 
-  await pickAgent(/Помощник по данным/);
+  await pickAgent(/Помощник технолога КДМ-1/);
   const plain = await send(gw, "что сейчас");
   expect(plain.body).not.toHaveProperty("agent");                                // помощник — default_agent места
   expect(plain.session).not.toBe(again.session);
@@ -189,7 +189,7 @@ test("send_agent_from_history_of_pomoshnik_thread", async () => {
   const next = await send(gw, "а за смену?");
   expect(next.session).toBe(SES_P);
   expect(next.body).not.toHaveProperty("agent");
-  expect(agentLine(container)).toBe("Агент: Помощник по данным");
+  expect(agentLine(container)).toBe("Агент: Помощник технолога КДМ-1");
   fireEvent.click(screen.getByRole("button", { name: "Новый разговор" }));       // а новый — снова с выбранным
   const fresh = await send(gw, "собери агента");
   expect(fresh.body).toMatchObject({ agent: "konstruktor" });
@@ -223,9 +223,9 @@ test("pick_unlocks_before_list_loaded", async () => {
   const onThreadIdChange = vi.fn();
   const { container } = render(<Chat onHalt={vi.fn()} initialSessionId={SES_K} loadAgents={createApi().agents}
                                      onThreadIdChange={onThreadIdChange} />);
-  await screen.findByRole("button", { name: /Помощник по данным/ });
+  await screen.findByRole("button", { name: /Помощник технолога КДМ-1/ });
   expect(box().disabled).toBe(true);                                             // решения ещё нет (m1)
-  await pickAgent(/Помощник по данным/);
+  await pickAgent(/Помощник технолога КДМ-1/);
   const first = await send(gw, "что сейчас");                                    // список всё ещё в пути
   expect(first.session).not.toBe(SES_K);
   expect(first.body).not.toHaveProperty("agent");
@@ -365,7 +365,7 @@ test("agent_appears_after_leaving_konstruktor_mid_turn", async () => {
   await waitFor(() => expect(gw.agentCalls).toBe(beforeEnd + 1), { timeout: 5_000 });
   expect(gw.agentAt.at(-1)! - endedAt).toBeGreaterThanOrEqual(990);              // через 1 с после конца хода
   await waitFor(() => expect(button(/Мой агент/).disabled).toBe(false), { timeout: 8_000 });   // pending → ready
-  expect(agentLine(container)).toBe("Агент: Помощник по данным");                 // открытый разговор не тронут
+  expect(agentLine(container)).toBe("Агент: Помощник технолога КДМ-1");                 // открытый разговор не тронут
 }, CHAT_TIMEOUT_MS);
 
 test("agents_refresh_on_thread_switch", async () => {
@@ -503,7 +503,7 @@ test("send_after_list_failure_on_reload", async () => {
   const first = await send(gw, "что сейчас");
   expect(first.session).not.toBe(SES_K);
   expect(first.body).not.toHaveProperty("agent");
-  expect(agentLine(container)).toBe("Агент: Помощник по данным");
+  expect(agentLine(container)).toBe("Агент: Помощник технолога КДМ-1");
   expect(gw.loads(SES_K)).toBe(0);
 }, CHAT_TIMEOUT_MS);
 
@@ -525,7 +525,7 @@ test("agent_line_builtin_titles_without_list", async () => {
   await screen.findByText("Какой узел и какие теги?");
   await waitFor(() => expect(agentLine(container)).toBe("Агент: Конструктор агентов"));
   fireEvent.click(screen.getByRole("button", { name: "Новый разговор" }));
-  await waitFor(() => expect(agentLine(container)).toBe("Агент: Помощник по данным"));
+  await waitFor(() => expect(agentLine(container)).toBe("Агент: Помощник технолога КДМ-1"));
   void gw;
 }, CHAT_TIMEOUT_MS);
 

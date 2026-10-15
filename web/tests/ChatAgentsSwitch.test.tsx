@@ -43,7 +43,7 @@ test("open_previous_switch_rejects_unlocks", async () => {
   await waitFor(() => expect(failSwitch.calls).toBe(1));                         // список пришёл — открыть прежний
   expect((await screen.findByRole("alert")).textContent).toBe(T_UNKNOWN);       // отказ — строкой ошибки
   await waitFor(() => expect(box().disabled).toBe(false));                       // блокировка снята и при отказе
-  expect(agentLine(container)).toBe("Агент: Помощник по данным");
+  expect(agentLine(container)).toBe("Агент: Помощник технолога КДМ-1");
   const first = await send(gw, "что сейчас");
   expect(first.session).not.toBe(SES_K);                                         // новый разговор, помощник
   expect(first.body).not.toHaveProperty("agent");

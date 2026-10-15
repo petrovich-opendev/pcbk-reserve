@@ -5,8 +5,8 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { expect, vi } from "vitest";
 import type { AgentItem } from "../src/agents";
 
-export const POMOSHNIK: AgentItem = { name: "pomoshnik", title: "Помощник по данным",
-                                      purpose: "текущие значения и сводки тегов БДРВ", kind: "builtin", state: "ready" };
+export const POMOSHNIK: AgentItem = { name: "pomoshnik", title: "Помощник технолога КДМ-1",
+                                      purpose: "диалог, данные БДРВ и подготовленные знания V1/V2", kind: "builtin", state: "ready" };
 export const KONSTRUKTOR: AgentItem = { name: "konstruktor", title: "Конструктор агентов",
                                         purpose: "за один разговор собирает вашего агента по узлу", kind: "builtin", state: "ready" };
 export const BUILTIN = [POMOSHNIK, KONSTRUKTOR];

@@ -75,7 +75,7 @@ def test_agents_api_contract(gw):                                               
     r = gw.as_("stu-03").get(AGENTS_PATH)
     assert (r.status_code, r.headers["content-type"]) == (200, "application/json")
     assert r.json() == {"agents": [
-        {"name": "pomoshnik", "title": "Помощник по данным", "purpose": "текущие значения и сводки тегов БДРВ",
+        {"name": "pomoshnik", "title": "Помощник технолога КДМ-1", "purpose": "диалог, данные БДРВ и подготовленные знания V1/V2",
          "kind": "builtin", "state": "ready"},
         {"name": "konstruktor", "title": "Конструктор агентов",
          "purpose": "за один разговор собирает вашего агента по узлу", "kind": "builtin", "state": "ready"},

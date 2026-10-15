@@ -28,7 +28,7 @@ test("overview_then_reader_is_read_only", async () => {
   expect(t.querySelector("script, b")).toBeNull();
   expect(t.textContent).toContain("<script>alert(2)</script>");
   expect(t.textContent).toContain("Запрос к данным: текущее значение — готово");
-  expect(t.textContent).toContain("Агент «Помощник по данным»");
+  expect(t.textContent).toContain("Агент «Помощник технолога КДМ-1»");
   expect(t.querySelector('[data-kind="fail"]')!.textContent).toBe("Ваша доля бюджета на модель израсходована");
   expect(t.textContent).toContain("Разговор показан не целиком — он слишком длинный");
   expect(t.querySelectorAll("button")).toHaveLength(0);                         // и кнопок отправки нет

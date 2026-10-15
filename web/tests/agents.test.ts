@@ -47,12 +47,12 @@ test("parse_agents_contract", () => {
 
 test("parse_agents_contract_fields", () => {
   const body = {
-    agents: [item({ name: "pomoshnik", title: "Помощник по данным", kind: "builtin", extra: 1 } as never),
+    agents: [item({ name: "pomoshnik", title: "Помощник технолога КДМ-1", kind: "builtin", extra: 1 } as never),
              item({ name: "a1", state: "pending" }), item({ name: "a2", state: "broken" })],
     own: 2, limit: 20,
   };
   expect(parseAgents(body)).toEqual([                                            // лишние поля не переносятся
-    { name: "pomoshnik", title: "Помощник по данным", purpose: "p", kind: "builtin", state: "ready" },
+    { name: "pomoshnik", title: "Помощник технолога КДМ-1", purpose: "p", kind: "builtin", state: "ready" },
     { name: "a1", title: "X", purpose: "p", kind: "own", state: "pending" },
     { name: "a2", title: "X", purpose: "p", kind: "own", state: "broken" },
   ]);

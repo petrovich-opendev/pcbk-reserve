@@ -87,7 +87,7 @@ export const T_AGENT_LINE = (title: string): string => `Агент: ${title}`;  
 // названия встроенных агентов места — для строки «Агент: …», когда списка нет (404 старого core, сбой) или агента в нём
 // нет (доводка р1, m3); источник правды — ответ ручки (IMAGE_AGENTS шлюза, Д7-R64), эти — запасные и с ним совпадают
 export const BUILTIN_AGENT_TITLES: ReadonlyMap<string, string> = new Map([
-  ["pomoshnik", "Помощник по данным"],
+  ["pomoshnik", "Помощник технолога КДМ-1"],
   ["konstruktor", "Конструктор агентов"],
 ]);
 
