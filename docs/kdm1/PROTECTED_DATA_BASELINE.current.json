@@ -1,5 +1,5 @@
 {
-  "description": "Текущие sha256 19 защищённых файлов (PROTECTED_DATA_BASELINE.json пакета заказчика) — пересчёт от рабочего дерева pcbk-reserve-kdm1 (план КДМ1, Task 0, Global Constraints). Эти файлы не менялись задачей 0 и не должны меняться последующими задачами плана без отдельного решения владельца. Д19 (15.10.2026, решение владельца «разрешить добавление»): catalog.py, service.py, mcp_server.py — добавлен инструмент чтения equipment; список тегов и прежние функции не изменены (docs/kdm1/DRIFT.md, раздел Д19).",
+  "description": "Текущие sha256 19 защищённых файлов (PROTECTED_DATA_BASELINE.json пакета заказчика) — пересчёт от рабочего дерева pcbk-reserve-kdm1 (план КДМ1, Task 0, Global Constraints). Эти файлы не менялись задачей 0 и не должны меняться последующими задачами плана без отдельного решения владельца. Д19 (15.10.2026, решение владельца «разрешить добавление»): catalog.py, service.py, mcp_server.py — добавлен инструмент чтения equipment; список тегов и прежние функции не изменены (docs/kdm1/DRIFT.md, раздел Д19). Д19б (15.10.2026, решение владельца «да делать»): те же три файла — внутри инструмента equipment агрегатом по запросу (units_total) считается только оборудование со словом запроса в начале названия, остальные подходящие запросу — mentions_total; список тегов, прежние функции и остальные инструменты не изменены (docs/kdm1/DRIFT.md, раздел Д19).",
   "reason": "Прямое указание пользователя: не менять общий разрешенный список тегов и его функции.",
   "archive_sha256": "9b87f7273b6da95069835f7bd3485f28b7c3d3d1e36db0637c1162a802b11dba",
   "computed_from_git_head": "9ea8159",
@@ -27,8 +27,8 @@
     },
     {
       "path": "core/pcbk_core/data/catalog.py",
-      "bytes": 14112,
-      "sha256": "44a0a08b5d1099c4b381c5f5f307d5fe4649a12c6240607a6e80faea765aff33"
+      "bytes": 17324,
+      "sha256": "bd585e6154ebd2d8522ddcf94f34f03fbdb47470eeb2bec3766de358b7a39998"
     },
     {
       "path": "core/pcbk_core/data/events.py",
@@ -57,8 +57,8 @@
     },
     {
       "path": "core/pcbk_core/data/mcp_server.py",
-      "bytes": 27223,
-      "sha256": "ecc9338f42b12de0e8c0d9adc2a3c20546e2781bf073d55447adcba551b77cc5"
+      "bytes": 27825,
+      "sha256": "6b501172fbbe6027667dc66f8b0eb9037f8693836e01e2acc2fbc3167cebafed"
     },
     {
       "path": "core/pcbk_core/data/my_agents.py",
@@ -87,8 +87,8 @@
     },
     {
       "path": "core/pcbk_core/data/service.py",
-      "bytes": 86705,
-      "sha256": "d509b89a25f90af61b2af86f022bdab1654f792c775d9402d82cc1965867b820"
+      "bytes": 88394,
+      "sha256": "95b9fa2e7b90fed95521d2d43f7203e11ddf39842cdaccce2cee005c62ef1056"
     },
     {
       "path": "core/pcbk_core/data/sql.py",

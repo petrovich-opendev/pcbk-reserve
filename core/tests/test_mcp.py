@@ -435,6 +435,7 @@ async def test_mcp_equipment_answer_from_service(core_server):
     assert r["units"] == [{"code": "25FAKE_007", "description": "Клапан подачи закрыт", "signals": ["CLS"],
                           "group": "25"}]
     assert r["groups"] == {"25": 1} and "state_counts" not in r
+    assert (r["mentions_total"], r["mentions"]) == (0, [])             # Д19б: ни одного упоминания
     assert with_state["units"][0]["state"] == "no_run_tag" and with_state["units"][0]["time"] is None
     assert with_state["state_counts"] == {"running": 0, "stopped": 0, "no_data": 0, "no_run_tag": 1}
     assert bad["message"].startswith("неверные аргументы: query")

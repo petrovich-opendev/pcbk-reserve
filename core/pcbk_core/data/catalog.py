@@ -87,6 +87,23 @@ def _group_of(code: str) -> str:
     return head if sep else code
 
 
+# Д19б: слово описания — буквы/цифры, дефис внутри слова не разделяет («насос-дозатор» — одно слово); тире
+# (длинное «—» и одиночное «-» между пробелами) и прочие знаки — не слова, схлопываются как разделители
+_DESC_WORD = re.compile(r"[^\W_]+(?:-[^\W_]+)*", re.UNICODE)
+HEAD_WORDS = 2           # первые столько слов описания проверяются на «слово запроса в начале названия»
+
+
+def _desc_words(description: str) -> list[str]:
+    """Слова описания после norm() (нижний регистр, «ё»→«е») — для проверки head (Д19б)."""
+    return _DESC_WORD.findall(norm(description))
+
+
+def _is_head(head_word: str, pairs: list[tuple[TagInfo, str]]) -> bool:
+    """Основа — агрегат по запросу (head, Д19б), если первое слово запроса встречается как подстрока в одном
+    из первых HEAD_WORDS слов описания хотя бы одного её тега."""
+    return any(head_word in w for t, _ in pairs for w in _desc_words(t.description)[:HEAD_WORDS])
+
+
 @dataclass(frozen=True, slots=True)
 class Unit:
     """Агрегат (Д19) — основа тега, у которой в белом списке есть хотя бы один тег привода или состояния
@@ -101,12 +118,26 @@ class Unit:
 
 
 @dataclass(frozen=True, slots=True)
+class Mention:
+    """Основа со словом запроса не в начале названия (Д19б) — у неё есть тег привода/состояния (как у Unit), но
+    она не считается агрегатом по этому запросу, только упоминанием: без group и run_tag — упоминания не входят
+    в groups и with_state."""
+
+    code: str
+    description: str
+    signals: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EquipmentMatch:
-    """Ответ Catalog.equipment (Д19): units — ВСЕ агрегаты белого списка, подходящие запросу, без обрезки на
-    вывод (её делает служба); measure_points_total — число подходящих запросу точек измерения (основ без тега
-    привода/состояния) — отдельно, это не агрегаты."""
+    """Ответ Catalog.equipment (Д19, правка Д19б): units — ВСЕ агрегаты белого списка, подходящие запросу и с
+    словом запроса в начале названия (head, см. equipment()), без обрезки на вывод (её делает служба); mentions
+    — агрегаты, подходящие запросу, но у которых слово запроса не в начале названия — тоже без обрезки, служба
+    показывает не больше 100; measure_points_total — число подходящих запросу точек измерения (основ без тега
+    привода/состояния) — отдельно, это не агрегаты и не упоминания."""
 
     units: tuple[Unit, ...]
+    mentions: tuple[Mention, ...]
     measure_points_total: int
 
 
@@ -233,14 +264,18 @@ class Catalog:
         return SearchResult(tuple(similar[:limit]), True, len(similar))
 
     def equipment(self, query: str) -> EquipmentMatch:
-        """Агрегаты и точки измерения белого списка по словам запроса (Д19): основы (имя без хвоста),
-        сгруппированные по тегам белого списка. Основа подходит запросу, если все слова запроса есть в
+        """Агрегаты и точки измерения белого списка по словам запроса (Д19, правка Д19б): основы (имя без
+        хвоста), сгруппированные по тегам белого списка. Основа подходит запросу, если все слова запроса есть в
         norm(имя + описание) хотя бы одного её тега — тот же разбор, что у search(). Пустой запрос ничего не
-        находит, как у search(). Основа с хотя бы одним тегом AGGREGATE_TAILS — агрегат (Unit); иначе —
-        точка измерения (считается, в units не входит)."""
+        находит, как у search(). Основа без тега AGGREGATE_TAILS — точка измерения (считается, не входит ни в
+        units, ни в mentions). Основа с хотя бы одним тегом AGGREGATE_TAILS — агрегат по запросу: head (Unit),
+        если первое слово запроса стоит в начале описания хотя бы одного её тега (_is_head), иначе — mention
+        (Mention): слово есть в описании, но не в начале названия — она подходит запросу, но в число агрегатов
+        не входит (владелец 15.10: «Клапан подачи массы после насоса» на запрос «насос» — не агрегат)."""
         words = norm(query).split()
         if not words:
-            return EquipmentMatch((), 0)
+            return EquipmentMatch((), (), 0)
+        head_word = words[0]
         by_stem: dict[str, list[tuple[TagInfo, str]]] = {}
         for t in self._listed:
             split = _split_tail(t.name)
@@ -249,6 +284,7 @@ class Catalog:
             stem, tail = split
             by_stem.setdefault(stem, []).append((t, tail))
         units: list[Unit] = []
+        mentions: list[Mention] = []
         measure_points = 0
         for stem, pairs in by_stem.items():
             pairs.sort(key=lambda p: p[0].name)
@@ -260,7 +296,11 @@ class Catalog:
             tails = tuple(sorted(tail for _, tail in pairs))
             run = next((t.name for t, tail in pairs if tail == "RUN"), None)
             description = next((t.description for t, tail in pairs if tail == "RUN"), pairs[0][0].description)
-            units.append(Unit(code=stem, description=description, signals=tails, group=_group_of(stem),
-                              run_tag=run))
+            if _is_head(head_word, pairs):
+                units.append(Unit(code=stem, description=description, signals=tails, group=_group_of(stem),
+                                  run_tag=run))
+            else:
+                mentions.append(Mention(code=stem, description=description, signals=tails))
         units.sort(key=lambda u: u.code)
-        return EquipmentMatch(tuple(units), measure_points)
+        mentions.sort(key=lambda m: m.code)
+        return EquipmentMatch(tuple(units), tuple(mentions), measure_points)

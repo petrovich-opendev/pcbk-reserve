@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 
 from fakes import CATALOG_ROWS, LIVE_ROWS, WHITELIST
-from pcbk_core.data.catalog import Catalog, EquipmentMatch, Lookup, SearchResult, TagInfo, Unit, norm
+from pcbk_core.data.catalog import Catalog, EquipmentMatch, Lookup, Mention, SearchResult, TagInfo, Unit, norm
 
 
 def test_catalog_counts_and_freshest():
@@ -147,14 +147,14 @@ def test_equipment_groups_run_and_lod_into_one_unit():
     cat = Catalog.from_rows(rows, [], whitelist)
     m = cat.equipment("насос")
     assert m == EquipmentMatch((Unit(code="30FAKE_001", description="Насос 1 работа", signals=("LOD", "RUN"),
-                                     group="30", run_tag="30FAKE_001_RUN"),), 0)
+                                     group="30", run_tag="30FAKE_001_RUN"),), (), 0)
 
 
 def test_equipment_mv_only_stem_is_measure_point_not_unit():
     rows = [("30FAKE_002_MV", "Расход после насоса", 1, 0.0, 10.0, "м3/ч")]
     cat = Catalog.from_rows(rows, [], frozenset({"30FAKE_002_MV"}))
     m = cat.equipment("насос")
-    assert m == EquipmentMatch((), 1)                       # точка измерения — не агрегат
+    assert m == EquipmentMatch((), (), 1)                   # точка измерения — не агрегат
 
 
 def test_equipment_description_falls_back_to_first_tag_without_run():
@@ -189,12 +189,13 @@ def test_equipment_outside_whitelist_or_without_underscore_ignored():
             ("NOUNDERSCORE", "без основы — насос", 1, 0.0, 1.0, "None")]
     cat = Catalog.from_rows(rows, [], frozenset({"NOUNDERSCORE"}))     # 30FAKE_005_RUN вне белого списка
     m = cat.equipment("насос")
-    assert m == EquipmentMatch((), 0)                                # вне списка и без основы — ни то, ни то
+    assert m == EquipmentMatch((), (), 0)                            # вне списка и без основы — ни то, ни то
 
 
 def test_equipment_empty_query_finds_nothing():
     cat = Catalog.from_rows(CATALOG_ROWS, [], WHITELIST)
-    assert cat.equipment("") == EquipmentMatch((), 0) and cat.equipment("   ") == EquipmentMatch((), 0)
+    assert (cat.equipment("") == EquipmentMatch((), (), 0)
+            and cat.equipment("   ") == EquipmentMatch((), (), 0))
 
 
 def test_equipment_sorted_by_code():
@@ -202,3 +203,57 @@ def test_equipment_sorted_by_code():
     whitelist = frozenset(r[0] for r in rows)
     cat = Catalog.from_rows(rows, [], whitelist)
     assert [u.code for u in cat.equipment("насос").units] == ["30FAKE_001", "30FAKE_002"]
+
+
+# --- Д19б: слово запроса должно стоять в начале названия, иначе — упоминание, не агрегат ---
+
+def test_equipment_head_word_in_first_two_words_examples_from_owner():
+    rows = [("30FAKE_010_RUN", "Насос циркуляционный смазки", 2, None, None, None),
+            ("30FAKE_011_RUN", "Маслонасос 1", 2, None, None, None),
+            ("30FAKE_012_RUN", "Насосы-дозаторы реагента", 2, None, None, None),
+            ("30FAKE_013_RUN", "Вакуумный насос отсоса", 2, None, None, None),
+            ("30FAKE_014_RUN", "ТВФ — Насос сепаратора", 2, None, None, None),
+            ("30FAKE_015_RUN", "Клапан подачи массы после насоса", 2, None, None, None),
+            ("30FAKE_016_RUN", "Вентилятор охлаждения двигателя насоса", 2, None, None, None)]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    m = cat.equipment("насос")
+    assert {u.code for u in m.units} == {"30FAKE_010", "30FAKE_011", "30FAKE_012", "30FAKE_013", "30FAKE_014"}
+    assert {x.code for x in m.mentions} == {"30FAKE_015", "30FAKE_016"}
+
+
+def test_equipment_mention_is_mention_type_with_code_description_signals():
+    rows = [("30FAKE_020_RUN", "Клапан после насоса", 2, None, None, None),
+            ("30FAKE_020_OPN", "Клапан после насоса открыт", 2, None, None, None)]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    m = cat.equipment("насос")
+    assert m.units == ()
+    assert m.mentions == (Mention(code="30FAKE_020", description="Клапан после насоса", signals=("OPN", "RUN")),)
+
+
+def test_equipment_head_and_mention_can_coexist_for_same_query():
+    rows = [("30FAKE_030_RUN", "Насос подачи массы", 2, None, None, None),
+            ("30FAKE_031_RUN", "Клапан перед насосом", 2, None, None, None)]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    m = cat.equipment("насос")
+    assert [u.code for u in m.units] == ["30FAKE_030"]
+    assert [x.code for x in m.mentions] == ["30FAKE_031"]
+
+
+def test_equipment_mentions_sorted_by_code():
+    rows = [("30FAKE_041_RUN", "Клапан 2 после насоса", 2, None, None, None),
+            ("30FAKE_040_RUN", "Клапан 1 после насоса", 2, None, None, None)]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    assert [x.code for x in cat.equipment("насос").mentions] == ["30FAKE_040", "30FAKE_041"]
+
+
+def test_equipment_measure_point_is_not_affected_by_head_rule():
+    """Точка измерения (без тега привода/состояния) — не агрегат вовсе, она не становится упоминанием, даже
+    если слово запроса не в начале описания."""
+    rows = [("30FAKE_050_MV", "Расход после насоса", 1, 0.0, 10.0, "м3/ч")]
+    cat = Catalog.from_rows(rows, [], frozenset({"30FAKE_050_MV"}))
+    m = cat.equipment("насос")
+    assert m == EquipmentMatch((), (), 1)

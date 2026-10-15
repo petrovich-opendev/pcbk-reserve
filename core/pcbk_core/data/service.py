@@ -121,6 +121,7 @@ FAIL_STREAK = 3                 # столько ошибок инструмен
 FAIL_STALE_S = 1800.0           # инструмент не звали дольше (монотонные часы роли) — из failing уходит сам
 DEVIATION_DEFAULT_POINTS = 72   # calc_deviation (Д13): по умолчанию 72 точки на тег — крупнее, чем у tag_series
 EQUIPMENT_UNITS_CAP = 300        # equipment (Д19): units в ответе — полный список матчей, но не больше этого
+EQUIPMENT_MENTIONS_CAP = 100      # equipment (Д19б): mentions в ответе — не больше этого (mentions_total — полный)
 EQUIPMENT_RUN_CAP = 120          # equipment: агрегатов с тегом _RUN за один with_state=true вызов — не больше
 EQUIPMENT_STALE_S = 86400.0      # equipment: _RUN не менялся дольше — заметка; порог не тот, что у tag_now
                                  # (STILL_NOTE_S, 10 мин): агрегат сутками «в работе» — это не залипание
@@ -132,6 +133,11 @@ EQUIPMENT_NOTES = (
     "коды с одинаковым описанием бывают одним механизмом — не считайте их разными агрегатами не глядя",
     "весь каталог стенда — участок КДМ-1",
 )
+# Д19б: слово запроса стоит не в начале названия — упоминание, не агрегат; добавляется в notes только когда
+# mentions_total > 0 (format(n=...))
+EQUIPMENT_MENTION_NOTE = ("число — оборудование, в начале названия которого есть слово запроса; ещё {n} единиц "
+                         "оборудования упоминают его в описании (например, клапан после насоса) — они в число "
+                         "не входят")
 EQUIPMENT_RUN_LIMIT_MESSAGE = f"агрегатов с тегом _RUN больше {EQUIPMENT_RUN_CAP} — сузьте запрос"
 
 # код ошибки ворот или историана → текст для людей; исход — outcome_for (OUTCOME_BY_CODE, F11)
@@ -949,11 +955,14 @@ class DataService:
                 "intervals": intervals}
 
     async def _equipment(self, call: _Call, query: object, with_state: object) -> dict[str, Any]:
-        """Агрегаты каталога по словам запроса (Д19): без with_state — только каталог в памяти, SQL не шлёт
-        (как catalog_search); с with_state — читает _RUN агрегатов тем же путём, что tag_now (пачки по
-        MAX_NAMES, один счёт частоты на весь вызов). units — полный список подходящих агрегатов, обрезка на
-        вывод — EQUIPMENT_UNITS_CAP; units_total/tags_total/groups/measure_points_total — по всем подходящим,
-        без обрезки."""
+        """Агрегаты каталога по словам запроса (Д19, правка Д19б): без with_state — только каталог в памяти, SQL
+        не шлёт (как catalog_search); с with_state — читает _RUN агрегатов тем же путём, что tag_now (пачки по
+        MAX_NAMES, один счёт частоты на весь вызов). units — полный список подходящих агрегатов, у которых слово
+        запроса стоит в начале названия (head, Catalog.equipment); обрезка на вывод — EQUIPMENT_UNITS_CAP;
+        units_total/tags_total/groups/measure_points_total — по всем подходящим head, без обрезки. mentions —
+        агрегаты, подходящие запросу, но слово не в начале (владелец 15.10): показываются отдельно, до
+        EQUIPMENT_MENTIONS_CAP, mentions_total — полный счёт, в units_total не входит; with_state читает _RUN
+        только у head (mentions никогда не идут в SQL)."""
         self._check_rate(call)
         self._check_drill()
         reason = _equipment_query_problem(query) or _with_state_problem(with_state)
@@ -966,10 +975,15 @@ class DataService:
         tags_total = sum(len(u.signals) for u in units)
         truncated = units_total > EQUIPMENT_UNITS_CAP
         shown = units[:EQUIPMENT_UNITS_CAP]
+        mentions_total = len(match.mentions)
+        mentions = [{"code": m.code, "description": m.description, "signals": list(m.signals)}
+                    for m in match.mentions[:EQUIPMENT_MENTIONS_CAP]]
         notes = list(EQUIPMENT_NOTES)
         if truncated:
             notes.append(f"показаны первые {EQUIPMENT_UNITS_CAP} из {units_total} агрегатов — сузьте запрос, "
                         "чтобы увидеть остальные")
+        if mentions_total:
+            notes.append(EQUIPMENT_MENTION_NOTE.format(n=mentions_total))
         groups: dict[str, int] = {}
         for u in units:
             groups[u.group] = groups.get(u.group, 0) + 1
@@ -998,7 +1012,7 @@ class DataService:
         answer = {"tool": "equipment", "status": "ok", "notes": notes, "cache": call.cache, "query": query,
                   "units_total": units_total, "tags_total": tags_total,
                   "measure_points_total": match.measure_points_total, "truncated": truncated, "units": items,
-                  "groups": groups}
+                  "groups": groups, "mentions_total": mentions_total, "mentions": mentions}
         if with_state:
             answer["state_counts"] = counts
         return answer

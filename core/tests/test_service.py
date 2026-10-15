@@ -17,7 +17,8 @@ from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.gate import GateRefused, GateResult, SlidingWindow
 from pcbk_core.data.historian import HistorianError, parse_clock
 from pcbk_core.data.periods import Period
-from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, DRILL_SUMMARY, EQUIPMENT_NOTES, EQUIPMENT_RUN_CAP,
+from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, DRILL_SUMMARY, EQUIPMENT_MENTIONS_CAP,
+                                    EQUIPMENT_MENTION_NOTE, EQUIPMENT_NOTES, EQUIPMENT_RUN_CAP,
                                     EQUIPMENT_RUN_LIMIT_MESSAGE, EQUIPMENT_STALE_NOTE, EQUIPMENT_UNITS_CAP,
                                     ERROR_MESSAGE, FAIL_STALE_S, FAIL_STREAK, GRID_NOTE, ITEM_TEXTS, MESSAGES,
                                     NO_LAST_NOTE, OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE, SOURCE_LIVE, SOURCE_SERIES,
@@ -1141,6 +1142,7 @@ async def test_equipment_without_state_sends_no_sql_like_catalog_search(svc):
     assert r["units"] == [{"code": "25FAKE_007", "description": "Клапан подачи закрыт", "signals": ["CLS"],
                           "group": "25"}]
     assert r["groups"] == {"25": 1} and "state_counts" not in r
+    assert (r["mentions_total"], r["mentions"]) == (0, [])             # Д19б: ни одного упоминания — без заметки
     assert set(EQUIPMENT_NOTES) <= set(r["notes"])
     assert fake.calls == []                                           # каталог в памяти — SQL не шлёт
     e = s.role.events.recent()[0]
@@ -1242,3 +1244,50 @@ async def test_equipment_units_cap_sets_truncated(tmp_path):
     r = await s.equipment("student-01", "http", "агрегат")
     assert (r["units_total"], len(r["units"]), r["truncated"]) == (EQUIPMENT_UNITS_CAP + 4, EQUIPMENT_UNITS_CAP, True)
     assert any("сузьте запрос" in n for n in r["notes"])
+
+
+# --- Д19б: слово запроса должно стоять в начале названия — иначе упоминание, не агрегат по числу ---
+
+async def test_equipment_mentions_separated_from_units_with_note(tmp_path):
+    rows = [("95FAKE_001_RUN", "Насос циркуляционный 1", 2, None, None, None),
+            ("95FAKE_002_RUN", "Клапан подачи массы после насоса", 2, None, None, None),
+            ("95FAKE_003_RUN", "Вентилятор охлаждения двигателя насоса", 2, None, None, None)]
+    whitelist = {r[0] for r in rows}
+    s, fake = _equipment_service(tmp_path, rows, whitelist)
+    r = await s.equipment("student-01", "http", "насос")
+    assert (r["units_total"], [u["code"] for u in r["units"]]) == (1, ["95FAKE_001"])
+    assert (r["mentions_total"], [m["code"] for m in r["mentions"]]) == (2, ["95FAKE_002", "95FAKE_003"])
+    assert r["mentions"][0] == {"code": "95FAKE_002", "description": "Клапан подачи массы после насоса",
+                               "signals": ["RUN"]}
+    assert EQUIPMENT_MENTION_NOTE.format(n=2) in r["notes"]
+    assert fake.calls == []                                           # упоминания — тоже из каталога в памяти
+
+
+async def test_equipment_no_mentions_means_no_mention_note(svc):
+    s, _ = svc
+    r = await s.equipment("student-01", "http", "клапан")              # 25FAKE_007_CLS — голова, упоминаний нет
+    assert r["mentions_total"] == 0
+    assert not any(n.startswith("число —") for n in r["notes"])
+
+
+async def test_equipment_with_state_counts_only_head_not_mentions(tmp_path):
+    rows = [("96FAKE_001_RUN", "Насос циркуляционный 1", 2, None, None, None),
+            ("96FAKE_002_RUN", "Клапан после насоса", 2, None, None, None)]
+    whitelist = {r[0] for r in rows}
+    live = {"96FAKE_001_RUN": (datetime(2026, 10, 1, 11, 0), 1.0, 0),
+            "96FAKE_002_RUN": (datetime(2026, 10, 1, 11, 0), 1.0, 0)}
+    s, fake = _equipment_service(tmp_path, rows, whitelist, live=live)
+    r = await s.equipment("student-01", "http", "насос", with_state=True)
+    assert (r["units_total"], [u["code"] for u in r["units"]]) == (1, ["96FAKE_001"])
+    assert (r["mentions_total"], [m["code"] for m in r["mentions"]]) == (1, ["96FAKE_002"])
+    assert r["state_counts"] == {"running": 1, "stopped": 0, "no_data": 0, "no_run_tag": 0}
+    assert set(sent_of(fake)) == {"96FAKE_001_RUN"}                    # упоминание не читает _RUN
+
+
+async def test_equipment_mentions_capped_at_100(tmp_path):
+    rows = [(f"97FAKE_{i:03d}_RUN", f"Клапан {i} после насоса", 2, None, None, None) for i in range(1, 103)]
+    whitelist = {r[0] for r in rows}
+    s, fake = _equipment_service(tmp_path, rows, whitelist)
+    r = await s.equipment("student-01", "http", "насос")
+    assert (r["units_total"], r["mentions_total"], len(r["mentions"])) == (0, 102, EQUIPMENT_MENTIONS_CAP)
+    assert fake.calls == []
