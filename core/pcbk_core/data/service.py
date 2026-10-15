@@ -689,6 +689,36 @@ class _Scope:
     period: Period
 
 
+
+SPC_MAX_INTERVALS = 40  # интервалов нарушений в ответе calc_spc (ночь 16.10: поточечный список обрезался в чате)
+
+
+def _spc_intervals(violations: list[dict], times: list, points: list) -> tuple[list[dict], dict[str, int]]:
+    """Нарушения правил — интервалами подряд идущих точек по каждому правилу (а не точка за точкой: при смене режима
+    правило 1 срабатывает на каждой из 96 точек, и ответ инструмента в чате обрезался). Возвращает (интервалы по
+    времени начала, число точек по правилам)."""
+    by_rule: dict[int, list[dict]] = {}
+    for v in violations:
+        by_rule.setdefault(v["rule"], []).append(v)
+    out: list[dict] = []
+    counts: dict[str, int] = {}
+    for rule, items in sorted(by_rule.items()):
+        items.sort(key=lambda v: v["index"])
+        counts[str(rule)] = len(items)
+        run: list[dict] = []
+        for v in items + [None]:
+            if v is not None and run and v["index"] == run[-1]["index"] + 1:
+                run.append(v)
+                continue
+            if run:
+                vals = [points[x["index"]] for x in run]
+                out.append({"rule": rule, "name_ru": run[0]["name_ru"], "start": times[run[0]["index"]],
+                            "end": times[run[-1]["index"]], "points": len(run),
+                            "value_min": round(min(vals), 3), "value_max": round(max(vals), 3)})
+            run = [v] if v is not None else []
+    out.sort(key=lambda x: (str(x["start"]), x["rule"]))
+    return out, counts
+
 class DataService:
     """Восемь инструментов чтения роли «данные» (с calc_spc, Д21). Ворота, каталог, часы, журнал событий и
     monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
@@ -1082,7 +1112,7 @@ class DataService:
                     "tag": entry.shown, "unit": info.unit, "period": self._period_json(period, clock, is_open),
                     "chart": chart_name, "n_points": 0, "skipped": skipped, "cl": None, "ucl": None, "lcl": None,
                     "sigma_within": None, "sigma_overall": None, "secondary": None, "violations": [],
-                    "in_control": None, "capability": None, "sparkline": ["", ""], "points": []}
+                    "rule_counts": {}, "in_control": None, "capability": None, "sparkline": ["", ""]}
         values = [v for _, v in valid]
         if subgroup == 1:
             chart = spc.individuals(values)
@@ -1112,14 +1142,20 @@ class DataService:
         secondary = chart["secondary"]
         call.summary = (f"{period.preset or 'свой период'}, точек {points}: {chart_name}, "
                         f"нарушений {len(violations)}")
-        return {"tool": "calc_spc", "status": "ok", "notes": notes, "cache": call.cache, "tag": entry.shown,
-                "unit": info.unit, "period": self._period_json(period, clock, is_open), "chart": chart_name,
-                "n_points": n_points, "skipped": skipped, "cl": chart["cl"], "ucl": chart["ucl"],
-                "lcl": chart["lcl"], "sigma_within": chart["sigma_hat"], "sigma_overall": sigma_overall,
+        intervals, rule_counts = _spc_intervals(violations, chart_times, chart["points"])
+        if len(intervals) > SPC_MAX_INTERVALS:
+            notes.append(f"Показаны первые {SPC_MAX_INTERVALS} интервалов нарушений из {len(intervals)}; "
+                         "число точек по каждому правилу — в rule_counts")
+            intervals = intervals[:SPC_MAX_INTERVALS]
+        # порядок полей — главное в начале: длинный ответ инструмента чат может обрезать с конца
+        return {"tool": "calc_spc", "status": "ok", "tag": entry.shown, "unit": info.unit, "chart": chart_name,
+                "in_control": not violations, "rule_counts": rule_counts, "sparkline": sparkline,
+                "cl": chart["cl"], "ucl": chart["ucl"], "lcl": chart["lcl"], "sigma_within": chart["sigma_hat"],
+                "sigma_overall": sigma_overall,
                 "secondary": {"chart": secondary["chart"], "cl": secondary["cl"], "ucl": secondary["ucl"],
                              "lcl": secondary["lcl"]},
-                "violations": violations, "in_control": not violations, "capability": capability,
-                "sparkline": sparkline, "points": [[t, v] for t, v in zip(chart_times, chart["points"])]}
+                "capability": capability, "violations": intervals, "n_points": n_points, "skipped": skipped,
+                "period": self._period_json(period, clock, is_open), "notes": notes, "cache": call.cache}
 
     async def _equipment(self, call: _Call, query: object, with_state: object) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19, правка Д19б): без with_state — только каталог в памяти, SQL

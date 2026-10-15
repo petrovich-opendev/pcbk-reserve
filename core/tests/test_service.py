@@ -1346,18 +1346,19 @@ async def test_calc_spc_individuals_answer_matches_spc_module(svc):
     assert sec["lcl"] == pytest.approx(expected["secondary"]["lcl"])
     assert r["capability"] is None
     assert len(expected_violations) > 0 and r["in_control"] is False       # выброс даёт нарушения — не пустой тест
-    stripped = [{k: v for k, v in viol.items() if k not in ("time", "value")} for viol in r["violations"]]
-    assert stripped == expected_violations
-    for viol in r["violations"]:
-        idx = viol["index"]
-        assert viol["time"] == _spc_iso(_SPC_VALID_IDX[idx])
-        assert viol["value"] == pytest.approx(expected["points"][idx])
+    # ночь 16.10: нарушения — интервалами по правилам (поточечный список обрезался в чате), ряда в ответе нет
+    by_rule = {}
+    for viol in expected_violations:
+        by_rule.setdefault(str(viol["rule"]), []).append(viol["index"])
+    assert r["rule_counts"] == {k: len(v) for k, v in by_rule.items()}
+    assert sum(iv["points"] for iv in r["violations"]) == len(expected_violations)
+    valid_times = {_spc_iso(i) for i in _SPC_VALID_IDX}
+    for iv in r["violations"]:
+        idxs = sorted(by_rule[str(iv["rule"])])
+        assert iv["start"] in valid_times and iv["end"] in valid_times and iv["points"] >= 1
+        assert iv["name_ru"] and iv["value_min"] <= iv["value_max"]
     assert r["sparkline"] == expected_sparkline
-    assert len(r["points"]) == 22
-    assert r["points"][0][0] == _spc_iso(_SPC_VALID_IDX[0])
-    assert r["points"][0][1] == pytest.approx(_SPC_VALUES[0])
-    assert r["points"][-1][0] == _spc_iso(_SPC_VALID_IDX[-1])
-    assert r["points"][-1][1] == pytest.approx(_SPC_VALUES[-1])
+    assert "points" not in r
     assert {SPC_GRID_NOTE, SPC_CONTROL_NOTE} <= set(r["notes"])
     assert SPC_BOUNDS_NOTE not in r["notes"] and SPC_FEW_POINTS_NOTE not in r["notes"]
 
@@ -1382,11 +1383,11 @@ async def test_calc_spc_xbar_r_subgroup4(svc):
     assert sec["cl"] == pytest.approx(expected["secondary"]["cl"])
     assert sec["ucl"] == pytest.approx(expected["secondary"]["ucl"])
     assert sec["lcl"] == pytest.approx(expected["secondary"]["lcl"])
-    assert [p[0] for p in r["points"]] == [_spc_iso(i) for i in chunk_last]
-    for p, v in zip(r["points"], expected["points"]):
-        assert p[1] == pytest.approx(v)
-    stripped = [{k: v for k, v in viol.items() if k not in ("time", "value")} for viol in r["violations"]]
-    assert stripped == expected_violations
+    assert "points" not in r
+    assert sum(iv["points"] for iv in r["violations"]) == len(expected_violations)
+    chunk_times = {_spc_iso(i) for i in chunk_last}            # момент подгруппы — её последняя точка
+    for iv in r["violations"]:
+        assert iv["start"] in chunk_times and iv["end"] in chunk_times
     assert any("хвост короче 4" in n for n in r["notes"])      # 2 точки хвоста (22 % 4) не вошли в подгруппу
     assert SPC_FEW_POINTS_NOTE in r["notes"]                    # 5 подгрупп < 20 — границы ориентировочные
 
@@ -1454,3 +1455,16 @@ async def test_calc_spc_event_has_tag(svc):
     e = s.role.events.recent()[0]
     assert (e.tool, e.caller, e.channel, e.outcome) == ("calc_spc", "ops", "mcp", "ok")
     assert tuple(e.tags) == ("20FAKE_001_PV",) and set(e.sent) == {"20FAKE_001_PV"}
+
+
+def test_spc_intervals_merge_consecutive_points_per_rule():                       # ночь 16.10
+    from pcbk_core.data.service import _spc_intervals
+    times = [f"t{i}" for i in range(10)]
+    points = [float(i) for i in range(10)]
+    viol = [{"rule": 1, "name_ru": "за 3σ", "index": i, "zone": "вне"} for i in (0, 1, 2, 5, 6)]
+    viol += [{"rule": 2, "name_ru": "9 подряд", "index": 9, "zone": "C"}]
+    out, counts = _spc_intervals(viol, times, points)
+    assert counts == {"1": 5, "2": 1}
+    assert [(x["rule"], x["start"], x["end"], x["points"]) for x in out] == [
+        (1, "t0", "t2", 3), (1, "t5", "t6", 2), (2, "t9", "t9", 1)]
+    assert (out[0]["value_min"], out[0]["value_max"]) == (0.0, 2.0)
