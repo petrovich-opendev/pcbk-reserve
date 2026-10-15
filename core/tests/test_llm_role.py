@@ -980,7 +980,7 @@ def test_startup_line_names_allocated_shares(tmp_path, fake_or, caplog):
     app, role = make_llm_app(tmp_path, fake_or, shares=True)
     with caplog.at_level(logging.INFO, logger="pcbk_core.llm"), TestClient(app):
         pass
-    assert "LLM-прокси: моделей 7, доли мест: распределено $1100 из $1000, по умолчанию $100" in caplog.text
+    assert "LLM-прокси: моделей 8, доли мест: распределено $1100 из $1000, по умолчанию $100" in caplog.text
 
 
 def test_fake_dear_word_prices_body_stream_and_generation(fake_or):       # двойник: FAKEDEAR — $0,5037 везде
