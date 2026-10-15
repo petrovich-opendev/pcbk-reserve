@@ -3,14 +3,16 @@
 import asyncio
 import json
 import sqlite3
+import statistics
 import threading
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 from fakes import CLOCK_ROWS, LIVE_ROWS, FakeHistorian
 from helpers import SETTINGS, make_role, make_service, sent_of
+from pcbk_core import spc as spc_lib
 from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data import service as service_module
 from pcbk_core.data.catalog import Catalog
@@ -22,7 +24,8 @@ from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, DRILL_SUMMARY, EQUIPME
                                     EQUIPMENT_RUN_LIMIT_MESSAGE, EQUIPMENT_STALE_NOTE, EQUIPMENT_UNITS_CAP,
                                     ERROR_MESSAGE, FAIL_STALE_S, FAIL_STREAK, GRID_NOTE, ITEM_TEXTS, MESSAGES,
                                     NO_LAST_NOTE, OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE, SOURCE_LIVE, SOURCE_SERIES,
-                                    SOURCE_STATE, SOURCE_SUMMARY, STD_KIND, TOOL_WINDOW)
+                                    SOURCE_STATE, SOURCE_SUMMARY, SPC_BOUNDS_NOTE, SPC_CONTROL_NOTE,
+                                    SPC_FEW_POINTS_NOTE, SPC_GRID_NOTE, SPC_NOT_ENOUGH_NOTE, STD_KIND, TOOL_WINDOW)
 from pcbk_core.data.sql import HAS_LAST, SUMMARY_COLUMNS, clock_sql, live_sql
 from pcbk_core.logs import setup_logging
 from pcbk_core.places import PLACES
@@ -1291,3 +1294,163 @@ async def test_equipment_mentions_capped_at_100(tmp_path):
     r = await s.equipment("student-01", "http", "насос")
     assert (r["units_total"], r["mentions_total"], len(r["mentions"])) == (0, 102, EQUIPMENT_MENTIONS_CAP)
     assert fake.calls == []
+
+
+# Д21: calc_spc — карта Шухарта и SPC по одному аналоговому тегу; чтение — тем же путём, что tag_series/
+# calc_deviation (ворота, белый список, бюджет, точки, кэш, tool "tag_series"); считает служба (pcbk_core.spc),
+# не агент. Ряд из 24 вымышленных точек (_SPC_RAW): индекс 5 — NULL, индекс 13 — недостоверное качество (64,
+# значение есть) — оба пропускаются (`skipped` = 2), остаются 22 валидных значения (_SPC_VALUES); выброс на
+# индексе 3 (50.0) даёт заметные нарушения правил Нельсона. Эталоны — прямой вызов pcbk_core.spc (та же
+# библиотека, что внутри службы): здесь проверяется ТОЛЬКО сборка ответа (чтение, пропуск, подгруппы, время,
+# заметки), арифметика самих формул уже проверена test_spc.py (план Д21 Task 1).
+
+_SPC_RAW = [10.1, 9.8, 10.3, 50.0, 10.0, None, 9.9, 10.2, 9.7, 10.4, 9.6, 10.1, 9.9, 10.0, 10.2, 9.8, 10.3, 9.9,
+           10.1, 10.0, 9.8, 10.2, 9.9, 10.0]
+_SPC_QUAL = [64 if i == 13 else 0 for i in range(len(_SPC_RAW))]
+_SPC_BASE = datetime(2026, 10, 2, 0, 0)
+_SPC_VALID_IDX = [i for i in range(len(_SPC_RAW)) if not (_SPC_RAW[i] is None or _SPC_QUAL[i] != 0)]
+_SPC_VALUES = [_SPC_RAW[i] for i in _SPC_VALID_IDX]            # 22 валидных значения
+
+
+def _spc_iso(i: int) -> str:
+    return (_SPC_BASE + timedelta(hours=i)).isoformat(timespec="seconds") + "+05:00"
+
+
+def _spc_series() -> list[tuple]:
+    return [(_SPC_BASE + timedelta(hours=i), v, q) for i, (v, q) in enumerate(zip(_SPC_RAW, _SPC_QUAL))]
+
+
+async def test_calc_spc_individuals_answer_matches_spc_module(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = _spc_series()
+    r = await s.calc_spc("student-01", "http", "20FAKE_001_PV", period="last_8h", points=24)
+
+    expected = spc_lib.individuals(_SPC_VALUES)
+    expected_violations = spc_lib.rules(expected["points"], expected["cl"], expected["sigma_point"])
+    flagged = {v["index"] for v in expected_violations}
+    expected_sparkline = spc_lib.sparkline(expected["points"], expected["lcl"], expected["ucl"], flagged)
+    expected_sigma_overall = statistics.stdev(_SPC_VALUES)
+
+    assert (r["tool"], r["status"], r["cache"]) == ("calc_spc", "ok", "miss")
+    assert (r["tag"], r["unit"], r["chart"]) == ("20FAKE_001_PV", "л/час", "I-MR")
+    assert (r["n_points"], r["skipped"]) == (22, 2)
+    assert r["cl"] == pytest.approx(expected["cl"])
+    assert r["ucl"] == pytest.approx(expected["ucl"])
+    assert r["lcl"] == pytest.approx(expected["lcl"])
+    assert r["sigma_within"] == pytest.approx(expected["sigma_hat"])
+    assert r["sigma_overall"] == pytest.approx(expected_sigma_overall)
+    sec = r["secondary"]
+    assert sec["chart"] == "MR"
+    assert sec["cl"] == pytest.approx(expected["secondary"]["cl"])
+    assert sec["ucl"] == pytest.approx(expected["secondary"]["ucl"])
+    assert sec["lcl"] == pytest.approx(expected["secondary"]["lcl"])
+    assert r["capability"] is None
+    assert len(expected_violations) > 0 and r["in_control"] is False       # выброс даёт нарушения — не пустой тест
+    stripped = [{k: v for k, v in viol.items() if k not in ("time", "value")} for viol in r["violations"]]
+    assert stripped == expected_violations
+    for viol in r["violations"]:
+        idx = viol["index"]
+        assert viol["time"] == _spc_iso(_SPC_VALID_IDX[idx])
+        assert viol["value"] == pytest.approx(expected["points"][idx])
+    assert r["sparkline"] == expected_sparkline
+    assert len(r["points"]) == 22
+    assert r["points"][0][0] == _spc_iso(_SPC_VALID_IDX[0])
+    assert r["points"][0][1] == pytest.approx(_SPC_VALUES[0])
+    assert r["points"][-1][0] == _spc_iso(_SPC_VALID_IDX[-1])
+    assert r["points"][-1][1] == pytest.approx(_SPC_VALUES[-1])
+    assert {SPC_GRID_NOTE, SPC_CONTROL_NOTE} <= set(r["notes"])
+    assert SPC_BOUNDS_NOTE not in r["notes"] and SPC_FEW_POINTS_NOTE not in r["notes"]
+
+
+async def test_calc_spc_xbar_r_subgroup4(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = _spc_series()
+    r = await s.calc_spc("student-01", "http", "20FAKE_001_PV", period="last_8h", points=24, subgroup=4)
+
+    expected = spc_lib.xbar_r(_SPC_VALUES, 4)
+    expected_violations = spc_lib.rules(expected["points"], expected["cl"], expected["sigma_point"])
+    chunk_last = [3, 8, 12, 17, 21]            # последняя точка каждой из 5 полных подгрупп по 4 (22 // 4)
+
+    assert (r["status"], r["chart"], r["skipped"]) == ("ok", "X̄-R", 2)
+    assert r["n_points"] == len(expected["points"]) == 5
+    assert r["cl"] == pytest.approx(expected["cl"])
+    assert r["ucl"] == pytest.approx(expected["ucl"])
+    assert r["lcl"] == pytest.approx(expected["lcl"])
+    assert r["sigma_within"] == pytest.approx(expected["sigma_hat"])
+    sec = r["secondary"]
+    assert sec["chart"] == "R"
+    assert sec["cl"] == pytest.approx(expected["secondary"]["cl"])
+    assert sec["ucl"] == pytest.approx(expected["secondary"]["ucl"])
+    assert sec["lcl"] == pytest.approx(expected["secondary"]["lcl"])
+    assert [p[0] for p in r["points"]] == [_spc_iso(i) for i in chunk_last]
+    for p, v in zip(r["points"], expected["points"]):
+        assert p[1] == pytest.approx(v)
+    stripped = [{k: v for k, v in viol.items() if k not in ("time", "value")} for viol in r["violations"]]
+    assert stripped == expected_violations
+    assert any("хвост короче 4" in n for n in r["notes"])      # 2 точки хвоста (22 % 4) не вошли в подгруппу
+    assert SPC_FEW_POINTS_NOTE in r["notes"]                    # 5 подгрупп < 20 — границы ориентировочные
+
+
+async def test_calc_spc_capability_with_bounds(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = _spc_series()
+    r = await s.calc_spc("student-01", "http", "20FAKE_001_PV", period="last_8h", points=24, lsl=5.0, usl=60.0)
+
+    expected_chart = spc_lib.individuals(_SPC_VALUES)
+    expected_cap = spc_lib.capability(_SPC_VALUES, expected_chart["sigma_hat"], 5.0, 60.0)
+
+    assert r["status"] == "ok"
+    assert r["capability"] == pytest.approx(expected_cap)
+    assert SPC_BOUNDS_NOTE in r["notes"]
+
+
+async def test_calc_spc_refuses_discrete_tag(svc):
+    s, fake = svc
+    r = await s.calc_spc("student-01", "http", "25FAKE_007_CLS", period="last_8h")
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["none"])
+    assert r["items"] == [{"tag": "25FAKE_007_CLS", "status": "discrete", "text": ITEM_TEXTS["discrete_series"]}]
+    assert fake.calls == []
+
+
+async def test_calc_spc_refuses_points_below_min(svc):
+    s, fake = svc
+    r = await s.calc_spc("student-01", "http", "20FAKE_001_PV", period="last_8h", points=2)
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["args"] + "points: от 20 до 96")
+    assert fake.calls == []
+
+
+async def test_calc_spc_partial_when_too_few_valid_points(svc):             # данные читались, но карты не хватило
+    s, fake = svc
+    base = datetime(2026, 10, 3, 0, 0)
+    rows = [(base, 10.0, 0)] + [(base + timedelta(hours=i), None, 0) for i in range(1, 20)]
+    fake.series["20FAKE_001_PV"] = rows
+    r = await s.calc_spc("student-01", "http", "20FAKE_001_PV", period="last_8h", points=20)
+    assert (r["status"], r["chart"], r["n_points"], r["skipped"]) == ("partial", "I-MR", 0, 19)
+    assert r["cl"] is None and r["capability"] is None and r["secondary"] is None
+    assert r["violations"] == [] and r["in_control"] is None and r["sparkline"] == ["", ""]
+    assert SPC_NOT_ENOUGH_NOTE in r["notes"]
+
+
+@pytest.mark.parametrize("kwargs,reason", [
+    ({"tag": "20FAKE_001_PV", "subgroup": 0}, "subgroup: целое от 1 до 10"),
+    ({"tag": "20FAKE_001_PV", "subgroup": 11}, "subgroup: целое от 1 до 10"),
+    ({"tag": "20FAKE_001_PV", "lsl": "x"}, "lsl: число"),
+    ({"tag": "20FAKE_001_PV", "usl": float("nan")}, "usl: число"),
+    ({"tag": "20FAKE_001_PV", "lsl": 10.0, "usl": 5.0}, "usl: должен быть больше lsl"),
+    ({"tag": "20FAKE_001_PV", "points": 97}, "points: от 20 до 96"),
+    ({"tag": 5}, "tag: нужен тег строкой"),
+])
+async def test_calc_spc_argument_errors(svc, kwargs, reason):
+    s, _ = svc
+    r = await s.calc_spc("student-01", "http", period="last_8h", **kwargs)
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["args"] + reason)
+
+
+async def test_calc_spc_event_has_tag(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = _spc_series()
+    r = await s.calc_spc("ops", "mcp", "20FAKE_001_PV", period="last_8h", points=24)
+    assert r["status"] == "ok"
+    e = s.role.events.recent()[0]
+    assert (e.tool, e.caller, e.channel, e.outcome) == ("calc_spc", "ops", "mcp", "ok")
+    assert tuple(e.tags) == ("20FAKE_001_PV",) and set(e.sent) == {"20FAKE_001_PV"}

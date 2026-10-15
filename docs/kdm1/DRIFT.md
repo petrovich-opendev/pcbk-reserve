@@ -109,3 +109,40 @@ validates_subject_and_tag` — настоящий HTTP-путь маршруто
 
 База `PROTECTED_DATA_BASELINE.current.json` пересчитана только для `catalog.py`, `service.py`, `mcp_server.py`
 (их записи из Д19 — заново); остальные 16 файлов — прежние.
+
+## Д21: инструмент чтения `calc_spc` в двух защищённых файлах (15.10.2026)
+
+Повод — `docs/plans/PLAN-D21-spc-2026-10-15.md`, Task 2: технолог просит в чате карту Шухарта (SPC) по тегу —
+агенты не могли посчитать 8 правил Нельсона и Cp/Cpk/Pp/Ppk «в уме», правило стенда — числа только из
+инструментов (как у `calc_deviation`, Д13, и `equipment`, Д19). Решения владельца 15.10 (план, Global
+Constraints): «только через чат … без дополнительных полей»; «мини-графики нужны»; добавление в защищённые
+файлы разрешено (как Д19: список тегов и прежние инструменты не меняются, база защиты пересчитывается).
+Считает служба (`pcbk_core.spc`, план Д21 Task 1 — вне защищённых файлов, отдельный модуль без ворот и SQL),
+не модель.
+
+Правка — только добавочная, в `service.py` и `mcp_server.py` (без `http_api.py`: у `calc_spc`, как и у
+`equipment`, нет HTTP-ручки): `service.py` — `DataService.calc_spc`/`_calc_spc` и помощники
+(`_spc_points_problem`, `_subgroup_problem`, `_spc_bound_problem`, `_spc_bounds_problem`,
+`_spc_valid_points`), константы `SPC_MIN_POINTS`/`SPC_DEFAULT_POINTS`/`SPC_MAX_SUBGROUP`/`SPC_RELIABLE_MIN` и
+тексты заметок (`SPC_CONTROL_NOTE`, `SPC_BOUNDS_NOTE`, `SPC_GRID_NOTE`, `SPC_FEW_POINTS_NOTE`,
+`SPC_NOT_ENOUGH_NOTE`); `mcp_server.py` — инструмент `calc_spc` (описание в `TOOL_DESCRIPTIONS`, модель
+аргументов `CalcSpcArgs` и алиасы схемы `SpcTag`/`SpcPoints`/`SpcSubgroup`/`SpcBound`, как у `EquipmentArgs`
+из Д19). Чтение ряда — ТЕМ ЖЕ внутренним путём, что `tag_series`/`calc_deviation`: тот же `cache_key`/`tool`
+`"tag_series"`, тот же `_read_series`, те же ворота, бюджет (`check_budget`/`check_points`) и окно; новый SQL
+не добавлен. Один аналоговый тег (не список); `points` — своя, выше нижней границы `tag_series`, диапазон
+20…96 (по умолчанию 96); `subgroup` — 1 (карта I-MR) или 2…10 (карта X̄-R); `lsl`/`usl` — необязательные
+границы допуска технолога (не норматив ПЦБК). Пустые и недостоверные по качеству точки сетки пропускаются до
+расчёта, их число — отдельным полем `skipped` в ответе, не молча. Белый список тегов, его построение и
+разбор, семь прежних инструментов (`catalog_search`, `tag_now`, `tag_period`, `tag_series`, `calc_runtime`,
+`calc_deviation`, `equipment`) — без изменений.
+
+Диапазон `points`/`subgroup` и конечность `lsl`/`usl` проверяет сама служба (та же причина, что у прямого
+вызова): модель аргументов `CalcSpcArgs` в `mcp_server.py` не несёт для них `Field(ge=/le=/allow_inf_nan=)` —
+общий `http_api.validation_reason()` (файл не входит в разрешённые правкой Task 2) у поля `points` всегда
+отвечает словами `SERIES_MIN_POINTS…SERIES_MAX_POINTS` (это для `tag_series`/`calc_deviation`, не для более
+строгой нижней границы `calc_spc`); рекламируемая схема аргументов (минимум/максимум для модели,
+`SpcPoints`/`SpcSubgroup`) идёт отдельно, через `json_schema_extra` функции инструмента, не через
+`CalcSpcArgs`.
+
+База `PROTECTED_DATA_BASELINE.current.json` пересчитана только для `service.py` и `mcp_server.py` (их записи —
+заново); остальные 17 файлов — прежние.

@@ -26,7 +26,7 @@ required вписывается в схему после регистрации 
 """
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.server import Settings as FastMCPSettings
@@ -38,12 +38,13 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import zones
-from .http_api import (UNAUTHORIZED, CalcDeviationArgs, CalcRuntimeArgs, CatalogSearchArgs, TagNowArgs,
+from .http_api import (UNAUTHORIZED, CalcDeviationArgs, CalcRuntimeArgs, CatalogSearchArgs, Tag, TagNowArgs,
                        TagPeriodArgs, TagSeriesArgs, bearer_caller, unauthorized, validation_reason)
 from .periods import PRESETS
 from .report_event import REPORT_DESCRIPTION, REPORT_PROPERTIES, REPORT_REQUIRED
 from .save_agent import SAVE_DESCRIPTION, SAVE_PROPERTIES, SAVE_REQUIRED
-from .service import DEVIATION_DEFAULT_POINTS, QUERY_CHARS, SEARCH_LIMIT, TAG_CHARS, requested_of
+from .service import (DEVIATION_DEFAULT_POINTS, QUERY_CHARS, SEARCH_LIMIT, SPC_DEFAULT_POINTS, SPC_MAX_SUBGROUP,
+                      SPC_MIN_POINTS, TAG_CHARS, requested_of)
 from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
 if TYPE_CHECKING:
@@ -79,6 +80,17 @@ TOOL_DESCRIPTIONS = {
                       "число точек сверх порога и интервалы подряд идущих точек сверх порога (начало, конец, число "
                       "точек, наибольшее отклонение с его измерением и заданием). Период — готовый (period) или "
                       "начало и конец (start, end, ISO 8601).",
+    "calc_spc": "Карта Шухарта (SPC) по одному аналоговому тегу БДРВ за период — считает служба, не модель (один "
+               "запрос, пределы как у tag_series: на тег до 96 точек, окно до 31 суток, бюджет 24 тего-суток; "
+               "points — от 20 до 96, по умолчанию 96): CL/UCL/LCL и σ (σ_внутр и σ_общ), нарушения 8 правил "
+               "Нельсона (время, правило, значение, зона), Cp/Cpk/Pp/Ppk при переданных границах допуска "
+               "(lsl/usl — порог технолога, число, НЕ норматив ПЦБК), мини-график строкой символов (sparkline). "
+               "subgroup=1 (по умолчанию) — карта индивидуальных значений (I-MR, скользящий размах); subgroup "
+               "2..10 — карта средних подгрупп (X̄-R). Зовите, когда просят карту Шухарта, SPC, контрольные "
+               "границы, нарушения правил или Cp/Cpk — не считайте сами: контрольные границы (UCL/LCL) — "
+               "статистическая вариация процесса, НЕ границы допуска и не норматив ПЦБК; при коротком ряде "
+               "(меньше 20 точек/подгрупп) границы ориентировочные. Период — готовый (period) или начало и "
+               "конец (start, end, ISO 8601).",
     "equipment": "Подсчёт агрегатов каталога БДРВ участка КДМ-1 по словам в имени и описании: зовите на "
                 "«сколько насосов/задвижек/мешалок…» и «сколько сейчас в работе» — служба сама группирует "
                 "теги агрегата (хвосты привода и состояния: RUN, LOD, SPD, CUR, OP, OPN, CLS, ON, OFF, STOP, "
@@ -116,6 +128,13 @@ Limit = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 1,
 DeviationTag = Annotated[Any, Field(json_schema_extra={"type": "string", "maxLength": TAG_CHARS})]
 Threshold = Annotated[Any, Field(json_schema_extra={"type": "number", "exclusiveMinimum": 0})]
 WithState = Annotated[Any, Field(json_schema_extra={"type": "boolean", "default": False})]
+# calc_spc (Д21): свои пределы points (SPC_MIN_POINTS..SERIES_MAX_POINTS — выше нижней границы tag_series) и
+# subgroup (1 — I-MR, 2..10 — X̄-R); lsl/usl — число без границ (None разрешён — отсутствие допуска)
+SpcTag = Annotated[Any, Field(json_schema_extra={"type": "string", "maxLength": TAG_CHARS})]
+SpcPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": SPC_MIN_POINTS,
+                                                    "maximum": SERIES_MAX_POINTS})]
+SpcSubgroup = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 1, "maximum": SPC_MAX_SUBGROUP})]
+SpcBound = Annotated[Any, Field(json_schema_extra={"type": "number"})]
 
 
 # equipment (Д19): MCP-инструмент без HTTP-ручки (Task 1) — своя модель аргументов, не из http_api
@@ -124,6 +143,29 @@ class EquipmentArgs(BaseModel):
 
     query: Annotated[str, StringConstraints(min_length=1, max_length=QUERY_CHARS)]
     with_state: bool = False
+
+
+# calc_spc (Д21): MCP-инструмент без HTTP-ручки, своя модель аргументов (как equipment), не из http_api.
+# points/subgroup/lsl/usl — БЕЗ Field(ge=/le=/allow_inf_nan=) здесь нарочно: общий http_api.validation_reason()
+# у поля "points" всегда отвечает словами SERIES_MIN_POINTS..SERIES_MAX_POINTS (там это захардкожено для
+# tag_series/calc_deviation, план Д21 не трогает http_api.py) — у calc_spc своя, более высокая нижняя граница
+# (SPC_MIN_POINTS); диапазон points/subgroup и конечность lsl/usl проверяет сама служба (_spc_points_problem,
+# _subgroup_problem, _spc_bound_problem) — ровно той же причиной, что у прямого вызова и HTTP-аналогов других
+# инструментов. Рекламируемая схема (минимум/максимум для модели) — отдельно, через SpcPoints/SpcSubgroup
+# (json_schema_extra для FastMCP), а не через эту модель.
+class CalcSpcArgs(BaseModel):
+    """SPC и карта Шухарта (Д21): один аналоговый тег; points, subgroup, lsl, usl — без собственных пределов
+    здесь (диапазон проверяет служба, см. комментарий выше); типы — целое/число, умолчания — как в сигнатуре
+    MCP-инструмента."""
+
+    tag: Tag
+    period: Literal[PRESETS] | None = None
+    start: str | None = None
+    end: str | None = None
+    points: int = SPC_DEFAULT_POINTS
+    subgroup: int = 1
+    lsl: float | None = None
+    usl: float | None = None
 AgentName = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["name"])]
 AgentTitle = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["title"])]
 AgentNode = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["node"])]
@@ -240,6 +282,16 @@ def build_mcp(role: "DataRole") -> FastMCP:
                           lambda caller, a: role.service.calc_deviation(caller, "mcp", a.measure_tag,
                                                                         a.setpoint_tag, a.threshold, a.period,
                                                                         a.start, a.end, a.points))
+
+    @mcp.tool(name="calc_spc", description=TOOL_DESCRIPTIONS["calc_spc"], annotations=READ_ONLY)
+    async def calc_spc(ctx: Context, tag: SpcTag = None, period: Preset = None, start: IsoTime = None,
+                       end: IsoTime = None, points: SpcPoints = SPC_DEFAULT_POINTS, subgroup: SpcSubgroup = 1,
+                       lsl: SpcBound = None, usl: SpcBound = None) -> dict[str, Any]:
+        return await call(ctx, "calc_spc", tag, CalcSpcArgs,
+                          {"tag": tag, "period": period, "start": start, "end": end, "points": points,
+                           "subgroup": subgroup, "lsl": lsl, "usl": usl},
+                          lambda caller, a: role.service.calc_spc(caller, "mcp", a.tag, a.period, a.start, a.end,
+                                                                  a.points, a.subgroup, a.lsl, a.usl))
 
     @mcp.tool(name="equipment", description=TOOL_DESCRIPTIONS["equipment"], annotations=READ_ONLY)
     async def equipment(ctx: Context, query: Query = None, with_state: WithState = False) -> dict[str, Any]:
