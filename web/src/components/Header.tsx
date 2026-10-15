@@ -1,12 +1,7 @@
-// Шапка (Д6-R44): предупреждение «учебный стенд» (тот же текст и роль, что .stand на login.html), баннер
-// состояния, вкладки (aria-pressed): у студента в фазах места и чата — «Чат», «Аналитический чат технолога»
-// (план КДМ1, Task 6), «Калькуляторы» (Д9-R88), «События» (Д13) и «Уроки» (Д15а, только у студента), у
-// преподавателя в фазе кабинета — «Кабинет», «Аналитический чат технолога» (мастер-промпт §6: справка
-// преподавателю — без LLM, не только студенту) и «Калькуляторы» (Д10-R110); «Вы вошли как …» и «Выйти».
-// Закреплена сверху и видна всегда.
+// Навигация: один обычный чат, калькуляторы, события и уроки. Отдельная аналитика убрана.
 import type { startStatusPolling } from "../status";
 import {
-  STAND_WARNING, T_LOGOUT, T_SIGNED_IN, T_TAB_ANALYTICS, T_TAB_ANALYTICS_SHORT, T_TAB_CABINET, T_TAB_CALC,
+  STAND_WARNING, T_LOGOUT, T_SIGNED_IN, T_TAB_CABINET, T_TAB_CALC,
   T_TAB_CHAT, T_TAB_EVENTS, T_TAB_LESSONS, T_TABS,
 } from "../texts";
 import { StatusBanner } from "./StatusBanner";
@@ -24,7 +19,7 @@ export interface HeaderProps {
   leaving: boolean;             // выход уже идёт
   view: View | null;            // открытая вкладка; null — вкладок нет (загрузка, ошибка, предупреждение, выход)
   teacher: boolean;             // своя вкладка — «Кабинет», а не «Чат»
-  showAnalytics: boolean;       // вкладка «Аналитический чат технолога» — у студента и преподавателя (мастер-промпт §6)
+  showAnalytics: boolean; // Устаревший параметр; отдельная аналитика больше не отображается.       // вкладка «Аналитический чат технолога» — у студента и преподавателя (мастер-промпт §6)
   showEvents: boolean;          // вкладка «События» — только у студента (Д13)
   showLessons: boolean;         // вкладка «Уроки» — только у студента (Д15а)
   onView(v: View): void;
@@ -41,13 +36,6 @@ export function Header(p: HeaderProps) {
             <button type="button" aria-pressed={p.view === "main"} onClick={() => p.onView("main")}>
               {p.teacher ? T_TAB_CABINET : T_TAB_CHAT}
             </button>
-            {p.showAnalytics && (
-              <button type="button" aria-pressed={p.view === "analytics"} aria-label={T_TAB_ANALYTICS}
-                      onClick={() => p.onView("analytics")}>
-                <span className="tab-full">{T_TAB_ANALYTICS}</span>
-                <span className="tab-short">{T_TAB_ANALYTICS_SHORT}</span>
-              </button>
-            )}
             <button type="button" aria-pressed={p.view === "calc"} onClick={() => p.onView("calc")}>{T_TAB_CALC}</button>
             {p.showEvents && (
               <button type="button" aria-pressed={p.view === "events"} onClick={() => p.onView("events")}>
