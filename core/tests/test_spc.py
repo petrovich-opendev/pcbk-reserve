@@ -173,6 +173,51 @@ def test_rules_flat_series_no_violations():
     assert rules(points, cl=5, sigma=1) == []
 
 
+# ---- круг правок по ревью (Important #2): zone — у самой дальней от CL точки окна, а не у точки `index` ----
+
+def test_rule6_zone_reflects_worst_point_in_window_not_last():
+    # Регрессия ревью: раньше zone брался у ПОСЛЕДНЕЙ точки окна (тут 0.05, зона C) — противоречие при явном
+    # срабатывании правила 6 (4 из 5 точек подряд за 1σ). Теперь zone — у самой дальней от CL точки окна
+    # (1.5 -> зона B).
+    points = [1.5, 1.5, 1.5, 1.5, 0.05]
+    violations = rules(points, cl=0, sigma=1)
+    assert violations == [{"rule": 6, "name_ru": "4 из 5 точек подряд за 1σ по одну сторону",
+                           "index": 4, "zone": "B"}]
+
+
+def test_rule5_zone_reflects_worst_point_in_window_not_last():
+    # Регрессия ревью: раньше zone у последней точки окна (0.2, зона C); теперь — у самой дальней (3.5), что
+    # даёт зону «вне» — та же точка (индекс 0) отдельно и правильно триггерит правило 1.
+    points = [3.5, 2.5, 0.2]
+    violations = rules(points, cl=0, sigma=1)
+    assert violations == [
+        {"rule": 1, "name_ru": "точка за контрольной границей (3σ)", "index": 0, "zone": "вне"},
+        {"rule": 5, "name_ru": "2 из 3 точек подряд за 2σ по одну сторону", "index": 2, "zone": "вне"},
+    ]
+
+
+# ---- круг правок по ревью (Important #1): sigma = 0 (ряд без вариации) не должна падать необработанным
+# исключением — это реальный случай (стабильный тег), не ошибка вызывающего ----
+
+def test_rules_rejects_negative_sigma():
+    with pytest.raises(ValueError, match="отрицательн"):
+        rules([1, 2, 3], cl=0, sigma=-1)
+
+
+def test_rules_zero_sigma_flat_series_no_violations():
+    # σ = 0 (например, у individuals()/xbar_r() на абсолютно стабильном ряду MR̄ = 0 или R̄ = 0); все точки
+    # равны CL -> z = 0 для всех, нарушений нет (короче 15, иначе отдельно сработало бы правило 7).
+    points = [5] * 10
+    assert rules(points, cl=5, sigma=0) == []
+
+
+def test_rules_zero_sigma_point_differs_from_cl():
+    # σ = 0, но одна точка отличается от CL -> физически бесконечное число сигм -> правило 1, зона «вне».
+    points = [5, 5, 5, 7, 5]
+    violations = rules(points, cl=5, sigma=0)
+    assert violations == [{"rule": 1, "name_ru": "точка за контрольной границей (3σ)", "index": 3, "zone": "вне"}]
+
+
 # ============================================================================================================
 # capability
 # ============================================================================================================
@@ -220,6 +265,17 @@ def test_capability_without_boundaries_is_none():
 def test_capability_requires_at_least_two_values_when_boundaries_given():
     with pytest.raises(ValueError, match="минимум 2"):
         capability([5], 1.2, lsl=1, usl=10)
+
+
+def test_capability_zero_overall_sigma_raises():
+    # Круг правок по ревью (Critical): все значения ряда одинаковы -> выборочное СКО (sigma_overall) = 0 ->
+    # без защиты Pp/Ppk делили бы на ноль (ZeroDivisionError). Проверяем все три варианта границ.
+    with pytest.raises(ValueError, match="σ_общ"):
+        capability([5, 5, 5], 1.2, lsl=1, usl=10)
+    with pytest.raises(ValueError, match="σ_общ"):
+        capability([5, 5, 5], 1.2, lsl=None, usl=10)
+    with pytest.raises(ValueError, match="σ_общ"):
+        capability([5, 5, 5], 1.2, lsl=1, usl=None)
 
 
 # ============================================================================================================

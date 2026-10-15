@@ -143,17 +143,32 @@ def _violation(rule: int, index: int, abs_z: float) -> dict[str, Any]:
 
 def rules(points: Sequence[float], cl: float, sigma: float) -> list[dict[str, Any]]:
     """8 правил Нельсона по готовым точкам карты (индивидуальным значениям или средним подгрупп); `sigma` — σ
-    САМОЙ точки карты (для X̄ — σ̂/√n, план Д21 Task 1). Правило, описывающее окно из нескольких точек подряд
-    (2..8), считается сработавшим на ПОСЛЕДНЕЙ точке окна (та точка, после которой образец становится виден) —
-    `index` и `zone` в ответе относятся к ней, а не к точке(ам), которая(ые) конкретно нарушила(и) порог внутри
-    окна. Список нарушений отсортирован по индексу точки, затем по номеру правила."""
-    if sigma <= 0:
-        raise ValueError("sigma должна быть больше нуля")
+    САМОЙ точки карты (для X̄ — σ̂/√n, план Д21 Task 1).
+
+    Правило, описывающее окно из нескольких точек подряд (2..8), считается сработавшим на ПОСЛЕДНЕЙ точке
+    окна (та точка, после которой образец становится виден) — `index` в ответе относится к ней. `zone` — зона
+    САМОЙ ДАЛЬНЕЙ от CL точки ВНУТРИ окна (круг правок по ревью: раньше брался `index`, из-за чего правило
+    могло быть помечено зоной «C» (норма), если именно последняя точка окна случайно была мягкой, а реально
+    отклонившиеся точки стояли раньше в окне — например, `rules([1.5, 1.5, 1.5, 1.5, 0.05], cl=0, sigma=1)`:
+    правило 6 срабатывает по первым четырём точкам, последняя (0.05) в норме).
+
+    `sigma` = 0 — карта без оценённой вариации (σ̂ = 0, обычно MR̄ = 0 или R̄ = 0: ряд абсолютно стабилен за
+    всё окно — реальный случай, когда тег не менялся, не ошибка вызывающего). Точки, равные `cl`, получают
+    z = 0 (зона C, правила 2/5/6/8 по ним не срабатывают — они все на одной стороне или вне 1σ не бывают).
+    Точка, отличная от `cl`, при σ = 0 физически бесконечно далека от центральной линии — ей присваивается
+    z = ±∞ (зона «вне», и правило 1 срабатывает на ней как на выходе за контрольную границу). Отрицательная
+    `sigma` — ошибка вызывающего (`ValueError`). Список нарушений отсортирован по индексу точки, затем по
+    номеру правила."""
+    if sigma < 0:
+        raise ValueError("sigma не может быть отрицательной")
     n = len(points)
     violations: list[dict[str, Any]] = []
     if n == 0:
         return violations
-    z = [(p - cl) / sigma for p in points]
+    if sigma == 0:
+        z = [0.0 if p == cl else math.copysign(math.inf, p - cl) for p in points]
+    else:
+        z = [(p - cl) / sigma for p in points]
     abs_z = [abs(v) for v in z]
 
     # 1 — точка за 3σ
@@ -166,7 +181,7 @@ def rules(points: Sequence[float], cl: float, sigma: float) -> list[dict[str, An
         window = z[i:i + 9]
         if all(v > 0 for v in window) or all(v < 0 for v in window):
             idx = i + 8
-            violations.append(_violation(2, idx, abs_z[idx]))
+            violations.append(_violation(2, idx, max(abs(v) for v in window)))
 
     # 3 — 6 подряд монотонно растут или падают
     for i in range(n - 5):
@@ -175,7 +190,7 @@ def rules(points: Sequence[float], cl: float, sigma: float) -> list[dict[str, An
         decreasing = all(window[j] > window[j + 1] for j in range(5))
         if increasing or decreasing:
             idx = i + 5
-            violations.append(_violation(3, idx, abs_z[idx]))
+            violations.append(_violation(3, idx, max(abs_z[i:i + 6])))
 
     # 4 — 14 подряд попеременно вверх-вниз
     for i in range(n - 13):
@@ -184,35 +199,35 @@ def rules(points: Sequence[float], cl: float, sigma: float) -> list[dict[str, An
         alternating = all(d != 0 for d in diffs) and all(diffs[j] * diffs[j + 1] < 0 for j in range(12))
         if alternating:
             idx = i + 13
-            violations.append(_violation(4, idx, abs_z[idx]))
+            violations.append(_violation(4, idx, max(abs_z[i:i + 14])))
 
     # 5 — 2 из 3 подряд за 2σ по одну сторону
     for i in range(n - 2):
         window = z[i:i + 3]
         if sum(1 for v in window if v > 2) >= 2 or sum(1 for v in window if v < -2) >= 2:
             idx = i + 2
-            violations.append(_violation(5, idx, abs_z[idx]))
+            violations.append(_violation(5, idx, max(abs(v) for v in window)))
 
     # 6 — 4 из 5 подряд за 1σ по одну сторону
     for i in range(n - 4):
         window = z[i:i + 5]
         if sum(1 for v in window if v > 1) >= 4 or sum(1 for v in window if v < -1) >= 4:
             idx = i + 4
-            violations.append(_violation(6, idx, abs_z[idx]))
+            violations.append(_violation(6, idx, max(abs(v) for v in window)))
 
     # 7 — 15 подряд в пределах 1σ
     for i in range(n - 14):
         window = abs_z[i:i + 15]
         if all(v <= 1 for v in window):
             idx = i + 14
-            violations.append(_violation(7, idx, abs_z[idx]))
+            violations.append(_violation(7, idx, max(window)))
 
     # 8 — 8 подряд вне 1σ по обе стороны (смесь, без зоны C)
     for i in range(n - 7):
         window = z[i:i + 8]
         if all(abs(v) > 1 for v in window) and any(v > 0 for v in window) and any(v < 0 for v in window):
             idx = i + 7
-            violations.append(_violation(8, idx, abs_z[idx]))
+            violations.append(_violation(8, idx, max(abs(v) for v in window)))
 
     violations.sort(key=lambda v: (v["index"], v["rule"]))
     return violations
@@ -223,7 +238,8 @@ def capability(values: Sequence[float], sigma_within: float, lsl: float | None =
     """Cp/Cpk (по `sigma_within` — внутригрупповой σ̂ карты) и Pp/Ppk (по σ_общ — выборочному СКО, n-1) для
     границ допуска ТЕХНОЛОГА (не норматив ПЦБК — текст об этом формирует вызывающий). Без обеих границ —
     `None`. С одной границей — только Cpk/Ppk ПО НЕЙ (Cp/Pp = `None`, т.к. у одностороннего допуска нет
-    ширины поля для Cp/Pp)."""
+    ширины поля для Cp/Pp). Круг правок по ревью: если все значения ряда одинаковы, σ_общ (выборочное СКО)
+    равна нулю — Pp/Ppk делили бы на ноль; это тоже `ValueError`, как и нулевая `sigma_within`."""
     if lsl is None and usl is None:
         return None
     if len(values) < 2:
@@ -232,6 +248,8 @@ def capability(values: Sequence[float], sigma_within: float, lsl: float | None =
         raise ValueError("sigma_within должна быть больше нуля")
     mu = statistics.mean(values)
     sigma_overall = statistics.stdev(values)
+    if sigma_overall <= 0:
+        raise ValueError("σ_общ (выборочное СКО) равна нулю — все значения ряда одинаковы, Pp/Ppk не определены")
     if lsl is not None and usl is not None:
         cp: float | None = (usl - lsl) / (6 * sigma_within)
         cpk = min(usl - mu, mu - lsl) / (3 * sigma_within)
