@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 
 from fakes import CATALOG_ROWS, LIVE_ROWS, WHITELIST
-from pcbk_core.data.catalog import Catalog, Lookup, SearchResult, TagInfo, norm
+from pcbk_core.data.catalog import Catalog, EquipmentMatch, Lookup, SearchResult, TagInfo, Unit, norm
 
 
 def test_catalog_counts_and_freshest():
@@ -136,3 +136,69 @@ def test_search_similar_ranked_by_words_and_by_stem(cat):
     stem = cat.search("20FAKE_004_XX")                          # похоже на имя: основа 20FAKE_004
     assert (stem.similar, [t.name for t in stem.matches], stem.total) == (True, ["20FAKE_004_PV"], 1)
     assert cat.search("20FAKE_005_XX") == SearchResult((), True, 0)               # основа только у тега вне списка
+
+
+# --- Д19: equipment() — служба сама группирует теги в агрегаты и считает их ---
+
+def test_equipment_groups_run_and_lod_into_one_unit():
+    rows = [("30FAKE_001_RUN", "Насос 1 работа", 2, None, None, None),
+            ("30FAKE_001_LOD", "Насос 1 нагрузка", 1, 0.0, 100.0, "%")]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    m = cat.equipment("насос")
+    assert m == EquipmentMatch((Unit(code="30FAKE_001", description="Насос 1 работа", signals=("LOD", "RUN"),
+                                     group="30", run_tag="30FAKE_001_RUN"),), 0)
+
+
+def test_equipment_mv_only_stem_is_measure_point_not_unit():
+    rows = [("30FAKE_002_MV", "Расход после насоса", 1, 0.0, 10.0, "м3/ч")]
+    cat = Catalog.from_rows(rows, [], frozenset({"30FAKE_002_MV"}))
+    m = cat.equipment("насос")
+    assert m == EquipmentMatch((), 1)                       # точка измерения — не агрегат
+
+
+def test_equipment_description_falls_back_to_first_tag_without_run():
+    rows = [("30FAKE_003_OPN", "Задвижка 3 открыта", 2, None, None, None),
+            ("30FAKE_003_CLS", "Задвижка 3 закрыта", 2, None, None, None)]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    unit = cat.equipment("задвижка").units[0]
+    assert (unit.description, unit.signals, unit.run_tag) == ("Задвижка 3 закрыта", ("CLS", "OPN"), None)
+
+
+def test_equipment_group_prefix_digits_or_before_underscore():
+    rows = [("21FAKE30_RUN", "Насос участка 21", 2, None, None, None),
+            ("TVF_030_RUN", "Насос мешалки TVF", 2, None, None, None)]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    groups = {u.code: u.group for u in cat.equipment("насос").units}
+    assert groups == {"21FAKE30": "21", "TVF_030": "TVF"}
+
+
+def test_equipment_matches_by_any_tag_of_the_unit():                 # как у search: всех слов в norm(имя+описание)
+    rows = [("30FAKE_004_RUN", "работа", 2, None, None, None),
+            ("30FAKE_004_LOD", "Насос 4 нагрузка", 1, 0.0, 100.0, "%")]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    m = cat.equipment("насос")
+    assert m.units[0].code == "30FAKE_004"                            # слово нашлось у _LOD, а не у _RUN
+
+
+def test_equipment_outside_whitelist_or_without_underscore_ignored():
+    rows = [("30FAKE_005_RUN", "Насос 5 работа", 2, None, None, None),
+            ("NOUNDERSCORE", "без основы — насос", 1, 0.0, 1.0, "None")]
+    cat = Catalog.from_rows(rows, [], frozenset({"NOUNDERSCORE"}))     # 30FAKE_005_RUN вне белого списка
+    m = cat.equipment("насос")
+    assert m == EquipmentMatch((), 0)                                # вне списка и без основы — ни то, ни то
+
+
+def test_equipment_empty_query_finds_nothing():
+    cat = Catalog.from_rows(CATALOG_ROWS, [], WHITELIST)
+    assert cat.equipment("") == EquipmentMatch((), 0) and cat.equipment("   ") == EquipmentMatch((), 0)
+
+
+def test_equipment_sorted_by_code():
+    rows = [("30FAKE_002_RUN", "Насос 2", 2, None, None, None), ("30FAKE_001_RUN", "Насос 1", 2, None, None, None)]
+    whitelist = frozenset(r[0] for r in rows)
+    cat = Catalog.from_rows(rows, [], whitelist)
+    assert [u.code for u in cat.equipment("насос").units] == ["30FAKE_001", "30FAKE_002"]

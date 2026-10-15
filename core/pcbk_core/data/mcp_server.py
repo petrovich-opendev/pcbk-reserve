@@ -32,7 +32,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.server import Settings as FastMCPSettings
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, StringConstraints, ValidationError
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -79,6 +79,13 @@ TOOL_DESCRIPTIONS = {
                       "число точек сверх порога и интервалы подряд идущих точек сверх порога (начало, конец, число "
                       "точек, наибольшее отклонение с его измерением и заданием). Период — готовый (period) или "
                       "начало и конец (start, end, ISO 8601).",
+    "equipment": "Подсчёт агрегатов каталога БДРВ участка КДМ-1 по словам в имени и описании: зовите на "
+                "«сколько насосов/задвижек/мешалок…» и «сколько сейчас в работе» — служба сама группирует "
+                "теги агрегата (хвосты привода и состояния: RUN, LOD, SPD, CUR, OP, OPN, CLS, ON, OFF, STOP, "
+                "FLT, ALM) и считает их, не агент. Число из units_total (и state_counts при with_state=true) "
+                "называйте студенту как есть, по спискам catalog_search не считайте сами. with_state=true — "
+                "дополнительно читает текущее значение тега _RUN каждого найденного агрегата (до 120 за "
+                "вызов): running/stopped/no_data/no_run_tag.",
     "save_agent": SAVE_DESCRIPTION,         # одно место правды — save_agent.py (research/09 §4.1, дословно)
     "my_agents": "Ваши сохранённые агенты этого места (без архивных и отправленных на карантин), с их инструкцией "
                 "— чтобы найти агента и предложить студенту правку. Без аргументов.",
@@ -104,6 +111,15 @@ Query = Annotated[Any, Field(json_schema_extra={"type": "string", "minLength": 1
 Limit = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 1, "maximum": SEARCH_LIMIT})]
 DeviationTag = Annotated[Any, Field(json_schema_extra={"type": "string", "maxLength": TAG_CHARS})]
 Threshold = Annotated[Any, Field(json_schema_extra={"type": "number", "exclusiveMinimum": 0})]
+WithState = Annotated[Any, Field(json_schema_extra={"type": "boolean", "default": False})]
+
+
+# equipment (Д19): MCP-инструмент без HTTP-ручки (Task 1) — своя модель аргументов, не из http_api
+class EquipmentArgs(BaseModel):
+    """Агрегаты каталога БДРВ: query — как у catalog_search, with_state — опрос тегов _RUN (до EQUIPMENT_RUN_CAP)."""
+
+    query: Annotated[str, StringConstraints(min_length=1, max_length=QUERY_CHARS)]
+    with_state: bool = False
 AgentName = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["name"])]
 AgentTitle = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["title"])]
 AgentNode = Annotated[Any, Field(json_schema_extra=SAVE_PROPERTIES["node"])]
@@ -220,6 +236,11 @@ def build_mcp(role: "DataRole") -> FastMCP:
                           lambda caller, a: role.service.calc_deviation(caller, "mcp", a.measure_tag,
                                                                         a.setpoint_tag, a.threshold, a.period,
                                                                         a.start, a.end, a.points))
+
+    @mcp.tool(name="equipment", description=TOOL_DESCRIPTIONS["equipment"], annotations=READ_ONLY)
+    async def equipment(ctx: Context, query: Query = None, with_state: WithState = False) -> dict[str, Any]:
+        return await call(ctx, "equipment", query, EquipmentArgs, {"query": query, "with_state": with_state},
+                          lambda caller, a: role.service.equipment(caller, "mcp", a.query, a.with_state))
 
     @mcp.tool(name="save_agent", description=TOOL_DESCRIPTIONS["save_agent"], annotations=SAVE_ANNOTATIONS)
     async def save_agent(ctx: Context, name: AgentName = None, title: AgentTitle = None, node: AgentNode = None,

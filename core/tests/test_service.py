@@ -9,16 +9,19 @@ from datetime import datetime
 
 import pytest
 
-from fakes import LIVE_ROWS
+from fakes import CLOCK_ROWS, LIVE_ROWS, FakeHistorian
 from helpers import SETTINGS, make_role, make_service, sent_of
 from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data import service as service_module
+from pcbk_core.data.catalog import Catalog
 from pcbk_core.data.gate import GateRefused, GateResult, SlidingWindow
-from pcbk_core.data.historian import HistorianError
+from pcbk_core.data.historian import HistorianError, parse_clock
 from pcbk_core.data.periods import Period
-from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, DRILL_SUMMARY, ERROR_MESSAGE, FAIL_STALE_S, FAIL_STREAK,
-                                    GRID_NOTE, ITEM_TEXTS, MESSAGES, NO_LAST_NOTE, OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE,
-                                    SOURCE_LIVE, SOURCE_SERIES, SOURCE_STATE, SOURCE_SUMMARY, STD_KIND, TOOL_WINDOW)
+from pcbk_core.data.service import (AVG_KIND, CLAMP_NOTE, DRILL_SUMMARY, EQUIPMENT_NOTES, EQUIPMENT_RUN_CAP,
+                                    EQUIPMENT_RUN_LIMIT_MESSAGE, EQUIPMENT_STALE_NOTE, EQUIPMENT_UNITS_CAP,
+                                    ERROR_MESSAGE, FAIL_STALE_S, FAIL_STREAK, GRID_NOTE, ITEM_TEXTS, MESSAGES,
+                                    NO_LAST_NOTE, OPEN_NOTE, SHIFT_NOTE, SIMILAR_NOTE, SOURCE_LIVE, SOURCE_SERIES,
+                                    SOURCE_STATE, SOURCE_SUMMARY, STD_KIND, TOOL_WINDOW)
 from pcbk_core.data.sql import HAS_LAST, SUMMARY_COLUMNS, clock_sql, live_sql
 from pcbk_core.logs import setup_logging
 from pcbk_core.places import PLACES
@@ -30,6 +33,19 @@ pytestmark = pytest.mark.anyio
 async def svc(tmp_path):
     s, fake = make_service(tmp_path)          # роль с загруженным каталогом; fake.calls очищены
     return s, fake
+
+
+def _equipment_service(tmp_path, rows, whitelist, live=None):
+    """Роль со своим каталогом (вымышленные теги Д19, не из fakes.CATALOG_ROWS) — для equipment: live задаёт
+    строки Live тегов _RUN, читаемые тем же путём, что tag_now."""
+    fake = FakeHistorian()
+    if live:
+        fake.live.update(live)
+    role, fake = make_role(db_dir=tmp_path, fake=fake, whitelist=frozenset(whitelist))
+    role._catalog_loaded(Catalog.from_rows(rows, [], role.whitelist), parse_clock(CLOCK_ROWS), role.monotonic())
+    fake.calls.clear()
+    fake.timeouts.clear()
+    return role.service, fake
 
 
 async def test_tag_now_answer_says_what_and_when(svc):
@@ -1112,3 +1128,117 @@ async def test_calc_deviation_event_has_both_tags(svc):
     assert (e.tool, e.caller, e.channel, e.outcome) == ("calc_deviation", "ops", "mcp", "ok")
     assert tuple(e.tags) == ("20FAKE_001_PV", "20FAKE_002_SP")
     assert set(e.sent) == {"20FAKE_001_PV", "20FAKE_002_SP"}
+
+
+# Д19: equipment — служба сама группирует теги каталога в агрегаты и считает их (и «сколько в работе»)
+
+
+async def test_equipment_without_state_sends_no_sql_like_catalog_search(svc):
+    s, fake = svc
+    r = await s.equipment("student-01", "http", "клапан")             # 25FAKE_007_CLS — единственный агрегат
+    assert (r["tool"], r["status"], r["cache"]) == ("equipment", "ok", "none")
+    assert (r["units_total"], r["tags_total"], r["measure_points_total"], r["truncated"]) == (1, 1, 0, False)
+    assert r["units"] == [{"code": "25FAKE_007", "description": "Клапан подачи закрыт", "signals": ["CLS"],
+                          "group": "25"}]
+    assert r["groups"] == {"25": 1} and "state_counts" not in r
+    assert set(EQUIPMENT_NOTES) <= set(r["notes"])
+    assert fake.calls == []                                           # каталог в памяти — SQL не шлёт
+    e = s.role.events.recent()[0]
+    assert (e.tool, e.outcome, e.summary) == ("equipment", "ok", "агрегатов 1, тегов 1")
+
+
+async def test_equipment_measure_point_counted_separately_from_units(svc):
+    s, _ = svc
+    r = await s.equipment("student-01", "http", "качество")           # QFAKE_010 — точка измерения, не агрегат
+    assert (r["units_total"], r["measure_points_total"], r["units"]) == (0, 1, [])
+
+
+async def test_equipment_no_match_is_ok_with_zeros(svc):
+    s, _ = svc
+    r = await s.equipment("student-01", "http", "zzzz-нет-такого")
+    assert (r["status"], r["units_total"], r["tags_total"], r["measure_points_total"], r["units"], r["groups"]) == (
+        "ok", 0, 0, 0, [], {})
+
+
+@pytest.mark.parametrize("kwargs,reason", [
+    ({"query": ""}, "query: нужна строка от 1 до 200 знаков"),
+    ({"query": "x" * 201}, "query: нужна строка от 1 до 200 знаков"),
+    ({"query": 5}, "query: нужна строка от 1 до 200 знаков"),
+    ({"query": "насос", "with_state": "yes"}, "with_state: нужен bool"),
+    ({"query": "насос", "with_state": 1}, "with_state: нужен bool"),
+])
+async def test_equipment_argument_errors(svc, kwargs, reason):
+    s, fake = svc
+    r = await s.equipment("student-01", "http", **kwargs)
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["args"] + reason)
+    assert fake.calls == []
+
+
+async def test_equipment_76_tags_full_list_not_truncated(tmp_path):      # Д19: было ≤ 50 у catalog_search
+    rows = [(f"40FAKE_{i:03d}_RUN", f"Насос {i} работа", 2, None, None, None) for i in range(1, 77)]
+    whitelist = {r[0] for r in rows}
+    s, fake = _equipment_service(tmp_path, rows, whitelist)
+    r = await s.equipment("student-01", "http", "насос")
+    assert (r["status"], r["units_total"], r["tags_total"], len(r["units"]), r["truncated"]) == (
+        "ok", 76, 76, 76, False)
+    assert fake.calls == []
+
+
+async def test_equipment_with_state_four_counters(tmp_path):
+    rows = [("50FAKE_001_RUN", "Агрегат 1 работа", 2, None, None, None),
+            ("50FAKE_002_RUN", "Агрегат 2 работа", 2, None, None, None),
+            ("50FAKE_003_RUN", "Агрегат 3 работа", 2, None, None, None),
+            ("50FAKE_004_OPN", "Агрегат 4 открыт", 2, None, None, None)]
+    whitelist = {r[0] for r in rows}
+    live = {"50FAKE_001_RUN": (datetime(2026, 10, 1, 11, 0), 1.0, 0),       # работает
+            "50FAKE_002_RUN": (datetime(2026, 10, 1, 11, 0), 0.0, 0),       # стоит
+            "50FAKE_003_RUN": (datetime(2026, 10, 1, 11, 0), 1.0, 64)}      # недостоверное качество
+    s, fake = _equipment_service(tmp_path, rows, whitelist, live=live)
+    r = await s.equipment("student-01", "http", "агрегат", with_state=True)
+    by_code = {u["code"]: u for u in r["units"]}
+    assert (by_code["50FAKE_001"]["state"], by_code["50FAKE_002"]["state"], by_code["50FAKE_003"]["state"],
+            by_code["50FAKE_004"]["state"]) == ("running", "stopped", "no_data", "no_run_tag")
+    assert by_code["50FAKE_004"]["time"] is None
+    assert r["state_counts"] == {"running": 1, "stopped": 1, "no_data": 1, "no_run_tag": 1}
+    assert set(sent_of(fake)) == {"50FAKE_001_RUN", "50FAKE_002_RUN", "50FAKE_003_RUN"}       # без тега 004 — SQL
+    e = s.role.events.recent()[0]
+    assert tuple(e.tags) == ("50FAKE_001_RUN", "50FAKE_002_RUN", "50FAKE_003_RUN")
+    assert set(e.sent) == {"50FAKE_001_RUN", "50FAKE_002_RUN", "50FAKE_003_RUN"}
+
+
+async def test_equipment_with_state_stale_note_is_a_day_not_ten_minutes(tmp_path):
+    rows = [("60FAKE_001_RUN", "Насос 60 работа", 2, None, None, None)]
+    live = {"60FAKE_001_RUN": (datetime(2026, 9, 29, 10, 0), 1.0, 0)}       # больше суток до «сейчас» 01.10 12:00
+    s, fake = _equipment_service(tmp_path, rows, {"60FAKE_001_RUN"}, live=live)
+    r = await s.equipment("student-01", "http", "насос", with_state=True)
+    unit = r["units"][0]
+    assert unit["state"] == "running" and unit["item_notes"] == [EQUIPMENT_STALE_NOTE]
+
+
+async def test_equipment_with_state_batches_by_max_names(tmp_path):
+    rows = [(f"80FAKE_{i:03d}_RUN", f"Агрегат {i}", 2, None, None, None) for i in range(1, 21)]   # 20 > MAX_NAMES
+    whitelist = {r[0] for r in rows}
+    live = {name: (datetime(2026, 10, 1, 11, 0), 1.0, 0) for name in whitelist}
+    s, fake = _equipment_service(tmp_path, rows, whitelist, live=live)
+    r = await s.equipment("student-01", "http", "агрегат", with_state=True)
+    assert r["state_counts"] == {"running": 20, "stopped": 0, "no_data": 0, "no_run_tag": 0}
+    assert len(fake.calls) == 2                                      # 16 + 4 — пачки по пределу tag_now
+    assert len(set(sent_of(fake))) == 20
+
+
+async def test_equipment_with_state_over_run_cap_is_refused_before_sql(tmp_path):
+    rows = [(f"70FAKE_{i:03d}_RUN", f"Агрегат {i}", 2, None, None, None) for i in range(1, EQUIPMENT_RUN_CAP + 2)]
+    whitelist = {r[0] for r in rows}
+    s, fake = _equipment_service(tmp_path, rows, whitelist)
+    r = await s.equipment("student-01", "http", "агрегат", with_state=True)
+    assert (r["status"], r["message"]) == ("refused", EQUIPMENT_RUN_LIMIT_MESSAGE)
+    assert fake.calls == []                                           # до ворот SQL не шлёт — сузьте запрос сами
+
+
+async def test_equipment_units_cap_sets_truncated(tmp_path):
+    rows = [(f"90FAKE_{i:04d}_LOD", f"Агрегат {i}", 1, 0.0, 100.0, "%") for i in range(1, EQUIPMENT_UNITS_CAP + 5)]
+    whitelist = {r[0] for r in rows}
+    s, fake = _equipment_service(tmp_path, rows, whitelist)
+    r = await s.equipment("student-01", "http", "агрегат")
+    assert (r["units_total"], len(r["units"]), r["truncated"]) == (EQUIPMENT_UNITS_CAP + 4, EQUIPMENT_UNITS_CAP, True)
+    assert any("сузьте запрос" in n for n in r["notes"])

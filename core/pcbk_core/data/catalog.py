@@ -5,6 +5,7 @@ EngineeringUnit) и live_all_sql() (Live). В нём все теги истор�
 белого списка: разбор имён отличает «вне списка» от «нет такого тега». Свойства
 тега, поиск и похожие имена отдаются только по белому списку.
 """
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,6 +64,50 @@ def _stem(key: str) -> str | None:
     """Основа имени — без последнего _ХВОСТА; у имени без «_» основы нет."""
     head, sep, _ = key.rpartition("_")
     return head if sep and head else None
+
+
+# Д19: хвосты привода/состояния белого списка (docs/research/05 §3.5) — основа с хотя бы одним из них — агрегат
+AGGREGATE_TAILS = frozenset({"RUN", "LOD", "SPD", "CUR", "OP", "OPN", "CLS", "ON", "OFF", "STOP", "FLT", "ALM"})
+_LEADING_DIGITS = re.compile(r"^[0-9]+")
+
+
+def _split_tail(name: str) -> tuple[str, str] | None:
+    """(основа, ХВОСТ верхним регистром) имени; у имени без «_» основы нет (как _stem)."""
+    head, sep, tail = name.rpartition("_")
+    return (head, tail.upper()) if sep and head else None
+
+
+def _group_of(code: str) -> str:
+    """Группа агрегата (Д19, план): ведущие цифры кода («21FAKE30» → «21»), иначе префикс до первого «_»
+    («TVF_030» → «TVF»), иначе код целиком."""
+    digits = _LEADING_DIGITS.match(code)
+    if digits:
+        return digits.group(0)
+    head, sep, _ = code.partition("_")
+    return head if sep else code
+
+
+@dataclass(frozen=True, slots=True)
+class Unit:
+    """Агрегат (Д19) — основа тега, у которой в белом списке есть хотя бы один тег привода или состояния
+    (AGGREGATE_TAILS). signals — хвосты всех её тегов белого списка, отсортированные; description — описание
+    тега «_RUN», иначе первого тега по имени; run_tag — имя тега «_RUN», если есть (для «сколько в работе»)."""
+
+    code: str
+    description: str
+    signals: tuple[str, ...]
+    group: str
+    run_tag: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EquipmentMatch:
+    """Ответ Catalog.equipment (Д19): units — ВСЕ агрегаты белого списка, подходящие запросу, без обрезки на
+    вывод (её делает служба); measure_points_total — число подходящих запросу точек измерения (основ без тега
+    привода/состояния) — отдельно, это не агрегаты."""
+
+    units: tuple[Unit, ...]
+    measure_points_total: int
 
 
 def _unit(value: Any) -> str | None:
@@ -186,3 +231,36 @@ class Catalog:
             seen = {t.name for t in similar}
             similar += [t for t in self._listed if _stem(t.name.upper()) == stem and t.name not in seen]
         return SearchResult(tuple(similar[:limit]), True, len(similar))
+
+    def equipment(self, query: str) -> EquipmentMatch:
+        """Агрегаты и точки измерения белого списка по словам запроса (Д19): основы (имя без хвоста),
+        сгруппированные по тегам белого списка. Основа подходит запросу, если все слова запроса есть в
+        norm(имя + описание) хотя бы одного её тега — тот же разбор, что у search(). Пустой запрос ничего не
+        находит, как у search(). Основа с хотя бы одним тегом AGGREGATE_TAILS — агрегат (Unit); иначе —
+        точка измерения (считается, в units не входит)."""
+        words = norm(query).split()
+        if not words:
+            return EquipmentMatch((), 0)
+        by_stem: dict[str, list[tuple[TagInfo, str]]] = {}
+        for t in self._listed:
+            split = _split_tail(t.name)
+            if split is None:
+                continue
+            stem, tail = split
+            by_stem.setdefault(stem, []).append((t, tail))
+        units: list[Unit] = []
+        measure_points = 0
+        for stem, pairs in by_stem.items():
+            pairs.sort(key=lambda p: p[0].name)
+            if not any(all(w in self._hay[t.name] for w in words) for t, _ in pairs):
+                continue
+            if not any(tail in AGGREGATE_TAILS for _, tail in pairs):
+                measure_points += 1
+                continue
+            tails = tuple(sorted(tail for _, tail in pairs))
+            run = next((t.name for t, tail in pairs if tail == "RUN"), None)
+            description = next((t.description for t, tail in pairs if tail == "RUN"), pairs[0][0].description)
+            units.append(Unit(code=stem, description=description, signals=tails, group=_group_of(stem),
+                              run_tag=run))
+        units.sort(key=lambda u: u.code)
+        return EquipmentMatch(tuple(units), measure_points)

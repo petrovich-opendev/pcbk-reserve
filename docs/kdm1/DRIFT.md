@@ -73,3 +73,14 @@ section_kind`/`test_job_response_schema_enum_includes_telemetry_observation` —
 control/refused, отказ `DataService` как есть, предел трёх подписей на ответ), `core/tests/test_gw_analytics_
 api.py` (`test_links_list_states`/`test_link_candidates_proxy_catalog_search`/`test_create_equipment_link_
 validates_subject_and_tag` — настоящий HTTP-путь маршрутов `links/*` и валидация заявки `equipment_link`).
+
+## Д19: инструмент чтения `equipment` в трёх защищённых файлах (15.10.2026)
+
+Повод — занятие 15.10: агенты не отвечали на «Сколько насосов?» (`docs/plans/PLAN-D19-equipment-2026-10-15.md`).
+Решение владельца 15.10 (вопрос с вариантами, «Разрешить добавление»): инструмент добавляется в защищённые
+`core/pcbk_core/data/catalog.py` (`Catalog.equipment` — группировка тегов белого списка по основе имени),
+`service.py` (`DataService.equipment`, `_equipment`) и `mcp_server.py` (инструмент `equipment`), коммит `9ea8159`.
+Правка только добавочная: 244 строки добавлено, 2 изменено — строка импорта (`pydantic`) и докстринг «Шесть
+инструментов чтения» → «Семь». Белый список тегов, его построение и разбор, шесть прежних инструментов
+(`catalog_search`, `tag_now`, `tag_period`, `tag_series`, `calc_runtime`, `calc_deviation`) — без изменений.
+База `PROTECTED_DATA_BASELINE.current.json` пересчитана только для этих трёх файлов; остальные 16 — прежние.

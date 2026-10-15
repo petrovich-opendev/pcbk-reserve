@@ -156,7 +156,7 @@ def test_render_match_aliases_no_tags():                                        
 def test_calc_agent_args_have_all_tools_no_digits():
     a = calc_agent_args(list(CASES.values()))
     assert a["tools"] == ["catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "calc_deviation",
-                          "report_event"]
+                          "equipment", "report_event"]
     assert a["tags"] == [TAG, "20FAKE_210_RUN"] and not any(ch.isdigit() for ch in a["prompt"])
 
 

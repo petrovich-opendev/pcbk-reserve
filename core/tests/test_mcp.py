@@ -46,10 +46,10 @@ async def test_mcp_lists_tools(core_server):
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
         tools = {t.name: t for t in (await s.list_tools()).tools}
     assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                          "calc_deviation", "save_agent", "my_agents", "report_event"}        # Д13: девять
+                          "calc_deviation", "equipment", "save_agent", "my_agents", "report_event"}  # Д19: десять
     assert all(tools[name].annotations.readOnlyHint is True
                for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                            "calc_deviation", "my_agents"))
+                            "calc_deviation", "equipment", "my_agents"))
     saver = tools["save_agent"]
     assert (saver.annotations.readOnlyHint, saver.annotations.destructiveHint, saver.annotations.idempotentHint,
             saver.annotations.openWorldHint) == (False, False, True, False)                  # Д7-R57
@@ -77,6 +77,7 @@ async def test_mcp_lists_tools(core_server):
     assert tools["tag_series"].description == TOOL_DESCRIPTIONS["tag_series"]                    # Д9а, А2
     assert tools["calc_runtime"].description == TOOL_DESCRIPTIONS["calc_runtime"]
     assert tools["calc_deviation"].description == TOOL_DESCRIPTIONS["calc_deviation"]             # Д13
+    assert tools["equipment"].description == TOOL_DESCRIPTIONS["equipment"]                       # Д19
     series = tools["tag_series"].inputSchema["properties"]
     assert (series["points"]["maximum"], series["tags"]["maxItems"]) == (96, 4)
 
@@ -416,4 +417,32 @@ async def test_mcp_calc_deviation_answer_from_service(core_server):
             props["points"]["default"]) == ("integer", 2, 96, 72)
     assert set(props) == {"measure_tag", "setpoint_tag", "threshold", "period", "start", "end", "points"}
     assert tools["calc_deviation"].annotations.openWorldHint is False
+
+
+# Д19: equipment — служба сама группирует теги каталога в агрегаты и считает их (и «сколько в работе»)
+
+
+@pytest.mark.anyio
+async def test_mcp_equipment_answer_from_service(core_server):
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        tools = {t.name: t for t in (await s.list_tools()).tools}
+        r = (await s.call_tool("equipment", {"query": "клапан"})).structuredContent
+        with_state = (await s.call_tool("equipment", {"query": "клапан", "with_state": True})).structuredContent
+        bad = (await s.call_tool("equipment", {"query": ""})).structuredContent
+        no_query = (await s.call_tool("equipment", {})).structuredContent
+    assert (r["status"], r["units_total"], r["tags_total"], r["measure_points_total"], r["truncated"]) == (
+        "ok", 1, 1, 0, False)
+    assert r["units"] == [{"code": "25FAKE_007", "description": "Клапан подачи закрыт", "signals": ["CLS"],
+                          "group": "25"}]
+    assert r["groups"] == {"25": 1} and "state_counts" not in r
+    assert with_state["units"][0]["state"] == "no_run_tag" and with_state["units"][0]["time"] is None
+    assert with_state["state_counts"] == {"running": 0, "stopped": 0, "no_data": 0, "no_run_tag": 1}
+    assert bad["message"].startswith("неверные аргументы: query")
+    assert no_query["message"].startswith("неверные аргументы: query")
+    props = tools["equipment"].inputSchema["properties"]
+    assert (props["query"]["type"], props["query"]["minLength"], props["query"]["maxLength"]) == ("string", 1, 200)
+    assert (props["with_state"]["type"], props["with_state"]["default"]) == ("boolean", False)
+    assert set(props) == {"query", "with_state"}
+    assert tools["equipment"].annotations.readOnlyHint is True and tools["equipment"].annotations.openWorldHint is False
+    assert TOOL_DESCRIPTIONS["equipment"].startswith("Подсчёт агрегатов каталога БДРВ участка КДМ-1")
     assert TOOL_DESCRIPTIONS["calc_deviation"].startswith("Отклонение измерения от задания регулятора БДРВ")

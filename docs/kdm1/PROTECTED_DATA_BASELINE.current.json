@@ -1,8 +1,8 @@
 {
-  "description": "Текущие sha256 19 защищённых файлов (PROTECTED_DATA_BASELINE.json пакета заказчика) — пересчёт от рабочего дерева pcbk-reserve-kdm1 (план КДМ1, Task 0, Global Constraints). Эти файлы не менялись задачей 0 и не должны меняться последующими задачами плана без отдельного решения владельца.",
+  "description": "Текущие sha256 19 защищённых файлов (PROTECTED_DATA_BASELINE.json пакета заказчика) — пересчёт от рабочего дерева pcbk-reserve-kdm1 (план КДМ1, Task 0, Global Constraints). Эти файлы не менялись задачей 0 и не должны меняться последующими задачами плана без отдельного решения владельца. Д19 (15.10.2026, решение владельца «разрешить добавление»): catalog.py, service.py, mcp_server.py — добавлен инструмент чтения equipment; список тегов и прежние функции не изменены (docs/kdm1/DRIFT.md, раздел Д19).",
   "reason": "Прямое указание пользователя: не менять общий разрешенный список тегов и его функции.",
   "archive_sha256": "9b87f7273b6da95069835f7bd3485f28b7c3d3d1e36db0637c1162a802b11dba",
-  "computed_from_git_head": "bea62db",
+  "computed_from_git_head": "9ea8159",
   "drift_from_archive_baseline": "docs/kdm1/DRIFT.md",
   "files": [
     {
@@ -27,8 +27,8 @@
     },
     {
       "path": "core/pcbk_core/data/catalog.py",
-      "bytes": 9697,
-      "sha256": "9c689be14fb22c62cdcb7abd7a22e34364692414cbe176ca14239114b889bd20"
+      "bytes": 14112,
+      "sha256": "44a0a08b5d1099c4b381c5f5f307d5fe4649a12c6240607a6e80faea765aff33"
     },
     {
       "path": "core/pcbk_core/data/events.py",
@@ -57,8 +57,8 @@
     },
     {
       "path": "core/pcbk_core/data/mcp_server.py",
-      "bytes": 25193,
-      "sha256": "681e940e0e55efda17700bc8ec7f206689c88e9bcc55c17d3cb49f2636ab8c9a"
+      "bytes": 27223,
+      "sha256": "ecc9338f42b12de0e8c0d9adc2a3c20546e2781bf073d55447adcba551b77cc5"
     },
     {
       "path": "core/pcbk_core/data/my_agents.py",
@@ -87,8 +87,8 @@
     },
     {
       "path": "core/pcbk_core/data/service.py",
-      "bytes": 77601,
-      "sha256": "9e865b27f544115ad8f05713a5e706fd26e424679f04cd344833de03e9f83050"
+      "bytes": 86705,
+      "sha256": "d509b89a25f90af61b2af86f022bdab1654f792c775d9402d82cc1965867b820"
     },
     {
       "path": "core/pcbk_core/data/sql.py",

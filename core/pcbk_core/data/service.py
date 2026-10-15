@@ -120,6 +120,19 @@ TOOL_WINDOW = 50                # tools_stats: столько последних
 FAIL_STREAK = 3                 # столько ошибок инструмента подряд — он в tools_stats()["failing"] (Д9-R83)
 FAIL_STALE_S = 1800.0           # инструмент не звали дольше (монотонные часы роли) — из failing уходит сам
 DEVIATION_DEFAULT_POINTS = 72   # calc_deviation (Д13): по умолчанию 72 точки на тег — крупнее, чем у tag_series
+EQUIPMENT_UNITS_CAP = 300        # equipment (Д19): units в ответе — полный список матчей, но не больше этого
+EQUIPMENT_RUN_CAP = 120          # equipment: агрегатов с тегом _RUN за один with_state=true вызов — не больше
+EQUIPMENT_STALE_S = 86400.0      # equipment: _RUN не менялся дольше — заметка; порог не тот, что у tag_now
+                                 # (STILL_NOTE_S, 10 мин): агрегат сутками «в работе» — это не залипание
+EQUIPMENT_STALE_NOTE = "значение не менялось больше суток"
+EQUIPMENT_STATES = ("running", "stopped", "no_data", "no_run_tag")
+EQUIPMENT_NOTES = (
+    "агрегат здесь — основа имени тега (без хвоста), у которой есть тег привода или состояния: RUN, LOD, SPD, "
+    "CUR, OP, OPN, CLS, ON, OFF, STOP, FLT, ALM",
+    "коды с одинаковым описанием бывают одним механизмом — не считайте их разными агрегатами не глядя",
+    "весь каталог стенда — участок КДМ-1",
+)
+EQUIPMENT_RUN_LIMIT_MESSAGE = f"агрегатов с тегом _RUN больше {EQUIPMENT_RUN_CAP} — сузьте запрос"
 
 # код ошибки ворот или историана → текст для людей; исход — outcome_for (OUTCOME_BY_CODE, F11)
 _CODE_MESSAGES = {"connect": MESSAGES["connect"], "auth": MESSAGES["auth"], "timeout": MESSAGES["timeout"],
@@ -290,6 +303,19 @@ def _query_problem(query: object, limit: object) -> str | None:
     return None
 
 
+def _equipment_query_problem(query: object) -> str | None:
+    """query — как у catalog_search (_query_problem), equipment без limit (Д19)."""
+    if not isinstance(query, str) or not 0 < len(query) <= QUERY_CHARS:
+        return f"query: нужна строка от 1 до {QUERY_CHARS} знаков"
+    return None
+
+
+def _with_state_problem(value: object) -> str | None:
+    if not isinstance(value, bool):
+        return "with_state: нужен bool"
+    return None
+
+
 def _resolve(catalog: Catalog, tags: Sequence[str]) -> list[_Entry]:
     """Разбор имён: повторы (без регистра и пробелов по краям) схлопываются, порядок — как во вводе."""
     seen: set[str] = set()
@@ -387,6 +413,25 @@ def _quality(code: object) -> str | None:
     if number is None:
         return None
     return "хорошее" if number == 0 else f"недостоверное (код {int(number)})"
+
+
+def _run_state(row: Row | None, now: datetime, tz: tzinfo | None) -> tuple[str, str | None, str | None]:
+    """Состояние агрегата по строке Live тега _RUN (equipment, Д19): running (1) / stopped (0) / no_data (нет
+    значения или недостоверное качество). Время — ISO (как tag_now); заметка «не менялось больше суток» — тот
+    же возраст, что у tag_now, порог другой (EQUIPMENT_STALE_S — агрегат сутками «в работе» не залипание)."""
+    if row is None:
+        return "no_data", None, None
+    when = _aware(row[1], tz) if tz is not None else None
+    value = _num(row[2])
+    quality = _quality(row[3])
+    time_iso = _iso(when)
+    if value is None or (quality is not None and quality.startswith("недостоверное")):
+        return "no_data", time_iso, None
+    state = "running" if value == 1 else "stopped" if value == 0 else "no_data"
+    note = None
+    if when is not None and max(0, int((now - when).total_seconds())) > EQUIPMENT_STALE_S:
+        note = EQUIPMENT_STALE_NOTE
+    return state, time_iso, note
 
 
 def _state_label(name: str, value: float | None) -> str | None:
@@ -551,6 +596,16 @@ def _safe(text: str, limit: int) -> str:
     return ascii(text)[1:-1][:limit]
 
 
+def _combine_cache(states: Sequence[CacheState]) -> CacheState:
+    """cache одного ответа equipment из нескольких пачек tag_now (Д19): miss, если хоть одна пачка сходила в
+    историан; иначе shared, если хоть одна ждала чужой полёт; иначе hit (все из кэша); без пачек — none."""
+    if not states:
+        return "none"
+    if "miss" in states:
+        return "miss"
+    return "shared" if "shared" in states else "hit"
+
+
 @dataclass(frozen=True)
 class _Scope:
     """Общее у инструментов за период после бюджета: разбор имён, имена в SQL, часы, «сейчас» и период."""
@@ -563,7 +618,7 @@ class _Scope:
 
 
 class DataService:
-    """Шесть инструментов чтения роли «данные» (с calc_deviation, Д13). Ворота, каталог, часы, журнал событий и
+    """Семь инструментов чтения роли «данные» (с equipment, Д19). Ворота, каталог, часы, журнал событий и
     monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
 
     def __init__(self, role: DataRole, *, cache: TTLCache | None = None, flight: SingleFlight | None = None,
@@ -639,6 +694,13 @@ class DataService:
         call = self._call(caller, channel, "calc_deviation", [measure_tag, setpoint_tag])
         return await self._run(call, self._calc_deviation(call, measure_tag, setpoint_tag, threshold, period, start,
                                                            end, points))
+
+    async def equipment(self, caller: str, channel: Channel, query: str, with_state: bool = False) -> dict[str, Any]:
+        """Агрегаты каталога по словам запроса (Д19): служба сама группирует теги и считает их — не агент."""
+        if self.role.config_error:          # F5
+            return await self.config_unavailable(caller, channel, "equipment", query)
+        call = self._call(caller, channel, "equipment", query)
+        return await self._run(call, self._equipment(call, query, with_state))
 
     async def refuse_args(self, caller: str, channel: Channel, tool: str, requested: Sequence[str],
                           reason: str) -> dict[str, Any]:
@@ -885,6 +947,87 @@ class DataService:
                 "setpoint_tag": setpoint_entry.shown, "threshold": float(threshold), "points": len(pairs),
                 "max_abs_dev": max_abs_dev, "mean_abs_dev": mean_abs_dev, "over_count": over_count,
                 "intervals": intervals}
+
+    async def _equipment(self, call: _Call, query: object, with_state: object) -> dict[str, Any]:
+        """Агрегаты каталога по словам запроса (Д19): без with_state — только каталог в памяти, SQL не шлёт
+        (как catalog_search); с with_state — читает _RUN агрегатов тем же путём, что tag_now (пачки по
+        MAX_NAMES, один счёт частоты на весь вызов). units — полный список подходящих агрегатов, обрезка на
+        вывод — EQUIPMENT_UNITS_CAP; units_total/tags_total/groups/measure_points_total — по всем подходящим,
+        без обрезки."""
+        self._check_rate(call)
+        self._check_drill()
+        reason = _equipment_query_problem(query) or _with_state_problem(with_state)
+        if reason:
+            raise _args_refusal(reason)
+        catalog = self._loaded_catalog()
+        match = catalog.equipment(query)
+        units = match.units
+        units_total = len(units)
+        tags_total = sum(len(u.signals) for u in units)
+        truncated = units_total > EQUIPMENT_UNITS_CAP
+        shown = units[:EQUIPMENT_UNITS_CAP]
+        notes = list(EQUIPMENT_NOTES)
+        if truncated:
+            notes.append(f"показаны первые {EQUIPMENT_UNITS_CAP} из {units_total} агрегатов — сузьте запрос, "
+                        "чтобы увидеть остальные")
+        groups: dict[str, int] = {}
+        for u in units:
+            groups[u.group] = groups.get(u.group, 0) + 1
+        states: dict[str, tuple[str, str | None, str | None]] = {}
+        counts = dict.fromkeys(EQUIPMENT_STATES, 0)
+        if with_state:
+            run_units = [u for u in shown if u.run_tag is not None]
+            if len(run_units) > EQUIPMENT_RUN_CAP:
+                raise _Refusal("refused", EQUIPMENT_RUN_LIMIT_MESSAGE,
+                               f"equipment_run: {len(run_units)} > {EQUIPMENT_RUN_CAP}")
+            states = await self._equipment_states(call, [u.run_tag for u in run_units])
+        items: list[dict[str, Any]] = []
+        for u in shown:
+            item: dict[str, Any] = {"code": u.code, "description": u.description, "signals": list(u.signals),
+                                    "group": u.group}
+            if with_state:
+                if u.run_tag is None:
+                    item["state"], item["time"], item["item_notes"] = "no_run_tag", None, []
+                else:
+                    state, time_iso, note = states[u.run_tag]
+                    item["state"], item["time"] = state, time_iso
+                    item["item_notes"] = [note] if note else []
+                counts[item["state"]] += 1
+            items.append(item)
+        call.summary = f"агрегатов {units_total}, тегов {tags_total}"
+        answer = {"tool": "equipment", "status": "ok", "notes": notes, "cache": call.cache, "query": query,
+                  "units_total": units_total, "tags_total": tags_total,
+                  "measure_points_total": match.measure_points_total, "truncated": truncated, "units": items,
+                  "groups": groups}
+        if with_state:
+            answer["state_counts"] = counts
+        return answer
+
+    async def _equipment_states(self, call: _Call,
+                                names: list[str]) -> dict[str, tuple[str, str | None, str | None]]:
+        """Значения _RUN агрегатов тем же путём, что tag_now (Д19): пачки по MAX_NAMES, без нового SQL. call.sent
+        и call.cache — по всем пачкам вместе (один вызов инструмента — один счёт частоты, не на пачку); «сейчас»
+        — один раз на вызов, после всех пачек, как у tag_now (возраст растёт у попадания в кэш)."""
+        call.tags = tuple(names)
+        if not names:
+            return {}
+        rows: dict[str, Row | None] = {}
+        tz = None
+        sent_all: list[str] = []
+        cache_states: list[CacheState] = []
+        for i in range(0, len(names), MAX_NAMES):
+            chunk = tuple(names[i:i + MAX_NAMES])
+            key = cache_key("tag_now", chunk, None, None)
+            snap = await self._fetch(call, key, lambda c=chunk, k=key: self._read_live(c, k))
+            cache_states.append(call.cache)
+            sent_all.extend(snap.sent)
+            tz = snap.asof.tzinfo
+            for name in chunk:
+                rows[name] = snap.rows.get(name.upper())
+        call.sent = tuple(dict.fromkeys(sent_all))
+        call.cache = _combine_cache(cache_states)
+        now = self.role.clock.aware(self._hist_now())
+        return {name: _run_state(row, now, tz) for name, row in rows.items()}
 
     # --- шаги ---
 
