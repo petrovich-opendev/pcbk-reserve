@@ -15,6 +15,7 @@ import urllib.request
 import pytest
 
 from helpers import CORE_DIR, TOKEN, http_post, make_role, mcp_session, non_root, run_python, serve_role
+from pcbk_core import spc as spc_lib
 from pcbk_core.agents.draft import AGENT_TOOLS
 from pcbk_core.data import CONFIG_ERRORS
 from pcbk_core.data.budget import PER_CALLER_LIMIT
@@ -46,10 +47,11 @@ async def test_mcp_lists_tools(core_server):
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
         tools = {t.name: t for t in (await s.list_tools()).tools}
     assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                          "calc_deviation", "equipment", "save_agent", "my_agents", "report_event"}  # Д19: десять
+                          "calc_deviation", "calc_spc", "equipment", "save_agent", "my_agents",
+                          "report_event"}  # Д21: одиннадцать
     assert all(tools[name].annotations.readOnlyHint is True
                for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                            "calc_deviation", "equipment", "my_agents"))
+                            "calc_deviation", "calc_spc", "equipment", "my_agents"))
     saver = tools["save_agent"]
     assert (saver.annotations.readOnlyHint, saver.annotations.destructiveHint, saver.annotations.idempotentHint,
             saver.annotations.openWorldHint) == (False, False, True, False)                  # Д7-R57
@@ -77,6 +79,7 @@ async def test_mcp_lists_tools(core_server):
     assert tools["tag_series"].description == TOOL_DESCRIPTIONS["tag_series"]                    # Д9а, А2
     assert tools["calc_runtime"].description == TOOL_DESCRIPTIONS["calc_runtime"]
     assert tools["calc_deviation"].description == TOOL_DESCRIPTIONS["calc_deviation"]             # Д13
+    assert tools["calc_spc"].description == TOOL_DESCRIPTIONS["calc_spc"]                         # Д21
     assert tools["equipment"].description == TOOL_DESCRIPTIONS["equipment"]                       # Д19
     series = tools["tag_series"].inputSchema["properties"]
     assert (series["points"]["maximum"], series["tags"]["maxItems"]) == (96, 4)
@@ -417,6 +420,41 @@ async def test_mcp_calc_deviation_answer_from_service(core_server):
             props["points"]["default"]) == ("integer", 2, 96, 72)
     assert set(props) == {"measure_tag", "setpoint_tag", "threshold", "period", "start", "end", "points"}
     assert tools["calc_deviation"].annotations.openWorldHint is False
+
+
+# Д21: calc_spc — карта Шухарта и SPC считает служба, не модель; схема аргументов — своя модель (как equipment),
+# без HTTP-ручки
+
+
+@pytest.mark.anyio
+async def test_mcp_calc_spc_answer_from_service(core_server):
+    args = {"tag": "20FAKE_001_PV", "period": "last_8h", "points": 24}
+    async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
+        tools = {t.name: t for t in (await s.list_tools()).tools}
+        r = (await s.call_tool("calc_spc", args)).structuredContent
+        bad_points = (await s.call_tool("calc_spc", {**args, "points": 2})).structuredContent
+        bad_subgroup = (await s.call_tool("calc_spc", {**args, "subgroup": 11})).structuredContent
+        discrete = (await s.call_tool("calc_spc", {**args, "tag": "25FAKE_007_CLS"})).structuredContent
+    # двойник (fakes.SERIES) отдаёт для 20FAKE_001_PV ровно 3 точки, вне зависимости от points аргумента
+    expected = spc_lib.individuals([10.0, 15.0, 12.5])
+    assert r["status"] == "ok" and r["tag"] == "20FAKE_001_PV" and r["chart"] == "I-MR"
+    assert (r["n_points"], r["skipped"]) == (3, 0)
+    assert r["cl"] == pytest.approx(expected["cl"])
+    assert r["ucl"] == pytest.approx(expected["ucl"])
+    assert r["lcl"] == pytest.approx(expected["lcl"])
+    assert r["sigma_within"] == pytest.approx(expected["sigma_hat"])
+    assert r["capability"] is None
+    assert bad_points["message"] == "неверные аргументы: points: от 20 до 96"
+    assert bad_subgroup["message"] == "неверные аргументы: subgroup: целое от 1 до 10"
+    assert discrete["status"] == "refused"
+    props = tools["calc_spc"].inputSchema["properties"]
+    assert (props["points"]["type"], props["points"]["minimum"], props["points"]["maximum"],
+            props["points"]["default"]) == ("integer", 20, 96, 96)
+    assert (props["subgroup"]["type"], props["subgroup"]["minimum"], props["subgroup"]["maximum"]) == (
+        "integer", 1, 10)
+    assert set(props) == {"tag", "period", "start", "end", "points", "subgroup", "lsl", "usl"}
+    assert tools["calc_spc"].annotations.readOnlyHint is True and tools["calc_spc"].annotations.openWorldHint is False
+    assert TOOL_DESCRIPTIONS["calc_spc"].startswith("Карта Шухарта (SPC)")
 
 
 # Д19: equipment — служба сама группирует теги каталога в агрегаты и считает их (и «сколько в работе»)

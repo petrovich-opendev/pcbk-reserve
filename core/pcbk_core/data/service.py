@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import statistics
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -40,6 +41,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
+from .. import spc
 from .budget import PER_CALLER_LIMIT, check_budget, check_points, cost_tag_days
 from .cache import SingleFlight, TTLCache, cache_key, round_now, ttl_for
 from .catalog import Catalog, Kind, Lookup, TagInfo
@@ -139,6 +141,19 @@ EQUIPMENT_MENTION_NOTE = ("число — оборудование, в нача�
                          "оборудования упоминают его в описании (например, клапан после насоса) — они в число "
                          "не входят")
 EQUIPMENT_RUN_LIMIT_MESSAGE = f"агрегатов с тегом _RUN больше {EQUIPMENT_RUN_CAP} — сузьте запрос"
+# calc_spc (Д21): точек на тег — своя, выше нижняя граница, чем у tag_series/_points_problem (SERIES_MIN_
+# POINTS=2): карта короче статистически не читается. По умолчанию — максимум окна ряда (96): больше точек —
+# надёжнее оценка границ.
+SPC_MIN_POINTS = 20
+SPC_DEFAULT_POINTS = SERIES_MAX_POINTS
+SPC_MAX_SUBGROUP = 10            # subgroup 1 (I-MR) или 2..10 (X̄-R, pcbk_core.spc._CONSTANTS)
+SPC_RELIABLE_MIN = 20            # меньше точек (I-MR) или подгрупп (X̄-R) карты — SPC_FEW_POINTS_NOTE
+SPC_CONTROL_NOTE = ("контрольные границы (UCL/CL/LCL) — статистическая вариация самого процесса, не границы "
+                    "допуска и не норматив ПЦБК")
+SPC_BOUNDS_NOTE = "границы допуска (LSL/USL) — порог технолога, не норматив ПЦБК"
+SPC_GRID_NOTE = "точки карты — значения равномерной сетки историана (усреднение по шагу), не сырые замеры"
+SPC_FEW_POINTS_NOTE = "меньше 20 точек (подгрупп) — контрольные границы ориентировочные"
+SPC_NOT_ENOUGH_NOTE = "после пропуска пустых и недостоверных точек ряда данных недостаточно для карты"
 
 # код ошибки ворот или историана → текст для людей; исход — outcome_for (OUTCOME_BY_CODE, F11)
 _CODE_MESSAGES = {"connect": MESSAGES["connect"], "auth": MESSAGES["auth"], "timeout": MESSAGES["timeout"],
@@ -301,6 +316,42 @@ def _threshold_problem(value: object) -> str | None:
     return None
 
 
+def _spc_points_problem(points: object) -> str | None:
+    """points (Д21, calc_spc): целое SPC_MIN_POINTS…SERIES_MAX_POINTS — выше нижней границы points у tag_series
+    (_points_problem): карта короче статистически не читается."""
+    if (isinstance(points, bool) or not isinstance(points, int)
+            or not SPC_MIN_POINTS <= points <= SERIES_MAX_POINTS):
+        return f"points: от {SPC_MIN_POINTS} до {SERIES_MAX_POINTS}"
+    return None
+
+
+def _subgroup_problem(subgroup: object) -> str | None:
+    """subgroup (Д21): целое 1 (I-MR) … SPC_MAX_SUBGROUP (X̄-R, таблица ASTM/AIAG в pcbk_core.spc)."""
+    if isinstance(subgroup, bool) or not isinstance(subgroup, int) or not 1 <= subgroup <= SPC_MAX_SUBGROUP:
+        return f"subgroup: целое от 1 до {SPC_MAX_SUBGROUP}"
+    return None
+
+
+def _spc_bound_problem(field: str, value: object) -> str | None:
+    """lsl/usl (Д21): не задана (None) — разрешено, карта без границ допуска; задана — конечное число, не bool."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(float(value)):
+        return f"{field}: число"
+    return None
+
+
+def _spc_bounds_problem(lsl: object, usl: object) -> str | None:
+    """lsl и usl по отдельности (_spc_bound_problem), затем — усл технолога: верхняя граница строго выше
+    нижней, когда заданы обе (иначе Cp/Cpk — отрицательное или бессмысленное число, не ошибка расчёта)."""
+    reason = _spc_bound_problem("lsl", lsl) or _spc_bound_problem("usl", usl)
+    if reason:
+        return reason
+    if lsl is not None and usl is not None and float(usl) <= float(lsl):
+        return "usl: должен быть больше lsl"
+    return None
+
+
 def _query_problem(query: object, limit: object) -> str | None:
     if not isinstance(query, str) or not 0 < len(query) <= QUERY_CHARS:
         return f"query: нужна строка от 1 до {QUERY_CHARS} знаков"
@@ -419,6 +470,21 @@ def _quality(code: object) -> str | None:
     if number is None:
         return None
     return "хорошее" if number == 0 else f"недостоверное (код {int(number)})"
+
+
+def _spc_valid_points(rows: Sequence[Row], tz: tzinfo) -> tuple[list[tuple[str | None, float]], int]:
+    """Валидные точки ряда для calc_spc (Д21, план Task 2 п.3): пустое значение ИЛИ недостоверное качество —
+    точка пропускается (не идёт в карту), число пропущенных — отдельно (ключ ответа `skipped`, не молча).
+    Порядок — как в rows (служба уже упорядочивает ряд по времени при чтении, Д9-R84)."""
+    valid: list[tuple[str | None, float]] = []
+    skipped = 0
+    for row in rows:
+        value = _num(row[2])
+        if value is None or _quality(row[3]) != "хорошее":
+            skipped += 1
+            continue
+        valid.append((_iso(_aware(row[1], tz)), value))
+    return valid, skipped
 
 
 def _run_state(row: Row | None, now: datetime, tz: tzinfo | None) -> tuple[str, str | None, str | None]:
@@ -624,7 +690,7 @@ class _Scope:
 
 
 class DataService:
-    """Семь инструментов чтения роли «данные» (с equipment, Д19). Ворота, каталог, часы, журнал событий и
+    """Восемь инструментов чтения роли «данные» (с calc_spc, Д21). Ворота, каталог, часы, журнал событий и
     monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
 
     def __init__(self, role: DataRole, *, cache: TTLCache | None = None, flight: SingleFlight | None = None,
@@ -700,6 +766,15 @@ class DataService:
         call = self._call(caller, channel, "calc_deviation", [measure_tag, setpoint_tag])
         return await self._run(call, self._calc_deviation(call, measure_tag, setpoint_tag, threshold, period, start,
                                                            end, points))
+
+    async def calc_spc(self, caller: str, channel: Channel, tag: str, period: str | None = None,
+                       start: str | None = None, end: str | None = None, points: int = SPC_DEFAULT_POINTS,
+                       subgroup: int = 1, lsl: float | None = None, usl: float | None = None) -> dict[str, Any]:
+        """Карта Шухарта и SPC по одному аналоговому тегу (Д21): считает служба (pcbk_core.spc), не модель."""
+        if self.role.config_error:          # F5
+            return await self.config_unavailable(caller, channel, "calc_spc", tag)
+        call = self._call(caller, channel, "calc_spc", tag)
+        return await self._run(call, self._calc_spc(call, tag, period, start, end, points, subgroup, lsl, usl))
 
     async def equipment(self, caller: str, channel: Channel, query: str, with_state: bool = False) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19): служба сама группирует теги и считает их — не агент."""
@@ -953,6 +1028,98 @@ class DataService:
                 "setpoint_tag": setpoint_entry.shown, "threshold": float(threshold), "points": len(pairs),
                 "max_abs_dev": max_abs_dev, "mean_abs_dev": mean_abs_dev, "over_count": over_count,
                 "intervals": intervals}
+
+    async def _calc_spc(self, call: _Call, tag: str, preset: str | None, start: str | None, end: str | None,
+                        points: int, subgroup: int, lsl: float | None, usl: float | None) -> dict[str, Any]:
+        """SPC и карта Шухарта для одного аналогового тега (Д21): чтение — тем же путём, что tag_series (SQL,
+        кэш, ворота, бюджет, точки — ключ кэша и tool "tag_series", как у calc_deviation, Д13); считает
+        pcbk_core.spc (individuals/xbar_r/rules/capability/sparkline), не модель. subgroup=1 — карта
+        индивидуальных значений (I-MR); subgroup 2..10 — карта средних подгрупп (X̄-R). Пустые и недостоверные
+        точки сетки пропускаются до расчёта (_spc_valid_points) — их число отдельно в ответе (`skipped`), не
+        молча. Меньше точек, чем нужно для хотя бы одной точки карты (2 для I-MR, subgroup для X̄-R) после
+        пропуска — не падение: status "partial", границы и карта — null (SQL уже ушёл, данные читались)."""
+        self._check_rate(call)
+        self._check_drill()
+        reason = (_deviation_tag_problem("tag", tag) or _period_problem(preset, start, end)
+                  or _spc_points_problem(points) or _subgroup_problem(subgroup)
+                  or _spc_bounds_problem(lsl, usl))
+        if reason:
+            raise _args_refusal(reason)
+        catalog = self._loaded_catalog()
+        # ошибки периода, которым не нужно «сейчас», — до запроса часов: такой отказ не шлёт SQL (как у ряда)
+        known = self.role.clock
+        reason = _period_syntax(preset, start, end, known.offset if known is not None else timedelta(0))
+        if reason:
+            raise _args_refusal(reason)
+        entry = _lookup_entry(catalog, tag)
+        if not _deviation_ready(entry):
+            # тег вне белого списка, неизвестен или не аналоговый — отказ как у ряда: SQL не шлётся
+            item = self._series_item(entry, None, None)
+            raise _Refusal("refused", MESSAGES["none"], "none: " + _counts([item]), extra={"items": [item]})
+        names = (entry.shown,)
+        clock, now_r, period = await self._clock_period(call, preset, start, end, names)
+        # точки — после окна и тего-суток и до series_sql, как у tag_series/calc_deviation
+        problem = check_points(len(names), points)
+        if problem is not None:
+            raise self._budget_refusal(problem, "budget: points", call, period, clock)
+        key = cache_key("tag_series", names, period.start, period.end, extra=str(points))
+        ttl = ttl_for("tag_series", period.end, now_r)
+        snap = await self._fetch(call, key, lambda: self._read_series(names, period, points, key, ttl))
+        info = entry.lookup.info
+        rows = snap.rows.get(entry.shown.upper(), ())
+        valid, skipped = _spc_valid_points(rows, clock.tz)
+        is_open = period.open or snap.open
+        call.tags = (entry.shown,)
+        notes = [SPC_GRID_NOTE, SPC_CONTROL_NOTE, *self._period_notes(period, is_open)]
+        if lsl is not None or usl is not None:
+            notes.append(SPC_BOUNDS_NOTE)
+        chart_name = "I-MR" if subgroup == 1 else "X̄-R"
+        need = subgroup if subgroup > 1 else 2
+        if len(valid) < need:
+            call.summary = f"{period.preset or 'свой период'}, точек {points}: данных недостаточно для карты"
+            notes.append(SPC_NOT_ENOUGH_NOTE)
+            return {"tool": "calc_spc", "status": "partial", "notes": notes, "cache": call.cache,
+                    "tag": entry.shown, "unit": info.unit, "period": self._period_json(period, clock, is_open),
+                    "chart": chart_name, "n_points": 0, "skipped": skipped, "cl": None, "ucl": None, "lcl": None,
+                    "sigma_within": None, "sigma_overall": None, "secondary": None, "violations": [],
+                    "in_control": None, "capability": None, "sparkline": ["", ""], "points": []}
+        values = [v for _, v in valid]
+        if subgroup == 1:
+            chart = spc.individuals(values)
+            chart_times = [t for t, _ in valid]
+        else:
+            chart = spc.xbar_r(values, subgroup)
+            full_len = len(values) - len(values) % subgroup
+            chart_times = [valid[i + subgroup - 1][0] for i in range(0, full_len, subgroup)]
+            if chart["discarded"]:
+                notes.append(f"{chart['discarded']} точек в конце ряда не вошли в подгруппу (хвост короче "
+                            f"{subgroup})")
+        violations = spc.rules(chart["points"], chart["cl"], chart["sigma_point"])
+        for v in violations:
+            v["time"], v["value"] = chart_times[v["index"]], chart["points"][v["index"]]
+        flagged = {v["index"] for v in violations}
+        sparkline = spc.sparkline(chart["points"], chart["lcl"], chart["ucl"], flagged)
+        n_points = len(chart["points"])
+        if n_points < SPC_RELIABLE_MIN:
+            notes.append(SPC_FEW_POINTS_NOTE)
+        sigma_overall = statistics.stdev(values)
+        capability = None
+        if lsl is not None or usl is not None:
+            try:
+                capability = spc.capability(values, chart["sigma_hat"], lsl, usl)
+            except ValueError as exc:
+                notes.append(f"Cp/Cpk/Pp/Ppk не посчитаны: {exc}")
+        secondary = chart["secondary"]
+        call.summary = (f"{period.preset or 'свой период'}, точек {points}: {chart_name}, "
+                        f"нарушений {len(violations)}")
+        return {"tool": "calc_spc", "status": "ok", "notes": notes, "cache": call.cache, "tag": entry.shown,
+                "unit": info.unit, "period": self._period_json(period, clock, is_open), "chart": chart_name,
+                "n_points": n_points, "skipped": skipped, "cl": chart["cl"], "ucl": chart["ucl"],
+                "lcl": chart["lcl"], "sigma_within": chart["sigma_hat"], "sigma_overall": sigma_overall,
+                "secondary": {"chart": secondary["chart"], "cl": secondary["cl"], "ucl": secondary["ucl"],
+                             "lcl": secondary["lcl"]},
+                "violations": violations, "in_control": not violations, "capability": capability,
+                "sparkline": sparkline, "points": [[t, v] for t, v in zip(chart_times, chart["points"])]}
 
     async def _equipment(self, call: _Call, query: object, with_state: object) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19, правка Д19б): без with_state — только каталог в памяти, SQL
