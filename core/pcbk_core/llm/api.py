@@ -66,7 +66,7 @@ HEALTH_PATH = "/health/llm"
 # поля счёта OpenRouter в /health/llm: только в ADMIN_NETS (pcbk-front, петля, pcbk-egress)
 ACCOUNT_KEYS = ("account_remaining_usd", "key_usage_usd", "key_spent_usd")
 CHAT_DEADLINE_S = 600.0         # 10 мин: 16 000 токенов ответа — при ≥ 27 токенов/с
-LEDGER_DURABLE_S = 2.0          # строка вызова на диске до OpenRouter (Д4а-R19)
+LEDGER_DURABLE_S = 8.0          # строка вызова на диске до OpenRouter (Д4а-R19); Д22: 2 → 8 с — на занятии 15.10 при 10 местах flush не успевал за 2 с
 STREAM_SEND_GRACE_S = 5.0       # клиент не читает поток: после срока вызова и этого запаса перекачка снимается
 BUSY_RETRY_AFTER = "2"
 LEDGER_RETRY_AFTER = "5"

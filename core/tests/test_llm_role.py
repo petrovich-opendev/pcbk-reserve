@@ -998,3 +998,15 @@ def test_fake_dear_word_prices_body_stream_and_generation(fake_or):       # дв
         assert plain["usage"]["cost"] == 0.0012                              # прочие слова не меняются
         usage = c.get(fake_or.url + "/key", headers=head).json()["data"]["usage"]
         assert usage == pytest.approx(3 * 0.5037 + 0.0012)                   # тело, поток, найденный дозапрос, обычный
+
+
+def test_ledger_tolerates_short_series_of_write_failures(tmp_path, fake_or):     # Д22: занятие 15.10, 10 мест
+    from pcbk_core.llm import LEDGER_FAILS_TOLERATED
+    app, role = make_llm_app(tmp_path, fake_or)
+    with TestClient(app):
+        wait_until(lambda: role.ledger.writable_ok is True)
+        role.ledger.consecutive_failures = LEDGER_FAILS_TOLERATED - 1              # короткая блокировка SQLite
+        assert role.ledger_ok() is True and role.ledger_error() is None
+        role.ledger.consecutive_failures = LEDGER_FAILS_TOLERATED                  # долгий сбой — прокси закрыт
+        assert role.ledger_ok() is False and role.ledger_error() == "write"
+        role.ledger.consecutive_failures = 0

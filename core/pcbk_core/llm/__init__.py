@@ -81,6 +81,11 @@ def _number(value: object) -> float | None:
     return value if math.isfinite(value) else None
 
 
+# Д22 (занятие 15.10, 10 мест): одна неудачная попытка записи («database is locked») сразу закрывала прокси для
+# всех (503 pcbk_ledger за 0 мс) до следующей удачной записи; терпим короткую серию — строка каждого вызова всё
+# равно должна лечь на диск до OpenRouter (flush до LEDGER_DURABLE_S), деньги по-прежнему важнее доступности.
+LEDGER_FAILS_TOLERATED = 12     # ≈ 12 × (WRITE_TIMEOUT_S + WRITE_RETRY_S) ≈ 9 с — дольше окна flush LEDGER_DURABLE_S
+
 class LlmRole(RoleBase):
     """upstream None — ключа OpenRouter нет (или настройка с ошибкой); key_fingerprint — первые 12 знаков sha256
     ключа, сам ключ живёт только внутри Upstream. config_error — настройка с ошибкой: /llm/ — 403 pcbk_config,
@@ -184,8 +189,8 @@ class LlmRole(RoleBase):
         """Только запомненные итоги журнала, без ввода-вывода (ревью задачи 4): открыт, писатель жив, проверка
         записи не провалилась, сбоев подряд нет и ни одна операция не брошена."""
         led = self.ledger
-        return (led.opened and led.writer_alive and led.writable_ok is not False and led.consecutive_failures == 0
-                and led.writes_dropped_total == 0)
+        return (led.opened and led.writer_alive and led.writable_ok is not False
+                and led.consecutive_failures < LEDGER_FAILS_TOLERATED and led.writes_dropped_total == 0)
 
     def ledger_error(self) -> Literal["dropped", "write"] | None:
         """dropped — операция журнала брошена (держится до перезапуска: каждый flush — LedgerWriteLost), write —
