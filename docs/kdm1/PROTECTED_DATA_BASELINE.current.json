@@ -87,8 +87,8 @@
     },
     {
       "path": "core/pcbk_core/data/service.py",
-      "bytes": 102851,
-      "sha256": "4f2327d69facf4d3bd7819a7a3baaf3ba2b11666c20c7029a73d1e498a9603c6"
+      "bytes": 104097,
+      "sha256": "081996fc1e9700ababb24f7d786cf72724bd95e7b429cc4be0bd0c4288cc347f"
     },
     {
       "path": "core/pcbk_core/data/sql.py",
