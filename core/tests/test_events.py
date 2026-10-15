@@ -9,7 +9,8 @@ from typing import get_args
 from helpers import EVENT as E            # пример события — в helpers: его берёт и test_role.py (F16)
 from helpers import non_root
 from pcbk_core.data.events import (AGENT_CHARS, EVENTS_CHECK_S, OUTCOME_BY_CODE, RETURNED_NAMES, SUMMARY_CHARS,
-                                   WRITE_TIMEOUT_S, CallEvent, EventLog, Outcome, outcome_for)
+                                   WRITE_ATTEMPTS, WRITE_RETRY_S, WRITE_TIMEOUT_S, WRITE_WINDOW_S, CallEvent,
+                                   EventLog, Outcome, outcome_for)
 from pcbk_core.data.freshness import ERROR_TEXTS
 from pcbk_core.data.historian import ErrorCode
 
@@ -156,7 +157,7 @@ def test_free_text_caps():                                                      
     assert replace(E, agent=None).agent is None
 
 
-def test_locked_db_fails_write_fast(tmp_path):                                  # M1: не дольше WRITE_TIMEOUT_S
+def test_locked_db_fails_write_fast(tmp_path):                  # M1; Д23: попытки при блокировке — и всё равно сбой
     log = EventLog(str(tmp_path / "core.db"))
     log.open()
     holder = sqlite3.connect(tmp_path / "core.db", isolation_level=None)
@@ -171,8 +172,40 @@ def test_locked_db_fails_write_fast(tmp_path):                                  
     finally:
         holder.execute("ROLLBACK")
         holder.close()
-    assert WRITE_TIMEOUT_S == 0.5 and took < WRITE_TIMEOUT_S + 1.0
-    assert log.consecutive_failures == 1 and "locked" in log.last_error
+    assert (WRITE_TIMEOUT_S, WRITE_ATTEMPTS, WRITE_RETRY_S, WRITE_WINDOW_S) == (0.5, 3, 0.25, 2.0)
+    assert took < WRITE_WINDOW_S + 1.0
+    assert log.consecutive_failures == 1 and "locked" in log.last_error and log.count() == 0
+
+
+def test_lock_released_between_attempts_writes_event(tmp_path):    # Д23: занятие 15.10 — «database is locked»
+    log = EventLog(str(tmp_path / "core.db"))
+    log.open()
+    holder = sqlite3.connect(tmp_path / "core.db", isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    release = threading.Timer(WRITE_TIMEOUT_S + 0.1, lambda: holder.execute("ROLLBACK"))
+    release.start()                         # первая попытка упирается в блокировку, следующая проходит
+    try:
+        log.write(E)
+    finally:
+        release.join()
+        holder.close()
+    assert log.consecutive_failures == 0 and log.last_error is None and log.recent() == [E]
+
+
+def test_other_errors_are_not_retried(tmp_path, monkeypatch):
+    log = EventLog(str(tmp_path / "core.db"))
+    calls = []
+
+    def full(e: CallEvent) -> None:
+        calls.append(e)
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(log, "_insert", full)
+    try:
+        log.write(E)
+    except sqlite3.OperationalError:
+        pass
+    assert len(calls) == 1 and log.consecutive_failures == 1
 
 
 # Д4б, задача 1: returned — имена, которые вернул catalog_search (по нему Д7 ловит tag_not_seen)

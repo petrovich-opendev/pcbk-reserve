@@ -18,7 +18,7 @@ from helpers import (LLM_ENV, SETTINGS, TEST_TOKENS, TOKEN, make_app, make_role,
 from pcbk_core.app import create_app
 from pcbk_core.data import CONFIG_ERRORS, TOKENS_ERROR, DataRole
 from pcbk_core.data.catalog import Catalog
-from pcbk_core.data.events import WRITE_TIMEOUT_S
+from pcbk_core.data.events import WRITE_WINDOW_S
 from pcbk_core.data.gate import GateResult, SlidingWindow
 from pcbk_core.data.historian import HistorianError
 from pcbk_core.data.sql import SUMMARY_COLUMNS, clock_sql, live_all_sql, live_sql, names_in, summary_sql
@@ -637,7 +637,7 @@ async def test_catalog_event_sent_is_gates_union():                             
     assert (e.outcome, e.sent) == ("timeout", (*GATE_SENT, "20FAKE_001_PV"))      # без повторов, по порядку
 
 
-async def test_locked_journal_holds_poll_at_most_write_timeout(tmp_path):         # M1
+async def test_locked_journal_holds_poll_at_most_write_window(tmp_path):          # M1; Д23: окно повторов
     role, _ = make_role(db_dir=tmp_path)
     await role.refresh_catalog()
     holder = sqlite3.connect(tmp_path / "core.db", isolation_level=None)
@@ -649,7 +649,7 @@ async def test_locked_journal_holds_poll_at_most_write_timeout(tmp_path):       
     finally:
         holder.execute("ROLLBACK")
         holder.close()
-    assert took < WRITE_TIMEOUT_S + 1.0 and role.freshness.error is None
+    assert took < WRITE_WINDOW_S + 1.0 and role.freshness.error is None
     assert role.events.consecutive_failures == 1 and "locked" in role.events.last_error
 
 

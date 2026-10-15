@@ -8,7 +8,9 @@
 или при первой операции. Соединение — на каждую операцию, как у журнала сторожа Д1:
 журнал пишут и читают потоки uvicorn, TestClient и asyncio.to_thread. writable() — проба
 записи с ожиданием блокировки до SQLITE_TIMEOUT_S: в цикле событий её не зовут (F9). Запись
-события ждёт блокировку не дольше WRITE_TIMEOUT_S, как журнал вызовов Д4а: долгая блокировка —
+события ждёт блокировку не дольше WRITE_TIMEOUT_S на попытку, как журнал вызовов Д4а; при блокировке
+(SQLITE_BUSY/SQLITE_LOCKED) — до WRITE_ATTEMPTS попыток с паузой WRITE_RETRY_S (Д23: core.db общий у шлюза,
+журнала вызовов и учёта агентов — на занятиях 15.10 терялось ~9 событий в час). Блокировка дольше WRITE_WINDOW_S —
 сбой записи со счётчиком, а не задержка вызова или опроса.
 
 Свободный текст события (requested, agent, summary) чистится на входе: одиночный суррогат
@@ -21,6 +23,7 @@
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,7 +46,11 @@ OUTCOME_BY_CODE: dict[str, Outcome] = {
 }
 EVENTS_CHECK_S = 30.0          # период фоновой проверки записи
 SQLITE_TIMEOUT_S = 5.0         # ожидание блокировки SQLite: схема, проба записи, чтение
-WRITE_TIMEOUT_S = 0.5          # ожидание блокировки у записи события
+WRITE_TIMEOUT_S = 0.5          # ожидание блокировки у одной попытки записи события
+WRITE_ATTEMPTS = 3             # Д23: попыток записи события при блокировке; иные ошибки — без повтора
+WRITE_RETRY_S = 0.25           # пауза перед повтором — как у писателя журнала вызовов
+# 2,0 с: дольше запись события вызов или опрос не держит
+WRITE_WINDOW_S = WRITE_ATTEMPTS * WRITE_TIMEOUT_S + (WRITE_ATTEMPTS - 1) * WRITE_RETRY_S
 REQUESTED_LINES = 16
 REQUESTED_CHARS = 128
 AGENT_CHARS = 128
@@ -89,6 +96,11 @@ def outcome_for(code: str) -> Outcome:
 
 def _why(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:ERROR_CHARS]
+
+
+def _locked(exc: sqlite3.OperationalError) -> bool:
+    """«database is locked»: другой писатель core.db держит блокировку дольше WRITE_TIMEOUT_S — повторить можно."""
+    return (getattr(exc, "sqlite_errorcode", 0) & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 def _text(value: object, limit: int) -> str:
@@ -216,10 +228,18 @@ class EventLog:
             db.execute(_INSERT, values)
 
     def write(self, e: CallEvent) -> None:
-        """Запись события; ошибка считается (consecutive_failures, last_error) и идёт дальше."""
+        """Запись события; блокировка — повтор (WRITE_ATTEMPTS, WRITE_RETRY_S). Неудача считается
+        (consecutive_failures, last_error) один раз на событие и идёт дальше."""
         try:
             self._ensure()
-            self._insert(e)
+            for attempt in range(1, WRITE_ATTEMPTS + 1):
+                try:
+                    self._insert(e)
+                    break
+                except sqlite3.OperationalError as exc:
+                    if attempt == WRITE_ATTEMPTS or not _locked(exc):
+                        raise
+                time.sleep(WRITE_RETRY_S)
         except Exception as exc:
             with self._state_lock:
                 self.consecutive_failures += 1
