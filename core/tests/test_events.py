@@ -192,20 +192,26 @@ def test_lock_released_between_attempts_writes_event(tmp_path):    # Д23: за�
     assert log.consecutive_failures == 0 and log.last_error is None and log.recent() == [E]
 
 
-def test_other_errors_are_not_retried(tmp_path, monkeypatch):
-    log = EventLog(str(tmp_path / "core.db"))
-    calls = []
+def test_retry_only_on_busy_or_locked_code(tmp_path, monkeypatch):    # по sqlite_errorcode, не по тексту
+    monkeypatch.setattr("pcbk_core.data.events.WRITE_RETRY_S", 0.0)
+    for code, tries in ((sqlite3.SQLITE_FULL, 1), (sqlite3.SQLITE_BUSY, WRITE_ATTEMPTS),
+                        (sqlite3.SQLITE_LOCKED, WRITE_ATTEMPTS), (None, 1)):
+        log = EventLog(str(tmp_path / f"core-{code}.db"))
+        calls = []
 
-    def full(e: CallEvent) -> None:
-        calls.append(e)
-        raise sqlite3.OperationalError("database or disk is full")
+        def fail(e: CallEvent, code=code, calls=calls) -> None:
+            calls.append(e)
+            exc = sqlite3.OperationalError("database is locked")
+            if code is not None:
+                exc.sqlite_errorcode = code
+            raise exc
 
-    monkeypatch.setattr(log, "_insert", full)
-    try:
-        log.write(E)
-    except sqlite3.OperationalError:
-        pass
-    assert len(calls) == 1 and log.consecutive_failures == 1
+        monkeypatch.setattr(log, "_insert", fail)
+        try:
+            log.write(E)
+        except sqlite3.OperationalError:
+            pass
+        assert (len(calls), log.consecutive_failures) == (tries, 1), code
 
 
 # Д4б, задача 1: returned — имена, которые вернул catalog_search (по нему Д7 ловит tag_not_seen)
