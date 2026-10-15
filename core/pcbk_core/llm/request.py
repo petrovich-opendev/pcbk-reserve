@@ -220,7 +220,8 @@ def rebuild_body(raw: object, policy: ModelPolicy, *, caller: str, session: str 
     body["max_tokens"] = _max_tokens(raw, max_tokens_cap)
     body.update(_optional(raw))
     body["reasoning"] = {"effort": policy.effort}
-    body["provider"] = {"only": [policy.provider_only], **PROVIDER_FIXED, "max_price": policy.max_price(0)}
+    body["provider"] = {"only": [policy.provider_only], **PROVIDER_FIXED, "zdr": policy.zdr,
+                        "max_price": policy.max_price(0)}
     body["user"] = f"pcbk-{caller}"
     body["session_id"] = f"{caller}:{session or 'none'}"
     if policy.auto_cache:

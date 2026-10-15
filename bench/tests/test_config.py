@@ -15,7 +15,7 @@ OC = REPO / "student" / "config" / "opencode.json"
 def test_config_refs_from_opencode_json():                                       # Review Focus 2
     refs = model_refs(json.loads(OC.read_text()))
     assert "pcbk/z-ai/glm-5.3" in refs and "pcbk-or/google/gemini-3.8-flash" in refs
-    assert "pcbk/anthropic/claude-fable-5.1" not in refs          # Д18: Fable без ZDR — в конфиге места нет
+    assert "pcbk/anthropic/claude-nonexistent-0" not in refs      # модели нет в конфиге места
 
 
 def test_model_refs_only_enabled_bench_providers():

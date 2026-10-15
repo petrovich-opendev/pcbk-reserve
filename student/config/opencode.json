@@ -38,7 +38,8 @@
         "z-ai/glm-5.3-flash": {"limit": {"context": 131072, "output": 16000}},
         "openai/gpt-6-luna": {"limit": {"context": 131072, "output": 16000}},
         "anthropic/claude-sonnet-5.5": {"limit": {"context": 131072, "output": 16000}},
-        "anthropic/claude-opus-5.5": {"limit": {"context": 131072, "output": 16000}}
+        "anthropic/claude-opus-5.5": {"limit": {"context": 131072, "output": 16000}},
+        "anthropic/claude-fable-5.1": {"limit": {"context": 131072, "output": 16000}}
       }
     },
     "pcbk-or": {
@@ -50,7 +51,8 @@
       "models": {
         "google/gemini-3.8-flash": {"limit": {"context": 131072, "output": 16000}},
         "anthropic/claude-sonnet-5.5": {"limit": {"context": 131072, "output": 16000}},
-        "anthropic/claude-opus-5.5": {"limit": {"context": 131072, "output": 16000}}
+        "anthropic/claude-opus-5.5": {"limit": {"context": 131072, "output": 16000}},
+        "anthropic/claude-fable-5.1": {"limit": {"context": 131072, "output": 16000}}
       }
     }
   },

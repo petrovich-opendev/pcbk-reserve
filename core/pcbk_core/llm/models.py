@@ -40,6 +40,7 @@ class ModelPolicy:
     tier_in_usd_m: float = 0.0
     tier_out_usd_m: float = 0.0
     tier_write_usd_m: float = 0.0
+    zdr: bool = True                            # provider.zdr; False — только по решению владельца (Д23, Fable 5.1)
 
     def input_tokens(self, body_bytes: int) -> int:
         """Оценённые токены входа: ceil(байты / BYTES_PER_TOKEN), в целых — без округления float."""
@@ -68,7 +69,7 @@ class ModelPolicy:
         return {"prompt": inp, "completion": out, "request": 0}
 
 
-# семь по порядку research/08 и восьмая — Д18; основание каждой цены — в комментарии строки
+# семь по порядку research/08, восьмая — Д18, девятая — Д23; основание каждой цены — в комментарии строки
 CANDIDATES: tuple[ModelPolicy, ...] = (
     # точка, вариантов нет
     ModelPolicy("z-ai/glm-5.3", "fireworks", "high", 1.40, 4.40, 0.0),
@@ -91,6 +92,11 @@ CANDIDATES: tuple[ModelPolicy, ...] = (
     # Д18 (решение владельца 15.10: самая сильная модель с ZDR вместо Fable 5.1 — у Fable нет ни одной ZDR-точки);
     # точка без вариантов, ZDR — в списке /endpoints/zdr; запись кэша — своя цена точки (1,25 × вход)
     ModelPolicy("anthropic/claude-opus-5.5", "google-vertex/global", "high", 4.00, 20.00, 5.00, auto_cache=True),
+    # Д23 (подготовлено ночью 16.10 по просьбе владельца «самая продвинутая LLM для рассуждений»): у Fable 5.1 НЕТ
+    # ни одной точки в списке ZDR — zdr=False; в LLM_MODELS включать только по явному «да» владельца (данные ПЦБК
+    # уйдут провайдеру без гарантии нулевого хранения). Цены точки google-vertex/global: 10 / 50 / запись кэша 12,5.
+    ModelPolicy("anthropic/claude-fable-5.1", "google-vertex/global", "high", 10.00, 50.00, 12.50, auto_cache=True,
+                zdr=False),
 )
 _BY_NAME = {p.model: p for p in CANDIDATES}
 
@@ -99,7 +105,7 @@ PROVIDER_FIXED = MappingProxyType({"allow_fallbacks": False, "zdr": True, "data_
 
 
 def select_models(names: str) -> dict[str, ModelPolicy]:
-    """Разрешённые модели по `LLM_MODELS`: пусто — все восемь по порядку таблицы.
+    """Разрешённые модели по `LLM_MODELS`: пусто — все девять по порядку таблицы.
 
     Иначе — имена через запятую (пробелы вокруг имён срезаются), порядок — как в строке. Неизвестное
     или пустое имя и повтор — `ValueError("LLM_MODELS: …")`.
@@ -124,7 +130,7 @@ def parse_fallback(raw: str, models: dict[str, ModelPolicy]) -> dict[str, str]:
 
     Ошибка — `ValueError("LLM_FALLBACK: …")`: неизвестное имя (основной или запасной), основная равна
     запасной, основная названа дважды, запасная не входит в `models` (активные кандидаты, как у
-    `select_models`), если `models` — не все восемь (LLM_MODELS их сузил).
+    `select_models`), если `models` — не все девять (LLM_MODELS их сузил).
     """
     if not raw.strip():
         return {}

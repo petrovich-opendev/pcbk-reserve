@@ -84,12 +84,12 @@ def test_model_list_exact():                                                    
     allowed = select_models("")
     assert list(allowed) == ["z-ai/glm-5.3", "deepseek/deepseek-v4.1-flash", "google/gemini-3.8-flash",
                              "openai/gpt-6-sol", "z-ai/glm-5.3-flash", "openai/gpt-6-luna",
-                             "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"]
+                             "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5", "anthropic/claude-fable-5.1"]
     assert [p.provider_only for p in allowed.values()] == ["fireworks", "deepinfra/fp8", "google-vertex/global",
                                                          "azure", "fireworks", "azure", "google-vertex/global",
-                                                         "google-vertex/global"]
+                                                         "google-vertex/global", "google-vertex/global"]
     assert [p.effort for p in allowed.values()] == ["high", "high", "medium", "medium", "low", "medium", "low",
-                                                    "high"]
+                                                    "high", "high"]
     assert list(select_models("z-ai/glm-5.3")) == ["z-ai/glm-5.3"]
     for bad in ("z-ai/glm-5.3:nitro", "~z-ai/glm-latest", "openrouter/auto", "z-ai/glm-5.3,z-ai/glm-5.3"):
         with pytest.raises(ValueError):
@@ -175,7 +175,8 @@ def test_table_is_eight_upper_prices():
         ("z-ai/glm-5.3-flash", 0.225, 0.75, 0, False, None, 0.0, 0.0, 0.0),
         ("openai/gpt-6-luna", 0.11, 0.55, 0.1375, False, 272_000, 0.22, 0.825, 0.275),
         ("anthropic/claude-sonnet-5.5", 2.00, 10.00, 2.50, True, None, 0.0, 0.0, 0.0),
-        ("anthropic/claude-opus-5.5", 4.00, 20.00, 5.00, True, None, 0.0, 0.0, 0.0)]
+        ("anthropic/claude-opus-5.5", 4.00, 20.00, 5.00, True, None, 0.0, 0.0, 0.0),
+        ("anthropic/claude-fable-5.1", 10.00, 50.00, 12.50, True, None, 0.0, 0.0, 0.0)]
     # доводка ревью, раунд 2: байт — токен у всех моделей (не больше токена на байт у любого токенизатора)
     assert BYTES_PER_TOKEN == 1
     assert all(p.input_tokens(b) == b for p in CANDIDATES for b in (0, 1, 2, 3, 1_048_576))
@@ -380,3 +381,12 @@ def test_attachment_only_user_is_not_a_question():                              
     b = rebuild_body({**OC_BODY, "messages": [*head, {"role": "user", "content": [
         {"type": "text", "text": "что на картинке?"}, ATTACHMENTS[0]]}]}, POLICY, caller="ops", session=None)
     assert turn_mark(b) == TurnMark("user", h("что на картинке?\n" + ATTACHMENT_TEXT), 4)
+
+
+
+def test_zdr_only_fable_is_false():                                               # Д23: Fable 5.1 без ZDR
+    allowed = select_models("")
+    assert [m for m, p in allowed.items() if not p.zdr] == ["anthropic/claude-fable-5.1"]
+    fable, opus = allowed["anthropic/claude-fable-5.1"], allowed["anthropic/claude-opus-5.5"]
+    assert rebuild_body({**OC_BODY, "model": fable.model}, fable, caller="ops", session=None)["provider"]["zdr"] is False
+    assert rebuild_body({**OC_BODY, "model": opus.model}, opus, caller="ops", session=None)["provider"]["zdr"] is True
