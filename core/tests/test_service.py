@@ -1359,6 +1359,15 @@ async def test_calc_spc_individuals_answer_matches_spc_module(svc):
         assert iv["name_ru"] and iv["value_min"] <= iv["value_max"]
     assert r["sparkline"] == expected_sparkline
     assert "points" not in r
+    # Д24: числа для графика в чате — последним полем, 5 значащих цифр; MR — на одну точку меньше
+    plot = r["plot"]
+    assert list(r)[-1] == "plot"
+    assert plot["points"] == [float(f"{v:.5g}") for v in expected["points"]]
+    assert plot["secondary"] == [float(f"{v:.5g}") for v in expected["secondary"]["points"]]
+    assert len(plot["secondary"]) == len(plot["points"]) - 1 == 21
+    assert plot["flagged"] == sorted(flagged) and plot["flagged"]
+    assert (plot["lsl"], plot["usl"]) == (None, None)
+    assert (plot["start"], plot["end"]) == (_spc_iso(_SPC_VALID_IDX[0]), _spc_iso(_SPC_VALID_IDX[-1]))
     assert {SPC_GRID_NOTE, SPC_CONTROL_NOTE} <= set(r["notes"])
     assert SPC_BOUNDS_NOTE not in r["notes"] and SPC_FEW_POINTS_NOTE not in r["notes"]
 
@@ -1389,6 +1398,8 @@ async def test_calc_spc_xbar_r_subgroup4(svc):
     for iv in r["violations"]:
         assert iv["start"] in chunk_times and iv["end"] in chunk_times
     assert any("хвост короче 4" in n for n in r["notes"])      # 2 точки хвоста (22 % 4) не вошли в подгруппу
+    assert r["plot"]["points"] == [float(f"{v:.5g}") for v in expected["points"]]
+    assert len(r["plot"]["secondary"]) == 5 and r["plot"]["end"] == _spc_iso(21)     # R — по подгруппам
     assert SPC_FEW_POINTS_NOTE in r["notes"]                    # 5 подгрупп < 20 — границы ориентировочные
 
 
@@ -1403,6 +1414,7 @@ async def test_calc_spc_capability_with_bounds(svc):
     assert r["status"] == "ok"
     assert r["capability"] == pytest.approx(expected_cap)
     assert SPC_BOUNDS_NOTE in r["notes"]
+    assert (r["plot"]["lsl"], r["plot"]["usl"]) == (5.0, 60.0)            # Д24: допуск — линиями на графике
 
 
 async def test_calc_spc_refuses_discrete_tag(svc):
@@ -1428,7 +1440,7 @@ async def test_calc_spc_partial_when_too_few_valid_points(svc):             # д
     r = await s.calc_spc("student-01", "http", "20FAKE_001_PV", period="last_8h", points=20)
     assert (r["status"], r["chart"], r["n_points"], r["skipped"]) == ("partial", "I-MR", 0, 19)
     assert r["cl"] is None and r["capability"] is None and r["secondary"] is None
-    assert r["violations"] == [] and r["in_control"] is None and r["sparkline"] == ["", ""]
+    assert r["violations"] == [] and r["in_control"] is None and r["sparkline"] == ["", ""] and r["plot"] is None
     assert SPC_NOT_ENOUGH_NOTE in r["notes"]
 
 

@@ -691,6 +691,12 @@ class _Scope:
 
 
 SPC_MAX_INTERVALS = 40  # интервалов нарушений в ответе calc_spc (ночь 16.10: поточечный список обрезался в чате)
+SPC_PLOT_DIGITS = 5     # Д24: значащих цифр у точек графика (plot) в ответе calc_spc — график рисует чат, не модель
+
+
+def _plot_number(value: float) -> float:
+    """Точка графика: SPC_PLOT_DIGITS значащих цифр — ответ короче, на картинке разницы нет."""
+    return float(f"{value:.{SPC_PLOT_DIGITS}g}")
 
 
 def _spc_intervals(violations: list[dict], times: list, points: list) -> tuple[list[dict], dict[str, int]]:
@@ -1112,7 +1118,7 @@ class DataService:
                     "tag": entry.shown, "unit": info.unit, "period": self._period_json(period, clock, is_open),
                     "chart": chart_name, "n_points": 0, "skipped": skipped, "cl": None, "ucl": None, "lcl": None,
                     "sigma_within": None, "sigma_overall": None, "secondary": None, "violations": [],
-                    "rule_counts": {}, "in_control": None, "capability": None, "sparkline": ["", ""]}
+                    "rule_counts": {}, "in_control": None, "capability": None, "sparkline": ["", ""], "plot": None}
         values = [v for _, v in valid]
         if subgroup == 1:
             chart = spc.individuals(values)
@@ -1155,7 +1161,13 @@ class DataService:
                 "secondary": {"chart": secondary["chart"], "cl": secondary["cl"], "ucl": secondary["ucl"],
                              "lcl": secondary["lcl"]},
                 "capability": capability, "violations": intervals, "n_points": n_points, "skipped": skipped,
-                "period": self._period_json(period, clock, is_open), "notes": notes, "cache": call.cache}
+                "period": self._period_json(period, clock, is_open), "notes": notes, "cache": call.cache,
+                # Д24: числа для графика карты в чате — последним полем: чат рисует его сам, модель их не пересказывает;
+                # secondary — точки MR (на одну меньше, с второй точки) или R (по подгруппам), flagged — индексы точек
+                # с нарушениями правил, start/end — время первой и последней точки карты
+                "plot": {"points": [_plot_number(v) for v in chart["points"]],
+                         "secondary": [_plot_number(v) for v in secondary["points"]], "flagged": sorted(flagged),
+                         "lsl": lsl, "usl": usl, "start": chart_times[0], "end": chart_times[-1]}}
 
     async def _equipment(self, call: _Call, query: object, with_state: object) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19, правка Д19б): без with_state — только каталог в памяти, SQL
