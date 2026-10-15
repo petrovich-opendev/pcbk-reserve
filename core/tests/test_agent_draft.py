@@ -369,10 +369,11 @@ CHECKED_DIGEST_D7 = "cf436d9510f82c15ac3aeffdde5b748e64070fcfe3143b93f5f0e928c3d
 
 def test_agent_tools_d9():                                                        # Review Focus 5
     assert AGENT_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                           "calc_deviation", "equipment", "report_event")          # Д19: подсчёт агрегатов
+                           "calc_deviation", "equipment", "calc_spc", "report_event")   # Д21: карта Шухарта
     for tools in (["tag_series"], ["calc_runtime"], ["pcbk_calc_runtime", "catalog_search"],
                  ["calc_deviation", "tag_now"], ["pcbk_calc_deviation", "pcbk_report_event", "tag_now"],
-                 ["equipment"], ["pcbk_equipment", "catalog_search"]):
+                 ["equipment"], ["pcbk_equipment", "catalog_search"], ["calc_spc"],
+                 ["pcbk_calc_spc", "tag_now"]):
         draft, problems = check_draft({**OK, "tools": tools}, CAT.lookup)
         assert problems == [] and draft is not None, tools
     assert check_draft({**OK, "tools": ["calc_runtime", "tag_now"]}, CAT.lookup)[0].tools == ("tag_now", "calc_runtime")
@@ -380,6 +381,8 @@ def test_agent_tools_d9():                                                      
         "tag_now", "calc_deviation")                                             # Д13: порядок — как в AGENT_TOOLS
     assert check_draft({**OK, "tools": ["report_event", "equipment"]}, CAT.lookup)[0].tools == (
         "equipment", "report_event")                                            # Д19: порядок — как в AGENT_TOOLS
+    assert check_draft({**OK, "tools": ["report_event", "calc_spc", "equipment"]}, CAT.lookup)[0].tools == (
+        "equipment", "calc_spc", "report_event")                                # Д21: порядок — как в AGENT_TOOLS
     assert codes({**OK, "tools": ["catalog_search"]}) == {("tools", "tools_useless")}
     # Д13: calc_deviation сам по себе — не инструмент чисел check_draft (нужны measure_tag/setpoint_tag вызова, а
     # не tags черновика); на стенде он всегда идёт с tag_now — так его даёт Конструктор
@@ -388,16 +391,20 @@ def test_agent_tools_d9():                                                      
     # calc_deviation выше), но без тегов и без catalog_search агенту искать нечем — то же правило, что у прочих
     assert codes({**OK, "tools": ["equipment"]}) == set()
     assert codes({**OK, "tools": ["equipment"], "tags": []}) == {("tools", "tools_useless")}
+    # Д21: calc_spc — как tag_now/calc_runtime выше, нужен тег черновика (один аналоговый, не query)
+    assert codes({**OK, "tools": ["calc_spc"]}) == set()
+    assert codes({**OK, "tools": ["calc_spc"], "tags": []}) == {("tools", "tools_useless")}
     assert PROBLEM_TEXTS["tools_useless"] == ("Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, "
-                                              "calc_runtime или equipment), а без тегов — ещё catalog_search")
+                                              "calc_runtime, equipment или calc_spc), а без тегов — ещё "
+                                              "catalog_search")
 
 
 def test_render_new_tools_permission_order():
     text = agent_text(replace(AGENT_DRAFT, tools=("tag_now", "tag_series", "calc_runtime", "calc_deviation",
-                                                   "equipment")))
-    assert text.splitlines()[7:13] == ['  "*": deny', "  pcbk_tag_now: allow", "  pcbk_tag_series: allow",
+                                                   "equipment", "calc_spc")))
+    assert text.splitlines()[7:14] == ['  "*": deny', "  pcbk_tag_now: allow", "  pcbk_tag_series: allow",
                                        "  pcbk_calc_runtime: allow", "  pcbk_calc_deviation: allow",
-                                       "  pcbk_equipment: allow"]      # Д19
+                                       "  pcbk_equipment: allow", "  pcbk_calc_spc: allow"]      # Д21
 
 
 def test_agent_digest_d7_unchanged():                                             # дайджест агентов Д7 — прежний (I-1)

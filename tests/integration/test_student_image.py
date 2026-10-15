@@ -30,14 +30,16 @@ MCP = {"pcbk": {"type": "remote", "url": "http://core:8000/mcp", "enabled": True
                 "headers": {"Authorization": "Bearer {file:/run/secrets/data-token}"}}}
 # агент по умолчанию (Д6-R45): фронтматтер файла — побайтно; ни name, ни model, ни question. Редакция 2 (Д9а, Д9-R89):
 # ряд и наработка — двумя строками allow в конце. Редакция 3 (Д15б, случай 13.10): правило оформления — в тело, не
-# во фронтматтер. Редакция 4 (Д19): plus pcbk_equipment: allow — FRONT не меняется
-FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 4 (Д19); меняется только пересборкой образа\n'
+# во фронтматтер. Редакция 4 (Д19): plus pcbk_equipment: allow. Редакция 5 (Д21): plus pcbk_calc_spc: allow —
+# FRONT не меняется
+FRONT = ('# pcbk-reserve: агент по умолчанию, редакция 5 (Д21); меняется только пересборкой образа\n'
          'description: "Помощник по данным: текущие значения и сводки тегов БДРВ"\nmode: primary\nsteps: 8\n'
          'permission:\n  "*": deny\n  pcbk_catalog_search: allow\n  pcbk_tag_now: allow\n  pcbk_tag_period: allow\n'
-         '  pcbk_tag_series: allow\n  pcbk_calc_runtime: allow\n  pcbk_equipment: allow\n')
+         '  pcbk_tag_series: allow\n  pcbk_calc_runtime: allow\n  pcbk_equipment: allow\n  pcbk_calc_spc: allow\n')
 # Конструктор агентов (Д7-R63, research/09 §3.1): фронтматтер — побайтно; модели нет — модель стенда. Редакция 2
-# (Д19): только комментарий редакции — permission Конструктора не меняется, он equipment сам не зовёт
-K_FRONT = ('# pcbk-reserve: встроенный агент образа, редакция 2 (Д19); меняется только пересборкой образа\n'
+# (Д19): только комментарий редакции — permission Конструктора не меняется, он equipment сам не зовёт. Редакция 3
+# (Д21): тоже только комментарий — он calc_spc сам не зовёт
+K_FRONT = ('# pcbk-reserve: встроенный агент образа, редакция 3 (Д21); меняется только пересборкой образа\n'
            'description: "Конструктор агентов: за один разговор собирает с технологом его агента по узлу"\n'
            'mode: primary\nsteps: 12\npermission:\n  "*": deny\n  pcbk_catalog_search: allow\n'
            '  pcbk_tag_now: allow\n  pcbk_save_agent: allow\n  pcbk_my_agents: allow\n')   # Д13: правка агента
@@ -193,8 +195,9 @@ def test_default_agent_file():                                                  
             "описание, значение, единица) — таблицей markdown; короткий ответ из одной-двух фраз — обычным "
             "текстом.") in " ".join(body.split())
     assert "не из данных стенда" not in body
-    assert "шесть вещей" in body and "три вещи" not in body and "пять вещей" not in body  # Д19: equipment — шестое
-    for tool in ("pcbk_tag_series", "pcbk_calc_runtime", "pcbk_equipment"):
+    assert "семь вещей" in body and "три вещи" not in body and "пять вещей" not in body     # Д21: calc_spc — седьмое
+    assert "шесть вещей" not in body                                      # Д19: equipment — шестое, прежний текст ушёл
+    for tool in ("pcbk_tag_series", "pcbk_calc_runtime", "pcbk_equipment", "pcbk_calc_spc"):
         assert tool in body, tool
 
 
@@ -214,10 +217,11 @@ def test_konstruktor_file():                                                    
                  "«konstruktor» и не с «pcbk» в начале",                             # m1: name_reserved службы
                  "ПРАВКА АГЕНТА", "replace", "pcbk_my_agents",                       # Д13: правка — та же name, replace
                  "КОНТРОЛЬНАЯ ТОЧКА", "порог технолога, не норматив ПЦБК", "pcbk_report_event",   # Д13: точка против _SP
-                 "умеет только восемь вещей", "tag_series", "calc_runtime",          # Д9а (Д9-R89, m8, I-1)
+                 "умеет только девять вещей", "tag_series", "calc_runtime",          # Д9а (Д9-R89, m8, I-1)
                  "считать агрегаты каталога (насосы, задвижки, мешалки и прочее) и сколько из",     # Д19: equipment
+                 "строить карту Шухарта (SPC): контрольные границы, нарушения правил, Cp/Cpk (calc_spc)",  # Д21
                  "как менялся параметр, наработка, контрольная точка — отклонение от задания, сколько "
-                 "агрегатов и сколько в работе, поиск тегов",
+                 "агрегатов и сколько в работе, карта Шухарта (SPC) — границы и нарушения правил, поиск тегов",
                                                                                       # строка «Что умеет» черновика
                  "Выясни три вещи",                                                  # шаг 1 не трогается
                  # Д13 (calc_deviation): инструменты и шаблон контрольной точки — служба считает, не агент «в уме»
@@ -228,32 +232,38 @@ def test_konstruktor_file():                                                    
                  "наибольшее отклонение и каждый интервал",
                  # доводка А6 р1, I-1: шаг 5 и строки плана инструкции — то, что даёт агенту новые инструменты
                  "tools — короткие имена: catalog_search, tag_now, tag_period, tag_series, calc_runtime, "
-                 "calc_deviation, equipment, report_event (обычно catalog_search, tag_now и tag_period; "
+                 "calc_deviation, equipment, calc_spc, report_event (обычно catalog_search, tag_now и tag_period; "
                  "tag_series — если технолог спрашивает, как менялся параметр; calc_runtime — если в тегах есть "
                  "теги состояний _RUN, _OPN, _CLS и нужна наработка; equipment — только если технолог спрашивает "
-                 "«сколько» (агрегатов, насосов, задвижек, мешалок, сколько в работе); calc_deviation и "
-                 "report_event — только для контрольной точки",
+                 "«сколько» (агрегатов, насосов, задвижек, мешалок, сколько в работе); calc_spc — только если "
+                 "технолог спрашивает про карту Шухарта, статистическое управление процессом (SPC) или Cp/Cpk; "
+                 "calc_deviation и report_event — только для контрольной точки",
                  "вопрос „как менялся …“ → pcbk_tag_series за <период>; назови значение в начале, в конце и "
                  "изменение.",
                  "вопрос о наработке → pcbk_calc_runtime за <период>; назови часы в каждом состоянии с подписью.",
+                 "вопрос про карту Шухарта, SPC, контрольные границы или Cp/Cpk (только если calc_spc в tools) → "
+                 "pcbk_calc_spc за <период>",                                                           # Д21
                  "«проверь контрольную точку за <период>» (только если calc_deviation в tools) → "
                  "pcbk_calc_deviation (тег измерения, тег задания, порог технолога <отклонение с единицей>, "
                  "период)",
-                 "Строки про pcbk_tag_series, pcbk_calc_runtime и контрольную точку необязательны: пиши их, только "
-                 "если соответствующий инструмент (tag_series, calc_runtime, calc_deviation) есть в tools агента.",
+                 "Строки про pcbk_tag_series, pcbk_calc_runtime, pcbk_calc_spc и контрольную точку необязательны: "
+                 "пиши их, только если соответствующий инструмент (tag_series, calc_runtime, calc_spc, "
+                 "calc_deviation) есть в tools агента.",
                  # доводка А6 р1, I-2: черновик обещает только то, что агент получит; Д13 — и calc_deviation
                  "В строке «Что умеет» называй только то, что агент получит в tools: «как менялся параметр» — "
                  "только с tag_series, «наработка» — только с calc_runtime, «контрольная точка — отклонение от "
                  "задания» — только с calc_deviation, «сколько агрегатов и сколько в работе» — только с "
-                 "equipment."):
+                 "equipment, «карта Шухарта (SPC) — границы и нарушения правил» — только с calc_spc."):
         assert rule in flat, rule
     assert "умеет только три вещи" not in flat and "обычно все три" not in flat     # тексты Д7 не вернулись
-    assert "умеет только шесть вещей" not in flat and "умеет только семь вещей" not in flat   # Д19: восемь — equipment
+    for n in ("шесть", "семь", "восемь"):
+        assert f"умеет только {n} вещей" not in flat                        # Д21: девять — calc_spc
     assert "через минуту" not in flat                                  # при сбое — пересказ message службы (р1)
     stand = (CONFIG / "AGENTS.md").read_text()                       # правила стенда в системном тексте всех агентов
     assert stand.startswith("# Правила учебного стенда ПЦБК (для всех агентов)")
     for rule in ("Норматива в данных стенда нет", "общие знания, не норматив ПЦБК", "Шкала прибора",
-                 "Все теги стенда относятся к КДМ-1", "pcbk_equipment", "сам по спискам поиска не считай"):  # Д19
+                 "Все теги стенда относятся к КДМ-1", "pcbk_equipment", "сам по спискам поиска не считай",  # Д19
+                 "pcbk_calc_spc", "Контрольные границы", "не допуск и не норматив"):                        # Д21
         assert rule in " ".join(stand.split()), rule
     permission = json.loads((CONFIG / "opencode.json").read_text())["permission"]
     assert permission["pcbk_save_agent"] == "deny" and list(permission)[-1] == "pcbk_save_agent"   # Д7б, П8

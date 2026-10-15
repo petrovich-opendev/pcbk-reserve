@@ -26,12 +26,13 @@ if TYPE_CHECKING:
 
 TEMPLATE_VERSION = 3
 # инструменты агента студента; save_agent у агента студента — никогда (Global Constraints Д7). Ряд и наработка Д9а
-# (Д9-R89), калькулятор отклонения и report_event Д13, подсчёт агрегатов (equipment) Д19 — в конце: строки allow и
-# дайджест черновика идут в порядке AGENT_TOOLS, файлы и дайджесты агентов Д7/Д9 прежние
+# (Д9-R89), калькулятор отклонения и report_event Д13, подсчёт агрегатов (equipment) Д19, карта Шухарта (calc_spc)
+# Д21 — в конце: строки allow и дайджест черновика идут в порядке AGENT_TOOLS, файлы и дайджесты агентов Д7/Д9 прежние
 AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "calc_deviation",
-              "equipment", "report_event")
-# equipment — Д19: запрос без тегов черновика (query, как у catalog_search), но инструмент чисел (units_total)
-_NUMBER_TOOLS = frozenset({"tag_now", "tag_period", "tag_series", "calc_runtime", "equipment"})
+              "equipment", "calc_spc", "report_event")
+# equipment — Д19: запрос без тегов черновика (query, как у catalog_search), но инструмент чисел (units_total).
+# calc_spc — Д21: как tag_now/tag_period/tag_series/calc_runtime, нужен тег черновика (один аналоговый)
+_NUMBER_TOOLS = frozenset({"tag_now", "tag_period", "tag_series", "calc_runtime", "equipment", "calc_spc"})
 _TOOL_PREFIX = "pcbk_"
 
 NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", re.ASCII)
@@ -110,8 +111,8 @@ PROBLEM_TEXTS: dict[str, str] = {
                  "на стенде запрещены",
     "tools_empty": f"Агенту нужен хотя бы один инструмент: {_TOOLS_LIST}",
     "tool_not_allowed": f"Инструмента «{{v}}» на стенде нет. Можно: {_TOOLS_LIST}.",
-    "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, calc_runtime или equipment), "
-                     "а без тегов — ещё catalog_search",
+    "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, calc_runtime, equipment или "
+                     "calc_spc), а без тегов — ещё catalog_search",
     "tags_too_many": f"Тегов не больше {MAX_TAGS}",
     "tag_unknown": "Такого тега нет в каталоге историана",
     "tag_unlisted": "Тег не входит в белый список стенда",
