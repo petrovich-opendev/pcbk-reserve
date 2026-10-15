@@ -48,10 +48,10 @@ DECLARED_ENV = {                   # наши переменные сверх п
     "pcbk-sp-ctl": set(),
     "pcbk-student-01": set(),
 }
-IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d15b", "pcbk-core": "pcbk-reserve/core:d17",
+IMAGES = {"pcbk-watchdog": "pcbk-reserve/watchdog:d15b", "pcbk-core": "pcbk-reserve/core:d18",
           "pcbk-edge": "nginx:1.30.5-alpine",
           "pcbk-sp-ro": "wollomatic/socket-proxy:1.13.1", "pcbk-sp-ctl": "wollomatic/socket-proxy:1.13.1",
-          "pcbk-student-01": "pcbk-reserve/student:d15b"}
+          "pcbk-student-01": "pcbk-reserve/student:d18"}
 WATCHDOG_PATHS = ("/status", "/status.json", "/status.js")
 # CSP страницы чата — строка Global Constraints Д6 (Д6-R41)
 CHAT_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "

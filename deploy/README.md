@@ -1719,6 +1719,28 @@ ANALYTICS_LLM_MODELS=deepseek/deepseek-v4.1-flash
 `parse_fallback`, `LlmSettings.from_env`, `AnalyticsSettings.from_env`) — граф `LLM_FALLBACK` разбирается, цикла
 (в смысле ошибки разбора) нет.
 
+**Основная модель — Claude Opus 5.5 на google-vertex/global (15.10, Д18)**: владелец попросил самую сильную модель
+рассуждения — Claude Fable 5.1. У Fable 5.1 в OpenRouter нет ни одной точки из списка ZDR (`GET /api/v1/endpoints/zdr`,
+15.10 ~08:00 UTC: точки Anthropic, Azure, Amazon Bedrock, Google — ни одной в списке), а прокси шлёт `zdr: true`
+всем моделям (`PROVIDER_FIXED`). Решение владельца 15.10 — `anthropic/claude-opus-5.5` с ZDR на всех местах и в
+аналитике. Точка `google-vertex/global` — без вариантов региона (как у Sonnet 5.5), в списке ZDR; цены точки: вход $4,
+выход $20, запись кэша $5 за 1 млн токенов (Bedrock и прочие регионы Vertex — на 10 % дороже); effort high; кэш
+`cache_control` верхнего уровня, как у Claude Sonnet. Места — через провайдер `pcbk-or` (`@openrouter/ai-sdk-provider`):
+только он возвращает `reasoning_details` с подписями, которые Claude требует обратно в шагах с инструментами
+(Д4б-R20); модель добавлена в оба провайдера `student/config/opencode.json` — образ места `student:d18`.
+
+`.env` сервера:
+```
+LLM_MODELS=anthropic/claude-opus-5.5,deepseek/deepseek-v4.1-flash,z-ai/glm-5.3,z-ai/glm-5.3-flash
+LLM_FALLBACK=anthropic/claude-opus-5.5=deepseek/deepseek-v4.1-flash,deepseek/deepseek-v4.1-flash=z-ai/glm-5.3,z-ai/glm-5.3=z-ai/glm-5.3-flash,z-ai/glm-5.3-flash=z-ai/glm-5.3
+ANALYTICS_LLM_MODELS=anthropic/claude-opus-5.5
+```
+и место конфига: `OPENCODE_CONFIG_CONTENT={"model": "pcbk-or/anthropic/claude-opus-5.5"}`. Запасная при отказе
+Opus — DeepSeek (один повтор за вызов, как выше; дальше по цепочке вызов не идёт). DeepSeek остаётся в `LLM_MODELS`:
+места, запущенные до переключения, работают на нём, пока шлюз их не остановит, — пересоздаются с новым конфигом
+только остановленные места (`docker compose --profile students create --force-recreate --no-build student-NN`,
+имена мест — явно). Откат — `.env.pre-opus`, `compose.override.yaml.pre-opus`, `compose.yaml.d17`.
+
 **Нагрузка 12.10** (10 студентов одновременно через веб: вход, Помощник, Конструктор, калькулятор): сервер — с запасом
 (свободно не меньше 7026 МиБ из 11 610, swap +1 МиБ, давление памяти ≤ 1,83 %); узкое место — частота у провайдера
 модели: 43 из 109 вызовов получили 429 и прошли повтором прокси (ответ Помощника — медиана 32 с, Конструктор — до 80 с).

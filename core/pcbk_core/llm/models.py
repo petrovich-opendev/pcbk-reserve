@@ -68,7 +68,7 @@ class ModelPolicy:
         return {"prompt": inp, "completion": out, "request": 0}
 
 
-# ровно семь, по порядку research/08; основание каждой цены — в комментарии строки
+# семь по порядку research/08 и восьмая — Д18; основание каждой цены — в комментарии строки
 CANDIDATES: tuple[ModelPolicy, ...] = (
     # точка, вариантов нет
     ModelPolicy("z-ai/glm-5.3", "fireworks", "high", 1.40, 4.40, 0.0),
@@ -88,6 +88,9 @@ CANDIDATES: tuple[ModelPolicy, ...] = (
                 tier_tokens=272_000, tier_in_usd_m=0.22, tier_out_usd_m=0.825, tier_write_usd_m=0.275),
     # точка, вариантов нет
     ModelPolicy("anthropic/claude-sonnet-5.5", "google-vertex/global", "low", 2.00, 10.00, 2.50, auto_cache=True),
+    # Д18 (решение владельца 15.10: самая сильная модель с ZDR вместо Fable 5.1 — у Fable нет ни одной ZDR-точки);
+    # точка без вариантов, ZDR — в списке /endpoints/zdr; запись кэша — своя цена точки (1,25 × вход)
+    ModelPolicy("anthropic/claude-opus-5.5", "google-vertex/global", "high", 4.00, 20.00, 5.00, auto_cache=True),
 )
 _BY_NAME = {p.model: p for p in CANDIDATES}
 
@@ -96,7 +99,7 @@ PROVIDER_FIXED = MappingProxyType({"allow_fallbacks": False, "zdr": True, "data_
 
 
 def select_models(names: str) -> dict[str, ModelPolicy]:
-    """Разрешённые модели по `LLM_MODELS`: пусто — все семь по порядку таблицы.
+    """Разрешённые модели по `LLM_MODELS`: пусто — все восемь по порядку таблицы.
 
     Иначе — имена через запятую (пробелы вокруг имён срезаются), порядок — как в строке. Неизвестное
     или пустое имя и повтор — `ValueError("LLM_MODELS: …")`.
@@ -121,7 +124,7 @@ def parse_fallback(raw: str, models: dict[str, ModelPolicy]) -> dict[str, str]:
 
     Ошибка — `ValueError("LLM_FALLBACK: …")`: неизвестное имя (основной или запасной), основная равна
     запасной, основная названа дважды, запасная не входит в `models` (активные кандидаты, как у
-    `select_models`), если `models` — не все семь (LLM_MODELS их сузил).
+    `select_models`), если `models` — не все восемь (LLM_MODELS их сузил).
     """
     if not raw.strip():
         return {}

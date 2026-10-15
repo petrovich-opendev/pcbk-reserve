@@ -84,10 +84,12 @@ def test_model_list_exact():                                                    
     allowed = select_models("")
     assert list(allowed) == ["z-ai/glm-5.3", "deepseek/deepseek-v4.1-flash", "google/gemini-3.8-flash",
                              "openai/gpt-6-sol", "z-ai/glm-5.3-flash", "openai/gpt-6-luna",
-                             "anthropic/claude-sonnet-5.5"]
+                             "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"]
     assert [p.provider_only for p in allowed.values()] == ["fireworks", "deepinfra/fp8", "google-vertex/global",
-                                                         "azure", "fireworks", "azure", "google-vertex/global"]
-    assert [p.effort for p in allowed.values()] == ["high", "high", "medium", "medium", "low", "medium", "low"]
+                                                         "azure", "fireworks", "azure", "google-vertex/global",
+                                                         "google-vertex/global"]
+    assert [p.effort for p in allowed.values()] == ["high", "high", "medium", "medium", "low", "medium", "low",
+                                                    "high"]
     assert list(select_models("z-ai/glm-5.3")) == ["z-ai/glm-5.3"]
     for bad in ("z-ai/glm-5.3:nitro", "~z-ai/glm-latest", "openrouter/auto", "z-ai/glm-5.3,z-ai/glm-5.3"):
         with pytest.raises(ValueError):
@@ -160,7 +162,7 @@ def test_turn_mark():
 
 # --- сверх брифа: развилки реализации, закреплённые тестами ---
 
-def test_table_is_seven_upper_prices():
+def test_table_is_eight_upper_prices():
     """Таблица дословно по брифу: вход / выход / запись, кэш Claude, ступень Azure."""
     assert SUMMARY_PROMPT == "What did we do so far?"                          # session/message-v2.ts:235
     got = [(p.model, p.in_usd_m, p.out_usd_m, p.write_usd_m, p.auto_cache, p.tier_tokens, p.tier_in_usd_m,
@@ -172,7 +174,8 @@ def test_table_is_seven_upper_prices():
         ("openai/gpt-6-sol", 2.20, 11.00, 2.75, False, 272_000, 4.40, 16.50, 5.50),
         ("z-ai/glm-5.3-flash", 0.225, 0.75, 0, False, None, 0.0, 0.0, 0.0),
         ("openai/gpt-6-luna", 0.11, 0.55, 0.1375, False, 272_000, 0.22, 0.825, 0.275),
-        ("anthropic/claude-sonnet-5.5", 2.00, 10.00, 2.50, True, None, 0.0, 0.0, 0.0)]
+        ("anthropic/claude-sonnet-5.5", 2.00, 10.00, 2.50, True, None, 0.0, 0.0, 0.0),
+        ("anthropic/claude-opus-5.5", 4.00, 20.00, 5.00, True, None, 0.0, 0.0, 0.0)]
     # доводка ревью, раунд 2: байт — токен у всех моделей (не больше токена на байт у любого токенизатора)
     assert BYTES_PER_TOKEN == 1
     assert all(p.input_tokens(b) == b for p in CANDIDATES for b in (0, 1, 2, 3, 1_048_576))
