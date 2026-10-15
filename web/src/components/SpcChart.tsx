@@ -58,12 +58,17 @@ export function shortTime(iso: string | null): string {
   return m ? `${m[2]}.${m[1]} ${m[3]}:${m[4]}` : "";
 }
 
-// подписи линий справа не наезжают друг на друга: сверху вниз не ближе gap
-export function spread(ys: number[], gap: number): number[] {
+// подписи линий справа не наезжают друг на друга (не ближе gap) и не уходят ниже max: сверху вниз раздвинуть,
+// снизу вверх поджать
+export function spread(ys: number[], gap: number, max = Infinity): number[] {
   const order = ys.map((y, i) => [y, i] as const).sort((a, b) => a[0] - b[0]);
-  const out = ys.slice();
+  const placed: number[] = [];
   let last = -Infinity;
-  for (const [y, i] of order) { last = Math.max(y, last + gap); out[i] = last; }
+  for (const [y] of order) { last = Math.max(y, last + gap); placed.push(last); }
+  let next = max + gap;
+  for (let k = placed.length - 1; k >= 0; k--) { next = Math.min(placed[k]!, next - gap); placed[k] = next; }
+  const out = ys.slice();
+  order.forEach(([, i], k) => { out[i] = placed[k]!; });
   return out;
 }
 
@@ -83,7 +88,7 @@ function scale(values: number[], top: number, height: number): (v: number) => nu
 function Panel(p: { points: number[]; xs: number[]; lines: Line[]; top: number; height: number;
                     flagged?: ReadonlySet<number>; cls: string }) {
   const path = p.points.map((v, i) => `${i ? "L" : "M"}${p.xs[i]!.toFixed(1)} ${v.toFixed(1)}`).join(" ");
-  const labelYs = spread(p.lines.map((l) => l.y), LABEL_GAP);
+  const labelYs = spread(p.lines.map((l) => l.y), LABEL_GAP, p.top + p.height);
   return (
     <g className={p.cls}>
       <rect className="spc-frame" x={LEFT} y={p.top} width={PLOT_W} height={p.height} />

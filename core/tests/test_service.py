@@ -1372,6 +1372,12 @@ async def test_calc_spc_individuals_answer_matches_spc_module(svc):
     assert SPC_BOUNDS_NOTE not in r["notes"] and SPC_FEW_POINTS_NOTE not in r["notes"]
 
 
+def test_plot_number_keeps_5_significant_digits():                          # Д24: и малые, и большие значения
+    from pcbk_core.data.service import _plot_number
+    assert [_plot_number(v) for v in (0.0, 1234567.891, -0.000123456789, 4.2, 1e-9, 98765.4321)] == \
+           [0.0, 1234600.0, -0.00012346, 4.2, 1e-9, 98765.0]
+
+
 async def test_calc_spc_xbar_r_subgroup4(svc):
     s, fake = svc
     fake.series["20FAKE_001_PV"] = _spc_series()
