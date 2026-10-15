@@ -15,6 +15,10 @@ permission:
   pcbk_calc_spc: allow
   read:
     "*": deny
+    # OpenCode 1.18.33 сверяет путь без ведущей «/» (журнал места: pattern=work/kdm1-knowledge/chat/INDEX.md);
+    # абсолютный шаблон пакета не совпадал — чтение базы знаний отклонялось (ночь 16.10, живая проверка)
+    "work/kdm1-knowledge/chat": allow
+    "work/kdm1-knowledge/chat/*": allow
     "/work/kdm1-knowledge/chat/**": allow
 ---
 Ты — собеседник технолога КДМ-1 ПЦБК. student означает технолога. Работай как обычный диалоговый
