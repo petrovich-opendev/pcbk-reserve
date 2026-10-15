@@ -34,7 +34,8 @@ test("tool_labels", () => {
   expect(TOOL_LABELS).toEqual({ pcbk_tag_now: "текущее значение", pcbk_tag_period: "сводка за период", pcbk_catalog_search: "поиск тегов",
                                pcbk_save_agent: "сохранение агента",
                                pcbk_tag_series: "ряд и профиль", pcbk_calc_runtime: "наработка",
-                               pcbk_my_agents: "мои агенты", pcbk_report_event: "запись события" });   // Д9-R88, Д13
+                               pcbk_my_agents: "мои агенты", pcbk_report_event: "запись события",
+                               pcbk_calc_spc: "карта Шухарта" });                                     // Д9-R88, Д13, Д24
 });
 
 // --- Д13: вкладка «События» — тексты дословно ---

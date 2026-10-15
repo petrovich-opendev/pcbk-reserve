@@ -129,6 +129,21 @@ button:disabled { opacity: .6; cursor: default; }
   font: .85em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .tool pre[data-part="args"] { color: var(--muted); }
 
+/* карта Шухарта под строкой pcbk_calc_spc (Д24): цвета — здесь, геометрия — атрибутами SVG */
+.spc { margin: .4rem 0 .8rem; max-width: 46rem; }
+.spc svg { display: block; width: 100%; height: auto; }
+.spc-frame { fill: none; stroke: var(--border); }
+.spc-path { fill: none; stroke: var(--accent); stroke-width: 1.4; }
+.spc-pt { fill: var(--accent); }
+.spc-pt.spc-bad { fill: var(--fail); }
+.spc-cl { stroke: var(--ok); stroke-width: 1.2; }
+.spc-limit { stroke: var(--fail); stroke-width: 1; stroke-dasharray: 5 4; }
+.spc-spec { stroke: var(--warn); stroke-width: 1.2; stroke-dasharray: 2 3; }
+.spc-title { fill: var(--fg); font-size: 12px; font-weight: 600; }
+.spc-label { fill: var(--muted); font-size: 11px; }
+.spc-caption { font-size: .85em; color: var(--muted); }
+.spc-caption-bad { color: var(--fail); }
+
 /* ожидающие ответа агента, поток, ошибка действия — над полем ввода */
 .pending { list-style: none; margin: 0 1rem; padding: 0; }
 .pending li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem;

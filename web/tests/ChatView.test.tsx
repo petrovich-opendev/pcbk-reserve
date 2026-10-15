@@ -130,6 +130,27 @@ test("tool_line_states_and_names", () => {
   expect(outputs).toEqual(["нет доступа", "короткий вывод"]);                 // у идущего вывода нет
 });
 
+// Д24: под строкой pcbk_calc_spc — карта Шухарта из ответа службы; у отказа, идущего вызова и чужого инструмента нет
+test("spc_chart_under_calc_spc_tool_line", () => {
+  const spc = JSON.stringify({
+    tool: "calc_spc", status: "ok", tag: "20FAKE_001_PV", unit: null, chart: "I-MR", cl: 10, ucl: 12, lcl: 8,
+    secondary: { chart: "MR", cl: 1, ucl: 3, lcl: 0 },
+    plot: { points: [10, 11, 9, 13], secondary: [1, 2, 4], flagged: [3], lsl: null, usl: null, start: null, end: null },
+  }, null, 2);
+  render(<Harness messages={[
+    assistantTool("pcbk_calc_spc", { tag: ["20FAKE_001_PV"] }, spc, "complete"),
+    user("ещё"),
+    assistantTool("pcbk_calc_spc", { tag: ["20FAKE_001_PV"] }, spc, "error"),
+    user("и ещё"),
+    assistantTool("pcbk_tag_series", { tags: ["20FAKE_001_PV"] }, spc, "complete"),
+  ]} />);
+  expect(screen.getAllByText("Запрос к данным: карта Шухарта — готово").length).toBe(1);
+  const figures = document.querySelectorAll("figure.spc");
+  expect(figures.length).toBe(1);
+  expect(figures[0]!.previousElementSibling!.tagName).toBe("DETAILS");      // сразу под строкой вызова
+  expect(figures[0]!.querySelectorAll("circle.spc-bad").length).toBe(1);
+});
+
 test("tool_output_markup_is_text", () => {
   const { container } = render(<Harness messages={[
     assistantTool("pcbk_tag_now", { tags: ["<img src=x onerror=alert(1)>"] }, '<script>alert(1)</script><img src=x>', "complete")]} />);

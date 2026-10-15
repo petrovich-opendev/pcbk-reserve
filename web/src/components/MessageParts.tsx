@@ -5,6 +5,7 @@
 // - Ссылки — только http:, https:, относительные и якоря; иначе ссылка без href.
 // - Вызов инструмента — строка «Запрос к данным: <что> — <состояние>» и свёрнутые аргументы и вывод,
 //   каждый обрезан до MAX_TOOL_TEXT знаков.
+// - Ответ pcbk_calc_spc с полем plot — под строкой вызова карта Шухарта (SpcChart, Д24): числа службы, не модели.
 import type {
   ImageMessagePartComponent, TextMessagePartComponent, ToolCallMessagePartComponent,
 } from "@assistant-ui/react";
@@ -12,6 +13,7 @@ import { MarkdownTextPrimitive, type MarkdownTextPrimitiveProps } from "@assista
 import type { ComponentPropsWithoutRef } from "react";
 import remarkGfm from "remark-gfm";
 import { remarkSoftBreaks } from "../remarkSoftBreaks";
+import { SpcChart, spcPlotOf } from "./SpcChart";
 import {
   T_IMAGE, T_TOOL_DONE, T_TOOL_ERROR, T_TOOL_LINE, T_TOOL_RUNNING, TOOL_LABELS,
 } from "../texts";
@@ -73,11 +75,15 @@ export const ToolLine: ToolCallMessagePartComponent = ({ toolName, args, argsTex
   const state = isError || status.type === "incomplete" ? T_TOOL_ERROR
     : status.type === "running" || status.type === "requires-action" ? T_TOOL_RUNNING
     : T_TOOL_DONE;
+  const plot = state === T_TOOL_DONE ? spcPlotOf(toolName, result) : null;
   return (
-    <details className="tool" data-state={state === T_TOOL_DONE ? "done" : state === T_TOOL_ERROR ? "error" : "running"}>
-      <summary>{T_TOOL_LINE(what, state)}</summary>
-      <pre data-part="args">{clip(argsText || asText(args))}</pre>
-      {result !== undefined && <pre data-part="output">{clip(asText(result))}</pre>}
-    </details>
+    <>
+      <details className="tool" data-state={state === T_TOOL_DONE ? "done" : state === T_TOOL_ERROR ? "error" : "running"}>
+        <summary>{T_TOOL_LINE(what, state)}</summary>
+        <pre data-part="args">{clip(argsText || asText(args))}</pre>
+        {result !== undefined && <pre data-part="output">{clip(asText(result))}</pre>}
+      </details>
+      {plot !== null && <SpcChart plot={plot} />}
+    </>
   );
 };

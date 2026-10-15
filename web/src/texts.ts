@@ -21,6 +21,7 @@ export const TOOL_LABELS: Readonly<Record<string, string>> = {
   pcbk_calc_runtime: "наработка",
   pcbk_my_agents: "мои агенты",
   pcbk_report_event: "запись события",
+  pcbk_calc_spc: "карта Шухарта",
 };
 
 // --- шапка и фазы чата (R39) ---
@@ -61,6 +62,15 @@ export const T_TOOL_RUNNING = "идёт…";
 export const T_TOOL_DONE = "готово";
 export const T_TOOL_ERROR = "ошибка";
 export const T_TOOL_LINE = (what: string, state: string): string => `Запрос к данным: ${what} — ${state}`;
+// --- карта Шухарта под строкой pcbk_calc_spc (Д24): рисует чат из чисел службы ---
+export const T_SPC_CHART = (chart: string, tag: string, unit: string | null): string =>
+  `${chart === "I-MR" ? "Карта I — индивидуальные значения" : "Карта X̄ — средние подгрупп"}: ${tag}` +
+  (unit ? `, ${unit}` : "");
+export const T_SPC_SECONDARY = (chart: string): string =>
+  chart === "MR" ? "Карта MR — скользящий размах" : chart === "R" ? "Карта R — размах подгрупп" : `Карта ${chart}`;
+export const T_SPC_OK = "Нарушений правил нет";
+export const T_SPC_BAD = (n: number): string => `Нарушения правил: ${n} ${n % 10 === 1 && n % 100 !== 11 ? "точка"
+  : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? "точки" : "точек"} (красным)`;
 export const T_PENDING = "Агент ждёт ответа, которого этот чат пока не умеет дать";
 export const T_REJECT = "Отклонить";
 
