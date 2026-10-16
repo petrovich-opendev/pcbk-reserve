@@ -22,6 +22,10 @@ export const TOOL_LABELS: Readonly<Record<string, string>> = {
   pcbk_my_agents: "мои агенты",
   pcbk_report_event: "запись события",
   pcbk_calc_spc: "карта Шухарта",
+  read: "чтение базы знаний",                         // Д25: read в чате — только у Помощника, база V1/V2
+  kb_corrections: "поправки базы знаний",
+  kb_correction_add: "запись поправки в базу знаний",
+  kb_correction_withdraw: "отзыв поправки",
 };
 
 // --- шапка и фазы чата (R39) ---

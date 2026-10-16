@@ -65,6 +65,15 @@
       "headers": {
         "Authorization": "Bearer {file:/run/secrets/data-token}"
       }
+    },
+    "kb": {
+      "type": "remote",
+      "url": "http://core:8000/mcp-kb",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {file:/run/secrets/data-token}"
+      }
     }
   }
 }
