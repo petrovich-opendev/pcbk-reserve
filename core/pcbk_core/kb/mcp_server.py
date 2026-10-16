@@ -95,6 +95,7 @@ def build_kb_mcp(role: "KbRole") -> FastMCP:
                   transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
 
     writes = SlidingWindow(WRITE_LIMIT, WRITE_WINDOW_S)     # в цикле событий: окно не потокобезопасно
+    reopen = asyncio.Lock()                                  # переоткрытие — одно за раз (как _first_login ворот)
 
     async def call(ctx: Context, tool: str, run, *, write: bool = False) -> dict[str, Any]:
         caller = _caller(ctx, role)
@@ -105,7 +106,9 @@ def build_kb_mcp(role: "KbRole") -> FastMCP:
             log.info("kb tool=%s caller=%s outcome=rate", tool, caller)
             return {"tool": tool, "status": "refused", "message": TOO_OFTEN}
         if role.opened is not True:     # не открылось при старте — пробуем снова при вызове, без перезапуска core
-            role.opened = await asyncio.to_thread(role.store.open)
+            async with reopen:
+                if role.opened is not True:
+                    role.opened = await asyncio.to_thread(role.store.open)
             if not role.opened:
                 log.error("kb tool=%s caller=%s outcome=unavailable хранилище не открыто (%s)", tool, caller,
                           role.store.last_error)
