@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from helpers import AGENT_DRAFT, BIG_TAGS, agent_catalog, agent_text
-from pcbk_core.agents.draft import (AGENT_TOOLS, FORBIDDEN, MAX_FILE_BYTES, MAX_TAGS, NAME_LINE, NAME_RE,
+from helpers import AGENT_DRAFT, BIG_TAGS, agent_catalog, agent_catalog_many, agent_text
+from pcbk_core.agents.draft import (AGENT_TOOLS, FORBIDDEN, MAX_FILE_BYTES, NAME_LINE, NAME_RE,
                                     PROBLEM_TEXTS, PROMPT_MAX, PROMPT_MAX_BYTES, RESERVED_NAMES, TEMPLATE_VERSION,
                                     Problem, check_draft, draft_digest, extract_prompt, one_line_problem,
                                     render_agent_file)
@@ -45,7 +45,7 @@ def test_valid_draft_is_normalized():
     ("prompt", BODY + " 10.1.2.3", "forbidden"), ("title", "Сушка {env:X}", "forbidden"),
     ("tools", [], "tools_empty"), ("tools", ["bash"], "tool_not_allowed"), ("tools", ["save_agent"], "tool_not_allowed"),
     ("tools", ["*"], "tool_not_allowed"), ("tools", ["catalog_search"], "tools_useless"),
-    ("tags", [f"20FAKE_{i:03d}_PV" for i in range(17)], "tags_too_many"), ("tags", ["20FAKE_999_PV"], "tag_unknown"),
+    ("tags", ["20FAKE_999_PV"], "tag_unknown"),
     ("tags", ["20FAKE_002_PV"], "tag_unlisted"), ("student_reply", " ", "text_field"),
 ])
 def test_each_problem(field, value, code):
@@ -119,7 +119,7 @@ def test_largest_draft_fits():                                         # рау�
            "tags": list(BIG_TAGS), "tools": list(AGENT_TOOLS)}
     d, problems = check_draft(raw, big.lookup)
     infos = {t: big.lookup(t).info for t in d.tags}
-    assert problems == [] and len(d.tags) == MAX_TAGS and all(len(t) == 128 for t in d.tags)
+    assert problems == [] and len(d.tags) == len(BIG_TAGS) and all(len(t) == 128 for t in d.tags)
     assert len(render_agent_file(d, infos, caller="student-10", created_at=AT).encode()) < MAX_FILE_BYTES
 
 def test_digest_ignores_student_reply():
@@ -267,13 +267,16 @@ def test_tool_refusal_hides_other_tool_codes_and_lists_each_once():
     assert [(p.code, p.value) for p in out] == [("tool_not_allowed", "bash"), ("tool_not_allowed", "pcbk_bash")]
 
 
-def test_tags_too_many_counted_after_dedup_and_without_lookups():
-    calls = []
-    def lookup(t):
-        calls.append(t)
-        return CAT.lookup(t)
-    seventeen = [f"20FAKE_{i:03d}_PV" for i in range(17)]
-    assert codes({**OK, "tags": seventeen}, lookup) == {("tags", "tags_too_many")} and calls == []
+def test_whole_whitelist_in_one_agent_no_tag_limit():                      # Д27: «убрать лимиты полностью»
+    cat, names = agent_catalog_many(1205)
+    d, problems = check_draft({**OK, "tags": list(names), "prompt": "п" * 4000}, cat.lookup)
+    assert problems == [] and len(d.tags) == 1205
+    text = render_agent_file(d, {t: cat.lookup(t).info for t in d.tags}, caller="student-10", created_at=AT)
+    assert len(text.encode()) < MAX_FILE_BYTES and text.count("\n- `20FAKE_") == 1205
+
+
+def test_tags_dedup_after_case_and_spaces():
+    lookup = CAT.lookup
     repeats = ["20FAKE_001_PV"] * 5 + [" 20fake_001_pv"] * 20          # 25 строк — один тег
     assert codes({**OK, "tags": repeats}, lookup) == set()
 

@@ -5,15 +5,16 @@
 задачи 3 их склеивает. is_open — одно правило и для заметки «период ещё
 идёт», и для срока кэша.
 
-Смены 06:00, 14:00, 22:00 — допущение (решение №6), технологом не
-подтверждено; ночная смена переходит через полночь.
+Смены КДМ-1 — дневная 08:00–20:00 и ночная 20:00–08:00 следующего дня, пермское время (местное время
+историана, UTC+05); подтверждено владельцем 16.10.2026 (Д27; до того — допущение 06:00, 14:00, 22:00, решение №6).
+Ночная смена переходит через полночь.
 """
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 
 ROUND_S = 30
 CLOSED_AFTER_S = 300
-SHIFT_STARTS = (6, 14, 22)
+SHIFT_STARTS = (8, 20)          # Д27: дневная 08:00–20:00, ночная 20:00–08:00
 PRESETS = ("last_hour", "last_8h", "last_24h", "current_shift", "prev_shift", "today", "yesterday", "last_7d",
            "last_30d")
 MIN_PERIOD = timedelta(seconds=60)
@@ -30,7 +31,7 @@ class Period:
     start: datetime
     end: datetime
     preset: str | None
-    shift_assumed: bool         # границы смен — допущение SHIFT_STARTS
+    shift_assumed: bool         # период — смена: в ответе заметка с границами смен (SHIFT_NOTE)
     clamped: bool               # конец ограничен «сейчас»
     open: bool                  # is_open(end, «сейчас»): период ещё идёт
 

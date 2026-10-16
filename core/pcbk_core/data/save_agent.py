@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 
-from ..agents.draft import (AGENT_TOOLS, MAX_TAGS, NAME_MAX, NAME_MIN, PROMPT_MAX, PROMPT_MIN, TEXT_LIMITS, Draft,
+from ..agents.draft import (AGENT_TOOLS, NAME_MAX, NAME_MIN, PROMPT_MAX, PROMPT_MIN, TEXT_LIMITS, Draft,
                             Problem, check_draft, render_agent_file)
 from ..agents.store import DirUnavailable, NameTaken, ReplaceMissing, StoreError, TooManyAgents, place_of_caller
 from .events import CallEvent, Outcome
@@ -70,7 +70,7 @@ SAVE_PROPERTIES: dict[str, dict[str, Any]] = {
     "tools": {"type": "array", "minItems": 1, "maxItems": len(AGENT_TOOLS), "uniqueItems": True,
               "items": {"type": "string", "enum": list(AGENT_TOOLS)},
               "description": "Что агент умеет; только эти имена"},
-    "tags": {"type": "array", "minItems": 0, "maxItems": MAX_TAGS, "uniqueItems": True,
+    "tags": {"type": "array", "minItems": 0, "uniqueItems": True,        # Д27: без предела числа тегов
              "items": {"type": "string", "minLength": 1, "maxLength": TAG_CHARS},
              "description": "Теги узла точно как их вернул catalog_search"},
     "prompt": {"type": "string", "minLength": PROMPT_MIN, "maxLength": PROMPT_MAX,

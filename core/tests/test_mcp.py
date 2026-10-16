@@ -68,7 +68,7 @@ async def test_mcp_lists_tools(core_server):
     assert (props["name"]["pattern"], props["name"]["minLength"], props["name"]["maxLength"]) == (
         "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", 3, 40)
     assert props["tools"]["items"]["enum"] == list(AGENT_TOOLS)                       # Д9а: пять (Д9-R89)
-    assert (props["tags"]["maxItems"], props["prompt"]["minLength"], props["prompt"]["maxLength"]) == (16, 200, 4000)
+    assert "maxItems" not in props["tags"] and (props["prompt"]["minLength"], props["prompt"]["maxLength"]) == (200, 4000)
     assert saver.description == SAVE_DESCRIPTION == (
         "Сохраняет агента студента после его явного согласия на последний показанный черновик. Служба проверяет "
         "черновик и пишет файл агента сама; права и правила стенда добавляет она же. Агент появится в „Мои агенты“ "

@@ -47,9 +47,10 @@ TEXT_LIMITS = {"title": (3, 60), "node": (2, 100), "purpose": (10, 200), "studen
 PROMPT_MIN = 200
 PROMPT_MAX = 4000
 PROMPT_MAX_BYTES = 8000         # и в байтах UTF-8: 4 000 эмодзи иначе прошли бы проверку, а файл — нет (доводка 1, m1)
-MAX_TAGS = 16
 AGENT_STEPS = 8
-MAX_FILE_BYTES = 16384
+# Д27: тегов у агента без предела (владелец 16.10: «убрать лимиты полностью») — файл вмещает весь белый список
+# (1205 тегов с описаниями ≈ 0,2–0,35 МБ); предел размера — только защита чтения файла, не число тегов
+MAX_FILE_BYTES = 1024 * 1024
 VALUE_MAX = 60                  # введённое значение в замечании обрезается до 60 знаков
 
 # порядок полей в замечаниях — как в схеме save_agent
@@ -113,7 +114,6 @@ PROBLEM_TEXTS: dict[str, str] = {
     "tool_not_allowed": f"Инструмента «{{v}}» на стенде нет. Можно: {_TOOLS_LIST}.",
     "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, calc_runtime, equipment или "
                      "calc_spc), а без тегов — ещё catalog_search",
-    "tags_too_many": f"Тегов не больше {MAX_TAGS}",
     "tag_unknown": "Такого тега нет в каталоге историана",
     "tag_unlisted": "Тег не входит в белый список стенда",
     # служба отвечает на него unavailable (Д7-R57); текст — на случай, если замечание всё же уйдёт модели
@@ -320,9 +320,7 @@ def check_draft(raw: Mapping[str, object], lookup: Callable[[str], Lookup] | Non
             if key not in seen:
                 seen.add(key)
                 unique.append(item.strip())
-        if len(unique) > MAX_TAGS:
-            add(Problem.make("tags", "tags_too_many"))
-        elif not unique:
+        if not unique:
             tags = []
         elif lookup is None:
             add(Problem.make("tags", "catalog_not_loaded"))

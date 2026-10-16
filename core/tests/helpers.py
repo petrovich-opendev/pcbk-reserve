@@ -740,6 +740,14 @@ def agent_catalog(big: bool = False) -> Catalog:
     return Catalog({t.name: t for t in tags}, frozenset(listed))
 
 
+def agent_catalog_many(n: int = 1205) -> tuple[Catalog, tuple[str, ...]]:
+    """Д27: каталог из n тегов белого списка с именами по 128 знаков и описаниями по 50 знаков кириллицей — весь белый
+    список стенда (1205) в одном агенте."""
+    names = tuple(f"20FAKE_{i:04d}_PV".ljust(128, "X") for i in range(n))
+    tags = [_agent_tag(name, f"Описание тега номер {i:04d} ".ljust(50, "ж"), "единицаизм") for i, name in enumerate(names)]
+    return Catalog({t.name: t for t in tags}, frozenset(names)), names
+
+
 # --- Агенты студентов: учёт и файлы (Д7а, задача А3) ---
 
 AGENT_NOW = datetime(2026, 10, 7, 9, tzinfo=timezone.utc)
