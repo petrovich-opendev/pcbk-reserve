@@ -417,7 +417,7 @@ def test_build_roles_llm_config_error_keeps_process(tmp_path, env, broken_tokens
     tokens = tmp_path / "llm-tokens"
     tokens.write_text("student-01 не-хеш\n" if broken_tokens else "")
     roles = {r.name: r for r in build_roles(settings, {**LLM_ENV, "LLM_TOKENS_FILE": str(tokens), **env})}   # не бросает
-    assert set(roles) == {"data", "llm", "gateway"} and roles["llm"].health()[1].startswith(health)
+    assert set(roles) == {"data", "llm", "gateway", "kb"} and roles["llm"].health()[1].startswith(health)
     assert (roles["llm"].config_error is None) is broken_tokens
     data = roles["data"].health()[1]                                             # П25: настоящая причина роли data
     assert data == "bdrv.env не читается (нет файла или прав)" and "LLM" not in data and "OpenRouter" not in data
@@ -459,8 +459,9 @@ def test_bad_management_key_disables_only_credits(tmp_path, capfd, restore_loggi
 
 
 def test_build_roles_share_agent_stats(monkeypatch, tmp_path):                  # Д7-R53, задача А1 Д7а
-    data, _, gw = build_roles(SETTINGS, env={})
+    data, _, gw, kb = build_roles(SETTINGS, env={})
     assert data.agent_stats is gw.agent_stats
+    assert kb.tokens is data.tokens                                               # Д25: те же токены мест
 
 
 # --- Д10а, задача А2: доли мест — одни у LLM-прокси и шлюза (Д10-R98) ---

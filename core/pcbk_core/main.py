@@ -72,8 +72,8 @@ def egress_targets(llm: LlmSettings, gw: GatewaySettings, cfg: BdrvConfig | None
 
 
 def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> list[Role]:
-    """Роли процесса: «данные», LLM-прокси (Д4а) и шлюз (Д5а); env — окружение ролей llm и gateway (None —
-    os.environ).
+    """Роли процесса: «данные», LLM-прокси (Д4а), шлюз (Д5а) и поправки базы знаний «kb» (Д25); env — окружение
+    ролей llm и gateway (None — os.environ).
 
     Нет файла белого списка — роль с пустым списком: /healthz/data отвечает 503
     с причиной, ворота не пускают ни одного имени. bdrv.env или белый список не
@@ -147,9 +147,12 @@ def build_roles(settings: Settings, env: Mapping[str, str] | None = None) -> lis
         # false, пока эта роль не здорова (config_error/stopped/upstream) или identity — преподаватель без явно
         # настроенного плательщика (мастер-промпт §6, см. llm_adapter.py и отчёт задачи 5)
         analytics_role = AnalyticsService(analytics_settings, calc=data.service, llm=llm)
+    from .kb import KbRole
+    # Д25: поправки технологов к базе знаний — своя роль и /mcp-kb (файлы службы данных защищены), те же токены мест
+    kb = KbRole(settings.DB_PATH, tokens)
     return [data, llm, build_gateway_role(settings, env, agent_stats=agent_stats, calc=data.service, llm=llm,
                                           analytics=analytics_role,
-                                          analytics_enabled=analytics_settings.ANALYTICS_ENABLED)]
+                                          analytics_enabled=analytics_settings.ANALYTICS_ENABLED), kb]
 
 
 def build_llm_role(settings: Settings, env: Mapping[str, str] | None = None, *, shares_drill: str = "",
