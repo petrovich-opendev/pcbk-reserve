@@ -41,7 +41,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
-from .. import spc
+from .. import flow, spc
 from .budget import PER_CALLER_LIMIT, check_budget, check_points, cost_tag_days
 from .cache import SingleFlight, TTLCache, cache_key, round_now, ttl_for
 from .catalog import Catalog, Kind, Lookup, TagInfo
@@ -694,6 +694,29 @@ SPC_MAX_INTERVALS = 40  # интервалов нарушений в ответ�
 SPC_PLOT_DIGITS = 5     # Д24: значащих цифр у точек графика (plot) в ответе calc_spc — график рисует чат, не модель
 
 
+# Д26: суммарный расход за период по мгновенным показаниям (calc_flow_total) — арифметика в pcbk_core.flow
+FLOW_DEFAULT_POINTS = SERIES_MAX_POINTS
+FLOW_GAP_STEPS = 1.5    # допустимый интервал источника: шаг сетки историана с допуском на округление меток
+FLOW_UNIT_CHARS = 20
+FLOW_MAX_INTERVALS = 20  # покрытых и непокрытых интервалов в ответе — не больше стольких каждого вида
+FLOW_METHOD = ("трапеции по фактическим интервалам между точками равномерной сетки историана; отрезок через "
+               "недостоверную или пустую точку и разрыв длиннее допустимого не интегрируются")
+FLOW_PARTIAL_NOTE = ("данные покрывают не весь период — показан частичный итог за покрытые интервалы; полный расход "
+                     "за период неизвестен")
+FLOW_NONE_NOTE = "нет ни одного отрезка с годными данными — расход за период неизвестен"
+FLOW_UNIT_TECH_NOTE = "единицы нет в каталоге историана — взята названная технологом"
+
+
+def _flow_unit_problem(unit: object) -> str | None:
+    if unit is not None and (not isinstance(unit, str) or not unit.strip() or len(unit) > FLOW_UNIT_CHARS):
+        return f"unit: строка до {FLOW_UNIT_CHARS} знаков, например т/ч или кг/с"
+    return None
+
+
+def _flow_intervals(pairs: Sequence[tuple[datetime, datetime]]) -> list[dict[str, str | None]]:
+    return [{"start": _iso(a), "end": _iso(b)} for a, b in pairs[:FLOW_MAX_INTERVALS]]
+
+
 def _plot_number(value: float) -> float:
     """Точка графика: SPC_PLOT_DIGITS значащих цифр — ответ короче, на картинке разницы нет."""
     return float(f"{value:.{SPC_PLOT_DIGITS}g}")
@@ -726,8 +749,8 @@ def _spc_intervals(violations: list[dict], times: list, points: list) -> tuple[l
     return out, counts
 
 class DataService:
-    """Восемь инструментов чтения роли «данные» (с calc_spc, Д21). Ворота, каталог, часы, журнал событий и
-    monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
+    """Девять инструментов чтения роли «данные» (calc_spc — Д21, calc_flow_total — Д26). Ворота, каталог, часы,
+    журнал событий и monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
 
     def __init__(self, role: DataRole, *, cache: TTLCache | None = None, flight: SingleFlight | None = None,
                  per_caller: SlidingWindow | None = None):
@@ -811,6 +834,15 @@ class DataService:
             return await self.config_unavailable(caller, channel, "calc_spc", tag)
         call = self._call(caller, channel, "calc_spc", tag)
         return await self._run(call, self._calc_spc(call, tag, period, start, end, points, subgroup, lsl, usl))
+
+    async def calc_flow_total(self, caller: str, channel: Channel, tag: str, period: str | None = None,
+                              start: str | None = None, end: str | None = None, points: int = FLOW_DEFAULT_POINTS,
+                              unit: str | None = None) -> dict[str, Any]:
+        """Суммарный расход за период по мгновенным показаниям расходомера (Д26): считает служба (pcbk_core.flow)."""
+        if self.role.config_error:          # F5
+            return await self.config_unavailable(caller, channel, "calc_flow_total", tag)
+        call = self._call(caller, channel, "calc_flow_total", tag)
+        return await self._run(call, self._calc_flow_total(call, tag, period, start, end, points, unit))
 
     async def equipment(self, caller: str, channel: Channel, query: str, with_state: bool = False) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19): служба сама группирует теги и считает их — не агент."""
@@ -1168,6 +1200,80 @@ class DataService:
                 "plot": {"points": [_plot_number(v) for v in chart["points"]],
                          "secondary": [_plot_number(v) for v in secondary["points"]], "flagged": sorted(flagged),
                          "lsl": lsl, "usl": usl, "start": chart_times[0], "end": chart_times[-1]}}
+
+    async def _calc_flow_total(self, call: _Call, tag: str, preset: str | None, start: str | None, end: str | None,
+                               points: int, unit: str | None) -> dict[str, Any]:
+        """Суммарный расход за период по мгновенным показаниям (Д26). Ряд — тем же путём, что tag_series (ворота,
+        белый список, бюджет, точки, кэш, ключ и tool "tag_series"); интеграл — pcbk_core.flow.integrate по годным
+        точкам (значение есть, качество хорошее), разрыв длиннее FLOW_GAP_STEPS шагов сетки не интегрируется.
+        Единица — из каталога; нет её там — названная технологом (unit); единица не «количество/время» —
+        отказ до SQL: накопительный счётчик повторно не интегрируется, прочее — не расход."""
+        self._check_rate(call)
+        self._check_drill()
+        reason = (_deviation_tag_problem("tag", tag) or _period_problem(preset, start, end) or _points_problem(points)
+                  or _flow_unit_problem(unit))
+        if reason:
+            raise _args_refusal(reason)
+        catalog = self._loaded_catalog()
+        known = self.role.clock
+        reason = _period_syntax(preset, start, end, known.offset if known is not None else timedelta(0))
+        if reason:
+            raise _args_refusal(reason)
+        entry = _lookup_entry(catalog, tag)
+        if not _deviation_ready(entry):
+            item = self._series_item(entry, None, None)
+            raise _Refusal("refused", MESSAGES["none"], "none: " + _counts([item]), extra={"items": [item]})
+        info = entry.lookup.info
+        catalog_unit = flow.parse_unit(info.unit)
+        parsed = catalog_unit if catalog_unit.kind != "unknown" else flow.parse_unit(unit)
+        if parsed.kind == "unknown":
+            raise _args_refusal(f"у тега {entry.shown} нет единицы в каталоге — уточните у технолога единицу "
+                                "мгновенного расхода (например т/ч, кг/с, м3/ч) и передайте её в unit")
+        if parsed.kind == "counter":
+            raise _args_refusal(f"единица «{parsed.text}» — накопительный счётчик: показания уже накоплены, "
+                                "повторно не интегрируются")
+        if parsed.kind == "other":
+            raise _args_refusal(f"единица «{parsed.text}» — не мгновенный расход (нужно количество за время, "
+                                "например т/ч или кг/с)")
+        names = (entry.shown,)
+        clock, now_r, period = await self._clock_period(call, preset, start, end, names)
+        problem = check_points(len(names), points)
+        if problem is not None:
+            raise self._budget_refusal(problem, "budget: points", call, period, clock)
+        key = cache_key("tag_series", names, period.start, period.end, extra=str(points))
+        ttl = ttl_for("tag_series", period.end, now_r)
+        snap = await self._fetch(call, key, lambda: self._read_series(names, period, points, key, ttl))
+        rows = snap.rows.get(entry.shown.upper(), ())
+        samples = [flow.Sample(_aware(row[1], clock.tz), _num(row[2]), _quality(row[3]) == "хорошее")
+                   for row in rows if isinstance(row[1], datetime)]
+        p_start, p_end = _aware(period.start, clock.tz), _aware(period.end, clock.tz)
+        step_s = (p_end - p_start).total_seconds() / (points - 1)
+        result = flow.integrate(samples, p_start, p_end, parsed.per_s, step_s * FLOW_GAP_STEPS)
+        is_open = period.open or snap.open
+        call.tags = (entry.shown,)
+        notes = [GRID_NOTE, *self._period_notes(period, is_open)]
+        if catalog_unit.kind == "unknown":
+            notes.append(FLOW_UNIT_TECH_NOTE)
+        if result.total is None:
+            notes.append(FLOW_NONE_NOTE)
+        elif not result.complete:
+            notes.append(FLOW_PARTIAL_NOTE)
+        if result.negative:
+            notes.append(f"отрицательных показаний: {result.negative} — проинтегрированы как есть")
+        coverage = round(100 * result.covered_s / result.period_s, 1) if result.period_s > 0 else 0.0
+        status = "ok" if result.complete else "partial"
+        total = None if result.total is None else round(result.total, 3)
+        call.summary = (f"{period.preset or 'свой период'}, точек {points}: "
+                        + (f"{total} {parsed.quantity}" if total is not None else "расход неизвестен")
+                        + f", покрытие {coverage} %")
+        return {"tool": "calc_flow_total", "status": status, "tag": entry.shown, "description": info.description,
+                "total": total, "total_unit": parsed.quantity, "complete": result.complete,
+                "coverage_percent": coverage, "unit": parsed.text,
+                "unit_source": "каталог" if catalog_unit.kind != "unknown" else "технолог",
+                "period": self._period_json(period, clock, is_open),
+                "covered": _flow_intervals(result.covered), "uncovered": _flow_intervals(result.uncovered),
+                "points": result.points, "points_usable": result.usable, "gaps": result.gaps,
+                "grid_step_s": round(step_s, 1), "method": FLOW_METHOD, "notes": notes, "cache": call.cache}
 
     async def _equipment(self, call: _Call, query: object, with_state: object) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19, правка Д19б): без with_state — только каталог в памяти, SQL

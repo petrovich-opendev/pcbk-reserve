@@ -47,11 +47,11 @@ async def test_mcp_lists_tools(core_server):
     async with mcp_session(core_server.url + "/mcp", TOKEN) as s:
         tools = {t.name: t for t in (await s.list_tools()).tools}
     assert set(tools) == {"catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                          "calc_deviation", "calc_spc", "equipment", "save_agent", "my_agents",
-                          "report_event"}  # Д21: одиннадцать
+                          "calc_deviation", "calc_spc", "calc_flow_total", "equipment", "save_agent", "my_agents",
+                          "report_event"}  # Д21: одиннадцать; Д26: двенадцать
     assert all(tools[name].annotations.readOnlyHint is True
                for name in ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                            "calc_deviation", "calc_spc", "equipment", "my_agents"))
+                            "calc_deviation", "calc_spc", "calc_flow_total", "equipment", "my_agents"))
     saver = tools["save_agent"]
     assert (saver.annotations.readOnlyHint, saver.annotations.destructiveHint, saver.annotations.idempotentHint,
             saver.annotations.openWorldHint) == (False, False, True, False)                  # Д7-R57

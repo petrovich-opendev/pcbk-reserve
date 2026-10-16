@@ -43,8 +43,8 @@ from .http_api import (UNAUTHORIZED, CalcDeviationArgs, CalcRuntimeArgs, Catalog
 from .periods import PRESETS
 from .report_event import REPORT_DESCRIPTION, REPORT_PROPERTIES, REPORT_REQUIRED
 from .save_agent import SAVE_DESCRIPTION, SAVE_PROPERTIES, SAVE_REQUIRED
-from .service import (DEVIATION_DEFAULT_POINTS, QUERY_CHARS, SEARCH_LIMIT, SPC_DEFAULT_POINTS, SPC_MAX_SUBGROUP,
-                      SPC_MIN_POINTS, TAG_CHARS, requested_of)
+from .service import (DEVIATION_DEFAULT_POINTS, FLOW_DEFAULT_POINTS, FLOW_UNIT_CHARS, QUERY_CHARS, SEARCH_LIMIT,
+                      SPC_DEFAULT_POINTS, SPC_MAX_SUBGROUP, SPC_MIN_POINTS, TAG_CHARS, requested_of)
 from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
 if TYPE_CHECKING:
@@ -80,6 +80,15 @@ TOOL_DESCRIPTIONS = {
                       "число точек сверх порога и интервалы подряд идущих точек сверх порога (начало, конец, число "
                       "точек, наибольшее отклонение с его измерением и заданием). Период — готовый (period) или "
                       "начало и конец (start, end, ISO 8601).",
+    "calc_flow_total": "Суммарный расход за период по мгновенным показаниям расходомера (один аналоговый тег БДРВ) — "
+                       "считает служба, не модель: интеграл методом трапеций по фактическим интервалам точек сетки "
+                       "историана (на тег до 96 точек, окно до 31 суток); единица — из каталога (т/ч → итог в т, "
+                       "кг/с → в кг); если в каталоге единицы нет — спросите технолога и передайте unit. Недостоверные "
+                       "точки и разрывы не интегрируются, пропуск — не ноль, края периода не достраиваются: при "
+                       "неполном покрытии — частичный итог (status partial), покрытые и непокрытые интервалы. "
+                       "Накопительный счётчик (единица без «/время») повторно не интегрируется — отказ. Зовите, когда "
+                       "спрашивают, сколько пара, воды, массы израсходовано или прошло за период. Период — готовый "
+                       "(period) или начало и конец (start, end, ISO 8601 с поясом).",
     "calc_spc": "Карта Шухарта (SPC) по одному аналоговому тегу БДРВ за период — считает служба, не модель (один "
                "запрос, пределы как у tag_series: на тег до 96 точек, окно до 31 суток, бюджет 24 тего-суток; "
                "points — от 20 до 96, по умолчанию 96): CL/UCL/LCL и σ (σ_внутр и σ_общ), нарушения 8 правил "
@@ -136,6 +145,10 @@ SpcPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum"
                                                     "maximum": SERIES_MAX_POINTS})]
 SpcSubgroup = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 1, "maximum": SPC_MAX_SUBGROUP})]
 SpcBound = Annotated[Any, Field(json_schema_extra={"type": "number"})]
+# calc_flow_total (Д26): points — как у tag_series (2..96), по умолчанию 96; unit — только если в каталоге её нет
+FlowTag = Annotated[Any, Field(json_schema_extra={"type": "string", "maxLength": TAG_CHARS})]
+FlowPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 2, "maximum": SERIES_MAX_POINTS})]
+FlowUnit = Annotated[Any, Field(json_schema_extra={"type": ["string", "null"], "maxLength": FLOW_UNIT_CHARS})]
 
 
 # equipment (Д19): MCP-инструмент без HTTP-ручки (Task 1) — своя модель аргументов, не из http_api
@@ -144,6 +157,19 @@ class EquipmentArgs(BaseModel):
 
     query: Annotated[str, StringConstraints(min_length=1, max_length=QUERY_CHARS)]
     with_state: bool = False
+
+
+# calc_flow_total (Д26): MCP-инструмент без HTTP-ручки, своя модель аргументов (как calc_spc); points и unit — без
+# пределов здесь, их проверяет служба (_points_problem, _flow_unit_problem) той же причиной, что у прямого вызова.
+class CalcFlowArgs(BaseModel):
+    """Суммарный расход за период (Д26): один аналоговый тег расходомера; unit — если в каталоге единицы нет."""
+
+    tag: Tag
+    period: Literal[PRESETS] | None = None
+    start: str | None = None
+    end: str | None = None
+    points: int = FLOW_DEFAULT_POINTS
+    unit: str | None = None
 
 
 # calc_spc (Д21): MCP-инструмент без HTTP-ручки, своя модель аргументов (как equipment), не из http_api.
@@ -293,6 +319,15 @@ def build_mcp(role: "DataRole") -> FastMCP:
                            "subgroup": subgroup, "lsl": lsl, "usl": usl},
                           lambda caller, a: role.service.calc_spc(caller, "mcp", a.tag, a.period, a.start, a.end,
                                                                   a.points, a.subgroup, a.lsl, a.usl))
+
+    @mcp.tool(name="calc_flow_total", description=TOOL_DESCRIPTIONS["calc_flow_total"], annotations=READ_ONLY)
+    async def calc_flow_total(ctx: Context, tag: FlowTag = None, period: Preset = None, start: IsoTime = None,
+                              end: IsoTime = None, points: FlowPoints = FLOW_DEFAULT_POINTS,
+                              unit: FlowUnit = None) -> dict[str, Any]:
+        return await call(ctx, "calc_flow_total", tag, CalcFlowArgs,
+                          {"tag": tag, "period": period, "start": start, "end": end, "points": points, "unit": unit},
+                          lambda caller, a: role.service.calc_flow_total(caller, "mcp", a.tag, a.period, a.start,
+                                                                         a.end, a.points, a.unit))
 
     @mcp.tool(name="equipment", description=TOOL_DESCRIPTIONS["equipment"], annotations=READ_ONLY)
     async def equipment(ctx: Context, query: Query = None, with_state: WithState = False) -> dict[str, Any]:
