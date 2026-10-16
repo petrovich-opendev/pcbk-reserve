@@ -316,9 +316,12 @@ def test_prompt_bytes_boundary():                                       # m1: 8 
 
 
 def test_render_refuses_oversize_file():                                # m1: предел MAX_FILE_BYTES держит сам шаблон
-    d = replace(check_draft(OK, CAT.lookup)[0], prompt="\U0001F600" * 4000)
+    # Д27: тегов без предела — 1 МБ переполняет не короткий prompt (как раньше), а большой список тегов
+    cat, names = agent_catalog_many(4500)
+    d, problems = check_draft({**OK, "tags": list(names), "prompt": "п" * 4000}, cat.lookup)
+    assert problems == []
     with pytest.raises(ValueError):
-        render_agent_file(d, {"20FAKE_001_PV": CAT.lookup("20FAKE_001_PV").info}, caller="student-03", created_at=AT)
+        render_agent_file(d, {t: cat.lookup(t).info for t in d.tags}, caller="student-03", created_at=AT)
 
 
 def test_tag_description_spaces_collapsed():                            # m3

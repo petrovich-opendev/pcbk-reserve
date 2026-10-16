@@ -136,7 +136,6 @@ REFUSAL_TEXTS: dict[str, str] = {
                         "calc_runtime, calc_deviation, equipment, calc_spc, report_event.",
     "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, calc_runtime, equipment или "
                      "calc_spc), а без тегов — ещё catalog_search",
-    "tags_too_many": "Тегов не больше 16",
     "tag_unknown": "Такого тега нет в каталоге историана",
     "tag_unlisted": "Тег не входит в белый список стенда",
     "catalog_not_loaded": "Каталог тегов ещё не загружен — повторите позже",

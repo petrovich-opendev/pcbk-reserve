@@ -15,7 +15,7 @@ def p(now=N, **kw):
 def test_presets_basic():
     assert (p(preset="last_hour").start, p(preset="last_hour").end) == \
            (datetime(2026, 10, 1, 11, 0, 30), datetime(2026, 10, 1, 12, 0, 30))
-    assert (p(preset="prev_shift").start, p(preset="prev_shift").end) == (datetime(2026, 9, 30, 22), datetime(2026, 10, 1, 6))
+    assert (p(preset="prev_shift").start, p(preset="prev_shift").end) == (datetime(2026, 9, 30, 20), datetime(2026, 10, 1, 8))
     assert (p(preset="yesterday").start, p(preset="today").start) == (datetime(2026, 9, 30), datetime(2026, 10, 1))
     assert p(preset="prev_shift").shift_assumed and not p(preset="last_hour").shift_assumed
     assert p(preset="last_hour").open and not p(preset="prev_shift").open          # F21: правило кэша
@@ -28,14 +28,14 @@ def test_open_uses_closed_after():
 def test_shift_presets_cross_midnight():
     at = lambda h, m, preset: p(now=datetime(2026, 10, 1, h, m), preset=preset)
     assert (at(5, 59, "current_shift").start, at(5, 59, "prev_shift").start, at(5, 59, "prev_shift").end) == \
-           (datetime(2026, 9, 30, 22), datetime(2026, 9, 30, 14), datetime(2026, 9, 30, 22))
+           (datetime(2026, 9, 30, 20), datetime(2026, 9, 30, 8), datetime(2026, 9, 30, 20))
     assert (at(23, 10, "current_shift").start, at(6, 10, "prev_shift").start) == \
-           (datetime(2026, 10, 1, 22), datetime(2026, 9, 30, 22))
+           (datetime(2026, 10, 1, 20), datetime(2026, 9, 30, 8))
 
 
 def test_period_shorter_than_minute_refused():                                  # F19: end == start
     with pytest.raises(PeriodError, match="короче минуты"):
-        p(now=datetime(2026, 10, 1, 6, 0, 20), preset="current_shift")
+        p(now=datetime(2026, 10, 1, 8, 0, 20), preset="current_shift")
     with pytest.raises(PeriodError, match="раньше начала"):
         p(start="2026-10-01 10:00", end="2026-10-01 09:59")
 
@@ -67,7 +67,7 @@ def test_every_preset_ends_by_now_and_is_not_clamped():
         assert q.preset == preset and not q.clamped and q.end <= now_r
         if preset in spans:
             assert (q.start, q.end) == (now_r - spans[preset], now_r)
-    assert (p(preset="today").end, p(preset="current_shift").start) == (now_r, datetime(2026, 10, 1, 6))
+    assert (p(preset="today").end, p(preset="current_shift").start) == (now_r, datetime(2026, 10, 1, 8))
 
 
 def test_round_now_floors_to_30_seconds():

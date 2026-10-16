@@ -105,7 +105,7 @@ async def test_tag_period_answer_says_what_was_computed(svc):
     it = r["items"][0]
     assert r["status"] == "ok" and it["range"] == pytest.approx(5.0) == it["max"] - it["min"]
     assert (r["source"], r["avg_kind"]["code"], r["std_kind"]["code"]) == (SOURCE_SUMMARY, AVG_KIND, STD_KIND)
-    assert r["period"]["start"] == "2026-09-30T22:00:00+05:00" and r["period"]["shift_grid_assumed"] is True
+    assert r["period"]["start"] == "2026-09-30T20:00:00+05:00" and r["period"]["shift_grid_assumed"] is True
     assert SHIFT_NOTE in r["notes"] and ("last" in it) is HAS_LAST
     assert r["period"]["open"] is False and OPEN_NOTE not in r["notes"]
 
@@ -212,7 +212,7 @@ async def test_call_log_line_without_values(svc, capfd, restore_logging):
     s, _ = svc
     await s.tag_period("student-01", "http", ["20FAKE_001_PV"], period="prev_shift")
     err = capfd.readouterr().err
-    assert "tool=tag_period" in err and "cost=0.333" in err and "12.4" not in err
+    assert "tool=tag_period" in err and "cost=0.500" in err and "12.4" not in err
 
 
 async def test_error_detail_never_leaves_process(svc, capfd, restore_logging):
@@ -996,7 +996,7 @@ async def test_calc_runtime_period_hours_and_notes(svc):                        
     r = await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="last_8h")
     assert (r["items"][0]["period_hours"], r["notes"]) == (8.0, [OPEN_NOTE])
     r = await s.calc_runtime("student-01", "http", ["25FAKE_007_CLS"], period="current_shift")
-    assert r["notes"] == [SHIFT_NOTE, OPEN_NOTE] and r["items"][0]["period_hours"] == 6.0
+    assert r["notes"] == [SHIFT_NOTE, OPEN_NOTE] and r["items"][0]["period_hours"] == 4.0
 
 
 async def test_tag_series_clamped_own_period_notes(svc):                         # m-4: конец ограничен «сейчас»
