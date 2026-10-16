@@ -43,7 +43,8 @@ from .http_api import (UNAUTHORIZED, CalcDeviationArgs, CalcRuntimeArgs, Catalog
 from .periods import PRESETS
 from .report_event import REPORT_DESCRIPTION, REPORT_PROPERTIES, REPORT_REQUIRED
 from .save_agent import SAVE_DESCRIPTION, SAVE_PROPERTIES, SAVE_REQUIRED
-from .service import (DEVIATION_DEFAULT_POINTS, FLOW_DEFAULT_POINTS, FLOW_UNIT_CHARS, QUERY_CHARS, SEARCH_LIMIT,
+from .service import (DEVIATION_DEFAULT_POINTS, FLOW_DEFAULT_POINTS, FLOW_MIN_POINTS, FLOW_UNIT_CHARS, QUERY_CHARS,
+                      SEARCH_LIMIT,
                       SPC_DEFAULT_POINTS, SPC_MAX_SUBGROUP, SPC_MIN_POINTS, TAG_CHARS, requested_of)
 from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
@@ -145,9 +146,10 @@ SpcPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum"
                                                     "maximum": SERIES_MAX_POINTS})]
 SpcSubgroup = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 1, "maximum": SPC_MAX_SUBGROUP})]
 SpcBound = Annotated[Any, Field(json_schema_extra={"type": "number"})]
-# calc_flow_total (Д26): points — как у tag_series (2..96), по умолчанию 96; unit — только если в каталоге её нет
+# calc_flow_total (Д26): points — 20..96, по умолчанию 96; unit — только если в каталоге её нет
 FlowTag = Annotated[Any, Field(json_schema_extra={"type": "string", "maxLength": TAG_CHARS})]
-FlowPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 2, "maximum": SERIES_MAX_POINTS})]
+FlowPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": FLOW_MIN_POINTS,
+                                                     "maximum": SERIES_MAX_POINTS})]
 FlowUnit = Annotated[Any, Field(json_schema_extra={"type": ["string", "null"], "maxLength": FLOW_UNIT_CHARS})]
 
 
@@ -160,7 +162,7 @@ class EquipmentArgs(BaseModel):
 
 
 # calc_flow_total (Д26): MCP-инструмент без HTTP-ручки, своя модель аргументов (как calc_spc); points и unit — без
-# пределов здесь, их проверяет служба (_points_problem, _flow_unit_problem) той же причиной, что у прямого вызова.
+# пределов здесь, их проверяет служба (_flow_points_problem, _flow_unit_problem) той же причиной, что у прямого вызова.
 class CalcFlowArgs(BaseModel):
     """Суммарный расход за период (Д26): один аналоговый тег расходомера; unit — если в каталоге единицы нет."""
 

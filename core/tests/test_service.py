@@ -1489,28 +1489,28 @@ def test_spc_intervals_merge_consecutive_points_per_rule():                     
 
 
 # Д26: calc_flow_total — суммарный расход за период по мгновенным показаниям (ряд — путём tag_series, интеграл —
-# pcbk_core.flow). 20FAKE_001_PV — расход в л/час; период 08:00–11:00 (3 ч) по часам двойника (+05:00), 13 точек —
-# шаг 15 мин; разрыв допустим до 1,5 шага.
+# pcbk_core.flow). 20FAKE_001_PV — расход в л/час; период 08:00–11:00 (3 ч) по часам двойника (+05:00), 25 точек —
+# шаг 7,5 мин; разрыв допустим до 1,5 шага.
 
 from pcbk_core.data.service import FLOW_NONE_NOTE, FLOW_PARTIAL_NOTE, FLOW_UNIT_TECH_NOTE  # noqa: E402
 
 _FLOW_BASE = datetime(2026, 10, 1, 8, 0)
-_FLOW_ARGS = {"start": "2026-10-01T08:00:00+05:00", "end": "2026-10-01T11:00:00+05:00", "points": 13}
+_FLOW_ARGS = {"start": "2026-10-01T08:00:00+05:00", "end": "2026-10-01T11:00:00+05:00", "points": 25}
 
 
 def _flow_rows(values) -> list[tuple]:
-    return [(_FLOW_BASE + timedelta(minutes=15 * i), v, q) for i, (v, q) in enumerate(values)]
+    return [(_FLOW_BASE + timedelta(minutes=7.5 * i), v, q) for i, (v, q) in enumerate(values)]
 
 
 async def test_calc_flow_total_constant_10_per_hour_for_3_hours(svc):
     s, fake = svc
-    fake.series["20FAKE_001_PV"] = _flow_rows([(10.0, 0)] * 13)
+    fake.series["20FAKE_001_PV"] = _flow_rows([(10.0, 0)] * 25)
     r = await s.calc_flow_total("student-01", "mcp", "20FAKE_001_PV", **_FLOW_ARGS)
     assert (r["tool"], r["status"], r["total"], r["total_unit"]) == ("calc_flow_total", "ok", 30.0, "л")
     assert (r["complete"], r["coverage_percent"], r["unit"], r["unit_source"]) == (True, 100.0, "л/час", "каталог")
     assert r["uncovered"] == [] and r["covered"] == [{"start": "2026-10-01T08:00:00+05:00",
                                                        "end": "2026-10-01T11:00:00+05:00"}]
-    assert (r["points"], r["points_usable"], r["gaps"], r["grid_step_s"]) == (13, 13, 0, 900.0)
+    assert (r["points"], r["points_usable"], r["gaps"], r["grid_step_s"]) == (25, 25, 0, 450.0)
     assert (r["period"]["start"], r["period"]["end"]) == ("2026-10-01T08:00:00+05:00", "2026-10-01T11:00:00+05:00")
     e = s.role.events.recent()[0]
     assert (e.tool, e.outcome, e.tags) == ("calc_flow_total", "ok", ("20FAKE_001_PV",))
@@ -1518,24 +1518,24 @@ async def test_calc_flow_total_constant_10_per_hour_for_3_hours(svc):
 
 async def test_calc_flow_total_gaps_give_partial_total_not_zero(svc):
     s, fake = svc
-    values = [(10.0, 0)] * 5 + [(500.0, 64), (None, 0)] + [(10.0, 0)] * 6        # 09:15 недостоверно, 09:30 пусто
+    values = [(10.0, 0)] * 9 + [(500.0, 64), (None, 0)] + [(10.0, 0)] * 14       # 09:07:30 недостоверно, 09:15 пусто
     fake.series["20FAKE_001_PV"] = _flow_rows(values)
     r = await s.calc_flow_total("student-01", "mcp", "20FAKE_001_PV", **_FLOW_ARGS)
-    assert (r["status"], r["complete"], r["total"]) == ("partial", False, 22.5)   # 1 ч + 1 ч 15 мин по 10 л/ч
-    assert r["uncovered"] == [{"start": "2026-10-01T09:00:00+05:00", "end": "2026-10-01T09:45:00+05:00"}]
-    assert r["coverage_percent"] == 75.0 and FLOW_PARTIAL_NOTE in r["notes"]
+    assert (r["status"], r["complete"], r["total"]) == ("partial", False, 26.25)  # 1 ч + 1 ч 37,5 мин по 10 л/ч
+    assert r["uncovered"] == [{"start": "2026-10-01T09:00:00+05:00", "end": "2026-10-01T09:22:30+05:00"}]
+    assert r["coverage_percent"] == 87.5 and FLOW_PARTIAL_NOTE in r["notes"]
 
 
 async def test_calc_flow_total_no_data_is_unknown(svc):
     s, fake = svc
-    fake.series["20FAKE_001_PV"] = _flow_rows([(None, 0)] * 13)
+    fake.series["20FAKE_001_PV"] = _flow_rows([(None, 0)] * 25)
     r = await s.calc_flow_total("student-01", "mcp", "20FAKE_001_PV", **_FLOW_ARGS)
     assert (r["status"], r["total"], r["coverage_percent"]) == ("partial", None, 0.0) and FLOW_NONE_NOTE in r["notes"]
 
 
 async def test_calc_flow_total_unit_from_technologist_when_catalog_has_none(svc):
     s, fake = svc
-    fake.series["20FAKE_003_PV"] = _flow_rows([(2.0, 0)] * 13)
+    fake.series["20FAKE_003_PV"] = _flow_rows([(2.0, 0)] * 25)
     asked = await s.calc_flow_total("student-01", "mcp", "20FAKE_003_PV", **_FLOW_ARGS)
     assert asked["status"] == "refused" and "нет единицы в каталоге" in asked["message"]
     r = await s.calc_flow_total("student-01", "mcp", "20FAKE_003_PV", unit="кг/с", **_FLOW_ARGS)
@@ -1556,9 +1556,16 @@ async def test_calc_flow_total_refuses_before_sql(svc, tag, unit, reason):
 
 async def test_calc_flow_total_catalog_unit_wins_over_argument(svc):
     s, fake = svc
-    fake.series["20FAKE_001_PV"] = _flow_rows([(10.0, 0)] * 13)
+    fake.series["20FAKE_001_PV"] = _flow_rows([(10.0, 0)] * 25)
     r = await s.calc_flow_total("student-01", "mcp", "20FAKE_001_PV", unit="кг/с", **_FLOW_ARGS)
     assert (r["total"], r["total_unit"], r["unit_source"]) == (30.0, "л", "каталог")
+    assert any("взята она, а не названная «кг/с»" in n for n in r["notes"])
+
+
+async def test_calc_flow_total_points_at_least_20(svc):                          # ревью Д26: грубая сетка
+    s, fake = svc
+    r = await s.calc_flow_total("student-01", "mcp", "20FAKE_001_PV", **{**_FLOW_ARGS, "points": 2})
+    assert (r["status"], r["message"]) == ("refused", MESSAGES["args"] + "points: от 20 до 96") and fake.calls == []
 
 
 async def test_calc_flow_total_refuses_discrete_tag(svc):

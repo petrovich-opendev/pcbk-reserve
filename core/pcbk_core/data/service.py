@@ -696,6 +696,7 @@ SPC_PLOT_DIGITS = 5     # Д24: значащих цифр у точек граф
 
 # Д26: суммарный расход за период по мгновенным показаниям (calc_flow_total) — арифметика в pcbk_core.flow
 FLOW_DEFAULT_POINTS = SERIES_MAX_POINTS
+FLOW_MIN_POINTS = 20     # меньше — шаг сетки грубый, и допустимый разрыв перестаёт ловить пропуски (ревью Д26)
 FLOW_GAP_STEPS = 1.5    # допустимый интервал источника: шаг сетки историана с допуском на округление меток
 FLOW_UNIT_CHARS = 20
 FLOW_MAX_INTERVALS = 20  # покрытых и непокрытых интервалов в ответе — не больше стольких каждого вида
@@ -705,6 +706,12 @@ FLOW_PARTIAL_NOTE = ("данные покрывают не весь период
                      "за период неизвестен")
 FLOW_NONE_NOTE = "нет ни одного отрезка с годными данными — расход за период неизвестен"
 FLOW_UNIT_TECH_NOTE = "единицы нет в каталоге историана — взята названная технологом"
+
+
+def _flow_points_problem(points: object) -> str | None:
+    if isinstance(points, bool) or not isinstance(points, int) or not FLOW_MIN_POINTS <= points <= SERIES_MAX_POINTS:
+        return f"points: от {FLOW_MIN_POINTS} до {SERIES_MAX_POINTS}"
+    return None
 
 
 def _flow_unit_problem(unit: object) -> str | None:
@@ -1210,8 +1217,8 @@ class DataService:
         отказ до SQL: накопительный счётчик повторно не интегрируется, прочее — не расход."""
         self._check_rate(call)
         self._check_drill()
-        reason = (_deviation_tag_problem("tag", tag) or _period_problem(preset, start, end) or _points_problem(points)
-                  or _flow_unit_problem(unit))
+        reason = (_deviation_tag_problem("tag", tag) or _period_problem(preset, start, end)
+                  or _flow_points_problem(points) or _flow_unit_problem(unit))
         if reason:
             raise _args_refusal(reason)
         catalog = self._loaded_catalog()
@@ -1254,13 +1261,18 @@ class DataService:
         notes = [GRID_NOTE, *self._period_notes(period, is_open)]
         if catalog_unit.kind == "unknown":
             notes.append(FLOW_UNIT_TECH_NOTE)
+        elif unit is not None and unit.strip() != catalog_unit.text:
+            notes.append(f"в каталоге единица «{catalog_unit.text}» — взята она, а не названная «{unit.strip()}»")
+        for name, pairs in (("покрытых", result.covered), ("непокрытых", result.uncovered)):
+            if len(pairs) > FLOW_MAX_INTERVALS:
+                notes.append(f"показаны первые {FLOW_MAX_INTERVALS} {name} интервалов из {len(pairs)}")
         if result.total is None:
             notes.append(FLOW_NONE_NOTE)
         elif not result.complete:
             notes.append(FLOW_PARTIAL_NOTE)
         if result.negative:
             notes.append(f"отрицательных показаний: {result.negative} — проинтегрированы как есть")
-        coverage = round(100 * result.covered_s / result.period_s, 1) if result.period_s > 0 else 0.0
+        coverage = 100.0 if result.complete else round(100 * result.covered_s / result.period_s, 1)
         status = "ok" if result.complete else "partial"
         total = None if result.total is None else round(result.total, 3)
         call.summary = (f"{period.preset or 'свой период'}, точек {points}: "
