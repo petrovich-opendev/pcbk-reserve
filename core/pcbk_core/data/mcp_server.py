@@ -46,6 +46,7 @@ from .save_agent import SAVE_DESCRIPTION, SAVE_PROPERTIES, SAVE_REQUIRED
 from .service import (DEVIATION_DEFAULT_POINTS, FLOW_DEFAULT_POINTS, FLOW_MIN_POINTS, FLOW_UNIT_CHARS, QUERY_CHARS,
                       SEARCH_LIMIT,
                       SPC_DEFAULT_POINTS, SPC_MAX_SUBGROUP, SPC_MIN_POINTS, TAG_CHARS, requested_of)
+from ..formula import FORMULA_CHARS
 from .sql import MAX_NAMES, SERIES_DEFAULT_POINTS, SERIES_MAX_POINTS, SERIES_MAX_TAGS, SERIES_MIN_POINTS
 
 if TYPE_CHECKING:
@@ -81,6 +82,16 @@ TOOL_DESCRIPTIONS = {
                       "число точек сверх порога и интервалы подряд идущих точек сверх порога (начало, конец, число "
                       "точек, наибольшее отклонение с его измерением и заданием). Период — готовый (period) или "
                       "начало и конец (start, end, ISO 8601).",
+    "calc_formula": "Расчёт производного показателя по формуле над рядами до 4 аналоговых тегов БДРВ за период — "
+                    "считает служба, не модель. tags — теги по порядку, в формуле они A, B, C, D. Формула: + - * / "
+                    "** и скобки поточечно; свёртки ряда в число: mean, sum, min, max, std, median, count, first, "
+                    "last; corr(x, y) — коэффициент Пирсона; slope(y, x), intercept(y, x), r2(y, x) — линейная "
+                    "регрессия; abs(x). Примеры: суммарная нагрузка — «A + B + C» (ряд) или «mean(A + B + C)»; "
+                    "удельный расход — «mean(A) / mean(B)»; связь двух параметров — «corr(A, B)», «slope(A, B)»; "
+                    "размах — «max(A) - min(A)». Пустые и недостоверные точки не считаются нулём. Единицы служба не "
+                    "пересчитывает. Пределы как у tag_series: окно до 31 суток, тего-сутки, точек на вызов до 288 "
+                    "(по умолчанию — наибольшее). Зовите, когда нужен показатель, которого нет готовым, — не "
+                    "отказывайтесь считать. Период — готовый (period) или начало и конец (start, end, ISO 8601).",
     "calc_flow_total": "Суммарный расход за период по мгновенным показаниям расходомера (один аналоговый тег БДРВ) — "
                        "считает служба, не модель: интеграл методом трапеций по фактическим интервалам точек сетки "
                        "историана (на тег до 96 точек, окно до 31 суток); единица — из каталога (т/ч → итог в т, "
@@ -146,6 +157,12 @@ SpcPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum"
                                                     "maximum": SERIES_MAX_POINTS})]
 SpcSubgroup = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": 1, "maximum": SPC_MAX_SUBGROUP})]
 SpcBound = Annotated[Any, Field(json_schema_extra={"type": "number"})]
+# calc_formula (Д28): теги — до SERIES_MAX_TAGS, формула — строка до FORMULA_CHARS, points — 2..96 или нет
+FormulaTags = Annotated[Any, Field(json_schema_extra={"type": "array", "minItems": 1, "maxItems": SERIES_MAX_TAGS,
+                                                      "items": {"type": "string", "maxLength": TAG_CHARS}})]
+FormulaText = Annotated[Any, Field(json_schema_extra={"type": "string", "minLength": 1, "maxLength": FORMULA_CHARS})]
+FormulaPoints = Annotated[Any, Field(json_schema_extra={"type": ["integer", "null"], "minimum": 2,
+                                                        "maximum": SERIES_MAX_POINTS})]
 # calc_flow_total (Д26): points — 20..96, по умолчанию 96; unit — только если в каталоге её нет
 FlowTag = Annotated[Any, Field(json_schema_extra={"type": "string", "maxLength": TAG_CHARS})]
 FlowPoints = Annotated[Any, Field(json_schema_extra={"type": "integer", "minimum": FLOW_MIN_POINTS,
@@ -159,6 +176,19 @@ class EquipmentArgs(BaseModel):
 
     query: Annotated[str, StringConstraints(min_length=1, max_length=QUERY_CHARS)]
     with_state: bool = False
+
+
+# calc_formula (Д28): MCP-инструмент без HTTP-ручки; все поля без пределов здесь — теги, формулу и точки проверяет
+# служба (_tags_problem, formula.parse, _points_problem) русской причиной, до SQL.
+class CalcFormulaArgs(BaseModel):
+    """Расчёт по формуле над рядами тегов (Д28): tags — по порядку A, B, C, D; formula — строка."""
+
+    tags: Any = None
+    formula: Any = None
+    period: Literal[PRESETS] | None = None
+    start: str | None = None
+    end: str | None = None
+    points: Any = None
 
 
 # calc_flow_total (Д26): MCP-инструмент без HTTP-ручки, своя модель аргументов (как calc_spc); points и unit — без
@@ -321,6 +351,15 @@ def build_mcp(role: "DataRole") -> FastMCP:
                            "subgroup": subgroup, "lsl": lsl, "usl": usl},
                           lambda caller, a: role.service.calc_spc(caller, "mcp", a.tag, a.period, a.start, a.end,
                                                                   a.points, a.subgroup, a.lsl, a.usl))
+
+    @mcp.tool(name="calc_formula", description=TOOL_DESCRIPTIONS["calc_formula"], annotations=READ_ONLY)
+    async def calc_formula(ctx: Context, tags: FormulaTags = None, formula: FormulaText = None, period: Preset = None,
+                           start: IsoTime = None, end: IsoTime = None, points: FormulaPoints = None) -> dict[str, Any]:
+        return await call(ctx, "calc_formula", tags, CalcFormulaArgs,
+                          {"tags": tags, "formula": formula, "period": period, "start": start, "end": end,
+                           "points": points},
+                          lambda caller, a: role.service.calc_formula(caller, "mcp", a.tags, a.formula, a.period,
+                                                                      a.start, a.end, a.points))
 
     @mcp.tool(name="calc_flow_total", description=TOOL_DESCRIPTIONS["calc_flow_total"], annotations=READ_ONLY)
     async def calc_flow_total(ctx: Context, tag: FlowTag = None, period: Preset = None, start: IsoTime = None,

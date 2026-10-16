@@ -41,8 +41,8 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
-from .. import flow, spc
-from .budget import PER_CALLER_LIMIT, check_budget, check_points, cost_tag_days
+from .. import flow, formula, spc
+from .budget import LIMITS, PER_CALLER_LIMIT, check_budget, check_points, cost_tag_days
 from .cache import SingleFlight, TTLCache, cache_key, round_now, ttl_for
 from .catalog import Catalog, Kind, Lookup, TagInfo
 from .events import REQUESTED_LINES, CacheState, CallEvent, Channel, Outcome, outcome_for
@@ -708,6 +708,24 @@ FLOW_NONE_NOTE = "нет ни одного отрезка с годными да
 FLOW_UNIT_TECH_NOTE = "единицы нет в каталоге историана — взята названная технологом"
 
 
+# Д28: расчёт по формуле над рядами тегов (calc_formula) — разбор и счёт в pcbk_core.formula, не модель
+FORMULA_METHOD = ("формула над рядами тегов на общей равномерной сетке историана; годная точка — значение есть и "
+                  "качество хорошее; пустая точка любого ряда даёт пустую точку результата; считает служба")
+FORMULA_UNITS_NOTE = "единицы служба не пересчитывает: результат — в единицах формулы над единицами тегов"
+FORMULA_SERIES_CAP = SERIES_MAX_POINTS
+
+
+def _formula_points(points: object, n_tags: int) -> int | None:
+    """points не задан — наибольшее по бюджету точек (n тегов × points ≤ max_points), но не больше 96."""
+    if points is None:
+        return min(SERIES_MAX_POINTS, LIMITS.max_points // max(n_tags, 1))
+    return points if isinstance(points, int) and not isinstance(points, bool) else None
+
+
+def _round6(value: float | None) -> float | None:
+    return None if value is None else float(f"{value:.6g}")
+
+
 def _flow_points_problem(points: object) -> str | None:
     if isinstance(points, bool) or not isinstance(points, int) or not FLOW_MIN_POINTS <= points <= SERIES_MAX_POINTS:
         return f"points: от {FLOW_MIN_POINTS} до {SERIES_MAX_POINTS}"
@@ -756,8 +774,8 @@ def _spc_intervals(violations: list[dict], times: list, points: list) -> tuple[l
     return out, counts
 
 class DataService:
-    """Девять инструментов чтения роли «данные» (calc_spc — Д21, calc_flow_total — Д26). Ворота, каталог, часы,
-    журнал событий и monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
+    """Десять инструментов чтения роли «данные» (calc_spc — Д21, calc_flow_total — Д26, calc_formula — Д28).
+    Ворота, каталог, часы, журнал событий и monotonic — из роли в момент вызова; конструктор без ввода-вывода."""
 
     def __init__(self, role: DataRole, *, cache: TTLCache | None = None, flight: SingleFlight | None = None,
                  per_caller: SlidingWindow | None = None):
@@ -850,6 +868,15 @@ class DataService:
             return await self.config_unavailable(caller, channel, "calc_flow_total", tag)
         call = self._call(caller, channel, "calc_flow_total", tag)
         return await self._run(call, self._calc_flow_total(call, tag, period, start, end, points, unit))
+
+    async def calc_formula(self, caller: str, channel: Channel, tags: list[str], formula: str,
+                           period: str | None = None, start: str | None = None, end: str | None = None,
+                           points: int | None = None) -> dict[str, Any]:
+        """Расчёт по формуле над рядами до 4 тегов (Д28): считает служба (pcbk_core.formula), не модель."""
+        if self.role.config_error:          # F5
+            return await self.config_unavailable(caller, channel, "calc_formula", tags)
+        call = self._call(caller, channel, "calc_formula", tags)
+        return await self._run(call, self._calc_formula(call, tags, formula, period, start, end, points))
 
     async def equipment(self, caller: str, channel: Channel, query: str, with_state: bool = False) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19): служба сама группирует теги и считает их — не агент."""
@@ -1286,6 +1313,95 @@ class DataService:
                 "covered": _flow_intervals(result.covered), "uncovered": _flow_intervals(result.uncovered),
                 "points": result.points, "points_usable": result.usable, "gaps": result.gaps,
                 "grid_step_s": round(step_s, 1), "method": FLOW_METHOD, "notes": notes, "cache": call.cache}
+
+    async def _calc_formula(self, call: _Call, tags: list[str], expr: object, preset: str | None, start: str | None,
+                            end: str | None, points: object) -> dict[str, Any]:
+        """Расчёт по формуле над рядами тегов (Д28): A, B, C, D — теги вызова по порядку. Ряд — тем же путём, что
+        tag_series (ворота, белый список, бюджет тего-суток и точек, кэш, ключ и tool "tag_series"); формула
+        разбирается до SQL (pcbk_core.formula.parse, без eval), считается по годным точкам общей сетки."""
+        self._check_rate(call)
+        self._check_drill()
+        reason = _tags_problem(tags, SERIES_MAX_TAGS) or _period_problem(preset, start, end)
+        if reason:
+            raise _args_refusal(reason)
+        n_points = _formula_points(points, len(tags))
+        reason = "points: от 2 до 96" if n_points is None else _points_problem(n_points)
+        if reason:
+            raise _args_refusal(reason)
+        try:
+            tree = formula.parse(expr)
+        except formula.FormulaError as exc:
+            raise _args_refusal(str(exc)) from None
+        used = formula.variables(tree)
+        names_for = dict(zip(formula.VARIABLES, tags))
+        missing = [v for v in used if v not in names_for]
+        if missing:
+            raise _args_refusal(f"formula: ряд {', '.join(missing)} — тегов в вызове {len(tags)} (A — первый тег, "
+                                "B — второй, …)")
+        catalog = self._loaded_catalog()
+        known = self.role.clock
+        reason = _period_syntax(preset, start, end, known.offset if known is not None else timedelta(0))
+        if reason:
+            raise _args_refusal(reason)
+        entries = [_lookup_entry(catalog, t) for t in tags]
+        if not all(_deviation_ready(e) for e in entries):
+            items = [self._series_item(e, None, None) for e in entries]
+            raise _Refusal("refused", MESSAGES["none"], "none: " + _counts(items), extra={"items": items})
+        names = tuple(e.shown for e in entries)
+        clock, now_r, period = await self._clock_period(call, preset, start, end, names)
+        problem = check_points(len(names), n_points)
+        if problem is not None:
+            raise self._budget_refusal(problem, "budget: points", call, period, clock)
+        key = cache_key("tag_series", names, period.start, period.end, extra=str(n_points))
+        ttl = ttl_for("tag_series", period.end, now_r)
+        snap = await self._fetch(call, key, lambda: self._read_series(names, period, n_points, key, ttl))
+        stamps: set = set()
+        good: list[dict] = []
+        skipped: dict[str, int] = {}
+        for var, entry in zip(formula.VARIABLES, entries):
+            rows = snap.rows.get(entry.shown.upper(), ())
+            values = {}
+            for row in rows:
+                if not isinstance(row[1], datetime):
+                    continue
+                stamps.add(row[1])
+                value = _num(row[2])
+                if value is not None and _quality(row[3]) == "хорошее":
+                    values[row[1]] = value
+            skipped[var] = sum(1 for row in rows if isinstance(row[1], datetime)) - len(values)
+            good.append(values)
+        times = sorted(stamps)
+        data = {var: [vals.get(t) for t in times] for var, vals in zip(formula.VARIABLES, good)}
+        try:
+            result = formula.evaluate(tree, data)
+        except formula.FormulaError as exc:
+            raise _Refusal("refused", str(exc), "formula: " + str(exc)[:80])
+        is_open = period.open or snap.open
+        call.tags = names
+        notes = [GRID_NOTE, FORMULA_UNITS_NOTE, *self._period_notes(period, is_open)]
+        if result.dropped:
+            notes.append(f"точек с делением на ноль или переполнением: {result.dropped} — выпали из результата")
+        if any(skipped.values()):
+            notes.append("пустых или недостоверных точек по рядам: "
+                         + ", ".join(f"{v} {skipped[v]}" for v in formula.VARIABLES[:len(tags)] if skipped[v]))
+        answer: dict[str, Any] = {
+            "tool": "calc_formula", "status": "ok", "formula": str(expr).strip(),
+            "variables": {var: {"tag": e.shown, "description": e.lookup.info.description, "unit": e.lookup.info.unit}
+                          for var, e in zip(formula.VARIABLES, entries)},
+            "result_kind": result.kind, "result": _round6(result.value),
+            "period": self._period_json(period, clock, is_open), "points": len(times), "method": FORMULA_METHOD,
+        }
+        if result.kind == "series":
+            stats = formula.summary(result.series)
+            answer["summary"] = {k: (_round6(v) if isinstance(v, float) else v) for k, v in stats.items()}
+            answer["series"] = [[_iso(_aware(t, clock.tz)), _round6(v)]
+                                for t, v in list(zip(times, result.series))[:FORMULA_SERIES_CAP]]
+        call.summary = (f"{period.preset or 'свой период'}, тегов {len(names)}, точек {n_points}: "
+                        + (f"= {answer['result']}" if result.kind == "number" else f"ряд, среднее "
+                           f"{answer['summary']['mean']}"))
+        answer["notes"] = notes
+        answer["cache"] = call.cache
+        return answer
 
     async def _equipment(self, call: _Call, query: object, with_state: object) -> dict[str, Any]:
         """Агрегаты каталога по словам запроса (Д19, правка Д19б): без with_state — только каталог в памяти, SQL

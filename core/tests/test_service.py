@@ -1572,3 +1572,68 @@ async def test_calc_flow_total_refuses_discrete_tag(svc):
     s, fake = svc
     r = await s.calc_flow_total("student-01", "mcp", "25FAKE_007_CLS", **_FLOW_ARGS)
     assert (r["status"], r["message"]) == ("refused", MESSAGES["none"]) and fake.calls == []
+
+
+# Д28: calc_formula — расчёт по формуле над рядами тегов (pcbk_core.formula); A — 20FAKE_001_PV, B — 20FAKE_003_PV.
+
+from pcbk_core.data.service import FORMULA_UNITS_NOTE  # noqa: E402
+
+_FX = {"start": "2026-10-01T08:00:00+05:00", "end": "2026-10-01T11:00:00+05:00"}
+
+
+def _fx_rows(values) -> list[tuple]:
+    return [(_FLOW_BASE + timedelta(minutes=30 * i), v, q) for i, (v, q) in enumerate(values)]
+
+
+async def test_calc_formula_sum_ratio_corr(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = _fx_rows([(float(i), 0) for i in range(1, 8)])            # 1..7
+    fake.series["20FAKE_003_PV"] = _fx_rows([(2.0 * i, 0) for i in range(1, 8)])             # 2..14
+    tags = ["20FAKE_001_PV", "20FAKE_003_PV"]
+    total = await s.calc_formula("student-01", "mcp", tags, "A + B", points=7, **_FX)
+    assert (total["status"], total["result_kind"], total["result"]) == ("ok", "series", None)
+    assert [v for _, v in total["series"]] == [3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0]
+    assert total["summary"] == {"count": 7, "mean": 12.0, "min": 3.0, "max": 21.0}
+    assert total["variables"]["A"]["tag"] == "20FAKE_001_PV" and FORMULA_UNITS_NOTE in total["notes"]
+    ratio = await s.calc_formula("student-01", "mcp", tags, "mean(B) / mean(A)", points=7, **_FX)
+    assert (ratio["result_kind"], ratio["result"]) == ("number", 2.0)
+    corr = await s.calc_formula("student-01", "mcp", tags, "corr(A, B)", points=7, **_FX)
+    assert corr["result"] == 1.0
+    e = s.role.events.recent()[0]
+    assert (e.tool, e.outcome, e.tags) == ("calc_formula", "ok", ("20FAKE_001_PV", "20FAKE_003_PV"))
+
+
+async def test_calc_formula_bad_points_are_skipped(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = _fx_rows([(1.0, 0), (500.0, 64), (None, 0), (4.0, 0)])
+    r = await s.calc_formula("student-01", "mcp", ["20FAKE_001_PV"], "mean(A)", points=4, **_FX)
+    assert r["result"] == 2.5 and any("A 2" in n for n in r["notes"])             # недостоверная и пустая — не ноль
+
+
+@pytest.mark.parametrize("tags,expr,reason", [
+    (["20FAKE_001_PV"], "A + C", "ряд C — тегов в вызове 1"),
+    (["20FAKE_001_PV"], "__import__('os')", "функции вызываются по имени"),
+    (["20FAKE_001_PV"], "", "нужна строка с формулой"),
+    (["20FAKE_001_PV"] * 5, "mean(A)", "tags: не больше 4 тегов"),
+])
+async def test_calc_formula_refuses_before_sql(svc, tags, expr, reason):
+    s, fake = svc
+    r = await s.calc_formula("student-01", "mcp", tags, expr, **_FX)
+    assert r["status"] == "refused" and reason in r["message"] and fake.calls == []
+
+
+async def test_calc_formula_refuses_discrete_and_formula_errors_after_data(svc):
+    s, fake = svc
+    d = await s.calc_formula("student-01", "mcp", ["25FAKE_007_CLS"], "mean(A)", **_FX)
+    assert (d["status"], d["message"]) == ("refused", MESSAGES["none"]) and fake.calls == []
+    fake.series["20FAKE_001_PV"] = _fx_rows([(None, 0)] * 4)
+    r = await s.calc_formula("student-01", "mcp", ["20FAKE_001_PV"], "mean(A)", points=4, **_FX)
+    assert r["status"] == "refused" and "нет ни одной годной точки" in r["message"]
+
+
+async def test_calc_formula_default_points_fit_budget(svc):
+    s, fake = svc
+    fake.series["20FAKE_001_PV"] = _fx_rows([(1.0, 0)] * 4)
+    r = await s.calc_formula("student-01", "mcp", ["20FAKE_001_PV", "20FAKE_003_PV", "20FAKE_004_PV",
+                                                   "20FAKE_002_SP"], "mean(A)", **_FX)
+    assert r["status"] == "ok" and "72" in s.role.events.recent()[0].summary        # 4 тега × 72 = 288

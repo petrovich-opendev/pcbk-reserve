@@ -23,6 +23,7 @@ export const TOOL_LABELS: Readonly<Record<string, string>> = {
   pcbk_report_event: "запись события",
   pcbk_calc_spc: "карта Шухарта",
   pcbk_calc_flow_total: "суммарный расход",                // Д26
+  pcbk_calc_formula: "расчёт по формуле",                  // Д28
   read: "чтение базы знаний",                         // Д25: read в чате — только у Помощника, база V1/V2
   kb_corrections: "поправки базы знаний",
   kb_correction_add: "запись поправки в базу знаний",

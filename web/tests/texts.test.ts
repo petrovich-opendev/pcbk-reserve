@@ -36,6 +36,7 @@ test("tool_labels", () => {
                                pcbk_tag_series: "ряд и профиль", pcbk_calc_runtime: "наработка",
                                pcbk_my_agents: "мои агенты", pcbk_report_event: "запись события",
                                pcbk_calc_spc: "карта Шухарта", pcbk_calc_flow_total: "суммарный расход",
+                               pcbk_calc_formula: "расчёт по формуле",
                                read: "чтение базы знаний",
                                kb_corrections: "поправки базы знаний", kb_correction_add: "запись поправки в базу знаний",
                                kb_correction_withdraw: "отзыв поправки" });                         // Д9-R88, Д13, Д24, Д25

@@ -29,10 +29,12 @@ TEMPLATE_VERSION = 3
 # (Д9-R89), калькулятор отклонения и report_event Д13, подсчёт агрегатов (equipment) Д19, карта Шухарта (calc_spc)
 # Д21 — в конце: строки allow и дайджест черновика идут в порядке AGENT_TOOLS, файлы и дайджесты агентов Д7/Д9 прежние
 AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "calc_deviation",
-              "equipment", "calc_spc", "report_event")
+              "equipment", "calc_spc", "report_event", "calc_formula")
 # equipment — Д19: запрос без тегов черновика (query, как у catalog_search), но инструмент чисел (units_total).
 # calc_spc — Д21: как tag_now/tag_period/tag_series/calc_runtime, нужен тег черновика (один аналоговый)
-_NUMBER_TOOLS = frozenset({"tag_now", "tag_period", "tag_series", "calc_runtime", "equipment", "calc_spc"})
+# calc_formula — Д28: производные показатели по формуле над тегами черновика (сумма, отношение, корреляция)
+_NUMBER_TOOLS = frozenset({"tag_now", "tag_period", "tag_series", "calc_runtime", "equipment", "calc_spc",
+                           "calc_formula"})
 _TOOL_PREFIX = "pcbk_"
 
 NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", re.ASCII)
@@ -112,8 +114,8 @@ PROBLEM_TEXTS: dict[str, str] = {
                  "на стенде запрещены",
     "tools_empty": f"Агенту нужен хотя бы один инструмент: {_TOOLS_LIST}",
     "tool_not_allowed": f"Инструмента «{{v}}» на стенде нет. Можно: {_TOOLS_LIST}.",
-    "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, calc_runtime, equipment или "
-                     "calc_spc), а без тегов — ещё catalog_search",
+    "tools_useless": "Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, calc_runtime, equipment, "
+                     "calc_spc или calc_formula), а без тегов — ещё catalog_search",
     "tag_unknown": "Такого тега нет в каталоге историана",
     "tag_unlisted": "Тег не входит в белый список стенда",
     # служба отвечает на него unavailable (Д7-R57); текст — на случай, если замечание всё же уйдёт модели
