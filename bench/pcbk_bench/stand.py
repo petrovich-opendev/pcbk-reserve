@@ -65,7 +65,7 @@ AGENT_NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", re.ASCII)
 # report_event; Д19 — подсчёт агрегатов equipment; Д21 — карта Шухарта calc_spc): калькулятор стенда и субагент
 # карточек
 DATA_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "calc_deviation",
-             "equipment", "calc_spc", "report_event")
+             "equipment", "calc_spc", "report_event", "calc_formula")                  # Д28: расчёт по формуле
 STU_RE = re.compile(r"\d{1,3}\.\d{1,3}")                        # STU_NET compose: первые два октета сетей мест
 REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]+")
 

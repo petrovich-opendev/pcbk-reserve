@@ -610,4 +610,4 @@ async def test_check_sees_readonly_store(tmp_path, caplog):                # I-1
 
 def test_save_schema_lists_d9_tools():                               # Д9-R89/Д13/Д19/Д21: схема — из AGENT_TOOLS
     assert SAVE_PROPERTIES["tools"]["items"]["enum"] == list(AGENT_TOOLS)
-    assert SAVE_PROPERTIES["tools"]["maxItems"] == 9                          # Д21: плюс calc_spc
+    assert SAVE_PROPERTIES["tools"]["maxItems"] == 10                         # Д21: calc_spc; Д28: calc_formula

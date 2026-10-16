@@ -98,3 +98,5 @@ def test_overflow_is_not_a_number():
         calc("max(A) * 1e300", A=[1e300])
     assert calc("A * 1e300", A=[1e300, 1.0]).series == (None, 1e300)        # точка с переполнением — пустая
     assert math.isfinite(calc("mean(A)", A=[1e300, 1e300]).value)
+    with pytest.raises(FormulaError, match="переполнение"):
+        calc("sum(A)", A=[1e308, 1e308])                                         # ревью Д28: не непойманный Overflow

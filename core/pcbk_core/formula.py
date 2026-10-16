@@ -208,11 +208,18 @@ def evaluate(tree: ast.Expression, data: dict[str, Series]) -> FormulaResult:
             values = _values(args[0])
             if not values:
                 raise FormulaError(f"{name}(): в ряду нет ни одной годной точки")
-            if name == "std":
-                if len(values) < 2:
-                    raise FormulaError("std(): нужно не меньше двух точек")
-                return statistics.stdev(values)
-            return float(_REDUCE[name](values))
+            try:
+                if name == "std":
+                    if len(values) < 2:
+                        raise FormulaError("std(): нужно не меньше двух точек")
+                    out = statistics.stdev(values)
+                else:
+                    out = float(_REDUCE[name](values))
+            except (OverflowError, ValueError) as exc:
+                raise FormulaError(f"{name}(): результат не число (переполнение)") from exc
+            if not math.isfinite(out):
+                raise FormulaError(f"{name}(): результат не число (переполнение)")
+            return out
         raise FormulaError(f"formula: недопустимая конструкция «{type(node).__name__}»")
 
     out = ev(tree)

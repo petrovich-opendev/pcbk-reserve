@@ -62,7 +62,7 @@ from .student import CONSENT, CONSENT_RE
 # калькулятор отклонения и report_event; Д19 — ещё подсчёт агрегатов equipment; Д21 — ещё карта Шухарта calc_spc) —
 # значением, не импортом: bench только на stdlib. По ним check_run судит права файла сохранённого агента (tools_ok)
 ALLOWED_TOOLS = ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime", "calc_deviation",
-                "equipment", "calc_spc", "report_event")
+                "equipment", "calc_spc", "report_event", "calc_formula")              # Д28: расчёт по формуле
 # инструменты заготовленного агента bench-uzel — прежний набор Д7: стенд отбора Д8 не меняется
 AGENT_TOOLS = ("catalog_search", "tag_now", "tag_period")
 # пределы полей save_agent (draft.py TEXT_LIMITS, PROMPT_MIN/MAX, MAX_TAGS) — значением

@@ -375,7 +375,8 @@ CHECKED_DIGEST_D7 = "cf436d9510f82c15ac3aeffdde5b748e64070fcfe3143b93f5f0e928c3d
 
 def test_agent_tools_d9():                                                        # Review Focus 5
     assert AGENT_TOOLS == ("catalog_search", "tag_now", "tag_period", "tag_series", "calc_runtime",
-                           "calc_deviation", "equipment", "calc_spc", "report_event")   # Д21: карта Шухарта
+                           "calc_deviation", "equipment", "calc_spc", "report_event",
+                           "calc_formula")                                           # Д21: SPC; Д28: формулы
     for tools in (["tag_series"], ["calc_runtime"], ["pcbk_calc_runtime", "catalog_search"],
                  ["calc_deviation", "tag_now"], ["pcbk_calc_deviation", "pcbk_report_event", "tag_now"],
                  ["equipment"], ["pcbk_equipment", "catalog_search"], ["calc_spc"],
@@ -401,8 +402,8 @@ def test_agent_tools_d9():                                                      
     assert codes({**OK, "tools": ["calc_spc"]}) == set()
     assert codes({**OK, "tools": ["calc_spc"], "tags": []}) == {("tools", "tools_useless")}
     assert PROBLEM_TEXTS["tools_useless"] == ("Агенту нужен инструмент чисел (tag_now, tag_period, tag_series, "
-                                              "calc_runtime, equipment или calc_spc), а без тегов — ещё "
-                                              "catalog_search")
+                                              "calc_runtime, equipment, calc_spc или calc_formula), а без тегов — ещё "
+                                              "catalog_search")                                     # Д28
 
 
 def test_render_new_tools_permission_order():
