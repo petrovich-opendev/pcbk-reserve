@@ -91,7 +91,7 @@ services:
   watchdog:
     build: ./watchdog
     # откатный образ — `watchdog:d10a` (Д11а, А0)
-    image: pcbk-reserve/watchdog:d15b
+    image: pcbk-reserve/watchdog:d25
     # свой образ: без never compose сперва ищет это имя на Docker Hub
     pull_policy: never
     container_name: pcbk-watchdog

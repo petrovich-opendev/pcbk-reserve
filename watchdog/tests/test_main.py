@@ -259,13 +259,13 @@ def test_components_file_d4a():                    # было test_components_fi
     assert [(c["id"], c["title"], c["kind"], c["container"], c["sleeping_ok"]) for c in students] == \
            [(f"student-{n:02d}", f"Рабочее место {n:02d}", "container", f"pcbk-student-{n:02d}", True)
             for n in range(1, 12)]
-    assert len(comps) == 23                                                     # Д15б: 11 мест, не 10
+    assert len(comps) == 24                                                     # Д15б: 11 мест; Д25: строка kb
 
 
 def test_components_file_d4b():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
-    assert ids[-8:-3] == ["core", "core-container", "historian", "llm", "gateway"]       # Д10а: строка teacher — последней
+    assert ids[-9:-4] == ["core", "core-container", "historian", "llm", "gateway"]       # Д25: строка kb — последней
     cc = comps[ids.index("core-container")]
     assert (cc["kind"], cc["container"], cc["sleeping_ok"], cc["title"]) == \
            ("container", "pcbk-core", False, "Серверный слой — контейнер")
@@ -279,24 +279,30 @@ def test_components_file_d5a():
     comps = load_components("components.json")
     ids = [c["id"] for c in comps]
     g = comps[ids.index("gateway")]
-    assert ids[-4] == "gateway"
+    assert ids[-5] == "gateway"
     assert (g["title"], g["kind"], g["url"]) == ("Шлюз и вход", "gateway", "http://pcbk-core:8000/health/gateway")
 
 
 def test_components_have_web_row():
     comps = load_components("components.json")
-    assert comps[-3] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
+    assert comps[-4] == {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/",
                          "reports_url": "http://pcbk-core:8000/health/web"}                # Д6б: отчёты браузеров
 
 
 def test_components_have_agents_row():
-    assert load_components("components.json")[-2] == {"id": "agents", "title": "Агенты студентов", "kind": "agents",
+    assert load_components("components.json")[-3] == {"id": "agents", "title": "Агенты студентов", "kind": "agents",
                                                       "url": "http://pcbk-core:8000/health/agents"}
 
 
 def test_components_have_teacher_row():                                        # задача А1 Д10а (Д10-R96)
-    assert load_components("components.json")[-1] == {"id": "teacher", "title": "Кабинет преподавателя и доли",
+    assert load_components("components.json")[-2] == {"id": "teacher", "title": "Кабинет преподавателя и доли",
                                                       "kind": "teacher", "url": "http://pcbk-core:8000/health/teacher"}
+
+
+def test_components_have_kb_row():                                                # Д25: поправки базы знаний
+    assert load_components("components.json")[-1] == {"id": "kb", "title": "Поправки базы знаний", "kind": "http",
+                                                      "url": "http://pcbk-core:8000/healthz/kb",
+                                                      "ok_detail": "хранилище открыто"}
 
 
 def test_teacher_stale_setting():

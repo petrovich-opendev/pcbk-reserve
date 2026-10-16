@@ -3,10 +3,12 @@ core.db (store.py), команда оператора `python -m pcbk_core.kb` (
 
 Отдельная роль, а не инструменты /mcp службы данных: файлы службы данных защищены пакетом КДМ-1. Токены мест — та
 же таблица core-tokens, что у службы данных (build_roles передаёт её объект). Здоровье без ввода-вывода: хранилище
-не открылось — красная строка с классом ошибки; инструменты при этом отвечают «недоступно», процесс жив.
+не открылось — красная строка с классом ошибки; инструменты при этом отвечают «недоступно» и при каждом вызове
+пробуют открыть хранилище снова (ревью Д25: без перезапуска core), процесс жив.
 """
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -26,9 +28,11 @@ KB_ERROR = "поправки базы знаний: хранилище не от
 class KbRole(RoleBase):
     name = "kb"
 
-    def __init__(self, db_path: str, tokens: TokenTable, *, wallclock: Callable[[], datetime] = now_utc):
+    def __init__(self, db_path: str, tokens: TokenTable, *, wallclock: Callable[[], datetime] = now_utc,
+                 monotonic: Callable[[], float] = time.monotonic):
         self.tokens = tokens
         self.wallclock = wallclock
+        self.monotonic = monotonic          # окно частоты записи (mcp_server.WRITE_LIMIT)
         self.store = CorrectionStore(db_path)
         self.opened: bool | None = None
         self.mcp = build_kb_mcp(self)

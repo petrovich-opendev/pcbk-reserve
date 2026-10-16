@@ -21,5 +21,6 @@
   {"id": "gateway", "title": "Шлюз и вход", "kind": "gateway", "url": "http://pcbk-core:8000/health/gateway"},
   {"id": "web", "title": "Веб-чат", "kind": "web", "url": "http://pcbk-edge:8080/chat/", "reports_url": "http://pcbk-core:8000/health/web"},
   {"id": "agents", "title": "Агенты студентов", "kind": "agents", "url": "http://pcbk-core:8000/health/agents"},
-  {"id": "teacher", "title": "Кабинет преподавателя и доли", "kind": "teacher", "url": "http://pcbk-core:8000/health/teacher"}
+  {"id": "teacher", "title": "Кабинет преподавателя и доли", "kind": "teacher", "url": "http://pcbk-core:8000/health/teacher"},
+  {"id": "kb", "title": "Поправки базы знаний", "kind": "http", "url": "http://pcbk-core:8000/healthz/kb", "ok_detail": "хранилище открыто"}
 ]

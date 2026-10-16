@@ -35,6 +35,8 @@ WRONG_CHARS = 600                # что неверно в базе (необя
 BASIS_CHARS = 600                # основание: документ, замер, опыт (необязательно)
 ACTIVE_PER_CALLER = 30           # действующих поправок у одного места
 ACTIVE_TOTAL = 500               # действующих поправок всего
+ROWS_TOTAL = 5000                # строк всего, с отозванными: цикл «добавить — отозвать» не раздует core.db
+ID_MAX = 2**63 - 1               # SQLite INTEGER: номер больше — отказ, а не OverflowError
 LIST_MAX = 50                    # corrections: не больше стольких за ответ, новые первыми
 SQLITE_TIMEOUT_S = 5.0
 _SQLITE_CODE = re.compile(r"SQLITE_[A-Z_]{1,40}")
@@ -110,11 +112,21 @@ def clean(value: object, field: str, limit: int, *, required: bool, minimum: int
     return text
 
 
+_EDGE = "«»\"'“”„.,;:!?()[]{}"
+_SKIP = frozenset({"запись", "запись:"})   # модель может передать строку карточки целиком: «Запись: v1:claim:…»
+
+
+def query_words(query: str) -> list[str]:
+    """Слова запроса без регистра и знаков по краям; служебное «Запись:» карточки отбрасывается."""
+    words = (w.strip(_EDGE) for w in query.casefold().split())
+    return [w for w in words if w and w not in _SKIP]
+
+
 def matches(c: Correction, query: str) -> bool:
-    """Совпадение поправки со словами запроса: каждое слово (без регистра) — в записи, «что неверно» или «как
+    """Совпадение поправки со словами запроса: каждое слово (query_words) — в записи, «что неверно» или «как
     правильно». SQLite lower() кириллицу не понижает — сверка в Python (действующих не больше ACTIVE_TOTAL)."""
     hay = " ".join(x for x in (c.record, c.wrong, c.statement) if x).casefold()
-    return all(word in hay for word in query.casefold().split())
+    return all(word in hay for word in query_words(query))
 
 
 class CorrectionStore:
@@ -177,6 +189,9 @@ class CorrectionStore:
             if total >= ACTIVE_TOTAL:
                 raise CorrectionRefused(f"действующих поправок уже {ACTIVE_TOTAL} — новые не принимаются, "
                                         "обратитесь к преподавателю")
+            if db.execute("SELECT count(*) FROM kb_corrections").fetchone()[0] >= ROWS_TOTAL:
+                raise CorrectionRefused(f"в журнале поправок уже {ROWS_TOTAL} записей вместе с отозванными — новые не "
+                                        "принимаются, обратитесь к преподавателю")
             row_id = db.execute(_INSERT, (ts, caller, rec, bad, stmt, why)).lastrowid
             db.execute("COMMIT")
         return Correction(row_id, ts, caller, rec, bad, stmt, why, None, None)
@@ -207,7 +222,7 @@ class CorrectionStore:
     def withdraw(self, correction_id: object, by: str, now: datetime, *, operator: bool = False) -> Correction:
         """Отзыв поправки: автор (то же место) или оператор (operator=True). Нет такой, чужая или уже отозвана —
         CorrectionRefused. Строка остаётся, ставится отметка."""
-        if type(correction_id) is not int or correction_id < 1:
+        if type(correction_id) is not int or not 1 <= correction_id <= ID_MAX:
             raise CorrectionRefused("id: номер поправки — целое число от 1")
         ts = _iso(now)
         with self._op() as db:

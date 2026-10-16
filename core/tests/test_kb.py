@@ -10,7 +10,7 @@ from helpers import TOKEN, mcp_session, serve_app, sha
 from pcbk_core.app import create_app
 from pcbk_core.kb import KbRole
 from pcbk_core.kb.__main__ import main as kb_cli
-from pcbk_core.kb.mcp_server import KB_MCP_PATH, NOTICE, TOOL_DESCRIPTIONS
+from pcbk_core.kb.mcp_server import KB_MCP_PATH, NOTICE, TOO_OFTEN, TOOL_DESCRIPTIONS, WRITE_LIMIT
 from pcbk_core.kb.store import (ACTIVE_PER_CALLER, LIST_MAX, STATEMENT_MIN, CorrectionRefused, CorrectionStore,
                                 clean)
 from pcbk_core.secrets import TokenTable
@@ -48,6 +48,9 @@ def test_query_matches_words_without_case_in_record_wrong_statement(tmp_path):
     assert [c.record for c in s.active("DEF-basis-weight")[0]] == ["v1:claim:DEF-basis-weight"]
     assert s.active("влажность сушки")[1] == 1 and s.active("нет такого")[1] == 0
     assert s.active("  ")[1] == 2                                                # пустой запрос — все
+    # модель может передать строку карточки целиком (ревью Д25): «Запись: …» и знаки по краям не мешают
+    assert [c.record for c in s.active("Запись: v1:claim:DEF-basis-weight.")[0]] == ["v1:claim:DEF-basis-weight"]
+    assert [c.record for c in s.active("«влажность»")[0]] == ["v1:term:moisture"]
 
 
 @pytest.mark.parametrize("kwargs,reason", [
@@ -87,6 +90,15 @@ def test_active_limit_per_place_and_list_cap(tmp_path, monkeypatch):
     assert (len(found), total) == (5, ACTIVE_PER_CALLER + 1) and LIST_MAX == 50
 
 
+def test_rows_total_counts_withdrawn_too(tmp_path, monkeypatch):               # ревью Д25: цикл add/withdraw
+    monkeypatch.setattr("pcbk_core.kb.store.ROWS_TOTAL", 3)
+    s = store(tmp_path)
+    for i in range(3):
+        s.withdraw(s.add("student-01", f"v1:claim:X{i}", STMT, None, None, NOW).id, "student-01", NOW)
+    with pytest.raises(CorrectionRefused, match="уже 3 записей вместе с отозванными"):
+        s.add("student-01", "v1:claim:Y", STMT, None, None, NOW)
+
+
 def test_withdraw_own_only_operator_any_and_row_kept(tmp_path):
     s = store(tmp_path)
     a = s.add("student-01", "v1:claim:X", STMT, None, None, NOW)
@@ -96,6 +108,8 @@ def test_withdraw_own_only_operator_any_and_row_kept(tmp_path):
         s.withdraw(99, "student-01", NOW)
     with pytest.raises(CorrectionRefused, match="целое число"):
         s.withdraw("1", "student-01", NOW)
+    with pytest.raises(CorrectionRefused, match="целое число"):
+        s.withdraw(10**26, "student-01", NOW)                                     # вне SQLite INTEGER — отказ, не Overflow
     w = s.withdraw(a.id, "student-01", NOW)
     assert (w.withdrawn_by, s.active()[1]) == ("student-01", 0)
     with pytest.raises(CorrectionRefused, match="уже отозвана"):
@@ -171,6 +185,24 @@ async def test_mcp_tools_schema_and_round_trip(kb_server):
 
 
 @pytest.mark.anyio
+async def test_mcp_writes_rate_limited_per_place(tmp_path):                       # ревью Д25: добавить — отозвать
+    role = KbRole(str(tmp_path / "core.db"), TOKENS, wallclock=lambda: NOW, monotonic=lambda: 100.0)
+    with serve_app(create_app(Settings(DB_PATH=str(tmp_path / "core.db")), [role])) as url:
+        async with mcp_session(url + KB_MCP_PATH, TOKEN) as s:
+            answers = []
+            for i in range(WRITE_LIMIT // 2):
+                added = _result(await s.call_tool("correction_add", {"record": f"v1:claim:X{i}", "statement": STMT}))
+                answers.append(added["status"])
+                answers.append(_result(await s.call_tool("correction_withdraw", {"id": added["id"]}))["status"])
+            over = _result(await s.call_tool("correction_add", {"record": "v1:claim:Y", "statement": STMT}))
+            read = _result(await s.call_tool("corrections", {}))
+        async with mcp_session(url + KB_MCP_PATH, TOKEN_02) as s:
+            other = _result(await s.call_tool("correction_add", {"record": "v1:claim:Z", "statement": STMT}))
+    assert answers == ["ok"] * WRITE_LIMIT and (over["status"], over["message"]) == ("refused", TOO_OFTEN)
+    assert read["status"] == "ok" and other["status"] == "ok"                    # чтение и другое место — без предела
+
+
+@pytest.mark.anyio
 async def test_mcp_bad_input_is_russian_refusal(kb_server):
     url, _ = kb_server
     async with mcp_session(url, TOKEN) as s:
@@ -209,6 +241,20 @@ async def test_mcp_store_failure_is_unavailable_not_500(tmp_path):
         async with mcp_session(url + KB_MCP_PATH, TOKEN) as s:
             r = _result(await s.call_tool("corrections", {}))
     assert r["status"] == "unavailable" and "недоступны" in r["message"]
+
+
+@pytest.mark.anyio
+async def test_store_reopens_on_call_after_failed_start(tmp_path):               # ревью Д25: без перезапуска core
+    (tmp_path / "later").mkdir()
+    db = tmp_path / "later" / "core.db"
+    role = KbRole(str(db), TOKENS)
+    role.store.db_path = str(tmp_path / "нет" / "core.db")                       # при старте каталога нет
+    with serve_app(create_app(Settings(DB_PATH=str(db)), [role])) as url:
+        assert role.health()[0] is False
+        role.store.db_path = str(db)                                              # том появился
+        async with mcp_session(url + KB_MCP_PATH, TOKEN) as s:
+            r = _result(await s.call_tool("corrections", {}))
+        assert r["status"] == "ok" and role.health() == (True, "поправки базы знаний: хранилище открыто")
 
 
 # --- команда оператора ---
