@@ -15,7 +15,7 @@ name: pcbk-reserve
 # :d7b (или :d8b) остаётся на сервере для отката Д9а (:d6a — для отката Д7б).
 # healthcheck не задаётся: работает проверка образа (GET /agent и слово MCP: «200 mcp=connected»).
 x-student: &student
-  image: pcbk-reserve/student:d24
+  image: pcbk-reserve/student:d25
   pull_policy: never
   runtime: runsc
   profiles: [students]
@@ -220,7 +220,7 @@ services:
   core:
     build: ./core
     # откатный образ — `core:d10b` (Д11а, А0; deploy/README.md, «Откат»)
-    image: pcbk-reserve/core:d24
+    image: pcbk-reserve/core:d25
     pull_policy: never              # свой образ: без never compose ищет имя на Docker Hub
     container_name: pcbk-core
     user: "10003:10003"
