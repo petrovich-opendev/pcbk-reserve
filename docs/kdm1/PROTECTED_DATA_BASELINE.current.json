@@ -57,8 +57,8 @@
     },
     {
       "path": "core/pcbk_core/data/mcp_server.py",
-      "bytes": 40819,
-      "sha256": "651390c6da8997b2f5d5682987b92812aee8c85d4c8ac3b0f07281515b641e2b"
+      "bytes": 40996,
+      "sha256": "4b349009fd6d91644394eb318565499b7ec60b1495349f84b5a128e714a2f8fc"
     },
     {
       "path": "core/pcbk_core/data/my_agents.py",
