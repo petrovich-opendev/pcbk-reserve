@@ -663,7 +663,8 @@ test("шаблон edge: ошибки JSON на уровне server, пути ш
                    "/pcbk/api/events",                                                  // события агентов (Д13)
                    "/pcbk/api/calc/",                                                   // калькуляторы (Д9а, Д9-R87)
                    "/pcbk/api/teacher/",                                                // кабинет (Д10-R105)
-                   "/pcbk/api/lessons", "/pcbk/api/lessons/"];                          // пакет уроков (Д15а)
+                   "/pcbk/api/lessons", "/pcbk/api/lessons/",                           // пакет уроков (Д15а)
+                   "/pcbk/api/analytics/"];                                             // аналитика КДМ-1 (Д16)
   const oc = ["/pcbk/api/oc/", "/pcbk/api/oc/event"];                                   // Д5б
   const report = "/pcbk/api/web/report";                                               // отчёты браузеров (Д6б, Д6-R50)
   const passes = locs.flatMap((l) => [...l.body.matchAll(/proxy_pass\s+([^;]*);/g)].map((m) => [l.path, m[1]]));
