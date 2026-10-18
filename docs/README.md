@@ -8,6 +8,12 @@
 [`AGENTS.md`](../AGENTS.md) в корне. Эксплуатация действующего стенда — ранбук
 [`deploy/README.md`](../deploy/README.md).
 
+## Ревью кода
+
+[`review/`](review/) — ревью качества и стабильности от 18.10.2026: отчёт с находками
+([CODE-REVIEW-2026-10-18.md](review/CODE-REVIEW-2026-10-18.md)) и промпт для агента-исполнителя улучшений
+([PROMPT-improvements-2026-10-18.md](review/PROMPT-improvements-2026-10-18.md)).
+
 ## Пакет заказчика КДМ-1
 
 [`kdm1/`](kdm1/) — `PROTECTED_DATA_BASELINE.current.json` (хеши 19 защищённых файлов пакета), `DRIFT.md`
