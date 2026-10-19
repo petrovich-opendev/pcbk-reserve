@@ -26,6 +26,8 @@
 [`research/15-production-decisions-2026-10-19.md`](research/15-production-decisions-2026-10-19.md) — **решения владельца**
 по продуктиву (новая система с нуля: Python, Keycloak+AD, PostgreSQL-контекст, Kubernetes 3 среды, Bitrix,
 модели РФ) — заменяют план 14.
+[`research/16-delivery-plan-and-resources-2026-10-19.md`](research/16-delivery-plan-and-resources-2026-10-19.md) — как
+строим продуктив (фазы по неделям) и какие трудовые ресурсы нужны от владельца и ИТ заказчика.
 
 ## Пакет заказчика КДМ-1
 
