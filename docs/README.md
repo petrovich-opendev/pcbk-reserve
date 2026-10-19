@@ -14,6 +14,11 @@
 ([CODE-REVIEW-2026-10-18.md](review/CODE-REVIEW-2026-10-18.md)) и промпт для агента-исполнителя улучшений
 ([PROMPT-improvements-2026-10-18.md](review/PROMPT-improvements-2026-10-18.md)).
 
+## Исследования целевой архитектуры
+
+[`research/12-nemoclaw-open-webui-2026-10-19.md`](research/12-nemoclaw-open-webui-2026-10-19.md) — можно ли
+переделать стенд на NVIDIA NemoClaw + Open WebUI: ответ, варианты, план, вопросы заказчику.
+
 ## Пакет заказчика КДМ-1
 
 [`kdm1/`](kdm1/) — `PROTECTED_DATA_BASELINE.current.json` (хеши 19 защищённых файлов пакета), `DRIFT.md`
