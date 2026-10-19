@@ -18,6 +18,8 @@
 
 [`research/12-nemoclaw-open-webui-2026-10-19.md`](research/12-nemoclaw-open-webui-2026-10-19.md) — можно ли
 переделать стенд на NVIDIA NemoClaw + Open WebUI: ответ, варианты, план, вопросы заказчику.
+[`research/13-alternatives-to-nemoclaw-open-webui-2026-10-19.md`](research/13-alternatives-to-nemoclaw-open-webui-2026-10-19.md) —
+альтернативы этой связке по слоям (среда агентов, интерфейс, визуализация, модели в РФ, платформы) и сборки целиком.
 
 ## Пакет заказчика КДМ-1
 
